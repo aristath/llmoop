@@ -123,6 +123,38 @@ impl VulkanU32ShaderPedal {
         })
     }
 
+    pub fn create_resident_dispatch(
+        &self,
+        device: &VulkanComputeDevice,
+        buffer: &VulkanU32ResidentBuffer,
+        len: usize,
+    ) -> Result<VulkanU32ResidentDispatch, VulkanError> {
+        device.create_u32_resident_dispatch(&self.program.words, buffer, len, self.local_size_x)
+    }
+
+    pub fn process_bound_resident(
+        &self,
+        device: &VulkanComputeDevice,
+        binding: &VulkanU32ResidentDispatch,
+        len: usize,
+    ) -> Result<VulkanU32PedalRun, VulkanError> {
+        let input = binding.read(len)?;
+        device.run_u32_storage_shader_on_resident_dispatch(
+            &self.program.words,
+            binding,
+            len,
+            self.local_size_x,
+        )?;
+        let output = binding.read(len)?;
+        Ok(VulkanU32PedalRun {
+            pedal_id: self.program.pedal_id.clone(),
+            operator_type: self.program.operator_type.clone(),
+            device_name: device.device_name().to_string(),
+            input,
+            output,
+        })
+    }
+
     pub fn install_on_device(&self, device: &VulkanComputeDevice) -> Result<(), VulkanError> {
         device.install_u32_storage_shader(&self.program.words, self.local_size_x)
     }
@@ -223,6 +255,73 @@ impl Drop for VulkanU32ResidentBuffer {
         unsafe {
             self.device.destroy_buffer(self.buffer, None);
             self.device.free_memory(self.memory, None);
+        }
+    }
+}
+
+pub struct VulkanU32ResidentDispatch {
+    device: ash::Device,
+    memory: vk::DeviceMemory,
+    descriptor_pool: vk::DescriptorPool,
+    descriptor_set: vk::DescriptorSet,
+    command_pool: vk::CommandPool,
+    command_buffer: vk::CommandBuffer,
+    pipeline_key: VulkanPipelineKey,
+    pipeline_layout: vk::PipelineLayout,
+    pipeline: vk::Pipeline,
+    capacity: usize,
+    byte_capacity: vk::DeviceSize,
+    len: usize,
+}
+
+impl VulkanU32ResidentDispatch {
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn read(&self, len: usize) -> Result<Vec<u32>, VulkanError> {
+        let byte_len = self.byte_len(len)?;
+        unsafe { read_u32_memory(&self.device, self.memory, byte_len, len) }
+    }
+
+    fn byte_len(&self, len: usize) -> Result<vk::DeviceSize, VulkanError> {
+        if len == 0 {
+            return Err(VulkanError(
+                "resident dispatch binding length must not be zero".to_string(),
+            ));
+        }
+        if len > self.len {
+            return Err(VulkanError(format!(
+                "resident dispatch binding length {} cannot read {} u32 values",
+                self.len, len
+            )));
+        }
+        if len > self.capacity {
+            return Err(VulkanError(format!(
+                "resident dispatch binding capacity {} cannot hold {} u32 values",
+                self.capacity, len
+            )));
+        }
+        let byte_len = len
+            .checked_mul(std::mem::size_of::<u32>())
+            .ok_or_else(|| VulkanError("resident dispatch byte length overflowed".to_string()))?
+            as vk::DeviceSize;
+        if byte_len > self.byte_capacity {
+            return Err(VulkanError(format!(
+                "resident dispatch byte capacity {} cannot hold {} bytes",
+                self.byte_capacity, byte_len
+            )));
+        }
+        Ok(byte_len)
+    }
+}
+
+impl Drop for VulkanU32ResidentDispatch {
+    fn drop(&mut self) {
+        unsafe {
+            self.device.destroy_command_pool(self.command_pool, None);
+            self.device
+                .destroy_descriptor_pool(self.descriptor_pool, None);
         }
     }
 }
@@ -377,6 +476,110 @@ impl VulkanComputeDevice {
         Ok(())
     }
 
+    pub fn create_u32_resident_dispatch(
+        &self,
+        spirv_words: &[u32],
+        resident_buffer: &VulkanU32ResidentBuffer,
+        len: usize,
+        local_size_x: u32,
+    ) -> Result<VulkanU32ResidentDispatch, VulkanError> {
+        if len == 0 {
+            return Err(VulkanError(
+                "resident dispatch binding length must not be zero".to_string(),
+            ));
+        }
+        if spirv_words.is_empty() {
+            return Err(VulkanError("SPIR-V module must not be empty".to_string()));
+        }
+        if local_size_x == 0 {
+            return Err(VulkanError("local_size_x must not be zero".to_string()));
+        }
+        resident_buffer.byte_len(len)?;
+
+        let pipeline_key = VulkanPipelineKey {
+            spirv_words: spirv_words.to_vec(),
+            local_size_x,
+        };
+        let (descriptor_set_layout, pipeline_layout, pipeline) =
+            self.u32_storage_pipeline(spirv_words, local_size_x)?;
+
+        unsafe {
+            let set_layouts = [descriptor_set_layout];
+            let pool_sizes = [vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::STORAGE_BUFFER,
+                descriptor_count: 1,
+            }];
+            let descriptor_pool_info = vk::DescriptorPoolCreateInfo::default()
+                .max_sets(1)
+                .pool_sizes(&pool_sizes);
+            let descriptor_pool = self
+                .device
+                .create_descriptor_pool(&descriptor_pool_info, None)
+                .map_err(|error| {
+                    VulkanError(format!(
+                        "failed to create resident descriptor pool: {error:?}"
+                    ))
+                })?;
+            let descriptor_alloc_info = vk::DescriptorSetAllocateInfo::default()
+                .descriptor_pool(descriptor_pool)
+                .set_layouts(&set_layouts);
+            let descriptor_set = self
+                .device
+                .allocate_descriptor_sets(&descriptor_alloc_info)
+                .map_err(|error| {
+                    VulkanError(format!(
+                        "failed to allocate resident descriptor set: {error:?}"
+                    ))
+                })?
+                .remove(0);
+            let descriptor_buffer = [resident_buffer.descriptor_buffer(len)?];
+            let descriptor_writes = [vk::WriteDescriptorSet::default()
+                .dst_set(descriptor_set)
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&descriptor_buffer)];
+            self.device.update_descriptor_sets(&descriptor_writes, &[]);
+
+            let command_pool_info = vk::CommandPoolCreateInfo::default()
+                .queue_family_index(self.queue_family_index)
+                .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+            let command_pool = self
+                .device
+                .create_command_pool(&command_pool_info, None)
+                .map_err(|error| {
+                    VulkanError(format!("failed to create resident command pool: {error:?}"))
+                })?;
+            let command_alloc_info = vk::CommandBufferAllocateInfo::default()
+                .command_pool(command_pool)
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .command_buffer_count(1);
+            let command_buffer = self
+                .device
+                .allocate_command_buffers(&command_alloc_info)
+                .map_err(|error| {
+                    VulkanError(format!(
+                        "failed to allocate resident command buffer: {error:?}"
+                    ))
+                })?
+                .remove(0);
+
+            Ok(VulkanU32ResidentDispatch {
+                device: self.device.clone(),
+                memory: resident_buffer.memory,
+                descriptor_pool,
+                descriptor_set,
+                command_pool,
+                command_buffer,
+                pipeline_key,
+                pipeline_layout,
+                pipeline,
+                capacity: resident_buffer.capacity,
+                byte_capacity: resident_buffer.byte_capacity,
+                len,
+            })
+        }
+    }
+
     pub fn run_u32_storage_shader(
         &self,
         spirv_words: &[u32],
@@ -423,86 +626,79 @@ impl VulkanComputeDevice {
             return Err(VulkanError("local_size_x must not be zero".to_string()));
         }
 
-        let (descriptor_set_layout, pipeline_layout, pipeline) =
-            self.u32_storage_pipeline(spirv_words, local_size_x)?;
+        let binding =
+            self.create_u32_resident_dispatch(spirv_words, resident_buffer, len, local_size_x)?;
+        self.run_u32_storage_shader_on_resident_dispatch(spirv_words, &binding, len, local_size_x)
+    }
+
+    pub fn run_u32_storage_shader_on_resident_dispatch(
+        &self,
+        spirv_words: &[u32],
+        binding: &VulkanU32ResidentDispatch,
+        len: usize,
+        local_size_x: u32,
+    ) -> Result<(), VulkanError> {
+        if len == 0 {
+            return Err(VulkanError(
+                "resident dispatch length must not be zero".to_string(),
+            ));
+        }
+        if len > binding.len {
+            return Err(VulkanError(format!(
+                "resident dispatch binding length {} cannot run {} u32 values",
+                binding.len, len
+            )));
+        }
+        if spirv_words.is_empty() {
+            return Err(VulkanError("SPIR-V module must not be empty".to_string()));
+        }
+        if local_size_x == 0 {
+            return Err(VulkanError("local_size_x must not be zero".to_string()));
+        }
+        if binding.pipeline_key.local_size_x != local_size_x
+            || binding.pipeline_key.spirv_words != spirv_words
+        {
+            return Err(VulkanError(
+                "resident dispatch binding was created for a different shader program".to_string(),
+            ));
+        }
 
         unsafe {
-            let set_layouts = [descriptor_set_layout];
-            let pool_sizes = [vk::DescriptorPoolSize {
-                ty: vk::DescriptorType::STORAGE_BUFFER,
-                descriptor_count: 1,
-            }];
-            let descriptor_pool_info = vk::DescriptorPoolCreateInfo::default()
-                .max_sets(1)
-                .pool_sizes(&pool_sizes);
-            let descriptor_pool = self
-                .device
-                .create_descriptor_pool(&descriptor_pool_info, None)
+            self.device
+                .reset_command_buffer(binding.command_buffer, vk::CommandBufferResetFlags::empty())
                 .map_err(|error| {
-                    VulkanError(format!("failed to create descriptor pool: {error:?}"))
+                    VulkanError(format!(
+                        "failed to reset resident command buffer: {error:?}"
+                    ))
                 })?;
-            let descriptor_alloc_info = vk::DescriptorSetAllocateInfo::default()
-                .descriptor_pool(descriptor_pool)
-                .set_layouts(&set_layouts);
-            let descriptor_set = self
-                .device
-                .allocate_descriptor_sets(&descriptor_alloc_info)
-                .map_err(|error| {
-                    VulkanError(format!("failed to allocate descriptor set: {error:?}"))
-                })?
-                .remove(0);
-            let descriptor_buffer = [resident_buffer.descriptor_buffer(len)?];
-            let descriptor_writes = [vk::WriteDescriptorSet::default()
-                .dst_set(descriptor_set)
-                .dst_binding(0)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&descriptor_buffer)];
-            self.device.update_descriptor_sets(&descriptor_writes, &[]);
-
-            let command_pool_info = vk::CommandPoolCreateInfo::default()
-                .queue_family_index(self.queue_family_index)
-                .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
-            let command_pool = self
-                .device
-                .create_command_pool(&command_pool_info, None)
-                .map_err(|error| {
-                    VulkanError(format!("failed to create command pool: {error:?}"))
-                })?;
-            let command_alloc_info = vk::CommandBufferAllocateInfo::default()
-                .command_pool(command_pool)
-                .level(vk::CommandBufferLevel::PRIMARY)
-                .command_buffer_count(1);
-            let command_buffer = self
-                .device
-                .allocate_command_buffers(&command_alloc_info)
-                .map_err(|error| {
-                    VulkanError(format!("failed to allocate command buffer: {error:?}"))
-                })?
-                .remove(0);
 
             let command_begin = vk::CommandBufferBeginInfo::default();
             self.device
-                .begin_command_buffer(command_buffer, &command_begin)
+                .begin_command_buffer(binding.command_buffer, &command_begin)
                 .map_err(|error| {
                     VulkanError(format!("failed to begin command buffer: {error:?}"))
                 })?;
-            self.device
-                .cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::COMPUTE, pipeline);
-            self.device.cmd_bind_descriptor_sets(
-                command_buffer,
+            self.device.cmd_bind_pipeline(
+                binding.command_buffer,
                 vk::PipelineBindPoint::COMPUTE,
-                pipeline_layout,
+                binding.pipeline,
+            );
+            self.device.cmd_bind_descriptor_sets(
+                binding.command_buffer,
+                vk::PipelineBindPoint::COMPUTE,
+                binding.pipeline_layout,
                 0,
-                &[descriptor_set],
+                &[binding.descriptor_set],
                 &[],
             );
             let workgroups = (len as u32).div_ceil(local_size_x);
-            self.device.cmd_dispatch(command_buffer, workgroups, 1, 1);
             self.device
-                .end_command_buffer(command_buffer)
+                .cmd_dispatch(binding.command_buffer, workgroups, 1, 1);
+            self.device
+                .end_command_buffer(binding.command_buffer)
                 .map_err(|error| VulkanError(format!("failed to end command buffer: {error:?}")))?;
 
-            let command_buffers = [command_buffer];
+            let command_buffers = [binding.command_buffer];
             let submit_info = [vk::SubmitInfo::default().command_buffers(&command_buffers)];
             self.device
                 .queue_submit(self.queue, &submit_info, vk::Fence::null())
@@ -512,9 +708,6 @@ impl VulkanComputeDevice {
             self.device.queue_wait_idle(self.queue).map_err(|error| {
                 VulkanError(format!("failed waiting for Vulkan queue: {error:?}"))
             })?;
-
-            self.device.destroy_command_pool(command_pool, None);
-            self.device.destroy_descriptor_pool(descriptor_pool, None);
 
             Ok(())
         }

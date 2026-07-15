@@ -1,6 +1,6 @@
 use crate::vulkan_compute::{
     VulkanComputeDevice, VulkanError, VulkanU32PedalRun, VulkanU32ResidentBuffer,
-    VulkanU32ShaderPedal,
+    VulkanU32ResidentDispatch, VulkanU32ShaderPedal,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -87,6 +87,46 @@ impl VulkanU32Pedalboard {
         let mut steps = Vec::with_capacity(self.pedals.len());
         for pedal in &self.pedals {
             steps.push(pedal.process_resident(device, buffer, len)?);
+        }
+        Ok(VulkanU32PedalboardRun {
+            device_name: device.device_name().to_string(),
+            input,
+            output: buffer.read(len)?,
+            steps,
+        })
+    }
+
+    pub fn create_resident_dispatches(
+        &self,
+        device: &VulkanComputeDevice,
+        buffer: &VulkanU32ResidentBuffer,
+        len: usize,
+    ) -> Result<Vec<VulkanU32ResidentDispatch>, VulkanError> {
+        let mut bindings = Vec::with_capacity(self.pedals.len());
+        for pedal in &self.pedals {
+            bindings.push(pedal.create_resident_dispatch(device, buffer, len)?);
+        }
+        Ok(bindings)
+    }
+
+    pub fn process_bound_resident(
+        &self,
+        device: &VulkanComputeDevice,
+        buffer: &VulkanU32ResidentBuffer,
+        bindings: &[VulkanU32ResidentDispatch],
+        len: usize,
+    ) -> Result<VulkanU32PedalboardRun, VulkanError> {
+        if bindings.len() != self.pedals.len() {
+            return Err(VulkanError(format!(
+                "resident dispatch binding count {} does not match pedal count {}",
+                bindings.len(),
+                self.pedals.len()
+            )));
+        }
+        let input = buffer.read(len)?;
+        let mut steps = Vec::with_capacity(self.pedals.len());
+        for (pedal, binding) in self.pedals.iter().zip(bindings) {
+            steps.push(pedal.process_bound_resident(device, binding, len)?);
         }
         Ok(VulkanU32PedalboardRun {
             device_name: device.device_name().to_string(),
@@ -201,5 +241,37 @@ mod tests {
         assert_eq!(run.output, vec![12, 22, 32]);
         assert_eq!(run.steps.len(), 2);
         assert_eq!(buffer.read(3).unwrap(), vec![12, 22, 32]);
+    }
+
+    #[test]
+    fn series_pedals_can_reuse_resident_dispatch_bindings() {
+        let Some(device) = test_device() else {
+            return;
+        };
+        let Some(first) = add_one_pedal("add_one_a") else {
+            return;
+        };
+        let Some(second) = add_one_pedal("add_one_b") else {
+            return;
+        };
+        let buffer = device.create_u32_resident_buffer(3).unwrap();
+        let board = VulkanU32Pedalboard::new(vec![first, second]);
+        board.install(&device).unwrap();
+        let bindings = board
+            .create_resident_dispatches(&device, &buffer, 3)
+            .unwrap();
+
+        buffer.write(&[1, 2, 3]).unwrap();
+        let first = board
+            .process_bound_resident(&device, &buffer, &bindings, 3)
+            .unwrap();
+        buffer.write(&[10, 20, 30]).unwrap();
+        let second = board
+            .process_bound_resident(&device, &buffer, &bindings, 3)
+            .unwrap();
+
+        assert_eq!(bindings.len(), 2);
+        assert_eq!(first.output, vec![3, 4, 5]);
+        assert_eq!(second.output, vec![12, 22, 32]);
     }
 }

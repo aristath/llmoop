@@ -16,7 +16,7 @@ use crate::vulkan::{
 };
 use crate::vulkan_compute::{
     VulkanComputeDevice, VulkanError, VulkanPipelineCacheStats, VulkanU32ResidentBuffer,
-    VulkanU32ShaderPedal,
+    VulkanU32ResidentDispatch, VulkanU32ShaderPedal,
 };
 use crate::vulkan_pedalboard::VulkanU32Pedalboard;
 
@@ -114,19 +114,35 @@ struct VulkanU32StreamRun {
 }
 
 struct VulkanU32MountedStream {
+    signal_dispatches: Vec<VulkanU32ResidentDispatch>,
     ports: VulkanU32StreamPorts,
 }
 
 impl VulkanU32MountedStream {
-    fn new(device: &VulkanComputeDevice) -> Result<Self, VulkanError> {
+    fn new(
+        device: &VulkanComputeDevice,
+        pedalboard: &VulkanU32Pedalboard,
+    ) -> Result<Self, VulkanError> {
+        let ports = VulkanU32StreamPorts::new(device)?;
+        let signal_dispatches =
+            pedalboard.create_resident_dispatches(device, &ports.signal_frame, 1)?;
         Ok(Self {
-            ports: VulkanU32StreamPorts::new(device)?,
+            signal_dispatches,
+            ports,
         })
     }
 
-    fn clone_from(device: &VulkanComputeDevice, source: &Self) -> Result<Self, VulkanError> {
+    fn clone_from(
+        device: &VulkanComputeDevice,
+        pedalboard: &VulkanU32Pedalboard,
+        source: &Self,
+    ) -> Result<Self, VulkanError> {
+        let ports = VulkanU32StreamPorts::clone_from(device, &source.ports)?;
+        let signal_dispatches =
+            pedalboard.create_resident_dispatches(device, &ports.signal_frame, 1)?;
         Ok(Self {
-            ports: VulkanU32StreamPorts::clone_from(device, &source.ports)?,
+            signal_dispatches,
+            ports,
         })
     }
 
@@ -145,7 +161,12 @@ impl VulkanU32MountedStream {
             .map_err(|_| VulkanBackendError::InvalidToken(input_token))?;
         self.ports.signal_frame.write(&[token])?;
 
-        let run = pedalboard.process_resident(device, &self.ports.signal_frame, 1)?;
+        let run = pedalboard.process_bound_resident(
+            device,
+            &self.ports.signal_frame,
+            &self.signal_dispatches,
+            1,
+        )?;
         let output = run
             .output
             .first()
@@ -175,9 +196,12 @@ struct VulkanU32Stream {
 }
 
 impl VulkanU32Stream {
-    fn new(device: &VulkanComputeDevice) -> Result<Self, VulkanError> {
+    fn new(
+        device: &VulkanComputeDevice,
+        pedalboard: &VulkanU32Pedalboard,
+    ) -> Result<Self, VulkanError> {
         Ok(Self {
-            mounted: VulkanU32MountedStream::new(device)?,
+            mounted: VulkanU32MountedStream::new(device, pedalboard)?,
             pending_external: VecDeque::new(),
             pending_feedback: VecDeque::new(),
             remaining_outputs: 0,
@@ -187,9 +211,13 @@ impl VulkanU32Stream {
         })
     }
 
-    fn fork_clone(&self, device: &VulkanComputeDevice) -> Result<Self, VulkanError> {
+    fn fork_clone(
+        &self,
+        device: &VulkanComputeDevice,
+        pedalboard: &VulkanU32Pedalboard,
+    ) -> Result<Self, VulkanError> {
         Ok(Self {
-            mounted: VulkanU32MountedStream::clone_from(device, &self.mounted)?,
+            mounted: VulkanU32MountedStream::clone_from(device, pedalboard, &self.mounted)?,
             pending_external: self.pending_external.clone(),
             pending_feedback: self.pending_feedback.clone(),
             remaining_outputs: self.remaining_outputs,
@@ -414,8 +442,10 @@ impl DeviceBackend for VulkanU32Backend {
         if self.has_stream(stream_id) {
             return Err(BackendError::DuplicateStream(stream_id.to_string()).into());
         }
-        self.streams
-            .insert(stream_id.to_string(), VulkanU32Stream::new(&self.device)?);
+        self.streams.insert(
+            stream_id.to_string(),
+            VulkanU32Stream::new(&self.device, &self.pedalboard)?,
+        );
         Ok(())
     }
 
@@ -488,8 +518,8 @@ impl DeviceBackend for VulkanU32Backend {
                 .streams
                 .get(&request.parent_stream_id)
                 .ok_or_else(|| BackendError::UnknownStream(request.parent_stream_id.clone()))?
-                .fork_clone(&self.device)?,
-            ForkPolicy::Fresh => VulkanU32Stream::new(&self.device)?,
+                .fork_clone(&self.device, &self.pedalboard)?,
+            ForkPolicy::Fresh => VulkanU32Stream::new(&self.device, &self.pedalboard)?,
         };
         let child_has_work = child.has_work();
         self.streams.insert(request.child_stream_id.clone(), child);
@@ -621,6 +651,13 @@ impl DeviceBackend for VulkanU32Backend {
                         static_shape: Some(vec![VULKAN_U32_TOKEN_PORT_CAPACITY]),
                         elements_per_token: Some(1),
                     },
+                    StateAllocation {
+                        pedal_id: "mounted_stream".to_string(),
+                        state_id: "signal_dispatches".to_string(),
+                        state_type: "vulkan_resident_dispatch_bindings".to_string(),
+                        static_shape: Some(vec![self.pedalboard.pedals().len()]),
+                        elements_per_token: None,
+                    },
                 ],
             },
             memory_plan: DeviceMemoryPlan {
@@ -742,13 +779,14 @@ mod tests {
         let Some(backend) = backend_with_adders(1) else {
             return;
         };
-        let mounted = match VulkanU32MountedStream::new(&backend.device) {
+        let mounted = match VulkanU32MountedStream::new(&backend.device, &backend.pedalboard) {
             Ok(mounted) => mounted,
             Err(error) => {
                 eprintln!("skipping mounted stream smoke: {error}");
                 return;
             }
         };
+        assert_eq!(mounted.signal_dispatches.len(), 1);
 
         let private_advance = mounted
             .advance_once(&backend.device, &backend.pedalboard, 1, false)
@@ -774,7 +812,7 @@ mod tests {
         let Some(backend) = backend_with_adders(1) else {
             return;
         };
-        let mut stream = match VulkanU32Stream::new(&backend.device) {
+        let mut stream = match VulkanU32Stream::new(&backend.device, &backend.pedalboard) {
             Ok(stream) => stream,
             Err(error) => {
                 eprintln!("skipping stream advance smoke: {error}");
@@ -812,7 +850,7 @@ mod tests {
         let Some(backend) = backend_with_adders(1) else {
             return;
         };
-        let mut stream = match VulkanU32Stream::new(&backend.device) {
+        let mut stream = match VulkanU32Stream::new(&backend.device, &backend.pedalboard) {
             Ok(stream) => stream,
             Err(error) => {
                 eprintln!("skipping stream run smoke: {error}");
@@ -970,13 +1008,21 @@ mod tests {
             manifest.host_ports.private_feedback,
             "device_owned_insert_loop"
         );
-        assert_eq!(manifest.stream_template.state_allocations.len(), 3);
+        assert_eq!(manifest.stream_template.state_allocations.len(), 4);
         assert!(
             manifest
                 .stream_template
                 .state_allocations
                 .iter()
                 .any(|allocation| allocation.state_id == "private_feedback")
+        );
+        assert!(
+            manifest
+                .stream_template
+                .state_allocations
+                .iter()
+                .any(|allocation| allocation.state_id == "signal_dispatches"
+                    && allocation.static_shape == Some(vec![1]))
         );
         assert!(
             manifest
