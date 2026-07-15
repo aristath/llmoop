@@ -61,6 +61,8 @@ pub struct TensorMetadata {
     #[serde(default)]
     pub byte_count: Option<usize>,
     #[serde(default)]
+    pub data_offsets: Option<Vec<usize>>,
+    #[serde(default)]
     pub source_file: Option<String>,
 }
 

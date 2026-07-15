@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::fs;
-use std::io;
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -411,12 +411,204 @@ impl VulkanPermanentParameterBuffers {
             .iter()
             .find(|buffer| buffer.parameter.tensor == tensor)
     }
+
+    pub fn load_parameter_from_tensor_index(
+        &self,
+        tensor_index: &TensorIndex,
+        tensor: &str,
+    ) -> Result<VulkanPermanentParameterLoadRecord, VulkanPermanentParameterLoadError> {
+        let allocation = self.parameter_buffer(tensor).ok_or_else(|| {
+            VulkanPermanentParameterLoadError(format!(
+                "mounted parameter buffer for tensor {tensor:?} is missing"
+            ))
+        })?;
+        load_parameter_allocation_from_tensor_index(allocation, tensor_index)
+    }
+
+    pub fn load_from_tensor_index(
+        &self,
+        tensor_index: &TensorIndex,
+    ) -> Result<VulkanPermanentParameterLoadReport, VulkanPermanentParameterLoadError> {
+        let mut records = Vec::with_capacity(self.buffers.len());
+        let mut total_bytes_loaded = 0usize;
+        let mut source_files = BTreeSet::new();
+
+        for allocation in &self.buffers {
+            let record = load_parameter_allocation_from_tensor_index(allocation, tensor_index)?;
+            total_bytes_loaded = total_bytes_loaded
+                .checked_add(record.byte_count)
+                .ok_or_else(|| {
+                    VulkanPermanentParameterLoadError(
+                        "permanent parameter loaded byte count overflowed".to_string(),
+                    )
+                })?;
+            source_files.insert(record.source_file.clone());
+            records.push(record);
+        }
+
+        Ok(VulkanPermanentParameterLoadReport {
+            parameter_count: self.buffers.len(),
+            loaded_count: records.len(),
+            total_bytes_loaded,
+            source_file_count: source_files.len(),
+            records,
+        })
+    }
 }
 
 pub struct VulkanPermanentParameterBufferAllocation {
     pub parameter: VulkanPermanentParameterBuffer,
     pub byte_capacity: usize,
     pub buffer: VulkanResidentBuffer,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanPermanentParameterLoadReport {
+    pub parameter_count: usize,
+    pub loaded_count: usize,
+    pub total_bytes_loaded: usize,
+    pub source_file_count: usize,
+    pub records: Vec<VulkanPermanentParameterLoadRecord>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanPermanentParameterLoadRecord {
+    pub tensor: String,
+    pub buffer_index: usize,
+    pub source_file: String,
+    pub data_start: usize,
+    pub data_end: usize,
+    pub byte_count: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanPermanentParameterLoadError(pub String);
+
+impl Display for VulkanPermanentParameterLoadError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl Error for VulkanPermanentParameterLoadError {}
+
+fn load_parameter_allocation_from_tensor_index(
+    allocation: &VulkanPermanentParameterBufferAllocation,
+    tensor_index: &TensorIndex,
+) -> Result<VulkanPermanentParameterLoadRecord, VulkanPermanentParameterLoadError> {
+    let tensor = &allocation.parameter.tensor;
+    let metadata = tensor_index.tensors.get(tensor).ok_or_else(|| {
+        VulkanPermanentParameterLoadError(format!(
+            "tensor index has no metadata for mounted parameter tensor {tensor:?}"
+        ))
+    })?;
+    let source_file = metadata.source_file.as_ref().ok_or_else(|| {
+        VulkanPermanentParameterLoadError(format!(
+            "tensor metadata for {tensor:?} has no source_file"
+        ))
+    })?;
+    let offsets = metadata.data_offsets.as_ref().ok_or_else(|| {
+        VulkanPermanentParameterLoadError(format!(
+            "tensor metadata for {tensor:?} has no data_offsets"
+        ))
+    })?;
+    if offsets.len() != 2 {
+        return Err(VulkanPermanentParameterLoadError(format!(
+            "tensor metadata for {tensor:?} has invalid data_offsets {:?}",
+            offsets
+        )));
+    }
+    let data_start = offsets[0];
+    let data_end = offsets[1];
+    if data_end < data_start {
+        return Err(VulkanPermanentParameterLoadError(format!(
+            "tensor metadata for {tensor:?} has reversed data_offsets {:?}",
+            offsets
+        )));
+    }
+    let byte_count = data_end - data_start;
+    if byte_count != allocation.byte_capacity {
+        return Err(VulkanPermanentParameterLoadError(format!(
+            "tensor {tensor:?} byte count {byte_count} does not match mounted buffer capacity {}",
+            allocation.byte_capacity
+        )));
+    }
+    if metadata.byte_count != Some(byte_count) {
+        return Err(VulkanPermanentParameterLoadError(format!(
+            "tensor {tensor:?} metadata byte_count {:?} does not match data_offsets byte count {byte_count}",
+            metadata.byte_count
+        )));
+    }
+
+    let source_path = Path::new(source_file);
+    let data_base = safetensors_data_start(source_path)?;
+    let absolute_start = data_base
+        .checked_add(u64::try_from(data_start).map_err(|_| {
+            VulkanPermanentParameterLoadError(format!(
+                "tensor {tensor:?} data_start {data_start} cannot fit in u64"
+            ))
+        })?)
+        .ok_or_else(|| {
+            VulkanPermanentParameterLoadError(format!(
+                "tensor {tensor:?} absolute data offset overflowed"
+            ))
+        })?;
+    let mut file = fs::File::open(source_path).map_err(|error| {
+        VulkanPermanentParameterLoadError(format!(
+            "failed to open safetensors source {source_file:?}: {error}"
+        ))
+    })?;
+    file.seek(SeekFrom::Start(absolute_start))
+        .map_err(|error| {
+            VulkanPermanentParameterLoadError(format!(
+                "failed to seek safetensors source {source_file:?} to tensor {tensor:?}: {error}"
+            ))
+        })?;
+    let mut bytes = vec![0u8; byte_count];
+    file.read_exact(&mut bytes).map_err(|error| {
+        VulkanPermanentParameterLoadError(format!(
+            "failed to read tensor {tensor:?} from safetensors source {source_file:?}: {error}"
+        ))
+    })?;
+    allocation.buffer.write_bytes(&bytes)?;
+
+    Ok(VulkanPermanentParameterLoadRecord {
+        tensor: tensor.clone(),
+        buffer_index: allocation.parameter.buffer_index,
+        source_file: source_file.clone(),
+        data_start,
+        data_end,
+        byte_count,
+    })
+}
+
+fn safetensors_data_start(path: &Path) -> Result<u64, VulkanPermanentParameterLoadError> {
+    let mut file = fs::File::open(path).map_err(|error| {
+        VulkanPermanentParameterLoadError(format!(
+            "failed to open safetensors file {:?}: {error}",
+            path
+        ))
+    })?;
+    let mut header_len_bytes = [0u8; 8];
+    file.read_exact(&mut header_len_bytes).map_err(|error| {
+        VulkanPermanentParameterLoadError(format!(
+            "failed to read safetensors header length from {:?}: {error}",
+            path
+        ))
+    })?;
+    let header_len = u64::from_le_bytes(header_len_bytes);
+    8u64.checked_add(header_len).ok_or_else(|| {
+        VulkanPermanentParameterLoadError(format!(
+            "safetensors data start overflowed for {:?}",
+            path
+        ))
+    })
+}
+
+impl From<VulkanError> for VulkanPermanentParameterLoadError {
+    fn from(error: VulkanError) -> Self {
+        Self(error.to_string())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -6295,6 +6487,39 @@ mod tests {
             operator_norm_weight.buffer.read_bytes(4).unwrap(),
             vec![21, 22, 23, 24]
         );
+        let operator_norm_metadata = tensor_index
+            .tensors
+            .get("model.layers.0.operator_norm.weight")
+            .unwrap();
+        if operator_norm_metadata
+            .source_file
+            .as_ref()
+            .map(|source_file| Path::new(source_file).exists())
+            .unwrap_or(false)
+        {
+            let loaded_weight = mounted
+                .parameter_buffers
+                .load_parameter_from_tensor_index(
+                    &tensor_index,
+                    "model.layers.0.operator_norm.weight",
+                )
+                .unwrap();
+            assert_eq!(loaded_weight.tensor, "model.layers.0.operator_norm.weight");
+            assert_eq!(loaded_weight.data_start, 158_345_216);
+            assert_eq!(loaded_weight.data_end, 158_347_264);
+            assert_eq!(loaded_weight.byte_count, 2_048);
+            assert_eq!(
+                operator_norm_weight.buffer.read_bytes(16).unwrap(),
+                vec![
+                    0xc6, 0x3e, 0xb9, 0x3e, 0xba, 0x3e, 0xba, 0x3e, 0xc2, 0x3e, 0xba, 0x3e, 0xbe,
+                    0x3e, 0x12, 0x3f,
+                ]
+            );
+        } else {
+            eprintln!(
+                "skipping real safetensors parameter load: source file for model.layers.0.operator_norm.weight is unavailable"
+            );
+        }
         assert_eq!(mounted.boundary_io.plan.device_id, "gpu0");
         assert_eq!(mounted.boundary_io.plan.input_count, 1);
         assert_eq!(mounted.boundary_io.plan.output_count, 1);
