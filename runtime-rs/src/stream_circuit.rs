@@ -9,7 +9,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::backend::{BackendError, DeviceBackend};
-use crate::stream_plan::{CircuitPlanError, StreamCircuitExecutionPlan, StreamCircuitResourcePlan};
+use crate::stream_plan::{
+    CircuitPlanError, StreamCircuitExecutionPlan, StreamCircuitResourcePlan, TensorIndex,
+};
 use crate::types::{
     ControlCommand, DeviceDispatchRun, DeviceMemoryPlan, DeviceOutputEvent, DispatchStatus,
     ForkPolicy, ForkRequest, HostPortsManifest, InputSignal, InstalledProcessorManifest,
@@ -841,6 +843,21 @@ impl InstalledStreamCircuit {
         StreamCircuitResourcePlan::from_graph_and_plan(&self.graph, &execution_plan)
     }
 
+    pub fn execution_plan_with_tensor_index(
+        &self,
+        tensor_index: &TensorIndex,
+    ) -> Result<StreamCircuitExecutionPlan, CircuitPlanError> {
+        StreamCircuitExecutionPlan::from_graph_with_tensor_index(&self.graph, tensor_index)
+    }
+
+    pub fn resource_plan_with_tensor_index(
+        &self,
+        tensor_index: &TensorIndex,
+    ) -> Result<StreamCircuitResourcePlan, CircuitPlanError> {
+        let execution_plan = self.execution_plan_with_tensor_index(tensor_index)?;
+        StreamCircuitResourcePlan::from_graph_and_plan(&self.graph, &execution_plan)
+    }
+
     pub fn capability_report(
         &self,
         capabilities: &StreamCircuitBackendCapabilities,
@@ -1054,6 +1071,21 @@ impl StreamCircuitDeviceBackend {
         self.installed.resource_plan()
     }
 
+    pub fn execution_plan_with_tensor_index(
+        &self,
+        tensor_index: &TensorIndex,
+    ) -> Result<StreamCircuitExecutionPlan, CircuitPlanError> {
+        self.installed
+            .execution_plan_with_tensor_index(tensor_index)
+    }
+
+    pub fn resource_plan_with_tensor_index(
+        &self,
+        tensor_index: &TensorIndex,
+    ) -> Result<StreamCircuitResourcePlan, CircuitPlanError> {
+        self.installed.resource_plan_with_tensor_index(tensor_index)
+    }
+
     pub fn capabilities(&self) -> &StreamCircuitBackendCapabilities {
         &self.capabilities
     }
@@ -1260,6 +1292,14 @@ mod tests {
             .join("pedalboard.circuits.json")
     }
 
+    fn lfm2_tensor_index_path() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("transpiled")
+            .join("lfm2_5_230m")
+            .join("tensors.json")
+    }
+
     #[test]
     fn loads_lfm2_lowered_pedalboard_as_runtime_circuit_graph() {
         let resolved = ResolvedLoweredPedalboard::from_index_file(lfm2_index_path()).unwrap();
@@ -1372,9 +1412,13 @@ mod tests {
             "stream_circuit_ir",
         )
         .unwrap();
+        let tensor_index = TensorIndex::from_json_file(lfm2_tensor_index_path()).unwrap();
 
         let execution_plan = installed.execution_plan().unwrap();
         let resource_plan = installed.resource_plan().unwrap();
+        let shaped_resource_plan = installed
+            .resource_plan_with_tensor_index(&tensor_index)
+            .unwrap();
 
         assert_eq!(execution_plan.circuits.len(), 14);
         assert_eq!(execution_plan.total_node_count(), 242);
@@ -1382,6 +1426,8 @@ mod tests {
         assert_eq!(resource_plan.parameter_ref_count, 130);
         assert_eq!(resource_plan.stream_state_count(), 14);
         assert_eq!(resource_plan.layer_local_activation_slot_count, 62);
+        assert_eq!(resource_plan.unknown_temporary_shape_count, 184);
+        assert_eq!(shaped_resource_plan.unknown_temporary_shape_count, 12);
         assert_eq!(
             resource_plan
                 .activation_banks
@@ -1472,6 +1518,10 @@ mod tests {
         let manifest = backend.describe();
         let template = backend.stream_template("s0").unwrap();
         let resource_plan = backend.resource_plan().unwrap();
+        let tensor_index = TensorIndex::from_json_file(lfm2_tensor_index_path()).unwrap();
+        let shaped_resource_plan = backend
+            .resource_plan_with_tensor_index(&tensor_index)
+            .unwrap();
 
         assert_eq!(backend.backend_id(), StreamCircuitDeviceBackend::BACKEND_ID);
         assert_eq!(manifest.permanent_circuit.pedal_count, 14);
@@ -1479,6 +1529,7 @@ mod tests {
         assert_eq!(template.allocations.len(), 14);
         assert_eq!(resource_plan.parameter_ref_count, 130);
         assert_eq!(resource_plan.activation_banks.len(), 14);
+        assert_eq!(shaped_resource_plan.unknown_temporary_shape_count, 12);
         assert_eq!(
             template.allocation_keys().get(2).map(String::as_str),
             Some("layer_02.kv_memory")

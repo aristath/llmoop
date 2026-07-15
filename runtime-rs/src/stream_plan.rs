@@ -1,11 +1,17 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
+use std::fs;
+use std::path::Path;
+
+use serde::Deserialize;
 
 use crate::stream_circuit::{
-    CircuitNode, CircuitPort, ResolvedCircuitArtifact, ResolvedLoweredPedalboard, StatePort,
-    StreamCircuit,
+    CircuitNode, CircuitPort, ParameterRef, ResolvedCircuitArtifact, ResolvedLoweredPedalboard,
+    StatePort, StreamCircuit,
 };
+
+pub const TENSOR_INDEX_SCHEMA: &str = "llmoop.tensor_index.v1";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CircuitPlanError(pub String);
@@ -17,6 +23,46 @@ impl Display for CircuitPlanError {
 }
 
 impl Error for CircuitPlanError {}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+pub struct TensorIndex {
+    pub schema: String,
+    #[serde(default)]
+    pub tensors: BTreeMap<String, TensorMetadata>,
+}
+
+impl TensorIndex {
+    pub fn from_json_file(path: impl AsRef<Path>) -> Result<Self, CircuitPlanError> {
+        let bytes = fs::read(path).map_err(|error| CircuitPlanError(error.to_string()))?;
+        let index: Self =
+            serde_json::from_slice(&bytes).map_err(|error| CircuitPlanError(error.to_string()))?;
+        if index.schema != TENSOR_INDEX_SCHEMA {
+            return Err(CircuitPlanError(format!(
+                "unsupported tensor index schema {:?}",
+                index.schema
+            )));
+        }
+        Ok(index)
+    }
+
+    pub fn tensor_shape(&self, tensor: &str) -> Option<&[usize]> {
+        self.tensors
+            .get(tensor)
+            .map(|metadata| metadata.shape.as_slice())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+pub struct TensorMetadata {
+    pub dtype: String,
+    pub shape: Vec<usize>,
+    #[serde(default)]
+    pub parameter_count: Option<usize>,
+    #[serde(default)]
+    pub byte_count: Option<usize>,
+    #[serde(default)]
+    pub source_file: Option<String>,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StreamCircuitExecutionPlan {
@@ -35,6 +81,29 @@ impl StreamCircuitExecutionPlan {
         let mut circuits = Vec::with_capacity(graph.circuits.len());
         for artifact in &graph.circuits {
             circuits.push(CircuitActivationPlan::from_artifact(artifact)?);
+        }
+        Ok(Self {
+            wiring: graph.index.graph.wiring.clone(),
+            circuits,
+        })
+    }
+
+    pub fn from_graph_with_tensor_index(
+        graph: &ResolvedLoweredPedalboard,
+        tensor_index: &TensorIndex,
+    ) -> Result<Self, CircuitPlanError> {
+        if graph.index.graph.wiring != "series" {
+            return Err(CircuitPlanError(format!(
+                "only series wiring can be planned currently, got {:?}",
+                graph.index.graph.wiring
+            )));
+        }
+        let mut circuits = Vec::with_capacity(graph.circuits.len());
+        for artifact in &graph.circuits {
+            circuits.push(CircuitActivationPlan::from_artifact_with_tensor_index(
+                artifact,
+                tensor_index,
+            )?);
         }
         Ok(Self {
             wiring: graph.index.graph.wiring.clone(),
@@ -107,6 +176,15 @@ pub struct StreamCircuitResourcePlan {
 impl StreamCircuitResourcePlan {
     pub fn from_graph(graph: &ResolvedLoweredPedalboard) -> Result<Self, CircuitPlanError> {
         let execution_plan = StreamCircuitExecutionPlan::from_graph(graph)?;
+        Self::from_graph_and_plan(graph, &execution_plan)
+    }
+
+    pub fn from_graph_with_tensor_index(
+        graph: &ResolvedLoweredPedalboard,
+        tensor_index: &TensorIndex,
+    ) -> Result<Self, CircuitPlanError> {
+        let execution_plan =
+            StreamCircuitExecutionPlan::from_graph_with_tensor_index(graph, tensor_index)?;
         Self::from_graph_and_plan(graph, &execution_plan)
     }
 
@@ -291,9 +369,32 @@ impl CircuitActivationPlan {
         Self::from_circuit(&artifact.pedal.id, &artifact.circuit)
     }
 
+    pub fn from_artifact_with_tensor_index(
+        artifact: &ResolvedCircuitArtifact,
+        tensor_index: &TensorIndex,
+    ) -> Result<Self, CircuitPlanError> {
+        Self::from_circuit_with_tensor_index(&artifact.pedal.id, &artifact.circuit, tensor_index)
+    }
+
     pub fn from_circuit(
         pedal_id: impl Into<String>,
         circuit: &StreamCircuit,
+    ) -> Result<Self, CircuitPlanError> {
+        Self::from_circuit_with_optional_tensor_index(pedal_id, circuit, None)
+    }
+
+    pub fn from_circuit_with_tensor_index(
+        pedal_id: impl Into<String>,
+        circuit: &StreamCircuit,
+        tensor_index: &TensorIndex,
+    ) -> Result<Self, CircuitPlanError> {
+        Self::from_circuit_with_optional_tensor_index(pedal_id, circuit, Some(tensor_index))
+    }
+
+    fn from_circuit_with_optional_tensor_index(
+        pedal_id: impl Into<String>,
+        circuit: &StreamCircuit,
+        tensor_index: Option<&TensorIndex>,
     ) -> Result<Self, CircuitPlanError> {
         let pedal_id = pedal_id.into();
         let state_ids: BTreeSet<_> = circuit.state_ports.iter().map(|state| &state.id).collect();
@@ -337,6 +438,13 @@ impl CircuitActivationPlan {
         let mut planned_nodes = Vec::with_capacity(circuit.nodes.len());
         for (index, node) in circuit.nodes.iter().enumerate() {
             validate_node_dependencies(&pedal_id, node, &available, &state_ids, &param_ids)?;
+            let output_shapes = infer_node_output_shapes(
+                &pedal_id,
+                node,
+                &signals,
+                &circuit.parameters.refs,
+                tensor_index,
+            )?;
 
             for input in &node.inputs {
                 let signal = signals.get_mut(input).ok_or_else(|| {
@@ -348,7 +456,7 @@ impl CircuitActivationPlan {
                 signal.consumers.push(node.id.clone());
             }
 
-            for output in &node.outputs {
+            for (output_index, output) in node.outputs.iter().enumerate() {
                 if available.contains(output) {
                     return Err(CircuitPlanError(format!(
                         "{} node {} output {:?} is already available",
@@ -364,7 +472,7 @@ impl CircuitActivationPlan {
                             node_id: node.id.clone(),
                         },
                         consumers: Vec::new(),
-                        shape: None,
+                        shape: output_shapes.get(output_index).cloned().unwrap_or(None),
                         is_boundary_output: boundary_output_sources.contains(output),
                     },
                 );
@@ -633,6 +741,168 @@ pub struct SignalSlotAssignment {
     pub last_consumed_at: usize,
 }
 
+fn infer_node_output_shapes(
+    pedal_id: &str,
+    node: &CircuitNode,
+    signals: &BTreeMap<String, PlannedSignal>,
+    params: &BTreeMap<String, ParameterRef>,
+    tensor_index: Option<&TensorIndex>,
+) -> Result<Vec<Option<Vec<usize>>>, CircuitPlanError> {
+    let outputs = node.outputs.len();
+    let unknown = || Ok(vec![None; outputs]);
+
+    match node.op.as_str() {
+        "rms_norm" | "rms_norm_per_head" | "silu" | "rotary_position_embedding" => {
+            Ok(repeat_shape(first_input_shape(node, signals), outputs))
+        }
+        "multiply" | "residual_add" => Ok(repeat_shape(
+            compatible_input_shape(pedal_id, node, signals)?,
+            outputs,
+        )),
+        "linear" => infer_linear_output_shapes(pedal_id, node, signals, params, tensor_index),
+        "split" => infer_split_output_shapes(pedal_id, node, signals),
+        "rolling_state_update" => {
+            let state_shape = node
+                .inputs
+                .get(1)
+                .and_then(|input| signals.get(input))
+                .and_then(|signal| signal.shape.clone());
+            Ok(repeat_shape(state_shape, outputs))
+        }
+        "depthwise_conv1d" => {
+            let output_shape = attr_usize(node, "groups")
+                .map(|groups| vec![groups])
+                .or_else(|| {
+                    first_input_shape(node, signals)
+                        .and_then(|shape| shape.last().copied().map(|last| vec![last]))
+                });
+            Ok(repeat_shape(output_shape, outputs))
+        }
+        "append_state_update" => unknown(),
+        "scaled_dot_product_attention" => {
+            Ok(repeat_shape(first_input_shape(node, signals), outputs))
+        }
+        _ => unknown(),
+    }
+}
+
+fn infer_linear_output_shapes(
+    pedal_id: &str,
+    node: &CircuitNode,
+    signals: &BTreeMap<String, PlannedSignal>,
+    params: &BTreeMap<String, ParameterRef>,
+    tensor_index: Option<&TensorIndex>,
+) -> Result<Vec<Option<Vec<usize>>>, CircuitPlanError> {
+    let Some(tensor_index) = tensor_index else {
+        return Ok(vec![None; node.outputs.len()]);
+    };
+    let Some(param_id) = node.params.first() else {
+        return Ok(vec![None; node.outputs.len()]);
+    };
+    let Some(parameter) = params.get(param_id) else {
+        return Ok(vec![None; node.outputs.len()]);
+    };
+    let Some(tensor) = parameter.tensor.as_deref() else {
+        return Ok(vec![None; node.outputs.len()]);
+    };
+    let Some(weight_shape) = tensor_index.tensor_shape(tensor) else {
+        return Ok(vec![None; node.outputs.len()]);
+    };
+    if weight_shape.len() != 2 {
+        return Ok(vec![None; node.outputs.len()]);
+    }
+
+    let output_width = weight_shape[0];
+    let input_width = weight_shape[1];
+    let output_shape = match first_input_shape(node, signals) {
+        Some(mut input_shape) => {
+            let Some(last_dim) = input_shape.last_mut() else {
+                return Ok(vec![None; node.outputs.len()]);
+            };
+            if *last_dim != input_width {
+                return Err(CircuitPlanError(format!(
+                    "{} node {} linear input width {} does not match parameter {:?} width {}",
+                    pedal_id, node.id, *last_dim, param_id, input_width
+                )));
+            }
+            *last_dim = output_width;
+            Some(input_shape)
+        }
+        None => Some(vec![output_width]),
+    };
+
+    Ok(repeat_shape(output_shape, node.outputs.len()))
+}
+
+fn infer_split_output_shapes(
+    pedal_id: &str,
+    node: &CircuitNode,
+    signals: &BTreeMap<String, PlannedSignal>,
+) -> Result<Vec<Option<Vec<usize>>>, CircuitPlanError> {
+    let Some(mut input_shape) = first_input_shape(node, signals) else {
+        return Ok(vec![None; node.outputs.len()]);
+    };
+    let Some(channel_dim) = input_shape.last_mut() else {
+        return Ok(vec![None; node.outputs.len()]);
+    };
+    if node.outputs.is_empty() || *channel_dim % node.outputs.len() != 0 {
+        return Err(CircuitPlanError(format!(
+            "{} node {} cannot split shape {:?} across {} outputs",
+            pedal_id,
+            node.id,
+            first_input_shape(node, signals),
+            node.outputs.len()
+        )));
+    }
+    *channel_dim /= node.outputs.len();
+    Ok(repeat_shape(Some(input_shape), node.outputs.len()))
+}
+
+fn compatible_input_shape(
+    pedal_id: &str,
+    node: &CircuitNode,
+    signals: &BTreeMap<String, PlannedSignal>,
+) -> Result<Option<Vec<usize>>, CircuitPlanError> {
+    let mut known_shape = None;
+    for input in &node.inputs {
+        let shape = signals.get(input).and_then(|signal| signal.shape.clone());
+        if let Some(shape) = shape {
+            if let Some(existing) = &known_shape {
+                if existing != &shape {
+                    return Err(CircuitPlanError(format!(
+                        "{} node {} input {:?} shape {:?} does not match {:?}",
+                        pedal_id, node.id, input, shape, existing
+                    )));
+                }
+            } else {
+                known_shape = Some(shape);
+            }
+        }
+    }
+    Ok(known_shape)
+}
+
+fn first_input_shape(
+    node: &CircuitNode,
+    signals: &BTreeMap<String, PlannedSignal>,
+) -> Option<Vec<usize>> {
+    node.inputs
+        .first()
+        .and_then(|input| signals.get(input))
+        .and_then(|signal| signal.shape.clone())
+}
+
+fn repeat_shape(shape: Option<Vec<usize>>, count: usize) -> Vec<Option<Vec<usize>>> {
+    (0..count).map(|_| shape.clone()).collect()
+}
+
+fn attr_usize(node: &CircuitNode, attr: &str) -> Option<usize> {
+    node.attrs
+        .get(attr)
+        .and_then(|value| value.as_u64())
+        .and_then(|value| usize::try_from(value).ok())
+}
+
 fn validate_node_dependencies(
     pedal_id: &str,
     node: &CircuitNode,
@@ -688,6 +958,14 @@ mod tests {
             .join("pedalboard.circuits.json")
     }
 
+    fn lfm2_tensor_index_path() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("transpiled")
+            .join("lfm2_5_230m")
+            .join("tensors.json")
+    }
+
     #[test]
     fn plans_lfm2_lowered_pedalboard_activation_schedule() {
         let graph = ResolvedLoweredPedalboard::from_index_file(lfm2_index_path()).unwrap();
@@ -741,6 +1019,52 @@ mod tests {
     }
 
     #[test]
+    fn tensor_index_enables_lfm2_signal_shape_planning() {
+        let graph = ResolvedLoweredPedalboard::from_index_file(lfm2_index_path()).unwrap();
+        let tensor_index = TensorIndex::from_json_file(lfm2_tensor_index_path()).unwrap();
+
+        let plan = StreamCircuitExecutionPlan::from_graph_with_tensor_index(&graph, &tensor_index)
+            .unwrap();
+        let resource_plan = StreamCircuitResourcePlan::from_graph_and_plan(&graph, &plan).unwrap();
+
+        assert_eq!(tensor_index.schema, TENSOR_INDEX_SCHEMA);
+        assert_eq!(resource_plan.temporary_signal_count, 250);
+        assert_eq!(resource_plan.unknown_temporary_shape_count, 12);
+        assert!(!resource_plan.intermediate_activation_shapes_known());
+
+        let layer_00 = &plan.circuits[0];
+        assert_eq!(
+            layer_00.signal("conv_projected").unwrap().shape,
+            Some(vec![3072])
+        );
+        assert_eq!(layer_00.signal("gate_b").unwrap().shape, Some(vec![1024]));
+        assert_eq!(
+            layer_00.signal("temporal_window").unwrap().shape,
+            Some(vec![3, 1024])
+        );
+        assert_eq!(
+            layer_00.signal("ffn_hidden").unwrap().shape,
+            Some(vec![2560])
+        );
+
+        let layer_02 = &plan.circuits[2];
+        assert_eq!(
+            layer_02.signal("q_projected").unwrap().shape,
+            Some(vec![1024])
+        );
+        assert_eq!(
+            layer_02.signal("k_projected").unwrap().shape,
+            Some(vec![512])
+        );
+        assert_eq!(layer_02.signal("k_memory").unwrap().shape, None);
+        assert_eq!(layer_02.signal("v_memory").unwrap().shape, None);
+        assert_eq!(
+            layer_02.signal("attention_out").unwrap().shape,
+            Some(vec![1024])
+        );
+    }
+
+    #[test]
     fn resource_plan_names_lfm2_mount_resources() {
         let graph = ResolvedLoweredPedalboard::from_index_file(lfm2_index_path()).unwrap();
         let execution_plan = StreamCircuitExecutionPlan::from_graph(&graph).unwrap();
@@ -755,7 +1079,7 @@ mod tests {
         assert_eq!(resource_plan.stream_state_count(), 14);
         assert_eq!(resource_plan.temporary_signal_count, 250);
         assert_eq!(resource_plan.layer_local_activation_slot_count, 62);
-        assert_eq!(resource_plan.unknown_temporary_shape_count, 250);
+        assert_eq!(resource_plan.unknown_temporary_shape_count, 184);
         assert!(!resource_plan.intermediate_activation_shapes_known());
 
         let conv_in = resource_plan
