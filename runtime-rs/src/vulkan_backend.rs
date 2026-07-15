@@ -1,6 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
+use std::path::Path;
 
 use crate::backend::{BackendError, DeviceBackend};
 use crate::types::{
@@ -10,7 +11,9 @@ use crate::types::{
     PermanentCircuitManifest, PromptInjection, PublicOutputSignal, RandomPolicy, StreamId,
     StreamTemplate, TokenId,
 };
-use crate::vulkan::{VULKAN_SPIRV_BACKEND_ID, VulkanBackendDescriptor};
+use crate::vulkan::{
+    VULKAN_SPIRV_BACKEND_ID, VulkanBackendArtifactManifest, VulkanBackendDescriptor,
+};
 use crate::vulkan_compute::{VulkanComputeDevice, VulkanError, VulkanU32ShaderPedal};
 use crate::vulkan_pedalboard::VulkanU32Pedalboard;
 
@@ -118,6 +121,18 @@ impl VulkanU32Backend {
             pedals.push(VulkanU32ShaderPedal::from_program(program)?);
         }
         Self::from_pedals(descriptor.device_id, pedals)
+    }
+
+    pub fn from_artifact_manifest(
+        manifest: VulkanBackendArtifactManifest,
+        artifact_root: impl AsRef<Path>,
+    ) -> Result<Self, VulkanBackendError> {
+        let descriptor = manifest.resolve(artifact_root).map_err(|error| {
+            VulkanBackendError::InvalidDescriptor(format!(
+                "failed to resolve Vulkan backend artifact manifest: {error}"
+            ))
+        })?;
+        Self::from_descriptor(descriptor)
     }
 
     pub fn device_name(&self) -> &str {
@@ -403,7 +418,10 @@ impl DeviceBackend for VulkanU32Backend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vulkan::{SpirvPedalProgram, VulkanBackendDescriptor};
+    use crate::vulkan::{
+        SpirvPedalProgram, SpirvPedalProgramRef, VulkanBackendArtifactManifest,
+        VulkanBackendDescriptor, write_spirv_words,
+    };
     use crate::vulkan_compute::compile_test_shader_words;
 
     fn add_one_pedal(id: &str) -> Option<VulkanU32ShaderPedal> {
@@ -529,6 +547,45 @@ mod tests {
         assert_eq!(run.outputs.len(), 1);
         assert_eq!(run.outputs[0].output.token_id, 3);
         assert_eq!(backend.describe().permanent_circuit.pedal_count, 2);
+    }
+
+    #[test]
+    fn vulkan_backend_can_be_installed_from_artifact_manifest() {
+        let Some(spirv_words) = compile_test_shader_words() else {
+            return;
+        };
+        let root = std::env::temp_dir().join(format!(
+            "llmoop-vulkan-backend-artifacts-{}",
+            std::process::id()
+        ));
+        let shader_dir = root.join("shaders");
+        std::fs::create_dir_all(&shader_dir).unwrap();
+        write_spirv_words(shader_dir.join("add_one.spv"), &spirv_words).unwrap();
+
+        let manifest = VulkanBackendArtifactManifest::empty("vulkan_device_0").with_program(
+            SpirvPedalProgramRef::new("add_one_0", "u32_add_one", "shaders/add_one.spv"),
+        );
+        let mut backend = match VulkanU32Backend::from_artifact_manifest(manifest, &root) {
+            Ok(backend) => backend,
+            Err(error) => {
+                eprintln!("skipping Vulkan backend artifact manifest smoke: {error}");
+                let _ = std::fs::remove_dir_all(root);
+                return;
+            }
+        };
+        backend.create_stream("s0").unwrap();
+        backend
+            .inject_prompt(PromptInjection::new("s0", vec![41], 1))
+            .unwrap();
+
+        let run = backend.dispatch(16).unwrap();
+
+        assert_eq!(run.status, DispatchStatus::Idle);
+        assert_eq!(run.outputs.len(), 1);
+        assert_eq!(run.outputs[0].output.token_id, 42);
+        assert_eq!(backend.describe().permanent_circuit.pedal_count, 1);
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
