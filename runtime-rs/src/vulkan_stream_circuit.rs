@@ -1797,6 +1797,7 @@ pub struct VulkanParameterBinding {
     pub param_id: String,
     pub tensor: String,
     pub byte_count: Option<usize>,
+    pub shape: Option<Vec<usize>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2196,6 +2197,25 @@ impl VulkanMountedPlacedStreamCircuit {
             .map_err(VulkanMountedPlacedResidentKernelDispatchError::Vulkan)
     }
 
+    pub fn create_resident_pedal_runner(
+        &self,
+        device: &VulkanComputeDevice,
+        mounted_bound_plan: &VulkanMountedPlacedBoundDispatchPlan,
+        pedal_id: &str,
+        loaded_manifest: &VulkanLoadedReusableKernelArtifactManifest,
+    ) -> Result<
+        VulkanMountedPlacedResidentPedalRunner,
+        VulkanMountedPlacedResidentKernelDispatchError,
+    > {
+        VulkanMountedPlacedResidentPedalRunner::from_mounted_bound_plan(
+            device,
+            self,
+            mounted_bound_plan,
+            pedal_id,
+            loaded_manifest,
+        )
+    }
+
     fn resident_kernel_buffer_binding<'a>(
         &'a self,
         dispatch: &VulkanMountedPlacedBoundDispatch,
@@ -2366,6 +2386,146 @@ impl VulkanMountedPlacedStreamCircuit {
             }
         }
     }
+}
+
+pub struct VulkanMountedPlacedResidentPedalRunner {
+    pub pedal_id: String,
+    pub dispatches: Vec<VulkanMountedPlacedResidentPedalDispatch>,
+    pub total_descriptor_count: usize,
+    pub total_push_constant_byte_count: u32,
+}
+
+impl VulkanMountedPlacedResidentPedalRunner {
+    fn from_mounted_bound_plan(
+        device: &VulkanComputeDevice,
+        mounted: &VulkanMountedPlacedStreamCircuit,
+        mounted_bound_plan: &VulkanMountedPlacedBoundDispatchPlan,
+        pedal_id: &str,
+        loaded_manifest: &VulkanLoadedReusableKernelArtifactManifest,
+    ) -> Result<Self, VulkanMountedPlacedResidentKernelDispatchError> {
+        let mut dispatches = Vec::new();
+        let mut total_descriptor_count = 0usize;
+        let mut total_push_constant_byte_count = 0u32;
+
+        for dispatch in mounted_bound_plan
+            .dispatches
+            .iter()
+            .filter(|dispatch| dispatch.pedal_id == pedal_id)
+        {
+            let resident_dispatch = mounted.create_resident_kernel_dispatch_for_bound_dispatch(
+                device,
+                dispatch,
+                loaded_manifest,
+            )?;
+            total_descriptor_count = total_descriptor_count
+                .checked_add(resident_dispatch.descriptor_count())
+                .ok_or(VulkanMountedPlacedResidentKernelDispatchError::PedalRunnerDescriptorCountOverflow {
+                    pedal_id: pedal_id.to_string(),
+                })?;
+            total_push_constant_byte_count = total_push_constant_byte_count
+                .checked_add(resident_dispatch.push_constant_byte_count())
+                .ok_or(VulkanMountedPlacedResidentKernelDispatchError::PedalRunnerPushConstantByteCountOverflow {
+                    pedal_id: pedal_id.to_string(),
+                })?;
+            dispatches.push(VulkanMountedPlacedResidentPedalDispatch {
+                dispatch_index: dispatch.dispatch_index,
+                kernel_id: dispatch.kernel_id.clone(),
+                node_id: dispatch.node_id.clone(),
+                op: dispatch.op.clone(),
+                reusable_family_id: dispatch.reusable_family_id.clone(),
+                resident_dispatch,
+            });
+        }
+
+        if dispatches.is_empty() {
+            return Err(
+                VulkanMountedPlacedResidentKernelDispatchError::MissingPedalDispatches {
+                    pedal_id: pedal_id.to_string(),
+                },
+            );
+        }
+
+        Ok(Self {
+            pedal_id: pedal_id.to_string(),
+            dispatches,
+            total_descriptor_count,
+            total_push_constant_byte_count,
+        })
+    }
+
+    pub fn dispatch_count(&self) -> usize {
+        self.dispatches.len()
+    }
+
+    pub fn run_zeroed_push_constants(
+        &self,
+        device: &VulkanComputeDevice,
+    ) -> Result<VulkanMountedPlacedResidentPedalRun, VulkanMountedPlacedResidentKernelDispatchError>
+    {
+        let mut dispatch_runs = Vec::with_capacity(self.dispatches.len());
+        for dispatch in &self.dispatches {
+            let push_constants =
+                vec![0u8; dispatch.resident_dispatch.push_constant_byte_count() as usize];
+            device
+                .run_resident_kernel_dispatch(&dispatch.resident_dispatch, &push_constants)
+                .map_err(VulkanMountedPlacedResidentKernelDispatchError::Vulkan)?;
+            dispatch_runs.push(VulkanMountedPlacedResidentPedalDispatchRun {
+                dispatch_index: dispatch.dispatch_index,
+                kernel_id: dispatch.kernel_id.clone(),
+                node_id: dispatch.node_id.clone(),
+                op: dispatch.op.clone(),
+                reusable_family_id: dispatch.reusable_family_id.clone(),
+                descriptor_count: dispatch.resident_dispatch.descriptor_count(),
+                workgroup_count_x: dispatch.resident_dispatch.workgroup_count_x(),
+                push_constant_byte_count: dispatch.resident_dispatch.push_constant_byte_count(),
+            });
+        }
+
+        Ok(VulkanMountedPlacedResidentPedalRun {
+            pedal_id: self.pedal_id.clone(),
+            dispatch_runs,
+        })
+    }
+}
+
+pub struct VulkanMountedPlacedResidentPedalDispatch {
+    pub dispatch_index: usize,
+    pub kernel_id: String,
+    pub node_id: String,
+    pub op: String,
+    pub reusable_family_id: String,
+    pub resident_dispatch: VulkanResidentKernelDispatch,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanMountedPlacedResidentPedalRun {
+    pub pedal_id: String,
+    pub dispatch_runs: Vec<VulkanMountedPlacedResidentPedalDispatchRun>,
+}
+
+impl VulkanMountedPlacedResidentPedalRun {
+    pub fn dispatch_count(&self) -> usize {
+        self.dispatch_runs.len()
+    }
+
+    pub fn node_ids(&self) -> Vec<&str> {
+        self.dispatch_runs
+            .iter()
+            .map(|dispatch| dispatch.node_id.as_str())
+            .collect()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanMountedPlacedResidentPedalDispatchRun {
+    pub dispatch_index: usize,
+    pub kernel_id: String,
+    pub node_id: String,
+    pub op: String,
+    pub reusable_family_id: String,
+    pub descriptor_count: usize,
+    pub workgroup_count_x: u32,
+    pub push_constant_byte_count: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -4911,6 +5071,9 @@ impl From<VulkanBoundDispatchPlanError> for VulkanMountedPlacedStreamTickError {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum VulkanMountedPlacedResidentKernelDispatchError {
+    MissingPedalDispatches {
+        pedal_id: String,
+    },
     MissingLoadedArtifact {
         dispatch_index: usize,
         family_id: String,
@@ -4972,12 +5135,21 @@ pub enum VulkanMountedPlacedResidentKernelDispatchError {
         output_element_count: usize,
         local_size_x: u32,
     },
+    PedalRunnerDescriptorCountOverflow {
+        pedal_id: String,
+    },
+    PedalRunnerPushConstantByteCountOverflow {
+        pedal_id: String,
+    },
     Vulkan(VulkanError),
 }
 
 impl Display for VulkanMountedPlacedResidentKernelDispatchError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::MissingPedalDispatches { pedal_id } => {
+                write!(f, "pedal {pedal_id:?} has no mounted dispatches")
+            }
             Self::MissingLoadedArtifact {
                 dispatch_index,
                 family_id,
@@ -5070,6 +5242,14 @@ impl Display for VulkanMountedPlacedResidentKernelDispatchError {
             } => write!(
                 f,
                 "dispatch {dispatch_index} cannot plan workgroups for {output_element_count} output elements with local_size_x {local_size_x}"
+            ),
+            Self::PedalRunnerDescriptorCountOverflow { pedal_id } => write!(
+                f,
+                "resident pedal runner {pedal_id:?} descriptor count overflowed"
+            ),
+            Self::PedalRunnerPushConstantByteCountOverflow { pedal_id } => write!(
+                f,
+                "resident pedal runner {pedal_id:?} push-constant byte count overflowed"
             ),
             Self::Vulkan(error) => Display::fmt(error, f),
         }
@@ -5644,6 +5824,8 @@ pub struct VulkanKernelDescriptorSlotSignature {
     pub resource_class: VulkanKernelDescriptorResourceClass,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub byte_capacity: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shape: Option<Vec<usize>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -5707,6 +5889,7 @@ impl VulkanKernelDescriptorSlotSignature {
             usage: binding.usage.clone(),
             resource_class: VulkanKernelDescriptorResourceClass::from_resource(&binding.resource),
             byte_capacity: descriptor_resource_byte_capacity(&binding.resource),
+            shape: descriptor_resource_shape(&binding.resource),
         }
     }
 }
@@ -5755,6 +5938,14 @@ fn descriptor_resource_byte_capacity(resource: &VulkanKernelDescriptorResource) 
                 (None, None) => None,
             }
         }
+    }
+}
+
+fn descriptor_resource_shape(resource: &VulkanKernelDescriptorResource) -> Option<Vec<usize>> {
+    match resource {
+        VulkanKernelDescriptorResource::Parameter(parameter) => parameter.shape.clone(),
+        VulkanKernelDescriptorResource::Signal(_)
+        | VulkanKernelDescriptorResource::State { .. } => None,
     }
 }
 
@@ -5877,6 +6068,7 @@ fn parameter_binding_index(
                     param_id: use_ref.param_id.clone(),
                     tensor: parameter.tensor.clone(),
                     byte_count: resident.byte_count,
+                    shape: resident.shape.clone(),
                 },
             );
             if previous.is_some() {
@@ -6275,6 +6467,180 @@ mod tests {
             .join("tensors.json")
     }
 
+    fn mount_lfm2_single_device_stream_circuit(
+        device: &VulkanComputeDevice,
+    ) -> (
+        TensorIndex,
+        VulkanMountedPlacedStreamCircuit,
+        VulkanReusableKernelArtifactManifest,
+        VulkanMountedPlacedBoundDispatchPlan,
+    ) {
+        let graph = ResolvedLoweredPedalboard::from_index_file(lfm2_index_path()).unwrap();
+        let tensor_index = TensorIndex::from_json_file(lfm2_tensor_index_path()).unwrap();
+        let execution_plan =
+            StreamCircuitExecutionPlan::from_graph_with_tensor_index(&graph, &tensor_index)
+                .unwrap();
+        let resource_plan =
+            StreamCircuitResourcePlan::from_graph_and_plan(&graph, &execution_plan).unwrap();
+        let placement_spec = StreamCircuitPlacementSpec::new("gpu0");
+        let placement_plan = graph.placement_plan(&placement_spec).unwrap();
+        let resident = VulkanPlacedStreamCircuitResidentPlan::from_resource_plan_for_device(
+            &resource_plan,
+            &placement_plan,
+            "gpu0",
+            Some(&tensor_index),
+            Some(2),
+        )
+        .unwrap();
+        let placed_plan =
+            VulkanPlacedStreamCircuitPlan::from_plans(&execution_plan, &resource_plan, resident)
+                .unwrap();
+        let mounted =
+            VulkanMountedPlacedStreamCircuit::from_placed_plan(device, placed_plan, 4).unwrap();
+        let manifest = VulkanReusableKernelArtifactManifest::new(
+            mounted
+                .placed_plan
+                .reusable_kernel_plan
+                .families
+                .iter()
+                .map(|family| {
+                    VulkanReusableKernelArtifact::from_family(
+                        family,
+                        format!("kernels/{}.spv", family.family_id),
+                    )
+                })
+                .collect(),
+        );
+        let mounted_bound = mounted
+            .mounted_placed_bound_dispatch_plan(&manifest)
+            .unwrap();
+        (tensor_index, mounted, manifest, mounted_bound)
+    }
+
+    fn load_layer_00_parameters(
+        mounted: &VulkanMountedPlacedStreamCircuit,
+        tensor_index: &TensorIndex,
+    ) {
+        for tensor in [
+            "model.layers.0.operator_norm.weight",
+            "model.layers.0.conv.in_proj.weight",
+            "model.layers.0.conv.conv.weight",
+            "model.layers.0.conv.out_proj.weight",
+            "model.layers.0.ffn_norm.weight",
+            "model.layers.0.feed_forward.w1.weight",
+            "model.layers.0.feed_forward.w2.weight",
+            "model.layers.0.feed_forward.w3.weight",
+        ] {
+            mounted
+                .parameter_buffers
+                .load_parameter_from_tensor_index(tensor_index, tensor)
+                .unwrap();
+        }
+    }
+
+    fn write_layer_00_unit_input_and_zero_state(mounted: &VulkanMountedPlacedStreamCircuit) {
+        let mut input_frame = Vec::with_capacity(2_048);
+        for _ in 0..1024 {
+            input_frame.extend_from_slice(&[0x80, 0x3f]);
+        }
+        mounted
+            .boundary_io
+            .input_buffer("input_frame")
+            .unwrap()
+            .buffer
+            .write_bytes(&input_frame)
+            .unwrap();
+        let temporal_memory = mounted
+            .buffers
+            .state_buffer("layer_00", "temporal_memory")
+            .unwrap();
+        temporal_memory
+            .buffer
+            .write_bytes(&vec![0u8; temporal_memory.byte_capacity])
+            .unwrap();
+    }
+
+    fn layer_00_level_1_loaded_kernel_pack(
+        mounted: &VulkanMountedPlacedStreamCircuit,
+        mounted_bound: &VulkanMountedPlacedBoundDispatchPlan,
+    ) -> Option<VulkanLoadedReusableKernelArtifactManifest> {
+        let node_shaders = [
+            ("operator_norm", "rms_norm_bf16_serial.comp"),
+            ("conv_in_projection", "linear_bf16_1024x3072.comp"),
+            ("split_b_c_x", "split_bf16_3072_to_3x1024.comp"),
+            ("input_gate", "multiply_bf16_1024.comp"),
+            (
+                "temporal_memory_update",
+                "rolling_state_update_bf16_3x1024.comp",
+            ),
+            (
+                "depthwise_temporal_conv",
+                "depthwise_conv1d_bf16_3x1024.comp",
+            ),
+            ("output_gate", "multiply_bf16_1024.comp"),
+            ("conv_out_projection", "linear_bf16_1024x1024.comp"),
+            ("operator_residual", "add_bf16_1024.comp"),
+            ("ffn_norm", "rms_norm_bf16_serial.comp"),
+            ("ffn_gate_projection", "linear_bf16_1024x2560.comp"),
+            ("ffn_up_projection", "linear_bf16_1024x2560.comp"),
+            ("ffn_gate_activation", "silu_bf16_2560.comp"),
+            ("ffn_gate_multiply", "multiply_bf16_2560.comp"),
+            ("ffn_down_projection", "linear_bf16_2560x1024.comp"),
+            ("ffn_residual", "add_bf16_1024.comp"),
+        ];
+        let mut loaded_artifacts = Vec::new();
+        let mut loaded_families = BTreeSet::new();
+        let mut total_word_count = 0usize;
+
+        for (node_id, shader_file) in node_shaders {
+            let dispatch = mounted_bound.dispatch("layer_00", node_id).unwrap();
+            if !loaded_families.insert(dispatch.reusable_family_id.clone()) {
+                continue;
+            }
+            let spirv_words =
+                crate::vulkan_compute::compile_test_shader_words_from_source(shader_file)?;
+            total_word_count = total_word_count.checked_add(spirv_words.len())?;
+            let family = mounted
+                .placed_plan
+                .reusable_kernel_plan
+                .family(&dispatch.reusable_family_id)
+                .unwrap();
+            let artifact_path = format!("kernels/{}.spv", dispatch.reusable_family_id);
+            loaded_artifacts.push(VulkanLoadedReusableKernelArtifact {
+                artifact: VulkanReusableKernelArtifact::from_family(family, artifact_path.clone()),
+                resolved_path: PathBuf::from(artifact_path),
+                words: spirv_words,
+            });
+        }
+
+        Some(VulkanLoadedReusableKernelArtifactManifest {
+            schema: VULKAN_REUSABLE_KERNEL_ARTIFACT_MANIFEST_SCHEMA.to_string(),
+            backend_id: VULKAN_STREAM_CIRCUIT_BACKEND_ID.to_string(),
+            artifacts: loaded_artifacts,
+            total_word_count,
+        })
+    }
+
+    fn reusable_family_with_kernel<'a>(
+        reusable_plan: &'a VulkanReusableKernelPlan,
+        kernel_id: &str,
+    ) -> &'a VulkanReusableKernelFamily {
+        reusable_plan
+            .families
+            .iter()
+            .find(|family| {
+                family
+                    .command_refs
+                    .iter()
+                    .any(|command| command.kernel_id == kernel_id)
+            })
+            .unwrap()
+    }
+
+    fn artifact_path_for_family(family: &VulkanReusableKernelFamily) -> String {
+        format!("kernels/{}.spv", family.family_id)
+    }
+
     #[test]
     fn plans_lfm2_vulkan_resident_allocations_from_stream_circuit_resources() {
         let graph = ResolvedLoweredPedalboard::from_index_file(lfm2_index_path()).unwrap();
@@ -6588,6 +6954,71 @@ mod tests {
                 ..
             } if pedal_id == "layer_02" && state_id == "kv_memory"
         ));
+    }
+
+    #[test]
+    fn resident_pedal_runner_executes_layer_00_end_to_end() {
+        let device = match VulkanComputeDevice::new() {
+            Ok(device) => device,
+            Err(error) => {
+                eprintln!("skipping layer_00 resident pedal runner: {error}");
+                return;
+            }
+        };
+        let (tensor_index, mounted, _manifest, mounted_bound) =
+            mount_lfm2_single_device_stream_circuit(&device);
+        let Some(loaded_manifest) = layer_00_level_1_loaded_kernel_pack(&mounted, &mounted_bound)
+        else {
+            eprintln!("skipping layer_00 resident pedal runner: no GLSL to SPIR-V compiler found");
+            return;
+        };
+        load_layer_00_parameters(&mounted, &tensor_index);
+        write_layer_00_unit_input_and_zero_state(&mounted);
+
+        let runner = mounted
+            .create_resident_pedal_runner(&device, &mounted_bound, "layer_00", &loaded_manifest)
+            .unwrap();
+        assert_eq!(runner.pedal_id, "layer_00");
+        assert_eq!(runner.dispatch_count(), 16);
+        assert_eq!(runner.total_descriptor_count, 52);
+        assert_eq!(runner.total_push_constant_byte_count, 256);
+
+        let run = runner.run_zeroed_push_constants(&device).unwrap();
+        assert_eq!(run.pedal_id, "layer_00");
+        assert_eq!(run.dispatch_count(), 16);
+        assert_eq!(
+            run.node_ids(),
+            vec![
+                "operator_norm",
+                "conv_in_projection",
+                "split_b_c_x",
+                "input_gate",
+                "temporal_memory_update",
+                "depthwise_temporal_conv",
+                "output_gate",
+                "conv_out_projection",
+                "operator_residual",
+                "ffn_norm",
+                "ffn_gate_projection",
+                "ffn_up_projection",
+                "ffn_gate_activation",
+                "ffn_gate_multiply",
+                "ffn_down_projection",
+                "ffn_residual",
+            ]
+        );
+
+        let final_residual_dispatch = mounted_bound.dispatch("layer_00", "ffn_residual").unwrap();
+        let final_residual_bindings = mounted
+            .resident_kernel_buffer_bindings_for_bound_dispatch(final_residual_dispatch)
+            .unwrap();
+        assert_eq!(
+            final_residual_bindings[2].buffer.read_bytes(16).unwrap(),
+            vec![
+                0x86, 0x3f, 0x82, 0x3f, 0x81, 0x3f, 0x7e, 0x3f, 0x83, 0x3f, 0x83, 0x3f, 0x83, 0x3f,
+                0x83, 0x3f,
+            ]
+        );
     }
 
     #[test]
@@ -6988,7 +7419,6 @@ mod tests {
                     let conv_in_dispatch = mounted_bound
                         .dispatch("layer_00", "conv_in_projection")
                         .unwrap();
-                    assert_eq!(conv_in_dispatch.reusable_family_id, "linear.signature_3");
                     let conv_in_bindings = mounted
                         .resident_kernel_buffer_bindings_for_bound_dispatch(conv_in_dispatch)
                         .unwrap();
@@ -7000,6 +7430,9 @@ mod tests {
                         .reusable_kernel_plan
                         .family(&conv_in_dispatch.reusable_family_id)
                         .unwrap();
+                    assert_eq!(linear_family.op, "linear");
+                    assert_eq!(linear_family.command_refs.len(), 8);
+                    let linear_artifact_path = artifact_path_for_family(linear_family);
                     let linear_kernel_manifest = VulkanLoadedReusableKernelArtifactManifest {
                         schema: VULKAN_REUSABLE_KERNEL_ARTIFACT_MANIFEST_SCHEMA.to_string(),
                         backend_id: VULKAN_STREAM_CIRCUIT_BACKEND_ID.to_string(),
@@ -7007,9 +7440,9 @@ mod tests {
                         artifacts: vec![VulkanLoadedReusableKernelArtifact {
                             artifact: VulkanReusableKernelArtifact::from_family(
                                 linear_family,
-                                "kernels/linear.signature_3.spv",
+                                linear_artifact_path.clone(),
                             ),
-                            resolved_path: PathBuf::from("kernels/linear.signature_3.spv"),
+                            resolved_path: PathBuf::from(linear_artifact_path),
                             words: linear_spirv_words,
                         }],
                     };
@@ -9224,6 +9657,7 @@ mod tests {
                 param_id: "conv_in_projection".to_string(),
                 tensor: "model.layers.0.conv.in_proj.weight".to_string(),
                 byte_count: Some(6_291_456),
+                shape: Some(vec![3072, 1024]),
             }
         );
         assert_eq!(
@@ -9587,12 +10021,12 @@ mod tests {
 
         assert_eq!(reusable_plan.backend_id, VULKAN_STREAM_CIRCUIT_BACKEND_ID);
         assert_eq!(reusable_plan.total_command_count, 242);
-        assert_eq!(reusable_plan.total_family_count(), 25);
-        assert_eq!(reusable_plan.reusable_family_count(), 25);
+        assert_eq!(reusable_plan.total_family_count(), 26);
+        assert_eq!(reusable_plan.reusable_family_count(), 26);
         assert_eq!(reusable_plan.families_for_op("rms_norm").len(), 4);
-        assert_eq!(reusable_plan.families_for_op("linear").len(), 5);
+        assert_eq!(reusable_plan.families_for_op("linear").len(), 6);
 
-        let linear = reusable_plan.family("linear.signature_3").unwrap();
+        let linear = reusable_family_with_kernel(&reusable_plan, "layer_00.conv_in_projection");
         assert_eq!(linear.op, "linear");
         assert_eq!(linear.command_refs.len(), 8);
         assert!(!linear.uses_stream_tick);
@@ -9604,18 +10038,21 @@ mod tests {
                     usage: VulkanKernelDescriptorUsage::InputSignal,
                     resource_class: VulkanKernelDescriptorResourceClass::SignalBuffer,
                     byte_capacity: Some(5_120),
+                    shape: None,
                 },
                 VulkanKernelDescriptorSlotSignature {
                     binding: 1,
                     usage: VulkanKernelDescriptorUsage::OutputSignal,
                     resource_class: VulkanKernelDescriptorResourceClass::SignalBuffer,
                     byte_capacity: Some(6_144),
+                    shape: None,
                 },
                 VulkanKernelDescriptorSlotSignature {
                     binding: 2,
                     usage: VulkanKernelDescriptorUsage::Parameter,
                     resource_class: VulkanKernelDescriptorResourceClass::ParameterBuffer,
                     byte_capacity: Some(6_291_456),
+                    shape: Some(vec![3072, 1024]),
                 },
             ]
         );
@@ -9742,12 +10179,15 @@ mod tests {
         .unwrap();
         let dispatch_plan = VulkanKernelDispatchPlan::from_binding_plan(&binding_plan);
         let reusable_plan = VulkanReusableKernelPlan::from_dispatch_plan(&dispatch_plan);
+        let conv_in_family =
+            reusable_family_with_kernel(&reusable_plan, "layer_00.conv_in_projection");
+        let conv_in_family_id = conv_in_family.family_id.as_str();
 
         let empty = reusable_plan.coverage_report(std::iter::empty::<&str>());
         assert!(!empty.all_available());
-        assert_eq!(empty.required_family_count, 25);
+        assert_eq!(empty.required_family_count, 26);
         assert_eq!(empty.available_family_count, 0);
-        assert_eq!(empty.missing_family_count, 25);
+        assert_eq!(empty.missing_family_count, 26);
         assert_eq!(empty.required_command_count, 242);
         assert_eq!(empty.covered_command_count, 0);
         assert_eq!(empty.missing_command_count, 242);
@@ -9755,10 +10195,10 @@ mod tests {
             empty
                 .missing_families()
                 .iter()
-                .any(|family| family.family_id == "linear.signature_3" && family.command_count == 8)
+                .any(|family| family.family_id == conv_in_family_id && family.command_count == 8)
         );
 
-        let partial_family_ids = ["linear.signature_3", "rms_norm.signature_1"];
+        let partial_family_ids = [conv_in_family_id, "rms_norm.signature_1"];
         let partial_covered_command_count = partial_family_ids
             .iter()
             .map(|family_id| reusable_plan.family(family_id).unwrap().command_refs.len())
@@ -9766,13 +10206,13 @@ mod tests {
         let partial = reusable_plan.coverage_report(partial_family_ids);
         assert!(!partial.all_available());
         assert_eq!(partial.available_family_count, 2);
-        assert_eq!(partial.missing_family_count, 23);
+        assert_eq!(partial.missing_family_count, 24);
         assert_eq!(partial.covered_command_count, partial_covered_command_count);
         assert_eq!(
             partial.missing_command_count,
             242 - partial_covered_command_count
         );
-        assert_eq!(partial.missing_families().len(), 23);
+        assert_eq!(partial.missing_families().len(), 24);
 
         let full = reusable_plan.coverage_report(
             reusable_plan
@@ -9781,7 +10221,7 @@ mod tests {
                 .map(|family| family.family_id.as_str()),
         );
         assert!(full.all_available());
-        assert_eq!(full.available_family_count, 25);
+        assert_eq!(full.available_family_count, 26);
         assert_eq!(full.missing_family_count, 0);
         assert_eq!(full.covered_command_count, 242);
         assert_eq!(full.missing_command_count, 0);
@@ -9810,6 +10250,10 @@ mod tests {
         .unwrap();
         let dispatch_plan = VulkanKernelDispatchPlan::from_binding_plan(&binding_plan);
         let reusable_plan = VulkanReusableKernelPlan::from_dispatch_plan(&dispatch_plan);
+        let conv_in_family =
+            reusable_family_with_kernel(&reusable_plan, "layer_00.conv_in_projection");
+        let conv_in_family_id = conv_in_family.family_id.as_str();
+        let conv_in_artifact_path = artifact_path_for_family(conv_in_family);
         let manifest = VulkanReusableKernelArtifactManifest::new(
             reusable_plan
                 .families
@@ -9830,10 +10274,10 @@ mod tests {
             VULKAN_REUSABLE_KERNEL_ARTIFACT_MANIFEST_SCHEMA
         );
         assert_eq!(manifest.backend_id, VULKAN_STREAM_CIRCUIT_BACKEND_ID);
-        assert_eq!(manifest.artifacts.len(), 25);
+        assert_eq!(manifest.artifacts.len(), 26);
         assert!(link_plan.is_fully_linked());
-        assert_eq!(link_plan.required_family_count, 25);
-        assert_eq!(link_plan.linked_family_count, 25);
+        assert_eq!(link_plan.required_family_count, 26);
+        assert_eq!(link_plan.linked_family_count, 26);
         assert_eq!(link_plan.missing_family_count, 0);
         assert_eq!(link_plan.incompatible_family_count, 0);
         assert_eq!(link_plan.required_command_count, 242);
@@ -9842,12 +10286,12 @@ mod tests {
         assert_eq!(link_plan.incompatible_command_count, 0);
         assert!(link_plan.issues.is_empty());
 
-        let linear = link_plan.family("linear.signature_3").unwrap();
+        let linear = link_plan.family(conv_in_family_id).unwrap();
         assert_eq!(linear.status, VulkanReusableKernelLinkStatus::Linked);
         assert_eq!(linear.command_count, 8);
         assert_eq!(
             linear.artifact_path.as_deref(),
-            Some("kernels/linear.signature_3.spv")
+            Some(conv_in_artifact_path.as_str())
         );
 
         let manifest_path = std::env::temp_dir().join(format!(
@@ -9858,7 +10302,7 @@ mod tests {
         let read = VulkanReusableKernelArtifactManifest::from_json_file(&manifest_path).unwrap();
         std::fs::remove_file(&manifest_path).unwrap();
         assert_eq!(read, manifest);
-        assert_eq!(read.family_ids().len(), 25);
+        assert_eq!(read.family_ids().len(), 26);
 
         let artifact_root = std::env::temp_dir().join(format!(
             "llmoop-reusable-kernel-artifacts-{}",
@@ -9880,14 +10324,14 @@ mod tests {
             VULKAN_REUSABLE_KERNEL_ARTIFACT_MANIFEST_SCHEMA
         );
         assert_eq!(loaded.backend_id, VULKAN_STREAM_CIRCUIT_BACKEND_ID);
-        assert_eq!(loaded.artifacts.len(), 25);
-        assert_eq!(loaded.family_ids().len(), 25);
-        assert_eq!(loaded.total_word_count, 50);
-        let loaded_linear = loaded.artifact("linear.signature_3").unwrap();
-        assert_eq!(loaded_linear.artifact.family_id, "linear.signature_3");
+        assert_eq!(loaded.artifacts.len(), 26);
+        assert_eq!(loaded.family_ids().len(), 26);
+        assert_eq!(loaded.total_word_count, 52);
+        let loaded_linear = loaded.artifact(conv_in_family_id).unwrap();
+        assert_eq!(loaded_linear.artifact.family_id, conv_in_family_id);
         assert_eq!(
             loaded_linear.resolved_path,
-            artifact_root.join("kernels/linear.signature_3.spv")
+            artifact_root.join(&conv_in_artifact_path)
         );
         assert_eq!(loaded_linear.words[0], 0x0723_0203);
         std::fs::remove_dir_all(&artifact_root).unwrap();
@@ -9916,21 +10360,23 @@ mod tests {
         .unwrap();
         let dispatch_plan = VulkanKernelDispatchPlan::from_binding_plan(&binding_plan);
         let reusable_plan = VulkanReusableKernelPlan::from_dispatch_plan(&dispatch_plan);
-        let linear = reusable_plan.family("linear.signature_3").unwrap();
+        let linear = reusable_family_with_kernel(&reusable_plan, "layer_00.conv_in_projection");
+        let linear_family_id = linear.family_id.as_str();
+        let linear_artifact_path = artifact_path_for_family(linear);
 
         let partial_manifest = VulkanReusableKernelArtifactManifest::empty().with_artifact(
-            VulkanReusableKernelArtifact::from_family(linear, "kernels/linear.signature_3.spv"),
+            VulkanReusableKernelArtifact::from_family(linear, linear_artifact_path),
         );
         let partial_link = reusable_plan.link_artifacts(&partial_manifest);
 
         assert!(!partial_link.is_fully_linked());
         assert_eq!(partial_link.linked_family_count, 1);
-        assert_eq!(partial_link.missing_family_count, 24);
+        assert_eq!(partial_link.missing_family_count, 25);
         assert_eq!(partial_link.incompatible_family_count, 0);
         assert_eq!(partial_link.linked_command_count, 8);
         assert_eq!(partial_link.missing_command_count, 242 - 8);
         assert_eq!(
-            partial_link.family("linear.signature_3").unwrap().status,
+            partial_link.family(linear_family_id).unwrap().status,
             VulkanReusableKernelLinkStatus::Linked
         );
         assert!(
@@ -9951,11 +10397,11 @@ mod tests {
 
         assert!(!incompatible_link.is_fully_linked());
         assert_eq!(incompatible_link.linked_family_count, 0);
-        assert_eq!(incompatible_link.missing_family_count, 24);
+        assert_eq!(incompatible_link.missing_family_count, 25);
         assert_eq!(incompatible_link.incompatible_family_count, 1);
         assert_eq!(incompatible_link.incompatible_command_count, 8);
         assert_eq!(incompatible_link.missing_command_count, 242 - 8);
-        let linear_link = incompatible_link.family("linear.signature_3").unwrap();
+        let linear_link = incompatible_link.family(linear_family_id).unwrap();
         assert_eq!(
             linear_link.status,
             VulkanReusableKernelLinkStatus::Incompatible
@@ -10006,6 +10452,10 @@ mod tests {
         .unwrap();
         let dispatch_plan = VulkanKernelDispatchPlan::from_binding_plan(&binding_plan);
         let reusable_plan = VulkanReusableKernelPlan::from_dispatch_plan(&dispatch_plan);
+        let conv_in_family =
+            reusable_family_with_kernel(&reusable_plan, "layer_00.conv_in_projection");
+        let conv_in_family_id = conv_in_family.family_id.as_str();
+        let conv_in_artifact_path = artifact_path_for_family(conv_in_family);
         let descriptor_plan =
             VulkanDescriptorResourcePlan::from_plans(&dispatch_plan, &resident_plan, 4).unwrap();
         let manifest = VulkanReusableKernelArtifactManifest::new(
@@ -10030,7 +10480,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(prepared.backend_id, VULKAN_STREAM_CIRCUIT_BACKEND_ID);
-        assert_eq!(prepared.reusable_family_count, 25);
+        assert_eq!(prepared.reusable_family_count, 26);
         assert_eq!(prepared.dispatches.len(), 242);
         assert_eq!(prepared.total_descriptor_count, 794);
 
@@ -10045,8 +10495,8 @@ mod tests {
 
         let linear = prepared.dispatch("layer_00", "conv_in_projection").unwrap();
         assert_eq!(linear.dispatch_index, 1);
-        assert_eq!(linear.reusable_family_id, "linear.signature_3");
-        assert_eq!(linear.artifact_path, "kernels/linear.signature_3.spv");
+        assert_eq!(linear.reusable_family_id, conv_in_family_id);
+        assert_eq!(linear.artifact_path, conv_in_artifact_path);
         assert_eq!(linear.descriptors.len(), 3);
 
         let kv_append = prepared.dispatch("layer_02", "kv_memory_append").unwrap();
@@ -10100,9 +10550,9 @@ mod tests {
         let reusable_plan = VulkanReusableKernelPlan::from_dispatch_plan(&dispatch_plan);
         let descriptor_plan =
             VulkanDescriptorResourcePlan::from_plans(&dispatch_plan, &resident_plan, 4).unwrap();
-        let linear = reusable_plan.family("linear.signature_3").unwrap();
+        let linear = reusable_family_with_kernel(&reusable_plan, "layer_00.conv_in_projection");
         let partial_manifest = VulkanReusableKernelArtifactManifest::empty().with_artifact(
-            VulkanReusableKernelArtifact::from_family(linear, "kernels/linear.signature_3.spv"),
+            VulkanReusableKernelArtifact::from_family(linear, artifact_path_for_family(linear)),
         );
 
         let error = VulkanPreparedDispatchPlan::from_plans(
@@ -10117,7 +10567,7 @@ mod tests {
             panic!("expected reusable kernel link failure");
         };
         assert_eq!(link_plan.linked_family_count, 1);
-        assert_eq!(link_plan.missing_family_count, 24);
+        assert_eq!(link_plan.missing_family_count, 25);
         assert_eq!(link_plan.linked_command_count, 8);
         assert_eq!(link_plan.missing_command_count, 242 - 8);
         assert!(
@@ -10291,16 +10741,16 @@ mod tests {
         assert_eq!(mounted.binding_plan.total_node_count(), 242);
         assert_eq!(mounted.kernel_interface_plan.total_kernel_count(), 242);
         assert_eq!(mounted.dispatch_plan.total_dispatch_count(), 242);
-        assert_eq!(mounted.reusable_kernel_plan.total_family_count(), 25);
+        assert_eq!(mounted.reusable_kernel_plan.total_family_count(), 26);
         assert_eq!(mounted.reusable_kernel_plan.total_command_count, 242);
         let empty_coverage = mounted.reusable_kernel_coverage_report(std::iter::empty::<&str>());
         assert!(!empty_coverage.all_available());
-        assert_eq!(empty_coverage.missing_family_count, 25);
+        assert_eq!(empty_coverage.missing_family_count, 26);
         assert_eq!(empty_coverage.missing_command_count, 242);
         let empty_link =
             mounted.link_reusable_kernels(&VulkanReusableKernelArtifactManifest::empty());
         assert!(!empty_link.is_fully_linked());
-        assert_eq!(empty_link.missing_family_count, 25);
+        assert_eq!(empty_link.missing_family_count, 26);
         assert_eq!(empty_link.missing_command_count, 242);
         let descriptor_plan = mounted.descriptor_resource_plan().unwrap();
         assert_eq!(descriptor_plan.total_descriptor_count, 794);
