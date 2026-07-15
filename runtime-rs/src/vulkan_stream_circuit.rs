@@ -892,6 +892,17 @@ impl VulkanMountedPlacedStreamCircuit {
             .map_err(VulkanBoundDispatchPlanError::PreparedDispatch)?;
         VulkanBoundDispatchPlan::from_prepared_plan(&prepared_plan, &self.buffers)
     }
+
+    pub fn placed_bound_dispatch_plan(
+        &self,
+        manifest: &VulkanReusableKernelArtifactManifest,
+    ) -> Result<VulkanPlacedBoundDispatchPlan, VulkanBoundDispatchPlanError> {
+        let bound_plan = self.bound_dispatch_plan(manifest)?;
+        Ok(VulkanPlacedBoundDispatchPlan::from_bound_plan(
+            &bound_plan,
+            &self.placed_plan.placed_resident_plan,
+        ))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2386,6 +2397,223 @@ impl VulkanBoundDispatchPlan {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanPlacedBoundDispatchPlan {
+    pub backend_id: String,
+    pub device_id: String,
+    pub dispatches: Vec<VulkanPlacedBoundDispatch>,
+    pub total_descriptor_count: usize,
+    pub resident_descriptor_count: usize,
+    pub model_boundary_descriptor_count: usize,
+    pub local_cable_descriptor_count: usize,
+    pub incoming_cable_descriptor_count: usize,
+    pub outgoing_cable_descriptor_count: usize,
+}
+
+impl VulkanPlacedBoundDispatchPlan {
+    pub fn from_bound_plan(
+        bound_plan: &VulkanBoundDispatchPlan,
+        placed_resident_plan: &VulkanPlacedStreamCircuitResidentPlan,
+    ) -> Self {
+        let mut resident_descriptor_count = 0usize;
+        let mut model_boundary_descriptor_count = 0usize;
+        let mut local_cable_descriptor_count = 0usize;
+        let mut incoming_cable_descriptor_count = 0usize;
+        let mut outgoing_cable_descriptor_count = 0usize;
+        let mut dispatches = Vec::with_capacity(bound_plan.dispatches.len());
+
+        for dispatch in &bound_plan.dispatches {
+            let mut descriptors = Vec::with_capacity(dispatch.descriptors.len());
+            for descriptor in &dispatch.descriptors {
+                let target = VulkanPlacedBoundDescriptorTarget::from_bound_target(
+                    &dispatch.pedal_id,
+                    &descriptor.target,
+                    placed_resident_plan,
+                );
+                match target {
+                    VulkanPlacedBoundDescriptorTarget::Resident { .. } => {
+                        resident_descriptor_count += 1;
+                    }
+                    VulkanPlacedBoundDescriptorTarget::ModelInput { .. }
+                    | VulkanPlacedBoundDescriptorTarget::ModelOutput { .. } => {
+                        model_boundary_descriptor_count += 1;
+                    }
+                    VulkanPlacedBoundDescriptorTarget::LocalCableInput { .. }
+                    | VulkanPlacedBoundDescriptorTarget::LocalCableOutput { .. } => {
+                        local_cable_descriptor_count += 1;
+                    }
+                    VulkanPlacedBoundDescriptorTarget::IncomingCable { .. } => {
+                        incoming_cable_descriptor_count += 1;
+                    }
+                    VulkanPlacedBoundDescriptorTarget::OutgoingCable { .. } => {
+                        outgoing_cable_descriptor_count += 1;
+                    }
+                }
+                descriptors.push(VulkanPlacedBoundDescriptor {
+                    binding: descriptor.binding,
+                    usage: descriptor.usage.clone(),
+                    name: descriptor.name.clone(),
+                    target,
+                });
+            }
+
+            dispatches.push(VulkanPlacedBoundDispatch {
+                dispatch_index: dispatch.dispatch_index,
+                kernel_id: dispatch.kernel_id.clone(),
+                pedal_id: dispatch.pedal_id.clone(),
+                circuit_id: dispatch.circuit_id.clone(),
+                node_index: dispatch.node_index,
+                node_id: dispatch.node_id.clone(),
+                op: dispatch.op.clone(),
+                reusable_family_id: dispatch.reusable_family_id.clone(),
+                artifact_path: dispatch.artifact_path.clone(),
+                entry_point: dispatch.entry_point.clone(),
+                local_size_x: dispatch.local_size_x,
+                descriptors,
+                push_constants: dispatch.push_constants.clone(),
+                uses_stream_tick: dispatch.uses_stream_tick,
+            });
+        }
+
+        let total_descriptor_count = resident_descriptor_count
+            + model_boundary_descriptor_count
+            + local_cable_descriptor_count
+            + incoming_cable_descriptor_count
+            + outgoing_cable_descriptor_count;
+
+        Self {
+            backend_id: bound_plan.backend_id.clone(),
+            device_id: placed_resident_plan.device_id.clone(),
+            dispatches,
+            total_descriptor_count,
+            resident_descriptor_count,
+            model_boundary_descriptor_count,
+            local_cable_descriptor_count,
+            incoming_cable_descriptor_count,
+            outgoing_cable_descriptor_count,
+        }
+    }
+
+    pub fn dispatch(&self, pedal_id: &str, node_id: &str) -> Option<&VulkanPlacedBoundDispatch> {
+        self.dispatches
+            .iter()
+            .find(|dispatch| dispatch.pedal_id == pedal_id && dispatch.node_id == node_id)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanPlacedBoundDispatch {
+    pub dispatch_index: usize,
+    pub kernel_id: String,
+    pub pedal_id: String,
+    pub circuit_id: String,
+    pub node_index: usize,
+    pub node_id: String,
+    pub op: String,
+    pub reusable_family_id: String,
+    pub artifact_path: String,
+    pub entry_point: String,
+    pub local_size_x: u32,
+    pub descriptors: Vec<VulkanPlacedBoundDescriptor>,
+    pub push_constants: Vec<VulkanKernelScalarBinding>,
+    pub uses_stream_tick: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanPlacedBoundDescriptor {
+    pub binding: usize,
+    pub usage: VulkanKernelDescriptorUsage,
+    pub name: String,
+    pub target: VulkanPlacedBoundDescriptorTarget,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VulkanPlacedBoundDescriptorTarget {
+    Resident { target: VulkanBoundDescriptorTarget },
+    ModelInput { signal_id: String },
+    ModelOutput { signal_id: String },
+    LocalCableInput { cable: PedalCablePlacement },
+    LocalCableOutput { cable: PedalCablePlacement },
+    IncomingCable { cable: PedalCablePlacement },
+    OutgoingCable { cable: PedalCablePlacement },
+}
+
+impl VulkanPlacedBoundDescriptorTarget {
+    fn from_bound_target(
+        pedal_id: &str,
+        target: &VulkanBoundDescriptorTarget,
+        placed_resident_plan: &VulkanPlacedStreamCircuitResidentPlan,
+    ) -> Self {
+        match target {
+            VulkanBoundDescriptorTarget::BoundaryInput { signal_id } => {
+                classify_boundary_input(pedal_id, signal_id, placed_resident_plan)
+            }
+            VulkanBoundDescriptorTarget::BoundaryOutput { signal_id } => {
+                classify_boundary_output(pedal_id, signal_id, placed_resident_plan)
+            }
+            _ => Self::Resident {
+                target: target.clone(),
+            },
+        }
+    }
+}
+
+fn classify_boundary_input(
+    pedal_id: &str,
+    signal_id: &str,
+    placed_resident_plan: &VulkanPlacedStreamCircuitResidentPlan,
+) -> VulkanPlacedBoundDescriptorTarget {
+    if let Some(cable) = placed_resident_plan
+        .local_cables
+        .iter()
+        .find(|cable| {
+            cable.destination_pedal_id == pedal_id && cable.destination_port_id == signal_id
+        })
+        .cloned()
+    {
+        return VulkanPlacedBoundDescriptorTarget::LocalCableInput { cable };
+    }
+    if let Some(cable) = placed_resident_plan
+        .incoming_cables
+        .iter()
+        .find(|cable| {
+            cable.destination_pedal_id == pedal_id && cable.destination_port_id == signal_id
+        })
+        .cloned()
+    {
+        return VulkanPlacedBoundDescriptorTarget::IncomingCable { cable };
+    }
+    VulkanPlacedBoundDescriptorTarget::ModelInput {
+        signal_id: signal_id.to_string(),
+    }
+}
+
+fn classify_boundary_output(
+    pedal_id: &str,
+    signal_id: &str,
+    placed_resident_plan: &VulkanPlacedStreamCircuitResidentPlan,
+) -> VulkanPlacedBoundDescriptorTarget {
+    if let Some(cable) = placed_resident_plan
+        .local_cables
+        .iter()
+        .find(|cable| cable.source_pedal_id == pedal_id && cable.source_port_id == signal_id)
+        .cloned()
+    {
+        return VulkanPlacedBoundDescriptorTarget::LocalCableOutput { cable };
+    }
+    if let Some(cable) = placed_resident_plan
+        .outgoing_cables
+        .iter()
+        .find(|cable| cable.source_pedal_id == pedal_id && cable.source_port_id == signal_id)
+        .cloned()
+    {
+        return VulkanPlacedBoundDescriptorTarget::OutgoingCable { cable };
+    }
+    VulkanPlacedBoundDescriptorTarget::ModelOutput {
+        signal_id: signal_id.to_string(),
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VulkanBoundDispatch {
     pub dispatch_index: usize,
     pub kernel_id: String,
@@ -3621,6 +3849,50 @@ mod tests {
         assert!(bound.permanent_parameter_descriptor_count > 0);
         assert!(bound.stream_state_descriptor_count > 0);
         assert!(bound.activation_slot_descriptor_count > 0);
+
+        let placed_bound = mounted.placed_bound_dispatch_plan(&manifest).unwrap();
+        assert_eq!(placed_bound.device_id, "gpu1");
+        assert_eq!(placed_bound.dispatches.len(), 19);
+        assert_eq!(
+            placed_bound.total_descriptor_count,
+            bound.total_descriptor_count
+        );
+        assert_eq!(placed_bound.model_boundary_descriptor_count, 0);
+        assert_eq!(placed_bound.local_cable_descriptor_count, 0);
+        assert_eq!(placed_bound.incoming_cable_descriptor_count, 2);
+        assert_eq!(placed_bound.outgoing_cable_descriptor_count, 1);
+        assert_eq!(
+            placed_bound
+                .dispatch("layer_02", "operator_norm")
+                .unwrap()
+                .descriptors[0]
+                .target,
+            VulkanPlacedBoundDescriptorTarget::IncomingCable {
+                cable: mounted.placed_plan.placed_resident_plan.incoming_cables[0].clone(),
+            }
+        );
+        assert_eq!(
+            placed_bound
+                .dispatch("layer_02", "operator_residual")
+                .unwrap()
+                .descriptors[0]
+                .target,
+            VulkanPlacedBoundDescriptorTarget::IncomingCable {
+                cable: mounted.placed_plan.placed_resident_plan.incoming_cables[0].clone(),
+            }
+        );
+        assert_eq!(
+            placed_bound
+                .dispatch("layer_02", "ffn_residual")
+                .unwrap()
+                .descriptors
+                .last()
+                .unwrap()
+                .target,
+            VulkanPlacedBoundDescriptorTarget::OutgoingCable {
+                cable: mounted.placed_plan.placed_resident_plan.outgoing_cables[0].clone(),
+            }
+        );
 
         let kv_append = bound.dispatch("layer_02", "kv_memory_append").unwrap();
         assert!(matches!(
