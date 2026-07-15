@@ -475,6 +475,8 @@ impl Error for VulkanBindingPlanError {}
 pub struct VulkanMountedStreamCircuit {
     pub resident_plan: VulkanStreamCircuitResidentPlan,
     pub binding_plan: VulkanStreamCircuitBindingPlan,
+    pub kernel_interface_plan: VulkanKernelInterfacePlan,
+    pub dispatch_plan: VulkanKernelDispatchPlan,
     pub buffers: VulkanStreamCircuitStreamBuffers,
 }
 
@@ -491,11 +493,16 @@ impl VulkanMountedStreamCircuit {
             resource_plan,
             &resident_plan,
         )?;
+        let kernel_interface_plan = VulkanKernelInterfacePlan::from_binding_plan(&binding_plan);
+        let dispatch_plan =
+            VulkanKernelDispatchPlan::from_kernel_interfaces(&kernel_interface_plan);
         let buffers =
             resident_plan.allocate_stream_buffers(device, dynamic_state_capacity_activations)?;
         Ok(Self {
             resident_plan,
             binding_plan,
+            kernel_interface_plan,
+            dispatch_plan,
             buffers,
         })
     }
@@ -1870,6 +1877,8 @@ mod tests {
         assert!(!mounted.can_execute());
         assert_eq!(mounted.resident_plan.permanent_parameters.len(), 130);
         assert_eq!(mounted.binding_plan.total_node_count(), 242);
+        assert_eq!(mounted.kernel_interface_plan.total_kernel_count(), 242);
+        assert_eq!(mounted.dispatch_plan.total_dispatch_count(), 242);
         assert_eq!(mounted.buffers.state_buffers.len(), 14);
         assert_eq!(mounted.buffers.activation_slot_buffers.len(), 56);
         assert_eq!(mounted.buffers.total_byte_capacity, 374_784);
@@ -1890,6 +1899,13 @@ mod tests {
                 .activation_slot_buffer("layer_02", 0)
                 .map(|buffer| buffer.byte_capacity),
             Some(2_048)
+        );
+        assert_eq!(
+            mounted
+                .dispatch_plan
+                .command("layer_02", "kv_memory_append")
+                .map(|command| command.dispatch_index),
+            Some(40)
         );
     }
 }
