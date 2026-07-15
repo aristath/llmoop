@@ -3,7 +3,7 @@ use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::fs;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -12,7 +12,7 @@ use crate::stream_plan::{
     CircuitActivationPlan, PlannedNode, SignalProducer, SignalStorage, StreamCircuitExecutionPlan,
     StreamCircuitResourcePlan, TensorIndex,
 };
-use crate::vulkan::{DEFAULT_COMPUTE_LOCAL_SIZE_X, DEFAULT_SPIRV_ENTRY_POINT};
+use crate::vulkan::{DEFAULT_COMPUTE_LOCAL_SIZE_X, DEFAULT_SPIRV_ENTRY_POINT, read_spirv_words};
 use crate::vulkan_compute::{VulkanComputeDevice, VulkanError, VulkanResidentBuffer};
 
 pub const VULKAN_STREAM_CIRCUIT_BACKEND_ID: &str = "vulkan_stream_circuit_ir";
@@ -2411,6 +2411,13 @@ impl VulkanReusableKernelArtifactManifest {
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         fs::write(path, bytes)
     }
+
+    pub fn load_artifacts(
+        &self,
+        artifact_root: impl AsRef<Path>,
+    ) -> io::Result<VulkanLoadedReusableKernelArtifactManifest> {
+        VulkanLoadedReusableKernelArtifactManifest::from_manifest(self, artifact_root)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -2447,6 +2454,78 @@ impl VulkanReusableKernelArtifact {
     pub fn with_local_size_x(mut self, local_size_x: u32) -> Self {
         self.local_size_x = local_size_x;
         self
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanLoadedReusableKernelArtifactManifest {
+    pub schema: String,
+    pub backend_id: String,
+    pub artifacts: Vec<VulkanLoadedReusableKernelArtifact>,
+    pub total_word_count: usize,
+}
+
+impl VulkanLoadedReusableKernelArtifactManifest {
+    pub fn from_manifest(
+        manifest: &VulkanReusableKernelArtifactManifest,
+        artifact_root: impl AsRef<Path>,
+    ) -> io::Result<Self> {
+        let artifact_root = artifact_root.as_ref();
+        let mut artifacts = Vec::with_capacity(manifest.artifacts.len());
+        let mut total_word_count = 0usize;
+
+        for artifact in &manifest.artifacts {
+            let resolved_path =
+                resolve_reusable_kernel_artifact_path(artifact_root, &artifact.path);
+            let words = read_spirv_words(&resolved_path)?;
+            total_word_count = total_word_count.checked_add(words.len()).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "loaded reusable kernel word count overflowed",
+                )
+            })?;
+            artifacts.push(VulkanLoadedReusableKernelArtifact {
+                artifact: artifact.clone(),
+                resolved_path,
+                words,
+            });
+        }
+
+        Ok(Self {
+            schema: manifest.schema.clone(),
+            backend_id: manifest.backend_id.clone(),
+            artifacts,
+            total_word_count,
+        })
+    }
+
+    pub fn artifact(&self, family_id: &str) -> Option<&VulkanLoadedReusableKernelArtifact> {
+        self.artifacts
+            .iter()
+            .find(|artifact| artifact.artifact.family_id == family_id)
+    }
+
+    pub fn family_ids(&self) -> Vec<&str> {
+        self.artifacts
+            .iter()
+            .map(|artifact| artifact.artifact.family_id.as_str())
+            .collect()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanLoadedReusableKernelArtifact {
+    pub artifact: VulkanReusableKernelArtifact,
+    pub resolved_path: PathBuf,
+    pub words: Vec<u32>,
+}
+
+fn resolve_reusable_kernel_artifact_path(artifact_root: &Path, path: &str) -> PathBuf {
+    let path = Path::new(path);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        artifact_root.join(path)
     }
 }
 
@@ -6653,6 +6732,38 @@ mod tests {
         std::fs::remove_file(&manifest_path).unwrap();
         assert_eq!(read, manifest);
         assert_eq!(read.family_ids().len(), 12);
+
+        let artifact_root = std::env::temp_dir().join(format!(
+            "llmoop-reusable-kernel-artifacts-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(artifact_root.join("kernels")).unwrap();
+        for (index, artifact) in manifest.artifacts.iter().enumerate() {
+            crate::vulkan::write_spirv_words(
+                artifact_root.join(&artifact.path),
+                &[0x0723_0203, index as u32],
+            )
+            .unwrap();
+        }
+
+        let loaded = manifest.load_artifacts(&artifact_root).unwrap();
+
+        assert_eq!(
+            loaded.schema,
+            VULKAN_REUSABLE_KERNEL_ARTIFACT_MANIFEST_SCHEMA
+        );
+        assert_eq!(loaded.backend_id, VULKAN_STREAM_CIRCUIT_BACKEND_ID);
+        assert_eq!(loaded.artifacts.len(), 12);
+        assert_eq!(loaded.family_ids().len(), 12);
+        assert_eq!(loaded.total_word_count, 24);
+        let loaded_linear = loaded.artifact("linear").unwrap();
+        assert_eq!(loaded_linear.artifact.family_id, "linear");
+        assert_eq!(
+            loaded_linear.resolved_path,
+            artifact_root.join("kernels/linear.spv")
+        );
+        assert_eq!(loaded_linear.words[0], 0x0723_0203);
+        std::fs::remove_dir_all(&artifact_root).unwrap();
     }
 
     #[test]
