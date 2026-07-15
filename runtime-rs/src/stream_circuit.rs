@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::backend::{BackendError, DeviceBackend};
+use crate::stream_plan::{CircuitPlanError, StreamCircuitExecutionPlan, StreamCircuitResourcePlan};
 use crate::types::{
     ControlCommand, DeviceDispatchRun, DeviceMemoryPlan, DeviceOutputEvent, DispatchStatus,
     ForkPolicy, ForkRequest, HostPortsManifest, InputSignal, InstalledProcessorManifest,
@@ -831,6 +832,15 @@ impl InstalledStreamCircuit {
         }
     }
 
+    pub fn execution_plan(&self) -> Result<StreamCircuitExecutionPlan, CircuitPlanError> {
+        StreamCircuitExecutionPlan::from_graph(&self.graph)
+    }
+
+    pub fn resource_plan(&self) -> Result<StreamCircuitResourcePlan, CircuitPlanError> {
+        let execution_plan = self.execution_plan()?;
+        StreamCircuitResourcePlan::from_graph_and_plan(&self.graph, &execution_plan)
+    }
+
     pub fn capability_report(
         &self,
         capabilities: &StreamCircuitBackendCapabilities,
@@ -1034,6 +1044,14 @@ impl StreamCircuitDeviceBackend {
 
     pub fn stream_template(&self, stream_id: &str) -> Option<&StreamCircuitStreamTemplate> {
         self.streams.get(stream_id).map(|stream| &stream.template)
+    }
+
+    pub fn execution_plan(&self) -> Result<StreamCircuitExecutionPlan, CircuitPlanError> {
+        self.installed.execution_plan()
+    }
+
+    pub fn resource_plan(&self) -> Result<StreamCircuitResourcePlan, CircuitPlanError> {
+        self.installed.resource_plan()
     }
 
     pub fn capabilities(&self) -> &StreamCircuitBackendCapabilities {
@@ -1347,6 +1365,34 @@ mod tests {
     }
 
     #[test]
+    fn installed_stream_circuit_exposes_mount_plans() {
+        let installed = InstalledStreamCircuit::from_index_file(
+            lfm2_index_path(),
+            "lfm2_5_230m_stream_circuit",
+            "stream_circuit_ir",
+        )
+        .unwrap();
+
+        let execution_plan = installed.execution_plan().unwrap();
+        let resource_plan = installed.resource_plan().unwrap();
+
+        assert_eq!(execution_plan.circuits.len(), 14);
+        assert_eq!(execution_plan.total_node_count(), 242);
+        assert_eq!(resource_plan.circuit_count, 14);
+        assert_eq!(resource_plan.parameter_ref_count, 130);
+        assert_eq!(resource_plan.stream_state_count(), 14);
+        assert_eq!(resource_plan.layer_local_activation_slot_count, 62);
+        assert_eq!(
+            resource_plan
+                .activation_banks
+                .iter()
+                .find(|bank| bank.pedal_id == "layer_02")
+                .map(|bank| bank.slot_count),
+            Some(5)
+        );
+    }
+
+    #[test]
     fn stream_circuit_capability_report_names_missing_executors() {
         let installed = InstalledStreamCircuit::from_index_file(
             lfm2_index_path(),
@@ -1425,11 +1471,14 @@ mod tests {
 
         let manifest = backend.describe();
         let template = backend.stream_template("s0").unwrap();
+        let resource_plan = backend.resource_plan().unwrap();
 
         assert_eq!(backend.backend_id(), StreamCircuitDeviceBackend::BACKEND_ID);
         assert_eq!(manifest.permanent_circuit.pedal_count, 14);
         assert_eq!(template.stream_id, "s0");
         assert_eq!(template.allocations.len(), 14);
+        assert_eq!(resource_plan.parameter_ref_count, 130);
+        assert_eq!(resource_plan.activation_banks.len(), 14);
         assert_eq!(
             template.allocation_keys().get(2).map(String::as_str),
             Some("layer_02.kv_memory")

@@ -92,6 +92,188 @@ impl StreamCircuitExecutionPlan {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StreamCircuitResourcePlan {
+    pub circuit_count: usize,
+    pub node_count: usize,
+    pub parameter_ref_count: usize,
+    pub parameters: Vec<PlannedParameterResource>,
+    pub state_allocations: Vec<PlannedStateResource>,
+    pub activation_banks: Vec<PlannedActivationSlotBank>,
+    pub temporary_signal_count: usize,
+    pub layer_local_activation_slot_count: usize,
+    pub unknown_temporary_shape_count: usize,
+}
+
+impl StreamCircuitResourcePlan {
+    pub fn from_graph(graph: &ResolvedLoweredPedalboard) -> Result<Self, CircuitPlanError> {
+        let execution_plan = StreamCircuitExecutionPlan::from_graph(graph)?;
+        Self::from_graph_and_plan(graph, &execution_plan)
+    }
+
+    pub fn from_graph_and_plan(
+        graph: &ResolvedLoweredPedalboard,
+        execution_plan: &StreamCircuitExecutionPlan,
+    ) -> Result<Self, CircuitPlanError> {
+        if graph.circuits.len() != execution_plan.circuits.len() {
+            return Err(CircuitPlanError(format!(
+                "graph circuit count {} does not match plan circuit count {}",
+                graph.circuits.len(),
+                execution_plan.circuits.len()
+            )));
+        }
+
+        let mut parameter_ref_count = 0;
+        let mut parameters_by_tensor: BTreeMap<String, Vec<PlannedParameterUse>> = BTreeMap::new();
+        let mut state_allocations = Vec::new();
+        let mut activation_banks = Vec::new();
+        let mut unknown_temporary_shape_count = 0;
+
+        for (artifact, activation_plan) in graph.circuits.iter().zip(&execution_plan.circuits) {
+            if artifact.pedal.id != activation_plan.pedal_id {
+                return Err(CircuitPlanError(format!(
+                    "graph pedal {:?} does not match activation plan pedal {:?}",
+                    artifact.pedal.id, activation_plan.pedal_id
+                )));
+            }
+            if artifact.circuit.id != activation_plan.circuit_id {
+                return Err(CircuitPlanError(format!(
+                    "graph circuit {:?} does not match activation plan circuit {:?}",
+                    artifact.circuit.id, activation_plan.circuit_id
+                )));
+            }
+
+            for (param_id, parameter) in &artifact.params.refs {
+                parameter_ref_count += 1;
+                let tensor = parameter.tensor.clone().ok_or_else(|| {
+                    CircuitPlanError(format!(
+                        "{} parameter {:?} has no source tensor",
+                        artifact.pedal.id, param_id
+                    ))
+                })?;
+                parameters_by_tensor
+                    .entry(tensor)
+                    .or_default()
+                    .push(PlannedParameterUse {
+                        pedal_id: artifact.pedal.id.clone(),
+                        circuit_id: artifact.circuit.id.clone(),
+                        param_id: param_id.clone(),
+                        role: parameter.role.clone(),
+                        layout: artifact.params.layout.clone(),
+                        storage: artifact.params.storage.clone(),
+                    });
+            }
+
+            for state in &artifact.state.state_ports {
+                state_allocations.push(PlannedStateResource {
+                    pedal_id: artifact.pedal.id.clone(),
+                    circuit_id: artifact.circuit.id.clone(),
+                    state_id: state.id.clone(),
+                    state_type: state.state_type.clone(),
+                    shape: state.shape.clone(),
+                    elements_per_activation: state.elements_per_activation(),
+                    update: state.update.clone(),
+                    growth: state.growth.clone(),
+                    sharing: state.sharing.clone(),
+                    owner: state.owner.clone(),
+                    layout: state.layout.clone(),
+                    source_layout: state.source_layout.clone(),
+                });
+            }
+
+            unknown_temporary_shape_count += activation_plan
+                .temporary_signals
+                .iter()
+                .filter(|signal_id| {
+                    activation_plan
+                        .signal(signal_id)
+                        .and_then(|signal| signal.shape.as_ref())
+                        .is_none()
+                })
+                .count();
+
+            let activation_frame = activation_plan.activation_frame_plan();
+            activation_banks.push(PlannedActivationSlotBank {
+                pedal_id: artifact.pedal.id.clone(),
+                circuit_id: artifact.circuit.id.clone(),
+                temporary_signal_count: activation_plan.temporary_signals.len(),
+                slot_count: activation_frame.slot_count,
+                assignments: activation_frame.assignments,
+            });
+        }
+
+        let parameters = parameters_by_tensor
+            .into_iter()
+            .map(|(tensor, uses)| PlannedParameterResource { tensor, uses })
+            .collect();
+
+        Ok(Self {
+            circuit_count: graph.circuits.len(),
+            node_count: execution_plan.total_node_count(),
+            parameter_ref_count,
+            parameters,
+            state_allocations,
+            activation_banks,
+            temporary_signal_count: execution_plan.temporary_signal_count(),
+            layer_local_activation_slot_count: execution_plan.layer_local_activation_slot_count(),
+            unknown_temporary_shape_count,
+        })
+    }
+
+    pub fn unique_parameter_tensor_count(&self) -> usize {
+        self.parameters.len()
+    }
+
+    pub fn stream_state_count(&self) -> usize {
+        self.state_allocations.len()
+    }
+
+    pub fn intermediate_activation_shapes_known(&self) -> bool {
+        self.unknown_temporary_shape_count == 0
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlannedParameterResource {
+    pub tensor: String,
+    pub uses: Vec<PlannedParameterUse>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlannedParameterUse {
+    pub pedal_id: String,
+    pub circuit_id: String,
+    pub param_id: String,
+    pub role: Option<String>,
+    pub layout: String,
+    pub storage: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlannedStateResource {
+    pub pedal_id: String,
+    pub circuit_id: String,
+    pub state_id: String,
+    pub state_type: String,
+    pub shape: Option<Vec<usize>>,
+    pub elements_per_activation: Option<usize>,
+    pub update: Option<String>,
+    pub growth: Option<String>,
+    pub sharing: Option<String>,
+    pub owner: Option<String>,
+    pub layout: Option<String>,
+    pub source_layout: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlannedActivationSlotBank {
+    pub pedal_id: String,
+    pub circuit_id: String,
+    pub temporary_signal_count: usize,
+    pub slot_count: usize,
+    pub assignments: Vec<SignalSlotAssignment>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CircuitActivationPlan {
     pub pedal_id: String,
     pub circuit_id: String,
@@ -556,6 +738,101 @@ mod tests {
                 .iter()
                 .any(|node| node.op == "scaled_dot_product_attention")
         );
+    }
+
+    #[test]
+    fn resource_plan_names_lfm2_mount_resources() {
+        let graph = ResolvedLoweredPedalboard::from_index_file(lfm2_index_path()).unwrap();
+        let execution_plan = StreamCircuitExecutionPlan::from_graph(&graph).unwrap();
+
+        let resource_plan =
+            StreamCircuitResourcePlan::from_graph_and_plan(&graph, &execution_plan).unwrap();
+
+        assert_eq!(resource_plan.circuit_count, 14);
+        assert_eq!(resource_plan.node_count, 242);
+        assert_eq!(resource_plan.parameter_ref_count, 130);
+        assert_eq!(resource_plan.unique_parameter_tensor_count(), 130);
+        assert_eq!(resource_plan.stream_state_count(), 14);
+        assert_eq!(resource_plan.temporary_signal_count, 250);
+        assert_eq!(resource_plan.layer_local_activation_slot_count, 62);
+        assert_eq!(resource_plan.unknown_temporary_shape_count, 250);
+        assert!(!resource_plan.intermediate_activation_shapes_known());
+
+        let conv_in = resource_plan
+            .parameters
+            .iter()
+            .find(|parameter| parameter.tensor == "model.layers.0.conv.in_proj.weight")
+            .unwrap();
+        assert_eq!(conv_in.uses.len(), 1);
+        assert_eq!(conv_in.uses[0].pedal_id, "layer_00");
+        assert_eq!(conv_in.uses[0].param_id, "conv_in_projection");
+        assert_eq!(
+            conv_in.uses[0].role.as_deref(),
+            Some("short_convolution_input_projection")
+        );
+        assert_eq!(conv_in.uses[0].storage, "source_tensor_refs");
+
+        let rolling_states = resource_plan
+            .state_allocations
+            .iter()
+            .filter(|state| state.state_type == "rolling_frame_memory")
+            .count();
+        let append_only_states = resource_plan
+            .state_allocations
+            .iter()
+            .filter(|state| state.state_type == "append_only_attention_memory")
+            .count();
+        assert_eq!(rolling_states, 8);
+        assert_eq!(append_only_states, 6);
+
+        let layer_00_state = resource_plan
+            .state_allocations
+            .iter()
+            .find(|state| state.pedal_id == "layer_00")
+            .unwrap();
+        assert_eq!(layer_00_state.state_id, "temporal_memory");
+        assert_eq!(layer_00_state.shape, Some(vec![3, 1024]));
+        assert_eq!(layer_00_state.elements_per_activation, None);
+        assert_eq!(layer_00_state.layout.as_deref(), Some("time_hidden"));
+
+        let layer_02_state = resource_plan
+            .state_allocations
+            .iter()
+            .find(|state| state.pedal_id == "layer_02")
+            .unwrap();
+        assert_eq!(layer_02_state.state_id, "kv_memory");
+        assert_eq!(layer_02_state.shape, None);
+        assert_eq!(layer_02_state.elements_per_activation, Some(1024));
+        assert_eq!(layer_02_state.layout.as_deref(), Some("append_only_kv"));
+
+        let layer_00_bank = resource_plan
+            .activation_banks
+            .iter()
+            .find(|bank| bank.pedal_id == "layer_00")
+            .unwrap();
+        assert_eq!(layer_00_bank.temporary_signal_count, 17);
+        assert_eq!(layer_00_bank.slot_count, 4);
+        assert_eq!(layer_00_bank.assignments.len(), 17);
+
+        let layer_02_bank = resource_plan
+            .activation_banks
+            .iter()
+            .find(|bank| bank.pedal_id == "layer_02")
+            .unwrap();
+        assert_eq!(layer_02_bank.temporary_signal_count, 19);
+        assert_eq!(layer_02_bank.slot_count, 5);
+    }
+
+    #[test]
+    fn resource_plan_rejects_mismatched_execution_plan() {
+        let graph = ResolvedLoweredPedalboard::from_index_file(lfm2_index_path()).unwrap();
+        let mut execution_plan = StreamCircuitExecutionPlan::from_graph(&graph).unwrap();
+        execution_plan.circuits.pop();
+
+        let error =
+            StreamCircuitResourcePlan::from_graph_and_plan(&graph, &execution_plan).unwrap_err();
+
+        assert!(error.to_string().contains("graph circuit count 14"));
     }
 
     #[test]
