@@ -550,6 +550,21 @@ impl VulkanMountedStreamCircuit {
             self.buffers.dynamic_state_capacity_activations,
         )
     }
+
+    pub fn prepared_dispatch_plan(
+        &self,
+        manifest: &VulkanReusableKernelArtifactManifest,
+    ) -> Result<VulkanPreparedDispatchPlan, VulkanPreparedDispatchPlanError> {
+        let descriptor_plan = self
+            .descriptor_resource_plan()
+            .map_err(VulkanPreparedDispatchPlanError::DescriptorResource)?;
+        VulkanPreparedDispatchPlan::from_plans(
+            &self.dispatch_plan,
+            &self.reusable_kernel_plan,
+            &descriptor_plan,
+            manifest,
+        )
+    }
 }
 
 #[derive(Debug)]
@@ -1835,6 +1850,151 @@ fn link_compatibility_issues(
 
     issues
 }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanPreparedDispatchPlan {
+    pub backend_id: String,
+    pub reusable_family_count: usize,
+    pub dispatches: Vec<VulkanPreparedDispatch>,
+    pub total_descriptor_count: usize,
+}
+
+impl VulkanPreparedDispatchPlan {
+    pub fn from_plans(
+        dispatch_plan: &VulkanKernelDispatchPlan,
+        reusable_plan: &VulkanReusableKernelPlan,
+        descriptor_plan: &VulkanDescriptorResourcePlan,
+        manifest: &VulkanReusableKernelArtifactManifest,
+    ) -> Result<Self, VulkanPreparedDispatchPlanError> {
+        let link_plan = reusable_plan.link_artifacts(manifest);
+        if !link_plan.is_fully_linked() {
+            return Err(VulkanPreparedDispatchPlanError::Link(link_plan));
+        }
+
+        let descriptor_by_dispatch: BTreeMap<usize, &VulkanDispatchDescriptorResourcePlan> =
+            descriptor_plan
+                .dispatches
+                .iter()
+                .map(|dispatch| (dispatch.dispatch_index, dispatch))
+                .collect();
+        let mut family_by_dispatch = BTreeMap::new();
+        for family in &reusable_plan.families {
+            for command_ref in &family.command_refs {
+                family_by_dispatch.insert(command_ref.dispatch_index, family);
+            }
+        }
+        let artifact_by_family: BTreeMap<_, _> = manifest
+            .artifacts
+            .iter()
+            .map(|artifact| (artifact.family_id.as_str(), artifact))
+            .collect();
+
+        let mut dispatches = Vec::with_capacity(dispatch_plan.commands.len());
+        for command in &dispatch_plan.commands {
+            let descriptor_dispatch = descriptor_by_dispatch.get(&command.dispatch_index).ok_or(
+                VulkanPreparedDispatchPlanError::MissingDescriptorResources {
+                    dispatch_index: command.dispatch_index,
+                },
+            )?;
+            let family = family_by_dispatch.get(&command.dispatch_index).ok_or(
+                VulkanPreparedDispatchPlanError::MissingReusableFamily {
+                    dispatch_index: command.dispatch_index,
+                },
+            )?;
+            let artifact = artifact_by_family
+                .get(family.family_id.as_str())
+                .ok_or_else(|| VulkanPreparedDispatchPlanError::MissingLinkedArtifact {
+                    family_id: family.family_id.clone(),
+                })?;
+
+            dispatches.push(VulkanPreparedDispatch {
+                dispatch_index: command.dispatch_index,
+                kernel_id: command.kernel_id.clone(),
+                pedal_id: command.pedal_id.clone(),
+                circuit_id: command.circuit_id.clone(),
+                node_index: command.node_index,
+                node_id: command.node_id.clone(),
+                op: command.op.clone(),
+                reusable_family_id: family.family_id.clone(),
+                artifact_path: artifact.path.clone(),
+                entry_point: artifact.entry_point.clone(),
+                local_size_x: artifact.local_size_x,
+                descriptors: descriptor_dispatch.descriptors.clone(),
+                push_constants: command.push_constants.clone(),
+                uses_stream_tick: command.uses_stream_tick,
+            });
+        }
+        let total_descriptor_count = dispatches
+            .iter()
+            .map(|dispatch| dispatch.descriptors.len())
+            .sum();
+
+        Ok(Self {
+            backend_id: VULKAN_STREAM_CIRCUIT_BACKEND_ID.to_string(),
+            reusable_family_count: reusable_plan.total_family_count(),
+            dispatches,
+            total_descriptor_count,
+        })
+    }
+
+    pub fn dispatch(&self, pedal_id: &str, node_id: &str) -> Option<&VulkanPreparedDispatch> {
+        self.dispatches
+            .iter()
+            .find(|dispatch| dispatch.pedal_id == pedal_id && dispatch.node_id == node_id)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanPreparedDispatch {
+    pub dispatch_index: usize,
+    pub kernel_id: String,
+    pub pedal_id: String,
+    pub circuit_id: String,
+    pub node_index: usize,
+    pub node_id: String,
+    pub op: String,
+    pub reusable_family_id: String,
+    pub artifact_path: String,
+    pub entry_point: String,
+    pub local_size_x: u32,
+    pub descriptors: Vec<VulkanResolvedDescriptorBinding>,
+    pub push_constants: Vec<VulkanKernelScalarBinding>,
+    pub uses_stream_tick: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VulkanPreparedDispatchPlanError {
+    DescriptorResource(VulkanDescriptorResourcePlanError),
+    Link(VulkanLinkedReusableKernelPlan),
+    MissingDescriptorResources { dispatch_index: usize },
+    MissingReusableFamily { dispatch_index: usize },
+    MissingLinkedArtifact { family_id: String },
+}
+
+impl Display for VulkanPreparedDispatchPlanError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DescriptorResource(error) => Display::fmt(error, f),
+            Self::Link(plan) => write!(
+                f,
+                "reusable Vulkan kernels are not fully linked: {} missing families, {} incompatible families",
+                plan.missing_family_count, plan.incompatible_family_count
+            ),
+            Self::MissingDescriptorResources { dispatch_index } => write!(
+                f,
+                "dispatch {dispatch_index} has no resolved descriptor resources"
+            ),
+            Self::MissingReusableFamily { dispatch_index } => {
+                write!(f, "dispatch {dispatch_index} has no reusable kernel family")
+            }
+            Self::MissingLinkedArtifact { family_id } => {
+                write!(f, "reusable family {family_id:?} has no linked artifact")
+            }
+        }
+    }
+}
+
+impl Error for VulkanPreparedDispatchPlanError {}
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct VulkanKernelDescriptorSlotSignature {
@@ -3460,6 +3620,150 @@ mod tests {
     }
 
     #[test]
+    fn prepared_dispatch_plan_links_artifacts_to_descriptor_resources() {
+        let graph = ResolvedLoweredPedalboard::from_index_file(lfm2_index_path()).unwrap();
+        let tensor_index = TensorIndex::from_json_file(lfm2_tensor_index_path()).unwrap();
+        let execution_plan =
+            StreamCircuitExecutionPlan::from_graph_with_tensor_index(&graph, &tensor_index)
+                .unwrap();
+        let resource_plan =
+            StreamCircuitResourcePlan::from_graph_and_plan(&graph, &execution_plan).unwrap();
+        let resident_plan = VulkanStreamCircuitResidentPlan::from_resource_plan(
+            &resource_plan,
+            Some(&tensor_index),
+            Some(2),
+        )
+        .unwrap();
+        let binding_plan = VulkanStreamCircuitBindingPlan::from_plans(
+            &execution_plan,
+            &resource_plan,
+            &resident_plan,
+        )
+        .unwrap();
+        let dispatch_plan = VulkanKernelDispatchPlan::from_binding_plan(&binding_plan);
+        let reusable_plan = VulkanReusableKernelPlan::from_dispatch_plan(&dispatch_plan);
+        let descriptor_plan =
+            VulkanDescriptorResourcePlan::from_plans(&dispatch_plan, &resident_plan, 4).unwrap();
+        let manifest = VulkanReusableKernelArtifactManifest::new(
+            reusable_plan
+                .families
+                .iter()
+                .map(|family| {
+                    VulkanReusableKernelArtifact::from_family(
+                        family,
+                        format!("kernels/{}.spv", family.family_id),
+                    )
+                })
+                .collect(),
+        );
+
+        let prepared = VulkanPreparedDispatchPlan::from_plans(
+            &dispatch_plan,
+            &reusable_plan,
+            &descriptor_plan,
+            &manifest,
+        )
+        .unwrap();
+
+        assert_eq!(prepared.backend_id, VULKAN_STREAM_CIRCUIT_BACKEND_ID);
+        assert_eq!(prepared.reusable_family_count, 12);
+        assert_eq!(prepared.dispatches.len(), 242);
+        assert_eq!(prepared.total_descriptor_count, 794);
+
+        let first = prepared.dispatch("layer_00", "operator_norm").unwrap();
+        assert_eq!(first.dispatch_index, 0);
+        assert_eq!(first.kernel_id, "layer_00.operator_norm");
+        assert_eq!(first.reusable_family_id, "rms_norm");
+        assert_eq!(first.artifact_path, "kernels/rms_norm.spv");
+        assert_eq!(first.entry_point, DEFAULT_SPIRV_ENTRY_POINT);
+        assert_eq!(first.local_size_x, DEFAULT_COMPUTE_LOCAL_SIZE_X);
+        assert_eq!(first.descriptors.len(), 3);
+
+        let linear = prepared.dispatch("layer_00", "conv_in_projection").unwrap();
+        assert_eq!(linear.dispatch_index, 1);
+        assert_eq!(linear.reusable_family_id, "linear");
+        assert_eq!(linear.artifact_path, "kernels/linear.spv");
+        assert_eq!(linear.descriptors.len(), 3);
+
+        let kv_append = prepared.dispatch("layer_02", "kv_memory_append").unwrap();
+        assert_eq!(kv_append.dispatch_index, 40);
+        assert_eq!(kv_append.reusable_family_id, "append_state_update");
+        assert_eq!(kv_append.artifact_path, "kernels/append_state_update.spv");
+        assert!(kv_append.uses_stream_tick);
+        assert_eq!(kv_append.descriptors.len(), 9);
+        assert!(matches!(
+            kv_append.descriptors[2].resource,
+            VulkanDescriptorResourceAddress::StateBuffer {
+                ref pedal_id,
+                ref state_id,
+                byte_capacity: 8192,
+                ..
+            } if pedal_id == "layer_02" && state_id == "kv_memory"
+        ));
+        assert!(matches!(
+            kv_append.descriptors[6].resource,
+            VulkanDescriptorResourceAddress::StateBuffer {
+                ref pedal_id,
+                ref state_id,
+                byte_capacity: 8192,
+                ..
+            } if pedal_id == "layer_02" && state_id == "kv_memory"
+        ));
+    }
+
+    #[test]
+    fn prepared_dispatch_plan_rejects_unlinked_reusable_kernels() {
+        let graph = ResolvedLoweredPedalboard::from_index_file(lfm2_index_path()).unwrap();
+        let tensor_index = TensorIndex::from_json_file(lfm2_tensor_index_path()).unwrap();
+        let execution_plan =
+            StreamCircuitExecutionPlan::from_graph_with_tensor_index(&graph, &tensor_index)
+                .unwrap();
+        let resource_plan =
+            StreamCircuitResourcePlan::from_graph_and_plan(&graph, &execution_plan).unwrap();
+        let resident_plan = VulkanStreamCircuitResidentPlan::from_resource_plan(
+            &resource_plan,
+            Some(&tensor_index),
+            Some(2),
+        )
+        .unwrap();
+        let binding_plan = VulkanStreamCircuitBindingPlan::from_plans(
+            &execution_plan,
+            &resource_plan,
+            &resident_plan,
+        )
+        .unwrap();
+        let dispatch_plan = VulkanKernelDispatchPlan::from_binding_plan(&binding_plan);
+        let reusable_plan = VulkanReusableKernelPlan::from_dispatch_plan(&dispatch_plan);
+        let descriptor_plan =
+            VulkanDescriptorResourcePlan::from_plans(&dispatch_plan, &resident_plan, 4).unwrap();
+        let linear = reusable_plan.family("linear").unwrap();
+        let partial_manifest = VulkanReusableKernelArtifactManifest::empty().with_artifact(
+            VulkanReusableKernelArtifact::from_family(linear, "kernels/linear.spv"),
+        );
+
+        let error = VulkanPreparedDispatchPlan::from_plans(
+            &dispatch_plan,
+            &reusable_plan,
+            &descriptor_plan,
+            &partial_manifest,
+        )
+        .unwrap_err();
+
+        let VulkanPreparedDispatchPlanError::Link(link_plan) = error else {
+            panic!("expected reusable kernel link failure");
+        };
+        assert_eq!(link_plan.linked_family_count, 1);
+        assert_eq!(link_plan.missing_family_count, 11);
+        assert_eq!(link_plan.linked_command_count, 82);
+        assert_eq!(link_plan.missing_command_count, 242 - 82);
+        assert!(
+            link_plan
+                .family("append_state_update")
+                .is_some_and(|family| family.status == VulkanReusableKernelLinkStatus::Missing)
+        );
+    }
+
+    #[test]
     fn mounts_lfm2_stream_circuit_resources_without_claiming_execution() {
         let device = match VulkanComputeDevice::new() {
             Ok(device) => device,
@@ -3510,6 +3814,22 @@ mod tests {
         let descriptor_plan = mounted.descriptor_resource_plan().unwrap();
         assert_eq!(descriptor_plan.total_descriptor_count, 794);
         assert_eq!(descriptor_plan.dynamic_state_capacity_activations, 4);
+        let manifest = VulkanReusableKernelArtifactManifest::new(
+            mounted
+                .reusable_kernel_plan
+                .families
+                .iter()
+                .map(|family| {
+                    VulkanReusableKernelArtifact::from_family(
+                        family,
+                        format!("kernels/{}.spv", family.family_id),
+                    )
+                })
+                .collect(),
+        );
+        let prepared = mounted.prepared_dispatch_plan(&manifest).unwrap();
+        assert_eq!(prepared.dispatches.len(), 242);
+        assert_eq!(prepared.total_descriptor_count, 794);
         assert_eq!(mounted.buffers.state_buffers.len(), 14);
         assert_eq!(mounted.buffers.activation_slot_buffers.len(), 56);
         assert_eq!(mounted.buffers.total_byte_capacity, 374_784);
