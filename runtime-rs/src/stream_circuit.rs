@@ -23,6 +23,7 @@ pub const STREAM_CIRCUIT_SCHEMA: &str = "llmoop.stream_circuit.v1";
 pub const CIRCUIT_PARAMS_SCHEMA: &str = "llmoop.circuit_params.v1";
 pub const CIRCUIT_STATE_SCHEMA: &str = "llmoop.circuit_state.v1";
 pub const LOWERED_PEDALBOARD_SCHEMA: &str = "llmoop.lowered_pedalboard.v1";
+pub const STREAM_CIRCUIT_PLACEMENT_SCHEMA: &str = "llmoop.stream_circuit_placement.v1";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CircuitArtifactError(pub String);
@@ -647,6 +648,21 @@ impl ResolvedLoweredPedalboard {
         }
     }
 
+    pub fn single_device_placement_plan(
+        &self,
+        device_id: impl Into<String>,
+    ) -> Result<StreamCircuitPlacementPlan, CircuitPlacementError> {
+        let spec = StreamCircuitPlacementSpec::new(device_id);
+        self.placement_plan(&spec)
+    }
+
+    pub fn placement_plan(
+        &self,
+        spec: &StreamCircuitPlacementSpec,
+    ) -> Result<StreamCircuitPlacementPlan, CircuitPlacementError> {
+        StreamCircuitPlacementPlan::from_graph(self, spec)
+    }
+
     pub fn to_installed_processor_manifest(
         &self,
         install_id: impl Into<String>,
@@ -753,6 +769,236 @@ impl ResolvedLoweredPedalboard {
                     })
             })
             .collect()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CircuitPlacementError(pub String);
+
+impl Display for CircuitPlacementError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl Error for CircuitPlacementError {}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamCircuitPlacementSpec {
+    pub schema: String,
+    pub default_device_id: String,
+    #[serde(default)]
+    pub pedal_devices: BTreeMap<String, String>,
+}
+
+impl StreamCircuitPlacementSpec {
+    pub fn new(default_device_id: impl Into<String>) -> Self {
+        Self {
+            schema: STREAM_CIRCUIT_PLACEMENT_SCHEMA.to_string(),
+            default_device_id: default_device_id.into(),
+            pedal_devices: BTreeMap::new(),
+        }
+    }
+
+    pub fn with_pedal_device(
+        mut self,
+        pedal_id: impl Into<String>,
+        device_id: impl Into<String>,
+    ) -> Self {
+        self.pedal_devices.insert(pedal_id.into(), device_id.into());
+        self
+    }
+
+    pub fn device_for_pedal(&self, pedal_id: &str) -> &str {
+        self.pedal_devices
+            .get(pedal_id)
+            .map(String::as_str)
+            .unwrap_or(&self.default_device_id)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamCircuitPlacementPlan {
+    pub schema: String,
+    pub wiring: String,
+    pub pedals: Vec<PedalPlacement>,
+    pub cables: Vec<PedalCablePlacement>,
+    pub local_cable_count: usize,
+    pub cross_device_cable_count: usize,
+}
+
+impl StreamCircuitPlacementPlan {
+    pub fn from_graph(
+        graph: &ResolvedLoweredPedalboard,
+        spec: &StreamCircuitPlacementSpec,
+    ) -> Result<Self, CircuitPlacementError> {
+        if spec.schema != STREAM_CIRCUIT_PLACEMENT_SCHEMA {
+            return Err(CircuitPlacementError(format!(
+                "unsupported stream-circuit placement schema {:?}",
+                spec.schema
+            )));
+        }
+        if spec.default_device_id.is_empty() {
+            return Err(CircuitPlacementError(
+                "placement default_device_id must not be empty".to_string(),
+            ));
+        }
+        if graph.index.graph.wiring != "series" {
+            return Err(CircuitPlacementError(format!(
+                "only series placement is currently planned, got {:?}",
+                graph.index.graph.wiring
+            )));
+        }
+
+        let pedal_ids: BTreeSet<_> = graph
+            .circuits
+            .iter()
+            .map(|artifact| artifact.pedal.id.as_str())
+            .collect();
+        for pedal_id in spec.pedal_devices.keys() {
+            if !pedal_ids.contains(pedal_id.as_str()) {
+                return Err(CircuitPlacementError(format!(
+                    "placement references unknown pedal {pedal_id:?}"
+                )));
+            }
+        }
+
+        let pedals = graph
+            .circuits
+            .iter()
+            .enumerate()
+            .map(|(pedal_index, artifact)| PedalPlacement {
+                pedal_index,
+                pedal_id: artifact.pedal.id.clone(),
+                circuit_id: artifact.circuit.id.clone(),
+                operator_type: artifact.pedal.operator_type.clone(),
+                device_id: spec.device_for_pedal(&artifact.pedal.id).to_string(),
+            })
+            .collect::<Vec<_>>();
+
+        let mut cables = Vec::with_capacity(graph.circuits.len().saturating_sub(1));
+        let mut local_cable_count = 0usize;
+        let mut cross_device_cable_count = 0usize;
+        for (cable_index, pair) in graph.circuits.windows(2).enumerate() {
+            let source = &pair[0];
+            let destination = &pair[1];
+            let output = source.circuit.boundary.outputs.first().ok_or_else(|| {
+                CircuitPlacementError(format!(
+                    "{} has no output port for placement cable",
+                    source.pedal.id
+                ))
+            })?;
+            let input = destination.circuit.boundary.inputs.first().ok_or_else(|| {
+                CircuitPlacementError(format!(
+                    "{} has no input port for placement cable",
+                    destination.pedal.id
+                ))
+            })?;
+            if output.signal != input.signal || output.shape != input.shape {
+                return Err(CircuitPlacementError(format!(
+                    "cannot place cable {} -> {} without an adapter: output {:?}/{:?}, input {:?}/{:?}",
+                    source.pedal.id,
+                    destination.pedal.id,
+                    output.signal,
+                    output.shape,
+                    input.signal,
+                    input.shape
+                )));
+            }
+
+            let source_device_id = spec.device_for_pedal(&source.pedal.id).to_string();
+            let destination_device_id = spec.device_for_pedal(&destination.pedal.id).to_string();
+            let transport = if source_device_id == destination_device_id {
+                local_cable_count += 1;
+                CableTransport::LocalBuffer {
+                    device_id: source_device_id.clone(),
+                }
+            } else {
+                cross_device_cable_count += 1;
+                CableTransport::CrossDevice {
+                    from_device_id: source_device_id.clone(),
+                    to_device_id: destination_device_id.clone(),
+                }
+            };
+
+            cables.push(PedalCablePlacement {
+                cable_index,
+                signal: output.signal.clone(),
+                shape: output.shape.clone(),
+                source_pedal_id: source.pedal.id.clone(),
+                source_device_id,
+                source_port_id: output.id.clone(),
+                source_pedal_port: output.pedal_port.clone(),
+                destination_pedal_id: destination.pedal.id.clone(),
+                destination_device_id,
+                destination_port_id: input.id.clone(),
+                destination_pedal_port: input.pedal_port.clone(),
+                transport,
+            });
+        }
+
+        Ok(Self {
+            schema: STREAM_CIRCUIT_PLACEMENT_SCHEMA.to_string(),
+            wiring: graph.index.graph.wiring.clone(),
+            pedals,
+            cables,
+            local_cable_count,
+            cross_device_cable_count,
+        })
+    }
+
+    pub fn pedal(&self, pedal_id: &str) -> Option<&PedalPlacement> {
+        self.pedals.iter().find(|pedal| pedal.pedal_id == pedal_id)
+    }
+
+    pub fn cross_device_cables(&self) -> Vec<&PedalCablePlacement> {
+        self.cables
+            .iter()
+            .filter(|cable| cable.transport.is_cross_device())
+            .collect()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PedalPlacement {
+    pub pedal_index: usize,
+    pub pedal_id: String,
+    pub circuit_id: String,
+    pub operator_type: String,
+    pub device_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PedalCablePlacement {
+    pub cable_index: usize,
+    pub signal: String,
+    pub shape: Vec<usize>,
+    pub source_pedal_id: String,
+    pub source_device_id: String,
+    pub source_port_id: String,
+    pub source_pedal_port: Option<String>,
+    pub destination_pedal_id: String,
+    pub destination_device_id: String,
+    pub destination_port_id: String,
+    pub destination_pedal_port: Option<String>,
+    pub transport: CableTransport,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CableTransport {
+    LocalBuffer {
+        device_id: String,
+    },
+    CrossDevice {
+        from_device_id: String,
+        to_device_id: String,
+    },
+}
+
+impl CableTransport {
+    pub fn is_cross_device(&self) -> bool {
+        matches!(self, Self::CrossDevice { .. })
     }
 }
 
@@ -1402,6 +1648,124 @@ mod tests {
                 .count(),
             6
         );
+    }
+
+    #[test]
+    fn placement_plan_keeps_layer_pedals_as_deployable_units() {
+        let resolved = ResolvedLoweredPedalboard::from_index_file(lfm2_index_path()).unwrap();
+
+        let placement = resolved.single_device_placement_plan("gpu0").unwrap();
+
+        assert_eq!(placement.schema, STREAM_CIRCUIT_PLACEMENT_SCHEMA);
+        assert_eq!(placement.wiring, "series");
+        assert_eq!(placement.pedals.len(), 14);
+        assert_eq!(placement.cables.len(), 13);
+        assert_eq!(placement.local_cable_count, 13);
+        assert_eq!(placement.cross_device_cable_count, 0);
+        assert_eq!(
+            placement.pedal("layer_00").unwrap(),
+            &PedalPlacement {
+                pedal_index: 0,
+                pedal_id: "layer_00".to_string(),
+                circuit_id: "layer_00_exact_lfm2_conv_circuit_v1".to_string(),
+                operator_type: "conv".to_string(),
+                device_id: "gpu0".to_string(),
+            }
+        );
+
+        let first_cable = &placement.cables[0];
+        assert_eq!(first_cable.source_pedal_id, "layer_00");
+        assert_eq!(first_cable.destination_pedal_id, "layer_01");
+        assert_eq!(first_cable.signal, "frame");
+        assert_eq!(first_cable.shape, vec![1024]);
+        assert_eq!(first_cable.source_port_id, "output_frame");
+        assert_eq!(first_cable.destination_port_id, "input_frame");
+        assert_eq!(first_cable.source_pedal_port.as_deref(), Some("output"));
+        assert_eq!(first_cable.destination_pedal_port.as_deref(), Some("input"));
+        assert_eq!(
+            first_cable.transport,
+            CableTransport::LocalBuffer {
+                device_id: "gpu0".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn placement_plan_changes_cables_not_pedalboard_when_devices_differ() {
+        let resolved = ResolvedLoweredPedalboard::from_index_file(lfm2_index_path()).unwrap();
+        let spec = StreamCircuitPlacementSpec::new("gpu0")
+            .with_pedal_device("layer_01", "cpu0")
+            .with_pedal_device("layer_02", "gpu1")
+            .with_pedal_device("layer_03", "lan:worker-a");
+
+        let placement = resolved.placement_plan(&spec).unwrap();
+
+        assert_eq!(placement.pedals.len(), 14);
+        assert_eq!(placement.cables.len(), 13);
+        assert_eq!(placement.local_cable_count, 9);
+        assert_eq!(placement.cross_device_cable_count, 4);
+        assert_eq!(
+            placement
+                .pedal("layer_01")
+                .map(|pedal| pedal.device_id.as_str()),
+            Some("cpu0")
+        );
+        assert_eq!(
+            placement
+                .pedal("layer_02")
+                .map(|pedal| pedal.device_id.as_str()),
+            Some("gpu1")
+        );
+        assert_eq!(
+            placement
+                .pedal("layer_03")
+                .map(|pedal| pedal.device_id.as_str()),
+            Some("lan:worker-a")
+        );
+        assert_eq!(
+            placement
+                .pedal("layer_04")
+                .map(|pedal| pedal.device_id.as_str()),
+            Some("gpu0")
+        );
+
+        let cross = placement.cross_device_cables();
+        assert_eq!(cross.len(), 4);
+        assert_eq!(
+            cross
+                .iter()
+                .map(|cable| (
+                    cable.source_pedal_id.as_str(),
+                    cable.source_device_id.as_str(),
+                    cable.destination_pedal_id.as_str(),
+                    cable.destination_device_id.as_str()
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("layer_00", "gpu0", "layer_01", "cpu0"),
+                ("layer_01", "cpu0", "layer_02", "gpu1"),
+                ("layer_02", "gpu1", "layer_03", "lan:worker-a"),
+                ("layer_03", "lan:worker-a", "layer_04", "gpu0"),
+            ]
+        );
+        assert_eq!(
+            cross[2].transport,
+            CableTransport::CrossDevice {
+                from_device_id: "gpu1".to_string(),
+                to_device_id: "lan:worker-a".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn placement_plan_rejects_unknown_pedal_overrides() {
+        let resolved = ResolvedLoweredPedalboard::from_index_file(lfm2_index_path()).unwrap();
+        let spec = StreamCircuitPlacementSpec::new("gpu0").with_pedal_device("layer_99", "gpu1");
+
+        let error = resolved.placement_plan(&spec).unwrap_err();
+
+        assert!(error.0.contains("unknown pedal"));
+        assert!(error.0.contains("layer_99"));
     }
 
     #[test]
