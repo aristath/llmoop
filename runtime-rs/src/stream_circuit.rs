@@ -673,6 +673,27 @@ impl ResolvedLoweredPedalboard {
             },
         }
     }
+
+    pub fn transient_allocations(&self) -> Vec<StreamCircuitStateAllocation> {
+        self.circuits
+            .iter()
+            .flat_map(|artifact| {
+                artifact
+                    .circuit
+                    .state_ports
+                    .iter()
+                    .map(|state| StreamCircuitStateAllocation {
+                        pedal_id: artifact.pedal.id.clone(),
+                        state_id: state.id.clone(),
+                        state_type: state.state_type.clone(),
+                        owner: state.owner.clone().unwrap_or_else(|| "stream".to_string()),
+                        static_shape: state.shape.clone(),
+                        elements_per_activation: state.elements_per_activation(),
+                        layout: state.layout.clone(),
+                    })
+            })
+            .collect()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -684,6 +705,74 @@ pub struct CircuitGraphSummary {
     pub parameter_ref_count: usize,
     pub static_state_elements: usize,
     pub append_only_state_elements_per_activation: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StreamCircuitStateAllocation {
+    pub pedal_id: String,
+    pub state_id: String,
+    pub state_type: String,
+    pub owner: String,
+    pub static_shape: Option<Vec<usize>>,
+    pub elements_per_activation: Option<usize>,
+    pub layout: Option<String>,
+}
+
+impl StreamCircuitStateAllocation {
+    pub fn allocation_key(&self) -> String {
+        format!("{}.{}", self.pedal_id, self.state_id)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StreamCircuitStreamTemplate {
+    pub stream_id: String,
+    pub allocations: Vec<StreamCircuitStateAllocation>,
+}
+
+impl StreamCircuitStreamTemplate {
+    pub fn allocation_keys(&self) -> Vec<String> {
+        self.allocations
+            .iter()
+            .map(StreamCircuitStateAllocation::allocation_key)
+            .collect()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct InstalledStreamCircuit {
+    pub graph: ResolvedLoweredPedalboard,
+    pub manifest: InstalledProcessorManifest,
+}
+
+impl InstalledStreamCircuit {
+    pub fn from_index_file(
+        index_path: impl AsRef<Path>,
+        install_id: impl Into<String>,
+        backend: impl Into<String>,
+    ) -> Result<Self, CircuitArtifactError> {
+        let graph = ResolvedLoweredPedalboard::from_index_file(index_path)?;
+        Ok(Self::new(graph, install_id, backend))
+    }
+
+    pub fn new(
+        graph: ResolvedLoweredPedalboard,
+        install_id: impl Into<String>,
+        backend: impl Into<String>,
+    ) -> Self {
+        let manifest = graph.to_installed_processor_manifest(install_id, backend);
+        Self { graph, manifest }
+    }
+
+    pub fn create_stream_template(
+        &self,
+        stream_id: impl Into<String>,
+    ) -> StreamCircuitStreamTemplate {
+        StreamCircuitStreamTemplate {
+            stream_id: stream_id.into(),
+            allocations: self.graph.transient_allocations(),
+        }
+    }
 }
 
 fn read_json<T: for<'de> Deserialize<'de>>(
@@ -782,6 +871,45 @@ mod tests {
                     && allocation.state_id == "kv_memory"
                     && allocation.static_shape.is_none()
                     && allocation.elements_per_token == Some(1024))
+        );
+    }
+
+    #[test]
+    fn installed_stream_circuit_creates_stream_transient_template() {
+        let installed = InstalledStreamCircuit::from_index_file(
+            lfm2_index_path(),
+            "lfm2_5_230m_stream_circuit",
+            "stream_circuit_ir",
+        )
+        .unwrap();
+
+        let stream = installed.create_stream_template("stream_a");
+        let allocation_keys = stream.allocation_keys();
+
+        assert_eq!(installed.manifest.permanent_circuit.pedal_count, 14);
+        assert_eq!(stream.stream_id, "stream_a");
+        assert_eq!(stream.allocations.len(), 14);
+        assert_eq!(
+            allocation_keys.first().map(String::as_str),
+            Some("layer_00.temporal_memory")
+        );
+        assert_eq!(
+            allocation_keys.get(2).map(String::as_str),
+            Some("layer_02.kv_memory")
+        );
+        assert!(
+            stream
+                .allocations
+                .iter()
+                .all(|allocation| allocation.owner == "stream")
+        );
+        assert_eq!(
+            stream
+                .allocations
+                .iter()
+                .filter(|allocation| allocation.layout.as_deref() == Some("append_only_kv"))
+                .count(),
+            6
         );
     }
 }
