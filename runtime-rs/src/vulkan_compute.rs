@@ -183,6 +183,7 @@ pub struct VulkanComputeDevice {
     queue: vk::Queue,
     device_name: String,
     u32_storage_pipelines: RefCell<HashMap<VulkanPipelineKey, VulkanU32StoragePipeline>>,
+    generic_storage_pipelines: RefCell<HashMap<VulkanGenericPipelineKey, VulkanStoragePipeline>>,
     pipeline_cache_hits: Cell<u64>,
     pipeline_cache_misses: Cell<u64>,
 }
@@ -207,6 +208,21 @@ struct VulkanU32StoragePipeline {
     pipeline: vk::Pipeline,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct VulkanGenericPipelineKey {
+    spirv_words: Vec<u32>,
+    descriptor_bindings: Vec<u32>,
+    push_constant_byte_count: u32,
+    local_size_x: u32,
+}
+
+struct VulkanStoragePipeline {
+    descriptor_set_layout: vk::DescriptorSetLayout,
+    pipeline_layout: vk::PipelineLayout,
+    shader_module: vk::ShaderModule,
+    pipeline: vk::Pipeline,
+}
+
 pub struct VulkanU32ResidentBuffer {
     device: ash::Device,
     buffer: vk::Buffer,
@@ -220,6 +236,22 @@ pub struct VulkanResidentBuffer {
     buffer: vk::Buffer,
     memory: vk::DeviceMemory,
     byte_capacity: vk::DeviceSize,
+}
+
+pub struct VulkanResidentKernelBufferBinding<'a> {
+    pub binding: u32,
+    pub buffer: &'a VulkanResidentBuffer,
+    pub byte_len: usize,
+}
+
+impl<'a> VulkanResidentKernelBufferBinding<'a> {
+    pub fn new(binding: u32, buffer: &'a VulkanResidentBuffer, byte_len: usize) -> Self {
+        Self {
+            binding,
+            buffer,
+            byte_len,
+        }
+    }
 }
 
 impl VulkanU32ResidentBuffer {
@@ -301,6 +333,14 @@ impl VulkanResidentBuffer {
         }
         Ok(byte_len)
     }
+
+    fn descriptor_buffer(&self, len: usize) -> Result<vk::DescriptorBufferInfo, VulkanError> {
+        Ok(vk::DescriptorBufferInfo {
+            buffer: self.buffer,
+            offset: 0,
+            range: self.byte_len(len)?,
+        })
+    }
 }
 
 impl Drop for VulkanU32ResidentBuffer {
@@ -334,6 +374,20 @@ pub struct VulkanU32ResidentDispatch {
     capacity: usize,
     byte_capacity: vk::DeviceSize,
     len: usize,
+}
+
+pub struct VulkanResidentKernelDispatch {
+    device: ash::Device,
+    descriptor_pool: vk::DescriptorPool,
+    descriptor_set: vk::DescriptorSet,
+    command_pool: vk::CommandPool,
+    command_buffer: vk::CommandBuffer,
+    pipeline_key: VulkanGenericPipelineKey,
+    pipeline_layout: vk::PipelineLayout,
+    pipeline: vk::Pipeline,
+    descriptor_count: usize,
+    workgroup_count_x: u32,
+    push_constant_byte_count: u32,
 }
 
 pub struct VulkanU32ResidentCopy {
@@ -410,6 +464,30 @@ impl Drop for VulkanU32ResidentDispatch {
     }
 }
 
+impl VulkanResidentKernelDispatch {
+    pub fn descriptor_count(&self) -> usize {
+        self.descriptor_count
+    }
+
+    pub fn workgroup_count_x(&self) -> u32 {
+        self.workgroup_count_x
+    }
+
+    pub fn push_constant_byte_count(&self) -> u32 {
+        self.push_constant_byte_count
+    }
+}
+
+impl Drop for VulkanResidentKernelDispatch {
+    fn drop(&mut self) {
+        unsafe {
+            self.device.destroy_command_pool(self.command_pool, None);
+            self.device
+                .destroy_descriptor_pool(self.descriptor_pool, None);
+        }
+    }
+}
+
 impl VulkanComputeDevice {
     pub fn new() -> Result<Self, VulkanError> {
         unsafe {
@@ -459,6 +537,7 @@ impl VulkanComputeDevice {
                 queue,
                 device_name,
                 u32_storage_pipelines: RefCell::new(HashMap::new()),
+                generic_storage_pipelines: RefCell::new(HashMap::new()),
                 pipeline_cache_hits: Cell::new(0),
                 pipeline_cache_misses: Cell::new(0),
             })
@@ -826,6 +905,230 @@ impl VulkanComputeDevice {
         }
     }
 
+    pub fn create_resident_kernel_dispatch(
+        &self,
+        spirv_words: &[u32],
+        buffers: &[VulkanResidentKernelBufferBinding<'_>],
+        workgroup_count_x: u32,
+        local_size_x: u32,
+        push_constant_byte_count: u32,
+    ) -> Result<VulkanResidentKernelDispatch, VulkanError> {
+        if spirv_words.is_empty() {
+            return Err(VulkanError("SPIR-V module must not be empty".to_string()));
+        }
+        if buffers.is_empty() {
+            return Err(VulkanError(
+                "resident kernel dispatch must bind at least one storage buffer".to_string(),
+            ));
+        }
+        if workgroup_count_x == 0 {
+            return Err(VulkanError(
+                "workgroup_count_x must not be zero".to_string(),
+            ));
+        }
+        if local_size_x == 0 {
+            return Err(VulkanError("local_size_x must not be zero".to_string()));
+        }
+
+        let mut descriptor_bindings = Vec::with_capacity(buffers.len());
+        for buffer in buffers {
+            buffer.buffer.byte_len(buffer.byte_len)?;
+            if descriptor_bindings.contains(&buffer.binding) {
+                return Err(VulkanError(format!(
+                    "duplicate storage buffer binding {}",
+                    buffer.binding
+                )));
+            }
+            descriptor_bindings.push(buffer.binding);
+        }
+        descriptor_bindings.sort_unstable();
+
+        let pipeline_key = VulkanGenericPipelineKey {
+            spirv_words: spirv_words.to_vec(),
+            descriptor_bindings: descriptor_bindings.clone(),
+            push_constant_byte_count,
+            local_size_x,
+        };
+        let (descriptor_set_layout, pipeline_layout, pipeline) = self.generic_storage_pipeline(
+            spirv_words,
+            &descriptor_bindings,
+            push_constant_byte_count,
+            local_size_x,
+        )?;
+
+        unsafe {
+            let set_layouts = [descriptor_set_layout];
+            let descriptor_count = u32::try_from(buffers.len()).map_err(|_| {
+                VulkanError("resident kernel descriptor count overflowed u32".to_string())
+            })?;
+            let pool_sizes = [vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::STORAGE_BUFFER,
+                descriptor_count,
+            }];
+            let descriptor_pool_info = vk::DescriptorPoolCreateInfo::default()
+                .max_sets(1)
+                .pool_sizes(&pool_sizes);
+            let descriptor_pool = self
+                .device
+                .create_descriptor_pool(&descriptor_pool_info, None)
+                .map_err(|error| {
+                    VulkanError(format!(
+                        "failed to create resident kernel descriptor pool: {error:?}"
+                    ))
+                })?;
+            let descriptor_alloc_info = vk::DescriptorSetAllocateInfo::default()
+                .descriptor_pool(descriptor_pool)
+                .set_layouts(&set_layouts);
+            let descriptor_set = self
+                .device
+                .allocate_descriptor_sets(&descriptor_alloc_info)
+                .map_err(|error| {
+                    self.device.destroy_descriptor_pool(descriptor_pool, None);
+                    VulkanError(format!(
+                        "failed to allocate resident kernel descriptor set: {error:?}"
+                    ))
+                })?
+                .remove(0);
+            let descriptor_buffers = buffers
+                .iter()
+                .map(|buffer| buffer.buffer.descriptor_buffer(buffer.byte_len))
+                .collect::<Result<Vec<_>, _>>()?;
+            let descriptor_writes = buffers
+                .iter()
+                .zip(&descriptor_buffers)
+                .map(|(buffer, descriptor_buffer)| {
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(descriptor_set)
+                        .dst_binding(buffer.binding)
+                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                        .buffer_info(std::slice::from_ref(descriptor_buffer))
+                })
+                .collect::<Vec<_>>();
+            self.device.update_descriptor_sets(&descriptor_writes, &[]);
+
+            let command_pool_info = vk::CommandPoolCreateInfo::default()
+                .queue_family_index(self.queue_family_index)
+                .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+            let command_pool = self
+                .device
+                .create_command_pool(&command_pool_info, None)
+                .map_err(|error| {
+                    self.device.destroy_descriptor_pool(descriptor_pool, None);
+                    VulkanError(format!(
+                        "failed to create resident kernel command pool: {error:?}"
+                    ))
+                })?;
+            let command_alloc_info = vk::CommandBufferAllocateInfo::default()
+                .command_pool(command_pool)
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .command_buffer_count(1);
+            let command_buffer = self
+                .device
+                .allocate_command_buffers(&command_alloc_info)
+                .map_err(|error| {
+                    self.device.destroy_command_pool(command_pool, None);
+                    self.device.destroy_descriptor_pool(descriptor_pool, None);
+                    VulkanError(format!(
+                        "failed to allocate resident kernel command buffer: {error:?}"
+                    ))
+                })?
+                .remove(0);
+
+            Ok(VulkanResidentKernelDispatch {
+                device: self.device.clone(),
+                descriptor_pool,
+                descriptor_set,
+                command_pool,
+                command_buffer,
+                pipeline_key,
+                pipeline_layout,
+                pipeline,
+                descriptor_count: buffers.len(),
+                workgroup_count_x,
+                push_constant_byte_count,
+            })
+        }
+    }
+
+    pub fn run_resident_kernel_dispatch(
+        &self,
+        binding: &VulkanResidentKernelDispatch,
+        push_constants: &[u8],
+    ) -> Result<(), VulkanError> {
+        if binding.pipeline_key.push_constant_byte_count != push_constants.len() as u32 {
+            return Err(VulkanError(format!(
+                "resident kernel dispatch expects {} push-constant bytes, got {}",
+                binding.pipeline_key.push_constant_byte_count,
+                push_constants.len()
+            )));
+        }
+
+        unsafe {
+            self.device
+                .reset_command_buffer(binding.command_buffer, vk::CommandBufferResetFlags::empty())
+                .map_err(|error| {
+                    VulkanError(format!(
+                        "failed to reset resident kernel command buffer: {error:?}"
+                    ))
+                })?;
+
+            let command_begin = vk::CommandBufferBeginInfo::default();
+            self.device
+                .begin_command_buffer(binding.command_buffer, &command_begin)
+                .map_err(|error| {
+                    VulkanError(format!(
+                        "failed to begin resident kernel command buffer: {error:?}"
+                    ))
+                })?;
+            self.device.cmd_bind_pipeline(
+                binding.command_buffer,
+                vk::PipelineBindPoint::COMPUTE,
+                binding.pipeline,
+            );
+            self.device.cmd_bind_descriptor_sets(
+                binding.command_buffer,
+                vk::PipelineBindPoint::COMPUTE,
+                binding.pipeline_layout,
+                0,
+                &[binding.descriptor_set],
+                &[],
+            );
+            if !push_constants.is_empty() {
+                self.device.cmd_push_constants(
+                    binding.command_buffer,
+                    binding.pipeline_layout,
+                    vk::ShaderStageFlags::COMPUTE,
+                    0,
+                    push_constants,
+                );
+            }
+            self.device
+                .cmd_dispatch(binding.command_buffer, binding.workgroup_count_x, 1, 1);
+            self.device
+                .end_command_buffer(binding.command_buffer)
+                .map_err(|error| {
+                    VulkanError(format!(
+                        "failed to end resident kernel command buffer: {error:?}"
+                    ))
+                })?;
+
+            let command_buffers = [binding.command_buffer];
+            let submit_info = [vk::SubmitInfo::default().command_buffers(&command_buffers)];
+            self.device
+                .queue_submit(self.queue, &submit_info, vk::Fence::null())
+                .map_err(|error| {
+                    VulkanError(format!("failed to submit resident kernel work: {error:?}"))
+                })?;
+            self.device.queue_wait_idle(self.queue).map_err(|error| {
+                VulkanError(format!(
+                    "failed waiting for resident kernel work: {error:?}"
+                ))
+            })?;
+
+            Ok(())
+        }
+    }
+
     pub fn run_u32_storage_shader(
         &self,
         spirv_words: &[u32],
@@ -992,6 +1295,45 @@ impl VulkanComputeDevice {
         Ok(handles)
     }
 
+    fn generic_storage_pipeline(
+        &self,
+        spirv_words: &[u32],
+        descriptor_bindings: &[u32],
+        push_constant_byte_count: u32,
+        local_size_x: u32,
+    ) -> Result<(vk::DescriptorSetLayout, vk::PipelineLayout, vk::Pipeline), VulkanError> {
+        let key = VulkanGenericPipelineKey {
+            spirv_words: spirv_words.to_vec(),
+            descriptor_bindings: descriptor_bindings.to_vec(),
+            push_constant_byte_count,
+            local_size_x,
+        };
+        if let Some(pipeline) = self.generic_storage_pipelines.borrow().get(&key) {
+            return Ok((
+                pipeline.descriptor_set_layout,
+                pipeline.pipeline_layout,
+                pipeline.pipeline,
+            ));
+        }
+
+        let pipeline = unsafe {
+            self.create_generic_storage_pipeline(
+                spirv_words,
+                descriptor_bindings,
+                push_constant_byte_count,
+            )?
+        };
+        let handles = (
+            pipeline.descriptor_set_layout,
+            pipeline.pipeline_layout,
+            pipeline.pipeline,
+        );
+        self.generic_storage_pipelines
+            .borrow_mut()
+            .insert(key, pipeline);
+        Ok(handles)
+    }
+
     unsafe fn create_u32_storage_pipeline(
         &self,
         spirv_words: &[u32],
@@ -1054,6 +1396,102 @@ impl VulkanComputeDevice {
             pipeline,
         })
     }
+
+    unsafe fn create_generic_storage_pipeline(
+        &self,
+        spirv_words: &[u32],
+        descriptor_bindings: &[u32],
+        push_constant_byte_count: u32,
+    ) -> Result<VulkanStoragePipeline, VulkanError> {
+        let descriptor_binding = descriptor_bindings
+            .iter()
+            .map(|binding| {
+                vk::DescriptorSetLayoutBinding::default()
+                    .binding(*binding)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .descriptor_count(1)
+                    .stage_flags(vk::ShaderStageFlags::COMPUTE)
+            })
+            .collect::<Vec<_>>();
+        let descriptor_layout_info =
+            vk::DescriptorSetLayoutCreateInfo::default().bindings(&descriptor_binding);
+        let descriptor_set_layout = unsafe {
+            self.device
+                .create_descriptor_set_layout(&descriptor_layout_info, None)
+                .map_err(|error| {
+                    VulkanError(format!(
+                        "failed to create generic descriptor set layout: {error:?}"
+                    ))
+                })?
+        };
+
+        let set_layouts = [descriptor_set_layout];
+        let push_constant_ranges = if push_constant_byte_count == 0 {
+            Vec::new()
+        } else {
+            vec![
+                vk::PushConstantRange::default()
+                    .stage_flags(vk::ShaderStageFlags::COMPUTE)
+                    .offset(0)
+                    .size(push_constant_byte_count),
+            ]
+        };
+        let pipeline_layout_info = vk::PipelineLayoutCreateInfo::default()
+            .set_layouts(&set_layouts)
+            .push_constant_ranges(&push_constant_ranges);
+        let pipeline_layout = unsafe {
+            self.device
+                .create_pipeline_layout(&pipeline_layout_info, None)
+                .map_err(|error| {
+                    self.device
+                        .destroy_descriptor_set_layout(descriptor_set_layout, None);
+                    VulkanError(format!(
+                        "failed to create generic pipeline layout: {error:?}"
+                    ))
+                })?
+        };
+
+        let shader_info = vk::ShaderModuleCreateInfo::default().code(spirv_words);
+        let shader_module = unsafe {
+            self.device
+                .create_shader_module(&shader_info, None)
+                .map_err(|error| {
+                    self.device.destroy_pipeline_layout(pipeline_layout, None);
+                    self.device
+                        .destroy_descriptor_set_layout(descriptor_set_layout, None);
+                    VulkanError(format!("failed to create generic shader module: {error:?}"))
+                })?
+        };
+        let entry_point = CString::new("main").expect("static string has no nul");
+        let shader_stage = vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::COMPUTE)
+            .module(shader_module)
+            .name(&entry_point);
+        let pipeline_info = [vk::ComputePipelineCreateInfo::default()
+            .stage(shader_stage)
+            .layout(pipeline_layout)];
+        let pipeline = unsafe {
+            self.device
+                .create_compute_pipelines(vk::PipelineCache::null(), &pipeline_info, None)
+                .map_err(|(_, error)| {
+                    self.device.destroy_shader_module(shader_module, None);
+                    self.device.destroy_pipeline_layout(pipeline_layout, None);
+                    self.device
+                        .destroy_descriptor_set_layout(descriptor_set_layout, None);
+                    VulkanError(format!(
+                        "failed to create generic compute pipeline: {error:?}"
+                    ))
+                })?
+                .remove(0)
+        };
+
+        Ok(VulkanStoragePipeline {
+            descriptor_set_layout,
+            pipeline_layout,
+            shader_module,
+            pipeline,
+        })
+    }
 }
 
 impl Drop for VulkanComputeDevice {
@@ -1061,6 +1499,15 @@ impl Drop for VulkanComputeDevice {
         unsafe {
             let _ = self.device.device_wait_idle();
             for (_, pipeline) in self.u32_storage_pipelines.get_mut().drain() {
+                self.device.destroy_pipeline(pipeline.pipeline, None);
+                self.device
+                    .destroy_shader_module(pipeline.shader_module, None);
+                self.device
+                    .destroy_pipeline_layout(pipeline.pipeline_layout, None);
+                self.device
+                    .destroy_descriptor_set_layout(pipeline.descriptor_set_layout, None);
+            }
+            for (_, pipeline) in self.generic_storage_pipelines.get_mut().drain() {
                 self.device.destroy_pipeline(pipeline.pipeline, None);
                 self.device
                     .destroy_shader_module(pipeline.shader_module, None);
@@ -1259,6 +1706,20 @@ fn test_command_exists(command: &str) -> bool {
 mod tests {
     use super::*;
 
+    fn u32_bytes(values: &[u32]) -> Vec<u8> {
+        values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect()
+    }
+
+    fn bytes_to_u32(bytes: &[u8]) -> Vec<u32> {
+        bytes
+            .chunks_exact(std::mem::size_of::<u32>())
+            .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            .collect()
+    }
+
     #[test]
     fn smoke_dispatches_add_one_shader_when_vulkan_is_available() {
         let Some(spirv_words) = compile_test_shader_words() else {
@@ -1413,6 +1874,69 @@ mod tests {
         assert_eq!(buffer.read_bytes(3).unwrap(), vec![10, 20, 30]);
         assert!(buffer.read_bytes(17).is_err());
         assert!(buffer.write_bytes(&[0; 17]).is_err());
+    }
+
+    #[test]
+    fn generic_resident_kernel_dispatch_runs_on_raw_byte_buffer() {
+        let Some(spirv_words) = compile_test_shader_words() else {
+            eprintln!("skipping Vulkan smoke: no GLSL to SPIR-V compiler found");
+            return;
+        };
+        let device = match VulkanComputeDevice::new() {
+            Ok(device) => device,
+            Err(error) => {
+                eprintln!("skipping Vulkan smoke: {error}");
+                return;
+            }
+        };
+        let buffer = device.create_resident_buffer(12).unwrap();
+        buffer.write_bytes(&u32_bytes(&[1, 2, 41])).unwrap();
+        let binding = VulkanResidentKernelBufferBinding::new(0, &buffer, 12);
+
+        let dispatch = device
+            .create_resident_kernel_dispatch(&spirv_words, &[binding], 1, 64, 0)
+            .unwrap();
+        device.run_resident_kernel_dispatch(&dispatch, &[]).unwrap();
+
+        assert_eq!(dispatch.descriptor_count(), 1);
+        assert_eq!(dispatch.workgroup_count_x(), 1);
+        assert_eq!(dispatch.push_constant_byte_count(), 0);
+        assert_eq!(
+            bytes_to_u32(&buffer.read_bytes(12).unwrap()),
+            vec![2, 3, 42]
+        );
+    }
+
+    #[test]
+    fn generic_resident_kernel_dispatch_validates_push_constant_size() {
+        let Some(spirv_words) = compile_test_shader_words() else {
+            eprintln!("skipping Vulkan smoke: no GLSL to SPIR-V compiler found");
+            return;
+        };
+        let device = match VulkanComputeDevice::new() {
+            Ok(device) => device,
+            Err(error) => {
+                eprintln!("skipping Vulkan smoke: {error}");
+                return;
+            }
+        };
+        let buffer = device.create_resident_buffer(4).unwrap();
+        buffer.write_bytes(&u32_bytes(&[10])).unwrap();
+        let binding = VulkanResidentKernelBufferBinding::new(0, &buffer, 4);
+        let dispatch = device
+            .create_resident_kernel_dispatch(&spirv_words, &[binding], 1, 64, 4)
+            .unwrap();
+
+        let error = device
+            .run_resident_kernel_dispatch(&dispatch, &[])
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            VulkanError(
+                "resident kernel dispatch expects 4 push-constant bytes, got 0".to_string()
+            )
+        );
     }
 
     #[test]
