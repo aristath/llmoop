@@ -135,6 +135,19 @@ impl VulkanU32Backend {
         Self::from_descriptor(descriptor)
     }
 
+    pub fn from_artifact_manifest_file(
+        manifest_path: impl AsRef<Path>,
+        artifact_root: impl AsRef<Path>,
+    ) -> Result<Self, VulkanBackendError> {
+        let manifest =
+            VulkanBackendArtifactManifest::from_json_file(manifest_path).map_err(|error| {
+                VulkanBackendError::InvalidDescriptor(format!(
+                    "failed to read Vulkan backend artifact manifest: {error}"
+                ))
+            })?;
+        Self::from_artifact_manifest(manifest, artifact_root)
+    }
+
     pub fn device_name(&self) -> &str {
         self.device.device_name()
     }
@@ -586,6 +599,32 @@ mod tests {
         assert_eq!(backend.describe().permanent_circuit.pedal_count, 1);
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn vulkan_backend_can_be_installed_from_bundled_artifact_manifest_file() {
+        let artifact_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("artifacts")
+            .join("add_one");
+        let manifest_path = artifact_root.join("backend.json");
+        let mut backend =
+            match VulkanU32Backend::from_artifact_manifest_file(&manifest_path, &artifact_root) {
+                Ok(backend) => backend,
+                Err(error) => {
+                    eprintln!("skipping bundled Vulkan artifact smoke: {error}");
+                    return;
+                }
+            };
+        backend.create_stream("s0").unwrap();
+        backend
+            .inject_prompt(PromptInjection::new("s0", vec![6], 1))
+            .unwrap();
+
+        let run = backend.dispatch(16).unwrap();
+
+        assert_eq!(run.status, DispatchStatus::Idle);
+        assert_eq!(run.outputs.len(), 1);
+        assert_eq!(run.outputs[0].output.token_id, 7);
     }
 
     #[test]
