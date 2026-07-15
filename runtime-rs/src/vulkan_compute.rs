@@ -1,3 +1,5 @@
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::error::Error;
 use std::ffi::CString;
 use std::fmt::{Display, Formatter};
@@ -107,6 +109,29 @@ pub struct VulkanComputeDevice {
     queue_family_index: u32,
     queue: vk::Queue,
     device_name: String,
+    u32_storage_pipelines: RefCell<HashMap<VulkanPipelineKey, VulkanU32StoragePipeline>>,
+    pipeline_cache_hits: Cell<u64>,
+    pipeline_cache_misses: Cell<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanPipelineCacheStats {
+    pub u32_storage_pipelines: usize,
+    pub hits: u64,
+    pub misses: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct VulkanPipelineKey {
+    spirv_words: Vec<u32>,
+    local_size_x: u32,
+}
+
+struct VulkanU32StoragePipeline {
+    descriptor_set_layout: vk::DescriptorSetLayout,
+    pipeline_layout: vk::PipelineLayout,
+    shader_module: vk::ShaderModule,
+    pipeline: vk::Pipeline,
 }
 
 impl VulkanComputeDevice {
@@ -157,12 +182,23 @@ impl VulkanComputeDevice {
                 queue_family_index,
                 queue,
                 device_name,
+                u32_storage_pipelines: RefCell::new(HashMap::new()),
+                pipeline_cache_hits: Cell::new(0),
+                pipeline_cache_misses: Cell::new(0),
             })
         }
     }
 
     pub fn device_name(&self) -> &str {
         &self.device_name
+    }
+
+    pub fn pipeline_cache_stats(&self) -> VulkanPipelineCacheStats {
+        VulkanPipelineCacheStats {
+            u32_storage_pipelines: self.u32_storage_pipelines.borrow().len(),
+            hits: self.pipeline_cache_hits.get(),
+            misses: self.pipeline_cache_misses.get(),
+        }
     }
 
     pub fn run_u32_storage_shader(
@@ -180,6 +216,9 @@ impl VulkanComputeDevice {
         if local_size_x == 0 {
             return Err(VulkanError("local_size_x must not be zero".to_string()));
         }
+
+        let (descriptor_set_layout, pipeline_layout, pipeline) =
+            self.u32_storage_pipeline(spirv_words, local_size_x)?;
 
         unsafe {
             let byte_len = std::mem::size_of_val(input) as vk::DeviceSize;
@@ -222,53 +261,7 @@ impl VulkanComputeDevice {
 
             write_u32_memory(&self.device, memory, byte_len, input)?;
 
-            let descriptor_binding = [vk::DescriptorSetLayoutBinding::default()
-                .binding(0)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::COMPUTE)];
-            let descriptor_layout_info =
-                vk::DescriptorSetLayoutCreateInfo::default().bindings(&descriptor_binding);
-            let descriptor_set_layout = self
-                .device
-                .create_descriptor_set_layout(&descriptor_layout_info, None)
-                .map_err(|error| {
-                    VulkanError(format!("failed to create descriptor set layout: {error:?}"))
-                })?;
-
             let set_layouts = [descriptor_set_layout];
-            let pipeline_layout_info =
-                vk::PipelineLayoutCreateInfo::default().set_layouts(&set_layouts);
-            let pipeline_layout = self
-                .device
-                .create_pipeline_layout(&pipeline_layout_info, None)
-                .map_err(|error| {
-                    VulkanError(format!("failed to create pipeline layout: {error:?}"))
-                })?;
-
-            let shader_info = vk::ShaderModuleCreateInfo::default().code(spirv_words);
-            let shader_module = self
-                .device
-                .create_shader_module(&shader_info, None)
-                .map_err(|error| {
-                    VulkanError(format!("failed to create shader module: {error:?}"))
-                })?;
-            let entry_point = CString::new("main").expect("static string has no nul");
-            let shader_stage = vk::PipelineShaderStageCreateInfo::default()
-                .stage(vk::ShaderStageFlags::COMPUTE)
-                .module(shader_module)
-                .name(&entry_point);
-            let pipeline_info = [vk::ComputePipelineCreateInfo::default()
-                .stage(shader_stage)
-                .layout(pipeline_layout)];
-            let pipeline = self
-                .device
-                .create_compute_pipelines(vk::PipelineCache::null(), &pipeline_info, None)
-                .map_err(|(_, error)| {
-                    VulkanError(format!("failed to create compute pipeline: {error:?}"))
-                })?
-                .remove(0);
-
             let pool_sizes = [vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::STORAGE_BUFFER,
                 descriptor_count: 1,
@@ -362,16 +355,107 @@ impl VulkanComputeDevice {
 
             self.device.destroy_command_pool(command_pool, None);
             self.device.destroy_descriptor_pool(descriptor_pool, None);
-            self.device.destroy_pipeline(pipeline, None);
-            self.device.destroy_shader_module(shader_module, None);
-            self.device.destroy_pipeline_layout(pipeline_layout, None);
-            self.device
-                .destroy_descriptor_set_layout(descriptor_set_layout, None);
             self.device.destroy_buffer(buffer, None);
             self.device.free_memory(memory, None);
 
             Ok(output)
         }
+    }
+
+    fn u32_storage_pipeline(
+        &self,
+        spirv_words: &[u32],
+        local_size_x: u32,
+    ) -> Result<(vk::DescriptorSetLayout, vk::PipelineLayout, vk::Pipeline), VulkanError> {
+        let key = VulkanPipelineKey {
+            spirv_words: spirv_words.to_vec(),
+            local_size_x,
+        };
+        if let Some(pipeline) = self.u32_storage_pipelines.borrow().get(&key) {
+            self.pipeline_cache_hits
+                .set(self.pipeline_cache_hits.get() + 1);
+            return Ok((
+                pipeline.descriptor_set_layout,
+                pipeline.pipeline_layout,
+                pipeline.pipeline,
+            ));
+        }
+
+        let pipeline = unsafe { self.create_u32_storage_pipeline(spirv_words)? };
+        let handles = (
+            pipeline.descriptor_set_layout,
+            pipeline.pipeline_layout,
+            pipeline.pipeline,
+        );
+        self.u32_storage_pipelines
+            .borrow_mut()
+            .insert(key, pipeline);
+        self.pipeline_cache_misses
+            .set(self.pipeline_cache_misses.get() + 1);
+        Ok(handles)
+    }
+
+    unsafe fn create_u32_storage_pipeline(
+        &self,
+        spirv_words: &[u32],
+    ) -> Result<VulkanU32StoragePipeline, VulkanError> {
+        let descriptor_binding = [vk::DescriptorSetLayoutBinding::default()
+            .binding(0)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::COMPUTE)];
+        let descriptor_layout_info =
+            vk::DescriptorSetLayoutCreateInfo::default().bindings(&descriptor_binding);
+        let descriptor_set_layout = unsafe {
+            self.device
+                .create_descriptor_set_layout(&descriptor_layout_info, None)
+                .map_err(|error| {
+                    VulkanError(format!("failed to create descriptor set layout: {error:?}"))
+                })?
+        };
+
+        let set_layouts = [descriptor_set_layout];
+        let pipeline_layout_info =
+            vk::PipelineLayoutCreateInfo::default().set_layouts(&set_layouts);
+        let pipeline_layout = unsafe {
+            self.device
+                .create_pipeline_layout(&pipeline_layout_info, None)
+                .map_err(|error| {
+                    VulkanError(format!("failed to create pipeline layout: {error:?}"))
+                })?
+        };
+
+        let shader_info = vk::ShaderModuleCreateInfo::default().code(spirv_words);
+        let shader_module = unsafe {
+            self.device
+                .create_shader_module(&shader_info, None)
+                .map_err(|error| {
+                    VulkanError(format!("failed to create shader module: {error:?}"))
+                })?
+        };
+        let entry_point = CString::new("main").expect("static string has no nul");
+        let shader_stage = vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::COMPUTE)
+            .module(shader_module)
+            .name(&entry_point);
+        let pipeline_info = [vk::ComputePipelineCreateInfo::default()
+            .stage(shader_stage)
+            .layout(pipeline_layout)];
+        let pipeline = unsafe {
+            self.device
+                .create_compute_pipelines(vk::PipelineCache::null(), &pipeline_info, None)
+                .map_err(|(_, error)| {
+                    VulkanError(format!("failed to create compute pipeline: {error:?}"))
+                })?
+                .remove(0)
+        };
+
+        Ok(VulkanU32StoragePipeline {
+            descriptor_set_layout,
+            pipeline_layout,
+            shader_module,
+            pipeline,
+        })
     }
 }
 
@@ -379,6 +463,15 @@ impl Drop for VulkanComputeDevice {
     fn drop(&mut self) {
         unsafe {
             let _ = self.device.device_wait_idle();
+            for (_, pipeline) in self.u32_storage_pipelines.get_mut().drain() {
+                self.device.destroy_pipeline(pipeline.pipeline, None);
+                self.device
+                    .destroy_shader_module(pipeline.shader_module, None);
+                self.device
+                    .destroy_pipeline_layout(pipeline.pipeline_layout, None);
+                self.device
+                    .destroy_descriptor_set_layout(pipeline.descriptor_set_layout, None);
+            }
             self.device.destroy_device(None);
             self.instance.destroy_instance(None);
         }
@@ -566,12 +659,36 @@ mod tests {
             }
         };
 
+        assert_eq!(
+            device.pipeline_cache_stats(),
+            VulkanPipelineCacheStats {
+                u32_storage_pipelines: 0,
+                hits: 0,
+                misses: 0
+            }
+        );
         let first = device
             .run_u32_storage_shader(&spirv_words, &[7, 8, 9], 64)
             .unwrap();
+        assert_eq!(
+            device.pipeline_cache_stats(),
+            VulkanPipelineCacheStats {
+                u32_storage_pipelines: 1,
+                hits: 0,
+                misses: 1
+            }
+        );
         let second = device
             .run_u32_storage_shader(&spirv_words, &[40, 41], 64)
             .unwrap();
+        assert_eq!(
+            device.pipeline_cache_stats(),
+            VulkanPipelineCacheStats {
+                u32_storage_pipelines: 1,
+                hits: 1,
+                misses: 1
+            }
+        );
 
         assert!(!device.device_name().is_empty());
         assert_eq!(first, vec![8, 9, 10]);
