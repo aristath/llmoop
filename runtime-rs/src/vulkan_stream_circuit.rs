@@ -7692,6 +7692,223 @@ mod tests {
                                                             0x79, 0x3e, 0x99, 0x3e,
                                                         ]
                                                     );
+
+                                                    if let Some(ffn_projection_spirv_words) =
+                                                        crate::vulkan_compute::compile_test_shader_words_from_source(
+                                                            "linear_bf16_1024x2560.comp",
+                                                        )
+                                                    {
+                                                        mounted
+                                                            .parameter_buffers
+                                                            .load_parameter_from_tensor_index(
+                                                                &tensor_index,
+                                                                "model.layers.0.feed_forward.w1.weight",
+                                                            )
+                                                            .unwrap();
+                                                        let ffn_gate_dispatch = mounted_bound
+                                                            .dispatch(
+                                                                "layer_00",
+                                                                "ffn_gate_projection",
+                                                            )
+                                                            .unwrap();
+                                                        assert_eq!(ffn_gate_dispatch.op, "linear");
+                                                        let ffn_gate_bindings = mounted
+                                                            .resident_kernel_buffer_bindings_for_bound_dispatch(
+                                                                ffn_gate_dispatch,
+                                                            )
+                                                            .unwrap();
+                                                        assert_eq!(ffn_gate_bindings.len(), 3);
+                                                        assert!(
+                                                            ffn_gate_bindings[0].byte_len >= 2_048
+                                                        );
+                                                        assert_eq!(
+                                                            ffn_gate_bindings[1].byte_len,
+                                                            5_120
+                                                        );
+                                                        assert_eq!(
+                                                            ffn_gate_bindings[2].byte_len,
+                                                            5_242_880
+                                                        );
+                                                        let ffn_gate_family = mounted
+                                                            .placed_plan
+                                                            .reusable_kernel_plan
+                                                            .family(
+                                                                &ffn_gate_dispatch
+                                                                    .reusable_family_id,
+                                                            )
+                                                            .unwrap();
+                                                        let ffn_gate_artifact_path = format!(
+                                                            "kernels/{}.spv",
+                                                            ffn_gate_dispatch.reusable_family_id
+                                                        );
+                                                        let ffn_gate_kernel_manifest =
+                                                            VulkanLoadedReusableKernelArtifactManifest {
+                                                                schema:
+                                                                    VULKAN_REUSABLE_KERNEL_ARTIFACT_MANIFEST_SCHEMA
+                                                                        .to_string(),
+                                                                backend_id:
+                                                                    VULKAN_STREAM_CIRCUIT_BACKEND_ID
+                                                                        .to_string(),
+                                                                total_word_count:
+                                                                    ffn_projection_spirv_words
+                                                                        .len(),
+                                                                artifacts: vec![
+                                                                    VulkanLoadedReusableKernelArtifact {
+                                                                        artifact:
+                                                                            VulkanReusableKernelArtifact::from_family(
+                                                                                ffn_gate_family,
+                                                                                ffn_gate_artifact_path.clone(),
+                                                                            ),
+                                                                        resolved_path:
+                                                                            PathBuf::from(
+                                                                                ffn_gate_artifact_path,
+                                                                            ),
+                                                                        words:
+                                                                            ffn_projection_spirv_words
+                                                                                .clone(),
+                                                                    },
+                                                                ],
+                                                            };
+                                                        let ffn_gate_resident_dispatch = mounted
+                                                            .create_resident_kernel_dispatch_for_bound_dispatch(
+                                                                &device,
+                                                                ffn_gate_dispatch,
+                                                                &ffn_gate_kernel_manifest,
+                                                            )
+                                                            .unwrap();
+                                                        assert!(
+                                                            ffn_gate_resident_dispatch
+                                                                .workgroup_count_x()
+                                                                >= 20
+                                                        );
+
+                                                        device
+                                                            .run_resident_kernel_dispatch(
+                                                                &ffn_gate_resident_dispatch,
+                                                                &[0u8; 16],
+                                                            )
+                                                            .unwrap();
+
+                                                        assert_eq!(
+                                                            ffn_gate_bindings[1]
+                                                                .buffer
+                                                                .read_bytes(16)
+                                                                .unwrap(),
+                                                            vec![
+                                                                0x0a, 0x3d, 0x16, 0x3e, 0xea,
+                                                                0x3d, 0x7c, 0x3e, 0x88, 0x3e,
+                                                                0x07, 0x3e, 0x4a, 0x3e, 0x38,
+                                                                0x3d,
+                                                            ]
+                                                        );
+
+                                                        mounted
+                                                            .parameter_buffers
+                                                            .load_parameter_from_tensor_index(
+                                                                &tensor_index,
+                                                                "model.layers.0.feed_forward.w3.weight",
+                                                            )
+                                                            .unwrap();
+                                                        let ffn_up_dispatch = mounted_bound
+                                                            .dispatch(
+                                                                "layer_00",
+                                                                "ffn_up_projection",
+                                                            )
+                                                            .unwrap();
+                                                        assert_eq!(ffn_up_dispatch.op, "linear");
+                                                        let ffn_up_bindings = mounted
+                                                            .resident_kernel_buffer_bindings_for_bound_dispatch(
+                                                                ffn_up_dispatch,
+                                                            )
+                                                            .unwrap();
+                                                        assert_eq!(ffn_up_bindings.len(), 3);
+                                                        assert!(
+                                                            ffn_up_bindings[0].byte_len >= 2_048
+                                                        );
+                                                        assert_eq!(
+                                                            ffn_up_bindings[1].byte_len,
+                                                            5_120
+                                                        );
+                                                        assert_eq!(
+                                                            ffn_up_bindings[2].byte_len,
+                                                            5_242_880
+                                                        );
+                                                        let ffn_up_family = mounted
+                                                            .placed_plan
+                                                            .reusable_kernel_plan
+                                                            .family(
+                                                                &ffn_up_dispatch
+                                                                    .reusable_family_id,
+                                                            )
+                                                            .unwrap();
+                                                        let ffn_up_artifact_path = format!(
+                                                            "kernels/{}.spv",
+                                                            ffn_up_dispatch.reusable_family_id
+                                                        );
+                                                        let ffn_up_kernel_manifest =
+                                                            VulkanLoadedReusableKernelArtifactManifest {
+                                                                schema:
+                                                                    VULKAN_REUSABLE_KERNEL_ARTIFACT_MANIFEST_SCHEMA
+                                                                        .to_string(),
+                                                                backend_id:
+                                                                    VULKAN_STREAM_CIRCUIT_BACKEND_ID
+                                                                        .to_string(),
+                                                                total_word_count:
+                                                                    ffn_projection_spirv_words
+                                                                        .len(),
+                                                                artifacts: vec![
+                                                                    VulkanLoadedReusableKernelArtifact {
+                                                                        artifact:
+                                                                            VulkanReusableKernelArtifact::from_family(
+                                                                                ffn_up_family,
+                                                                                ffn_up_artifact_path.clone(),
+                                                                            ),
+                                                                        resolved_path:
+                                                                            PathBuf::from(
+                                                                                ffn_up_artifact_path,
+                                                                            ),
+                                                                        words:
+                                                                            ffn_projection_spirv_words,
+                                                                    },
+                                                                ],
+                                                            };
+                                                        let ffn_up_resident_dispatch = mounted
+                                                            .create_resident_kernel_dispatch_for_bound_dispatch(
+                                                                &device,
+                                                                ffn_up_dispatch,
+                                                                &ffn_up_kernel_manifest,
+                                                            )
+                                                            .unwrap();
+                                                        assert!(
+                                                            ffn_up_resident_dispatch
+                                                                .workgroup_count_x()
+                                                                >= 20
+                                                        );
+
+                                                        device
+                                                            .run_resident_kernel_dispatch(
+                                                                &ffn_up_resident_dispatch,
+                                                                &[0u8; 16],
+                                                            )
+                                                            .unwrap();
+
+                                                        assert_eq!(
+                                                            ffn_up_bindings[1]
+                                                                .buffer
+                                                                .read_bytes(16)
+                                                                .unwrap(),
+                                                            vec![
+                                                                0x35, 0xbe, 0xe6, 0xbe, 0x5d,
+                                                                0xbe, 0x1d, 0x3e, 0x2a, 0xbe,
+                                                                0x8b, 0x3c, 0x5e, 0x3e, 0xb1,
+                                                                0xbe,
+                                                            ]
+                                                        );
+                                                    } else {
+                                                        eprintln!(
+                                                            "skipping BF16 FFN projection Vulkan dispatches: no GLSL to SPIR-V compiler found"
+                                                        );
+                                                    }
                                                 } else {
                                                     eprintln!(
                                                         "skipping BF16 FFN RMSNorm Vulkan dispatch: no GLSL to SPIR-V compiler found"
