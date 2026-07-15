@@ -7159,13 +7159,105 @@ mod tests {
                                 )
                                 .unwrap();
 
+                            let gated_x_first_16 = vec![
+                                0x69, 0xbd, 0xe0, 0x3d, 0x8b, 0xbb, 0xe6, 0x3c, 0x2f, 0x3e, 0xba,
+                                0x3a, 0x80, 0x3d, 0x9a, 0x3d,
+                            ];
                             assert_eq!(
                                 multiply_bindings[2].buffer.read_bytes(16).unwrap(),
-                                vec![
-                                    0x69, 0xbd, 0xe0, 0x3d, 0x8b, 0xbb, 0xe6, 0x3c, 0x2f, 0x3e,
-                                    0xba, 0x3a, 0x80, 0x3d, 0x9a, 0x3d,
-                                ]
+                                gated_x_first_16.clone()
                             );
+
+                            if let Some(rolling_spirv_words) =
+                                crate::vulkan_compute::compile_test_shader_words_from_source(
+                                    "rolling_state_update_bf16_3x1024.comp",
+                                )
+                            {
+                                let rolling_dispatch = mounted_bound
+                                    .dispatch("layer_00", "temporal_memory_update")
+                                    .unwrap();
+                                assert_eq!(
+                                    rolling_dispatch.reusable_family_id,
+                                    "rolling_state_update"
+                                );
+                                let rolling_bindings = mounted
+                                    .resident_kernel_buffer_bindings_for_bound_dispatch(
+                                        rolling_dispatch,
+                                    )
+                                    .unwrap();
+                                assert_eq!(
+                                    rolling_bindings
+                                        .iter()
+                                        .map(|binding| binding.byte_len)
+                                        .collect::<Vec<_>>(),
+                                    vec![6_144, 6_144, 6_144, 6_144, 6_144, 6_144]
+                                );
+                                let zero_temporal_memory = vec![0u8; 6_144];
+                                rolling_bindings[3]
+                                    .buffer
+                                    .write_bytes(&zero_temporal_memory)
+                                    .unwrap();
+                                rolling_bindings[4]
+                                    .buffer
+                                    .write_bytes(&zero_temporal_memory)
+                                    .unwrap();
+                                let rolling_family = mounted
+                                    .placed_plan
+                                    .reusable_kernel_plan
+                                    .family(&rolling_dispatch.reusable_family_id)
+                                    .unwrap();
+                                let rolling_kernel_manifest =
+                                    VulkanLoadedReusableKernelArtifactManifest {
+                                        schema: VULKAN_REUSABLE_KERNEL_ARTIFACT_MANIFEST_SCHEMA
+                                            .to_string(),
+                                        backend_id: VULKAN_STREAM_CIRCUIT_BACKEND_ID.to_string(),
+                                        total_word_count: rolling_spirv_words.len(),
+                                        artifacts: vec![VulkanLoadedReusableKernelArtifact {
+                                            artifact: VulkanReusableKernelArtifact::from_family(
+                                                rolling_family,
+                                                "kernels/rolling_state_update.spv",
+                                            ),
+                                            resolved_path: PathBuf::from(
+                                                "kernels/rolling_state_update.spv",
+                                            ),
+                                            words: rolling_spirv_words,
+                                        }],
+                                    };
+                                let rolling_resident_dispatch = mounted
+                                    .create_resident_kernel_dispatch_for_bound_dispatch(
+                                        &device,
+                                        rolling_dispatch,
+                                        &rolling_kernel_manifest,
+                                    )
+                                    .unwrap();
+                                assert_eq!(rolling_resident_dispatch.workgroup_count_x(), 1);
+
+                                device
+                                    .run_resident_kernel_dispatch(
+                                        &rolling_resident_dispatch,
+                                        &[0u8; 16],
+                                    )
+                                    .unwrap();
+
+                                let temporal_window =
+                                    rolling_bindings[2].buffer.read_bytes(6_144).unwrap();
+                                assert!(
+                                    temporal_window[..4_096].iter().all(|byte| *byte == 0),
+                                    "first two temporal frames should be empty after a zero-state first tick"
+                                );
+                                assert_eq!(
+                                    &temporal_window[4_096..4_112],
+                                    gated_x_first_16.as_slice()
+                                );
+                                assert_eq!(
+                                    rolling_bindings[4].buffer.read_bytes(6_144).unwrap(),
+                                    temporal_window
+                                );
+                            } else {
+                                eprintln!(
+                                    "skipping BF16 rolling state Vulkan dispatch: no GLSL to SPIR-V compiler found"
+                                );
+                            }
                         } else {
                             eprintln!(
                                 "skipping BF16 multiply Vulkan dispatch: no GLSL to SPIR-V compiler found"
