@@ -16,12 +16,13 @@ use crate::vulkan::{
 };
 use crate::vulkan_compute::{
     VulkanComputeDevice, VulkanError, VulkanPipelineCacheStats, VulkanU32ResidentBuffer,
-    VulkanU32ResidentDispatch, VulkanU32ShaderPedal,
+    VulkanU32ResidentCopy, VulkanU32ResidentDispatch, VulkanU32ShaderPedal,
 };
 use crate::vulkan_pedalboard::VulkanU32Pedalboard;
 
 const VULKAN_U32_TOKEN_PORT_CAPACITY: usize = 1;
 const VULKAN_U32_STREAM_PORT_COUNT: usize = 3;
+const VULKAN_U32_STREAM_ROUTE_COUNT: usize = 3;
 const VULKAN_U32_STREAM_PORT_BYTES: usize =
     VULKAN_U32_STREAM_PORT_COUNT * std::mem::size_of::<u32>();
 
@@ -126,8 +127,40 @@ impl VulkanU32StreamInput {
     }
 }
 
+struct VulkanU32StreamRoutes {
+    private_feedback_to_signal: VulkanU32ResidentCopy,
+    signal_to_private_feedback: VulkanU32ResidentCopy,
+    signal_to_public_output: VulkanU32ResidentCopy,
+}
+
+impl VulkanU32StreamRoutes {
+    fn new(
+        device: &VulkanComputeDevice,
+        ports: &VulkanU32StreamPorts,
+    ) -> Result<Self, VulkanError> {
+        Ok(Self {
+            private_feedback_to_signal: device.create_u32_resident_copy(
+                &ports.private_feedback,
+                &ports.signal_frame,
+                VULKAN_U32_TOKEN_PORT_CAPACITY,
+            )?,
+            signal_to_private_feedback: device.create_u32_resident_copy(
+                &ports.signal_frame,
+                &ports.private_feedback,
+                VULKAN_U32_TOKEN_PORT_CAPACITY,
+            )?,
+            signal_to_public_output: device.create_u32_resident_copy(
+                &ports.signal_frame,
+                &ports.public_output,
+                VULKAN_U32_TOKEN_PORT_CAPACITY,
+            )?,
+        })
+    }
+}
+
 struct VulkanU32MountedStream {
     signal_dispatches: Vec<VulkanU32ResidentDispatch>,
+    routes: VulkanU32StreamRoutes,
     ports: VulkanU32StreamPorts,
 }
 
@@ -139,8 +172,10 @@ impl VulkanU32MountedStream {
         let ports = VulkanU32StreamPorts::new(device)?;
         let signal_dispatches =
             pedalboard.create_resident_dispatches(device, &ports.signal_frame, 1)?;
+        let routes = VulkanU32StreamRoutes::new(device, &ports)?;
         Ok(Self {
             signal_dispatches,
+            routes,
             ports,
         })
     }
@@ -153,8 +188,10 @@ impl VulkanU32MountedStream {
         let ports = VulkanU32StreamPorts::clone_from(device, &source.ports)?;
         let signal_dispatches =
             pedalboard.create_resident_dispatches(device, &ports.signal_frame, 1)?;
+        let routes = VulkanU32StreamRoutes::new(device, &ports)?;
         Ok(Self {
             signal_dispatches,
+            routes,
             ports,
         })
     }
@@ -182,9 +219,8 @@ impl VulkanU32MountedStream {
         pedalboard: &VulkanU32Pedalboard,
         emit_public: bool,
     ) -> Result<VulkanU32StreamAdvance, VulkanBackendError> {
-        device.copy_u32_resident_buffer(
-            &self.ports.private_feedback,
-            &self.ports.signal_frame,
+        device.run_u32_resident_copy(
+            &self.routes.private_feedback_to_signal,
             VULKAN_U32_TOKEN_PORT_CAPACITY,
         )?;
         self.advance_signal_frame(device, pedalboard, emit_public)
@@ -207,15 +243,13 @@ impl VulkanU32MountedStream {
             .first()
             .copied()
             .ok_or(VulkanBackendError::EmptyPedalOutput)?;
-        device.copy_u32_resident_buffer(
-            &self.ports.signal_frame,
-            &self.ports.private_feedback,
+        device.run_u32_resident_copy(
+            &self.routes.signal_to_private_feedback,
             VULKAN_U32_TOKEN_PORT_CAPACITY,
         )?;
         if emit_public {
-            device.copy_u32_resident_buffer(
-                &self.ports.signal_frame,
-                &self.ports.public_output,
+            device.run_u32_resident_copy(
+                &self.routes.signal_to_public_output,
                 VULKAN_U32_TOKEN_PORT_CAPACITY,
             )?;
         }
@@ -708,6 +742,13 @@ impl DeviceBackend for VulkanU32Backend {
                         static_shape: Some(vec![self.pedalboard.pedals().len()]),
                         elements_per_token: None,
                     },
+                    StateAllocation {
+                        pedal_id: "mounted_stream".to_string(),
+                        state_id: "port_routes".to_string(),
+                        state_type: "vulkan_resident_copy_bindings".to_string(),
+                        static_shape: Some(vec![VULKAN_U32_STREAM_ROUTE_COUNT]),
+                        elements_per_token: None,
+                    },
                 ],
             },
             memory_plan: DeviceMemoryPlan {
@@ -1082,7 +1123,7 @@ mod tests {
             manifest.host_ports.private_feedback,
             "device_owned_insert_loop"
         );
-        assert_eq!(manifest.stream_template.state_allocations.len(), 4);
+        assert_eq!(manifest.stream_template.state_allocations.len(), 5);
         assert!(
             manifest
                 .stream_template
@@ -1097,6 +1138,14 @@ mod tests {
                 .iter()
                 .any(|allocation| allocation.state_id == "signal_dispatches"
                     && allocation.static_shape == Some(vec![1]))
+        );
+        assert!(
+            manifest
+                .stream_template
+                .state_allocations
+                .iter()
+                .any(|allocation| allocation.state_id == "port_routes"
+                    && allocation.static_shape == Some(vec![VULKAN_U32_STREAM_ROUTE_COUNT]))
         );
         assert!(
             manifest
