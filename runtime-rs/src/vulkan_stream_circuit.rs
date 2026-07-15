@@ -13,7 +13,10 @@ use crate::stream_plan::{
     StreamCircuitResourcePlan, TensorIndex,
 };
 use crate::vulkan::{DEFAULT_COMPUTE_LOCAL_SIZE_X, DEFAULT_SPIRV_ENTRY_POINT, read_spirv_words};
-use crate::vulkan_compute::{VulkanComputeDevice, VulkanError, VulkanResidentBuffer};
+use crate::vulkan_compute::{
+    VulkanComputeDevice, VulkanError, VulkanResidentBuffer, VulkanResidentKernelBufferBinding,
+    VulkanResidentKernelDispatch,
+};
 
 pub const VULKAN_STREAM_CIRCUIT_BACKEND_ID: &str = "vulkan_stream_circuit_ir";
 pub const VULKAN_REUSABLE_KERNEL_ARTIFACT_MANIFEST_SCHEMA: &str =
@@ -1442,6 +1445,201 @@ impl VulkanMountedPlacedStreamCircuit {
     ) -> Result<VulkanMountedPlacedStreamTickRun, VulkanMountedPlacedStreamTickError> {
         let tick_plan = self.stream_tick_plan(manifest)?;
         Ok(tick_plan.advance(stream_tick))
+    }
+
+    pub fn resident_kernel_buffer_bindings_for_bound_dispatch<'a>(
+        &'a self,
+        dispatch: &VulkanMountedPlacedBoundDispatch,
+    ) -> Result<
+        Vec<VulkanResidentKernelBufferBinding<'a>>,
+        VulkanMountedPlacedResidentKernelDispatchError,
+    > {
+        dispatch
+            .descriptors
+            .iter()
+            .map(|descriptor| self.resident_kernel_buffer_binding(dispatch, descriptor))
+            .collect()
+    }
+
+    pub fn create_resident_kernel_dispatch_for_bound_dispatch(
+        &self,
+        device: &VulkanComputeDevice,
+        dispatch: &VulkanMountedPlacedBoundDispatch,
+        loaded_manifest: &VulkanLoadedReusableKernelArtifactManifest,
+    ) -> Result<VulkanResidentKernelDispatch, VulkanMountedPlacedResidentKernelDispatchError> {
+        let artifact = loaded_manifest
+            .artifact(&dispatch.reusable_family_id)
+            .ok_or_else(|| {
+                VulkanMountedPlacedResidentKernelDispatchError::MissingLoadedArtifact {
+                    dispatch_index: dispatch.dispatch_index,
+                    family_id: dispatch.reusable_family_id.clone(),
+                }
+            })?;
+        let buffer_bindings = self.resident_kernel_buffer_bindings_for_bound_dispatch(dispatch)?;
+        let workgroup_count_x = 1;
+        device
+            .create_resident_kernel_dispatch(
+                &artifact.words,
+                &buffer_bindings,
+                workgroup_count_x,
+                dispatch.local_size_x,
+                push_constant_byte_count(&dispatch.push_constants)?,
+            )
+            .map_err(VulkanMountedPlacedResidentKernelDispatchError::Vulkan)
+    }
+
+    fn resident_kernel_buffer_binding<'a>(
+        &'a self,
+        dispatch: &VulkanMountedPlacedBoundDispatch,
+        descriptor: &VulkanMountedPlacedBoundDescriptor,
+    ) -> Result<VulkanResidentKernelBufferBinding<'a>, VulkanMountedPlacedResidentKernelDispatchError>
+    {
+        let binding = u32::try_from(descriptor.binding).map_err(|_| {
+            VulkanMountedPlacedResidentKernelDispatchError::DescriptorBindingOverflow {
+                dispatch_index: dispatch.dispatch_index,
+                binding: descriptor.binding,
+            }
+        })?;
+        let (buffer, byte_len) = match &descriptor.target {
+            VulkanMountedPlacedBoundDescriptorTarget::Resident { target } => {
+                self.resident_kernel_buffer_for_resident_target(dispatch, descriptor, target)?
+            }
+            VulkanMountedPlacedBoundDescriptorTarget::ModelInput { signal_id }
+            | VulkanMountedPlacedBoundDescriptorTarget::ModelOutput { signal_id } => {
+                return Err(
+                    VulkanMountedPlacedResidentKernelDispatchError::ModelBoundaryBufferUnavailable {
+                        dispatch_index: dispatch.dispatch_index,
+                        binding: descriptor.binding,
+                        signal_id: signal_id.clone(),
+                    },
+                );
+            }
+            VulkanMountedPlacedBoundDescriptorTarget::LocalCableInputBuffer { cable }
+            | VulkanMountedPlacedBoundDescriptorTarget::LocalCableOutputBuffer { cable } => {
+                let allocation = self
+                    .cable_io
+                    .local_buffers
+                    .get(cable.buffer_index)
+                    .ok_or_else(|| {
+                        VulkanMountedPlacedResidentKernelDispatchError::MissingMountedBuffer {
+                            dispatch_index: dispatch.dispatch_index,
+                            binding: descriptor.binding,
+                            buffer_kind: "local_cable".to_string(),
+                            buffer_index: cable.buffer_index,
+                        }
+                    })?;
+                (&allocation.buffer, cable.byte_capacity)
+            }
+            VulkanMountedPlacedBoundDescriptorTarget::IncomingCableBuffer { endpoint } => {
+                let allocation = self
+                    .cable_io
+                    .incoming_buffers
+                    .get(endpoint.buffer_index)
+                    .ok_or_else(|| {
+                        VulkanMountedPlacedResidentKernelDispatchError::MissingMountedBuffer {
+                            dispatch_index: dispatch.dispatch_index,
+                            binding: descriptor.binding,
+                            buffer_kind: "incoming_cable".to_string(),
+                            buffer_index: endpoint.buffer_index,
+                        }
+                    })?;
+                (&allocation.buffer, endpoint.byte_capacity)
+            }
+            VulkanMountedPlacedBoundDescriptorTarget::OutgoingCableBuffer { endpoint } => {
+                let allocation = self
+                    .cable_io
+                    .outgoing_buffers
+                    .get(endpoint.buffer_index)
+                    .ok_or_else(|| {
+                        VulkanMountedPlacedResidentKernelDispatchError::MissingMountedBuffer {
+                            dispatch_index: dispatch.dispatch_index,
+                            binding: descriptor.binding,
+                            buffer_kind: "outgoing_cable".to_string(),
+                            buffer_index: endpoint.buffer_index,
+                        }
+                    })?;
+                (&allocation.buffer, endpoint.byte_capacity)
+            }
+        };
+
+        Ok(VulkanResidentKernelBufferBinding::new(
+            binding, buffer, byte_len,
+        ))
+    }
+
+    fn resident_kernel_buffer_for_resident_target<'a>(
+        &'a self,
+        dispatch: &VulkanMountedPlacedBoundDispatch,
+        descriptor: &VulkanMountedPlacedBoundDescriptor,
+        target: &VulkanBoundDescriptorTarget,
+    ) -> Result<(&'a VulkanResidentBuffer, usize), VulkanMountedPlacedResidentKernelDispatchError>
+    {
+        match target {
+            VulkanBoundDescriptorTarget::PermanentParameter {
+                param_id,
+                tensor,
+                byte_count,
+            } => Err(
+                VulkanMountedPlacedResidentKernelDispatchError::PermanentParameterBufferUnavailable {
+                    dispatch_index: dispatch.dispatch_index,
+                    binding: descriptor.binding,
+                    param_id: param_id.clone(),
+                    tensor: tensor.clone(),
+                    byte_count: *byte_count,
+                },
+            ),
+            VulkanBoundDescriptorTarget::BoundaryInput { signal_id }
+            | VulkanBoundDescriptorTarget::BoundaryOutput { signal_id } => Err(
+                VulkanMountedPlacedResidentKernelDispatchError::ModelBoundaryBufferUnavailable {
+                    dispatch_index: dispatch.dispatch_index,
+                    binding: descriptor.binding,
+                    signal_id: signal_id.clone(),
+                },
+            ),
+            VulkanBoundDescriptorTarget::ActivationSlot {
+                buffer_index,
+                byte_capacity,
+                ..
+            } => {
+                let allocation = self
+                    .buffers
+                    .activation_slot_buffers
+                    .get(*buffer_index)
+                    .ok_or_else(|| {
+                        VulkanMountedPlacedResidentKernelDispatchError::MissingMountedBuffer {
+                            dispatch_index: dispatch.dispatch_index,
+                            binding: descriptor.binding,
+                            buffer_kind: "activation_slot".to_string(),
+                            buffer_index: *buffer_index,
+                        }
+                    })?;
+                Ok((&allocation.buffer, *byte_capacity))
+            }
+            VulkanBoundDescriptorTarget::StreamStateBuffer {
+                buffer_index,
+                byte_capacity,
+                ..
+            }
+            | VulkanBoundDescriptorTarget::StreamStateView {
+                buffer_index,
+                byte_capacity,
+                ..
+            } => {
+                let allocation = self
+                    .buffers
+                    .state_buffers
+                    .get(*buffer_index)
+                    .ok_or_else(|| {
+                        VulkanMountedPlacedResidentKernelDispatchError::MissingMountedBuffer {
+                            dispatch_index: dispatch.dispatch_index,
+                            binding: descriptor.binding,
+                            buffer_kind: "stream_state".to_string(),
+                            buffer_index: *buffer_index,
+                        }
+                    })?;
+                Ok((&allocation.buffer, *byte_capacity))
+            }
+        }
     }
 }
 
@@ -3866,6 +4064,123 @@ impl From<VulkanBoundDispatchPlanError> for VulkanMountedPlacedStreamTickError {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VulkanMountedPlacedResidentKernelDispatchError {
+    MissingLoadedArtifact {
+        dispatch_index: usize,
+        family_id: String,
+    },
+    DescriptorBindingOverflow {
+        dispatch_index: usize,
+        binding: usize,
+    },
+    MissingMountedBuffer {
+        dispatch_index: usize,
+        binding: usize,
+        buffer_kind: String,
+        buffer_index: usize,
+    },
+    PermanentParameterBufferUnavailable {
+        dispatch_index: usize,
+        binding: usize,
+        param_id: String,
+        tensor: String,
+        byte_count: Option<usize>,
+    },
+    ModelBoundaryBufferUnavailable {
+        dispatch_index: usize,
+        binding: usize,
+        signal_id: String,
+    },
+    UnsupportedPushConstantScalar {
+        scalar_type: String,
+    },
+    PushConstantByteCountOverflow,
+    Vulkan(VulkanError),
+}
+
+impl Display for VulkanMountedPlacedResidentKernelDispatchError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingLoadedArtifact {
+                dispatch_index,
+                family_id,
+            } => write!(
+                f,
+                "dispatch {dispatch_index} cannot create a resident kernel dispatch because loaded artifact {family_id:?} is missing"
+            ),
+            Self::DescriptorBindingOverflow {
+                dispatch_index,
+                binding,
+            } => write!(
+                f,
+                "dispatch {dispatch_index} descriptor binding {binding} cannot fit in u32"
+            ),
+            Self::MissingMountedBuffer {
+                dispatch_index,
+                binding,
+                buffer_kind,
+                buffer_index,
+            } => write!(
+                f,
+                "dispatch {dispatch_index} descriptor {binding} references missing mounted {buffer_kind} buffer {buffer_index}"
+            ),
+            Self::PermanentParameterBufferUnavailable {
+                dispatch_index,
+                binding,
+                param_id,
+                tensor,
+                byte_count,
+            } => write!(
+                f,
+                "dispatch {dispatch_index} descriptor {binding} references permanent parameter {param_id:?} tensor {tensor:?} ({byte_count:?} bytes), but permanent parameter buffers are not mounted yet"
+            ),
+            Self::ModelBoundaryBufferUnavailable {
+                dispatch_index,
+                binding,
+                signal_id,
+            } => write!(
+                f,
+                "dispatch {dispatch_index} descriptor {binding} references model boundary signal {signal_id:?}, but model boundary buffers are not mounted yet"
+            ),
+            Self::UnsupportedPushConstantScalar { scalar_type } => {
+                write!(f, "unsupported push-constant scalar type {scalar_type:?}")
+            }
+            Self::PushConstantByteCountOverflow => {
+                f.write_str("push-constant byte count overflowed")
+            }
+            Self::Vulkan(error) => Display::fmt(error, f),
+        }
+    }
+}
+
+impl Error for VulkanMountedPlacedResidentKernelDispatchError {}
+
+fn push_constant_byte_count(
+    push_constants: &[VulkanKernelScalarBinding],
+) -> Result<u32, VulkanMountedPlacedResidentKernelDispatchError> {
+    push_constants.iter().try_fold(0u32, |total, binding| {
+        let bytes = push_constant_scalar_byte_count(&binding.scalar_type)?;
+        total
+            .checked_add(bytes)
+            .ok_or(VulkanMountedPlacedResidentKernelDispatchError::PushConstantByteCountOverflow)
+    })
+}
+
+fn push_constant_scalar_byte_count(
+    scalar_type: &str,
+) -> Result<u32, VulkanMountedPlacedResidentKernelDispatchError> {
+    match scalar_type {
+        "u32" | "i32" | "f32" => Ok(4),
+        "u64" | "i64" | "f64" => Ok(8),
+        _ => Err(
+            VulkanMountedPlacedResidentKernelDispatchError::UnsupportedPushConstantScalar {
+                scalar_type: scalar_type.to_string(),
+            },
+        ),
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VulkanPlacedBoundDispatch {
     pub dispatch_index: usize,
     pub kernel_id: String,
@@ -5401,6 +5716,20 @@ mod tests {
             tick_run.stages[1].status,
             VulkanMountedPlacedStreamTickStageStatus::Pending
         );
+        assert!(matches!(
+            mounted.resident_kernel_buffer_bindings_for_bound_dispatch(
+                mounted_bound
+                    .dispatch("layer_00", "operator_norm")
+                    .unwrap()
+            ),
+            Err(
+                VulkanMountedPlacedResidentKernelDispatchError::ModelBoundaryBufferUnavailable {
+                    dispatch_index: 0,
+                    binding: 0,
+                    ref signal_id,
+                }
+            ) if signal_id == "input_frame"
+        ));
 
         assert_eq!(
             mounted_bound
@@ -5854,6 +6183,53 @@ mod tests {
                 ..
             } if pedal_id == "layer_02" && state_id == "kv_memory"
         ));
+        let mounted_kv_append = mounted_bound
+            .dispatch("layer_02", "kv_memory_append")
+            .unwrap();
+        let kv_bindings = mounted
+            .resident_kernel_buffer_bindings_for_bound_dispatch(mounted_kv_append)
+            .unwrap();
+        assert_eq!(kv_bindings.len(), mounted_kv_append.descriptors.len());
+        assert_eq!(kv_bindings[0].binding, 0);
+        assert_eq!(kv_bindings[0].byte_len, 2_048);
+        assert_eq!(kv_bindings[2].binding, 2);
+        assert_eq!(kv_bindings[2].byte_len, 8_192);
+
+        if let Some(spirv_words) = crate::vulkan_compute::compile_test_shader_words() {
+            let family = mounted
+                .placed_plan
+                .reusable_kernel_plan
+                .family(&mounted_kv_append.reusable_family_id)
+                .unwrap();
+            let loaded_manifest = VulkanLoadedReusableKernelArtifactManifest {
+                schema: VULKAN_REUSABLE_KERNEL_ARTIFACT_MANIFEST_SCHEMA.to_string(),
+                backend_id: VULKAN_STREAM_CIRCUIT_BACKEND_ID.to_string(),
+                total_word_count: spirv_words.len(),
+                artifacts: vec![VulkanLoadedReusableKernelArtifact {
+                    artifact: VulkanReusableKernelArtifact::from_family(
+                        family,
+                        "kernels/append_state_update.spv",
+                    ),
+                    resolved_path: PathBuf::from("kernels/append_state_update.spv"),
+                    words: spirv_words,
+                }],
+            };
+            let resident_dispatch = mounted
+                .create_resident_kernel_dispatch_for_bound_dispatch(
+                    &device,
+                    mounted_kv_append,
+                    &loaded_manifest,
+                )
+                .unwrap();
+
+            assert_eq!(resident_dispatch.descriptor_count(), kv_bindings.len());
+            assert_eq!(resident_dispatch.workgroup_count_x(), 1);
+            assert_eq!(resident_dispatch.push_constant_byte_count(), 16);
+        } else {
+            eprintln!(
+                "skipping resident kernel dispatch handle smoke: no GLSL to SPIR-V compiler found"
+            );
+        }
     }
 
     #[test]
