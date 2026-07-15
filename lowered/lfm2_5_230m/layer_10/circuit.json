@@ -1,0 +1,413 @@
+{
+  "schema": "llmoop.stream_circuit.v1",
+  "id": "layer_10_lfm2_gqa_attention_circuit_v1",
+  "source": {
+    "pedal_id": "layer_10",
+    "pedal_file": "transpiled/lfm2_5_230m/layers/layer_10.json",
+    "source_layer_index": 10,
+    "source_operator_type": "full_attention"
+  },
+  "behavioral_role": "source_reference_circuit",
+  "implementation": "reference_lfm2_gqa_attention_layer_circuit_v1",
+  "boundary": {
+    "inputs": [
+      {
+        "id": "input_frame",
+        "signal": "frame",
+        "shape": [
+          1024
+        ],
+        "pedal_port": "input"
+      }
+    ],
+    "outputs": [
+      {
+        "id": "output_frame",
+        "signal": "frame",
+        "shape": [
+          1024
+        ],
+        "source": "output_frame",
+        "pedal_port": "output"
+      }
+    ],
+    "controls": [
+      {
+        "id": "control",
+        "type": "pedal_control",
+        "optional": true
+      }
+    ]
+  },
+  "state_ports": [
+    {
+      "id": "kv_memory",
+      "type": "append_only_attention_memory",
+      "key_shape_per_token": [
+        8,
+        64
+      ],
+      "value_shape_per_token": [
+        8,
+        64
+      ],
+      "growth": "per_activation",
+      "sharing": "per_stream_per_pedal_instance",
+      "owner": "stream",
+      "layout": "append_only_kv",
+      "source_layout": "batch_kvheads_seq_headdim"
+    }
+  ],
+  "parameters": {
+    "layout": "lfm2_gqa_attention_layer_params_v1",
+    "storage": "source_tensor_refs",
+    "refs": {
+      "operator_norm": {
+        "tensor": "model.layers.10.operator_norm.weight",
+        "role": "operator_normalization_weight"
+      },
+      "ffn_norm": {
+        "tensor": "model.layers.10.ffn_norm.weight",
+        "role": "feed_forward_normalization_weight"
+      },
+      "ffn_gate": {
+        "tensor": "model.layers.10.feed_forward.w1.weight",
+        "role": "feed_forward_swiglu_gate_projection"
+      },
+      "ffn_down": {
+        "tensor": "model.layers.10.feed_forward.w2.weight",
+        "role": "feed_forward_down_projection"
+      },
+      "ffn_up": {
+        "tensor": "model.layers.10.feed_forward.w3.weight",
+        "role": "feed_forward_up_projection"
+      },
+      "q_projection": {
+        "tensor": "model.layers.10.self_attn.q_proj.weight",
+        "role": "attention_query_projection"
+      },
+      "k_projection": {
+        "tensor": "model.layers.10.self_attn.k_proj.weight",
+        "role": "attention_key_projection"
+      },
+      "v_projection": {
+        "tensor": "model.layers.10.self_attn.v_proj.weight",
+        "role": "attention_value_projection"
+      },
+      "attention_out_projection": {
+        "tensor": "model.layers.10.self_attn.out_proj.weight",
+        "role": "attention_output_projection"
+      },
+      "q_norm": {
+        "tensor": "model.layers.10.self_attn.q_layernorm.weight",
+        "role": "attention_query_head_normalization"
+      },
+      "k_norm": {
+        "tensor": "model.layers.10.self_attn.k_layernorm.weight",
+        "role": "attention_key_head_normalization"
+      }
+    }
+  },
+  "nodes": [
+    {
+      "id": "operator_norm",
+      "op": "rms_norm",
+      "inputs": [
+        "input_frame"
+      ],
+      "outputs": [
+        "operator_norm_out"
+      ],
+      "params": [
+        "operator_norm"
+      ],
+      "attrs": {
+        "eps_source": "model.config.norm_eps"
+      }
+    },
+    {
+      "id": "q_projection",
+      "op": "linear",
+      "inputs": [
+        "operator_norm_out"
+      ],
+      "outputs": [
+        "q_projected"
+      ],
+      "params": [
+        "q_projection"
+      ]
+    },
+    {
+      "id": "k_projection",
+      "op": "linear",
+      "inputs": [
+        "operator_norm_out"
+      ],
+      "outputs": [
+        "k_projected"
+      ],
+      "params": [
+        "k_projection"
+      ]
+    },
+    {
+      "id": "v_projection",
+      "op": "linear",
+      "inputs": [
+        "operator_norm_out"
+      ],
+      "outputs": [
+        "v_projected"
+      ],
+      "params": [
+        "v_projection"
+      ]
+    },
+    {
+      "id": "q_head_norm",
+      "op": "rms_norm_per_head",
+      "inputs": [
+        "q_projected"
+      ],
+      "outputs": [
+        "q_normed"
+      ],
+      "params": [
+        "q_norm"
+      ],
+      "attrs": {
+        "query_heads": 16,
+        "key_value_heads": 8,
+        "head_width": 64,
+        "query_groups_per_kv_head": 2
+      }
+    },
+    {
+      "id": "k_head_norm",
+      "op": "rms_norm_per_head",
+      "inputs": [
+        "k_projected"
+      ],
+      "outputs": [
+        "k_normed"
+      ],
+      "params": [
+        "k_norm"
+      ],
+      "attrs": {
+        "query_heads": 16,
+        "key_value_heads": 8,
+        "head_width": 64,
+        "query_groups_per_kv_head": 2
+      }
+    },
+    {
+      "id": "q_rope",
+      "op": "rotary_position_embedding",
+      "inputs": [
+        "q_normed"
+      ],
+      "outputs": [
+        "q_positioned"
+      ],
+      "attrs": {
+        "position_source": "stream_tick",
+        "query_heads": 16,
+        "key_value_heads": 8,
+        "head_width": 64,
+        "query_groups_per_kv_head": 2
+      }
+    },
+    {
+      "id": "k_rope",
+      "op": "rotary_position_embedding",
+      "inputs": [
+        "k_normed"
+      ],
+      "outputs": [
+        "k_positioned"
+      ],
+      "attrs": {
+        "position_source": "stream_tick",
+        "query_heads": 16,
+        "key_value_heads": 8,
+        "head_width": 64,
+        "query_groups_per_kv_head": 2
+      }
+    },
+    {
+      "id": "kv_memory_append",
+      "op": "append_state_update",
+      "inputs": [
+        "k_positioned",
+        "v_projected",
+        "kv_memory"
+      ],
+      "outputs": [
+        "k_memory",
+        "v_memory"
+      ],
+      "state_reads": [
+        "kv_memory"
+      ],
+      "state_writes": [
+        "kv_memory"
+      ],
+      "attrs": {
+        "growth": "per_activation",
+        "query_heads": 16,
+        "key_value_heads": 8,
+        "head_width": 64,
+        "query_groups_per_kv_head": 2
+      }
+    },
+    {
+      "id": "attention_read",
+      "op": "scaled_dot_product_attention",
+      "inputs": [
+        "q_positioned",
+        "k_memory",
+        "v_memory"
+      ],
+      "outputs": [
+        "attention_out"
+      ],
+      "attrs": {
+        "causal": true,
+        "query_heads": 16,
+        "key_value_heads": 8,
+        "head_width": 64,
+        "query_groups_per_kv_head": 2
+      }
+    },
+    {
+      "id": "attention_out_projection",
+      "op": "linear",
+      "inputs": [
+        "attention_out"
+      ],
+      "outputs": [
+        "operator_out"
+      ],
+      "params": [
+        "attention_out_projection"
+      ]
+    },
+    {
+      "id": "operator_residual",
+      "op": "residual_add",
+      "inputs": [
+        "input_frame",
+        "operator_out"
+      ],
+      "outputs": [
+        "operator_residual_out"
+      ]
+    },
+    {
+      "id": "ffn_norm",
+      "op": "rms_norm",
+      "inputs": [
+        "operator_residual_out"
+      ],
+      "outputs": [
+        "ffn_norm_out"
+      ],
+      "params": [
+        "ffn_norm"
+      ],
+      "attrs": {
+        "eps_source": "model.config.norm_eps"
+      }
+    },
+    {
+      "id": "ffn_gate_projection",
+      "op": "linear",
+      "inputs": [
+        "ffn_norm_out"
+      ],
+      "outputs": [
+        "ffn_gate"
+      ],
+      "params": [
+        "ffn_gate"
+      ]
+    },
+    {
+      "id": "ffn_up_projection",
+      "op": "linear",
+      "inputs": [
+        "ffn_norm_out"
+      ],
+      "outputs": [
+        "ffn_up"
+      ],
+      "params": [
+        "ffn_up"
+      ]
+    },
+    {
+      "id": "ffn_gate_activation",
+      "op": "silu",
+      "inputs": [
+        "ffn_gate"
+      ],
+      "outputs": [
+        "ffn_gate_activated"
+      ]
+    },
+    {
+      "id": "ffn_gate_multiply",
+      "op": "multiply",
+      "inputs": [
+        "ffn_gate_activated",
+        "ffn_up"
+      ],
+      "outputs": [
+        "ffn_hidden"
+      ]
+    },
+    {
+      "id": "ffn_down_projection",
+      "op": "linear",
+      "inputs": [
+        "ffn_hidden"
+      ],
+      "outputs": [
+        "ffn_out"
+      ],
+      "params": [
+        "ffn_down"
+      ]
+    },
+    {
+      "id": "ffn_residual",
+      "op": "residual_add",
+      "inputs": [
+        "operator_residual_out",
+        "ffn_out"
+      ],
+      "outputs": [
+        "output_frame"
+      ]
+    }
+  ],
+  "behavioral_error_contract": {
+    "mode": "source_reference_circuit",
+    "reference": "source_lfm2_layer_10",
+    "current_tolerance": {
+      "atol": 1e-06,
+      "rtol": 1e-05
+    },
+    "notes": [
+      "This circuit preserves the source grouped-query attention layer decomposition.",
+      "KV is represented as stream-owned append-only transient state, not as a disposable host cache."
+    ]
+  },
+  "lowering_notes": [
+    "Layer is represented as one pedal-level circuit with explicit internal nodes.",
+    "Transient memory belongs to the stream instance.",
+    "The graph is ordered topologically so a backend can fuse or replace regions without changing the boundary contract."
+  ]
+}

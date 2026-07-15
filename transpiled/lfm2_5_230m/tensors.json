@@ -1,0 +1,1833 @@
+{
+  "schema": "llmoop.tensor_index.v1",
+  "source": {
+    "model_dir": "/home/aristath/models/lfm2.5/230m",
+    "weights_file": "/home/aristath/models/lfm2.5/230m/model.safetensors",
+    "safetensors_header_bytes": 14736,
+    "metadata": {
+      "format": "pt"
+    }
+  },
+  "totals": {
+    "tensor_count": 132,
+    "parameter_count": 229693184,
+    "byte_count": 459386368
+  },
+  "tensors": {
+    "model.embed_tokens.weight": {
+      "dtype": "BF16",
+      "shape": [
+        65536,
+        1024
+      ],
+      "data_offsets": [
+        0,
+        134217728
+      ],
+      "parameter_count": 67108864,
+      "byte_count": 134217728,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.embedding_norm.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        134217728,
+        134219776
+      ],
+      "parameter_count": 1024,
+      "byte_count": 2048,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.0.conv.conv.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1,
+        3
+      ],
+      "data_offsets": [
+        134219776,
+        134225920
+      ],
+      "parameter_count": 3072,
+      "byte_count": 6144,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.0.conv.in_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        3072,
+        1024
+      ],
+      "data_offsets": [
+        134225920,
+        140517376
+      ],
+      "parameter_count": 3145728,
+      "byte_count": 6291456,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.0.conv.out_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        140517376,
+        142614528
+      ],
+      "parameter_count": 1048576,
+      "byte_count": 2097152,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.0.feed_forward.w1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        2560,
+        1024
+      ],
+      "data_offsets": [
+        142614528,
+        147857408
+      ],
+      "parameter_count": 2621440,
+      "byte_count": 5242880,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.0.feed_forward.w2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        2560
+      ],
+      "data_offsets": [
+        147857408,
+        153100288
+      ],
+      "parameter_count": 2621440,
+      "byte_count": 5242880,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.0.feed_forward.w3.weight": {
+      "dtype": "BF16",
+      "shape": [
+        2560,
+        1024
+      ],
+      "data_offsets": [
+        153100288,
+        158343168
+      ],
+      "parameter_count": 2621440,
+      "byte_count": 5242880,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.0.ffn_norm.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        158343168,
+        158345216
+      ],
+      "parameter_count": 1024,
+      "byte_count": 2048,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.0.operator_norm.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        158345216,
+        158347264
+      ],
+      "parameter_count": 1024,
+      "byte_count": 2048,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.1.conv.conv.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1,
+        3
+      ],
+      "data_offsets": [
+        158347264,
+        158353408
+      ],
+      "parameter_count": 3072,
+      "byte_count": 6144,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.1.conv.in_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        3072,
+        1024
+      ],
+      "data_offsets": [
+        158353408,
+        164644864
+      ],
+      "parameter_count": 3145728,
+      "byte_count": 6291456,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.1.conv.out_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        164644864,
+        166742016
+      ],
+      "parameter_count": 1048576,
+      "byte_count": 2097152,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.1.feed_forward.w1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        2560,
+        1024
+      ],
+      "data_offsets": [
+        166742016,
+        171984896
+      ],
+      "parameter_count": 2621440,
+      "byte_count": 5242880,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.1.feed_forward.w2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        2560
+      ],
+      "data_offsets": [
+        171984896,
+        177227776
+      ],
+      "parameter_count": 2621440,
+      "byte_count": 5242880,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.1.feed_forward.w3.weight": {
+      "dtype": "BF16",
+      "shape": [
+        2560,
+        1024
+      ],
+      "data_offsets": [
+        177227776,
+        182470656
+      ],
+      "parameter_count": 2621440,
+      "byte_count": 5242880,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.1.ffn_norm.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        182470656,
+        182472704
+      ],
+      "parameter_count": 1024,
+      "byte_count": 2048,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.1.operator_norm.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        182472704,
+        182474752
+      ],
+      "parameter_count": 1024,
+      "byte_count": 2048,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.10.feed_forward.w1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        2560,
+        1024
+      ],
+      "data_offsets": [
+        182474752,
+        187717632
+      ],
+      "parameter_count": 2621440,
+      "byte_count": 5242880,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.10.feed_forward.w2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        2560
+      ],
+      "data_offsets": [
+        187717632,
+        192960512
+      ],
+      "parameter_count": 2621440,
+      "byte_count": 5242880,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.10.feed_forward.w3.weight": {
+      "dtype": "BF16",
+      "shape": [
+        2560,
+        1024
+      ],
+      "data_offsets": [
+        192960512,
+        198203392
+      ],
+      "parameter_count": 2621440,
+      "byte_count": 5242880,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.10.ffn_norm.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        198203392,
+        198205440
+      ],
+      "parameter_count": 1024,
+      "byte_count": 2048,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.10.operator_norm.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        198205440,
+        198207488
+      ],
+      "parameter_count": 1024,
+      "byte_count": 2048,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.10.self_attn.k_layernorm.weight": {
+      "dtype": "BF16",
+      "shape": [
+        64
+      ],
+      "data_offsets": [
+        198207488,
+        198207616
+      ],
+      "parameter_count": 64,
+      "byte_count": 128,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.10.self_attn.k_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        512,
+        1024
+      ],
+      "data_offsets": [
+        198207616,
+        199256192
+      ],
+      "parameter_count": 524288,
+      "byte_count": 1048576,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.10.self_attn.out_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        199256192,
+        201353344
+      ],
+      "parameter_count": 1048576,
+      "byte_count": 2097152,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.10.self_attn.q_layernorm.weight": {
+      "dtype": "BF16",
+      "shape": [
+        64
+      ],
+      "data_offsets": [
+        201353344,
+        201353472
+      ],
+      "parameter_count": 64,
+      "byte_count": 128,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.10.self_attn.q_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        201353472,
+        203450624
+      ],
+      "parameter_count": 1048576,
+      "byte_count": 2097152,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.10.self_attn.v_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        512,
+        1024
+      ],
+      "data_offsets": [
+        203450624,
+        204499200
+      ],
+      "parameter_count": 524288,
+      "byte_count": 1048576,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.11.conv.conv.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1,
+        3
+      ],
+      "data_offsets": [
+        204499200,
+        204505344
+      ],
+      "parameter_count": 3072,
+      "byte_count": 6144,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.11.conv.in_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        3072,
+        1024
+      ],
+      "data_offsets": [
+        204505344,
+        210796800
+      ],
+      "parameter_count": 3145728,
+      "byte_count": 6291456,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.11.conv.out_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        210796800,
+        212893952
+      ],
+      "parameter_count": 1048576,
+      "byte_count": 2097152,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.11.feed_forward.w1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        2560,
+        1024
+      ],
+      "data_offsets": [
+        212893952,
+        218136832
+      ],
+      "parameter_count": 2621440,
+      "byte_count": 5242880,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.11.feed_forward.w2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        2560
+      ],
+      "data_offsets": [
+        218136832,
+        223379712
+      ],
+      "parameter_count": 2621440,
+      "byte_count": 5242880,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.11.feed_forward.w3.weight": {
+      "dtype": "BF16",
+      "shape": [
+        2560,
+        1024
+      ],
+      "data_offsets": [
+        223379712,
+        228622592
+      ],
+      "parameter_count": 2621440,
+      "byte_count": 5242880,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.11.ffn_norm.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        228622592,
+        228624640
+      ],
+      "parameter_count": 1024,
+      "byte_count": 2048,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.11.operator_norm.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        228624640,
+        228626688
+      ],
+      "parameter_count": 1024,
+      "byte_count": 2048,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.12.feed_forward.w1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        2560,
+        1024
+      ],
+      "data_offsets": [
+        228626688,
+        233869568
+      ],
+      "parameter_count": 2621440,
+      "byte_count": 5242880,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.12.feed_forward.w2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        2560
+      ],
+      "data_offsets": [
+        233869568,
+        239112448
+      ],
+      "parameter_count": 2621440,
+      "byte_count": 5242880,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.12.feed_forward.w3.weight": {
+      "dtype": "BF16",
+      "shape": [
+        2560,
+        1024
+      ],
+      "data_offsets": [
+        239112448,
+        244355328
+      ],
+      "parameter_count": 2621440,
+      "byte_count": 5242880,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.12.ffn_norm.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        244355328,
+        244357376
+      ],
+      "parameter_count": 1024,
+      "byte_count": 2048,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.12.operator_norm.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        244357376,
+        244359424
+      ],
+      "parameter_count": 1024,
+      "byte_count": 2048,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.12.self_attn.k_layernorm.weight": {
+      "dtype": "BF16",
+      "shape": [
+        64
+      ],
+      "data_offsets": [
+        244359424,
+        244359552
+      ],
+      "parameter_count": 64,
+      "byte_count": 128,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.12.self_attn.k_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        512,
+        1024
+      ],
+      "data_offsets": [
+        244359552,
+        245408128
+      ],
+      "parameter_count": 524288,
+      "byte_count": 1048576,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.12.self_attn.out_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        245408128,
+        247505280
+      ],
+      "parameter_count": 1048576,
+      "byte_count": 2097152,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.12.self_attn.q_layernorm.weight": {
+      "dtype": "BF16",
+      "shape": [
+        64
+      ],
+      "data_offsets": [
+        247505280,
+        247505408
+      ],
+      "parameter_count": 64,
+      "byte_count": 128,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.12.self_attn.q_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        247505408,
+        249602560
+      ],
+      "parameter_count": 1048576,
+      "byte_count": 2097152,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.12.self_attn.v_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        512,
+        1024
+      ],
+      "data_offsets": [
+        249602560,
+        250651136
+      ],
+      "parameter_count": 524288,
+      "byte_count": 1048576,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.13.conv.conv.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1,
+        3
+      ],
+      "data_offsets": [
+        250651136,
+        250657280
+      ],
+      "parameter_count": 3072,
+      "byte_count": 6144,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.13.conv.in_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        3072,
+        1024
+      ],
+      "data_offsets": [
+        250657280,
+        256948736
+      ],
+      "parameter_count": 3145728,
+      "byte_count": 6291456,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.13.conv.out_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        256948736,
+        259045888
+      ],
+      "parameter_count": 1048576,
+      "byte_count": 2097152,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.13.feed_forward.w1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        2560,
+        1024
+      ],
+      "data_offsets": [
+        259045888,
+        264288768
+      ],
+      "parameter_count": 2621440,
+      "byte_count": 5242880,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.13.feed_forward.w2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        2560
+      ],
+      "data_offsets": [
+        264288768,
+        269531648
+      ],
+      "parameter_count": 2621440,
+      "byte_count": 5242880,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.13.feed_forward.w3.weight": {
+      "dtype": "BF16",
+      "shape": [
+        2560,
+        1024
+      ],
+      "data_offsets": [
+        269531648,
+        274774528
+      ],
+      "parameter_count": 2621440,
+      "byte_count": 5242880,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.13.ffn_norm.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        274774528,
+        274776576
+      ],
+      "parameter_count": 1024,
+      "byte_count": 2048,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.13.operator_norm.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        274776576,
+        274778624
+      ],
+      "parameter_count": 1024,
+      "byte_count": 2048,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.2.feed_forward.w1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        2560,
+        1024
+      ],
+      "data_offsets": [
+        274778624,
+        280021504
+      ],
+      "parameter_count": 2621440,
+      "byte_count": 5242880,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.2.feed_forward.w2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        2560
+      ],
+      "data_offsets": [
+        280021504,
+        285264384
+      ],
+      "parameter_count": 2621440,
+      "byte_count": 5242880,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.2.feed_forward.w3.weight": {
+      "dtype": "BF16",
+      "shape": [
+        2560,
+        1024
+      ],
+      "data_offsets": [
+        285264384,
+        290507264
+      ],
+      "parameter_count": 2621440,
+      "byte_count": 5242880,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.2.ffn_norm.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        290507264,
+        290509312
+      ],
+      "parameter_count": 1024,
+      "byte_count": 2048,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.2.operator_norm.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        290509312,
+        290511360
+      ],
+      "parameter_count": 1024,
+      "byte_count": 2048,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.2.self_attn.k_layernorm.weight": {
+      "dtype": "BF16",
+      "shape": [
+        64
+      ],
+      "data_offsets": [
+        290511360,
+        290511488
+      ],
+      "parameter_count": 64,
+      "byte_count": 128,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.2.self_attn.k_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        512,
+        1024
+      ],
+      "data_offsets": [
+        290511488,
+        291560064
+      ],
+      "parameter_count": 524288,
+      "byte_count": 1048576,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.2.self_attn.out_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        291560064,
+        293657216
+      ],
+      "parameter_count": 1048576,
+      "byte_count": 2097152,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.2.self_attn.q_layernorm.weight": {
+      "dtype": "BF16",
+      "shape": [
+        64
+      ],
+      "data_offsets": [
+        293657216,
+        293657344
+      ],
+      "parameter_count": 64,
+      "byte_count": 128,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.2.self_attn.q_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        293657344,
+        295754496
+      ],
+      "parameter_count": 1048576,
+      "byte_count": 2097152,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.2.self_attn.v_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        512,
+        1024
+      ],
+      "data_offsets": [
+        295754496,
+        296803072
+      ],
+      "parameter_count": 524288,
+      "byte_count": 1048576,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.3.conv.conv.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1,
+        3
+      ],
+      "data_offsets": [
+        296803072,
+        296809216
+      ],
+      "parameter_count": 3072,
+      "byte_count": 6144,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.3.conv.in_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        3072,
+        1024
+      ],
+      "data_offsets": [
+        296809216,
+        303100672
+      ],
+      "parameter_count": 3145728,
+      "byte_count": 6291456,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.3.conv.out_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        303100672,
+        305197824
+      ],
+      "parameter_count": 1048576,
+      "byte_count": 2097152,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.3.feed_forward.w1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        2560,
+        1024
+      ],
+      "data_offsets": [
+        305197824,
+        310440704
+      ],
+      "parameter_count": 2621440,
+      "byte_count": 5242880,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.3.feed_forward.w2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        2560
+      ],
+      "data_offsets": [
+        310440704,
+        315683584
+      ],
+      "parameter_count": 2621440,
+      "byte_count": 5242880,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.3.feed_forward.w3.weight": {
+      "dtype": "BF16",
+      "shape": [
+        2560,
+        1024
+      ],
+      "data_offsets": [
+        315683584,
+        320926464
+      ],
+      "parameter_count": 2621440,
+      "byte_count": 5242880,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.3.ffn_norm.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        320926464,
+        320928512
+      ],
+      "parameter_count": 1024,
+      "byte_count": 2048,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.3.operator_norm.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        320928512,
+        320930560
+      ],
+      "parameter_count": 1024,
+      "byte_count": 2048,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.4.feed_forward.w1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        2560,
+        1024
+      ],
+      "data_offsets": [
+        320930560,
+        326173440
+      ],
+      "parameter_count": 2621440,
+      "byte_count": 5242880,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.4.feed_forward.w2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        2560
+      ],
+      "data_offsets": [
+        326173440,
+        331416320
+      ],
+      "parameter_count": 2621440,
+      "byte_count": 5242880,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.4.feed_forward.w3.weight": {
+      "dtype": "BF16",
+      "shape": [
+        2560,
+        1024
+      ],
+      "data_offsets": [
+        331416320,
+        336659200
+      ],
+      "parameter_count": 2621440,
+      "byte_count": 5242880,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.4.ffn_norm.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        336659200,
+        336661248
+      ],
+      "parameter_count": 1024,
+      "byte_count": 2048,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.4.operator_norm.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        336661248,
+        336663296
+      ],
+      "parameter_count": 1024,
+      "byte_count": 2048,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.4.self_attn.k_layernorm.weight": {
+      "dtype": "BF16",
+      "shape": [
+        64
+      ],
+      "data_offsets": [
+        336663296,
+        336663424
+      ],
+      "parameter_count": 64,
+      "byte_count": 128,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.4.self_attn.k_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        512,
+        1024
+      ],
+      "data_offsets": [
+        336663424,
+        337712000
+      ],
+      "parameter_count": 524288,
+      "byte_count": 1048576,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.4.self_attn.out_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        337712000,
+        339809152
+      ],
+      "parameter_count": 1048576,
+      "byte_count": 2097152,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.4.self_attn.q_layernorm.weight": {
+      "dtype": "BF16",
+      "shape": [
+        64
+      ],
+      "data_offsets": [
+        339809152,
+        339809280
+      ],
+      "parameter_count": 64,
+      "byte_count": 128,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.4.self_attn.q_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        339809280,
+        341906432
+      ],
+      "parameter_count": 1048576,
+      "byte_count": 2097152,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.4.self_attn.v_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        512,
+        1024
+      ],
+      "data_offsets": [
+        341906432,
+        342955008
+      ],
+      "parameter_count": 524288,
+      "byte_count": 1048576,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.5.conv.conv.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1,
+        3
+      ],
+      "data_offsets": [
+        342955008,
+        342961152
+      ],
+      "parameter_count": 3072,
+      "byte_count": 6144,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.5.conv.in_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        3072,
+        1024
+      ],
+      "data_offsets": [
+        342961152,
+        349252608
+      ],
+      "parameter_count": 3145728,
+      "byte_count": 6291456,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.5.conv.out_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        349252608,
+        351349760
+      ],
+      "parameter_count": 1048576,
+      "byte_count": 2097152,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.5.feed_forward.w1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        2560,
+        1024
+      ],
+      "data_offsets": [
+        351349760,
+        356592640
+      ],
+      "parameter_count": 2621440,
+      "byte_count": 5242880,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.5.feed_forward.w2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        2560
+      ],
+      "data_offsets": [
+        356592640,
+        361835520
+      ],
+      "parameter_count": 2621440,
+      "byte_count": 5242880,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.5.feed_forward.w3.weight": {
+      "dtype": "BF16",
+      "shape": [
+        2560,
+        1024
+      ],
+      "data_offsets": [
+        361835520,
+        367078400
+      ],
+      "parameter_count": 2621440,
+      "byte_count": 5242880,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.5.ffn_norm.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        367078400,
+        367080448
+      ],
+      "parameter_count": 1024,
+      "byte_count": 2048,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.5.operator_norm.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        367080448,
+        367082496
+      ],
+      "parameter_count": 1024,
+      "byte_count": 2048,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.6.feed_forward.w1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        2560,
+        1024
+      ],
+      "data_offsets": [
+        367082496,
+        372325376
+      ],
+      "parameter_count": 2621440,
+      "byte_count": 5242880,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.6.feed_forward.w2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        2560
+      ],
+      "data_offsets": [
+        372325376,
+        377568256
+      ],
+      "parameter_count": 2621440,
+      "byte_count": 5242880,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.6.feed_forward.w3.weight": {
+      "dtype": "BF16",
+      "shape": [
+        2560,
+        1024
+      ],
+      "data_offsets": [
+        377568256,
+        382811136
+      ],
+      "parameter_count": 2621440,
+      "byte_count": 5242880,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.6.ffn_norm.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        382811136,
+        382813184
+      ],
+      "parameter_count": 1024,
+      "byte_count": 2048,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.6.operator_norm.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        382813184,
+        382815232
+      ],
+      "parameter_count": 1024,
+      "byte_count": 2048,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.6.self_attn.k_layernorm.weight": {
+      "dtype": "BF16",
+      "shape": [
+        64
+      ],
+      "data_offsets": [
+        382815232,
+        382815360
+      ],
+      "parameter_count": 64,
+      "byte_count": 128,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.6.self_attn.k_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        512,
+        1024
+      ],
+      "data_offsets": [
+        382815360,
+        383863936
+      ],
+      "parameter_count": 524288,
+      "byte_count": 1048576,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.6.self_attn.out_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        383863936,
+        385961088
+      ],
+      "parameter_count": 1048576,
+      "byte_count": 2097152,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.6.self_attn.q_layernorm.weight": {
+      "dtype": "BF16",
+      "shape": [
+        64
+      ],
+      "data_offsets": [
+        385961088,
+        385961216
+      ],
+      "parameter_count": 64,
+      "byte_count": 128,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.6.self_attn.q_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        385961216,
+        388058368
+      ],
+      "parameter_count": 1048576,
+      "byte_count": 2097152,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.6.self_attn.v_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        512,
+        1024
+      ],
+      "data_offsets": [
+        388058368,
+        389106944
+      ],
+      "parameter_count": 524288,
+      "byte_count": 1048576,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.7.conv.conv.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1,
+        3
+      ],
+      "data_offsets": [
+        389106944,
+        389113088
+      ],
+      "parameter_count": 3072,
+      "byte_count": 6144,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.7.conv.in_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        3072,
+        1024
+      ],
+      "data_offsets": [
+        389113088,
+        395404544
+      ],
+      "parameter_count": 3145728,
+      "byte_count": 6291456,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.7.conv.out_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        395404544,
+        397501696
+      ],
+      "parameter_count": 1048576,
+      "byte_count": 2097152,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.7.feed_forward.w1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        2560,
+        1024
+      ],
+      "data_offsets": [
+        397501696,
+        402744576
+      ],
+      "parameter_count": 2621440,
+      "byte_count": 5242880,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.7.feed_forward.w2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        2560
+      ],
+      "data_offsets": [
+        402744576,
+        407987456
+      ],
+      "parameter_count": 2621440,
+      "byte_count": 5242880,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.7.feed_forward.w3.weight": {
+      "dtype": "BF16",
+      "shape": [
+        2560,
+        1024
+      ],
+      "data_offsets": [
+        407987456,
+        413230336
+      ],
+      "parameter_count": 2621440,
+      "byte_count": 5242880,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.7.ffn_norm.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        413230336,
+        413232384
+      ],
+      "parameter_count": 1024,
+      "byte_count": 2048,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.7.operator_norm.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        413232384,
+        413234432
+      ],
+      "parameter_count": 1024,
+      "byte_count": 2048,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.8.feed_forward.w1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        2560,
+        1024
+      ],
+      "data_offsets": [
+        413234432,
+        418477312
+      ],
+      "parameter_count": 2621440,
+      "byte_count": 5242880,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.8.feed_forward.w2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        2560
+      ],
+      "data_offsets": [
+        418477312,
+        423720192
+      ],
+      "parameter_count": 2621440,
+      "byte_count": 5242880,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.8.feed_forward.w3.weight": {
+      "dtype": "BF16",
+      "shape": [
+        2560,
+        1024
+      ],
+      "data_offsets": [
+        423720192,
+        428963072
+      ],
+      "parameter_count": 2621440,
+      "byte_count": 5242880,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.8.ffn_norm.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        428963072,
+        428965120
+      ],
+      "parameter_count": 1024,
+      "byte_count": 2048,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.8.operator_norm.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        428965120,
+        428967168
+      ],
+      "parameter_count": 1024,
+      "byte_count": 2048,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.8.self_attn.k_layernorm.weight": {
+      "dtype": "BF16",
+      "shape": [
+        64
+      ],
+      "data_offsets": [
+        428967168,
+        428967296
+      ],
+      "parameter_count": 64,
+      "byte_count": 128,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.8.self_attn.k_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        512,
+        1024
+      ],
+      "data_offsets": [
+        428967296,
+        430015872
+      ],
+      "parameter_count": 524288,
+      "byte_count": 1048576,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.8.self_attn.out_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        430015872,
+        432113024
+      ],
+      "parameter_count": 1048576,
+      "byte_count": 2097152,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.8.self_attn.q_layernorm.weight": {
+      "dtype": "BF16",
+      "shape": [
+        64
+      ],
+      "data_offsets": [
+        432113024,
+        432113152
+      ],
+      "parameter_count": 64,
+      "byte_count": 128,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.8.self_attn.q_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        432113152,
+        434210304
+      ],
+      "parameter_count": 1048576,
+      "byte_count": 2097152,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.8.self_attn.v_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        512,
+        1024
+      ],
+      "data_offsets": [
+        434210304,
+        435258880
+      ],
+      "parameter_count": 524288,
+      "byte_count": 1048576,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.9.conv.conv.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1,
+        3
+      ],
+      "data_offsets": [
+        435258880,
+        435265024
+      ],
+      "parameter_count": 3072,
+      "byte_count": 6144,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.9.conv.in_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        3072,
+        1024
+      ],
+      "data_offsets": [
+        435265024,
+        441556480
+      ],
+      "parameter_count": 3145728,
+      "byte_count": 6291456,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.9.conv.out_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        441556480,
+        443653632
+      ],
+      "parameter_count": 1048576,
+      "byte_count": 2097152,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.9.feed_forward.w1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        2560,
+        1024
+      ],
+      "data_offsets": [
+        443653632,
+        448896512
+      ],
+      "parameter_count": 2621440,
+      "byte_count": 5242880,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.9.feed_forward.w2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        2560
+      ],
+      "data_offsets": [
+        448896512,
+        454139392
+      ],
+      "parameter_count": 2621440,
+      "byte_count": 5242880,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.9.feed_forward.w3.weight": {
+      "dtype": "BF16",
+      "shape": [
+        2560,
+        1024
+      ],
+      "data_offsets": [
+        454139392,
+        459382272
+      ],
+      "parameter_count": 2621440,
+      "byte_count": 5242880,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.9.ffn_norm.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        459382272,
+        459384320
+      ],
+      "parameter_count": 1024,
+      "byte_count": 2048,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    },
+    "model.layers.9.operator_norm.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        459384320,
+        459386368
+      ],
+      "parameter_count": 1024,
+      "byte_count": 2048,
+      "source_file": "/home/aristath/models/lfm2.5/230m/model.safetensors"
+    }
+  }
+}

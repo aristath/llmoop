@@ -1,0 +1,52 @@
+{
+  "schema": "llmoop.circuit_params.v1",
+  "circuit": "layer_12_lfm2_gqa_attention_circuit_v1",
+  "layout": "lfm2_gqa_attention_layer_params_v1",
+  "storage": "source_tensor_refs",
+  "refs": {
+    "operator_norm": {
+      "tensor": "model.layers.12.operator_norm.weight",
+      "role": "operator_normalization_weight"
+    },
+    "ffn_norm": {
+      "tensor": "model.layers.12.ffn_norm.weight",
+      "role": "feed_forward_normalization_weight"
+    },
+    "ffn_gate": {
+      "tensor": "model.layers.12.feed_forward.w1.weight",
+      "role": "feed_forward_swiglu_gate_projection"
+    },
+    "ffn_down": {
+      "tensor": "model.layers.12.feed_forward.w2.weight",
+      "role": "feed_forward_down_projection"
+    },
+    "ffn_up": {
+      "tensor": "model.layers.12.feed_forward.w3.weight",
+      "role": "feed_forward_up_projection"
+    },
+    "q_projection": {
+      "tensor": "model.layers.12.self_attn.q_proj.weight",
+      "role": "attention_query_projection"
+    },
+    "k_projection": {
+      "tensor": "model.layers.12.self_attn.k_proj.weight",
+      "role": "attention_key_projection"
+    },
+    "v_projection": {
+      "tensor": "model.layers.12.self_attn.v_proj.weight",
+      "role": "attention_value_projection"
+    },
+    "attention_out_projection": {
+      "tensor": "model.layers.12.self_attn.out_proj.weight",
+      "role": "attention_output_projection"
+    },
+    "q_norm": {
+      "tensor": "model.layers.12.self_attn.q_layernorm.weight",
+      "role": "attention_query_head_normalization"
+    },
+    "k_norm": {
+      "tensor": "model.layers.12.self_attn.k_layernorm.weight",
+      "role": "attention_key_head_normalization"
+    }
+  }
+}

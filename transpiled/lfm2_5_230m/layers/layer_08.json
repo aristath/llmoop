@@ -1,0 +1,281 @@
+{
+  "schema": "llmoop.pedal_instance.v1",
+  "id": "layer_08",
+  "source_layer_index": 8,
+  "type": "pedal_instance",
+  "pedal_class": "lfm2_gqa_attention_layer_h1024_q16_kv8_d64_ffn2560_v1",
+  "operator_type": "full_attention",
+  "ports": {
+    "inputs": [
+      {
+        "id": "input",
+        "signal": "frame",
+        "shape": [
+          1024
+        ]
+      }
+    ],
+    "outputs": [
+      {
+        "id": "output",
+        "signal": "frame",
+        "shape": [
+          1024
+        ]
+      }
+    ],
+    "controls": [
+      {
+        "id": "control",
+        "type": "pedal_control",
+        "optional": true
+      }
+    ]
+  },
+  "state_ports": [
+    {
+      "id": "kv_memory",
+      "type": "append_only_attention_memory",
+      "key_shape_per_token": [
+        8,
+        64
+      ],
+      "value_shape_per_token": [
+        8,
+        64
+      ],
+      "growth": "per_activation",
+      "sharing": "per_stream_per_pedal_instance"
+    }
+  ],
+  "parameter_block": {
+    "layout": "lfm2_gqa_attention_layer_params_v1",
+    "storage": "source_tensor_refs",
+    "params": {
+      "operator_norm": {
+        "tensor": "model.layers.8.operator_norm.weight"
+      },
+      "ffn_norm": {
+        "tensor": "model.layers.8.ffn_norm.weight"
+      },
+      "ffn_gate": {
+        "tensor": "model.layers.8.feed_forward.w1.weight"
+      },
+      "ffn_down": {
+        "tensor": "model.layers.8.feed_forward.w2.weight"
+      },
+      "ffn_up": {
+        "tensor": "model.layers.8.feed_forward.w3.weight"
+      },
+      "q_projection": {
+        "tensor": "model.layers.8.self_attn.q_proj.weight"
+      },
+      "k_projection": {
+        "tensor": "model.layers.8.self_attn.k_proj.weight"
+      },
+      "v_projection": {
+        "tensor": "model.layers.8.self_attn.v_proj.weight"
+      },
+      "attention_out_projection": {
+        "tensor": "model.layers.8.self_attn.out_proj.weight"
+      },
+      "q_norm": {
+        "tensor": "model.layers.8.self_attn.q_layernorm.weight"
+      },
+      "k_norm": {
+        "tensor": "model.layers.8.self_attn.k_layernorm.weight"
+      }
+    },
+    "tensor_refs": [
+      "model.layers.8.operator_norm.weight",
+      "model.layers.8.ffn_norm.weight",
+      "model.layers.8.feed_forward.w1.weight",
+      "model.layers.8.feed_forward.w2.weight",
+      "model.layers.8.feed_forward.w3.weight",
+      "model.layers.8.self_attn.q_proj.weight",
+      "model.layers.8.self_attn.k_proj.weight",
+      "model.layers.8.self_attn.v_proj.weight",
+      "model.layers.8.self_attn.out_proj.weight",
+      "model.layers.8.self_attn.q_layernorm.weight",
+      "model.layers.8.self_attn.k_layernorm.weight"
+    ]
+  },
+  "transition_contract": {
+    "type": "stateful_frame_transform",
+    "equation": "(output_frame, next_state, events) = pedal(input_frame, state, params, control)",
+    "reference_behavior": "source_lfm2_layer_8",
+    "behavioral_error_contract": "not_defined_yet"
+  },
+  "runtime_boundary": {
+    "opaque_to_pedalboard": true,
+    "compiler_may_fuse_internal_operations": true,
+    "compiler_may_replace_reference_decomposition": true
+  },
+  "reference_decomposition": {
+    "source": "lfm2_reference_layer",
+    "wiring": [
+      {
+        "id": "operator_norm",
+        "type": "rms_norm",
+        "circuit_template": "rms_norm_h1024_v1",
+        "input": "input",
+        "output": "operator_norm.output",
+        "params": {
+          "weight": {
+            "tensor": "model.layers.8.operator_norm.weight"
+          }
+        }
+      },
+      {
+        "id": "operator",
+        "type": "gqa_attention_operator",
+        "circuit_template": "gqa_attention_h1024_q16_kv8_d64_v1",
+        "input": "operator_norm.output",
+        "output": "operator.output",
+        "heads": {
+          "query_heads": 16,
+          "key_value_heads": 8,
+          "head_width": 64,
+          "query_groups_per_kv_head": 2
+        },
+        "state_ports": [
+          {
+            "id": "kv_memory",
+            "type": "append_only_attention_memory",
+            "key_shape_per_token": [
+              8,
+              64
+            ],
+            "value_shape_per_token": [
+              8,
+              64
+            ],
+            "growth": "per_activation",
+            "sharing": "per_stream_per_layer_instance"
+          }
+        ],
+        "params": {
+          "q_projection": {
+            "tensor": "model.layers.8.self_attn.q_proj.weight"
+          },
+          "k_projection": {
+            "tensor": "model.layers.8.self_attn.k_proj.weight"
+          },
+          "v_projection": {
+            "tensor": "model.layers.8.self_attn.v_proj.weight"
+          },
+          "out_projection": {
+            "tensor": "model.layers.8.self_attn.out_proj.weight"
+          },
+          "q_norm": {
+            "tensor": "model.layers.8.self_attn.q_layernorm.weight"
+          },
+          "k_norm": {
+            "tensor": "model.layers.8.self_attn.k_layernorm.weight"
+          }
+        },
+        "internal_pedals": [
+          {
+            "id": "q_projection",
+            "type": "linear"
+          },
+          {
+            "id": "k_projection",
+            "type": "linear"
+          },
+          {
+            "id": "v_projection",
+            "type": "linear"
+          },
+          {
+            "id": "q_norm",
+            "type": "rms_norm_per_head"
+          },
+          {
+            "id": "k_norm",
+            "type": "rms_norm_per_head"
+          },
+          {
+            "id": "rope",
+            "type": "rotary_position_embedding"
+          },
+          {
+            "id": "kv_memory",
+            "type": "stateful_append_memory"
+          },
+          {
+            "id": "attention_read",
+            "type": "scaled_dot_product_attention"
+          },
+          {
+            "id": "out_projection",
+            "type": "linear"
+          }
+        ]
+      },
+      {
+        "id": "operator_residual",
+        "type": "residual_add",
+        "circuit_template": "add_h1024_v1",
+        "inputs": [
+          "input",
+          "operator.output"
+        ],
+        "output": "operator_residual.output"
+      },
+      {
+        "id": "ffn_norm",
+        "type": "rms_norm",
+        "circuit_template": "rms_norm_h1024_v1",
+        "input": "operator_residual.output",
+        "output": "ffn_norm.output",
+        "params": {
+          "weight": {
+            "tensor": "model.layers.8.ffn_norm.weight"
+          }
+        }
+      },
+      {
+        "id": "feed_forward",
+        "type": "swiglu_feed_forward",
+        "circuit_template": "swiglu_ffn_1024_2560_v1",
+        "input": "ffn_norm.output",
+        "output": "ffn.output",
+        "params": {
+          "gate": {
+            "tensor": "model.layers.8.feed_forward.w1.weight"
+          },
+          "down": {
+            "tensor": "model.layers.8.feed_forward.w2.weight"
+          },
+          "up": {
+            "tensor": "model.layers.8.feed_forward.w3.weight"
+          }
+        }
+      },
+      {
+        "id": "ffn_residual",
+        "type": "residual_add",
+        "circuit_template": "add_h1024_v1",
+        "inputs": [
+          "operator_residual.output",
+          "ffn.output"
+        ],
+        "output": "output"
+      }
+    ]
+  },
+  "tensor_refs": [
+    "model.layers.8.operator_norm.weight",
+    "model.layers.8.ffn_norm.weight",
+    "model.layers.8.feed_forward.w1.weight",
+    "model.layers.8.feed_forward.w2.weight",
+    "model.layers.8.feed_forward.w3.weight",
+    "model.layers.8.self_attn.q_proj.weight",
+    "model.layers.8.self_attn.k_proj.weight",
+    "model.layers.8.self_attn.v_proj.weight",
+    "model.layers.8.self_attn.out_proj.weight",
+    "model.layers.8.self_attn.q_layernorm.weight",
+    "model.layers.8.self_attn.k_layernorm.weight"
+  ]
+}

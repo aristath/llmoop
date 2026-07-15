@@ -1,0 +1,242 @@
+{
+  "schema": "llmoop.pedal_instance.v1",
+  "id": "layer_07",
+  "source_layer_index": 7,
+  "type": "pedal_instance",
+  "pedal_class": "lfm2_shortconv_layer_h1024_k3_ffn2560_v1",
+  "operator_type": "conv",
+  "ports": {
+    "inputs": [
+      {
+        "id": "input",
+        "signal": "frame",
+        "shape": [
+          1024
+        ]
+      }
+    ],
+    "outputs": [
+      {
+        "id": "output",
+        "signal": "frame",
+        "shape": [
+          1024
+        ]
+      }
+    ],
+    "controls": [
+      {
+        "id": "control",
+        "type": "pedal_control",
+        "optional": true
+      }
+    ]
+  },
+  "state_ports": [
+    {
+      "id": "temporal_memory",
+      "type": "rolling_frame_memory",
+      "shape": [
+        3,
+        1024
+      ],
+      "update": "shift_append",
+      "sharing": "per_stream_per_pedal_instance"
+    }
+  ],
+  "parameter_block": {
+    "layout": "lfm2_shortconv_layer_params_v1",
+    "storage": "source_tensor_refs",
+    "params": {
+      "operator_norm": {
+        "tensor": "model.layers.7.operator_norm.weight"
+      },
+      "ffn_norm": {
+        "tensor": "model.layers.7.ffn_norm.weight"
+      },
+      "ffn_gate": {
+        "tensor": "model.layers.7.feed_forward.w1.weight"
+      },
+      "ffn_down": {
+        "tensor": "model.layers.7.feed_forward.w2.weight"
+      },
+      "ffn_up": {
+        "tensor": "model.layers.7.feed_forward.w3.weight"
+      },
+      "conv_in_projection": {
+        "tensor": "model.layers.7.conv.in_proj.weight"
+      },
+      "conv_depthwise_kernel": {
+        "tensor": "model.layers.7.conv.conv.weight"
+      },
+      "conv_out_projection": {
+        "tensor": "model.layers.7.conv.out_proj.weight"
+      }
+    },
+    "tensor_refs": [
+      "model.layers.7.operator_norm.weight",
+      "model.layers.7.ffn_norm.weight",
+      "model.layers.7.feed_forward.w1.weight",
+      "model.layers.7.feed_forward.w2.weight",
+      "model.layers.7.feed_forward.w3.weight",
+      "model.layers.7.conv.in_proj.weight",
+      "model.layers.7.conv.conv.weight",
+      "model.layers.7.conv.out_proj.weight"
+    ]
+  },
+  "transition_contract": {
+    "type": "stateful_frame_transform",
+    "equation": "(output_frame, next_state, events) = pedal(input_frame, state, params, control)",
+    "reference_behavior": "source_lfm2_layer_7",
+    "behavioral_error_contract": "not_defined_yet"
+  },
+  "runtime_boundary": {
+    "opaque_to_pedalboard": true,
+    "compiler_may_fuse_internal_operations": true,
+    "compiler_may_replace_reference_decomposition": true
+  },
+  "reference_decomposition": {
+    "source": "lfm2_reference_layer",
+    "wiring": [
+      {
+        "id": "operator_norm",
+        "type": "rms_norm",
+        "circuit_template": "rms_norm_h1024_v1",
+        "input": "input",
+        "output": "operator_norm.output",
+        "params": {
+          "weight": {
+            "tensor": "model.layers.7.operator_norm.weight"
+          }
+        }
+      },
+      {
+        "id": "operator",
+        "type": "short_conv_operator",
+        "circuit_template": "short_conv_h1024_k3_v1",
+        "input": "operator_norm.output",
+        "output": "operator.output",
+        "state_ports": [
+          {
+            "id": "temporal_memory",
+            "type": "rolling_frame_memory",
+            "shape": [
+              3,
+              1024
+            ],
+            "update": "shift_append",
+            "sharing": "per_stream_per_layer_instance"
+          }
+        ],
+        "params": {
+          "in_projection": {
+            "tensor": "model.layers.7.conv.in_proj.weight"
+          },
+          "depthwise_kernel": {
+            "tensor": "model.layers.7.conv.conv.weight"
+          },
+          "out_projection": {
+            "tensor": "model.layers.7.conv.out_proj.weight"
+          }
+        },
+        "internal_pedals": [
+          {
+            "id": "in_projection",
+            "type": "linear"
+          },
+          {
+            "id": "split_b_c_x",
+            "type": "split",
+            "parts": [
+              "b",
+              "c",
+              "x"
+            ]
+          },
+          {
+            "id": "input_gate",
+            "type": "multiply",
+            "expression": "b * x"
+          },
+          {
+            "id": "temporal_memory",
+            "type": "stateful_delay_line"
+          },
+          {
+            "id": "depthwise_conv",
+            "type": "depthwise_temporal_convolution"
+          },
+          {
+            "id": "output_gate",
+            "type": "multiply",
+            "expression": "c * conv_out"
+          },
+          {
+            "id": "out_projection",
+            "type": "linear"
+          }
+        ]
+      },
+      {
+        "id": "operator_residual",
+        "type": "residual_add",
+        "circuit_template": "add_h1024_v1",
+        "inputs": [
+          "input",
+          "operator.output"
+        ],
+        "output": "operator_residual.output"
+      },
+      {
+        "id": "ffn_norm",
+        "type": "rms_norm",
+        "circuit_template": "rms_norm_h1024_v1",
+        "input": "operator_residual.output",
+        "output": "ffn_norm.output",
+        "params": {
+          "weight": {
+            "tensor": "model.layers.7.ffn_norm.weight"
+          }
+        }
+      },
+      {
+        "id": "feed_forward",
+        "type": "swiglu_feed_forward",
+        "circuit_template": "swiglu_ffn_1024_2560_v1",
+        "input": "ffn_norm.output",
+        "output": "ffn.output",
+        "params": {
+          "gate": {
+            "tensor": "model.layers.7.feed_forward.w1.weight"
+          },
+          "down": {
+            "tensor": "model.layers.7.feed_forward.w2.weight"
+          },
+          "up": {
+            "tensor": "model.layers.7.feed_forward.w3.weight"
+          }
+        }
+      },
+      {
+        "id": "ffn_residual",
+        "type": "residual_add",
+        "circuit_template": "add_h1024_v1",
+        "inputs": [
+          "operator_residual.output",
+          "ffn.output"
+        ],
+        "output": "output"
+      }
+    ]
+  },
+  "tensor_refs": [
+    "model.layers.7.operator_norm.weight",
+    "model.layers.7.ffn_norm.weight",
+    "model.layers.7.feed_forward.w1.weight",
+    "model.layers.7.feed_forward.w2.weight",
+    "model.layers.7.feed_forward.w3.weight",
+    "model.layers.7.conv.in_proj.weight",
+    "model.layers.7.conv.conv.weight",
+    "model.layers.7.conv.out_proj.weight"
+  ]
+}

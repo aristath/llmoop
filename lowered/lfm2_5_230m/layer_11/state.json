@@ -1,0 +1,19 @@
+{
+  "schema": "llmoop.circuit_state.v1",
+  "circuit": "layer_11_lfm2_shortconv_circuit_v1",
+  "state_ports": [
+    {
+      "id": "temporal_memory",
+      "type": "rolling_frame_memory",
+      "shape": [
+        3,
+        1024
+      ],
+      "update": "shift_append",
+      "sharing": "per_stream_per_pedal_instance",
+      "owner": "stream",
+      "layout": "time_hidden",
+      "source_layout": "batch_hidden_time"
+    }
+  ]
+}
