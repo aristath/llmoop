@@ -215,6 +215,13 @@ pub struct VulkanU32ResidentBuffer {
     byte_capacity: vk::DeviceSize,
 }
 
+pub struct VulkanResidentBuffer {
+    device: ash::Device,
+    buffer: vk::Buffer,
+    memory: vk::DeviceMemory,
+    byte_capacity: vk::DeviceSize,
+}
+
 impl VulkanU32ResidentBuffer {
     pub fn capacity(&self) -> usize {
         self.capacity
@@ -264,7 +271,48 @@ impl VulkanU32ResidentBuffer {
     }
 }
 
+impl VulkanResidentBuffer {
+    pub fn byte_capacity(&self) -> usize {
+        self.byte_capacity as usize
+    }
+
+    pub fn write_bytes(&self, input: &[u8]) -> Result<(), VulkanError> {
+        let byte_len = self.byte_len(input.len())?;
+        unsafe { write_byte_memory(&self.device, self.memory, byte_len, input) }
+    }
+
+    pub fn read_bytes(&self, len: usize) -> Result<Vec<u8>, VulkanError> {
+        let byte_len = self.byte_len(len)?;
+        unsafe { read_byte_memory(&self.device, self.memory, byte_len, len) }
+    }
+
+    fn byte_len(&self, len: usize) -> Result<vk::DeviceSize, VulkanError> {
+        if len == 0 {
+            return Err(VulkanError(
+                "resident byte buffer length must not be zero".to_string(),
+            ));
+        }
+        let byte_len = len as vk::DeviceSize;
+        if byte_len > self.byte_capacity {
+            return Err(VulkanError(format!(
+                "resident byte buffer capacity {} cannot hold {} bytes",
+                self.byte_capacity, byte_len
+            )));
+        }
+        Ok(byte_len)
+    }
+}
+
 impl Drop for VulkanU32ResidentBuffer {
+    fn drop(&mut self) {
+        unsafe {
+            self.device.destroy_buffer(self.buffer, None);
+            self.device.free_memory(self.memory, None);
+        }
+    }
+}
+
+impl Drop for VulkanResidentBuffer {
     fn drop(&mut self) {
         unsafe {
             self.device.destroy_buffer(self.buffer, None);
@@ -429,6 +477,24 @@ impl VulkanComputeDevice {
         }
     }
 
+    pub fn create_resident_buffer(
+        &self,
+        byte_capacity: usize,
+    ) -> Result<VulkanResidentBuffer, VulkanError> {
+        if byte_capacity == 0 {
+            return Err(VulkanError(
+                "resident byte buffer capacity must not be zero".to_string(),
+            ));
+        }
+        let (buffer, memory, byte_capacity) = self.create_resident_storage_buffer(byte_capacity)?;
+        Ok(VulkanResidentBuffer {
+            device: self.device.clone(),
+            buffer,
+            memory,
+            byte_capacity,
+        })
+    }
+
     pub fn create_u32_resident_buffer(
         &self,
         capacity: usize,
@@ -441,8 +507,23 @@ impl VulkanComputeDevice {
         let byte_capacity = capacity
             .checked_mul(std::mem::size_of::<u32>())
             .ok_or_else(|| VulkanError("resident buffer byte capacity overflowed".to_string()))?
-            as vk::DeviceSize;
+            as usize;
 
+        let (buffer, memory, byte_capacity) = self.create_resident_storage_buffer(byte_capacity)?;
+        Ok(VulkanU32ResidentBuffer {
+            device: self.device.clone(),
+            buffer,
+            memory,
+            capacity,
+            byte_capacity,
+        })
+    }
+
+    fn create_resident_storage_buffer(
+        &self,
+        byte_capacity: usize,
+    ) -> Result<(vk::Buffer, vk::DeviceMemory, vk::DeviceSize), VulkanError> {
+        let byte_capacity = byte_capacity as vk::DeviceSize;
         unsafe {
             let buffer_info = vk::BufferCreateInfo::default()
                 .size(byte_capacity)
@@ -490,14 +571,7 @@ impl VulkanComputeDevice {
                         "failed to bind resident storage buffer memory: {error:?}"
                     ))
                 })?;
-
-            Ok(VulkanU32ResidentBuffer {
-                device: self.device.clone(),
-                buffer,
-                memory,
-                capacity,
-                byte_capacity,
-            })
+            Ok((buffer, memory, byte_capacity))
         }
     }
 
@@ -1073,6 +1147,23 @@ unsafe fn write_u32_memory(
     Ok(())
 }
 
+unsafe fn write_byte_memory(
+    device: &ash::Device,
+    memory: vk::DeviceMemory,
+    byte_len: vk::DeviceSize,
+    input: &[u8],
+) -> Result<(), VulkanError> {
+    let ptr = unsafe {
+        device
+            .map_memory(memory, 0, byte_len, vk::MemoryMapFlags::empty())
+            .map_err(|error| VulkanError(format!("failed to map input memory: {error:?}")))?
+    };
+    let mapped = unsafe { std::slice::from_raw_parts_mut(ptr.cast::<u8>(), input.len()) };
+    mapped.copy_from_slice(input);
+    unsafe { device.unmap_memory(memory) };
+    Ok(())
+}
+
 unsafe fn read_u32_memory(
     device: &ash::Device,
     memory: vk::DeviceMemory,
@@ -1085,6 +1176,22 @@ unsafe fn read_u32_memory(
             .map_err(|error| VulkanError(format!("failed to map output memory: {error:?}")))?
     };
     let output = unsafe { std::slice::from_raw_parts(ptr.cast::<u32>(), len) }.to_vec();
+    unsafe { device.unmap_memory(memory) };
+    Ok(output)
+}
+
+unsafe fn read_byte_memory(
+    device: &ash::Device,
+    memory: vk::DeviceMemory,
+    byte_len: vk::DeviceSize,
+    len: usize,
+) -> Result<Vec<u8>, VulkanError> {
+    let ptr = unsafe {
+        device
+            .map_memory(memory, 0, byte_len, vk::MemoryMapFlags::empty())
+            .map_err(|error| VulkanError(format!("failed to map output memory: {error:?}")))?
+    };
+    let output = unsafe { std::slice::from_raw_parts(ptr.cast::<u8>(), len) }.to_vec();
     unsafe { device.unmap_memory(memory) };
     Ok(output)
 }
@@ -1285,6 +1392,27 @@ mod tests {
 
         assert_eq!(buffer.capacity(), 4);
         assert_eq!(buffer.read(2).unwrap(), vec![41, 42]);
+    }
+
+    #[test]
+    fn resident_byte_buffer_can_be_reused_for_raw_model_memory() {
+        let device = match VulkanComputeDevice::new() {
+            Ok(device) => device,
+            Err(error) => {
+                eprintln!("skipping Vulkan smoke: {error}");
+                return;
+            }
+        };
+        let buffer = device.create_resident_buffer(16).unwrap();
+
+        buffer.write_bytes(&[1, 2, 3, 4, 5]).unwrap();
+        assert_eq!(buffer.byte_capacity(), 16);
+        assert_eq!(buffer.read_bytes(5).unwrap(), vec![1, 2, 3, 4, 5]);
+
+        buffer.write_bytes(&[10, 20, 30]).unwrap();
+        assert_eq!(buffer.read_bytes(3).unwrap(), vec![10, 20, 30]);
+        assert!(buffer.read_bytes(17).is_err());
+        assert!(buffer.write_bytes(&[0; 17]).is_err());
     }
 
     #[test]
