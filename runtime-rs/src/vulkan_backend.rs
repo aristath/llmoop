@@ -14,7 +14,9 @@ use crate::types::{
 use crate::vulkan::{
     VULKAN_SPIRV_BACKEND_ID, VulkanBackendArtifactManifest, VulkanBackendDescriptor,
 };
-use crate::vulkan_compute::{VulkanComputeDevice, VulkanError, VulkanU32ShaderPedal};
+use crate::vulkan_compute::{
+    VulkanComputeDevice, VulkanError, VulkanPipelineCacheStats, VulkanU32ShaderPedal,
+};
 use crate::vulkan_pedalboard::VulkanU32Pedalboard;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -89,9 +91,11 @@ impl VulkanU32Backend {
         device_id: impl Into<String>,
         pedalboard: VulkanU32Pedalboard,
     ) -> Result<Self, VulkanBackendError> {
+        let device = VulkanComputeDevice::new()?;
+        pedalboard.install(&device)?;
         Ok(Self {
             device_id: device_id.into(),
-            device: VulkanComputeDevice::new()?,
+            device,
             pedalboard,
             streams: HashMap::new(),
             active_queue: VecDeque::new(),
@@ -150,6 +154,10 @@ impl VulkanU32Backend {
 
     pub fn device_name(&self) -> &str {
         self.device.device_name()
+    }
+
+    pub fn pipeline_cache_stats(&self) -> VulkanPipelineCacheStats {
+        self.device.pipeline_cache_stats()
     }
 
     fn stream_mut(&mut self, stream_id: &str) -> Result<&mut VulkanU32Stream, BackendError> {
@@ -548,6 +556,14 @@ mod tests {
                 return;
             }
         };
+        assert_eq!(
+            backend.pipeline_cache_stats(),
+            VulkanPipelineCacheStats {
+                u32_storage_pipelines: 1,
+                hits: 1,
+                misses: 1
+            }
+        );
         backend.create_stream("s0").unwrap();
         backend
             .inject_prompt(PromptInjection::new("s0", vec![1], 1))

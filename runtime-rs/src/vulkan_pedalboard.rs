@@ -49,6 +49,13 @@ impl VulkanU32Pedalboard {
         Ok(self.pedals.remove(index))
     }
 
+    pub fn install(&self, device: &VulkanComputeDevice) -> Result<(), VulkanError> {
+        for pedal in &self.pedals {
+            pedal.install_on_device(device)?;
+        }
+        Ok(())
+    }
+
     pub fn process(
         &self,
         device: &VulkanComputeDevice,
@@ -102,6 +109,9 @@ mod tests {
             return;
         };
         let board = VulkanU32Pedalboard::new(vec![first, second]);
+        board.install(&device).unwrap();
+
+        assert_eq!(device.pipeline_cache_stats().u32_storage_pipelines, 1);
 
         let run = board.process(&device, &[0, 10, 40]).unwrap();
 

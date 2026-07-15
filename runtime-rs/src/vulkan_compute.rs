@@ -99,6 +99,10 @@ impl VulkanU32ShaderPedal {
             output,
         })
     }
+
+    pub fn install_on_device(&self, device: &VulkanComputeDevice) -> Result<(), VulkanError> {
+        device.install_u32_storage_shader(&self.program.words, self.local_size_x)
+    }
 }
 
 pub struct VulkanComputeDevice {
@@ -199,6 +203,21 @@ impl VulkanComputeDevice {
             hits: self.pipeline_cache_hits.get(),
             misses: self.pipeline_cache_misses.get(),
         }
+    }
+
+    pub fn install_u32_storage_shader(
+        &self,
+        spirv_words: &[u32],
+        local_size_x: u32,
+    ) -> Result<(), VulkanError> {
+        if spirv_words.is_empty() {
+            return Err(VulkanError("SPIR-V module must not be empty".to_string()));
+        }
+        if local_size_x == 0 {
+            return Err(VulkanError("local_size_x must not be zero".to_string()));
+        }
+        self.u32_storage_pipeline(spirv_words, local_size_x)?;
+        Ok(())
     }
 
     pub fn run_u32_storage_shader(
@@ -693,6 +712,45 @@ mod tests {
         assert!(!device.device_name().is_empty());
         assert_eq!(first, vec![8, 9, 10]);
         assert_eq!(second, vec![41, 42]);
+    }
+
+    #[test]
+    fn installing_shader_warms_pipeline_cache_before_dispatch() {
+        let Some(spirv_words) = compile_test_shader_words() else {
+            eprintln!("skipping Vulkan smoke: no GLSL to SPIR-V compiler found");
+            return;
+        };
+        let device = match VulkanComputeDevice::new() {
+            Ok(device) => device,
+            Err(error) => {
+                eprintln!("skipping Vulkan smoke: {error}");
+                return;
+            }
+        };
+
+        device.install_u32_storage_shader(&spirv_words, 64).unwrap();
+        assert_eq!(
+            device.pipeline_cache_stats(),
+            VulkanPipelineCacheStats {
+                u32_storage_pipelines: 1,
+                hits: 0,
+                misses: 1
+            }
+        );
+
+        let output = device
+            .run_u32_storage_shader(&spirv_words, &[10, 20], 64)
+            .unwrap();
+
+        assert_eq!(output, vec![11, 21]);
+        assert_eq!(
+            device.pipeline_cache_stats(),
+            VulkanPipelineCacheStats {
+                u32_storage_pipelines: 1,
+                hits: 1,
+                misses: 1
+            }
+        );
     }
 
     #[test]
