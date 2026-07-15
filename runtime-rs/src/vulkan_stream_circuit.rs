@@ -7904,6 +7904,228 @@ mod tests {
                                                                 0xbe,
                                                             ]
                                                         );
+
+                                                        if let Some(silu_spirv_words) =
+                                                            crate::vulkan_compute::compile_test_shader_words_from_source(
+                                                                "silu_bf16_2560.comp",
+                                                            )
+                                                        {
+                                                            let silu_dispatch = mounted_bound
+                                                                .dispatch(
+                                                                    "layer_00",
+                                                                    "ffn_gate_activation",
+                                                                )
+                                                                .unwrap();
+                                                            assert_eq!(silu_dispatch.op, "silu");
+                                                            let silu_bindings = mounted
+                                                                .resident_kernel_buffer_bindings_for_bound_dispatch(
+                                                                    silu_dispatch,
+                                                                )
+                                                                .unwrap();
+                                                            assert_eq!(silu_bindings.len(), 2);
+                                                            assert_eq!(
+                                                                silu_bindings[0].byte_len,
+                                                                5_120
+                                                            );
+                                                            assert_eq!(
+                                                                silu_bindings[1].byte_len,
+                                                                5_120
+                                                            );
+                                                            let silu_family = mounted
+                                                                .placed_plan
+                                                                .reusable_kernel_plan
+                                                                .family(
+                                                                    &silu_dispatch
+                                                                        .reusable_family_id,
+                                                                )
+                                                                .unwrap();
+                                                            let silu_artifact_path = format!(
+                                                                "kernels/{}.spv",
+                                                                silu_dispatch.reusable_family_id
+                                                            );
+                                                            let silu_kernel_manifest =
+                                                                VulkanLoadedReusableKernelArtifactManifest {
+                                                                    schema:
+                                                                        VULKAN_REUSABLE_KERNEL_ARTIFACT_MANIFEST_SCHEMA
+                                                                            .to_string(),
+                                                                    backend_id:
+                                                                        VULKAN_STREAM_CIRCUIT_BACKEND_ID
+                                                                            .to_string(),
+                                                                    total_word_count:
+                                                                        silu_spirv_words.len(),
+                                                                    artifacts: vec![
+                                                                        VulkanLoadedReusableKernelArtifact {
+                                                                            artifact:
+                                                                                VulkanReusableKernelArtifact::from_family(
+                                                                                    silu_family,
+                                                                                    silu_artifact_path.clone(),
+                                                                                ),
+                                                                            resolved_path:
+                                                                                PathBuf::from(
+                                                                                    silu_artifact_path,
+                                                                                ),
+                                                                            words:
+                                                                                silu_spirv_words,
+                                                                        },
+                                                                    ],
+                                                                };
+                                                            let silu_resident_dispatch = mounted
+                                                                .create_resident_kernel_dispatch_for_bound_dispatch(
+                                                                    &device,
+                                                                    silu_dispatch,
+                                                                    &silu_kernel_manifest,
+                                                                )
+                                                                .unwrap();
+                                                            assert_eq!(
+                                                                silu_resident_dispatch
+                                                                    .workgroup_count_x(),
+                                                                1
+                                                            );
+
+                                                            device
+                                                                .run_resident_kernel_dispatch(
+                                                                    &silu_resident_dispatch,
+                                                                    &[0u8; 16],
+                                                                )
+                                                                .unwrap();
+
+                                                            assert_eq!(
+                                                                silu_bindings[1]
+                                                                    .buffer
+                                                                    .read_bytes(16)
+                                                                    .unwrap(),
+                                                                vec![
+                                                                    0x8c, 0x3c, 0xa1, 0x3d, 0x77,
+                                                                    0x3d, 0x0d, 0x3e, 0x1a, 0x3e,
+                                                                    0x90, 0x3d, 0xde, 0x3d, 0xbc,
+                                                                    0x3c,
+                                                                ]
+                                                            );
+
+                                                            if let Some(ffn_multiply_spirv_words) =
+                                                                crate::vulkan_compute::compile_test_shader_words_from_source(
+                                                                    "multiply_bf16_2560.comp",
+                                                                )
+                                                            {
+                                                                let ffn_multiply_dispatch =
+                                                                    mounted_bound
+                                                                        .dispatch(
+                                                                            "layer_00",
+                                                                            "ffn_gate_multiply",
+                                                                        )
+                                                                        .unwrap();
+                                                                assert_eq!(
+                                                                    ffn_multiply_dispatch.op,
+                                                                    "multiply"
+                                                                );
+                                                                let ffn_multiply_bindings = mounted
+                                                                    .resident_kernel_buffer_bindings_for_bound_dispatch(
+                                                                        ffn_multiply_dispatch,
+                                                                    )
+                                                                    .unwrap();
+                                                                assert_eq!(
+                                                                    ffn_multiply_bindings.len(),
+                                                                    3
+                                                                );
+                                                                assert_eq!(
+                                                                    ffn_multiply_bindings[0]
+                                                                        .byte_len,
+                                                                    5_120
+                                                                );
+                                                                assert_eq!(
+                                                                    ffn_multiply_bindings[1]
+                                                                        .byte_len,
+                                                                    5_120
+                                                                );
+                                                                assert_eq!(
+                                                                    ffn_multiply_bindings[2]
+                                                                        .byte_len,
+                                                                    5_120
+                                                                );
+                                                                let ffn_multiply_family = mounted
+                                                                    .placed_plan
+                                                                    .reusable_kernel_plan
+                                                                    .family(
+                                                                        &ffn_multiply_dispatch
+                                                                            .reusable_family_id,
+                                                                    )
+                                                                    .unwrap();
+                                                                let ffn_multiply_artifact_path =
+                                                                    format!(
+                                                                        "kernels/{}.spv",
+                                                                        ffn_multiply_dispatch
+                                                                            .reusable_family_id
+                                                                    );
+                                                                let ffn_multiply_kernel_manifest =
+                                                                    VulkanLoadedReusableKernelArtifactManifest {
+                                                                        schema:
+                                                                            VULKAN_REUSABLE_KERNEL_ARTIFACT_MANIFEST_SCHEMA
+                                                                                .to_string(),
+                                                                        backend_id:
+                                                                            VULKAN_STREAM_CIRCUIT_BACKEND_ID
+                                                                                .to_string(),
+                                                                        total_word_count:
+                                                                            ffn_multiply_spirv_words
+                                                                                .len(),
+                                                                        artifacts: vec![
+                                                                            VulkanLoadedReusableKernelArtifact {
+                                                                                artifact:
+                                                                                    VulkanReusableKernelArtifact::from_family(
+                                                                                        ffn_multiply_family,
+                                                                                        ffn_multiply_artifact_path.clone(),
+                                                                                    ),
+                                                                                resolved_path:
+                                                                                    PathBuf::from(
+                                                                                        ffn_multiply_artifact_path,
+                                                                                    ),
+                                                                                words:
+                                                                                    ffn_multiply_spirv_words,
+                                                                            },
+                                                                        ],
+                                                                    };
+                                                                let ffn_multiply_resident_dispatch =
+                                                                    mounted
+                                                                        .create_resident_kernel_dispatch_for_bound_dispatch(
+                                                                            &device,
+                                                                            ffn_multiply_dispatch,
+                                                                            &ffn_multiply_kernel_manifest,
+                                                                        )
+                                                                        .unwrap();
+                                                                assert_eq!(
+                                                                    ffn_multiply_resident_dispatch
+                                                                        .workgroup_count_x(),
+                                                                    1
+                                                                );
+
+                                                                device
+                                                                    .run_resident_kernel_dispatch(
+                                                                        &ffn_multiply_resident_dispatch,
+                                                                        &[0u8; 16],
+                                                                    )
+                                                                    .unwrap();
+
+                                                                assert_eq!(
+                                                                    ffn_multiply_bindings[2]
+                                                                        .buffer
+                                                                        .read_bytes(16)
+                                                                        .unwrap(),
+                                                                    vec![
+                                                                        0x46, 0xbb, 0x11, 0xbd,
+                                                                        0x55, 0xbc, 0xad, 0x3c,
+                                                                        0xcd, 0xbc, 0x9c, 0x3a,
+                                                                        0xc1, 0x3c, 0x02, 0xbc,
+                                                                    ]
+                                                                );
+                                                            } else {
+                                                                eprintln!(
+                                                                    "skipping BF16 FFN multiply Vulkan dispatch: no GLSL to SPIR-V compiler found"
+                                                                );
+                                                            }
+                                                        } else {
+                                                            eprintln!(
+                                                                "skipping BF16 SiLU Vulkan dispatch: no GLSL to SPIR-V compiler found"
+                                                            );
+                                                        }
                                                     } else {
                                                         eprintln!(
                                                             "skipping BF16 FFN projection Vulkan dispatches: no GLSL to SPIR-V compiler found"
