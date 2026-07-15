@@ -2216,6 +2216,29 @@ impl VulkanMountedPlacedStreamCircuit {
         )
     }
 
+    pub fn create_resident_pedalboard_runner<I, S>(
+        &self,
+        device: &VulkanComputeDevice,
+        mounted_bound_plan: &VulkanMountedPlacedBoundDispatchPlan,
+        pedal_ids: I,
+        loaded_manifest: &VulkanLoadedReusableKernelArtifactManifest,
+    ) -> Result<
+        VulkanMountedPlacedResidentPedalboardRunner,
+        VulkanMountedPlacedResidentKernelDispatchError,
+    >
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        VulkanMountedPlacedResidentPedalboardRunner::from_mounted_bound_plan(
+            device,
+            self,
+            mounted_bound_plan,
+            pedal_ids,
+            loaded_manifest,
+        )
+    }
+
     fn resident_kernel_buffer_binding<'a>(
         &'a self,
         dispatch: &VulkanMountedPlacedBoundDispatch,
@@ -2526,6 +2549,134 @@ pub struct VulkanMountedPlacedResidentPedalDispatchRun {
     pub descriptor_count: usize,
     pub workgroup_count_x: u32,
     pub push_constant_byte_count: u32,
+}
+
+pub struct VulkanMountedPlacedResidentPedalboardRunner {
+    pub device_id: String,
+    pub pedals: Vec<VulkanMountedPlacedResidentPedalRunner>,
+    pub total_descriptor_count: usize,
+    pub total_push_constant_byte_count: u32,
+}
+
+impl VulkanMountedPlacedResidentPedalboardRunner {
+    fn from_mounted_bound_plan<I, S>(
+        device: &VulkanComputeDevice,
+        mounted: &VulkanMountedPlacedStreamCircuit,
+        mounted_bound_plan: &VulkanMountedPlacedBoundDispatchPlan,
+        pedal_ids: I,
+        loaded_manifest: &VulkanLoadedReusableKernelArtifactManifest,
+    ) -> Result<Self, VulkanMountedPlacedResidentKernelDispatchError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut pedals = Vec::new();
+        let mut total_descriptor_count = 0usize;
+        let mut total_push_constant_byte_count = 0u32;
+
+        for pedal_id in pedal_ids {
+            let pedal_id = pedal_id.as_ref();
+            let runner = VulkanMountedPlacedResidentPedalRunner::from_mounted_bound_plan(
+                device,
+                mounted,
+                mounted_bound_plan,
+                pedal_id,
+                loaded_manifest,
+            )?;
+            total_descriptor_count = total_descriptor_count
+                .checked_add(runner.total_descriptor_count)
+                .ok_or_else(|| {
+                    VulkanMountedPlacedResidentKernelDispatchError::PedalboardRunnerDescriptorCountOverflow {
+                        device_id: mounted_bound_plan.device_id.clone(),
+                    }
+                })?;
+            total_push_constant_byte_count = total_push_constant_byte_count
+                .checked_add(runner.total_push_constant_byte_count)
+                .ok_or_else(|| {
+                    VulkanMountedPlacedResidentKernelDispatchError::PedalboardRunnerPushConstantByteCountOverflow {
+                        device_id: mounted_bound_plan.device_id.clone(),
+                    }
+                })?;
+            pedals.push(runner);
+        }
+
+        if pedals.is_empty() {
+            return Err(
+                VulkanMountedPlacedResidentKernelDispatchError::MissingPedalboardPedals {
+                    device_id: mounted_bound_plan.device_id.clone(),
+                },
+            );
+        }
+
+        Ok(Self {
+            device_id: mounted_bound_plan.device_id.clone(),
+            pedals,
+            total_descriptor_count,
+            total_push_constant_byte_count,
+        })
+    }
+
+    pub fn pedal_count(&self) -> usize {
+        self.pedals.len()
+    }
+
+    pub fn dispatch_count(&self) -> usize {
+        self.pedals
+            .iter()
+            .map(VulkanMountedPlacedResidentPedalRunner::dispatch_count)
+            .sum()
+    }
+
+    pub fn pedal_ids(&self) -> Vec<&str> {
+        self.pedals
+            .iter()
+            .map(|pedal| pedal.pedal_id.as_str())
+            .collect()
+    }
+
+    pub fn run_zeroed_push_constants(
+        &self,
+        device: &VulkanComputeDevice,
+    ) -> Result<
+        VulkanMountedPlacedResidentPedalboardRun,
+        VulkanMountedPlacedResidentKernelDispatchError,
+    > {
+        let mut pedal_runs = Vec::with_capacity(self.pedals.len());
+        for pedal in &self.pedals {
+            pedal_runs.push(pedal.run_zeroed_push_constants(device)?);
+        }
+
+        Ok(VulkanMountedPlacedResidentPedalboardRun {
+            device_id: self.device_id.clone(),
+            pedal_runs,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanMountedPlacedResidentPedalboardRun {
+    pub device_id: String,
+    pub pedal_runs: Vec<VulkanMountedPlacedResidentPedalRun>,
+}
+
+impl VulkanMountedPlacedResidentPedalboardRun {
+    pub fn pedal_count(&self) -> usize {
+        self.pedal_runs.len()
+    }
+
+    pub fn dispatch_count(&self) -> usize {
+        self.pedal_runs
+            .iter()
+            .map(VulkanMountedPlacedResidentPedalRun::dispatch_count)
+            .sum()
+    }
+
+    pub fn pedal_ids(&self) -> Vec<&str> {
+        self.pedal_runs
+            .iter()
+            .map(|pedal| pedal.pedal_id.as_str())
+            .collect()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -5071,6 +5222,9 @@ impl From<VulkanBoundDispatchPlanError> for VulkanMountedPlacedStreamTickError {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum VulkanMountedPlacedResidentKernelDispatchError {
+    MissingPedalboardPedals {
+        device_id: String,
+    },
     MissingPedalDispatches {
         pedal_id: String,
     },
@@ -5141,12 +5295,24 @@ pub enum VulkanMountedPlacedResidentKernelDispatchError {
     PedalRunnerPushConstantByteCountOverflow {
         pedal_id: String,
     },
+    PedalboardRunnerDescriptorCountOverflow {
+        device_id: String,
+    },
+    PedalboardRunnerPushConstantByteCountOverflow {
+        device_id: String,
+    },
     Vulkan(VulkanError),
 }
 
 impl Display for VulkanMountedPlacedResidentKernelDispatchError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::MissingPedalboardPedals { device_id } => {
+                write!(
+                    f,
+                    "resident pedalboard runner for device {device_id:?} has no pedals"
+                )
+            }
             Self::MissingPedalDispatches { pedal_id } => {
                 write!(f, "pedal {pedal_id:?} has no mounted dispatches")
             }
@@ -5250,6 +5416,14 @@ impl Display for VulkanMountedPlacedResidentKernelDispatchError {
             Self::PedalRunnerPushConstantByteCountOverflow { pedal_id } => write!(
                 f,
                 "resident pedal runner {pedal_id:?} push-constant byte count overflowed"
+            ),
+            Self::PedalboardRunnerDescriptorCountOverflow { device_id } => write!(
+                f,
+                "resident pedalboard runner for device {device_id:?} descriptor count overflowed"
+            ),
+            Self::PedalboardRunnerPushConstantByteCountOverflow { device_id } => write!(
+                f,
+                "resident pedalboard runner for device {device_id:?} push-constant byte count overflowed"
             ),
             Self::Vulkan(error) => Display::fmt(error, f),
         }
@@ -6521,19 +6695,28 @@ mod tests {
         mounted: &VulkanMountedPlacedStreamCircuit,
         tensor_index: &TensorIndex,
     ) {
-        for tensor in [
-            "model.layers.0.operator_norm.weight",
-            "model.layers.0.conv.in_proj.weight",
-            "model.layers.0.conv.conv.weight",
-            "model.layers.0.conv.out_proj.weight",
-            "model.layers.0.ffn_norm.weight",
-            "model.layers.0.feed_forward.w1.weight",
-            "model.layers.0.feed_forward.w2.weight",
-            "model.layers.0.feed_forward.w3.weight",
+        load_lfm2_conv_layer_parameters(mounted, tensor_index, 0);
+    }
+
+    fn load_lfm2_conv_layer_parameters(
+        mounted: &VulkanMountedPlacedStreamCircuit,
+        tensor_index: &TensorIndex,
+        layer_index: usize,
+    ) {
+        for suffix in [
+            "operator_norm.weight",
+            "conv.in_proj.weight",
+            "conv.conv.weight",
+            "conv.out_proj.weight",
+            "ffn_norm.weight",
+            "feed_forward.w1.weight",
+            "feed_forward.w2.weight",
+            "feed_forward.w3.weight",
         ] {
+            let tensor = format!("model.layers.{layer_index}.{suffix}");
             mounted
                 .parameter_buffers
-                .load_parameter_from_tensor_index(tensor_index, tensor)
+                .load_parameter_from_tensor_index(tensor_index, &tensor)
                 .unwrap();
         }
     }
@@ -6550,9 +6733,13 @@ mod tests {
             .buffer
             .write_bytes(&input_frame)
             .unwrap();
+        zero_lfm2_temporal_memory(mounted, "layer_00");
+    }
+
+    fn zero_lfm2_temporal_memory(mounted: &VulkanMountedPlacedStreamCircuit, pedal_id: &str) {
         let temporal_memory = mounted
             .buffers
-            .state_buffer("layer_00", "temporal_memory")
+            .state_buffer(pedal_id, "temporal_memory")
             .unwrap();
         temporal_memory
             .buffer
@@ -7016,6 +7203,73 @@ mod tests {
             final_residual_bindings[2].buffer.read_bytes(16).unwrap(),
             vec![
                 0x86, 0x3f, 0x82, 0x3f, 0x81, 0x3f, 0x7e, 0x3f, 0x83, 0x3f, 0x83, 0x3f, 0x83, 0x3f,
+                0x83, 0x3f,
+            ]
+        );
+    }
+
+    #[test]
+    fn resident_pedalboard_runner_executes_layer_00_to_layer_01_over_local_cable() {
+        let device = match VulkanComputeDevice::new() {
+            Ok(device) => device,
+            Err(error) => {
+                eprintln!("skipping resident pedalboard runner: {error}");
+                return;
+            }
+        };
+        let (tensor_index, mounted, _manifest, mounted_bound) =
+            mount_lfm2_single_device_stream_circuit(&device);
+        let Some(loaded_manifest) = layer_00_level_1_loaded_kernel_pack(&mounted, &mounted_bound)
+        else {
+            eprintln!("skipping resident pedalboard runner: no GLSL to SPIR-V compiler found");
+            return;
+        };
+        load_layer_00_parameters(&mounted, &tensor_index);
+        load_lfm2_conv_layer_parameters(&mounted, &tensor_index, 1);
+        write_layer_00_unit_input_and_zero_state(&mounted);
+        zero_lfm2_temporal_memory(&mounted, "layer_01");
+
+        let runner = mounted
+            .create_resident_pedalboard_runner(
+                &device,
+                &mounted_bound,
+                ["layer_00", "layer_01"],
+                &loaded_manifest,
+            )
+            .unwrap();
+        assert_eq!(runner.device_id, "gpu0");
+        assert_eq!(runner.pedal_count(), 2);
+        assert_eq!(runner.pedal_ids(), vec!["layer_00", "layer_01"]);
+        assert_eq!(runner.dispatch_count(), 32);
+        assert_eq!(runner.total_descriptor_count, 104);
+        assert_eq!(runner.total_push_constant_byte_count, 512);
+
+        let run = runner.run_zeroed_push_constants(&device).unwrap();
+        assert_eq!(run.device_id, "gpu0");
+        assert_eq!(run.pedal_count(), 2);
+        assert_eq!(run.pedal_ids(), vec!["layer_00", "layer_01"]);
+        assert_eq!(run.dispatch_count(), 32);
+
+        let layer_00_output_dispatch = mounted_bound.dispatch("layer_00", "ffn_residual").unwrap();
+        let layer_00_output_bindings = mounted
+            .resident_kernel_buffer_bindings_for_bound_dispatch(layer_00_output_dispatch)
+            .unwrap();
+        assert_eq!(
+            layer_00_output_bindings[2].buffer.read_bytes(16).unwrap(),
+            vec![
+                0x86, 0x3f, 0x82, 0x3f, 0x81, 0x3f, 0x7e, 0x3f, 0x83, 0x3f, 0x83, 0x3f, 0x83, 0x3f,
+                0x83, 0x3f,
+            ]
+        );
+
+        let layer_01_output_dispatch = mounted_bound.dispatch("layer_01", "ffn_residual").unwrap();
+        let layer_01_output_bindings = mounted
+            .resident_kernel_buffer_bindings_for_bound_dispatch(layer_01_output_dispatch)
+            .unwrap();
+        assert_eq!(
+            layer_01_output_bindings[2].buffer.read_bytes(16).unwrap(),
+            vec![
+                0x86, 0x3f, 0x84, 0x3f, 0x80, 0x3f, 0x7f, 0x3f, 0x83, 0x3f, 0x84, 0x3f, 0x88, 0x3f,
                 0x83, 0x3f,
             ]
         );
