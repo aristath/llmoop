@@ -101,8 +101,15 @@ struct VulkanU32StreamAdvance {
 }
 
 struct VulkanU32QueuedAdvance {
+    dispatch_tick: u64,
     input: InputSignal,
     public_output: Option<PublicOutputSignal>,
+    has_more_work: bool,
+}
+
+struct VulkanU32StreamRun {
+    advances: Vec<VulkanU32QueuedAdvance>,
+    next_dispatch_tick: u64,
     has_more_work: bool,
 }
 
@@ -248,10 +255,40 @@ impl VulkanU32Stream {
         });
 
         Ok(Some(VulkanU32QueuedAdvance {
+            dispatch_tick,
             input,
             public_output,
             has_more_work: self.has_work(),
         }))
+    }
+
+    fn advance_for_budget(
+        &mut self,
+        device: &VulkanComputeDevice,
+        pedalboard: &VulkanU32Pedalboard,
+        start_dispatch_tick: u64,
+        max_ticks: usize,
+    ) -> Result<VulkanU32StreamRun, VulkanBackendError> {
+        let mut advances = Vec::new();
+        let mut dispatch_tick = start_dispatch_tick;
+
+        while advances.len() < max_ticks {
+            let Some(advance) = self.advance_queued_once(device, pedalboard, dispatch_tick)? else {
+                break;
+            };
+            dispatch_tick += 1;
+            let has_more_work = advance.has_more_work;
+            advances.push(advance);
+            if !has_more_work {
+                break;
+            }
+        }
+
+        Ok(VulkanU32StreamRun {
+            has_more_work: self.has_work(),
+            next_dispatch_tick: dispatch_tick,
+            advances,
+        })
     }
 }
 
@@ -474,42 +511,50 @@ impl DeviceBackend for VulkanU32Backend {
                 .active_queue
                 .pop_front()
                 .expect("queue checked as non-empty");
-            let dispatch_tick = self.dispatch_tick;
+            let remaining_tick_budget = max_ticks as usize - ticks.len();
 
-            let advance = {
+            let run = {
                 let device = &self.device;
                 let pedalboard = &self.pedalboard;
                 let stream = self
                     .streams
                     .get_mut(&stream_id)
                     .ok_or_else(|| BackendError::UnknownStream(stream_id.clone()))?;
-                stream.advance_queued_once(device, pedalboard, dispatch_tick)?
+                stream.advance_for_budget(
+                    device,
+                    pedalboard,
+                    self.dispatch_tick,
+                    remaining_tick_budget,
+                )?
             };
-            let Some(advance) = advance else {
+            if run.advances.is_empty() {
                 continue;
-            };
-
-            let output = advance.public_output.map(|public| DeviceOutputEvent {
-                device_id: self.device_id.clone(),
-                stream_id: stream_id.clone(),
-                output: public,
-                dispatch_tick,
-            });
-
-            self.dispatch_tick += 1;
-            ticks.push(DeviceDispatchTick {
-                device_id: self.device_id.clone(),
-                dispatch_tick,
-                stream_id: stream_id.clone(),
-                input: advance.input,
-                status: "processed".to_string(),
-            });
-
-            if let Some(event) = output {
-                self.output_queue.push(event.clone());
-                outputs.push(event);
             }
-            if advance.has_more_work {
+
+            for advance in run.advances {
+                let output = advance.public_output.map(|public| DeviceOutputEvent {
+                    device_id: self.device_id.clone(),
+                    stream_id: stream_id.clone(),
+                    output: public,
+                    dispatch_tick: advance.dispatch_tick,
+                });
+
+                ticks.push(DeviceDispatchTick {
+                    device_id: self.device_id.clone(),
+                    dispatch_tick: advance.dispatch_tick,
+                    stream_id: stream_id.clone(),
+                    input: advance.input,
+                    status: "processed".to_string(),
+                });
+
+                if let Some(event) = output {
+                    self.output_queue.push(event.clone());
+                    outputs.push(event);
+                }
+            }
+
+            self.dispatch_tick = run.next_dispatch_tick;
+            if run.has_more_work {
                 self.schedule(&stream_id);
             }
         }
@@ -746,6 +791,7 @@ mod tests {
             .unwrap()
             .unwrap();
 
+        assert_eq!(advance.dispatch_tick, 7);
         assert_eq!(advance.input.token_id, 1);
         assert_eq!(advance.public_output.unwrap().token_id, 2);
         assert_eq!(stream.public_counter, 1);
@@ -759,6 +805,39 @@ mod tests {
             stream.mounted.ports.private_feedback.read(1).unwrap(),
             vec![2]
         );
+    }
+
+    #[test]
+    fn stream_run_advances_feedback_loop_until_budget_or_idle() {
+        let Some(backend) = backend_with_adders(1) else {
+            return;
+        };
+        let mut stream = match VulkanU32Stream::new(&backend.device) {
+            Ok(stream) => stream,
+            Err(error) => {
+                eprintln!("skipping stream run smoke: {error}");
+                return;
+            }
+        };
+        stream
+            .pending_external
+            .push_back(InputSignal::external("input_0", 1, "test"));
+        stream.remaining_outputs = 3;
+
+        let run = stream
+            .advance_for_budget(&backend.device, &backend.pedalboard, 9, 2)
+            .unwrap();
+
+        assert_eq!(run.advances.len(), 2);
+        assert_eq!(run.advances[0].dispatch_tick, 9);
+        assert_eq!(run.advances[0].public_output.as_ref().unwrap().token_id, 2);
+        assert_eq!(run.advances[1].dispatch_tick, 10);
+        assert_eq!(run.advances[1].public_output.as_ref().unwrap().token_id, 3);
+        assert_eq!(run.next_dispatch_tick, 11);
+        assert!(run.has_more_work);
+        assert_eq!(stream.remaining_outputs, 1);
+        assert_eq!(stream.pending_feedback.len(), 1);
+        assert_eq!(stream.pending_feedback[0].token_id, 3);
     }
 
     #[test]
@@ -849,6 +928,32 @@ mod tests {
         assert_eq!(run.ticks.len(), 2);
         assert_eq!(run.outputs.len(), 1);
         assert_eq!(run.outputs[0].output.token_id, 3);
+    }
+
+    #[test]
+    fn vulkan_backend_lets_stream_consume_bounded_dispatch_budget() {
+        let Some(mut backend) = backend_with_adders(1) else {
+            return;
+        };
+        backend.create_stream("s0").unwrap();
+        backend
+            .inject_prompt(PromptInjection::new("s0", vec![1], 3))
+            .unwrap();
+
+        let first = backend.dispatch(2).unwrap();
+        let second = backend.dispatch(8).unwrap();
+
+        assert_eq!(first.status, DispatchStatus::BudgetExhausted);
+        assert_eq!(first.ticks.len(), 2);
+        assert_eq!(first.outputs.len(), 2);
+        assert_eq!(first.outputs[0].output.token_id, 2);
+        assert_eq!(first.outputs[1].output.token_id, 3);
+        assert_eq!(first.active_streams, vec!["s0".to_string()]);
+
+        assert_eq!(second.status, DispatchStatus::Idle);
+        assert_eq!(second.ticks.len(), 2);
+        assert_eq!(second.outputs.len(), 1);
+        assert_eq!(second.outputs[0].output.token_id, 4);
     }
 
     #[test]
