@@ -7033,6 +7033,149 @@ mod tests {
                             0xab, 0xbe, 0xc5, 0xbd,
                         ]
                     );
+
+                    if let Some(split_spirv_words) =
+                        crate::vulkan_compute::compile_test_shader_words_from_source(
+                            "split_bf16_3072_to_3x1024.comp",
+                        )
+                    {
+                        let split_dispatch =
+                            mounted_bound.dispatch("layer_00", "split_b_c_x").unwrap();
+                        assert_eq!(split_dispatch.reusable_family_id, "split");
+                        let split_bindings = mounted
+                            .resident_kernel_buffer_bindings_for_bound_dispatch(split_dispatch)
+                            .unwrap();
+                        assert_eq!(split_bindings[0].byte_len, 6_144);
+                        assert_eq!(split_bindings[1].byte_len, 5_120);
+                        assert_eq!(split_bindings[2].byte_len, 5_120);
+                        assert_eq!(split_bindings[3].byte_len, 5_120);
+                        let split_family = mounted
+                            .placed_plan
+                            .reusable_kernel_plan
+                            .family(&split_dispatch.reusable_family_id)
+                            .unwrap();
+                        let split_kernel_manifest = VulkanLoadedReusableKernelArtifactManifest {
+                            schema: VULKAN_REUSABLE_KERNEL_ARTIFACT_MANIFEST_SCHEMA.to_string(),
+                            backend_id: VULKAN_STREAM_CIRCUIT_BACKEND_ID.to_string(),
+                            total_word_count: split_spirv_words.len(),
+                            artifacts: vec![VulkanLoadedReusableKernelArtifact {
+                                artifact: VulkanReusableKernelArtifact::from_family(
+                                    split_family,
+                                    "kernels/split.spv",
+                                ),
+                                resolved_path: PathBuf::from("kernels/split.spv"),
+                                words: split_spirv_words,
+                            }],
+                        };
+                        let split_resident_dispatch = mounted
+                            .create_resident_kernel_dispatch_for_bound_dispatch(
+                                &device,
+                                split_dispatch,
+                                &split_kernel_manifest,
+                            )
+                            .unwrap();
+                        assert_eq!(split_resident_dispatch.workgroup_count_x(), 1);
+
+                        device
+                            .run_resident_kernel_dispatch(&split_resident_dispatch, &[0u8; 16])
+                            .unwrap();
+
+                        assert_eq!(
+                            split_bindings[1].buffer.read_bytes(16).unwrap(),
+                            vec![
+                                0xc7, 0x3e, 0x74, 0xbe, 0x7f, 0x3e, 0x97, 0x3e, 0x5a, 0xbe, 0xd2,
+                                0xbe, 0xab, 0xbe, 0xc5, 0xbd,
+                            ]
+                        );
+                        assert_eq!(
+                            split_bindings[2].buffer.read_bytes(16).unwrap(),
+                            vec![
+                                0x04, 0xbf, 0x91, 0x3e, 0x9c, 0x3e, 0xd8, 0xbe, 0x9d, 0x3d, 0xe1,
+                                0xbc, 0x87, 0x3d, 0x15, 0x3f,
+                            ]
+                        );
+                        assert_eq!(
+                            split_bindings[3].buffer.read_bytes(16).unwrap(),
+                            vec![
+                                0x16, 0xbe, 0xeb, 0xbe, 0x8c, 0xbc, 0xc3, 0x3d, 0x4d, 0xbf, 0x63,
+                                0xbb, 0x40, 0xbe, 0x48, 0xbf,
+                            ]
+                        );
+
+                        if let Some(multiply_spirv_words) =
+                            crate::vulkan_compute::compile_test_shader_words_from_source(
+                                "multiply_bf16_1024.comp",
+                            )
+                        {
+                            let multiply_dispatch =
+                                mounted_bound.dispatch("layer_00", "input_gate").unwrap();
+                            assert_eq!(
+                                multiply_dispatch.reusable_family_id,
+                                "multiply.signature_1"
+                            );
+                            let multiply_bindings = mounted
+                                .resident_kernel_buffer_bindings_for_bound_dispatch(
+                                    multiply_dispatch,
+                                )
+                                .unwrap();
+                            assert_eq!(multiply_bindings[0].byte_len, 5_120);
+                            assert_eq!(multiply_bindings[1].byte_len, 5_120);
+                            assert_eq!(multiply_bindings[2].byte_len, 6_144);
+                            let multiply_family = mounted
+                                .placed_plan
+                                .reusable_kernel_plan
+                                .family(&multiply_dispatch.reusable_family_id)
+                                .unwrap();
+                            let multiply_kernel_manifest =
+                                VulkanLoadedReusableKernelArtifactManifest {
+                                    schema: VULKAN_REUSABLE_KERNEL_ARTIFACT_MANIFEST_SCHEMA
+                                        .to_string(),
+                                    backend_id: VULKAN_STREAM_CIRCUIT_BACKEND_ID.to_string(),
+                                    total_word_count: multiply_spirv_words.len(),
+                                    artifacts: vec![VulkanLoadedReusableKernelArtifact {
+                                        artifact: VulkanReusableKernelArtifact::from_family(
+                                            multiply_family,
+                                            "kernels/multiply.signature_1.spv",
+                                        ),
+                                        resolved_path: PathBuf::from(
+                                            "kernels/multiply.signature_1.spv",
+                                        ),
+                                        words: multiply_spirv_words,
+                                    }],
+                                };
+                            let multiply_resident_dispatch = mounted
+                                .create_resident_kernel_dispatch_for_bound_dispatch(
+                                    &device,
+                                    multiply_dispatch,
+                                    &multiply_kernel_manifest,
+                                )
+                                .unwrap();
+                            assert_eq!(multiply_resident_dispatch.workgroup_count_x(), 1);
+
+                            device
+                                .run_resident_kernel_dispatch(
+                                    &multiply_resident_dispatch,
+                                    &[0u8; 16],
+                                )
+                                .unwrap();
+
+                            assert_eq!(
+                                multiply_bindings[2].buffer.read_bytes(16).unwrap(),
+                                vec![
+                                    0x69, 0xbd, 0xe0, 0x3d, 0x8b, 0xbb, 0xe6, 0x3c, 0x2f, 0x3e,
+                                    0xba, 0x3a, 0x80, 0x3d, 0x9a, 0x3d,
+                                ]
+                            );
+                        } else {
+                            eprintln!(
+                                "skipping BF16 multiply Vulkan dispatch: no GLSL to SPIR-V compiler found"
+                            );
+                        }
+                    } else {
+                        eprintln!(
+                            "skipping BF16 split Vulkan dispatch: no GLSL to SPIR-V compiler found"
+                        );
+                    }
                 } else {
                     eprintln!(
                         "skipping linear BF16 Vulkan dispatch: no GLSL to SPIR-V compiler found"
