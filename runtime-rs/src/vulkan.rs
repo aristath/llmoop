@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 
 pub const VULKAN_SPIRV_BACKEND_ID: &str = "vulkan_spirv";
 pub const DEFAULT_SPIRV_ENTRY_POINT: &str = "main";
+pub const DEFAULT_COMPUTE_LOCAL_SIZE_X: u32 = 64;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SpirvPedalProgram {
@@ -13,6 +14,7 @@ pub struct SpirvPedalProgram {
     pub operator_type: String,
     pub entry_point: String,
     pub specialization: Option<String>,
+    pub local_size_x: u32,
     pub words: Vec<u32>,
 }
 
@@ -27,8 +29,14 @@ impl SpirvPedalProgram {
             operator_type: operator_type.into(),
             entry_point: DEFAULT_SPIRV_ENTRY_POINT.to_string(),
             specialization: None,
+            local_size_x: DEFAULT_COMPUTE_LOCAL_SIZE_X,
             words,
         }
+    }
+
+    pub fn with_local_size_x(mut self, local_size_x: u32) -> Self {
+        self.local_size_x = local_size_x;
+        self
     }
 
     pub fn from_spirv_file(
@@ -72,13 +80,34 @@ pub struct VulkanBackendDescriptor {
 }
 
 impl VulkanBackendDescriptor {
-    pub fn empty(device_id: impl Into<String>) -> Self {
+    pub fn new(device_id: impl Into<String>, programs: Vec<SpirvPedalProgram>) -> Self {
         Self {
             backend_id: VULKAN_SPIRV_BACKEND_ID.to_string(),
             device_id: device_id.into(),
             queue_family: None,
-            programs: Vec::new(),
+            programs,
         }
+    }
+
+    pub fn empty(device_id: impl Into<String>) -> Self {
+        Self::new(device_id, Vec::new())
+    }
+
+    pub fn with_program(mut self, program: SpirvPedalProgram) -> Self {
+        self.programs.push(program);
+        self
+    }
+
+    pub fn from_json_file(path: impl AsRef<Path>) -> io::Result<Self> {
+        let bytes = fs::read(path)?;
+        serde_json::from_slice(&bytes)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+    }
+
+    pub fn write_json_file(&self, path: impl AsRef<Path>) -> io::Result<()> {
+        let bytes = serde_json::to_vec_pretty(self)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        fs::write(path, bytes)
     }
 }
 
@@ -103,6 +132,7 @@ mod tests {
         assert_eq!(program.pedal_id, "pedal_0");
         assert_eq!(program.operator_type, "test_kernel");
         assert_eq!(program.entry_point, DEFAULT_SPIRV_ENTRY_POINT);
+        assert_eq!(program.local_size_x, DEFAULT_COMPUTE_LOCAL_SIZE_X);
         assert_eq!(read_spirv_words(&path).unwrap(), words);
 
         let _ = fs::remove_file(path);
@@ -117,6 +147,28 @@ mod tests {
         let error = read_spirv_words(&path).unwrap_err();
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn backend_descriptor_round_trips_as_json() {
+        let program = SpirvPedalProgram::new("pedal_a", "u32_add_one", vec![0x0723_0203, 1, 2, 3])
+            .with_local_size_x(128);
+        let descriptor = VulkanBackendDescriptor::empty("device_0").with_program(program);
+        let path = std::env::temp_dir().join(format!(
+            "llmoop-vulkan-descriptor-{}.json",
+            std::process::id()
+        ));
+
+        descriptor.write_json_file(&path).unwrap();
+        let read = VulkanBackendDescriptor::from_json_file(&path).unwrap();
+
+        assert_eq!(read.backend_id, VULKAN_SPIRV_BACKEND_ID);
+        assert_eq!(read.device_id, "device_0");
+        assert_eq!(read.programs.len(), 1);
+        assert_eq!(read.programs[0].pedal_id, "pedal_a");
+        assert_eq!(read.programs[0].local_size_x, 128);
 
         let _ = fs::remove_file(path);
     }

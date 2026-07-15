@@ -47,15 +47,12 @@ impl VulkanU32ShaderPedal {
         local_size_x: u32,
     ) -> Result<Self, VulkanError> {
         Self::from_program(
-            SpirvPedalProgram::new(pedal_id, operator_type, spirv_words),
-            local_size_x,
+            SpirvPedalProgram::new(pedal_id, operator_type, spirv_words)
+                .with_local_size_x(local_size_x),
         )
     }
 
-    pub fn from_program(
-        program: SpirvPedalProgram,
-        local_size_x: u32,
-    ) -> Result<Self, VulkanError> {
+    pub fn from_program(program: SpirvPedalProgram) -> Result<Self, VulkanError> {
         if program.words.is_empty() {
             return Err(VulkanError(
                 "SPIR-V pedal program must not be empty".to_string(),
@@ -67,9 +64,10 @@ impl VulkanU32ShaderPedal {
                 program.entry_point
             )));
         }
-        if local_size_x == 0 {
+        if program.local_size_x == 0 {
             return Err(VulkanError("local_size_x must not be zero".to_string()));
         }
+        let local_size_x = program.local_size_x;
         Ok(Self {
             program,
             local_size_x,

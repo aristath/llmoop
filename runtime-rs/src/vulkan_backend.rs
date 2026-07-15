@@ -10,7 +10,7 @@ use crate::types::{
     PermanentCircuitManifest, PromptInjection, PublicOutputSignal, RandomPolicy, StreamId,
     StreamTemplate, TokenId,
 };
-use crate::vulkan::VULKAN_SPIRV_BACKEND_ID;
+use crate::vulkan::{VULKAN_SPIRV_BACKEND_ID, VulkanBackendDescriptor};
 use crate::vulkan_compute::{VulkanComputeDevice, VulkanError, VulkanU32ShaderPedal};
 use crate::vulkan_pedalboard::VulkanU32Pedalboard;
 
@@ -18,6 +18,7 @@ use crate::vulkan_pedalboard::VulkanU32Pedalboard;
 pub enum VulkanBackendError {
     Backend(BackendError),
     Vulkan(VulkanError),
+    InvalidDescriptor(String),
     InvalidToken(TokenId),
     EmptyPedalOutput,
 }
@@ -27,6 +28,7 @@ impl Display for VulkanBackendError {
         match self {
             Self::Backend(error) => Display::fmt(error, f),
             Self::Vulkan(error) => Display::fmt(error, f),
+            Self::InvalidDescriptor(message) => f.write_str(message),
             Self::InvalidToken(token) => write!(f, "token {token} cannot be represented as u32"),
             Self::EmptyPedalOutput => f.write_str("Vulkan pedalboard returned no output token"),
         }
@@ -100,6 +102,22 @@ impl VulkanU32Backend {
         pedals: Vec<VulkanU32ShaderPedal>,
     ) -> Result<Self, VulkanBackendError> {
         Self::new(device_id, VulkanU32Pedalboard::new(pedals))
+    }
+
+    pub fn from_descriptor(
+        descriptor: VulkanBackendDescriptor,
+    ) -> Result<Self, VulkanBackendError> {
+        if descriptor.backend_id != VULKAN_SPIRV_BACKEND_ID {
+            return Err(VulkanBackendError::InvalidDescriptor(format!(
+                "unsupported Vulkan backend descriptor {:?}",
+                descriptor.backend_id
+            )));
+        }
+        let mut pedals = Vec::with_capacity(descriptor.programs.len());
+        for program in descriptor.programs {
+            pedals.push(VulkanU32ShaderPedal::from_program(program)?);
+        }
+        Self::from_pedals(descriptor.device_id, pedals)
     }
 
     pub fn device_name(&self) -> &str {
@@ -385,6 +403,7 @@ impl DeviceBackend for VulkanU32Backend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vulkan::{SpirvPedalProgram, VulkanBackendDescriptor};
     use crate::vulkan_compute::compile_test_shader_words;
 
     fn add_one_pedal(id: &str) -> Option<VulkanU32ShaderPedal> {
@@ -404,6 +423,17 @@ mod tests {
                 None
             }
         }
+    }
+
+    fn backend_descriptor_with_adders(count: usize) -> Option<VulkanBackendDescriptor> {
+        let mut descriptor = VulkanBackendDescriptor::empty("vulkan_device_0");
+        for index in 0..count {
+            let spirv_words = compile_test_shader_words()?;
+            let program =
+                SpirvPedalProgram::new(format!("add_one_{index}"), "u32_add_one", spirv_words);
+            descriptor = descriptor.with_program(program);
+        }
+        Some(descriptor)
     }
 
     #[test]
@@ -473,5 +503,47 @@ mod tests {
                 .iter()
                 .any(|region| region.kind == MemoryRegionKind::StreamTransientState)
         );
+    }
+
+    #[test]
+    fn vulkan_backend_can_be_installed_from_descriptor() {
+        let Some(descriptor) = backend_descriptor_with_adders(2) else {
+            return;
+        };
+        let mut backend = match VulkanU32Backend::from_descriptor(descriptor) {
+            Ok(backend) => backend,
+            Err(error) => {
+                eprintln!("skipping Vulkan backend descriptor smoke: {error}");
+                return;
+            }
+        };
+        backend.create_stream("s0").unwrap();
+        backend
+            .inject_prompt(PromptInjection::new("s0", vec![1], 1))
+            .unwrap();
+
+        let run = backend.dispatch(16).unwrap();
+
+        assert_eq!(backend.backend_id(), VULKAN_SPIRV_BACKEND_ID);
+        assert_eq!(run.status, DispatchStatus::Idle);
+        assert_eq!(run.outputs.len(), 1);
+        assert_eq!(run.outputs[0].output.token_id, 3);
+        assert_eq!(backend.describe().permanent_circuit.pedal_count, 2);
+    }
+
+    #[test]
+    fn vulkan_backend_rejects_wrong_descriptor_backend_id() {
+        let descriptor = VulkanBackendDescriptor {
+            backend_id: "not_vulkan".to_string(),
+            device_id: "device_0".to_string(),
+            queue_family: None,
+            programs: Vec::new(),
+        };
+
+        match VulkanU32Backend::from_descriptor(descriptor) {
+            Err(VulkanBackendError::InvalidDescriptor(_)) => {}
+            Err(error) => panic!("expected invalid descriptor error, got {error}"),
+            Ok(_) => panic!("expected descriptor installation to fail"),
+        }
     }
 }
