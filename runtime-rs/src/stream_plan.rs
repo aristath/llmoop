@@ -295,6 +295,7 @@ impl StreamCircuitResourcePlan {
                 circuit_id: artifact.circuit.id.clone(),
                 temporary_signal_count: activation_plan.temporary_signals.len(),
                 slot_count: activation_frame.slot_count,
+                slots: planned_activation_slots(activation_plan, &activation_frame),
                 assignments: activation_frame.assignments,
             });
         }
@@ -370,7 +371,15 @@ pub struct PlannedActivationSlotBank {
     pub circuit_id: String,
     pub temporary_signal_count: usize,
     pub slot_count: usize,
+    pub slots: Vec<PlannedActivationSlot>,
     pub assignments: Vec<SignalSlotAssignment>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlannedActivationSlot {
+    pub slot: usize,
+    pub signal_ids: Vec<String>,
+    pub max_elements: Option<usize>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -949,11 +958,55 @@ fn attr_usize(node: &CircuitNode, attr: &str) -> Option<usize> {
         .and_then(|value| usize::try_from(value).ok())
 }
 
+fn product(shape: &[usize]) -> Option<usize> {
+    shape
+        .iter()
+        .try_fold(1usize, |total, value| total.checked_mul(*value))
+}
+
 fn node_output_storage(node: &CircuitNode) -> SignalStorage {
     match node.op.as_str() {
         "append_state_update" | "rolling_state_update" => SignalStorage::StateView,
         _ => SignalStorage::Activation,
     }
+}
+
+fn planned_activation_slots(
+    activation_plan: &CircuitActivationPlan,
+    frame: &ActivationFramePlan,
+) -> Vec<PlannedActivationSlot> {
+    let mut signals_by_slot: BTreeMap<usize, Vec<String>> = BTreeMap::new();
+    for assignment in &frame.assignments {
+        signals_by_slot
+            .entry(assignment.slot)
+            .or_default()
+            .push(assignment.signal_id.clone());
+    }
+
+    signals_by_slot
+        .into_iter()
+        .map(|(slot, signal_ids)| {
+            let mut max_elements = Some(0usize);
+            for signal_id in &signal_ids {
+                let elements = activation_plan
+                    .signal(signal_id)
+                    .and_then(|signal| signal.shape.as_ref())
+                    .and_then(|shape| product(shape));
+                match (max_elements, elements) {
+                    (Some(max), Some(elements)) => max_elements = Some(max.max(elements)),
+                    _ => {
+                        max_elements = None;
+                        break;
+                    }
+                }
+            }
+            PlannedActivationSlot {
+                slot,
+                signal_ids,
+                max_elements,
+            }
+        })
+        .collect()
 }
 
 fn validate_node_dependencies(
@@ -1134,6 +1187,36 @@ mod tests {
         assert_eq!(
             layer_02.signal("attention_out").unwrap().shape,
             Some(vec![1024])
+        );
+
+        let layer_00_bank = resource_plan
+            .activation_banks
+            .iter()
+            .find(|bank| bank.pedal_id == "layer_00")
+            .unwrap();
+        assert_eq!(layer_00_bank.slot_count, 4);
+        assert_eq!(
+            layer_00_bank
+                .slots
+                .iter()
+                .map(|slot| slot.max_elements)
+                .collect::<Vec<_>>(),
+            vec![Some(2560), Some(3072), Some(2560), Some(2560)]
+        );
+
+        let layer_02_bank = resource_plan
+            .activation_banks
+            .iter()
+            .find(|bank| bank.pedal_id == "layer_02")
+            .unwrap();
+        assert_eq!(layer_02_bank.slot_count, 4);
+        assert_eq!(
+            layer_02_bank
+                .slots
+                .iter()
+                .map(|slot| slot.max_elements)
+                .collect::<Vec<_>>(),
+            vec![Some(1024), Some(2560), Some(2560), Some(2560)]
         );
     }
 
