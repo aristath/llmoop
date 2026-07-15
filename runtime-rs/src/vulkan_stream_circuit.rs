@@ -7,6 +7,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+use crate::stream_circuit::{PedalCablePlacement, StreamCircuitPlacementPlan};
 use crate::stream_plan::{
     CircuitActivationPlan, PlannedNode, SignalProducer, SignalStorage, StreamCircuitExecutionPlan,
     StreamCircuitResourcePlan, TensorIndex,
@@ -43,11 +44,38 @@ impl VulkanStreamCircuitResidentPlan {
         tensor_index: Option<&TensorIndex>,
         activation_element_bytes: Option<usize>,
     ) -> Result<Self, VulkanResidentPlanError> {
+        Self::from_resource_plan_with_hosted_pedals(
+            resource_plan,
+            None,
+            tensor_index,
+            activation_element_bytes,
+        )
+    }
+
+    fn from_resource_plan_with_hosted_pedals(
+        resource_plan: &StreamCircuitResourcePlan,
+        hosted_pedals: Option<&BTreeSet<String>>,
+        tensor_index: Option<&TensorIndex>,
+        activation_element_bytes: Option<usize>,
+    ) -> Result<Self, VulkanResidentPlanError> {
+        let hosts_pedal = |pedal_id: &str| {
+            hosted_pedals
+                .map(|pedals| pedals.contains(pedal_id))
+                .unwrap_or(true)
+        };
         let mut permanent_parameters = Vec::with_capacity(resource_plan.parameters.len());
         let mut permanent_parameter_bytes = Some(0usize);
         let mut unresolved_parameter_tensors = Vec::new();
 
         for parameter in &resource_plan.parameters {
+            let hosted_use_count = parameter
+                .uses
+                .iter()
+                .filter(|use_ref| hosts_pedal(&use_ref.pedal_id))
+                .count();
+            if hosted_use_count == 0 {
+                continue;
+            }
             let metadata = tensor_index.and_then(|index| index.tensors.get(&parameter.tensor));
             let byte_count = metadata.and_then(|metadata| metadata.byte_count);
             match (permanent_parameter_bytes, byte_count) {
@@ -66,7 +94,7 @@ impl VulkanStreamCircuitResidentPlan {
                 dtype: metadata.map(|metadata| metadata.dtype.clone()),
                 shape: metadata.map(|metadata| metadata.shape.clone()),
                 byte_count,
-                use_count: parameter.uses.len(),
+                use_count: hosted_use_count,
             });
         }
 
@@ -75,6 +103,9 @@ impl VulkanStreamCircuitResidentPlan {
         let mut per_stream_dynamic_state_elements_per_activation = 0usize;
 
         for state in &resource_plan.state_allocations {
+            if !hosts_pedal(&state.pedal_id) {
+                continue;
+            }
             let static_elements = state.shape.as_ref().and_then(|shape| product(shape));
             if let Some(elements) = static_elements {
                 per_stream_static_state_elements = checked_add(
@@ -111,6 +142,9 @@ impl VulkanStreamCircuitResidentPlan {
         let mut unresolved_activation_slots = Vec::new();
 
         for bank in &resource_plan.activation_banks {
+            if !hosts_pedal(&bank.pedal_id) {
+                continue;
+            }
             let mut slots = Vec::with_capacity(bank.slots.len());
             for slot in &bank.slots {
                 match (per_stream_activation_slot_elements, slot.max_elements) {
@@ -143,14 +177,25 @@ impl VulkanStreamCircuitResidentPlan {
                 slots,
             });
         }
+        let circuit_count = resource_plan
+            .activation_banks
+            .iter()
+            .filter(|bank| hosts_pedal(&bank.pedal_id))
+            .count();
+        let state_view_signal_count = resource_plan
+            .activation_banks
+            .iter()
+            .filter(|bank| hosts_pedal(&bank.pedal_id))
+            .map(|bank| bank.state_view_signal_count)
+            .sum();
 
         Ok(Self {
             backend_id: VULKAN_STREAM_CIRCUIT_BACKEND_ID.to_string(),
-            circuit_count: resource_plan.circuit_count,
+            circuit_count,
             permanent_parameters,
             permanent_parameter_bytes,
             stream_state_buffers,
-            state_view_signal_count: resource_plan.state_view_signal_count,
+            state_view_signal_count,
             activation_banks,
             per_stream_static_state_elements,
             per_stream_dynamic_state_elements_per_activation,
@@ -234,6 +279,87 @@ impl VulkanStreamCircuitResidentPlan {
             activation_slot_buffers,
             total_byte_capacity,
         })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanPlacedStreamCircuitResidentPlan {
+    pub backend_id: String,
+    pub device_id: String,
+    pub hosted_pedal_ids: Vec<String>,
+    pub local_cables: Vec<PedalCablePlacement>,
+    pub incoming_cables: Vec<PedalCablePlacement>,
+    pub outgoing_cables: Vec<PedalCablePlacement>,
+    pub resident_plan: VulkanStreamCircuitResidentPlan,
+}
+
+impl VulkanPlacedStreamCircuitResidentPlan {
+    pub fn from_resource_plan_for_device(
+        resource_plan: &StreamCircuitResourcePlan,
+        placement_plan: &StreamCircuitPlacementPlan,
+        device_id: impl Into<String>,
+        tensor_index: Option<&TensorIndex>,
+        activation_element_bytes: Option<usize>,
+    ) -> Result<Self, VulkanResidentPlanError> {
+        let device_id = device_id.into();
+        if device_id.is_empty() {
+            return Err(VulkanResidentPlanError(
+                "Vulkan placed resident plan device_id must not be empty".to_string(),
+            ));
+        }
+        let hosted_pedal_ids = placement_plan
+            .pedals
+            .iter()
+            .filter(|pedal| pedal.device_id == device_id)
+            .map(|pedal| pedal.pedal_id.clone())
+            .collect::<Vec<_>>();
+        let hosted_pedal_set = hosted_pedal_ids.iter().cloned().collect::<BTreeSet<_>>();
+        let resident_plan = VulkanStreamCircuitResidentPlan::from_resource_plan_with_hosted_pedals(
+            resource_plan,
+            Some(&hosted_pedal_set),
+            tensor_index,
+            activation_element_bytes,
+        )?;
+        let local_cables = placement_plan
+            .cables
+            .iter()
+            .filter(|cable| {
+                cable.source_device_id == device_id && cable.destination_device_id == device_id
+            })
+            .cloned()
+            .collect();
+        let incoming_cables = placement_plan
+            .cables
+            .iter()
+            .filter(|cable| {
+                cable.source_device_id != device_id && cable.destination_device_id == device_id
+            })
+            .cloned()
+            .collect();
+        let outgoing_cables = placement_plan
+            .cables
+            .iter()
+            .filter(|cable| {
+                cable.source_device_id == device_id && cable.destination_device_id != device_id
+            })
+            .cloned()
+            .collect();
+
+        Ok(Self {
+            backend_id: VULKAN_STREAM_CIRCUIT_BACKEND_ID.to_string(),
+            device_id,
+            hosted_pedal_ids,
+            local_cables,
+            incoming_cables,
+            outgoing_cables,
+            resident_plan,
+        })
+    }
+
+    pub fn hosts_pedal(&self, pedal_id: &str) -> bool {
+        self.hosted_pedal_ids
+            .iter()
+            .any(|hosted| hosted == pedal_id)
     }
 }
 
@@ -2943,7 +3069,7 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::*;
-    use crate::stream_circuit::ResolvedLoweredPedalboard;
+    use crate::stream_circuit::{ResolvedLoweredPedalboard, StreamCircuitPlacementSpec};
     use crate::stream_plan::{StreamCircuitExecutionPlan, StreamCircuitResourcePlan};
 
     fn lfm2_index_path() -> PathBuf {
@@ -3033,6 +3159,88 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![Some(2048), Some(5120), Some(5120), Some(5120)]
         );
+    }
+
+    #[test]
+    fn placed_resident_plan_hosts_only_the_pedals_assigned_to_a_device() {
+        let graph = ResolvedLoweredPedalboard::from_index_file(lfm2_index_path()).unwrap();
+        let tensor_index = TensorIndex::from_json_file(lfm2_tensor_index_path()).unwrap();
+        let execution_plan =
+            StreamCircuitExecutionPlan::from_graph_with_tensor_index(&graph, &tensor_index)
+                .unwrap();
+        let resource_plan =
+            StreamCircuitResourcePlan::from_graph_and_plan(&graph, &execution_plan).unwrap();
+        let placement_spec = StreamCircuitPlacementSpec::new("gpu0")
+            .with_pedal_device("layer_01", "cpu0")
+            .with_pedal_device("layer_02", "gpu1")
+            .with_pedal_device("layer_03", "lan:worker-a");
+        let placement_plan = graph.placement_plan(&placement_spec).unwrap();
+
+        let gpu0 = VulkanPlacedStreamCircuitResidentPlan::from_resource_plan_for_device(
+            &resource_plan,
+            &placement_plan,
+            "gpu0",
+            Some(&tensor_index),
+            Some(2),
+        )
+        .unwrap();
+        let gpu1 = VulkanPlacedStreamCircuitResidentPlan::from_resource_plan_for_device(
+            &resource_plan,
+            &placement_plan,
+            "gpu1",
+            Some(&tensor_index),
+            Some(2),
+        )
+        .unwrap();
+        let cpu0 = VulkanPlacedStreamCircuitResidentPlan::from_resource_plan_for_device(
+            &resource_plan,
+            &placement_plan,
+            "cpu0",
+            Some(&tensor_index),
+            Some(2),
+        )
+        .unwrap();
+        let lan = VulkanPlacedStreamCircuitResidentPlan::from_resource_plan_for_device(
+            &resource_plan,
+            &placement_plan,
+            "lan:worker-a",
+            Some(&tensor_index),
+            Some(2),
+        )
+        .unwrap();
+
+        assert_eq!(gpu0.backend_id, VULKAN_STREAM_CIRCUIT_BACKEND_ID);
+        assert_eq!(gpu0.device_id, "gpu0");
+        assert_eq!(gpu0.hosted_pedal_ids.len(), 11);
+        assert!(gpu0.hosts_pedal("layer_00"));
+        assert!(!gpu0.hosts_pedal("layer_02"));
+        assert_eq!(gpu0.resident_plan.circuit_count, 11);
+        assert_eq!(gpu0.resident_plan.permanent_parameters.len(), 103);
+        assert_eq!(gpu0.resident_plan.stream_state_buffers.len(), 11);
+        assert_eq!(gpu0.resident_plan.activation_banks.len(), 11);
+        assert_eq!(gpu0.resident_plan.state_view_signal_count, 16);
+        assert_eq!(gpu0.local_cables.len(), 9);
+        assert_eq!(gpu0.incoming_cables.len(), 1);
+        assert_eq!(gpu0.outgoing_cables.len(), 1);
+        assert_eq!(gpu0.incoming_cables[0].source_pedal_id, "layer_03");
+        assert_eq!(gpu0.incoming_cables[0].destination_pedal_id, "layer_04");
+        assert_eq!(gpu0.outgoing_cables[0].source_pedal_id, "layer_00");
+        assert_eq!(gpu0.outgoing_cables[0].destination_pedal_id, "layer_01");
+
+        assert_eq!(gpu1.hosted_pedal_ids, vec!["layer_02".to_string()]);
+        assert_eq!(gpu1.resident_plan.circuit_count, 1);
+        assert_eq!(gpu1.resident_plan.permanent_parameters.len(), 11);
+        assert_eq!(gpu1.resident_plan.stream_state_buffers.len(), 1);
+        assert_eq!(gpu1.resident_plan.state_view_signal_count, 2);
+        assert_eq!(gpu1.incoming_cables[0].source_pedal_id, "layer_01");
+        assert_eq!(gpu1.outgoing_cables[0].destination_pedal_id, "layer_03");
+
+        assert_eq!(cpu0.hosted_pedal_ids, vec!["layer_01".to_string()]);
+        assert_eq!(cpu0.resident_plan.permanent_parameters.len(), 8);
+        assert_eq!(cpu0.resident_plan.state_view_signal_count, 1);
+        assert_eq!(lan.hosted_pedal_ids, vec!["layer_03".to_string()]);
+        assert_eq!(lan.resident_plan.permanent_parameters.len(), 8);
+        assert_eq!(lan.resident_plan.state_view_signal_count, 1);
     }
 
     #[test]
