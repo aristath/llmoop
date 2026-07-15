@@ -286,6 +286,161 @@ impl VulkanStreamCircuitResidentPlan {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanPermanentParameterBufferPlan {
+    pub backend_id: String,
+    pub device_id: String,
+    pub parameters: Vec<VulkanPermanentParameterBuffer>,
+    pub parameter_count: usize,
+    pub total_byte_capacity: Option<usize>,
+    pub unresolved_tensors: Vec<String>,
+}
+
+impl VulkanPermanentParameterBufferPlan {
+    pub fn from_placed_resident_plan(
+        placed_resident_plan: &VulkanPlacedStreamCircuitResidentPlan,
+    ) -> Result<Self, VulkanPermanentParameterBufferPlanError> {
+        let mut parameters = Vec::with_capacity(
+            placed_resident_plan
+                .resident_plan
+                .permanent_parameters
+                .len(),
+        );
+        let mut tensor_ids = BTreeSet::new();
+        let mut total_byte_capacity = Some(0usize);
+        let mut unresolved_tensors = Vec::new();
+
+        for parameter in &placed_resident_plan.resident_plan.permanent_parameters {
+            if !tensor_ids.insert(parameter.tensor.clone()) {
+                return Err(VulkanPermanentParameterBufferPlanError(format!(
+                    "{} permanent parameter tensor {:?} appears more than once",
+                    placed_resident_plan.device_id, parameter.tensor
+                )));
+            }
+
+            match (total_byte_capacity, parameter.byte_count) {
+                (Some(total), Some(bytes)) => {
+                    total_byte_capacity = Some(add_parameter_bytes(
+                        total,
+                        bytes,
+                        "permanent parameter buffer plan",
+                    )?);
+                }
+                _ => {
+                    total_byte_capacity = None;
+                    unresolved_tensors.push(parameter.tensor.clone());
+                }
+            }
+
+            parameters.push(VulkanPermanentParameterBuffer {
+                buffer_index: parameters.len(),
+                tensor: parameter.tensor.clone(),
+                dtype: parameter.dtype.clone(),
+                shape: parameter.shape.clone(),
+                byte_capacity: parameter.byte_count,
+                use_count: parameter.use_count,
+            });
+        }
+
+        let parameter_count = parameters.len();
+        Ok(Self {
+            backend_id: VULKAN_STREAM_CIRCUIT_BACKEND_ID.to_string(),
+            device_id: placed_resident_plan.device_id.clone(),
+            parameters,
+            parameter_count,
+            total_byte_capacity,
+            unresolved_tensors,
+        })
+    }
+
+    pub fn allocate_buffers(
+        &self,
+        device: &VulkanComputeDevice,
+    ) -> Result<VulkanPermanentParameterBuffers, VulkanError> {
+        let mut buffers = Vec::with_capacity(self.parameters.len());
+        let mut total_byte_capacity = 0usize;
+
+        for parameter in &self.parameters {
+            let byte_capacity = parameter.byte_capacity.ok_or_else(|| {
+                VulkanError(format!(
+                    "{} permanent parameter {:?} has unknown byte capacity",
+                    self.device_id, parameter.tensor
+                ))
+            })?;
+            total_byte_capacity = checked_add_bytes(
+                total_byte_capacity,
+                byte_capacity,
+                "permanent parameter buffer allocation",
+            )?;
+            buffers.push(VulkanPermanentParameterBufferAllocation {
+                parameter: parameter.clone(),
+                byte_capacity,
+                buffer: device.create_resident_buffer(byte_capacity)?,
+            });
+        }
+
+        Ok(VulkanPermanentParameterBuffers {
+            plan: self.clone(),
+            buffers,
+            total_byte_capacity,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanPermanentParameterBuffer {
+    pub buffer_index: usize,
+    pub tensor: String,
+    pub dtype: Option<String>,
+    pub shape: Option<Vec<usize>>,
+    pub byte_capacity: Option<usize>,
+    pub use_count: usize,
+}
+
+pub struct VulkanPermanentParameterBuffers {
+    pub plan: VulkanPermanentParameterBufferPlan,
+    pub buffers: Vec<VulkanPermanentParameterBufferAllocation>,
+    pub total_byte_capacity: usize,
+}
+
+impl VulkanPermanentParameterBuffers {
+    pub fn parameter_buffer(
+        &self,
+        tensor: &str,
+    ) -> Option<&VulkanPermanentParameterBufferAllocation> {
+        self.buffers
+            .iter()
+            .find(|buffer| buffer.parameter.tensor == tensor)
+    }
+}
+
+pub struct VulkanPermanentParameterBufferAllocation {
+    pub parameter: VulkanPermanentParameterBuffer,
+    pub byte_capacity: usize,
+    pub buffer: VulkanResidentBuffer,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanPermanentParameterBufferPlanError(pub String);
+
+impl Display for VulkanPermanentParameterBufferPlanError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl Error for VulkanPermanentParameterBufferPlanError {}
+
+fn add_parameter_bytes(
+    total: usize,
+    bytes: usize,
+    label: &str,
+) -> Result<usize, VulkanPermanentParameterBufferPlanError> {
+    total
+        .checked_add(bytes)
+        .ok_or_else(|| VulkanPermanentParameterBufferPlanError(format!("{label} overflowed")))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VulkanModelBoundaryBufferPlan {
     pub backend_id: String,
     pub device_id: String,
@@ -1573,6 +1728,7 @@ pub enum VulkanStreamCircuitMountError {
     Binding(VulkanBindingPlanError),
     BoundaryIo(VulkanModelBoundaryBufferPlanError),
     CableIo(VulkanPlacedCableIoPlanError),
+    PermanentParameters(VulkanPermanentParameterBufferPlanError),
     Vulkan(VulkanError),
 }
 
@@ -1582,6 +1738,7 @@ impl Display for VulkanStreamCircuitMountError {
             Self::Binding(error) => Display::fmt(error, f),
             Self::BoundaryIo(error) => Display::fmt(error, f),
             Self::CableIo(error) => Display::fmt(error, f),
+            Self::PermanentParameters(error) => Display::fmt(error, f),
             Self::Vulkan(error) => Display::fmt(error, f),
         }
     }
@@ -1607,6 +1764,12 @@ impl From<VulkanPlacedCableIoPlanError> for VulkanStreamCircuitMountError {
     }
 }
 
+impl From<VulkanPermanentParameterBufferPlanError> for VulkanStreamCircuitMountError {
+    fn from(error: VulkanPermanentParameterBufferPlanError) -> Self {
+        Self::PermanentParameters(error)
+    }
+}
+
 impl From<VulkanError> for VulkanStreamCircuitMountError {
     fn from(error: VulkanError) -> Self {
         Self::Vulkan(error)
@@ -1615,6 +1778,7 @@ impl From<VulkanError> for VulkanStreamCircuitMountError {
 
 pub struct VulkanMountedPlacedStreamCircuit {
     pub placed_plan: VulkanPlacedStreamCircuitPlan,
+    pub parameter_buffers: VulkanPermanentParameterBuffers,
     pub buffers: VulkanStreamCircuitStreamBuffers,
     pub boundary_io: VulkanModelBoundaryBuffers,
     pub cable_io: VulkanPlacedCableIoBuffers,
@@ -1630,6 +1794,10 @@ impl VulkanMountedPlacedStreamCircuit {
             .placed_resident_plan
             .resident_plan
             .allocate_stream_buffers(device, dynamic_state_capacity_activations)?;
+        let parameter_buffer_plan = VulkanPermanentParameterBufferPlan::from_placed_resident_plan(
+            &placed_plan.placed_resident_plan,
+        )?;
+        let parameter_buffers = parameter_buffer_plan.allocate_buffers(device)?;
         let boundary_io_plan = VulkanModelBoundaryBufferPlan::from_placed_plan(&placed_plan)?;
         let boundary_io = boundary_io_plan.allocate_buffers(device)?;
         let cable_io_plan =
@@ -1637,6 +1805,7 @@ impl VulkanMountedPlacedStreamCircuit {
         let cable_io = cable_io_plan.allocate_buffers(device)?;
         Ok(Self {
             placed_plan,
+            parameter_buffers,
             buffers,
             boundary_io,
             cable_io,
@@ -1871,15 +2040,20 @@ impl VulkanMountedPlacedStreamCircuit {
                 param_id,
                 tensor,
                 byte_count,
-            } => Err(
-                VulkanMountedPlacedResidentKernelDispatchError::PermanentParameterBufferUnavailable {
-                    dispatch_index: dispatch.dispatch_index,
-                    binding: descriptor.binding,
-                    param_id: param_id.clone(),
-                    tensor: tensor.clone(),
-                    byte_count: *byte_count,
-                },
-            ),
+            } => {
+                let allocation = self.parameter_buffers.parameter_buffer(tensor).ok_or_else(
+                    || {
+                        VulkanMountedPlacedResidentKernelDispatchError::MissingPermanentParameterBuffer {
+                            dispatch_index: dispatch.dispatch_index,
+                            binding: descriptor.binding,
+                            param_id: param_id.clone(),
+                            tensor: tensor.clone(),
+                            byte_count: *byte_count,
+                        }
+                    },
+                )?;
+                Ok((&allocation.buffer, allocation.byte_capacity))
+            }
             VulkanBoundDescriptorTarget::BoundaryInput { signal_id }
             | VulkanBoundDescriptorTarget::BoundaryOutput { signal_id } => Err(
                 VulkanMountedPlacedResidentKernelDispatchError::ModelBoundaryBufferUnavailable {
@@ -1917,18 +2091,18 @@ impl VulkanMountedPlacedStreamCircuit {
                 byte_capacity,
                 ..
             } => {
-                let allocation = self
-                    .buffers
-                    .state_buffers
-                    .get(*buffer_index)
-                    .ok_or_else(|| {
-                        VulkanMountedPlacedResidentKernelDispatchError::MissingMountedBuffer {
-                            dispatch_index: dispatch.dispatch_index,
-                            binding: descriptor.binding,
-                            buffer_kind: "stream_state".to_string(),
-                            buffer_index: *buffer_index,
-                        }
-                    })?;
+                let allocation =
+                    self.buffers
+                        .state_buffers
+                        .get(*buffer_index)
+                        .ok_or_else(|| {
+                            VulkanMountedPlacedResidentKernelDispatchError::MissingMountedBuffer {
+                                dispatch_index: dispatch.dispatch_index,
+                                binding: descriptor.binding,
+                                buffer_kind: "stream_state".to_string(),
+                                buffer_index: *buffer_index,
+                            }
+                        })?;
                 Ok((&allocation.buffer, *byte_capacity))
             }
         }
@@ -4377,6 +4551,13 @@ pub enum VulkanMountedPlacedResidentKernelDispatchError {
         direction: VulkanModelBoundaryDirection,
         signal_id: String,
     },
+    MissingPermanentParameterBuffer {
+        dispatch_index: usize,
+        binding: usize,
+        param_id: String,
+        tensor: String,
+        byte_count: Option<usize>,
+    },
     PermanentParameterBufferUnavailable {
         dispatch_index: usize,
         binding: usize,
@@ -4430,6 +4611,16 @@ impl Display for VulkanMountedPlacedResidentKernelDispatchError {
             } => write!(
                 f,
                 "dispatch {dispatch_index} descriptor {binding} references missing mounted model {direction:?} boundary buffer {signal_id:?}"
+            ),
+            Self::MissingPermanentParameterBuffer {
+                dispatch_index,
+                binding,
+                param_id,
+                tensor,
+                byte_count,
+            } => write!(
+                f,
+                "dispatch {dispatch_index} descriptor {binding} references missing mounted permanent parameter {param_id:?} tensor {tensor:?} ({byte_count:?} bytes)"
             ),
             Self::PermanentParameterBufferUnavailable {
                 dispatch_index,
@@ -5902,6 +6093,32 @@ mod tests {
             mounted.placed_plan.dispatch_plan.total_dispatch_count(),
             242
         );
+        assert_eq!(mounted.parameter_buffers.plan.device_id, "gpu0");
+        assert_eq!(mounted.parameter_buffers.plan.parameter_count, 130);
+        assert_eq!(
+            mounted.parameter_buffers.plan.total_byte_capacity,
+            Some(325_166_592)
+        );
+        assert!(mounted.parameter_buffers.plan.unresolved_tensors.is_empty());
+        assert_eq!(mounted.parameter_buffers.total_byte_capacity, 325_166_592);
+        let operator_norm_weight = mounted
+            .parameter_buffers
+            .parameter_buffer("model.layers.0.operator_norm.weight")
+            .unwrap();
+        assert_eq!(
+            operator_norm_weight.parameter.dtype.as_deref(),
+            Some("BF16")
+        );
+        assert_eq!(operator_norm_weight.parameter.shape, Some(vec![1024]));
+        assert_eq!(operator_norm_weight.byte_capacity, 2_048);
+        operator_norm_weight
+            .buffer
+            .write_bytes(&[21, 22, 23, 24])
+            .unwrap();
+        assert_eq!(
+            operator_norm_weight.buffer.read_bytes(4).unwrap(),
+            vec![21, 22, 23, 24]
+        );
         assert_eq!(mounted.boundary_io.plan.device_id, "gpu0");
         assert_eq!(mounted.boundary_io.plan.input_count, 1);
         assert_eq!(mounted.boundary_io.plan.output_count, 1);
@@ -6042,22 +6259,20 @@ mod tests {
             tick_run.stages[1].status,
             VulkanMountedPlacedStreamTickStageStatus::Pending
         );
-        assert!(matches!(
-            mounted.resident_kernel_buffer_bindings_for_bound_dispatch(
-                mounted_bound
-                    .dispatch("layer_00", "operator_norm")
-                    .unwrap()
-            ),
-            Err(
-                VulkanMountedPlacedResidentKernelDispatchError::PermanentParameterBufferUnavailable {
-                    dispatch_index: 0,
-                    binding: 2,
-                    ref param_id,
-                    ref tensor,
-                    byte_count: Some(2_048),
-                }
-            ) if param_id == "operator_norm" && tensor == "model.layers.0.operator_norm.weight"
-        ));
+        let operator_norm_dispatch = mounted_bound.dispatch("layer_00", "operator_norm").unwrap();
+        let operator_norm_bindings = mounted
+            .resident_kernel_buffer_bindings_for_bound_dispatch(operator_norm_dispatch)
+            .unwrap();
+        assert_eq!(
+            operator_norm_bindings.len(),
+            operator_norm_dispatch.descriptors.len()
+        );
+        assert_eq!(operator_norm_bindings[0].binding, 0);
+        assert_eq!(operator_norm_bindings[0].byte_len, 2_048);
+        assert_eq!(operator_norm_bindings[1].binding, 1);
+        assert_eq!(operator_norm_bindings[1].byte_len, 5_120);
+        assert_eq!(operator_norm_bindings[2].binding, 2);
+        assert_eq!(operator_norm_bindings[2].byte_len, 2_048);
 
         assert_eq!(
             mounted_bound
@@ -6199,6 +6414,21 @@ mod tests {
         assert!(!mounted.can_execute());
         assert_eq!(mounted.placed_plan.binding_plan.circuits.len(), 1);
         assert_eq!(mounted.placed_plan.dispatch_plan.total_dispatch_count(), 19);
+        assert_eq!(mounted.parameter_buffers.plan.device_id, "gpu1");
+        assert_eq!(mounted.parameter_buffers.plan.parameter_count, 11);
+        assert_eq!(
+            mounted.parameter_buffers.plan.total_byte_capacity,
+            mounted
+                .placed_plan
+                .placed_resident_plan
+                .resident_plan
+                .permanent_parameter_bytes
+        );
+        assert_eq!(
+            Some(mounted.parameter_buffers.total_byte_capacity),
+            mounted.parameter_buffers.plan.total_byte_capacity
+        );
+        assert!(mounted.parameter_buffers.plan.unresolved_tensors.is_empty());
         assert_eq!(mounted.boundary_io.plan.device_id, "gpu1");
         assert_eq!(mounted.boundary_io.plan.input_count, 0);
         assert_eq!(mounted.boundary_io.plan.output_count, 0);
