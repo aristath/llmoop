@@ -155,6 +155,20 @@ impl VulkanU32ShaderPedal {
         })
     }
 
+    pub fn dispatch_bound_resident(
+        &self,
+        device: &VulkanComputeDevice,
+        binding: &VulkanU32ResidentDispatch,
+        len: usize,
+    ) -> Result<(), VulkanError> {
+        device.run_u32_storage_shader_on_resident_dispatch(
+            &self.program.words,
+            binding,
+            len,
+            self.local_size_x,
+        )
+    }
+
     pub fn install_on_device(&self, device: &VulkanComputeDevice) -> Result<(), VulkanError> {
         device.install_u32_storage_shader(&self.program.words, self.local_size_x)
     }

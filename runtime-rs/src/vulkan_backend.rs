@@ -232,14 +232,11 @@ impl VulkanU32MountedStream {
         pedalboard: &VulkanU32Pedalboard,
         emit_public: bool,
     ) -> Result<VulkanU32StreamAdvance, VulkanBackendError> {
-        let run = pedalboard.process_bound_resident(
-            device,
-            &self.ports.signal_frame,
-            &self.signal_dispatches,
-            1,
-        )?;
-        let output = run
-            .output
+        pedalboard.dispatch_bound_resident_in_place(device, &self.signal_dispatches, 1)?;
+        let output = self
+            .ports
+            .signal_frame
+            .read(1)?
             .first()
             .copied()
             .ok_or(VulkanBackendError::EmptyPedalOutput)?;
