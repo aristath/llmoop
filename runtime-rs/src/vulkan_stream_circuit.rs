@@ -472,6 +472,68 @@ impl Display for VulkanBindingPlanError {
 
 impl Error for VulkanBindingPlanError {}
 
+pub struct VulkanMountedStreamCircuit {
+    pub resident_plan: VulkanStreamCircuitResidentPlan,
+    pub binding_plan: VulkanStreamCircuitBindingPlan,
+    pub buffers: VulkanStreamCircuitStreamBuffers,
+}
+
+impl VulkanMountedStreamCircuit {
+    pub fn from_plans(
+        device: &VulkanComputeDevice,
+        execution_plan: &StreamCircuitExecutionPlan,
+        resource_plan: &StreamCircuitResourcePlan,
+        resident_plan: VulkanStreamCircuitResidentPlan,
+        dynamic_state_capacity_activations: usize,
+    ) -> Result<Self, VulkanStreamCircuitMountError> {
+        let binding_plan = VulkanStreamCircuitBindingPlan::from_plans(
+            execution_plan,
+            resource_plan,
+            &resident_plan,
+        )?;
+        let buffers =
+            resident_plan.allocate_stream_buffers(device, dynamic_state_capacity_activations)?;
+        Ok(Self {
+            resident_plan,
+            binding_plan,
+            buffers,
+        })
+    }
+
+    pub fn can_execute(&self) -> bool {
+        false
+    }
+}
+
+#[derive(Debug)]
+pub enum VulkanStreamCircuitMountError {
+    Binding(VulkanBindingPlanError),
+    Vulkan(VulkanError),
+}
+
+impl Display for VulkanStreamCircuitMountError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Binding(error) => Display::fmt(error, f),
+            Self::Vulkan(error) => Display::fmt(error, f),
+        }
+    }
+}
+
+impl Error for VulkanStreamCircuitMountError {}
+
+impl From<VulkanBindingPlanError> for VulkanStreamCircuitMountError {
+    fn from(error: VulkanBindingPlanError) -> Self {
+        Self::Binding(error)
+    }
+}
+
+impl From<VulkanError> for VulkanStreamCircuitMountError {
+    fn from(error: VulkanError) -> Self {
+        Self::Vulkan(error)
+    }
+}
+
 fn parameter_binding_index(
     resource_plan: &StreamCircuitResourcePlan,
     resident_plan: &VulkanStreamCircuitResidentPlan,
@@ -1184,6 +1246,64 @@ mod tests {
                 slot: 0,
                 bytes: Some(2048),
             }
+        );
+    }
+
+    #[test]
+    fn mounts_lfm2_stream_circuit_resources_without_claiming_execution() {
+        let device = match VulkanComputeDevice::new() {
+            Ok(device) => device,
+            Err(error) => {
+                eprintln!("skipping Vulkan stream-circuit mount: {error}");
+                return;
+            }
+        };
+        let graph = ResolvedLoweredPedalboard::from_index_file(lfm2_index_path()).unwrap();
+        let tensor_index = TensorIndex::from_json_file(lfm2_tensor_index_path()).unwrap();
+        let execution_plan =
+            StreamCircuitExecutionPlan::from_graph_with_tensor_index(&graph, &tensor_index)
+                .unwrap();
+        let resource_plan =
+            StreamCircuitResourcePlan::from_graph_and_plan(&graph, &execution_plan).unwrap();
+        let resident_plan = VulkanStreamCircuitResidentPlan::from_resource_plan(
+            &resource_plan,
+            Some(&tensor_index),
+            Some(2),
+        )
+        .unwrap();
+
+        let mounted = VulkanMountedStreamCircuit::from_plans(
+            &device,
+            &execution_plan,
+            &resource_plan,
+            resident_plan,
+            4,
+        )
+        .unwrap();
+
+        assert!(!mounted.can_execute());
+        assert_eq!(mounted.resident_plan.permanent_parameters.len(), 130);
+        assert_eq!(mounted.binding_plan.total_node_count(), 242);
+        assert_eq!(mounted.buffers.state_buffers.len(), 14);
+        assert_eq!(mounted.buffers.activation_slot_buffers.len(), 56);
+        assert_eq!(mounted.buffers.total_byte_capacity, 374_784);
+
+        let attention = mounted
+            .binding_plan
+            .circuit("layer_02")
+            .unwrap()
+            .node("attention_read")
+            .unwrap();
+        assert!(matches!(
+            attention.input("k_memory").unwrap().resource,
+            VulkanSignalResource::StateView { .. }
+        ));
+        assert_eq!(
+            mounted
+                .buffers
+                .activation_slot_buffer("layer_02", 0)
+                .map(|buffer| buffer.byte_capacity),
+            Some(2_048)
         );
     }
 }
