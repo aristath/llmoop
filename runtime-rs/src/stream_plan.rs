@@ -125,6 +125,13 @@ impl StreamCircuitExecutionPlan {
             .sum()
     }
 
+    pub fn state_view_signal_count(&self) -> usize {
+        self.circuits
+            .iter()
+            .map(|circuit| circuit.state_view_signals.len())
+            .sum()
+    }
+
     pub fn produced_signal_count(&self) -> usize {
         self.circuits
             .iter()
@@ -169,8 +176,10 @@ pub struct StreamCircuitResourcePlan {
     pub state_allocations: Vec<PlannedStateResource>,
     pub activation_banks: Vec<PlannedActivationSlotBank>,
     pub temporary_signal_count: usize,
+    pub state_view_signal_count: usize,
     pub layer_local_activation_slot_count: usize,
     pub unknown_temporary_shape_count: usize,
+    pub unknown_state_view_shape_count: usize,
 }
 
 impl StreamCircuitResourcePlan {
@@ -205,6 +214,7 @@ impl StreamCircuitResourcePlan {
         let mut state_allocations = Vec::new();
         let mut activation_banks = Vec::new();
         let mut unknown_temporary_shape_count = 0;
+        let mut unknown_state_view_shape_count = 0;
 
         for (artifact, activation_plan) in graph.circuits.iter().zip(&execution_plan.circuits) {
             if artifact.pedal.id != activation_plan.pedal_id {
@@ -268,6 +278,16 @@ impl StreamCircuitResourcePlan {
                         .is_none()
                 })
                 .count();
+            unknown_state_view_shape_count += activation_plan
+                .state_view_signals
+                .iter()
+                .filter(|signal_id| {
+                    activation_plan
+                        .signal(signal_id)
+                        .and_then(|signal| signal.shape.as_ref())
+                        .is_none()
+                })
+                .count();
 
             let activation_frame = activation_plan.activation_frame_plan();
             activation_banks.push(PlannedActivationSlotBank {
@@ -292,8 +312,10 @@ impl StreamCircuitResourcePlan {
             state_allocations,
             activation_banks,
             temporary_signal_count: execution_plan.temporary_signal_count(),
+            state_view_signal_count: execution_plan.state_view_signal_count(),
             layer_local_activation_slot_count: execution_plan.layer_local_activation_slot_count(),
             unknown_temporary_shape_count,
+            unknown_state_view_shape_count,
         })
     }
 
@@ -362,6 +384,7 @@ pub struct CircuitActivationPlan {
     pub nodes: Vec<PlannedNode>,
     pub signals: BTreeMap<String, PlannedSignal>,
     pub temporary_signals: Vec<String>,
+    pub state_view_signals: Vec<String>,
 }
 
 impl CircuitActivationPlan {
@@ -417,6 +440,7 @@ impl CircuitActivationPlan {
                     producer: SignalProducer::BoundaryInput,
                     consumers: Vec::new(),
                     shape: Some(input.shape.clone()),
+                    storage: SignalStorage::Boundary,
                     is_boundary_output: false,
                 },
             );
@@ -430,6 +454,7 @@ impl CircuitActivationPlan {
                     producer: SignalProducer::StatePort,
                     consumers: Vec::new(),
                     shape: state.shape.clone(),
+                    storage: SignalStorage::State,
                     is_boundary_output: false,
                 },
             );
@@ -473,6 +498,7 @@ impl CircuitActivationPlan {
                         },
                         consumers: Vec::new(),
                         shape: output_shapes.get(output_index).cloned().unwrap_or(None),
+                        storage: node_output_storage(node),
                         is_boundary_output: boundary_output_sources.contains(output),
                     },
                 );
@@ -498,7 +524,17 @@ impl CircuitActivationPlan {
         let temporary_signals = signals
             .values()
             .filter(|signal| {
-                matches!(signal.producer, SignalProducer::Node { .. }) && !signal.is_boundary_output
+                matches!(signal.producer, SignalProducer::Node { .. })
+                    && signal.storage == SignalStorage::Activation
+                    && !signal.is_boundary_output
+            })
+            .map(|signal| signal.id.clone())
+            .collect();
+        let state_view_signals = signals
+            .values()
+            .filter(|signal| {
+                matches!(signal.producer, SignalProducer::Node { .. })
+                    && signal.storage == SignalStorage::StateView
             })
             .map(|signal| signal.id.clone())
             .collect();
@@ -527,6 +563,7 @@ impl CircuitActivationPlan {
             nodes: planned_nodes,
             signals,
             temporary_signals,
+            state_view_signals,
         })
     }
 
@@ -691,6 +728,7 @@ pub struct PlannedSignal {
     pub producer: SignalProducer,
     pub consumers: Vec<String>,
     pub shape: Option<Vec<usize>>,
+    pub storage: SignalStorage,
     pub is_boundary_output: bool,
 }
 
@@ -699,6 +737,14 @@ pub enum SignalProducer {
     BoundaryInput,
     StatePort,
     Node { node_id: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SignalStorage {
+    Boundary,
+    State,
+    Activation,
+    StateView,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -903,6 +949,13 @@ fn attr_usize(node: &CircuitNode, attr: &str) -> Option<usize> {
         .and_then(|value| usize::try_from(value).ok())
 }
 
+fn node_output_storage(node: &CircuitNode) -> SignalStorage {
+    match node.op.as_str() {
+        "append_state_update" | "rolling_state_update" => SignalStorage::StateView,
+        _ => SignalStorage::Activation,
+    }
+}
+
 fn validate_node_dependencies(
     pedal_id: &str,
     node: &CircuitNode,
@@ -976,8 +1029,9 @@ mod tests {
         assert_eq!(plan.circuits.len(), 14);
         assert_eq!(plan.total_node_count(), 242);
         assert_eq!(plan.produced_signal_count(), 264);
-        assert_eq!(plan.temporary_signal_count(), 250);
-        assert_eq!(plan.layer_local_activation_slot_count(), 62);
+        assert_eq!(plan.temporary_signal_count(), 230);
+        assert_eq!(plan.state_view_signal_count(), 20);
+        assert_eq!(plan.layer_local_activation_slot_count(), 56);
         assert_eq!(plan.operator_counts().get("linear"), Some(&82));
         assert_eq!(
             plan.state_type_counts().get("append_only_attention_memory"),
@@ -988,7 +1042,11 @@ mod tests {
         let layer_00_frame = layer_00.activation_frame_plan();
         assert_eq!(layer_00.pedal_id, "layer_00");
         assert_eq!(layer_00.nodes.len(), 16);
-        assert_eq!(layer_00.temporary_signals.len(), 17);
+        assert_eq!(layer_00.temporary_signals.len(), 16);
+        assert_eq!(
+            layer_00.state_view_signals,
+            vec!["temporal_window".to_string()]
+        );
         assert_eq!(layer_00_frame.slot_count, 4);
         assert_eq!(layer_00.input_ports[0].id, "input_frame");
         assert_eq!(layer_00.output_ports[0].id, "output_frame");
@@ -1003,7 +1061,12 @@ mod tests {
         );
 
         let layer_02 = &plan.circuits[2];
-        assert_eq!(layer_02.activation_frame_plan().slot_count, 5);
+        assert_eq!(layer_02.temporary_signals.len(), 17);
+        assert_eq!(
+            layer_02.state_view_signals,
+            vec!["k_memory".to_string(), "v_memory".to_string()]
+        );
+        assert_eq!(layer_02.activation_frame_plan().slot_count, 4);
         assert!(
             layer_02
                 .nodes
@@ -1028,9 +1091,11 @@ mod tests {
         let resource_plan = StreamCircuitResourcePlan::from_graph_and_plan(&graph, &plan).unwrap();
 
         assert_eq!(tensor_index.schema, TENSOR_INDEX_SCHEMA);
-        assert_eq!(resource_plan.temporary_signal_count, 250);
-        assert_eq!(resource_plan.unknown_temporary_shape_count, 12);
-        assert!(!resource_plan.intermediate_activation_shapes_known());
+        assert_eq!(resource_plan.temporary_signal_count, 230);
+        assert_eq!(resource_plan.state_view_signal_count, 20);
+        assert_eq!(resource_plan.unknown_temporary_shape_count, 0);
+        assert_eq!(resource_plan.unknown_state_view_shape_count, 12);
+        assert!(resource_plan.intermediate_activation_shapes_known());
 
         let layer_00 = &plan.circuits[0];
         assert_eq!(
@@ -1057,7 +1122,15 @@ mod tests {
             Some(vec![512])
         );
         assert_eq!(layer_02.signal("k_memory").unwrap().shape, None);
+        assert_eq!(
+            layer_02.signal("k_memory").unwrap().storage,
+            SignalStorage::StateView
+        );
         assert_eq!(layer_02.signal("v_memory").unwrap().shape, None);
+        assert_eq!(
+            layer_02.signal("v_memory").unwrap().storage,
+            SignalStorage::StateView
+        );
         assert_eq!(
             layer_02.signal("attention_out").unwrap().shape,
             Some(vec![1024])
@@ -1077,9 +1150,11 @@ mod tests {
         assert_eq!(resource_plan.parameter_ref_count, 130);
         assert_eq!(resource_plan.unique_parameter_tensor_count(), 130);
         assert_eq!(resource_plan.stream_state_count(), 14);
-        assert_eq!(resource_plan.temporary_signal_count, 250);
-        assert_eq!(resource_plan.layer_local_activation_slot_count, 62);
-        assert_eq!(resource_plan.unknown_temporary_shape_count, 184);
+        assert_eq!(resource_plan.temporary_signal_count, 230);
+        assert_eq!(resource_plan.state_view_signal_count, 20);
+        assert_eq!(resource_plan.layer_local_activation_slot_count, 56);
+        assert_eq!(resource_plan.unknown_temporary_shape_count, 172);
+        assert_eq!(resource_plan.unknown_state_view_shape_count, 12);
         assert!(!resource_plan.intermediate_activation_shapes_known());
 
         let conv_in = resource_plan
@@ -1134,17 +1209,17 @@ mod tests {
             .iter()
             .find(|bank| bank.pedal_id == "layer_00")
             .unwrap();
-        assert_eq!(layer_00_bank.temporary_signal_count, 17);
+        assert_eq!(layer_00_bank.temporary_signal_count, 16);
         assert_eq!(layer_00_bank.slot_count, 4);
-        assert_eq!(layer_00_bank.assignments.len(), 17);
+        assert_eq!(layer_00_bank.assignments.len(), 16);
 
         let layer_02_bank = resource_plan
             .activation_banks
             .iter()
             .find(|bank| bank.pedal_id == "layer_02")
             .unwrap();
-        assert_eq!(layer_02_bank.temporary_signal_count, 19);
-        assert_eq!(layer_02_bank.slot_count, 5);
+        assert_eq!(layer_02_bank.temporary_signal_count, 17);
+        assert_eq!(layer_02_bank.slot_count, 4);
     }
 
     #[test]
@@ -1187,6 +1262,13 @@ mod tests {
             output_frame.consumers,
             vec!["boundary.output:output_frame".to_string()]
         );
+
+        let temporal_window = layer_00.signal("temporal_window").unwrap();
+        assert_eq!(temporal_window.storage, SignalStorage::StateView);
+        assert_eq!(
+            temporal_window.consumers,
+            vec!["depthwise_temporal_conv".to_string()]
+        );
     }
 
     #[test]
@@ -1195,13 +1277,14 @@ mod tests {
         let plan = StreamCircuitExecutionPlan::from_graph(&graph).unwrap();
         let frame = plan.circuits[0].activation_frame_plan();
 
-        assert_eq!(frame.liveness.len(), 17);
+        assert_eq!(frame.liveness.len(), 16);
         assert_eq!(frame.slot_count, 4);
         assert_eq!(frame.slot_for("operator_norm_out"), Some(0));
         assert_eq!(frame.slot_for("gate_b"), Some(0));
         assert_eq!(frame.slot_for("gate_c"), Some(2));
         assert_eq!(frame.slot_for("projected_x"), Some(3));
-        assert_eq!(frame.slot_for("operator_residual_out"), Some(0));
+        assert_eq!(frame.slot_for("operator_residual_out"), Some(1));
+        assert_eq!(frame.slot_for("temporal_window"), None);
 
         let residual = frame.liveness_for("operator_residual_out").unwrap();
         assert_eq!(residual.produced_by, "operator_residual");

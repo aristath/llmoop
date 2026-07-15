@@ -1425,16 +1425,19 @@ mod tests {
         assert_eq!(resource_plan.circuit_count, 14);
         assert_eq!(resource_plan.parameter_ref_count, 130);
         assert_eq!(resource_plan.stream_state_count(), 14);
-        assert_eq!(resource_plan.layer_local_activation_slot_count, 62);
-        assert_eq!(resource_plan.unknown_temporary_shape_count, 184);
-        assert_eq!(shaped_resource_plan.unknown_temporary_shape_count, 12);
+        assert_eq!(resource_plan.state_view_signal_count, 20);
+        assert_eq!(resource_plan.layer_local_activation_slot_count, 56);
+        assert_eq!(resource_plan.unknown_temporary_shape_count, 172);
+        assert_eq!(resource_plan.unknown_state_view_shape_count, 12);
+        assert_eq!(shaped_resource_plan.unknown_temporary_shape_count, 0);
+        assert_eq!(shaped_resource_plan.unknown_state_view_shape_count, 12);
         assert_eq!(
             resource_plan
                 .activation_banks
                 .iter()
                 .find(|bank| bank.pedal_id == "layer_02")
                 .map(|bank| bank.slot_count),
-            Some(5)
+            Some(4)
         );
     }
 
@@ -1529,7 +1532,9 @@ mod tests {
         assert_eq!(template.allocations.len(), 14);
         assert_eq!(resource_plan.parameter_ref_count, 130);
         assert_eq!(resource_plan.activation_banks.len(), 14);
-        assert_eq!(shaped_resource_plan.unknown_temporary_shape_count, 12);
+        assert_eq!(resource_plan.state_view_signal_count, 20);
+        assert_eq!(shaped_resource_plan.unknown_temporary_shape_count, 0);
+        assert_eq!(shaped_resource_plan.unknown_state_view_shape_count, 12);
         assert_eq!(
             template.allocation_keys().get(2).map(String::as_str),
             Some("layer_02.kv_memory")
