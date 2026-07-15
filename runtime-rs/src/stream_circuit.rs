@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::fs;
@@ -8,9 +8,12 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+use crate::backend::{BackendError, DeviceBackend};
 use crate::types::{
-    DeviceMemoryPlan, HostPortsManifest, InstalledProcessorManifest, MemoryRegion,
-    MemoryRegionKind, MemorySharing, PermanentCircuitManifest, StateAllocation, StreamTemplate,
+    ControlCommand, DeviceDispatchRun, DeviceMemoryPlan, DeviceOutputEvent, DispatchStatus,
+    ForkPolicy, ForkRequest, HostPortsManifest, InputSignal, InstalledProcessorManifest,
+    MemoryRegion, MemoryRegionKind, MemorySharing, PermanentCircuitManifest, PromptInjection,
+    RandomPolicy, StateAllocation, StreamId, StreamTemplate,
 };
 
 pub const STREAM_CIRCUIT_SCHEMA: &str = "llmoop.stream_circuit.v1";
@@ -921,6 +924,290 @@ impl CircuitCapabilityReport {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StreamCircuitRuntimeError {
+    Backend(BackendError),
+    UnsupportedExecutionPlan(CircuitCapabilityReport),
+    ExecutionUnavailable(String),
+}
+
+impl Display for StreamCircuitRuntimeError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Backend(error) => Display::fmt(error, f),
+            Self::UnsupportedExecutionPlan(report) => write!(
+                f,
+                "stream circuit backend {:?} cannot execute graph yet; unsupported ops: {:?}; unsupported state types: {:?}",
+                report.backend_id,
+                report.unsupported_ops(),
+                report.unsupported_state_types()
+            ),
+            Self::ExecutionUnavailable(message) => f.write_str(message),
+        }
+    }
+}
+
+impl Error for StreamCircuitRuntimeError {}
+
+impl From<BackendError> for StreamCircuitRuntimeError {
+    fn from(error: BackendError) -> Self {
+        Self::Backend(error)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct MountedStreamCircuit {
+    pub template: StreamCircuitStreamTemplate,
+    pending_external: VecDeque<InputSignal>,
+    remaining_public_outputs: u32,
+    input_counter: u64,
+}
+
+impl MountedStreamCircuit {
+    fn new(installed: &InstalledStreamCircuit, stream_id: impl Into<String>) -> Self {
+        Self {
+            template: installed.create_stream_template(stream_id),
+            pending_external: VecDeque::new(),
+            remaining_public_outputs: 0,
+            input_counter: 0,
+        }
+    }
+
+    fn has_work(&self) -> bool {
+        !self.pending_external.is_empty()
+    }
+
+    fn reset(&mut self) {
+        self.pending_external.clear();
+        self.remaining_public_outputs = 0;
+        self.input_counter = 0;
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct StreamCircuitDeviceBackend {
+    device_id: String,
+    installed: InstalledStreamCircuit,
+    capabilities: StreamCircuitBackendCapabilities,
+    capability_report: CircuitCapabilityReport,
+    streams: BTreeMap<StreamId, MountedStreamCircuit>,
+    active_queue: VecDeque<StreamId>,
+    output_queue: Vec<DeviceOutputEvent>,
+}
+
+impl StreamCircuitDeviceBackend {
+    pub const BACKEND_ID: &'static str = "stream_circuit_ir";
+
+    pub fn new(
+        device_id: impl Into<String>,
+        installed: InstalledStreamCircuit,
+        capabilities: StreamCircuitBackendCapabilities,
+    ) -> Self {
+        let capability_report = installed.capability_report(&capabilities);
+        Self {
+            device_id: device_id.into(),
+            installed,
+            capabilities,
+            capability_report,
+            streams: BTreeMap::new(),
+            active_queue: VecDeque::new(),
+            output_queue: Vec::new(),
+        }
+    }
+
+    pub fn from_index_file(
+        device_id: impl Into<String>,
+        index_path: impl AsRef<Path>,
+        capabilities: StreamCircuitBackendCapabilities,
+    ) -> Result<Self, CircuitArtifactError> {
+        let installed = InstalledStreamCircuit::from_index_file(
+            index_path,
+            "stream_circuit_installed_processor",
+            capabilities.backend_id.clone(),
+        )?;
+        Ok(Self::new(device_id, installed, capabilities))
+    }
+
+    pub fn capability_report(&self) -> &CircuitCapabilityReport {
+        &self.capability_report
+    }
+
+    pub fn stream_template(&self, stream_id: &str) -> Option<&StreamCircuitStreamTemplate> {
+        self.streams.get(stream_id).map(|stream| &stream.template)
+    }
+
+    pub fn capabilities(&self) -> &StreamCircuitBackendCapabilities {
+        &self.capabilities
+    }
+
+    fn stream_mut(&mut self, stream_id: &str) -> Result<&mut MountedStreamCircuit, BackendError> {
+        self.streams
+            .get_mut(stream_id)
+            .ok_or_else(|| BackendError::UnknownStream(stream_id.to_string()))
+    }
+
+    fn schedule(&mut self, stream_id: &str) {
+        if !self.active_queue.iter().any(|active| active == stream_id) {
+            self.active_queue.push_back(stream_id.to_string());
+        }
+    }
+
+    fn deschedule_if_idle(&mut self, stream_id: &str) {
+        if self
+            .streams
+            .get(stream_id)
+            .is_some_and(MountedStreamCircuit::has_work)
+        {
+            return;
+        }
+        self.active_queue.retain(|active| active != stream_id);
+    }
+}
+
+impl DeviceBackend for StreamCircuitDeviceBackend {
+    type Error = StreamCircuitRuntimeError;
+
+    fn backend_id(&self) -> &str {
+        Self::BACKEND_ID
+    }
+
+    fn device_id(&self) -> &str {
+        &self.device_id
+    }
+
+    fn has_stream(&self, stream_id: &str) -> bool {
+        self.streams.contains_key(stream_id)
+    }
+
+    fn create_stream(&mut self, stream_id: &str) -> Result<(), Self::Error> {
+        if self.has_stream(stream_id) {
+            return Err(BackendError::DuplicateStream(stream_id.to_string()).into());
+        }
+        self.streams.insert(
+            stream_id.to_string(),
+            MountedStreamCircuit::new(&self.installed, stream_id),
+        );
+        Ok(())
+    }
+
+    fn inject_prompt(&mut self, injection: PromptInjection) -> Result<(), Self::Error> {
+        let stream_id = injection.stream_id.clone();
+        let stream = self.stream_mut(&stream_id)?;
+        for token_id in injection.prompt_ids {
+            let signal = InputSignal::external(
+                format!("input_{}", stream.input_counter),
+                token_id,
+                injection.origin.clone(),
+            );
+            stream.input_counter += 1;
+            stream.pending_external.push_back(signal);
+        }
+        stream.remaining_public_outputs = stream
+            .remaining_public_outputs
+            .saturating_add(injection.max_new_tokens);
+        self.schedule(&stream_id);
+        Ok(())
+    }
+
+    fn inject_token(&mut self, stream_id: &str, signal: InputSignal) -> Result<(), Self::Error> {
+        self.stream_mut(stream_id)?
+            .pending_external
+            .push_back(signal);
+        self.schedule(stream_id);
+        Ok(())
+    }
+
+    fn control(&mut self, stream_id: &str, command: ControlCommand) -> Result<(), Self::Error> {
+        let stream = self.stream_mut(stream_id)?;
+        match command {
+            ControlCommand::Continue {
+                additional_public_outputs,
+                ..
+            } => {
+                stream.remaining_public_outputs = stream
+                    .remaining_public_outputs
+                    .saturating_add(additional_public_outputs);
+            }
+            ControlCommand::Interrupt { .. } | ControlCommand::StopAfterCurrent { .. } => {
+                stream.remaining_public_outputs = 0;
+            }
+            ControlCommand::ResetState { .. } => {
+                stream.reset();
+            }
+            ControlCommand::ReseedRandom { .. } => {}
+        }
+        if stream.has_work() {
+            self.schedule(stream_id);
+        } else {
+            self.deschedule_if_idle(stream_id);
+        }
+        Ok(())
+    }
+
+    fn fork_stream(&mut self, request: ForkRequest) -> Result<(), Self::Error> {
+        if self.has_stream(&request.child_stream_id) {
+            return Err(BackendError::DuplicateStream(request.child_stream_id).into());
+        }
+        let mut child = match request.state_policy {
+            ForkPolicy::Clone => self
+                .streams
+                .get(&request.parent_stream_id)
+                .ok_or_else(|| BackendError::UnknownStream(request.parent_stream_id.clone()))?
+                .clone(),
+            ForkPolicy::Fresh => {
+                MountedStreamCircuit::new(&self.installed, &request.child_stream_id)
+            }
+        };
+        child.template.stream_id = request.child_stream_id.clone();
+        let child_has_work = child.has_work();
+        self.streams.insert(request.child_stream_id.clone(), child);
+        if request.random_policy == RandomPolicy::Fresh {
+            // Random queues are part of the circuit contract; this shell has no sampler executor yet.
+        }
+        if child_has_work {
+            self.schedule(&request.child_stream_id);
+        }
+        Ok(())
+    }
+
+    fn dispatch(&mut self, max_ticks: u32) -> Result<DeviceDispatchRun, Self::Error> {
+        if self.active_queue.is_empty() {
+            return Ok(DeviceDispatchRun {
+                device_id: self.device_id.clone(),
+                ticks: Vec::new(),
+                outputs: Vec::new(),
+                status: DispatchStatus::Idle,
+                active_streams: Vec::new(),
+            });
+        }
+        if max_ticks == 0 {
+            return Ok(DeviceDispatchRun {
+                device_id: self.device_id.clone(),
+                ticks: Vec::new(),
+                outputs: Vec::new(),
+                status: DispatchStatus::BudgetExhausted,
+                active_streams: self.active_queue.iter().cloned().collect(),
+            });
+        }
+        if !self.capability_report.executable() {
+            return Err(StreamCircuitRuntimeError::UnsupportedExecutionPlan(
+                self.capability_report.clone(),
+            ));
+        }
+        Err(StreamCircuitRuntimeError::ExecutionUnavailable(
+            "stream circuit executor registry is not installed".to_string(),
+        ))
+    }
+
+    fn drain_outputs(&mut self) -> Result<Vec<DeviceOutputEvent>, Self::Error> {
+        Ok(std::mem::take(&mut self.output_queue))
+    }
+
+    fn describe(&self) -> InstalledProcessorManifest {
+        self.installed.manifest.clone()
+    }
+}
+
 fn read_json<T: for<'de> Deserialize<'de>>(
     path: impl AsRef<Path>,
 ) -> Result<T, CircuitArtifactError> {
@@ -1119,5 +1406,74 @@ mod tests {
         assert!(report.executable());
         assert!(report.unsupported_ops().is_empty());
         assert!(report.unsupported_state_types().is_empty());
+    }
+
+    #[test]
+    fn stream_circuit_device_mounts_streams_without_claiming_execution() {
+        let capabilities = StreamCircuitBackendCapabilities::new("stream_circuit_ir");
+        let mut backend = StreamCircuitDeviceBackend::from_index_file(
+            "device_0",
+            lfm2_index_path(),
+            capabilities,
+        )
+        .unwrap();
+
+        backend.create_stream("s0").unwrap();
+        backend
+            .inject_prompt(PromptInjection::new("s0", vec![1, 2], 1))
+            .unwrap();
+
+        let manifest = backend.describe();
+        let template = backend.stream_template("s0").unwrap();
+
+        assert_eq!(backend.backend_id(), StreamCircuitDeviceBackend::BACKEND_ID);
+        assert_eq!(manifest.permanent_circuit.pedal_count, 14);
+        assert_eq!(template.stream_id, "s0");
+        assert_eq!(template.allocations.len(), 14);
+        assert_eq!(
+            template.allocation_keys().get(2).map(String::as_str),
+            Some("layer_02.kv_memory")
+        );
+        assert_eq!(
+            backend.dispatch(0).unwrap().status,
+            DispatchStatus::BudgetExhausted
+        );
+
+        match backend.dispatch(1) {
+            Err(StreamCircuitRuntimeError::UnsupportedExecutionPlan(report)) => {
+                assert_eq!(report.unsupported_ops().len(), 12);
+                assert!(report.unsupported_ops().contains(&"linear".to_string()));
+            }
+            other => panic!("expected unsupported execution plan, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stream_circuit_device_fork_preserves_allocations_with_child_identity() {
+        let capabilities = StreamCircuitBackendCapabilities::new("stream_circuit_ir");
+        let mut backend = StreamCircuitDeviceBackend::from_index_file(
+            "device_0",
+            lfm2_index_path(),
+            capabilities,
+        )
+        .unwrap();
+        backend.create_stream("parent").unwrap();
+
+        backend
+            .fork_stream(ForkRequest {
+                parent_stream_id: "parent".to_string(),
+                child_stream_id: "child".to_string(),
+                state_policy: ForkPolicy::Clone,
+                random_policy: RandomPolicy::Clone,
+                random_seed: None,
+            })
+            .unwrap();
+
+        let parent = backend.stream_template("parent").unwrap();
+        let child = backend.stream_template("child").unwrap();
+
+        assert_eq!(parent.stream_id, "parent");
+        assert_eq!(child.stream_id, "child");
+        assert_eq!(parent.allocation_keys(), child.allocation_keys());
     }
 }
