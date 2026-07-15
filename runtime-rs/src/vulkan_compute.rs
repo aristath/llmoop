@@ -476,15 +476,71 @@ unsafe fn read_u32_memory(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) fn compile_test_shader_words() -> Option<Vec<u32>> {
     use std::path::PathBuf;
     use std::process::{Command, Stdio};
 
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let shader = manifest_dir.join("shaders/add_one.comp");
+    let output = std::env::temp_dir().join(format!("llmoop-add-one-{}.spv", std::process::id()));
+    let compiled = if test_command_exists("glslangValidator") {
+        Command::new("glslangValidator")
+            .arg("-V")
+            .arg(&shader)
+            .arg("-o")
+            .arg(&output)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .ok()?
+            .success()
+    } else if test_command_exists("glslc") {
+        Command::new("glslc")
+            .arg(&shader)
+            .arg("-o")
+            .arg(&output)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .ok()?
+            .success()
+    } else {
+        return None;
+    };
+    if !compiled {
+        return None;
+    }
+    let bytes = std::fs::read(output).ok()?;
+    if bytes.len() % 4 != 0 {
+        return None;
+    }
+    let words = bytes
+        .chunks_exact(4)
+        .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect();
+    Some(words)
+}
+
+#[cfg(test)]
+fn test_command_exists(command: &str) -> bool {
+    use std::process::{Command, Stdio};
+
+    Command::new(command)
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
     use super::*;
 
     #[test]
     fn smoke_dispatches_add_one_shader_when_vulkan_is_available() {
-        let Some(spirv_words) = compile_shader_words() else {
+        let Some(spirv_words) = compile_test_shader_words() else {
             eprintln!("skipping Vulkan smoke: no GLSL to SPIR-V compiler found");
             return;
         };
@@ -500,7 +556,7 @@ mod tests {
 
     #[test]
     fn compute_device_reuses_context_for_multiple_dispatches() {
-        let Some(spirv_words) = compile_shader_words() else {
+        let Some(spirv_words) = compile_test_shader_words() else {
             eprintln!("skipping Vulkan smoke: no GLSL to SPIR-V compiler found");
             return;
         };
@@ -526,7 +582,7 @@ mod tests {
 
     #[test]
     fn u32_shader_pedal_runs_on_compute_device() {
-        let Some(spirv_words) = compile_shader_words() else {
+        let Some(spirv_words) = compile_test_shader_words() else {
             eprintln!("skipping Vulkan smoke: no GLSL to SPIR-V compiler found");
             return;
         };
@@ -550,58 +606,5 @@ mod tests {
         assert!(!run.device_name.is_empty());
         assert_eq!(run.input, vec![4, 5, 6]);
         assert_eq!(run.output, vec![5, 6, 7]);
-    }
-
-    fn compile_shader_words() -> Option<Vec<u32>> {
-        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let shader = manifest_dir.join("shaders/add_one.comp");
-        let output =
-            std::env::temp_dir().join(format!("llmoop-add-one-{}.spv", std::process::id()));
-        let compiled = if command_exists("glslangValidator") {
-            Command::new("glslangValidator")
-                .arg("-V")
-                .arg(&shader)
-                .arg("-o")
-                .arg(&output)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .ok()?
-                .success()
-        } else if command_exists("glslc") {
-            Command::new("glslc")
-                .arg(&shader)
-                .arg("-o")
-                .arg(&output)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .ok()?
-                .success()
-        } else {
-            return None;
-        };
-        if !compiled {
-            return None;
-        }
-        let bytes = std::fs::read(output).ok()?;
-        if bytes.len() % 4 != 0 {
-            return None;
-        }
-        let words = bytes
-            .chunks_exact(4)
-            .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-            .collect();
-        Some(words)
-    }
-
-    fn command_exists(command: &str) -> bool {
-        Command::new(command)
-            .arg("--version")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false)
     }
 }
