@@ -655,6 +655,14 @@ impl VulkanKernelStreamMetadata {
             uses_stream_tick: matches!(op, "rotary_position_embedding" | "append_state_update"),
         }
     }
+
+    pub fn push_constants(&self) -> Vec<VulkanKernelScalarBinding> {
+        vec![
+            self.stream_tick.clone(),
+            self.control_flags.clone(),
+            self.dynamic_state_capacity_activations.clone(),
+        ]
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -677,6 +685,198 @@ impl VulkanKernelScalarBinding {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum VulkanKernelScalarSource {
     PushConstant,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanKernelDispatchPlan {
+    pub backend_id: String,
+    pub commands: Vec<VulkanKernelDispatchCommand>,
+}
+
+impl VulkanKernelDispatchPlan {
+    pub fn from_binding_plan(binding_plan: &VulkanStreamCircuitBindingPlan) -> Self {
+        Self::from_kernel_interfaces(&VulkanKernelInterfacePlan::from_binding_plan(binding_plan))
+    }
+
+    pub fn from_kernel_interfaces(interface_plan: &VulkanKernelInterfacePlan) -> Self {
+        let mut commands = Vec::with_capacity(interface_plan.total_kernel_count());
+        for (circuit_index, circuit) in interface_plan.circuits.iter().enumerate() {
+            for kernel in &circuit.kernels {
+                commands.push(VulkanKernelDispatchCommand::from_kernel(
+                    commands.len(),
+                    circuit_index,
+                    &circuit.circuit_id,
+                    kernel,
+                ));
+            }
+        }
+
+        Self {
+            backend_id: VULKAN_STREAM_CIRCUIT_BACKEND_ID.to_string(),
+            commands,
+        }
+    }
+
+    pub fn total_dispatch_count(&self) -> usize {
+        self.commands.len()
+    }
+
+    pub fn command(&self, pedal_id: &str, node_id: &str) -> Option<&VulkanKernelDispatchCommand> {
+        self.commands
+            .iter()
+            .find(|command| command.pedal_id == pedal_id && command.node_id == node_id)
+    }
+
+    pub fn op_counts(&self) -> BTreeMap<String, usize> {
+        let mut counts = BTreeMap::new();
+        for command in &self.commands {
+            *counts.entry(command.op.clone()).or_insert(0) += 1;
+        }
+        counts
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanKernelDispatchCommand {
+    pub dispatch_index: usize,
+    pub circuit_index: usize,
+    pub kernel_id: String,
+    pub pedal_id: String,
+    pub circuit_id: String,
+    pub node_index: usize,
+    pub node_id: String,
+    pub op: String,
+    pub descriptor_bindings: Vec<VulkanKernelDescriptorBinding>,
+    pub push_constants: Vec<VulkanKernelScalarBinding>,
+    pub uses_stream_tick: bool,
+}
+
+impl VulkanKernelDispatchCommand {
+    fn from_kernel(
+        dispatch_index: usize,
+        circuit_index: usize,
+        circuit_id: &str,
+        kernel: &VulkanKernelInterface,
+    ) -> Self {
+        Self {
+            dispatch_index,
+            circuit_index,
+            kernel_id: kernel.kernel_id.clone(),
+            pedal_id: kernel.pedal_id.clone(),
+            circuit_id: circuit_id.to_string(),
+            node_index: kernel.node_index,
+            node_id: kernel.node_id.clone(),
+            op: kernel.op.clone(),
+            descriptor_bindings: descriptor_bindings_for_kernel(kernel),
+            push_constants: kernel.stream_metadata.push_constants(),
+            uses_stream_tick: kernel.stream_metadata.uses_stream_tick,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanKernelDescriptorBinding {
+    pub binding: usize,
+    pub usage: VulkanKernelDescriptorUsage,
+    pub name: String,
+    pub resource: VulkanKernelDescriptorResource,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VulkanKernelDescriptorUsage {
+    InputSignal,
+    OutputSignal,
+    Parameter,
+    StateRead,
+    StateWrite,
+    StateView,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VulkanKernelDescriptorResource {
+    Signal(VulkanSignalBinding),
+    Parameter(VulkanParameterBinding),
+    State {
+        pedal_id: String,
+        binding: VulkanStateBinding,
+    },
+}
+
+fn descriptor_bindings_for_kernel(
+    kernel: &VulkanKernelInterface,
+) -> Vec<VulkanKernelDescriptorBinding> {
+    let mut bindings = Vec::new();
+
+    for input in &kernel.inputs {
+        push_descriptor_binding(
+            &mut bindings,
+            VulkanKernelDescriptorUsage::InputSignal,
+            input.signal_id.clone(),
+            VulkanKernelDescriptorResource::Signal(input.clone()),
+        );
+    }
+    for output in &kernel.outputs {
+        push_descriptor_binding(
+            &mut bindings,
+            VulkanKernelDescriptorUsage::OutputSignal,
+            output.signal_id.clone(),
+            VulkanKernelDescriptorResource::Signal(output.clone()),
+        );
+    }
+    for parameter in &kernel.parameters {
+        push_descriptor_binding(
+            &mut bindings,
+            VulkanKernelDescriptorUsage::Parameter,
+            parameter.param_id.clone(),
+            VulkanKernelDescriptorResource::Parameter(parameter.clone()),
+        );
+    }
+    for state in &kernel.state_reads {
+        push_descriptor_binding(
+            &mut bindings,
+            VulkanKernelDescriptorUsage::StateRead,
+            state.state_id.clone(),
+            VulkanKernelDescriptorResource::State {
+                pedal_id: kernel.pedal_id.clone(),
+                binding: state.clone(),
+            },
+        );
+    }
+    for state in &kernel.state_writes {
+        push_descriptor_binding(
+            &mut bindings,
+            VulkanKernelDescriptorUsage::StateWrite,
+            state.state_id.clone(),
+            VulkanKernelDescriptorResource::State {
+                pedal_id: kernel.pedal_id.clone(),
+                binding: state.clone(),
+            },
+        );
+    }
+    for state_view in &kernel.state_views {
+        push_descriptor_binding(
+            &mut bindings,
+            VulkanKernelDescriptorUsage::StateView,
+            state_view.signal_id.clone(),
+            VulkanKernelDescriptorResource::Signal(state_view.clone()),
+        );
+    }
+
+    bindings
+}
+
+fn push_descriptor_binding(
+    bindings: &mut Vec<VulkanKernelDescriptorBinding>,
+    usage: VulkanKernelDescriptorUsage,
+    name: String,
+    resource: VulkanKernelDescriptorResource,
+) {
+    bindings.push(VulkanKernelDescriptorBinding {
+        binding: bindings.len(),
+        usage,
+        name,
+        resource,
+    });
 }
 
 fn parameter_binding_index(
@@ -1501,6 +1701,137 @@ mod tests {
                 .dynamic_state_capacity_activations
                 .name,
             "dynamic_state_capacity_activations"
+        );
+    }
+
+    #[test]
+    fn dispatch_plan_orders_lfm2_kernel_commands_for_stream_ticks() {
+        let graph = ResolvedLoweredPedalboard::from_index_file(lfm2_index_path()).unwrap();
+        let tensor_index = TensorIndex::from_json_file(lfm2_tensor_index_path()).unwrap();
+        let execution_plan =
+            StreamCircuitExecutionPlan::from_graph_with_tensor_index(&graph, &tensor_index)
+                .unwrap();
+        let resource_plan =
+            StreamCircuitResourcePlan::from_graph_and_plan(&graph, &execution_plan).unwrap();
+        let resident_plan = VulkanStreamCircuitResidentPlan::from_resource_plan(
+            &resource_plan,
+            Some(&tensor_index),
+            Some(2),
+        )
+        .unwrap();
+        let binding_plan = VulkanStreamCircuitBindingPlan::from_plans(
+            &execution_plan,
+            &resource_plan,
+            &resident_plan,
+        )
+        .unwrap();
+
+        let dispatch_plan = VulkanKernelDispatchPlan::from_binding_plan(&binding_plan);
+
+        assert_eq!(dispatch_plan.backend_id, VULKAN_STREAM_CIRCUIT_BACKEND_ID);
+        assert_eq!(dispatch_plan.total_dispatch_count(), 242);
+        assert_eq!(dispatch_plan.op_counts().get("linear"), Some(&82));
+
+        let first = &dispatch_plan.commands[0];
+        assert_eq!(first.dispatch_index, 0);
+        assert_eq!(first.circuit_index, 0);
+        assert_eq!(first.kernel_id, "layer_00.operator_norm");
+        assert_eq!(first.pedal_id, "layer_00");
+        assert_eq!(first.node_index, 0);
+        assert_eq!(first.op, "rms_norm");
+        assert_eq!(first.descriptor_bindings.len(), 3);
+        assert_eq!(
+            first
+                .descriptor_bindings
+                .iter()
+                .map(|binding| binding.usage.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                VulkanKernelDescriptorUsage::InputSignal,
+                VulkanKernelDescriptorUsage::OutputSignal,
+                VulkanKernelDescriptorUsage::Parameter,
+            ]
+        );
+        assert_eq!(
+            first
+                .push_constants
+                .iter()
+                .map(|binding| binding.name.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "stream_tick",
+                "control_flags",
+                "dynamic_state_capacity_activations"
+            ]
+        );
+        assert!(!first.uses_stream_tick);
+
+        let kv_append = dispatch_plan
+            .command("layer_02", "kv_memory_append")
+            .unwrap();
+        assert_eq!(kv_append.dispatch_index, 40);
+        assert_eq!(kv_append.circuit_index, 2);
+        assert_eq!(kv_append.node_index, 8);
+        assert_eq!(kv_append.op, "append_state_update");
+        assert!(kv_append.uses_stream_tick);
+        assert_eq!(
+            kv_append
+                .descriptor_bindings
+                .iter()
+                .map(|binding| (
+                    binding.binding,
+                    binding.usage.clone(),
+                    binding.name.as_str()
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (0, VulkanKernelDescriptorUsage::InputSignal, "k_positioned"),
+                (1, VulkanKernelDescriptorUsage::InputSignal, "v_projected"),
+                (2, VulkanKernelDescriptorUsage::InputSignal, "kv_memory"),
+                (3, VulkanKernelDescriptorUsage::OutputSignal, "k_memory"),
+                (4, VulkanKernelDescriptorUsage::OutputSignal, "v_memory"),
+                (5, VulkanKernelDescriptorUsage::StateRead, "kv_memory"),
+                (6, VulkanKernelDescriptorUsage::StateWrite, "kv_memory"),
+                (7, VulkanKernelDescriptorUsage::StateView, "k_memory"),
+                (8, VulkanKernelDescriptorUsage::StateView, "v_memory"),
+            ]
+        );
+        assert_eq!(
+            kv_append.descriptor_bindings[2].resource,
+            VulkanKernelDescriptorResource::Signal(VulkanSignalBinding {
+                signal_id: "kv_memory".to_string(),
+                resource: VulkanSignalResource::StateBuffer {
+                    pedal_id: "layer_02".to_string(),
+                    state_id: "kv_memory".to_string(),
+                    static_bytes: None,
+                    bytes_per_activation: Some(2048),
+                },
+            })
+        );
+        assert_eq!(
+            kv_append.descriptor_bindings[6].resource,
+            VulkanKernelDescriptorResource::State {
+                pedal_id: "layer_02".to_string(),
+                binding: VulkanStateBinding {
+                    state_id: "kv_memory".to_string(),
+                    state_type: "append_only_attention_memory".to_string(),
+                    static_bytes: None,
+                    bytes_per_activation: Some(2048),
+                },
+            }
+        );
+
+        let last = dispatch_plan.commands.last().unwrap();
+        assert_eq!(last.dispatch_index, 241);
+        assert_eq!(last.circuit_index, 13);
+        assert_eq!(last.kernel_id, "layer_13.ffn_residual");
+        assert_eq!(last.node_index, 15);
+        assert_eq!(
+            last.descriptor_bindings.last().unwrap().resource,
+            VulkanKernelDescriptorResource::Signal(VulkanSignalBinding {
+                signal_id: "output_frame".to_string(),
+                resource: VulkanSignalResource::BoundaryOutput,
+            })
         );
     }
 
