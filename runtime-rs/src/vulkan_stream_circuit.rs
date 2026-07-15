@@ -7,7 +7,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::stream_circuit::{PedalCablePlacement, StreamCircuitPlacementPlan};
+use crate::stream_circuit::{CableTransport, PedalCablePlacement, StreamCircuitPlacementPlan};
 use crate::stream_plan::{
     CircuitActivationPlan, PlannedNode, SignalProducer, SignalStorage, StreamCircuitExecutionPlan,
     StreamCircuitResourcePlan, TensorIndex,
@@ -287,6 +287,7 @@ pub struct VulkanPlacedStreamCircuitResidentPlan {
     pub backend_id: String,
     pub device_id: String,
     pub hosted_pedal_ids: Vec<String>,
+    pub signal_element_bytes: Option<usize>,
     pub local_cables: Vec<PedalCablePlacement>,
     pub incoming_cables: Vec<PedalCablePlacement>,
     pub outgoing_cables: Vec<PedalCablePlacement>,
@@ -349,6 +350,7 @@ impl VulkanPlacedStreamCircuitResidentPlan {
             backend_id: VULKAN_STREAM_CIRCUIT_BACKEND_ID.to_string(),
             device_id,
             hosted_pedal_ids,
+            signal_element_bytes: activation_element_bytes,
             local_cables,
             incoming_cables,
             outgoing_cables,
@@ -457,6 +459,328 @@ impl VulkanStreamCircuitStreamBuffers {
             .position(|buffer| buffer.pedal_id == pedal_id && buffer.slot == slot)
     }
 }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanPlacedCableIoPlan {
+    pub backend_id: String,
+    pub device_id: String,
+    pub signal_element_bytes: Option<usize>,
+    pub endpoints: Vec<VulkanPlacedCableEndpoint>,
+    pub incoming_endpoint_count: usize,
+    pub outgoing_endpoint_count: usize,
+    pub total_endpoint_count: usize,
+    pub total_byte_capacity: Option<usize>,
+    pub unresolved_byte_cables: Vec<usize>,
+}
+
+impl VulkanPlacedCableIoPlan {
+    pub fn from_placed_resident_plan(
+        placed_resident_plan: &VulkanPlacedStreamCircuitResidentPlan,
+    ) -> Result<Self, VulkanPlacedCableIoPlanError> {
+        let mut endpoints = Vec::with_capacity(
+            placed_resident_plan.incoming_cables.len() + placed_resident_plan.outgoing_cables.len(),
+        );
+
+        for cable in &placed_resident_plan.incoming_cables {
+            endpoints.push(VulkanPlacedCableEndpoint::from_cable(
+                endpoints.len(),
+                VulkanPlacedCableDirection::Incoming,
+                &placed_resident_plan.device_id,
+                cable,
+                placed_resident_plan.signal_element_bytes,
+            )?);
+        }
+        for cable in &placed_resident_plan.outgoing_cables {
+            endpoints.push(VulkanPlacedCableEndpoint::from_cable(
+                endpoints.len(),
+                VulkanPlacedCableDirection::Outgoing,
+                &placed_resident_plan.device_id,
+                cable,
+                placed_resident_plan.signal_element_bytes,
+            )?);
+        }
+
+        let incoming_endpoint_count = endpoints
+            .iter()
+            .filter(|endpoint| endpoint.direction == VulkanPlacedCableDirection::Incoming)
+            .count();
+        let outgoing_endpoint_count = endpoints
+            .iter()
+            .filter(|endpoint| endpoint.direction == VulkanPlacedCableDirection::Outgoing)
+            .count();
+        let unresolved_byte_cables = endpoints
+            .iter()
+            .filter(|endpoint| endpoint.byte_capacity.is_none())
+            .map(|endpoint| endpoint.cable_index)
+            .collect::<Vec<_>>();
+        let total_byte_capacity =
+            endpoints.iter().try_fold(Some(0usize), |total, endpoint| {
+                match (total, endpoint.byte_capacity) {
+                    (Some(total), Some(bytes)) => Some(total.checked_add(bytes).ok_or_else(|| {
+                        VulkanPlacedCableIoPlanError(
+                            "placed cable endpoint byte capacity overflowed".to_string(),
+                        )
+                    }))
+                    .transpose(),
+                    _ => Ok(None),
+                }
+            })?;
+
+        Ok(Self {
+            backend_id: VULKAN_STREAM_CIRCUIT_BACKEND_ID.to_string(),
+            device_id: placed_resident_plan.device_id.clone(),
+            signal_element_bytes: placed_resident_plan.signal_element_bytes,
+            total_endpoint_count: endpoints.len(),
+            endpoints,
+            incoming_endpoint_count,
+            outgoing_endpoint_count,
+            total_byte_capacity,
+            unresolved_byte_cables,
+        })
+    }
+
+    pub fn endpoint(
+        &self,
+        direction: VulkanPlacedCableDirection,
+        cable_index: usize,
+    ) -> Option<&VulkanPlacedCableEndpoint> {
+        self.endpoints
+            .iter()
+            .find(|endpoint| endpoint.direction == direction && endpoint.cable_index == cable_index)
+    }
+
+    pub fn allocate_buffers(
+        &self,
+        device: &VulkanComputeDevice,
+    ) -> Result<VulkanPlacedCableIoBuffers, VulkanError> {
+        let mut incoming_buffers = Vec::with_capacity(self.incoming_endpoint_count);
+        let mut outgoing_buffers = Vec::with_capacity(self.outgoing_endpoint_count);
+        let mut total_byte_capacity = 0usize;
+
+        for endpoint in &self.endpoints {
+            let byte_capacity = endpoint.byte_capacity.ok_or_else(|| {
+                VulkanError(format!(
+                    "{} endpoint {} for cable {} has unknown byte capacity",
+                    self.device_id, endpoint.endpoint_id, endpoint.cable_index
+                ))
+            })?;
+            total_byte_capacity = checked_add_bytes(
+                total_byte_capacity,
+                byte_capacity,
+                "placed cable endpoint buffer allocation",
+            )?;
+            let allocation = VulkanPlacedCableBufferAllocation {
+                endpoint: endpoint.clone(),
+                byte_capacity,
+                buffer: device.create_resident_buffer(byte_capacity)?,
+            };
+            match endpoint.direction {
+                VulkanPlacedCableDirection::Incoming => incoming_buffers.push(allocation),
+                VulkanPlacedCableDirection::Outgoing => outgoing_buffers.push(allocation),
+            }
+        }
+
+        Ok(VulkanPlacedCableIoBuffers {
+            plan: self.clone(),
+            incoming_buffers,
+            outgoing_buffers,
+            total_byte_capacity,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanPlacedCableEndpoint {
+    pub endpoint_index: usize,
+    pub endpoint_id: String,
+    pub direction: VulkanPlacedCableDirection,
+    pub cable_index: usize,
+    pub signal: String,
+    pub shape: Vec<usize>,
+    pub element_count: usize,
+    pub byte_capacity: Option<usize>,
+    pub local_device_id: String,
+    pub remote_device_id: String,
+    pub local_pedal_id: String,
+    pub remote_pedal_id: String,
+    pub local_port_id: String,
+    pub remote_port_id: String,
+    pub local_pedal_port: Option<String>,
+    pub remote_pedal_port: Option<String>,
+    pub transport: CableTransport,
+}
+
+impl VulkanPlacedCableEndpoint {
+    fn from_cable(
+        endpoint_index: usize,
+        direction: VulkanPlacedCableDirection,
+        device_id: &str,
+        cable: &PedalCablePlacement,
+        signal_element_bytes: Option<usize>,
+    ) -> Result<Self, VulkanPlacedCableIoPlanError> {
+        let CableTransport::CrossDevice {
+            from_device_id,
+            to_device_id,
+        } = &cable.transport
+        else {
+            return Err(VulkanPlacedCableIoPlanError(format!(
+                "cable {} is not a cross-device cable",
+                cable.cable_index
+            )));
+        };
+
+        match direction {
+            VulkanPlacedCableDirection::Incoming => {
+                if to_device_id != device_id || cable.destination_device_id != device_id {
+                    return Err(VulkanPlacedCableIoPlanError(format!(
+                        "incoming cable {} does not terminate on device {:?}",
+                        cable.cable_index, device_id
+                    )));
+                }
+            }
+            VulkanPlacedCableDirection::Outgoing => {
+                if from_device_id != device_id || cable.source_device_id != device_id {
+                    return Err(VulkanPlacedCableIoPlanError(format!(
+                        "outgoing cable {} does not originate on device {:?}",
+                        cable.cable_index, device_id
+                    )));
+                }
+            }
+        }
+
+        let element_count = product(&cable.shape).ok_or_else(|| {
+            VulkanPlacedCableIoPlanError(format!(
+                "cable {} signal shape {:?} overflows",
+                cable.cable_index, cable.shape
+            ))
+        })?;
+        if element_count == 0 {
+            return Err(VulkanPlacedCableIoPlanError(format!(
+                "cable {} signal shape {:?} has zero elements",
+                cable.cable_index, cable.shape
+            )));
+        }
+        let byte_capacity = match signal_element_bytes {
+            Some(bytes_per_element) => Some(
+                element_count
+                    .checked_mul(bytes_per_element)
+                    .ok_or_else(|| {
+                        VulkanPlacedCableIoPlanError(format!(
+                            "cable {} byte capacity overflowed",
+                            cable.cable_index
+                        ))
+                    })?,
+            ),
+            None => None,
+        };
+
+        let (
+            local_device_id,
+            remote_device_id,
+            local_pedal_id,
+            remote_pedal_id,
+            local_port_id,
+            remote_port_id,
+            local_pedal_port,
+            remote_pedal_port,
+        ) = match direction {
+            VulkanPlacedCableDirection::Incoming => (
+                cable.destination_device_id.clone(),
+                cable.source_device_id.clone(),
+                cable.destination_pedal_id.clone(),
+                cable.source_pedal_id.clone(),
+                cable.destination_port_id.clone(),
+                cable.source_port_id.clone(),
+                cable.destination_pedal_port.clone(),
+                cable.source_pedal_port.clone(),
+            ),
+            VulkanPlacedCableDirection::Outgoing => (
+                cable.source_device_id.clone(),
+                cable.destination_device_id.clone(),
+                cable.source_pedal_id.clone(),
+                cable.destination_pedal_id.clone(),
+                cable.source_port_id.clone(),
+                cable.destination_port_id.clone(),
+                cable.source_pedal_port.clone(),
+                cable.destination_pedal_port.clone(),
+            ),
+        };
+        let direction_suffix = match direction {
+            VulkanPlacedCableDirection::Incoming => "in",
+            VulkanPlacedCableDirection::Outgoing => "out",
+        };
+
+        Ok(Self {
+            endpoint_index,
+            endpoint_id: format!("cable_{}_{}", cable.cable_index, direction_suffix),
+            direction,
+            cable_index: cable.cable_index,
+            signal: cable.signal.clone(),
+            shape: cable.shape.clone(),
+            element_count,
+            byte_capacity,
+            local_device_id,
+            remote_device_id,
+            local_pedal_id,
+            remote_pedal_id,
+            local_port_id,
+            remote_port_id,
+            local_pedal_port,
+            remote_pedal_port,
+            transport: cable.transport.clone(),
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VulkanPlacedCableDirection {
+    Incoming,
+    Outgoing,
+}
+
+pub struct VulkanPlacedCableIoBuffers {
+    pub plan: VulkanPlacedCableIoPlan,
+    pub incoming_buffers: Vec<VulkanPlacedCableBufferAllocation>,
+    pub outgoing_buffers: Vec<VulkanPlacedCableBufferAllocation>,
+    pub total_byte_capacity: usize,
+}
+
+impl VulkanPlacedCableIoBuffers {
+    pub fn incoming_buffer(
+        &self,
+        cable_index: usize,
+    ) -> Option<&VulkanPlacedCableBufferAllocation> {
+        self.incoming_buffers
+            .iter()
+            .find(|buffer| buffer.endpoint.cable_index == cable_index)
+    }
+
+    pub fn outgoing_buffer(
+        &self,
+        cable_index: usize,
+    ) -> Option<&VulkanPlacedCableBufferAllocation> {
+        self.outgoing_buffers
+            .iter()
+            .find(|buffer| buffer.endpoint.cable_index == cable_index)
+    }
+}
+
+pub struct VulkanPlacedCableBufferAllocation {
+    pub endpoint: VulkanPlacedCableEndpoint,
+    pub byte_capacity: usize,
+    pub buffer: VulkanResidentBuffer,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanPlacedCableIoPlanError(pub String);
+
+impl Display for VulkanPlacedCableIoPlanError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl Error for VulkanPlacedCableIoPlanError {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VulkanStreamCircuitBindingPlan {
@@ -803,6 +1127,7 @@ impl VulkanMountedStreamCircuit {
 #[derive(Debug)]
 pub enum VulkanStreamCircuitMountError {
     Binding(VulkanBindingPlanError),
+    CableIo(VulkanPlacedCableIoPlanError),
     Vulkan(VulkanError),
 }
 
@@ -810,6 +1135,7 @@ impl Display for VulkanStreamCircuitMountError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Binding(error) => Display::fmt(error, f),
+            Self::CableIo(error) => Display::fmt(error, f),
             Self::Vulkan(error) => Display::fmt(error, f),
         }
     }
@@ -823,6 +1149,12 @@ impl From<VulkanBindingPlanError> for VulkanStreamCircuitMountError {
     }
 }
 
+impl From<VulkanPlacedCableIoPlanError> for VulkanStreamCircuitMountError {
+    fn from(error: VulkanPlacedCableIoPlanError) -> Self {
+        Self::CableIo(error)
+    }
+}
+
 impl From<VulkanError> for VulkanStreamCircuitMountError {
     fn from(error: VulkanError) -> Self {
         Self::Vulkan(error)
@@ -832,6 +1164,7 @@ impl From<VulkanError> for VulkanStreamCircuitMountError {
 pub struct VulkanMountedPlacedStreamCircuit {
     pub placed_plan: VulkanPlacedStreamCircuitPlan,
     pub buffers: VulkanStreamCircuitStreamBuffers,
+    pub cable_io: VulkanPlacedCableIoBuffers,
 }
 
 impl VulkanMountedPlacedStreamCircuit {
@@ -844,9 +1177,13 @@ impl VulkanMountedPlacedStreamCircuit {
             .placed_resident_plan
             .resident_plan
             .allocate_stream_buffers(device, dynamic_state_capacity_activations)?;
+        let cable_io_plan =
+            VulkanPlacedCableIoPlan::from_placed_resident_plan(&placed_plan.placed_resident_plan)?;
+        let cable_io = cable_io_plan.allocate_buffers(device)?;
         Ok(Self {
             placed_plan,
             buffers,
+            cable_io,
         })
     }
 
@@ -3611,6 +3948,7 @@ mod tests {
         assert_eq!(gpu0.resident_plan.stream_state_buffers.len(), 11);
         assert_eq!(gpu0.resident_plan.activation_banks.len(), 11);
         assert_eq!(gpu0.resident_plan.state_view_signal_count, 16);
+        assert_eq!(gpu0.signal_element_bytes, Some(2));
         assert_eq!(gpu0.local_cables.len(), 9);
         assert_eq!(gpu0.incoming_cables.len(), 1);
         assert_eq!(gpu0.outgoing_cables.len(), 1);
@@ -3619,6 +3957,13 @@ mod tests {
         assert_eq!(gpu0.outgoing_cables[0].source_pedal_id, "layer_00");
         assert_eq!(gpu0.outgoing_cables[0].destination_pedal_id, "layer_01");
 
+        let gpu0_cable_io = VulkanPlacedCableIoPlan::from_placed_resident_plan(&gpu0).unwrap();
+        assert_eq!(gpu0_cable_io.device_id, "gpu0");
+        assert_eq!(gpu0_cable_io.total_endpoint_count, 2);
+        assert_eq!(gpu0_cable_io.incoming_endpoint_count, 1);
+        assert_eq!(gpu0_cable_io.outgoing_endpoint_count, 1);
+        assert_eq!(gpu0_cable_io.total_byte_capacity, Some(4_096));
+
         assert_eq!(gpu1.hosted_pedal_ids, vec!["layer_02".to_string()]);
         assert_eq!(gpu1.resident_plan.circuit_count, 1);
         assert_eq!(gpu1.resident_plan.permanent_parameters.len(), 11);
@@ -3626,6 +3971,34 @@ mod tests {
         assert_eq!(gpu1.resident_plan.state_view_signal_count, 2);
         assert_eq!(gpu1.incoming_cables[0].source_pedal_id, "layer_01");
         assert_eq!(gpu1.outgoing_cables[0].destination_pedal_id, "layer_03");
+        let gpu1_cable_io = VulkanPlacedCableIoPlan::from_placed_resident_plan(&gpu1).unwrap();
+        assert_eq!(gpu1_cable_io.device_id, "gpu1");
+        assert_eq!(gpu1_cable_io.total_endpoint_count, 2);
+        assert_eq!(gpu1_cable_io.total_byte_capacity, Some(4_096));
+        assert_eq!(gpu1_cable_io.unresolved_byte_cables, Vec::<usize>::new());
+        let gpu1_incoming = gpu1_cable_io
+            .endpoint(VulkanPlacedCableDirection::Incoming, 1)
+            .unwrap();
+        assert_eq!(gpu1_incoming.endpoint_id, "cable_1_in");
+        assert_eq!(gpu1_incoming.signal, "frame");
+        assert_eq!(gpu1_incoming.shape, vec![1024]);
+        assert_eq!(gpu1_incoming.element_count, 1024);
+        assert_eq!(gpu1_incoming.byte_capacity, Some(2_048));
+        assert_eq!(gpu1_incoming.local_device_id, "gpu1");
+        assert_eq!(gpu1_incoming.remote_device_id, "cpu0");
+        assert_eq!(gpu1_incoming.local_pedal_id, "layer_02");
+        assert_eq!(gpu1_incoming.remote_pedal_id, "layer_01");
+        assert_eq!(gpu1_incoming.local_port_id, "input_frame");
+        assert_eq!(gpu1_incoming.remote_port_id, "output_frame");
+        let gpu1_outgoing = gpu1_cable_io
+            .endpoint(VulkanPlacedCableDirection::Outgoing, 2)
+            .unwrap();
+        assert_eq!(gpu1_outgoing.endpoint_id, "cable_2_out");
+        assert_eq!(gpu1_outgoing.byte_capacity, Some(2_048));
+        assert_eq!(gpu1_outgoing.local_device_id, "gpu1");
+        assert_eq!(gpu1_outgoing.remote_device_id, "lan:worker-a");
+        assert_eq!(gpu1_outgoing.local_pedal_id, "layer_02");
+        assert_eq!(gpu1_outgoing.remote_pedal_id, "layer_03");
 
         assert_eq!(cpu0.hosted_pedal_ids, vec!["layer_01".to_string()]);
         assert_eq!(cpu0.resident_plan.permanent_parameters.len(), 8);
@@ -3796,6 +4169,35 @@ mod tests {
         assert_eq!(mounted.buffers.state_buffers.len(), 1);
         assert_eq!(mounted.buffers.activation_slot_buffers.len(), 4);
         assert_eq!(mounted.buffers.total_byte_capacity, 25_600);
+        assert_eq!(mounted.cable_io.plan.device_id, "gpu1");
+        assert_eq!(mounted.cable_io.plan.total_endpoint_count, 2);
+        assert_eq!(mounted.cable_io.plan.total_byte_capacity, Some(4_096));
+        assert_eq!(mounted.cable_io.incoming_buffers.len(), 1);
+        assert_eq!(mounted.cable_io.outgoing_buffers.len(), 1);
+        assert_eq!(mounted.cable_io.total_byte_capacity, 4_096);
+        let incoming_cable = mounted.cable_io.incoming_buffer(1).unwrap();
+        assert_eq!(
+            incoming_cable.endpoint.direction,
+            VulkanPlacedCableDirection::Incoming
+        );
+        assert_eq!(incoming_cable.endpoint.local_pedal_id, "layer_02");
+        assert_eq!(incoming_cable.endpoint.remote_pedal_id, "layer_01");
+        assert_eq!(incoming_cable.byte_capacity, 2_048);
+        assert_eq!(incoming_cable.buffer.byte_capacity(), 2_048);
+        incoming_cable.buffer.write_bytes(&[7, 8, 9, 10]).unwrap();
+        assert_eq!(
+            incoming_cable.buffer.read_bytes(4).unwrap(),
+            vec![7, 8, 9, 10]
+        );
+        let outgoing_cable = mounted.cable_io.outgoing_buffer(2).unwrap();
+        assert_eq!(
+            outgoing_cable.endpoint.direction,
+            VulkanPlacedCableDirection::Outgoing
+        );
+        assert_eq!(outgoing_cable.endpoint.local_pedal_id, "layer_02");
+        assert_eq!(outgoing_cable.endpoint.remote_pedal_id, "layer_03");
+        assert_eq!(outgoing_cable.byte_capacity, 2_048);
+        assert_eq!(outgoing_cable.buffer.byte_capacity(), 2_048);
         assert_eq!(
             mounted
                 .buffers
