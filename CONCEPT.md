@@ -256,6 +256,43 @@ A --------> C
 
 Port types and dimensions remain part of the contract. Where two entities are incompatible, the graph must contain an explicit adapter rather than silently reinterpret the signal.
 
+### Layer pedals as device-placement boundaries
+
+For the first practical architecture, each source model layer should be represented as a standalone pedal in the pedalboard schema. Smaller internal components may exist inside that pedal, and later compiler passes may fuse, split, or specialize implementation details, but the layer-level pedal boundary is important enough to preserve as a logical placement and routing boundary.
+
+One reason is multi-device inference. If each layer is a self-contained pedal with typed input ports, output ports, permanent parameters, and stream-owned transient state, then different pedals can live on different execution devices:
+
+```text
+input
+  |
+  v
+layer_00 pedal  @ GPU 0
+  |
+  v
+layer_01 pedal  @ CPU
+  |
+  v
+layer_02 pedal  @ GPU 1
+  |
+  v
+layer_03 pedal  @ LAN device
+  |
+  v
+output
+```
+
+The pedalboard schema does not need to change when placement changes. The circuit remains the same logical graph; only the cables become different kinds of transport. A short cable may be an in-device buffer reference. A longer cable may be a device-to-device copy, shared memory handoff, PCIe transfer, IPC channel, or LAN stream. In audio terms, the pedalboard still has the same pedals in the same order; the only thing that changes is cable length and cable type.
+
+This makes placement a routing problem rather than a model-architecture problem:
+
+- a pedal declares what it consumes and produces;
+- a device backend declares what pedals it can host;
+- a cable declares how signals move between hosted pedals;
+- the scheduler decides when cross-device boundaries must synchronize; and
+- the behavioral contract stays attached to the pedal, not to the device.
+
+This is also why a layer should not be treated merely as a compile-time convenience. A layer pedal is a deployable unit. It can be hosted locally, remotely, duplicated, bypassed, inspected, replaced, or migrated, provided its port and state contracts remain compatible.
+
 ### Pedal duplication
 
 Duplicating an entity does not necessarily duplicate its permanent parameters. Multiple instances can reference one immutable circuit while retaining independent stream state:
