@@ -410,7 +410,11 @@ impl VulkanComputeDevice {
         unsafe {
             let buffer_info = vk::BufferCreateInfo::default()
                 .size(byte_capacity)
-                .usage(vk::BufferUsageFlags::STORAGE_BUFFER)
+                .usage(
+                    vk::BufferUsageFlags::STORAGE_BUFFER
+                        | vk::BufferUsageFlags::TRANSFER_SRC
+                        | vk::BufferUsageFlags::TRANSFER_DST,
+                )
                 .sharing_mode(vk::SharingMode::EXCLUSIVE);
             let buffer = self
                 .device
@@ -458,6 +462,94 @@ impl VulkanComputeDevice {
                 capacity,
                 byte_capacity,
             })
+        }
+    }
+
+    pub fn copy_u32_resident_buffer(
+        &self,
+        source: &VulkanU32ResidentBuffer,
+        destination: &VulkanU32ResidentBuffer,
+        len: usize,
+    ) -> Result<(), VulkanError> {
+        if len == 0 {
+            return Err(VulkanError(
+                "resident copy length must not be zero".to_string(),
+            ));
+        }
+        let byte_len = source.byte_len(len)?;
+        destination.byte_len(len)?;
+
+        unsafe {
+            let command_pool_info = vk::CommandPoolCreateInfo::default()
+                .queue_family_index(self.queue_family_index)
+                .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+            let command_pool = self
+                .device
+                .create_command_pool(&command_pool_info, None)
+                .map_err(|error| {
+                    VulkanError(format!(
+                        "failed to create resident copy command pool: {error:?}"
+                    ))
+                })?;
+            let command_alloc_info = vk::CommandBufferAllocateInfo::default()
+                .command_pool(command_pool)
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .command_buffer_count(1);
+            let command_buffer = self
+                .device
+                .allocate_command_buffers(&command_alloc_info)
+                .map_err(|error| {
+                    self.device.destroy_command_pool(command_pool, None);
+                    VulkanError(format!(
+                        "failed to allocate resident copy command buffer: {error:?}"
+                    ))
+                })?
+                .remove(0);
+
+            let command_begin = vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+            self.device
+                .begin_command_buffer(command_buffer, &command_begin)
+                .map_err(|error| {
+                    self.device.destroy_command_pool(command_pool, None);
+                    VulkanError(format!(
+                        "failed to begin resident copy command buffer: {error:?}"
+                    ))
+                })?;
+            let copy_regions = [vk::BufferCopy {
+                src_offset: 0,
+                dst_offset: 0,
+                size: byte_len,
+            }];
+            self.device.cmd_copy_buffer(
+                command_buffer,
+                source.buffer,
+                destination.buffer,
+                &copy_regions,
+            );
+            self.device
+                .end_command_buffer(command_buffer)
+                .map_err(|error| {
+                    self.device.destroy_command_pool(command_pool, None);
+                    VulkanError(format!(
+                        "failed to end resident copy command buffer: {error:?}"
+                    ))
+                })?;
+
+            let command_buffers = [command_buffer];
+            let submit_info = [vk::SubmitInfo::default().command_buffers(&command_buffers)];
+            self.device
+                .queue_submit(self.queue, &submit_info, vk::Fence::null())
+                .map_err(|error| {
+                    self.device.destroy_command_pool(command_pool, None);
+                    VulkanError(format!("failed to submit resident copy: {error:?}"))
+                })?;
+            self.device.queue_wait_idle(self.queue).map_err(|error| {
+                self.device.destroy_command_pool(command_pool, None);
+                VulkanError(format!("failed waiting for resident copy: {error:?}"))
+            })?;
+            self.device.destroy_command_pool(command_pool, None);
+            Ok(())
         }
     }
 
@@ -1113,6 +1205,27 @@ mod tests {
 
         assert_eq!(buffer.capacity(), 4);
         assert_eq!(buffer.read(2).unwrap(), vec![41, 42]);
+    }
+
+    #[test]
+    fn resident_buffers_can_copy_on_device() {
+        let device = match VulkanComputeDevice::new() {
+            Ok(device) => device,
+            Err(error) => {
+                eprintln!("skipping Vulkan smoke: {error}");
+                return;
+            }
+        };
+        let source = device.create_u32_resident_buffer(4).unwrap();
+        let destination = device.create_u32_resident_buffer(4).unwrap();
+        source.write(&[7, 8, 9]).unwrap();
+        destination.write(&[0, 0, 0]).unwrap();
+
+        device
+            .copy_u32_resident_buffer(&source, &destination, 3)
+            .unwrap();
+
+        assert_eq!(destination.read(3).unwrap(), vec![7, 8, 9]);
     }
 
     #[test]

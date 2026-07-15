@@ -113,6 +113,19 @@ struct VulkanU32StreamRun {
     has_more_work: bool,
 }
 
+enum VulkanU32StreamInput {
+    External(InputSignal),
+    PrivateFeedback(InputSignal),
+}
+
+impl VulkanU32StreamInput {
+    fn into_signal(self) -> InputSignal {
+        match self {
+            Self::External(signal) | Self::PrivateFeedback(signal) => signal,
+        }
+    }
+}
+
 struct VulkanU32MountedStream {
     signal_dispatches: Vec<VulkanU32ResidentDispatch>,
     ports: VulkanU32StreamPorts,
@@ -150,7 +163,7 @@ impl VulkanU32MountedStream {
         self.ports.clear()
     }
 
-    fn advance_once(
+    fn advance_external(
         &self,
         device: &VulkanComputeDevice,
         pedalboard: &VulkanU32Pedalboard,
@@ -160,7 +173,29 @@ impl VulkanU32MountedStream {
         let token = u32::try_from(input_token)
             .map_err(|_| VulkanBackendError::InvalidToken(input_token))?;
         self.ports.signal_frame.write(&[token])?;
+        self.advance_signal_frame(device, pedalboard, emit_public)
+    }
 
+    fn advance_private_feedback(
+        &self,
+        device: &VulkanComputeDevice,
+        pedalboard: &VulkanU32Pedalboard,
+        emit_public: bool,
+    ) -> Result<VulkanU32StreamAdvance, VulkanBackendError> {
+        device.copy_u32_resident_buffer(
+            &self.ports.private_feedback,
+            &self.ports.signal_frame,
+            VULKAN_U32_TOKEN_PORT_CAPACITY,
+        )?;
+        self.advance_signal_frame(device, pedalboard, emit_public)
+    }
+
+    fn advance_signal_frame(
+        &self,
+        device: &VulkanComputeDevice,
+        pedalboard: &VulkanU32Pedalboard,
+        emit_public: bool,
+    ) -> Result<VulkanU32StreamAdvance, VulkanBackendError> {
         let run = pedalboard.process_bound_resident(
             device,
             &self.ports.signal_frame,
@@ -172,9 +207,17 @@ impl VulkanU32MountedStream {
             .first()
             .copied()
             .ok_or(VulkanBackendError::EmptyPedalOutput)?;
-        self.ports.private_feedback.write(&[output])?;
+        device.copy_u32_resident_buffer(
+            &self.ports.signal_frame,
+            &self.ports.private_feedback,
+            VULKAN_U32_TOKEN_PORT_CAPACITY,
+        )?;
         if emit_public {
-            self.ports.public_output.write(&[output])?;
+            device.copy_u32_resident_buffer(
+                &self.ports.signal_frame,
+                &self.ports.public_output,
+                VULKAN_U32_TOKEN_PORT_CAPACITY,
+            )?;
         }
 
         let output_token = TokenId::from(output);
@@ -188,7 +231,7 @@ impl VulkanU32MountedStream {
 struct VulkanU32Stream {
     mounted: VulkanU32MountedStream,
     pending_external: VecDeque<InputSignal>,
-    pending_feedback: VecDeque<InputSignal>,
+    private_feedback_signal: Option<InputSignal>,
     remaining_outputs: u32,
     input_counter: u64,
     public_counter: u64,
@@ -203,7 +246,7 @@ impl VulkanU32Stream {
         Ok(Self {
             mounted: VulkanU32MountedStream::new(device, pedalboard)?,
             pending_external: VecDeque::new(),
-            pending_feedback: VecDeque::new(),
+            private_feedback_signal: None,
             remaining_outputs: 0,
             input_counter: 0,
             public_counter: 0,
@@ -219,7 +262,7 @@ impl VulkanU32Stream {
         Ok(Self {
             mounted: VulkanU32MountedStream::clone_from(device, pedalboard, &self.mounted)?,
             pending_external: self.pending_external.clone(),
-            pending_feedback: self.pending_feedback.clone(),
+            private_feedback_signal: self.private_feedback_signal.clone(),
             remaining_outputs: self.remaining_outputs,
             input_counter: self.input_counter,
             public_counter: self.public_counter,
@@ -229,7 +272,7 @@ impl VulkanU32Stream {
 
     fn reset_state(&mut self) -> Result<(), VulkanError> {
         self.pending_external.clear();
-        self.pending_feedback.clear();
+        self.private_feedback_signal = None;
         self.remaining_outputs = 0;
         self.input_counter = 0;
         self.public_counter = 0;
@@ -238,13 +281,18 @@ impl VulkanU32Stream {
     }
 
     fn has_work(&self) -> bool {
-        !self.pending_external.is_empty() || !self.pending_feedback.is_empty()
+        !self.pending_external.is_empty() || self.private_feedback_signal.is_some()
     }
 
-    fn next_input(&mut self) -> Option<InputSignal> {
+    fn next_input(&mut self) -> Option<VulkanU32StreamInput> {
         self.pending_external
             .pop_front()
-            .or_else(|| self.pending_feedback.pop_front())
+            .map(VulkanU32StreamInput::External)
+            .or_else(|| {
+                self.private_feedback_signal
+                    .take()
+                    .map(VulkanU32StreamInput::PrivateFeedback)
+            })
     }
 
     fn advance_queued_once(
@@ -260,9 +308,15 @@ impl VulkanU32Stream {
             return Ok(None);
         };
 
-        let advance = self
-            .mounted
-            .advance_once(device, pedalboard, input.token_id, can_emit)?;
+        let advance = match &input {
+            VulkanU32StreamInput::External(signal) => {
+                self.mounted
+                    .advance_external(device, pedalboard, signal.token_id, can_emit)?
+            }
+            VulkanU32StreamInput::PrivateFeedback(_) => self
+                .mounted
+                .advance_private_feedback(device, pedalboard, can_emit)?,
+        };
         let public_output = advance.public_token.map(|public_token| {
             let public = PublicOutputSignal::token(
                 format!("public_{}", self.public_counter),
@@ -277,14 +331,14 @@ impl VulkanU32Stream {
                 advance.private_feedback_token,
             );
             self.feedback_counter += 1;
-            self.pending_feedback.push_back(feedback);
+            self.private_feedback_signal = Some(feedback);
 
             public
         });
 
         Ok(Some(VulkanU32QueuedAdvance {
             dispatch_tick,
-            input,
+            input: input.into_signal(),
             public_output,
             has_more_work: self.has_work(),
         }))
@@ -488,14 +542,10 @@ impl DeviceBackend for VulkanU32Backend {
                     .saturating_add(additional_public_outputs);
             }
             ControlCommand::Interrupt { .. } => {
-                stream.pending_feedback.clear();
+                stream.private_feedback_signal = None;
                 stream.remaining_outputs = 0;
             }
             ControlCommand::StopAfterCurrent { .. } => {
-                if let Some(current) = stream.pending_feedback.pop_front() {
-                    stream.pending_feedback.clear();
-                    stream.pending_feedback.push_back(current);
-                }
                 stream.remaining_outputs = 0;
             }
             ControlCommand::ResetState { .. } => {
@@ -789,7 +839,7 @@ mod tests {
         assert_eq!(mounted.signal_dispatches.len(), 1);
 
         let private_advance = mounted
-            .advance_once(&backend.device, &backend.pedalboard, 1, false)
+            .advance_external(&backend.device, &backend.pedalboard, 1, false)
             .unwrap();
 
         assert_eq!(private_advance.private_feedback_token, 2);
@@ -798,17 +848,27 @@ mod tests {
         assert_eq!(mounted.ports.public_output.read(1).unwrap(), vec![0]);
 
         let public_advance = mounted
-            .advance_once(&backend.device, &backend.pedalboard, 2, true)
+            .advance_external(&backend.device, &backend.pedalboard, 2, true)
             .unwrap();
 
         assert_eq!(public_advance.private_feedback_token, 3);
         assert_eq!(public_advance.public_token, Some(3));
         assert_eq!(mounted.ports.private_feedback.read(1).unwrap(), vec![3]);
         assert_eq!(mounted.ports.public_output.read(1).unwrap(), vec![3]);
+
+        let feedback_advance = mounted
+            .advance_private_feedback(&backend.device, &backend.pedalboard, false)
+            .unwrap();
+
+        assert_eq!(feedback_advance.private_feedback_token, 4);
+        assert_eq!(feedback_advance.public_token, None);
+        assert_eq!(mounted.ports.signal_frame.read(1).unwrap(), vec![4]);
+        assert_eq!(mounted.ports.private_feedback.read(1).unwrap(), vec![4]);
+        assert_eq!(mounted.ports.public_output.read(1).unwrap(), vec![3]);
     }
 
     #[test]
-    fn stream_advance_owns_queued_feedback_bookkeeping() {
+    fn stream_advance_keeps_feedback_in_mounted_insert_port() {
         let Some(backend) = backend_with_adders(1) else {
             return;
         };
@@ -835,13 +895,28 @@ mod tests {
         assert_eq!(stream.public_counter, 1);
         assert_eq!(stream.feedback_counter, 1);
         assert_eq!(stream.remaining_outputs, 0);
-        assert_eq!(stream.pending_feedback.len(), 1);
-        assert_eq!(stream.pending_feedback[0].token_id, 2);
+        assert_eq!(stream.private_feedback_signal.as_ref().unwrap().token_id, 2);
         assert!(advance.has_more_work);
         assert_eq!(stream.mounted.ports.public_output.read(1).unwrap(), vec![2]);
         assert_eq!(
             stream.mounted.ports.private_feedback.read(1).unwrap(),
             vec![2]
+        );
+
+        let closing = stream
+            .advance_queued_once(&backend.device, &backend.pedalboard, 8)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(closing.input.route, "insert_in");
+        assert_eq!(closing.input.token_id, 2);
+        assert!(closing.public_output.is_none());
+        assert!(!closing.has_more_work);
+        assert!(stream.private_feedback_signal.is_none());
+        assert_eq!(stream.mounted.ports.signal_frame.read(1).unwrap(), vec![3]);
+        assert_eq!(
+            stream.mounted.ports.private_feedback.read(1).unwrap(),
+            vec![3]
         );
     }
 
@@ -874,8 +949,7 @@ mod tests {
         assert_eq!(run.next_dispatch_tick, 11);
         assert!(run.has_more_work);
         assert_eq!(stream.remaining_outputs, 1);
-        assert_eq!(stream.pending_feedback.len(), 1);
-        assert_eq!(stream.pending_feedback[0].token_id, 3);
+        assert_eq!(stream.private_feedback_signal.as_ref().unwrap().token_id, 3);
     }
 
     #[test]
