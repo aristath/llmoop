@@ -1896,6 +1896,61 @@ impl VulkanMountedPlacedStreamCircuit {
         Ok(tick_plan.advance(stream_tick))
     }
 
+    pub fn resident_kernel_dispatch_readiness_plan(
+        &self,
+        manifest: &VulkanReusableKernelArtifactManifest,
+        loaded_manifest: &VulkanLoadedReusableKernelArtifactManifest,
+    ) -> Result<VulkanMountedPlacedResidentKernelDispatchReadinessPlan, VulkanBoundDispatchPlanError>
+    {
+        let mounted_bound_plan = self.mounted_placed_bound_dispatch_plan(manifest)?;
+        Ok(
+            VulkanMountedPlacedResidentKernelDispatchReadinessPlan::from_mounted_bound_plan(
+                self,
+                &mounted_bound_plan,
+                loaded_manifest,
+            ),
+        )
+    }
+
+    pub fn resident_kernel_dispatch_readiness_for_bound_dispatch(
+        &self,
+        dispatch: &VulkanMountedPlacedBoundDispatch,
+        loaded_manifest: &VulkanLoadedReusableKernelArtifactManifest,
+    ) -> VulkanMountedPlacedResidentKernelDispatchStatus {
+        if loaded_manifest
+            .artifact(&dispatch.reusable_family_id)
+            .is_none()
+        {
+            return VulkanMountedPlacedResidentKernelDispatchStatus::Blocked {
+                error: VulkanMountedPlacedResidentKernelDispatchError::MissingLoadedArtifact {
+                    dispatch_index: dispatch.dispatch_index,
+                    family_id: dispatch.reusable_family_id.clone(),
+                },
+            };
+        }
+
+        let descriptor_count =
+            match self.resident_kernel_buffer_bindings_for_bound_dispatch(dispatch) {
+                Ok(bindings) => bindings.len(),
+                Err(error) => {
+                    return VulkanMountedPlacedResidentKernelDispatchStatus::Blocked { error };
+                }
+            };
+        let push_constant_byte_count = match push_constant_byte_count(&dispatch.push_constants) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                return VulkanMountedPlacedResidentKernelDispatchStatus::Blocked { error };
+            }
+        };
+
+        VulkanMountedPlacedResidentKernelDispatchStatus::Instantiable {
+            descriptor_count,
+            workgroup_count_x: 1,
+            local_size_x: dispatch.local_size_x,
+            push_constant_byte_count,
+        }
+    }
+
     pub fn resident_kernel_buffer_bindings_for_bound_dispatch<'a>(
         &'a self,
         dispatch: &VulkanMountedPlacedBoundDispatch,
@@ -4011,6 +4066,127 @@ impl VulkanMountedPlacedBoundDescriptorTarget {
             }
         }
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanMountedPlacedResidentKernelDispatchReadinessPlan {
+    pub backend_id: String,
+    pub device_id: String,
+    pub dispatches: Vec<VulkanMountedPlacedResidentKernelDispatchReadiness>,
+    pub dispatch_count: usize,
+    pub instantiable_count: usize,
+    pub blocked_count: usize,
+    pub missing_loaded_artifact_count: usize,
+    pub descriptor_binding_blocked_count: usize,
+    pub push_constant_blocked_count: usize,
+    pub instantiable_descriptor_count: usize,
+}
+
+impl VulkanMountedPlacedResidentKernelDispatchReadinessPlan {
+    fn from_mounted_bound_plan(
+        mounted: &VulkanMountedPlacedStreamCircuit,
+        mounted_bound_plan: &VulkanMountedPlacedBoundDispatchPlan,
+        loaded_manifest: &VulkanLoadedReusableKernelArtifactManifest,
+    ) -> Self {
+        let mut instantiable_count = 0usize;
+        let mut blocked_count = 0usize;
+        let mut missing_loaded_artifact_count = 0usize;
+        let mut descriptor_binding_blocked_count = 0usize;
+        let mut push_constant_blocked_count = 0usize;
+        let mut instantiable_descriptor_count = 0usize;
+
+        let dispatches = mounted_bound_plan
+            .dispatches
+            .iter()
+            .map(|dispatch| {
+                let status = mounted.resident_kernel_dispatch_readiness_for_bound_dispatch(
+                    dispatch,
+                    loaded_manifest,
+                );
+                match &status {
+                    VulkanMountedPlacedResidentKernelDispatchStatus::Instantiable {
+                        descriptor_count,
+                        ..
+                    } => {
+                        instantiable_count += 1;
+                        instantiable_descriptor_count += descriptor_count;
+                    }
+                    VulkanMountedPlacedResidentKernelDispatchStatus::Blocked { error } => {
+                        blocked_count += 1;
+                        match error {
+                            VulkanMountedPlacedResidentKernelDispatchError::MissingLoadedArtifact {
+                                ..
+                            } => missing_loaded_artifact_count += 1,
+                            VulkanMountedPlacedResidentKernelDispatchError::UnsupportedPushConstantScalar {
+                                ..
+                            }
+                            | VulkanMountedPlacedResidentKernelDispatchError::PushConstantByteCountOverflow => {
+                                push_constant_blocked_count += 1;
+                            }
+                            _ => descriptor_binding_blocked_count += 1,
+                        }
+                    }
+                }
+                VulkanMountedPlacedResidentKernelDispatchReadiness {
+                    dispatch_index: dispatch.dispatch_index,
+                    kernel_id: dispatch.kernel_id.clone(),
+                    pedal_id: dispatch.pedal_id.clone(),
+                    node_id: dispatch.node_id.clone(),
+                    op: dispatch.op.clone(),
+                    reusable_family_id: dispatch.reusable_family_id.clone(),
+                    status,
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let dispatch_count = dispatches.len();
+        Self {
+            backend_id: mounted_bound_plan.backend_id.clone(),
+            device_id: mounted_bound_plan.device_id.clone(),
+            dispatches,
+            dispatch_count,
+            instantiable_count,
+            blocked_count,
+            missing_loaded_artifact_count,
+            descriptor_binding_blocked_count,
+            push_constant_blocked_count,
+            instantiable_descriptor_count,
+        }
+    }
+
+    pub fn dispatch(
+        &self,
+        pedal_id: &str,
+        node_id: &str,
+    ) -> Option<&VulkanMountedPlacedResidentKernelDispatchReadiness> {
+        self.dispatches
+            .iter()
+            .find(|dispatch| dispatch.pedal_id == pedal_id && dispatch.node_id == node_id)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanMountedPlacedResidentKernelDispatchReadiness {
+    pub dispatch_index: usize,
+    pub kernel_id: String,
+    pub pedal_id: String,
+    pub node_id: String,
+    pub op: String,
+    pub reusable_family_id: String,
+    pub status: VulkanMountedPlacedResidentKernelDispatchStatus,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VulkanMountedPlacedResidentKernelDispatchStatus {
+    Instantiable {
+        descriptor_count: usize,
+        workgroup_count_x: u32,
+        local_size_x: u32,
+        push_constant_byte_count: u32,
+    },
+    Blocked {
+        error: VulkanMountedPlacedResidentKernelDispatchError,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -6273,6 +6449,85 @@ mod tests {
         assert_eq!(operator_norm_bindings[1].byte_len, 5_120);
         assert_eq!(operator_norm_bindings[2].binding, 2);
         assert_eq!(operator_norm_bindings[2].byte_len, 2_048);
+
+        let empty_loaded_manifest = VulkanLoadedReusableKernelArtifactManifest {
+            schema: VULKAN_REUSABLE_KERNEL_ARTIFACT_MANIFEST_SCHEMA.to_string(),
+            backend_id: VULKAN_STREAM_CIRCUIT_BACKEND_ID.to_string(),
+            artifacts: Vec::new(),
+            total_word_count: 0,
+        };
+        let empty_readiness = mounted
+            .resident_kernel_dispatch_readiness_plan(&manifest, &empty_loaded_manifest)
+            .unwrap();
+        assert_eq!(empty_readiness.device_id, "gpu0");
+        assert_eq!(empty_readiness.dispatch_count, 242);
+        assert_eq!(empty_readiness.instantiable_count, 0);
+        assert_eq!(empty_readiness.blocked_count, 242);
+        assert_eq!(empty_readiness.missing_loaded_artifact_count, 242);
+        assert_eq!(empty_readiness.descriptor_binding_blocked_count, 0);
+        assert_eq!(empty_readiness.push_constant_blocked_count, 0);
+        assert_eq!(empty_readiness.instantiable_descriptor_count, 0);
+        assert!(matches!(
+            empty_readiness
+                .dispatch("layer_00", "operator_norm")
+                .unwrap()
+                .status,
+            VulkanMountedPlacedResidentKernelDispatchStatus::Blocked {
+                error:
+                    VulkanMountedPlacedResidentKernelDispatchError::MissingLoadedArtifact {
+                        dispatch_index: 0,
+                        ref family_id,
+                    },
+            } if family_id == "rms_norm"
+        ));
+
+        let rms_norm_family = mounted
+            .placed_plan
+            .reusable_kernel_plan
+            .family("rms_norm")
+            .unwrap();
+        let rms_norm_loaded_manifest = VulkanLoadedReusableKernelArtifactManifest {
+            schema: VULKAN_REUSABLE_KERNEL_ARTIFACT_MANIFEST_SCHEMA.to_string(),
+            backend_id: VULKAN_STREAM_CIRCUIT_BACKEND_ID.to_string(),
+            total_word_count: 2,
+            artifacts: vec![VulkanLoadedReusableKernelArtifact {
+                artifact: VulkanReusableKernelArtifact::from_family(
+                    rms_norm_family,
+                    "kernels/rms_norm.spv",
+                ),
+                resolved_path: PathBuf::from("kernels/rms_norm.spv"),
+                words: vec![0x0723_0203, 0],
+            }],
+        };
+        let rms_norm_readiness = mounted
+            .resident_kernel_dispatch_readiness_plan(&manifest, &rms_norm_loaded_manifest)
+            .unwrap();
+        assert_eq!(
+            rms_norm_readiness.instantiable_count,
+            rms_norm_family.command_refs.len()
+        );
+        assert_eq!(
+            rms_norm_readiness.blocked_count,
+            rms_norm_readiness.dispatch_count - rms_norm_family.command_refs.len()
+        );
+        assert_eq!(
+            rms_norm_readiness.missing_loaded_artifact_count,
+            rms_norm_readiness.blocked_count
+        );
+        assert_eq!(rms_norm_readiness.descriptor_binding_blocked_count, 0);
+        assert_eq!(rms_norm_readiness.push_constant_blocked_count, 0);
+        assert!(matches!(
+            rms_norm_readiness
+                .dispatch("layer_00", "operator_norm")
+                .unwrap()
+                .status,
+            VulkanMountedPlacedResidentKernelDispatchStatus::Instantiable {
+                descriptor_count: 3,
+                workgroup_count_x: 1,
+                local_size_x: DEFAULT_COMPUTE_LOCAL_SIZE_X,
+                push_constant_byte_count: 16,
+            }
+        ));
 
         assert_eq!(
             mounted_bound
