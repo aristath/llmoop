@@ -1,14 +1,22 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
+use std::fs;
+use std::io;
+use std::path::Path;
+
+use serde::{Deserialize, Serialize};
 
 use crate::stream_plan::{
     CircuitActivationPlan, PlannedNode, SignalProducer, SignalStorage, StreamCircuitExecutionPlan,
     StreamCircuitResourcePlan, TensorIndex,
 };
+use crate::vulkan::{DEFAULT_COMPUTE_LOCAL_SIZE_X, DEFAULT_SPIRV_ENTRY_POINT};
 use crate::vulkan_compute::{VulkanComputeDevice, VulkanError, VulkanResidentBuffer};
 
 pub const VULKAN_STREAM_CIRCUIT_BACKEND_ID: &str = "vulkan_stream_circuit_ir";
+pub const VULKAN_REUSABLE_KERNEL_ARTIFACT_MANIFEST_SCHEMA: &str =
+    "llmoop.vulkan_reusable_kernel_artifacts.v1";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VulkanStreamCircuitResidentPlan {
@@ -525,6 +533,13 @@ impl VulkanMountedStreamCircuit {
         self.reusable_kernel_plan
             .coverage_report(available_family_ids)
     }
+
+    pub fn link_reusable_kernels(
+        &self,
+        manifest: &VulkanReusableKernelArtifactManifest,
+    ) -> VulkanLinkedReusableKernelPlan {
+        self.reusable_kernel_plan.link_artifacts(manifest)
+    }
 }
 
 #[derive(Debug)]
@@ -687,7 +702,7 @@ impl VulkanKernelStreamMetadata {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct VulkanKernelScalarBinding {
     pub name: String,
     pub scalar_type: String,
@@ -704,7 +719,8 @@ impl VulkanKernelScalarBinding {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum VulkanKernelScalarSource {
     PushConstant,
 }
@@ -804,7 +820,8 @@ pub struct VulkanKernelDescriptorBinding {
     pub resource: VulkanKernelDescriptorResource,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum VulkanKernelDescriptorUsage {
     InputSignal,
     OutputSignal,
@@ -938,6 +955,13 @@ impl VulkanReusableKernelPlan {
             families,
         }
     }
+
+    pub fn link_artifacts(
+        &self,
+        manifest: &VulkanReusableKernelArtifactManifest,
+    ) -> VulkanLinkedReusableKernelPlan {
+        VulkanLinkedReusableKernelPlan::from_reusable_plan_and_manifest(self, manifest)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -983,14 +1007,357 @@ pub struct VulkanReusableKernelFamilyCoverage {
     pub available: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VulkanReusableKernelArtifactManifest {
+    pub schema: String,
+    pub backend_id: String,
+    pub artifacts: Vec<VulkanReusableKernelArtifact>,
+}
+
+impl VulkanReusableKernelArtifactManifest {
+    pub fn new(artifacts: Vec<VulkanReusableKernelArtifact>) -> Self {
+        Self {
+            schema: VULKAN_REUSABLE_KERNEL_ARTIFACT_MANIFEST_SCHEMA.to_string(),
+            backend_id: VULKAN_STREAM_CIRCUIT_BACKEND_ID.to_string(),
+            artifacts,
+        }
+    }
+
+    pub fn empty() -> Self {
+        Self::new(Vec::new())
+    }
+
+    pub fn with_artifact(mut self, artifact: VulkanReusableKernelArtifact) -> Self {
+        self.artifacts.push(artifact);
+        self
+    }
+
+    pub fn family_ids(&self) -> Vec<&str> {
+        self.artifacts
+            .iter()
+            .map(|artifact| artifact.family_id.as_str())
+            .collect()
+    }
+
+    pub fn from_json_file(path: impl AsRef<Path>) -> io::Result<Self> {
+        let bytes = fs::read(path)?;
+        let manifest: Self = serde_json::from_slice(&bytes)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        if manifest.schema != VULKAN_REUSABLE_KERNEL_ARTIFACT_MANIFEST_SCHEMA {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "unsupported reusable kernel manifest schema {:?}",
+                    manifest.schema
+                ),
+            ));
+        }
+        Ok(manifest)
+    }
+
+    pub fn write_json_file(&self, path: impl AsRef<Path>) -> io::Result<()> {
+        let bytes = serde_json::to_vec_pretty(self)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        fs::write(path, bytes)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VulkanReusableKernelArtifact {
+    pub family_id: String,
+    pub op: String,
+    pub path: String,
+    pub entry_point: String,
+    pub local_size_x: u32,
+    pub descriptor_signature: Vec<VulkanKernelDescriptorSlotSignature>,
+    pub push_constants: Vec<VulkanKernelScalarBinding>,
+    pub uses_stream_tick: bool,
+}
+
+impl VulkanReusableKernelArtifact {
+    pub fn from_family(family: &VulkanReusableKernelFamily, path: impl Into<String>) -> Self {
+        Self {
+            family_id: family.family_id.clone(),
+            op: family.op.clone(),
+            path: path.into(),
+            entry_point: DEFAULT_SPIRV_ENTRY_POINT.to_string(),
+            local_size_x: DEFAULT_COMPUTE_LOCAL_SIZE_X,
+            descriptor_signature: family.descriptor_signature.clone(),
+            push_constants: family.push_constants.clone(),
+            uses_stream_tick: family.uses_stream_tick,
+        }
+    }
+
+    pub fn with_entry_point(mut self, entry_point: impl Into<String>) -> Self {
+        self.entry_point = entry_point.into();
+        self
+    }
+
+    pub fn with_local_size_x(mut self, local_size_x: u32) -> Self {
+        self.local_size_x = local_size_x;
+        self
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanLinkedReusableKernelPlan {
+    pub backend_id: String,
+    pub manifest_schema: String,
+    pub manifest_backend_id: String,
+    pub required_family_count: usize,
+    pub linked_family_count: usize,
+    pub missing_family_count: usize,
+    pub incompatible_family_count: usize,
+    pub required_command_count: usize,
+    pub linked_command_count: usize,
+    pub missing_command_count: usize,
+    pub incompatible_command_count: usize,
+    pub families: Vec<VulkanLinkedReusableKernelFamily>,
+    pub issues: Vec<VulkanReusableKernelLinkIssue>,
+}
+
+impl VulkanLinkedReusableKernelPlan {
+    pub fn from_reusable_plan_and_manifest(
+        reusable_plan: &VulkanReusableKernelPlan,
+        manifest: &VulkanReusableKernelArtifactManifest,
+    ) -> Self {
+        let mut artifacts_by_family_id: BTreeMap<&str, Vec<&VulkanReusableKernelArtifact>> =
+            BTreeMap::new();
+        for artifact in &manifest.artifacts {
+            artifacts_by_family_id
+                .entry(artifact.family_id.as_str())
+                .or_default()
+                .push(artifact);
+        }
+
+        let mut families = Vec::with_capacity(reusable_plan.families.len());
+        let mut issues = Vec::new();
+        let mut linked_family_count = 0usize;
+        let mut missing_family_count = 0usize;
+        let mut incompatible_family_count = 0usize;
+        let mut linked_command_count = 0usize;
+        let mut missing_command_count = 0usize;
+        let mut incompatible_command_count = 0usize;
+
+        for family in &reusable_plan.families {
+            let command_count = family.command_refs.len();
+            let artifacts = artifacts_by_family_id
+                .get(family.family_id.as_str())
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let mut family_issues = Vec::new();
+
+            if artifacts.is_empty() {
+                family_issues.push(VulkanReusableKernelLinkIssue {
+                    family_id: family.family_id.clone(),
+                    op: family.op.clone(),
+                    problem: VulkanReusableKernelLinkProblem::MissingArtifact,
+                });
+            } else if artifacts.len() > 1 {
+                family_issues.push(VulkanReusableKernelLinkIssue {
+                    family_id: family.family_id.clone(),
+                    op: family.op.clone(),
+                    problem: VulkanReusableKernelLinkProblem::DuplicateArtifact {
+                        count: artifacts.len(),
+                    },
+                });
+            }
+
+            let artifact = artifacts.first().copied();
+            if let Some(artifact) = artifact {
+                family_issues.extend(link_compatibility_issues(family, artifact));
+            }
+
+            let (status, artifact_path) = if artifacts.is_empty() {
+                missing_family_count += 1;
+                missing_command_count += command_count;
+                (VulkanReusableKernelLinkStatus::Missing, None)
+            } else if family_issues.is_empty() {
+                linked_family_count += 1;
+                linked_command_count += command_count;
+                (
+                    VulkanReusableKernelLinkStatus::Linked,
+                    artifact.map(|artifact| artifact.path.clone()),
+                )
+            } else {
+                incompatible_family_count += 1;
+                incompatible_command_count += command_count;
+                (
+                    VulkanReusableKernelLinkStatus::Incompatible,
+                    artifact.map(|artifact| artifact.path.clone()),
+                )
+            };
+
+            issues.extend(family_issues.iter().cloned());
+            families.push(VulkanLinkedReusableKernelFamily {
+                family_id: family.family_id.clone(),
+                op: family.op.clone(),
+                command_count,
+                status,
+                artifact_path,
+                issues: family_issues,
+            });
+        }
+
+        Self {
+            backend_id: reusable_plan.backend_id.clone(),
+            manifest_schema: manifest.schema.clone(),
+            manifest_backend_id: manifest.backend_id.clone(),
+            required_family_count: reusable_plan.families.len(),
+            linked_family_count,
+            missing_family_count,
+            incompatible_family_count,
+            required_command_count: reusable_plan.total_command_count,
+            linked_command_count,
+            missing_command_count,
+            incompatible_command_count,
+            families,
+            issues,
+        }
+    }
+
+    pub fn is_fully_linked(&self) -> bool {
+        self.missing_family_count == 0
+            && self.incompatible_family_count == 0
+            && self.linked_command_count == self.required_command_count
+    }
+
+    pub fn family(&self, family_id: &str) -> Option<&VulkanLinkedReusableKernelFamily> {
+        self.families
+            .iter()
+            .find(|family| family.family_id == family_id)
+    }
+
+    pub fn missing_families(&self) -> Vec<&VulkanLinkedReusableKernelFamily> {
+        self.families
+            .iter()
+            .filter(|family| family.status == VulkanReusableKernelLinkStatus::Missing)
+            .collect()
+    }
+
+    pub fn incompatible_families(&self) -> Vec<&VulkanLinkedReusableKernelFamily> {
+        self.families
+            .iter()
+            .filter(|family| family.status == VulkanReusableKernelLinkStatus::Incompatible)
+            .collect()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanLinkedReusableKernelFamily {
+    pub family_id: String,
+    pub op: String,
+    pub command_count: usize,
+    pub status: VulkanReusableKernelLinkStatus,
+    pub artifact_path: Option<String>,
+    pub issues: Vec<VulkanReusableKernelLinkIssue>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VulkanReusableKernelLinkStatus {
+    Linked,
+    Missing,
+    Incompatible,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanReusableKernelLinkIssue {
+    pub family_id: String,
+    pub op: String,
+    pub problem: VulkanReusableKernelLinkProblem,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VulkanReusableKernelLinkProblem {
+    MissingArtifact,
+    DuplicateArtifact { count: usize },
+    OpMismatch { found: String },
+    DescriptorSignatureMismatch,
+    PushConstantSignatureMismatch,
+    StreamTickUsageMismatch { found: bool },
+    EmptySpirvPath,
+    UnsupportedEntryPoint { found: String },
+    InvalidLocalSizeX { found: u32 },
+}
+
+fn link_compatibility_issues(
+    family: &VulkanReusableKernelFamily,
+    artifact: &VulkanReusableKernelArtifact,
+) -> Vec<VulkanReusableKernelLinkIssue> {
+    let mut issues = Vec::new();
+    let family_id = family.family_id.clone();
+    let op = family.op.clone();
+
+    if artifact.op != family.op {
+        issues.push(VulkanReusableKernelLinkIssue {
+            family_id: family_id.clone(),
+            op: op.clone(),
+            problem: VulkanReusableKernelLinkProblem::OpMismatch {
+                found: artifact.op.clone(),
+            },
+        });
+    }
+    if artifact.descriptor_signature != family.descriptor_signature {
+        issues.push(VulkanReusableKernelLinkIssue {
+            family_id: family_id.clone(),
+            op: op.clone(),
+            problem: VulkanReusableKernelLinkProblem::DescriptorSignatureMismatch,
+        });
+    }
+    if artifact.push_constants != family.push_constants {
+        issues.push(VulkanReusableKernelLinkIssue {
+            family_id: family_id.clone(),
+            op: op.clone(),
+            problem: VulkanReusableKernelLinkProblem::PushConstantSignatureMismatch,
+        });
+    }
+    if artifact.uses_stream_tick != family.uses_stream_tick {
+        issues.push(VulkanReusableKernelLinkIssue {
+            family_id: family_id.clone(),
+            op: op.clone(),
+            problem: VulkanReusableKernelLinkProblem::StreamTickUsageMismatch {
+                found: artifact.uses_stream_tick,
+            },
+        });
+    }
+    if artifact.path.is_empty() {
+        issues.push(VulkanReusableKernelLinkIssue {
+            family_id: family_id.clone(),
+            op: op.clone(),
+            problem: VulkanReusableKernelLinkProblem::EmptySpirvPath,
+        });
+    }
+    if artifact.entry_point != DEFAULT_SPIRV_ENTRY_POINT {
+        issues.push(VulkanReusableKernelLinkIssue {
+            family_id: family_id.clone(),
+            op: op.clone(),
+            problem: VulkanReusableKernelLinkProblem::UnsupportedEntryPoint {
+                found: artifact.entry_point.clone(),
+            },
+        });
+    }
+    if artifact.local_size_x == 0 {
+        issues.push(VulkanReusableKernelLinkIssue {
+            family_id,
+            op,
+            problem: VulkanReusableKernelLinkProblem::InvalidLocalSizeX {
+                found: artifact.local_size_x,
+            },
+        });
+    }
+
+    issues
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct VulkanKernelDescriptorSlotSignature {
     pub binding: usize,
     pub usage: VulkanKernelDescriptorUsage,
     pub resource_class: VulkanKernelDescriptorResourceClass,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum VulkanKernelDescriptorResourceClass {
     SignalBuffer,
     ParameterBuffer,
@@ -2304,6 +2671,167 @@ mod tests {
     }
 
     #[test]
+    fn reusable_kernel_artifact_manifest_links_lfm2_kernel_families() {
+        let graph = ResolvedLoweredPedalboard::from_index_file(lfm2_index_path()).unwrap();
+        let tensor_index = TensorIndex::from_json_file(lfm2_tensor_index_path()).unwrap();
+        let execution_plan =
+            StreamCircuitExecutionPlan::from_graph_with_tensor_index(&graph, &tensor_index)
+                .unwrap();
+        let resource_plan =
+            StreamCircuitResourcePlan::from_graph_and_plan(&graph, &execution_plan).unwrap();
+        let resident_plan = VulkanStreamCircuitResidentPlan::from_resource_plan(
+            &resource_plan,
+            Some(&tensor_index),
+            Some(2),
+        )
+        .unwrap();
+        let binding_plan = VulkanStreamCircuitBindingPlan::from_plans(
+            &execution_plan,
+            &resource_plan,
+            &resident_plan,
+        )
+        .unwrap();
+        let dispatch_plan = VulkanKernelDispatchPlan::from_binding_plan(&binding_plan);
+        let reusable_plan = VulkanReusableKernelPlan::from_dispatch_plan(&dispatch_plan);
+        let manifest = VulkanReusableKernelArtifactManifest::new(
+            reusable_plan
+                .families
+                .iter()
+                .map(|family| {
+                    VulkanReusableKernelArtifact::from_family(
+                        family,
+                        format!("kernels/{}.spv", family.family_id),
+                    )
+                })
+                .collect(),
+        );
+
+        let link_plan = reusable_plan.link_artifacts(&manifest);
+
+        assert_eq!(
+            manifest.schema,
+            VULKAN_REUSABLE_KERNEL_ARTIFACT_MANIFEST_SCHEMA
+        );
+        assert_eq!(manifest.backend_id, VULKAN_STREAM_CIRCUIT_BACKEND_ID);
+        assert_eq!(manifest.artifacts.len(), 12);
+        assert!(link_plan.is_fully_linked());
+        assert_eq!(link_plan.required_family_count, 12);
+        assert_eq!(link_plan.linked_family_count, 12);
+        assert_eq!(link_plan.missing_family_count, 0);
+        assert_eq!(link_plan.incompatible_family_count, 0);
+        assert_eq!(link_plan.required_command_count, 242);
+        assert_eq!(link_plan.linked_command_count, 242);
+        assert_eq!(link_plan.missing_command_count, 0);
+        assert_eq!(link_plan.incompatible_command_count, 0);
+        assert!(link_plan.issues.is_empty());
+
+        let linear = link_plan.family("linear").unwrap();
+        assert_eq!(linear.status, VulkanReusableKernelLinkStatus::Linked);
+        assert_eq!(linear.command_count, 82);
+        assert_eq!(linear.artifact_path.as_deref(), Some("kernels/linear.spv"));
+
+        let manifest_path = std::env::temp_dir().join(format!(
+            "llmoop-reusable-kernel-manifest-{}.json",
+            std::process::id()
+        ));
+        manifest.write_json_file(&manifest_path).unwrap();
+        let read = VulkanReusableKernelArtifactManifest::from_json_file(&manifest_path).unwrap();
+        std::fs::remove_file(&manifest_path).unwrap();
+        assert_eq!(read, manifest);
+        assert_eq!(read.family_ids().len(), 12);
+    }
+
+    #[test]
+    fn reusable_kernel_link_plan_reports_partial_and_incompatible_artifacts() {
+        let graph = ResolvedLoweredPedalboard::from_index_file(lfm2_index_path()).unwrap();
+        let tensor_index = TensorIndex::from_json_file(lfm2_tensor_index_path()).unwrap();
+        let execution_plan =
+            StreamCircuitExecutionPlan::from_graph_with_tensor_index(&graph, &tensor_index)
+                .unwrap();
+        let resource_plan =
+            StreamCircuitResourcePlan::from_graph_and_plan(&graph, &execution_plan).unwrap();
+        let resident_plan = VulkanStreamCircuitResidentPlan::from_resource_plan(
+            &resource_plan,
+            Some(&tensor_index),
+            Some(2),
+        )
+        .unwrap();
+        let binding_plan = VulkanStreamCircuitBindingPlan::from_plans(
+            &execution_plan,
+            &resource_plan,
+            &resident_plan,
+        )
+        .unwrap();
+        let dispatch_plan = VulkanKernelDispatchPlan::from_binding_plan(&binding_plan);
+        let reusable_plan = VulkanReusableKernelPlan::from_dispatch_plan(&dispatch_plan);
+        let linear = reusable_plan.family("linear").unwrap();
+
+        let partial_manifest = VulkanReusableKernelArtifactManifest::empty().with_artifact(
+            VulkanReusableKernelArtifact::from_family(linear, "kernels/linear.spv"),
+        );
+        let partial_link = reusable_plan.link_artifacts(&partial_manifest);
+
+        assert!(!partial_link.is_fully_linked());
+        assert_eq!(partial_link.linked_family_count, 1);
+        assert_eq!(partial_link.missing_family_count, 11);
+        assert_eq!(partial_link.incompatible_family_count, 0);
+        assert_eq!(partial_link.linked_command_count, 82);
+        assert_eq!(partial_link.missing_command_count, 242 - 82);
+        assert_eq!(
+            partial_link.family("linear").unwrap().status,
+            VulkanReusableKernelLinkStatus::Linked
+        );
+        assert!(
+            partial_link
+                .missing_families()
+                .iter()
+                .any(|family| family.family_id == "append_state_update")
+        );
+
+        let mut bad_linear = VulkanReusableKernelArtifact::from_family(linear, "")
+            .with_entry_point("not_main")
+            .with_local_size_x(0);
+        bad_linear.op = "multiply".to_string();
+        bad_linear.descriptor_signature.pop();
+        let incompatible_manifest =
+            VulkanReusableKernelArtifactManifest::empty().with_artifact(bad_linear);
+        let incompatible_link = reusable_plan.link_artifacts(&incompatible_manifest);
+
+        assert!(!incompatible_link.is_fully_linked());
+        assert_eq!(incompatible_link.linked_family_count, 0);
+        assert_eq!(incompatible_link.missing_family_count, 11);
+        assert_eq!(incompatible_link.incompatible_family_count, 1);
+        assert_eq!(incompatible_link.incompatible_command_count, 82);
+        assert_eq!(incompatible_link.missing_command_count, 242 - 82);
+        let linear_link = incompatible_link.family("linear").unwrap();
+        assert_eq!(
+            linear_link.status,
+            VulkanReusableKernelLinkStatus::Incompatible
+        );
+        assert!(linear_link.issues.iter().any(|issue| matches!(
+            issue.problem,
+            VulkanReusableKernelLinkProblem::OpMismatch { .. }
+        )));
+        assert!(linear_link.issues.iter().any(|issue| matches!(
+            issue.problem,
+            VulkanReusableKernelLinkProblem::DescriptorSignatureMismatch
+        )));
+        assert!(linear_link.issues.iter().any(|issue| matches!(
+            issue.problem,
+            VulkanReusableKernelLinkProblem::EmptySpirvPath
+        )));
+        assert!(linear_link.issues.iter().any(|issue| matches!(
+            issue.problem,
+            VulkanReusableKernelLinkProblem::UnsupportedEntryPoint { .. }
+        )));
+        assert!(linear_link.issues.iter().any(|issue| matches!(
+            issue.problem,
+            VulkanReusableKernelLinkProblem::InvalidLocalSizeX { .. }
+        )));
+        assert_eq!(incompatible_link.incompatible_families().len(), 1);
+    }
+
+    #[test]
     fn mounts_lfm2_stream_circuit_resources_without_claiming_execution() {
         let device = match VulkanComputeDevice::new() {
             Ok(device) => device,
@@ -2346,6 +2874,11 @@ mod tests {
         assert!(!empty_coverage.all_available());
         assert_eq!(empty_coverage.missing_family_count, 12);
         assert_eq!(empty_coverage.missing_command_count, 242);
+        let empty_link =
+            mounted.link_reusable_kernels(&VulkanReusableKernelArtifactManifest::empty());
+        assert!(!empty_link.is_fully_linked());
+        assert_eq!(empty_link.missing_family_count, 12);
+        assert_eq!(empty_link.missing_command_count, 242);
         assert_eq!(mounted.buffers.state_buffers.len(), 14);
         assert_eq!(mounted.buffers.activation_slot_buffers.len(), 56);
         assert_eq!(mounted.buffers.total_byte_capacity, 374_784);
