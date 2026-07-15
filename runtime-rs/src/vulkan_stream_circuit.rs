@@ -1,7 +1,11 @@
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 
-use crate::stream_plan::{StreamCircuitResourcePlan, TensorIndex};
+use crate::stream_plan::{
+    CircuitActivationPlan, PlannedNode, SignalProducer, SignalStorage, StreamCircuitExecutionPlan,
+    StreamCircuitResourcePlan, TensorIndex,
+};
 use crate::vulkan_compute::{VulkanComputeDevice, VulkanError, VulkanResidentBuffer};
 
 pub const VULKAN_STREAM_CIRCUIT_BACKEND_ID: &str = "vulkan_stream_circuit_ir";
@@ -286,6 +290,503 @@ pub struct VulkanActivationSlotBufferAllocation {
     pub buffer: VulkanResidentBuffer,
 }
 
+impl VulkanStreamCircuitStreamBuffers {
+    pub fn state_buffer(
+        &self,
+        pedal_id: &str,
+        state_id: &str,
+    ) -> Option<&VulkanStreamStateBufferAllocation> {
+        self.state_buffers
+            .iter()
+            .find(|buffer| buffer.pedal_id == pedal_id && buffer.state_id == state_id)
+    }
+
+    pub fn activation_slot_buffer(
+        &self,
+        pedal_id: &str,
+        slot: usize,
+    ) -> Option<&VulkanActivationSlotBufferAllocation> {
+        self.activation_slot_buffers
+            .iter()
+            .find(|buffer| buffer.pedal_id == pedal_id && buffer.slot == slot)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanStreamCircuitBindingPlan {
+    pub backend_id: String,
+    pub circuits: Vec<VulkanCircuitBindingPlan>,
+}
+
+impl VulkanStreamCircuitBindingPlan {
+    pub fn from_plans(
+        execution_plan: &StreamCircuitExecutionPlan,
+        resource_plan: &StreamCircuitResourcePlan,
+        resident_plan: &VulkanStreamCircuitResidentPlan,
+    ) -> Result<Self, VulkanBindingPlanError> {
+        if execution_plan.circuits.len() != resident_plan.circuit_count
+            || resource_plan.circuit_count != resident_plan.circuit_count
+        {
+            return Err(VulkanBindingPlanError(format!(
+                "execution/resource/resident circuit counts do not match: {}/{}/{}",
+                execution_plan.circuits.len(),
+                resource_plan.circuit_count,
+                resident_plan.circuit_count
+            )));
+        }
+
+        let parameter_bindings = parameter_binding_index(resource_plan, resident_plan)?;
+        let state_bindings = state_binding_index(resident_plan)?;
+        let activation_bindings = activation_binding_index(resident_plan)?;
+
+        let circuits = execution_plan
+            .circuits
+            .iter()
+            .map(|circuit| {
+                bind_circuit(
+                    circuit,
+                    &parameter_bindings,
+                    &state_bindings,
+                    &activation_bindings,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(Self {
+            backend_id: VULKAN_STREAM_CIRCUIT_BACKEND_ID.to_string(),
+            circuits,
+        })
+    }
+
+    pub fn total_node_count(&self) -> usize {
+        self.circuits
+            .iter()
+            .map(|circuit| circuit.nodes.len())
+            .sum()
+    }
+
+    pub fn circuit(&self, pedal_id: &str) -> Option<&VulkanCircuitBindingPlan> {
+        self.circuits
+            .iter()
+            .find(|circuit| circuit.pedal_id == pedal_id)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanCircuitBindingPlan {
+    pub pedal_id: String,
+    pub circuit_id: String,
+    pub nodes: Vec<VulkanNodeBinding>,
+}
+
+impl VulkanCircuitBindingPlan {
+    pub fn node(&self, node_id: &str) -> Option<&VulkanNodeBinding> {
+        self.nodes.iter().find(|node| node.node_id == node_id)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanNodeBinding {
+    pub node_index: usize,
+    pub node_id: String,
+    pub op: String,
+    pub inputs: Vec<VulkanSignalBinding>,
+    pub outputs: Vec<VulkanSignalBinding>,
+    pub parameters: Vec<VulkanParameterBinding>,
+    pub state_reads: Vec<VulkanStateBinding>,
+    pub state_writes: Vec<VulkanStateBinding>,
+}
+
+impl VulkanNodeBinding {
+    pub fn input(&self, signal_id: &str) -> Option<&VulkanSignalBinding> {
+        self.inputs
+            .iter()
+            .find(|binding| binding.signal_id == signal_id)
+    }
+
+    pub fn output(&self, signal_id: &str) -> Option<&VulkanSignalBinding> {
+        self.outputs
+            .iter()
+            .find(|binding| binding.signal_id == signal_id)
+    }
+
+    pub fn parameter(&self, param_id: &str) -> Option<&VulkanParameterBinding> {
+        self.parameters
+            .iter()
+            .find(|binding| binding.param_id == param_id)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanSignalBinding {
+    pub signal_id: String,
+    pub resource: VulkanSignalResource,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VulkanSignalResource {
+    BoundaryInput,
+    BoundaryOutput,
+    StateBuffer {
+        pedal_id: String,
+        state_id: String,
+        static_bytes: Option<usize>,
+        bytes_per_activation: Option<usize>,
+    },
+    StateView {
+        pedal_id: String,
+        state_id: String,
+        static_bytes: Option<usize>,
+        bytes_per_activation: Option<usize>,
+    },
+    ActivationSlot {
+        pedal_id: String,
+        slot: usize,
+        bytes: Option<usize>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanParameterBinding {
+    pub param_id: String,
+    pub tensor: String,
+    pub byte_count: Option<usize>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanStateBinding {
+    pub state_id: String,
+    pub state_type: String,
+    pub static_bytes: Option<usize>,
+    pub bytes_per_activation: Option<usize>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanBindingPlanError(pub String);
+
+impl Display for VulkanBindingPlanError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl Error for VulkanBindingPlanError {}
+
+fn parameter_binding_index(
+    resource_plan: &StreamCircuitResourcePlan,
+    resident_plan: &VulkanStreamCircuitResidentPlan,
+) -> Result<BTreeMap<(String, String), VulkanParameterBinding>, VulkanBindingPlanError> {
+    let resident_by_tensor: BTreeMap<_, _> = resident_plan
+        .permanent_parameters
+        .iter()
+        .map(|parameter| (parameter.tensor.as_str(), parameter))
+        .collect();
+    let mut bindings = BTreeMap::new();
+
+    for parameter in &resource_plan.parameters {
+        let resident = resident_by_tensor
+            .get(parameter.tensor.as_str())
+            .ok_or_else(|| {
+                VulkanBindingPlanError(format!(
+                    "resident plan has no permanent parameter for tensor {:?}",
+                    parameter.tensor
+                ))
+            })?;
+        for use_ref in &parameter.uses {
+            let key = (use_ref.pedal_id.clone(), use_ref.param_id.clone());
+            let previous = bindings.insert(
+                key.clone(),
+                VulkanParameterBinding {
+                    param_id: use_ref.param_id.clone(),
+                    tensor: parameter.tensor.clone(),
+                    byte_count: resident.byte_count,
+                },
+            );
+            if previous.is_some() {
+                return Err(VulkanBindingPlanError(format!(
+                    "duplicate parameter binding for {}.{}",
+                    key.0, key.1
+                )));
+            }
+        }
+    }
+
+    Ok(bindings)
+}
+
+fn state_binding_index(
+    resident_plan: &VulkanStreamCircuitResidentPlan,
+) -> Result<BTreeMap<(String, String), VulkanStateBinding>, VulkanBindingPlanError> {
+    let mut bindings = BTreeMap::new();
+    for state in &resident_plan.stream_state_buffers {
+        let key = (state.pedal_id.clone(), state.state_id.clone());
+        let previous = bindings.insert(
+            key.clone(),
+            VulkanStateBinding {
+                state_id: state.state_id.clone(),
+                state_type: state.state_type.clone(),
+                static_bytes: state.static_bytes,
+                bytes_per_activation: state.bytes_per_activation,
+            },
+        );
+        if previous.is_some() {
+            return Err(VulkanBindingPlanError(format!(
+                "duplicate state binding for {}.{}",
+                key.0, key.1
+            )));
+        }
+    }
+    Ok(bindings)
+}
+
+fn activation_binding_index(
+    resident_plan: &VulkanStreamCircuitResidentPlan,
+) -> Result<BTreeMap<(String, String), (usize, Option<usize>)>, VulkanBindingPlanError> {
+    let mut bindings = BTreeMap::new();
+    for bank in &resident_plan.activation_banks {
+        for slot in &bank.slots {
+            for signal_id in &slot.signal_ids {
+                let key = (bank.pedal_id.clone(), signal_id.clone());
+                let previous = bindings.insert(key.clone(), (slot.slot, slot.bytes));
+                if previous.is_some() {
+                    return Err(VulkanBindingPlanError(format!(
+                        "duplicate activation binding for {}.{}",
+                        key.0, key.1
+                    )));
+                }
+            }
+        }
+    }
+    Ok(bindings)
+}
+
+fn bind_circuit(
+    circuit: &CircuitActivationPlan,
+    parameter_bindings: &BTreeMap<(String, String), VulkanParameterBinding>,
+    state_bindings: &BTreeMap<(String, String), VulkanStateBinding>,
+    activation_bindings: &BTreeMap<(String, String), (usize, Option<usize>)>,
+) -> Result<VulkanCircuitBindingPlan, VulkanBindingPlanError> {
+    let nodes = circuit
+        .nodes
+        .iter()
+        .map(|node| {
+            bind_node(
+                circuit,
+                node,
+                parameter_bindings,
+                state_bindings,
+                activation_bindings,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(VulkanCircuitBindingPlan {
+        pedal_id: circuit.pedal_id.clone(),
+        circuit_id: circuit.circuit_id.clone(),
+        nodes,
+    })
+}
+
+fn bind_node(
+    circuit: &CircuitActivationPlan,
+    node: &PlannedNode,
+    parameter_bindings: &BTreeMap<(String, String), VulkanParameterBinding>,
+    state_bindings: &BTreeMap<(String, String), VulkanStateBinding>,
+    activation_bindings: &BTreeMap<(String, String), (usize, Option<usize>)>,
+) -> Result<VulkanNodeBinding, VulkanBindingPlanError> {
+    let inputs = node
+        .inputs
+        .iter()
+        .map(|signal_id| {
+            bind_signal(
+                circuit,
+                node,
+                signal_id,
+                state_bindings,
+                activation_bindings,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let outputs = node
+        .outputs
+        .iter()
+        .map(|signal_id| {
+            bind_signal(
+                circuit,
+                node,
+                signal_id,
+                state_bindings,
+                activation_bindings,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let parameters = node
+        .params
+        .iter()
+        .map(|param_id| {
+            parameter_bindings
+                .get(&(circuit.pedal_id.clone(), param_id.clone()))
+                .cloned()
+                .ok_or_else(|| {
+                    VulkanBindingPlanError(format!(
+                        "{} node {} parameter {:?} is not bound",
+                        circuit.pedal_id, node.id, param_id
+                    ))
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let state_reads = bind_state_refs(circuit, node, &node.state_reads, state_bindings)?;
+    let state_writes = bind_state_refs(circuit, node, &node.state_writes, state_bindings)?;
+
+    Ok(VulkanNodeBinding {
+        node_index: node.index,
+        node_id: node.id.clone(),
+        op: node.op.clone(),
+        inputs,
+        outputs,
+        parameters,
+        state_reads,
+        state_writes,
+    })
+}
+
+fn bind_state_refs(
+    circuit: &CircuitActivationPlan,
+    node: &PlannedNode,
+    state_ids: &[String],
+    state_bindings: &BTreeMap<(String, String), VulkanStateBinding>,
+) -> Result<Vec<VulkanStateBinding>, VulkanBindingPlanError> {
+    state_ids
+        .iter()
+        .map(|state_id| {
+            state_bindings
+                .get(&(circuit.pedal_id.clone(), state_id.clone()))
+                .cloned()
+                .ok_or_else(|| {
+                    VulkanBindingPlanError(format!(
+                        "{} node {} state {:?} is not bound",
+                        circuit.pedal_id, node.id, state_id
+                    ))
+                })
+        })
+        .collect()
+}
+
+fn bind_signal(
+    circuit: &CircuitActivationPlan,
+    node: &PlannedNode,
+    signal_id: &str,
+    state_bindings: &BTreeMap<(String, String), VulkanStateBinding>,
+    activation_bindings: &BTreeMap<(String, String), (usize, Option<usize>)>,
+) -> Result<VulkanSignalBinding, VulkanBindingPlanError> {
+    let signal = circuit.signal(signal_id).ok_or_else(|| {
+        VulkanBindingPlanError(format!(
+            "{} node {} signal {:?} is not planned",
+            circuit.pedal_id, node.id, signal_id
+        ))
+    })?;
+
+    let resource = if signal.is_boundary_output {
+        VulkanSignalResource::BoundaryOutput
+    } else {
+        match signal.storage {
+            SignalStorage::Boundary => VulkanSignalResource::BoundaryInput,
+            SignalStorage::State => {
+                let state = state_bindings
+                    .get(&(circuit.pedal_id.clone(), signal_id.to_string()))
+                    .ok_or_else(|| {
+                        VulkanBindingPlanError(format!(
+                            "{} signal {:?} has no state buffer binding",
+                            circuit.pedal_id, signal_id
+                        ))
+                    })?;
+                VulkanSignalResource::StateBuffer {
+                    pedal_id: circuit.pedal_id.clone(),
+                    state_id: state.state_id.clone(),
+                    static_bytes: state.static_bytes,
+                    bytes_per_activation: state.bytes_per_activation,
+                }
+            }
+            SignalStorage::Activation => {
+                let (slot, bytes) = activation_bindings
+                    .get(&(circuit.pedal_id.clone(), signal_id.to_string()))
+                    .ok_or_else(|| {
+                        VulkanBindingPlanError(format!(
+                            "{} signal {:?} has no activation slot binding",
+                            circuit.pedal_id, signal_id
+                        ))
+                    })?;
+                VulkanSignalResource::ActivationSlot {
+                    pedal_id: circuit.pedal_id.clone(),
+                    slot: *slot,
+                    bytes: *bytes,
+                }
+            }
+            SignalStorage::StateView => {
+                let state_id = state_view_state_id(circuit, signal_id)?;
+                let state = state_bindings
+                    .get(&(circuit.pedal_id.clone(), state_id.clone()))
+                    .ok_or_else(|| {
+                        VulkanBindingPlanError(format!(
+                            "{} state-view signal {:?} has no state buffer binding for {:?}",
+                            circuit.pedal_id, signal_id, state_id
+                        ))
+                    })?;
+                VulkanSignalResource::StateView {
+                    pedal_id: circuit.pedal_id.clone(),
+                    state_id,
+                    static_bytes: state.static_bytes,
+                    bytes_per_activation: state.bytes_per_activation,
+                }
+            }
+        }
+    };
+
+    Ok(VulkanSignalBinding {
+        signal_id: signal_id.to_string(),
+        resource,
+    })
+}
+
+fn state_view_state_id(
+    circuit: &CircuitActivationPlan,
+    signal_id: &str,
+) -> Result<String, VulkanBindingPlanError> {
+    let signal = circuit.signal(signal_id).ok_or_else(|| {
+        VulkanBindingPlanError(format!(
+            "{} signal {:?} is not planned",
+            circuit.pedal_id, signal_id
+        ))
+    })?;
+    let SignalProducer::Node { node_id } = &signal.producer else {
+        return Err(VulkanBindingPlanError(format!(
+            "{} state-view signal {:?} is not produced by a node",
+            circuit.pedal_id, signal_id
+        )));
+    };
+    let producer = circuit
+        .nodes
+        .iter()
+        .find(|node| &node.id == node_id)
+        .ok_or_else(|| {
+            VulkanBindingPlanError(format!(
+                "{} state-view signal {:?} producer {:?} is not planned",
+                circuit.pedal_id, signal_id, node_id
+            ))
+        })?;
+    producer
+        .state_writes
+        .first()
+        .or_else(|| producer.state_reads.first())
+        .cloned()
+        .ok_or_else(|| {
+            VulkanBindingPlanError(format!(
+                "{} state-view signal {:?} producer {:?} does not reference state",
+                circuit.pedal_id, signal_id, node_id
+            ))
+        })
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VulkanResidentPlanError(pub String);
 
@@ -377,7 +878,7 @@ mod tests {
 
     use super::*;
     use crate::stream_circuit::ResolvedLoweredPedalboard;
-    use crate::stream_plan::StreamCircuitResourcePlan;
+    use crate::stream_plan::{StreamCircuitExecutionPlan, StreamCircuitResourcePlan};
 
     fn lfm2_index_path() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -546,6 +1047,143 @@ mod tests {
             layer_00_slot_1
                 .signal_ids
                 .contains(&"conv_projected".to_string())
+        );
+        assert_eq!(
+            buffers
+                .state_buffer("layer_02", "kv_memory")
+                .map(|buffer| buffer.byte_capacity),
+            Some(8_192)
+        );
+        assert_eq!(
+            buffers
+                .activation_slot_buffer("layer_02", 0)
+                .map(|buffer| buffer.byte_capacity),
+            Some(2_048)
+        );
+    }
+
+    #[test]
+    fn binds_lfm2_nodes_to_vulkan_resident_resources() {
+        let graph = ResolvedLoweredPedalboard::from_index_file(lfm2_index_path()).unwrap();
+        let tensor_index = TensorIndex::from_json_file(lfm2_tensor_index_path()).unwrap();
+        let execution_plan =
+            StreamCircuitExecutionPlan::from_graph_with_tensor_index(&graph, &tensor_index)
+                .unwrap();
+        let resource_plan =
+            StreamCircuitResourcePlan::from_graph_and_plan(&graph, &execution_plan).unwrap();
+        let resident_plan = VulkanStreamCircuitResidentPlan::from_resource_plan(
+            &resource_plan,
+            Some(&tensor_index),
+            Some(2),
+        )
+        .unwrap();
+
+        let binding_plan = VulkanStreamCircuitBindingPlan::from_plans(
+            &execution_plan,
+            &resource_plan,
+            &resident_plan,
+        )
+        .unwrap();
+
+        assert_eq!(binding_plan.backend_id, VULKAN_STREAM_CIRCUIT_BACKEND_ID);
+        assert_eq!(binding_plan.circuits.len(), 14);
+        assert_eq!(binding_plan.total_node_count(), 242);
+
+        let layer_00 = binding_plan.circuit("layer_00").unwrap();
+        let operator_norm = layer_00.node("operator_norm").unwrap();
+        assert_eq!(
+            operator_norm.input("input_frame").unwrap().resource,
+            VulkanSignalResource::BoundaryInput
+        );
+        assert_eq!(
+            operator_norm.parameter("operator_norm").unwrap().tensor,
+            "model.layers.0.operator_norm.weight"
+        );
+
+        let conv_in = layer_00.node("conv_in_projection").unwrap();
+        assert_eq!(
+            conv_in.parameter("conv_in_projection").unwrap().tensor,
+            "model.layers.0.conv.in_proj.weight"
+        );
+        assert_eq!(
+            conv_in.output("conv_projected").unwrap().resource,
+            VulkanSignalResource::ActivationSlot {
+                pedal_id: "layer_00".to_string(),
+                slot: 1,
+                bytes: Some(6144)
+            }
+        );
+
+        let temporal_update = layer_00.node("temporal_memory_update").unwrap();
+        assert_eq!(
+            temporal_update.input("temporal_memory").unwrap().resource,
+            VulkanSignalResource::StateBuffer {
+                pedal_id: "layer_00".to_string(),
+                state_id: "temporal_memory".to_string(),
+                static_bytes: Some(6144),
+                bytes_per_activation: None,
+            }
+        );
+        assert_eq!(
+            temporal_update.output("temporal_window").unwrap().resource,
+            VulkanSignalResource::StateView {
+                pedal_id: "layer_00".to_string(),
+                state_id: "temporal_memory".to_string(),
+                static_bytes: Some(6144),
+                bytes_per_activation: None,
+            }
+        );
+
+        let layer_02 = binding_plan.circuit("layer_02").unwrap();
+        let kv_append = layer_02.node("kv_memory_append").unwrap();
+        assert_eq!(
+            kv_append.input("kv_memory").unwrap().resource,
+            VulkanSignalResource::StateBuffer {
+                pedal_id: "layer_02".to_string(),
+                state_id: "kv_memory".to_string(),
+                static_bytes: None,
+                bytes_per_activation: Some(2048),
+            }
+        );
+        assert_eq!(
+            kv_append.output("k_memory").unwrap().resource,
+            VulkanSignalResource::StateView {
+                pedal_id: "layer_02".to_string(),
+                state_id: "kv_memory".to_string(),
+                static_bytes: None,
+                bytes_per_activation: Some(2048),
+            }
+        );
+        assert_eq!(
+            kv_append.output("v_memory").unwrap().resource,
+            VulkanSignalResource::StateView {
+                pedal_id: "layer_02".to_string(),
+                state_id: "kv_memory".to_string(),
+                static_bytes: None,
+                bytes_per_activation: Some(2048),
+            }
+        );
+
+        let attention = layer_02.node("attention_read").unwrap();
+        assert_eq!(
+            attention.input("q_positioned").unwrap().resource,
+            VulkanSignalResource::ActivationSlot {
+                pedal_id: "layer_02".to_string(),
+                slot: 2,
+                bytes: Some(5120),
+            }
+        );
+        assert!(matches!(
+            attention.input("k_memory").unwrap().resource,
+            VulkanSignalResource::StateView { .. }
+        ));
+        assert_eq!(
+            attention.output("attention_out").unwrap().resource,
+            VulkanSignalResource::ActivationSlot {
+                pedal_id: "layer_02".to_string(),
+                slot: 0,
+                bytes: Some(2048),
+            }
         );
     }
 }
