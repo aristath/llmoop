@@ -829,6 +829,71 @@ impl From<VulkanError> for VulkanStreamCircuitMountError {
     }
 }
 
+pub struct VulkanMountedPlacedStreamCircuit {
+    pub placed_plan: VulkanPlacedStreamCircuitPlan,
+    pub buffers: VulkanStreamCircuitStreamBuffers,
+}
+
+impl VulkanMountedPlacedStreamCircuit {
+    pub fn from_placed_plan(
+        device: &VulkanComputeDevice,
+        placed_plan: VulkanPlacedStreamCircuitPlan,
+        dynamic_state_capacity_activations: usize,
+    ) -> Result<Self, VulkanStreamCircuitMountError> {
+        let buffers = placed_plan
+            .placed_resident_plan
+            .resident_plan
+            .allocate_stream_buffers(device, dynamic_state_capacity_activations)?;
+        Ok(Self {
+            placed_plan,
+            buffers,
+        })
+    }
+
+    pub fn can_execute(&self) -> bool {
+        false
+    }
+
+    pub fn device_id(&self) -> &str {
+        &self.placed_plan.device_id
+    }
+
+    pub fn descriptor_resource_plan(
+        &self,
+    ) -> Result<VulkanDescriptorResourcePlan, VulkanDescriptorResourcePlanError> {
+        VulkanDescriptorResourcePlan::from_plans(
+            &self.placed_plan.dispatch_plan,
+            &self.placed_plan.placed_resident_plan.resident_plan,
+            self.buffers.dynamic_state_capacity_activations,
+        )
+    }
+
+    pub fn prepared_dispatch_plan(
+        &self,
+        manifest: &VulkanReusableKernelArtifactManifest,
+    ) -> Result<VulkanPreparedDispatchPlan, VulkanPreparedDispatchPlanError> {
+        let descriptor_plan = self
+            .descriptor_resource_plan()
+            .map_err(VulkanPreparedDispatchPlanError::DescriptorResource)?;
+        VulkanPreparedDispatchPlan::from_plans(
+            &self.placed_plan.dispatch_plan,
+            &self.placed_plan.reusable_kernel_plan,
+            &descriptor_plan,
+            manifest,
+        )
+    }
+
+    pub fn bound_dispatch_plan(
+        &self,
+        manifest: &VulkanReusableKernelArtifactManifest,
+    ) -> Result<VulkanBoundDispatchPlan, VulkanBoundDispatchPlanError> {
+        let prepared_plan = self
+            .prepared_dispatch_plan(manifest)
+            .map_err(VulkanBoundDispatchPlanError::PreparedDispatch)?;
+        VulkanBoundDispatchPlan::from_prepared_plan(&prepared_plan, &self.buffers)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VulkanKernelInterfacePlan {
     pub backend_id: String,
@@ -3451,6 +3516,119 @@ mod tests {
             VulkanDescriptorResourceAddress::StateBuffer {
                 ref pedal_id,
                 ref state_id,
+                byte_capacity: 8192,
+                ..
+            } if pedal_id == "layer_02" && state_id == "kv_memory"
+        ));
+    }
+
+    #[test]
+    fn mounted_placed_stream_circuit_binds_only_local_device_slice() {
+        let device = match VulkanComputeDevice::new() {
+            Ok(device) => device,
+            Err(error) => {
+                eprintln!("skipping placed Vulkan stream-circuit mount: {error}");
+                return;
+            }
+        };
+        let graph = ResolvedLoweredPedalboard::from_index_file(lfm2_index_path()).unwrap();
+        let tensor_index = TensorIndex::from_json_file(lfm2_tensor_index_path()).unwrap();
+        let execution_plan =
+            StreamCircuitExecutionPlan::from_graph_with_tensor_index(&graph, &tensor_index)
+                .unwrap();
+        let resource_plan =
+            StreamCircuitResourcePlan::from_graph_and_plan(&graph, &execution_plan).unwrap();
+        let placement_spec = StreamCircuitPlacementSpec::new("gpu0")
+            .with_pedal_device("layer_01", "cpu0")
+            .with_pedal_device("layer_02", "gpu1")
+            .with_pedal_device("layer_03", "lan:worker-a");
+        let placement_plan = graph.placement_plan(&placement_spec).unwrap();
+        let gpu1_resident = VulkanPlacedStreamCircuitResidentPlan::from_resource_plan_for_device(
+            &resource_plan,
+            &placement_plan,
+            "gpu1",
+            Some(&tensor_index),
+            Some(2),
+        )
+        .unwrap();
+        let gpu1_plan = VulkanPlacedStreamCircuitPlan::from_plans(
+            &execution_plan,
+            &resource_plan,
+            gpu1_resident,
+        )
+        .unwrap();
+
+        let mounted =
+            VulkanMountedPlacedStreamCircuit::from_placed_plan(&device, gpu1_plan, 4).unwrap();
+
+        assert_eq!(mounted.device_id(), "gpu1");
+        assert!(!mounted.can_execute());
+        assert_eq!(mounted.placed_plan.binding_plan.circuits.len(), 1);
+        assert_eq!(mounted.placed_plan.dispatch_plan.total_dispatch_count(), 19);
+        assert_eq!(mounted.buffers.state_buffers.len(), 1);
+        assert_eq!(mounted.buffers.activation_slot_buffers.len(), 4);
+        assert_eq!(mounted.buffers.total_byte_capacity, 25_600);
+        assert_eq!(
+            mounted
+                .buffers
+                .state_buffer("layer_02", "kv_memory")
+                .map(|buffer| buffer.byte_capacity),
+            Some(8_192)
+        );
+
+        let descriptor_plan = mounted.descriptor_resource_plan().unwrap();
+        assert_eq!(descriptor_plan.dispatches.len(), 19);
+        assert!(
+            descriptor_plan
+                .dispatch("layer_00", "operator_norm")
+                .is_none()
+        );
+        assert!(
+            descriptor_plan
+                .dispatch("layer_02", "kv_memory_append")
+                .is_some()
+        );
+
+        let manifest = VulkanReusableKernelArtifactManifest::new(
+            mounted
+                .placed_plan
+                .reusable_kernel_plan
+                .families
+                .iter()
+                .map(|family| {
+                    VulkanReusableKernelArtifact::from_family(
+                        family,
+                        format!("kernels/{}.spv", family.family_id),
+                    )
+                })
+                .collect(),
+        );
+        let prepared = mounted.prepared_dispatch_plan(&manifest).unwrap();
+        assert_eq!(prepared.dispatches.len(), 19);
+        assert_eq!(
+            prepared
+                .dispatch("layer_02", "kv_memory_append")
+                .map(|dispatch| dispatch.artifact_path.as_str()),
+            Some("kernels/append_state_update.spv")
+        );
+        let bound = mounted.bound_dispatch_plan(&manifest).unwrap();
+        assert_eq!(bound.dispatches.len(), 19);
+        assert_eq!(
+            bound.total_descriptor_count,
+            prepared.total_descriptor_count
+        );
+        assert!(bound.boundary_descriptor_count > 0);
+        assert!(bound.permanent_parameter_descriptor_count > 0);
+        assert!(bound.stream_state_descriptor_count > 0);
+        assert!(bound.activation_slot_descriptor_count > 0);
+
+        let kv_append = bound.dispatch("layer_02", "kv_memory_append").unwrap();
+        assert!(matches!(
+            kv_append.descriptors[2].target,
+            VulkanBoundDescriptorTarget::StreamStateBuffer {
+                ref pedal_id,
+                ref state_id,
+                buffer_index: 0,
                 byte_capacity: 8192,
                 ..
             } if pedal_id == "layer_02" && state_id == "kv_memory"
