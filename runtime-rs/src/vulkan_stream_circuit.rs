@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 
@@ -513,6 +513,18 @@ impl VulkanMountedStreamCircuit {
     pub fn can_execute(&self) -> bool {
         false
     }
+
+    pub fn reusable_kernel_coverage_report<I, S>(
+        &self,
+        available_family_ids: I,
+    ) -> VulkanReusableKernelCoverageReport
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        self.reusable_kernel_plan
+            .coverage_report(available_family_ids)
+    }
 }
 
 #[derive(Debug)]
@@ -884,6 +896,48 @@ impl VulkanReusableKernelPlan {
             .filter(|family| family.op == op)
             .collect()
     }
+
+    pub fn coverage_report<I, S>(
+        &self,
+        available_family_ids: I,
+    ) -> VulkanReusableKernelCoverageReport
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let available_family_ids: BTreeSet<String> = available_family_ids
+            .into_iter()
+            .map(|id| id.as_ref().to_string())
+            .collect();
+        let mut families = Vec::with_capacity(self.families.len());
+        let mut available_family_count = 0usize;
+        let mut covered_command_count = 0usize;
+
+        for family in &self.families {
+            let available = available_family_ids.contains(&family.family_id);
+            if available {
+                available_family_count += 1;
+                covered_command_count += family.command_refs.len();
+            }
+            families.push(VulkanReusableKernelFamilyCoverage {
+                family_id: family.family_id.clone(),
+                op: family.op.clone(),
+                command_count: family.command_refs.len(),
+                available,
+            });
+        }
+
+        VulkanReusableKernelCoverageReport {
+            backend_id: self.backend_id.clone(),
+            required_family_count: self.families.len(),
+            available_family_count,
+            missing_family_count: self.families.len() - available_family_count,
+            required_command_count: self.total_command_count,
+            covered_command_count,
+            missing_command_count: self.total_command_count - covered_command_count,
+            families,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -894,6 +948,39 @@ pub struct VulkanReusableKernelFamily {
     pub push_constants: Vec<VulkanKernelScalarBinding>,
     pub uses_stream_tick: bool,
     pub command_refs: Vec<VulkanKernelDispatchRef>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanReusableKernelCoverageReport {
+    pub backend_id: String,
+    pub required_family_count: usize,
+    pub available_family_count: usize,
+    pub missing_family_count: usize,
+    pub required_command_count: usize,
+    pub covered_command_count: usize,
+    pub missing_command_count: usize,
+    pub families: Vec<VulkanReusableKernelFamilyCoverage>,
+}
+
+impl VulkanReusableKernelCoverageReport {
+    pub fn all_available(&self) -> bool {
+        self.missing_family_count == 0
+    }
+
+    pub fn missing_families(&self) -> Vec<&VulkanReusableKernelFamilyCoverage> {
+        self.families
+            .iter()
+            .filter(|family| !family.available)
+            .collect()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanReusableKernelFamilyCoverage {
+    pub family_id: String,
+    pub op: String,
+    pub command_count: usize,
+    pub available: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -2157,6 +2244,66 @@ mod tests {
     }
 
     #[test]
+    fn reusable_kernel_coverage_reports_missing_gpu_pedal_circuits() {
+        let graph = ResolvedLoweredPedalboard::from_index_file(lfm2_index_path()).unwrap();
+        let tensor_index = TensorIndex::from_json_file(lfm2_tensor_index_path()).unwrap();
+        let execution_plan =
+            StreamCircuitExecutionPlan::from_graph_with_tensor_index(&graph, &tensor_index)
+                .unwrap();
+        let resource_plan =
+            StreamCircuitResourcePlan::from_graph_and_plan(&graph, &execution_plan).unwrap();
+        let resident_plan = VulkanStreamCircuitResidentPlan::from_resource_plan(
+            &resource_plan,
+            Some(&tensor_index),
+            Some(2),
+        )
+        .unwrap();
+        let binding_plan = VulkanStreamCircuitBindingPlan::from_plans(
+            &execution_plan,
+            &resource_plan,
+            &resident_plan,
+        )
+        .unwrap();
+        let dispatch_plan = VulkanKernelDispatchPlan::from_binding_plan(&binding_plan);
+        let reusable_plan = VulkanReusableKernelPlan::from_dispatch_plan(&dispatch_plan);
+
+        let empty = reusable_plan.coverage_report(std::iter::empty::<&str>());
+        assert!(!empty.all_available());
+        assert_eq!(empty.required_family_count, 12);
+        assert_eq!(empty.available_family_count, 0);
+        assert_eq!(empty.missing_family_count, 12);
+        assert_eq!(empty.required_command_count, 242);
+        assert_eq!(empty.covered_command_count, 0);
+        assert_eq!(empty.missing_command_count, 242);
+        assert!(
+            empty
+                .missing_families()
+                .iter()
+                .any(|family| family.family_id == "linear" && family.command_count == 82)
+        );
+
+        let partial = reusable_plan.coverage_report(["linear", "rms_norm"]);
+        assert!(!partial.all_available());
+        assert_eq!(partial.available_family_count, 2);
+        assert_eq!(partial.missing_family_count, 10);
+        assert_eq!(partial.covered_command_count, 82 + 28);
+        assert_eq!(partial.missing_command_count, 242 - 82 - 28);
+        assert_eq!(partial.missing_families().len(), 10);
+
+        let full = reusable_plan.coverage_report(
+            reusable_plan
+                .families
+                .iter()
+                .map(|family| family.family_id.as_str()),
+        );
+        assert!(full.all_available());
+        assert_eq!(full.available_family_count, 12);
+        assert_eq!(full.missing_family_count, 0);
+        assert_eq!(full.covered_command_count, 242);
+        assert_eq!(full.missing_command_count, 0);
+    }
+
+    #[test]
     fn mounts_lfm2_stream_circuit_resources_without_claiming_execution() {
         let device = match VulkanComputeDevice::new() {
             Ok(device) => device,
@@ -2195,6 +2342,10 @@ mod tests {
         assert_eq!(mounted.dispatch_plan.total_dispatch_count(), 242);
         assert_eq!(mounted.reusable_kernel_plan.total_family_count(), 12);
         assert_eq!(mounted.reusable_kernel_plan.total_command_count, 242);
+        let empty_coverage = mounted.reusable_kernel_coverage_report(std::iter::empty::<&str>());
+        assert!(!empty_coverage.all_available());
+        assert_eq!(empty_coverage.missing_family_count, 12);
+        assert_eq!(empty_coverage.missing_command_count, 242);
         assert_eq!(mounted.buffers.state_buffers.len(), 14);
         assert_eq!(mounted.buffers.activation_slot_buffers.len(), 56);
         assert_eq!(mounted.buffers.total_byte_capacity, 374_784);
