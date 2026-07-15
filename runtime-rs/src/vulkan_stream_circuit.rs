@@ -7253,6 +7253,167 @@ mod tests {
                                     rolling_bindings[4].buffer.read_bytes(6_144).unwrap(),
                                     temporal_window
                                 );
+
+                                mounted
+                                    .parameter_buffers
+                                    .load_parameter_from_tensor_index(
+                                        &tensor_index,
+                                        "model.layers.0.conv.conv.weight",
+                                    )
+                                    .unwrap();
+                                if let Some(depthwise_spirv_words) =
+                                    crate::vulkan_compute::compile_test_shader_words_from_source(
+                                        "depthwise_conv1d_bf16_3x1024.comp",
+                                    )
+                                {
+                                    let depthwise_dispatch = mounted_bound
+                                        .dispatch("layer_00", "depthwise_temporal_conv")
+                                        .unwrap();
+                                    assert_eq!(
+                                        depthwise_dispatch.reusable_family_id,
+                                        "depthwise_conv1d"
+                                    );
+                                    let depthwise_bindings = mounted
+                                        .resident_kernel_buffer_bindings_for_bound_dispatch(
+                                            depthwise_dispatch,
+                                        )
+                                        .unwrap();
+                                    assert_eq!(depthwise_bindings.len(), 4);
+                                    assert_eq!(depthwise_bindings[0].byte_len, 6_144);
+                                    assert!(depthwise_bindings[1].byte_len >= 2_048);
+                                    assert_eq!(depthwise_bindings[2].byte_len, 6_144);
+                                    assert_eq!(depthwise_bindings[3].byte_len, 6_144);
+                                    let depthwise_family = mounted
+                                        .placed_plan
+                                        .reusable_kernel_plan
+                                        .family(&depthwise_dispatch.reusable_family_id)
+                                        .unwrap();
+                                    let depthwise_kernel_manifest =
+                                        VulkanLoadedReusableKernelArtifactManifest {
+                                            schema: VULKAN_REUSABLE_KERNEL_ARTIFACT_MANIFEST_SCHEMA
+                                                .to_string(),
+                                            backend_id: VULKAN_STREAM_CIRCUIT_BACKEND_ID
+                                                .to_string(),
+                                            total_word_count: depthwise_spirv_words.len(),
+                                            artifacts: vec![VulkanLoadedReusableKernelArtifact {
+                                                artifact: VulkanReusableKernelArtifact::from_family(
+                                                    depthwise_family,
+                                                    "kernels/depthwise_conv1d.spv",
+                                                ),
+                                                resolved_path: PathBuf::from(
+                                                    "kernels/depthwise_conv1d.spv",
+                                                ),
+                                                words: depthwise_spirv_words,
+                                            }],
+                                        };
+                                    let depthwise_resident_dispatch = mounted
+                                        .create_resident_kernel_dispatch_for_bound_dispatch(
+                                            &device,
+                                            depthwise_dispatch,
+                                            &depthwise_kernel_manifest,
+                                        )
+                                        .unwrap();
+                                    assert_eq!(depthwise_resident_dispatch.workgroup_count_x(), 1);
+
+                                    device
+                                        .run_resident_kernel_dispatch(
+                                            &depthwise_resident_dispatch,
+                                            &[0u8; 16],
+                                        )
+                                        .unwrap();
+
+                                    assert_eq!(
+                                        depthwise_bindings[1].buffer.read_bytes(16).unwrap(),
+                                        vec![
+                                            0x20, 0x3c, 0xb1, 0xba, 0x17, 0x38, 0x6b, 0x38, 0x5b,
+                                            0xb9, 0x82, 0x37, 0x6c, 0xb8, 0x8a, 0xba,
+                                        ]
+                                    );
+
+                                    if let Some(output_gate_spirv_words) =
+                                        crate::vulkan_compute::compile_test_shader_words_from_source(
+                                            "multiply_bf16_1024.comp",
+                                        )
+                                    {
+                                        let output_gate_dispatch = mounted_bound
+                                            .dispatch("layer_00", "output_gate")
+                                            .unwrap();
+                                        assert_eq!(output_gate_dispatch.op, "multiply");
+                                        let output_gate_bindings = mounted
+                                            .resident_kernel_buffer_bindings_for_bound_dispatch(
+                                                output_gate_dispatch,
+                                            )
+                                            .unwrap();
+                                        assert_eq!(output_gate_bindings.len(), 3);
+                                        assert!(output_gate_bindings[0].byte_len >= 2_048);
+                                        assert!(output_gate_bindings[1].byte_len >= 2_048);
+                                        assert!(output_gate_bindings[2].byte_len >= 2_048);
+                                        let output_gate_family = mounted
+                                            .placed_plan
+                                            .reusable_kernel_plan
+                                            .family(&output_gate_dispatch.reusable_family_id)
+                                            .unwrap();
+                                        let output_gate_artifact_path = format!(
+                                            "kernels/{}.spv",
+                                            output_gate_dispatch.reusable_family_id
+                                        );
+                                        let output_gate_kernel_manifest =
+                                            VulkanLoadedReusableKernelArtifactManifest {
+                                                schema:
+                                                    VULKAN_REUSABLE_KERNEL_ARTIFACT_MANIFEST_SCHEMA
+                                                        .to_string(),
+                                                backend_id: VULKAN_STREAM_CIRCUIT_BACKEND_ID
+                                                    .to_string(),
+                                                total_word_count: output_gate_spirv_words.len(),
+                                                artifacts:
+                                                    vec![VulkanLoadedReusableKernelArtifact {
+                                                    artifact:
+                                                        VulkanReusableKernelArtifact::from_family(
+                                                            output_gate_family,
+                                                            output_gate_artifact_path.clone(),
+                                                        ),
+                                                    resolved_path: PathBuf::from(
+                                                        output_gate_artifact_path,
+                                                    ),
+                                                    words: output_gate_spirv_words,
+                                                }],
+                                            };
+                                        let output_gate_resident_dispatch = mounted
+                                            .create_resident_kernel_dispatch_for_bound_dispatch(
+                                                &device,
+                                                output_gate_dispatch,
+                                                &output_gate_kernel_manifest,
+                                            )
+                                            .unwrap();
+                                        assert_eq!(
+                                            output_gate_resident_dispatch.workgroup_count_x(),
+                                            1
+                                        );
+
+                                        device
+                                            .run_resident_kernel_dispatch(
+                                                &output_gate_resident_dispatch,
+                                                &[0u8; 16],
+                                            )
+                                            .unwrap();
+
+                                        assert_eq!(
+                                            output_gate_bindings[2].buffer.read_bytes(16).unwrap(),
+                                            vec![
+                                                0xa5, 0xbb, 0xc9, 0xb9, 0x38, 0x37, 0xc6, 0xb7,
+                                                0x86, 0xb7, 0xe5, 0xb4, 0x79, 0xb6, 0x21, 0xba,
+                                            ]
+                                        );
+                                    } else {
+                                        eprintln!(
+                                            "skipping BF16 output gate Vulkan dispatch: no GLSL to SPIR-V compiler found"
+                                        );
+                                    }
+                                } else {
+                                    eprintln!(
+                                        "skipping BF16 depthwise conv Vulkan dispatch: no GLSL to SPIR-V compiler found"
+                                    );
+                                }
                             } else {
                                 eprintln!(
                                     "skipping BF16 rolling state Vulkan dispatch: no GLSL to SPIR-V compiler found"
