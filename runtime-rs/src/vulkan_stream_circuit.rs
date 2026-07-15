@@ -1434,6 +1434,15 @@ impl VulkanMountedPlacedStreamCircuit {
             &mounted_bound_plan,
         ))
     }
+
+    pub fn advance_stream_tick(
+        &self,
+        manifest: &VulkanReusableKernelArtifactManifest,
+        stream_tick: u64,
+    ) -> Result<VulkanMountedPlacedStreamTickRun, VulkanMountedPlacedStreamTickError> {
+        let tick_plan = self.stream_tick_plan(manifest)?;
+        Ok(tick_plan.advance(stream_tick))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3504,6 +3513,73 @@ impl VulkanMountedPlacedStreamTickPlan {
             can_execute: false,
         }
     }
+
+    pub fn advance(&self, stream_tick: u64) -> VulkanMountedPlacedStreamTickRun {
+        let mut stages = Vec::with_capacity(self.stages.len());
+        let mut blocked = None;
+        let mut attempted_stage_count = 0usize;
+        let mut completed_stage_count = 0usize;
+
+        for stage in &self.stages {
+            let status = if blocked.is_some() {
+                VulkanMountedPlacedStreamTickStageStatus::Pending
+            } else {
+                attempted_stage_count += 1;
+                let reason = match stage {
+                    VulkanMountedPlacedStreamTickStage::ReceiveCable { .. } => {
+                        VulkanMountedPlacedStreamTickBlockReason::CableReceiveTransportUnavailable
+                    }
+                    VulkanMountedPlacedStreamTickStage::Dispatch { .. } => {
+                        VulkanMountedPlacedStreamTickBlockReason::KernelDispatchUnavailable
+                    }
+                    VulkanMountedPlacedStreamTickStage::PublishCable { .. } => {
+                        VulkanMountedPlacedStreamTickBlockReason::CablePublishTransportUnavailable
+                    }
+                };
+                blocked = Some((stage.stage_index(), reason.clone()));
+                VulkanMountedPlacedStreamTickStageStatus::Blocked { reason }
+            };
+            if matches!(status, VulkanMountedPlacedStreamTickStageStatus::Completed) {
+                completed_stage_count += 1;
+            }
+            stages.push(VulkanMountedPlacedStreamTickStageRun {
+                stage_index: stage.stage_index(),
+                stage: stage.clone(),
+                status,
+            });
+        }
+
+        let pending_stage_count = stages
+            .iter()
+            .filter(|stage| {
+                matches!(
+                    stage.status,
+                    VulkanMountedPlacedStreamTickStageStatus::Pending
+                )
+            })
+            .count();
+        let status = blocked
+            .map(
+                |(stage_index, reason)| VulkanMountedPlacedStreamTickRunStatus::Blocked {
+                    stage_index,
+                    reason,
+                },
+            )
+            .unwrap_or(VulkanMountedPlacedStreamTickRunStatus::Completed);
+
+        VulkanMountedPlacedStreamTickRun {
+            backend_id: self.backend_id.clone(),
+            device_id: self.device_id.clone(),
+            stream_tick,
+            stages,
+            planned_stage_count: self.stage_count,
+            attempted_stage_count,
+            completed_stage_count,
+            pending_stage_count,
+            status,
+            can_execute: self.can_execute,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3530,6 +3606,16 @@ pub enum VulkanMountedPlacedStreamTickStage {
         remote_device_id: String,
         remote_pedal_id: String,
     },
+}
+
+impl VulkanMountedPlacedStreamTickStage {
+    pub fn stage_index(&self) -> usize {
+        match self {
+            Self::ReceiveCable { stage_index, .. }
+            | Self::Dispatch { stage_index, .. }
+            | Self::PublishCable { stage_index, .. } => *stage_index,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3631,6 +3717,73 @@ pub enum VulkanMountedPlacedStreamTickIo {
         buffer_index: usize,
         byte_capacity: usize,
     },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanMountedPlacedStreamTickRun {
+    pub backend_id: String,
+    pub device_id: String,
+    pub stream_tick: u64,
+    pub stages: Vec<VulkanMountedPlacedStreamTickStageRun>,
+    pub planned_stage_count: usize,
+    pub attempted_stage_count: usize,
+    pub completed_stage_count: usize,
+    pub pending_stage_count: usize,
+    pub status: VulkanMountedPlacedStreamTickRunStatus,
+    pub can_execute: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanMountedPlacedStreamTickStageRun {
+    pub stage_index: usize,
+    pub stage: VulkanMountedPlacedStreamTickStage,
+    pub status: VulkanMountedPlacedStreamTickStageStatus,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VulkanMountedPlacedStreamTickRunStatus {
+    Completed,
+    Blocked {
+        stage_index: usize,
+        reason: VulkanMountedPlacedStreamTickBlockReason,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VulkanMountedPlacedStreamTickStageStatus {
+    Pending,
+    Completed,
+    Blocked {
+        reason: VulkanMountedPlacedStreamTickBlockReason,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VulkanMountedPlacedStreamTickBlockReason {
+    CableReceiveTransportUnavailable,
+    KernelDispatchUnavailable,
+    CablePublishTransportUnavailable,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VulkanMountedPlacedStreamTickError {
+    BoundDispatchPlan(VulkanBoundDispatchPlanError),
+}
+
+impl Display for VulkanMountedPlacedStreamTickError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BoundDispatchPlan(error) => Display::fmt(error, f),
+        }
+    }
+}
+
+impl Error for VulkanMountedPlacedStreamTickError {}
+
+impl From<VulkanBoundDispatchPlanError> for VulkanMountedPlacedStreamTickError {
+    fn from(error: VulkanBoundDispatchPlanError) -> Self {
+        Self::BoundDispatchPlan(error)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -5143,6 +5296,32 @@ mod tests {
                 },
             }
         );
+        let tick_run = mounted.advance_stream_tick(&manifest, 42).unwrap();
+        assert_eq!(tick_run.device_id, "gpu0");
+        assert_eq!(tick_run.stream_tick, 42);
+        assert!(!tick_run.can_execute);
+        assert_eq!(tick_run.planned_stage_count, 242);
+        assert_eq!(tick_run.attempted_stage_count, 1);
+        assert_eq!(tick_run.completed_stage_count, 0);
+        assert_eq!(tick_run.pending_stage_count, 241);
+        assert_eq!(
+            tick_run.status,
+            VulkanMountedPlacedStreamTickRunStatus::Blocked {
+                stage_index: 0,
+                reason: VulkanMountedPlacedStreamTickBlockReason::KernelDispatchUnavailable,
+            }
+        );
+        assert_eq!(tick_run.stages[0].stage, tick_plan.stages[0]);
+        assert_eq!(
+            tick_run.stages[0].status,
+            VulkanMountedPlacedStreamTickStageStatus::Blocked {
+                reason: VulkanMountedPlacedStreamTickBlockReason::KernelDispatchUnavailable,
+            }
+        );
+        assert_eq!(
+            tick_run.stages[1].status,
+            VulkanMountedPlacedStreamTickStageStatus::Pending
+        );
 
         assert_eq!(
             mounted_bound
@@ -5553,6 +5732,36 @@ mod tests {
                 remote_device_id: "lan:worker-a".to_string(),
                 remote_pedal_id: "layer_03".to_string(),
             }
+        );
+        let tick_run = mounted.advance_stream_tick(&manifest, 7).unwrap();
+        assert_eq!(tick_run.device_id, "gpu1");
+        assert_eq!(tick_run.stream_tick, 7);
+        assert!(!tick_run.can_execute);
+        assert_eq!(tick_run.planned_stage_count, 21);
+        assert_eq!(tick_run.attempted_stage_count, 1);
+        assert_eq!(tick_run.completed_stage_count, 0);
+        assert_eq!(tick_run.pending_stage_count, 20);
+        assert_eq!(
+            tick_run.status,
+            VulkanMountedPlacedStreamTickRunStatus::Blocked {
+                stage_index: 0,
+                reason: VulkanMountedPlacedStreamTickBlockReason::CableReceiveTransportUnavailable,
+            }
+        );
+        assert_eq!(tick_run.stages[0].stage, tick_plan.stages[0]);
+        assert_eq!(
+            tick_run.stages[0].status,
+            VulkanMountedPlacedStreamTickStageStatus::Blocked {
+                reason: VulkanMountedPlacedStreamTickBlockReason::CableReceiveTransportUnavailable,
+            }
+        );
+        assert_eq!(
+            tick_run.stages[1].status,
+            VulkanMountedPlacedStreamTickStageStatus::Pending
+        );
+        assert_eq!(
+            tick_run.stages[20].status,
+            VulkanMountedPlacedStreamTickStageStatus::Pending
         );
 
         let kv_append = bound.dispatch("layer_02", "kv_memory_append").unwrap();
