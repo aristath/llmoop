@@ -587,6 +587,60 @@ impl ResolvedLoweredPedalboard {
         }
     }
 
+    pub fn node_operator_counts(&self) -> BTreeMap<String, usize> {
+        let mut counts = BTreeMap::new();
+        for artifact in &self.circuits {
+            for node in &artifact.circuit.nodes {
+                *counts.entry(node.op.clone()).or_insert(0) += 1;
+            }
+        }
+        counts
+    }
+
+    pub fn state_type_counts(&self) -> BTreeMap<String, usize> {
+        let mut counts = BTreeMap::new();
+        for artifact in &self.circuits {
+            for state in &artifact.circuit.state_ports {
+                *counts.entry(state.state_type.clone()).or_insert(0) += 1;
+            }
+        }
+        counts
+    }
+
+    pub fn capability_report(
+        &self,
+        capabilities: &StreamCircuitBackendCapabilities,
+    ) -> CircuitCapabilityReport {
+        let op_support = self
+            .node_operator_counts()
+            .into_iter()
+            .map(|(op, count)| CircuitOpSupport {
+                op: op.clone(),
+                count,
+                supported: capabilities.supported_ops.contains(&op),
+            })
+            .collect();
+        let state_support = self
+            .state_type_counts()
+            .into_iter()
+            .map(|(state_type, count)| CircuitStateSupport {
+                state_type: state_type.clone(),
+                count,
+                supported: capabilities.supported_state_types.contains(&state_type),
+            })
+            .collect();
+
+        CircuitCapabilityReport {
+            backend_id: capabilities.backend_id.clone(),
+            circuit_count: self.circuits.len(),
+            wiring: self.index.graph.wiring.clone(),
+            series_wiring_supported: self.index.graph.wiring == "series"
+                && capabilities.supports_series_wiring,
+            op_support,
+            state_support,
+        }
+    }
+
     pub fn to_installed_processor_manifest(
         &self,
         install_id: impl Into<String>,
@@ -773,6 +827,98 @@ impl InstalledStreamCircuit {
             allocations: self.graph.transient_allocations(),
         }
     }
+
+    pub fn capability_report(
+        &self,
+        capabilities: &StreamCircuitBackendCapabilities,
+    ) -> CircuitCapabilityReport {
+        self.graph.capability_report(capabilities)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StreamCircuitBackendCapabilities {
+    pub backend_id: String,
+    pub supports_series_wiring: bool,
+    pub supported_ops: BTreeSet<String>,
+    pub supported_state_types: BTreeSet<String>,
+}
+
+impl StreamCircuitBackendCapabilities {
+    pub fn new(backend_id: impl Into<String>) -> Self {
+        Self {
+            backend_id: backend_id.into(),
+            supports_series_wiring: true,
+            supported_ops: BTreeSet::new(),
+            supported_state_types: BTreeSet::new(),
+        }
+    }
+
+    pub fn with_supported_ops<I, S>(mut self, ops: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.supported_ops = ops.into_iter().map(Into::into).collect();
+        self
+    }
+
+    pub fn with_supported_state_types<I, S>(mut self, state_types: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.supported_state_types = state_types.into_iter().map(Into::into).collect();
+        self
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CircuitOpSupport {
+    pub op: String,
+    pub count: usize,
+    pub supported: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CircuitStateSupport {
+    pub state_type: String,
+    pub count: usize,
+    pub supported: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CircuitCapabilityReport {
+    pub backend_id: String,
+    pub circuit_count: usize,
+    pub wiring: String,
+    pub series_wiring_supported: bool,
+    pub op_support: Vec<CircuitOpSupport>,
+    pub state_support: Vec<CircuitStateSupport>,
+}
+
+impl CircuitCapabilityReport {
+    pub fn executable(&self) -> bool {
+        self.series_wiring_supported
+            && self.op_support.iter().all(|op| op.supported)
+            && self.state_support.iter().all(|state| state.supported)
+    }
+
+    pub fn unsupported_ops(&self) -> Vec<String> {
+        self.op_support
+            .iter()
+            .filter(|op| !op.supported)
+            .map(|op| op.op.clone())
+            .collect()
+    }
+
+    pub fn unsupported_state_types(&self) -> Vec<String> {
+        self.state_support
+            .iter()
+            .filter(|state| !state.supported)
+            .map(|state| state.state_type.clone())
+            .collect()
+    }
 }
 
 fn read_json<T: for<'de> Deserialize<'de>>(
@@ -911,5 +1057,67 @@ mod tests {
                 .count(),
             6
         );
+    }
+
+    #[test]
+    fn stream_circuit_capability_report_names_missing_executors() {
+        let installed = InstalledStreamCircuit::from_index_file(
+            lfm2_index_path(),
+            "lfm2_5_230m_stream_circuit",
+            "stream_circuit_ir",
+        )
+        .unwrap();
+
+        let report =
+            installed.capability_report(&StreamCircuitBackendCapabilities::new("vulkan_spirv"));
+
+        assert_eq!(report.backend_id, "vulkan_spirv");
+        assert_eq!(report.circuit_count, 14);
+        assert_eq!(report.wiring, "series");
+        assert!(report.series_wiring_supported);
+        assert!(!report.executable());
+        assert_eq!(report.unsupported_ops().len(), 12);
+        assert_eq!(
+            report.unsupported_state_types(),
+            vec![
+                "append_only_attention_memory".to_string(),
+                "rolling_frame_memory".to_string()
+            ]
+        );
+        assert!(
+            report
+                .op_support
+                .iter()
+                .any(|op| op.op == "linear" && op.count == 82 && !op.supported)
+        );
+        assert!(
+            report
+                .op_support
+                .iter()
+                .any(|op| op.op == "scaled_dot_product_attention"
+                    && op.count == 6
+                    && !op.supported)
+        );
+    }
+
+    #[test]
+    fn stream_circuit_capability_report_can_mark_graph_executable() {
+        let installed = InstalledStreamCircuit::from_index_file(
+            lfm2_index_path(),
+            "lfm2_5_230m_stream_circuit",
+            "stream_circuit_ir",
+        )
+        .unwrap();
+        let ops = installed.graph.node_operator_counts().into_keys();
+        let state_types = installed.graph.state_type_counts().into_keys();
+        let capabilities = StreamCircuitBackendCapabilities::new("future_backend")
+            .with_supported_ops(ops)
+            .with_supported_state_types(state_types);
+
+        let report = installed.capability_report(&capabilities);
+
+        assert!(report.executable());
+        assert!(report.unsupported_ops().is_empty());
+        assert!(report.unsupported_state_types().is_empty());
     }
 }
