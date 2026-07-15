@@ -470,8 +470,47 @@ impl VulkanStreamCircuitBindingPlan {
         resource_plan: &StreamCircuitResourcePlan,
         resident_plan: &VulkanStreamCircuitResidentPlan,
     ) -> Result<Self, VulkanBindingPlanError> {
-        if execution_plan.circuits.len() != resident_plan.circuit_count
-            || resource_plan.circuit_count != resident_plan.circuit_count
+        Self::from_plans_with_hosted_pedals(execution_plan, resource_plan, resident_plan, None)
+    }
+
+    pub fn from_placed_resident_plan(
+        execution_plan: &StreamCircuitExecutionPlan,
+        resource_plan: &StreamCircuitResourcePlan,
+        placed_resident_plan: &VulkanPlacedStreamCircuitResidentPlan,
+    ) -> Result<Self, VulkanBindingPlanError> {
+        let hosted_pedals = placed_resident_plan
+            .hosted_pedal_ids
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        Self::from_plans_with_hosted_pedals(
+            execution_plan,
+            resource_plan,
+            &placed_resident_plan.resident_plan,
+            Some(&hosted_pedals),
+        )
+    }
+
+    fn from_plans_with_hosted_pedals(
+        execution_plan: &StreamCircuitExecutionPlan,
+        resource_plan: &StreamCircuitResourcePlan,
+        resident_plan: &VulkanStreamCircuitResidentPlan,
+        hosted_pedals: Option<&BTreeSet<String>>,
+    ) -> Result<Self, VulkanBindingPlanError> {
+        let hosts_pedal = |pedal_id: &str| {
+            hosted_pedals
+                .map(|pedals| pedals.contains(pedal_id))
+                .unwrap_or(true)
+        };
+        let hosted_circuit_count = execution_plan
+            .circuits
+            .iter()
+            .filter(|circuit| hosts_pedal(&circuit.pedal_id))
+            .count();
+
+        if hosted_pedals.is_none()
+            && (execution_plan.circuits.len() != resident_plan.circuit_count
+                || resource_plan.circuit_count != resident_plan.circuit_count)
         {
             return Err(VulkanBindingPlanError(format!(
                 "execution/resource/resident circuit counts do not match: {}/{}/{}",
@@ -480,14 +519,22 @@ impl VulkanStreamCircuitBindingPlan {
                 resident_plan.circuit_count
             )));
         }
+        if hosted_circuit_count != resident_plan.circuit_count {
+            return Err(VulkanBindingPlanError(format!(
+                "hosted execution/resident circuit counts do not match: {}/{}",
+                hosted_circuit_count, resident_plan.circuit_count
+            )));
+        }
 
-        let parameter_bindings = parameter_binding_index(resource_plan, resident_plan)?;
+        let parameter_bindings =
+            parameter_binding_index(resource_plan, resident_plan, hosted_pedals)?;
         let state_bindings = state_binding_index(resident_plan)?;
         let activation_bindings = activation_binding_index(resident_plan)?;
 
         let circuits = execution_plan
             .circuits
             .iter()
+            .filter(|circuit| hosts_pedal(&circuit.pedal_id))
             .map(|circuit| {
                 bind_circuit(
                     circuit,
@@ -515,6 +562,44 @@ impl VulkanStreamCircuitBindingPlan {
         self.circuits
             .iter()
             .find(|circuit| circuit.pedal_id == pedal_id)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanPlacedStreamCircuitPlan {
+    pub backend_id: String,
+    pub device_id: String,
+    pub placed_resident_plan: VulkanPlacedStreamCircuitResidentPlan,
+    pub binding_plan: VulkanStreamCircuitBindingPlan,
+    pub kernel_interface_plan: VulkanKernelInterfacePlan,
+    pub dispatch_plan: VulkanKernelDispatchPlan,
+    pub reusable_kernel_plan: VulkanReusableKernelPlan,
+}
+
+impl VulkanPlacedStreamCircuitPlan {
+    pub fn from_plans(
+        execution_plan: &StreamCircuitExecutionPlan,
+        resource_plan: &StreamCircuitResourcePlan,
+        placed_resident_plan: VulkanPlacedStreamCircuitResidentPlan,
+    ) -> Result<Self, VulkanBindingPlanError> {
+        let binding_plan = VulkanStreamCircuitBindingPlan::from_placed_resident_plan(
+            execution_plan,
+            resource_plan,
+            &placed_resident_plan,
+        )?;
+        let kernel_interface_plan = VulkanKernelInterfacePlan::from_binding_plan(&binding_plan);
+        let dispatch_plan =
+            VulkanKernelDispatchPlan::from_kernel_interfaces(&kernel_interface_plan);
+        let reusable_kernel_plan = VulkanReusableKernelPlan::from_dispatch_plan(&dispatch_plan);
+        Ok(Self {
+            backend_id: VULKAN_STREAM_CIRCUIT_BACKEND_ID.to_string(),
+            device_id: placed_resident_plan.device_id.clone(),
+            placed_resident_plan,
+            binding_plan,
+            kernel_interface_plan,
+            dispatch_plan,
+            reusable_kernel_plan,
+        })
     }
 }
 
@@ -2667,7 +2752,13 @@ fn push_descriptor_binding(
 fn parameter_binding_index(
     resource_plan: &StreamCircuitResourcePlan,
     resident_plan: &VulkanStreamCircuitResidentPlan,
+    hosted_pedals: Option<&BTreeSet<String>>,
 ) -> Result<BTreeMap<(String, String), VulkanParameterBinding>, VulkanBindingPlanError> {
+    let hosts_pedal = |pedal_id: &str| {
+        hosted_pedals
+            .map(|pedals| pedals.contains(pedal_id))
+            .unwrap_or(true)
+    };
     let resident_by_tensor: BTreeMap<_, _> = resident_plan
         .permanent_parameters
         .iter()
@@ -2676,6 +2767,14 @@ fn parameter_binding_index(
     let mut bindings = BTreeMap::new();
 
     for parameter in &resource_plan.parameters {
+        let hosted_uses = parameter
+            .uses
+            .iter()
+            .filter(|use_ref| hosts_pedal(&use_ref.pedal_id))
+            .collect::<Vec<_>>();
+        if hosted_uses.is_empty() {
+            continue;
+        }
         let resident = resident_by_tensor
             .get(parameter.tensor.as_str())
             .ok_or_else(|| {
@@ -2684,7 +2783,7 @@ fn parameter_binding_index(
                     parameter.tensor
                 ))
             })?;
-        for use_ref in &parameter.uses {
+        for use_ref in hosted_uses {
             let key = (use_ref.pedal_id.clone(), use_ref.param_id.clone());
             let previous = bindings.insert(
                 key.clone(),
@@ -3241,6 +3340,121 @@ mod tests {
         assert_eq!(lan.hosted_pedal_ids, vec!["layer_03".to_string()]);
         assert_eq!(lan.resident_plan.permanent_parameters.len(), 8);
         assert_eq!(lan.resident_plan.state_view_signal_count, 1);
+    }
+
+    #[test]
+    fn placed_stream_circuit_plan_dispatches_only_hosted_pedals() {
+        let graph = ResolvedLoweredPedalboard::from_index_file(lfm2_index_path()).unwrap();
+        let tensor_index = TensorIndex::from_json_file(lfm2_tensor_index_path()).unwrap();
+        let execution_plan =
+            StreamCircuitExecutionPlan::from_graph_with_tensor_index(&graph, &tensor_index)
+                .unwrap();
+        let resource_plan =
+            StreamCircuitResourcePlan::from_graph_and_plan(&graph, &execution_plan).unwrap();
+        let placement_spec = StreamCircuitPlacementSpec::new("gpu0")
+            .with_pedal_device("layer_01", "cpu0")
+            .with_pedal_device("layer_02", "gpu1")
+            .with_pedal_device("layer_03", "lan:worker-a");
+        let placement_plan = graph.placement_plan(&placement_spec).unwrap();
+        let gpu0_resident = VulkanPlacedStreamCircuitResidentPlan::from_resource_plan_for_device(
+            &resource_plan,
+            &placement_plan,
+            "gpu0",
+            Some(&tensor_index),
+            Some(2),
+        )
+        .unwrap();
+        let gpu1_resident = VulkanPlacedStreamCircuitResidentPlan::from_resource_plan_for_device(
+            &resource_plan,
+            &placement_plan,
+            "gpu1",
+            Some(&tensor_index),
+            Some(2),
+        )
+        .unwrap();
+
+        let gpu0_plan = VulkanPlacedStreamCircuitPlan::from_plans(
+            &execution_plan,
+            &resource_plan,
+            gpu0_resident,
+        )
+        .unwrap();
+        let gpu1_plan = VulkanPlacedStreamCircuitPlan::from_plans(
+            &execution_plan,
+            &resource_plan,
+            gpu1_resident,
+        )
+        .unwrap();
+
+        assert_eq!(gpu0_plan.backend_id, VULKAN_STREAM_CIRCUIT_BACKEND_ID);
+        assert_eq!(gpu0_plan.device_id, "gpu0");
+        assert_eq!(gpu0_plan.binding_plan.circuits.len(), 11);
+        assert_eq!(gpu0_plan.binding_plan.total_node_count(), 191);
+        assert_eq!(gpu0_plan.kernel_interface_plan.total_kernel_count(), 191);
+        assert_eq!(gpu0_plan.dispatch_plan.total_dispatch_count(), 191);
+        assert!(gpu0_plan.binding_plan.circuit("layer_00").is_some());
+        assert!(gpu0_plan.binding_plan.circuit("layer_04").is_some());
+        assert!(gpu0_plan.binding_plan.circuit("layer_01").is_none());
+        assert!(gpu0_plan.binding_plan.circuit("layer_02").is_none());
+        assert!(
+            gpu0_plan
+                .dispatch_plan
+                .command("layer_02", "kv_memory_append")
+                .is_none()
+        );
+        assert_eq!(
+            gpu0_plan
+                .dispatch_plan
+                .command("layer_04", "operator_norm")
+                .map(|command| command.dispatch_index),
+            Some(16)
+        );
+
+        assert_eq!(gpu1_plan.device_id, "gpu1");
+        assert_eq!(gpu1_plan.binding_plan.circuits.len(), 1);
+        assert_eq!(gpu1_plan.binding_plan.total_node_count(), 19);
+        assert_eq!(gpu1_plan.dispatch_plan.total_dispatch_count(), 19);
+        assert_eq!(
+            gpu1_plan
+                .dispatch_plan
+                .command("layer_02", "operator_norm")
+                .map(|command| command.dispatch_index),
+            Some(0)
+        );
+        assert_eq!(
+            gpu1_plan
+                .dispatch_plan
+                .command("layer_02", "kv_memory_append")
+                .map(|command| command.dispatch_index),
+            Some(8)
+        );
+        assert!(
+            gpu1_plan
+                .dispatch_plan
+                .command("layer_00", "operator_norm")
+                .is_none()
+        );
+
+        let gpu1_descriptors = VulkanDescriptorResourcePlan::from_plans(
+            &gpu1_plan.dispatch_plan,
+            &gpu1_plan.placed_resident_plan.resident_plan,
+            4,
+        )
+        .unwrap();
+        assert_eq!(gpu1_descriptors.dispatches.len(), 19);
+        let kv_append = gpu1_descriptors
+            .dispatch("layer_02", "kv_memory_append")
+            .unwrap();
+        assert_eq!(kv_append.descriptors.len(), 9);
+        assert!(matches!(
+            kv_append.descriptors[2].resource,
+            VulkanDescriptorResourceAddress::StateBuffer {
+                ref pedal_id,
+                ref state_id,
+                byte_capacity: 8192,
+                ..
+            } if pedal_id == "layer_02" && state_id == "kv_memory"
+        ));
     }
 
     #[test]
