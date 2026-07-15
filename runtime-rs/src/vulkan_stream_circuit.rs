@@ -2456,6 +2456,7 @@ impl VulkanMountedPlacedResidentPedalRunner {
                 node_id: dispatch.node_id.clone(),
                 op: dispatch.op.clone(),
                 reusable_family_id: dispatch.reusable_family_id.clone(),
+                push_constants: dispatch.push_constants.clone(),
                 resident_dispatch,
             });
         }
@@ -2485,10 +2486,39 @@ impl VulkanMountedPlacedResidentPedalRunner {
         device: &VulkanComputeDevice,
     ) -> Result<VulkanMountedPlacedResidentPedalRun, VulkanMountedPlacedResidentKernelDispatchError>
     {
+        self.run_with_push_constant_bytes(device, |dispatch| {
+            Ok(vec![
+                0u8;
+                dispatch.resident_dispatch.push_constant_byte_count()
+                    as usize
+            ])
+        })
+    }
+
+    pub fn run_with_stream_control(
+        &self,
+        device: &VulkanComputeDevice,
+        control: VulkanMountedPlacedStreamControl,
+    ) -> Result<VulkanMountedPlacedResidentPedalRun, VulkanMountedPlacedResidentKernelDispatchError>
+    {
+        self.run_with_push_constant_bytes(device, |dispatch| {
+            stream_control_push_constant_bytes(&dispatch.push_constants, control)
+        })
+    }
+
+    fn run_with_push_constant_bytes<F>(
+        &self,
+        device: &VulkanComputeDevice,
+        mut push_constant_bytes_for: F,
+    ) -> Result<VulkanMountedPlacedResidentPedalRun, VulkanMountedPlacedResidentKernelDispatchError>
+    where
+        F: FnMut(
+            &VulkanMountedPlacedResidentPedalDispatch,
+        ) -> Result<Vec<u8>, VulkanMountedPlacedResidentKernelDispatchError>,
+    {
         let mut dispatch_runs = Vec::with_capacity(self.dispatches.len());
         for dispatch in &self.dispatches {
-            let push_constants =
-                vec![0u8; dispatch.resident_dispatch.push_constant_byte_count() as usize];
+            let push_constants = push_constant_bytes_for(dispatch)?;
             device
                 .run_resident_kernel_dispatch(&dispatch.resident_dispatch, &push_constants)
                 .map_err(VulkanMountedPlacedResidentKernelDispatchError::Vulkan)?;
@@ -2517,6 +2547,7 @@ pub struct VulkanMountedPlacedResidentPedalDispatch {
     pub node_id: String,
     pub op: String,
     pub reusable_family_id: String,
+    pub push_constants: Vec<VulkanKernelScalarBinding>,
     pub resident_dispatch: VulkanResidentKernelDispatch,
 }
 
@@ -2651,6 +2682,25 @@ impl VulkanMountedPlacedResidentPedalboardRunner {
             pedal_runs,
         })
     }
+
+    pub fn run_with_stream_control(
+        &self,
+        device: &VulkanComputeDevice,
+        control: VulkanMountedPlacedStreamControl,
+    ) -> Result<
+        VulkanMountedPlacedResidentPedalboardRun,
+        VulkanMountedPlacedResidentKernelDispatchError,
+    > {
+        let mut pedal_runs = Vec::with_capacity(self.pedals.len());
+        for pedal in &self.pedals {
+            pedal_runs.push(pedal.run_with_stream_control(device, control)?);
+        }
+
+        Ok(VulkanMountedPlacedResidentPedalboardRun {
+            device_id: self.device_id.clone(),
+            pedal_runs,
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2677,6 +2727,13 @@ impl VulkanMountedPlacedResidentPedalboardRun {
             .map(|pedal| pedal.pedal_id.as_str())
             .collect()
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VulkanMountedPlacedStreamControl {
+    pub stream_tick: u64,
+    pub control_flags: u32,
+    pub dynamic_state_capacity_activations: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -4635,6 +4692,9 @@ impl VulkanMountedPlacedResidentKernelDispatchReadinessPlan {
                             VulkanMountedPlacedResidentKernelDispatchError::UnsupportedPushConstantScalar {
                                 ..
                             }
+                            | VulkanMountedPlacedResidentKernelDispatchError::UnsupportedPushConstantBinding {
+                                ..
+                            }
                             | VulkanMountedPlacedResidentKernelDispatchError::PushConstantByteCountOverflow => {
                                 push_constant_blocked_count += 1;
                             }
@@ -5270,6 +5330,10 @@ pub enum VulkanMountedPlacedResidentKernelDispatchError {
     UnsupportedPushConstantScalar {
         scalar_type: String,
     },
+    UnsupportedPushConstantBinding {
+        name: String,
+        scalar_type: String,
+    },
     PushConstantByteCountOverflow,
     MissingOutputDescriptorForWorkgroup {
         dispatch_index: usize,
@@ -5379,6 +5443,10 @@ impl Display for VulkanMountedPlacedResidentKernelDispatchError {
             Self::UnsupportedPushConstantScalar { scalar_type } => {
                 write!(f, "unsupported push-constant scalar type {scalar_type:?}")
             }
+            Self::UnsupportedPushConstantBinding { name, scalar_type } => write!(
+                f,
+                "unsupported push-constant binding {name:?} with scalar type {scalar_type:?}"
+            ),
             Self::PushConstantByteCountOverflow => {
                 f.write_str("push-constant byte count overflowed")
             }
@@ -5455,6 +5523,38 @@ fn push_constant_scalar_byte_count(
             },
         ),
     }
+}
+
+fn stream_control_push_constant_bytes(
+    push_constants: &[VulkanKernelScalarBinding],
+    control: VulkanMountedPlacedStreamControl,
+) -> Result<Vec<u8>, VulkanMountedPlacedResidentKernelDispatchError> {
+    let byte_count = push_constant_byte_count(push_constants)?;
+    let mut bytes = Vec::with_capacity(byte_count as usize);
+
+    for binding in push_constants {
+        match (binding.name.as_str(), binding.scalar_type.as_str()) {
+            ("stream_tick", "u64") => {
+                bytes.extend_from_slice(&control.stream_tick.to_le_bytes());
+            }
+            ("control_flags", "u32") => {
+                bytes.extend_from_slice(&control.control_flags.to_le_bytes());
+            }
+            ("dynamic_state_capacity_activations", "u32") => {
+                bytes.extend_from_slice(&control.dynamic_state_capacity_activations.to_le_bytes());
+            }
+            _ => {
+                return Err(
+                    VulkanMountedPlacedResidentKernelDispatchError::UnsupportedPushConstantBinding {
+                        name: binding.name.clone(),
+                        scalar_type: binding.scalar_type.clone(),
+                    },
+                );
+            }
+        }
+    }
+
+    Ok(bytes)
 }
 
 fn resident_kernel_dispatch_workgroup_count_x(
@@ -7170,7 +7270,19 @@ mod tests {
         assert_eq!(runner.total_descriptor_count, 52);
         assert_eq!(runner.total_push_constant_byte_count, 256);
 
-        let run = runner.run_zeroed_push_constants(&device).unwrap();
+        let run = runner
+            .run_with_stream_control(
+                &device,
+                VulkanMountedPlacedStreamControl {
+                    stream_tick: 7,
+                    control_flags: 0,
+                    dynamic_state_capacity_activations: mounted
+                        .buffers
+                        .dynamic_state_capacity_activations
+                        as u32,
+                },
+            )
+            .unwrap();
         assert_eq!(run.pedal_id, "layer_00");
         assert_eq!(run.dispatch_count(), 16);
         assert_eq!(
@@ -9974,6 +10086,27 @@ mod tests {
                 .name,
             "dynamic_state_capacity_activations"
         );
+    }
+
+    #[test]
+    fn stream_control_push_constants_follow_kernel_abi_order() {
+        let push_constants =
+            VulkanKernelStreamMetadata::for_op("rotary_position_embedding").push_constants();
+        let bytes = stream_control_push_constant_bytes(
+            &push_constants,
+            VulkanMountedPlacedStreamControl {
+                stream_tick: 42,
+                control_flags: 7,
+                dynamic_state_capacity_activations: 4,
+            },
+        )
+        .unwrap();
+
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&42u64.to_le_bytes());
+        expected.extend_from_slice(&7u32.to_le_bytes());
+        expected.extend_from_slice(&4u32.to_le_bytes());
+        assert_eq!(bytes, expected);
     }
 
     #[test]
