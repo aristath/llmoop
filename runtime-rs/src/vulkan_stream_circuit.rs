@@ -6491,12 +6491,12 @@ mod tests {
             .tensors
             .get("model.layers.0.operator_norm.weight")
             .unwrap();
-        if operator_norm_metadata
+        let operator_norm_source_available = operator_norm_metadata
             .source_file
             .as_ref()
             .map(|source_file| Path::new(source_file).exists())
-            .unwrap_or(false)
-        {
+            .unwrap_or(false);
+        if operator_norm_source_available {
             let loaded_weight = mounted
                 .parameter_buffers
                 .load_parameter_from_tensor_index(
@@ -6753,6 +6753,53 @@ mod tests {
                 push_constant_byte_count: 16,
             }
         ));
+        if operator_norm_source_available {
+            if let Some(spirv_words) = crate::vulkan_compute::compile_test_shader_words_from_source(
+                "rms_norm_bf16_serial.comp",
+            ) {
+                let rms_norm_kernel_manifest = VulkanLoadedReusableKernelArtifactManifest {
+                    schema: VULKAN_REUSABLE_KERNEL_ARTIFACT_MANIFEST_SCHEMA.to_string(),
+                    backend_id: VULKAN_STREAM_CIRCUIT_BACKEND_ID.to_string(),
+                    total_word_count: spirv_words.len(),
+                    artifacts: vec![VulkanLoadedReusableKernelArtifact {
+                        artifact: VulkanReusableKernelArtifact::from_family(
+                            rms_norm_family,
+                            "kernels/rms_norm.spv",
+                        ),
+                        resolved_path: PathBuf::from("kernels/rms_norm.spv"),
+                        words: spirv_words,
+                    }],
+                };
+                let resident_dispatch = mounted
+                    .create_resident_kernel_dispatch_for_bound_dispatch(
+                        &device,
+                        operator_norm_dispatch,
+                        &rms_norm_kernel_manifest,
+                    )
+                    .unwrap();
+                let mut input_frame = Vec::with_capacity(2_048);
+                for _ in 0..1024 {
+                    input_frame.extend_from_slice(&[0x80, 0x3f]);
+                }
+                model_input.buffer.write_bytes(&input_frame).unwrap();
+
+                device
+                    .run_resident_kernel_dispatch(&resident_dispatch, &[0u8; 16])
+                    .unwrap();
+
+                assert_eq!(
+                    operator_norm_bindings[1].buffer.read_bytes(16).unwrap(),
+                    vec![
+                        0xc6, 0x3e, 0xb9, 0x3e, 0xba, 0x3e, 0xba, 0x3e, 0xc2, 0x3e, 0xba, 0x3e,
+                        0xbe, 0x3e, 0x12, 0x3f,
+                    ]
+                );
+            } else {
+                eprintln!(
+                    "skipping serial RMSNorm Vulkan dispatch: no GLSL to SPIR-V compiler found"
+                );
+            }
+        }
 
         assert_eq!(
             mounted_bound

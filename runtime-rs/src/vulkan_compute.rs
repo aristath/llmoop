@@ -1645,12 +1645,21 @@ unsafe fn read_byte_memory(
 
 #[cfg(test)]
 pub(crate) fn compile_test_shader_words() -> Option<Vec<u32>> {
+    compile_test_shader_words_from_source("add_one.comp")
+}
+
+#[cfg(test)]
+pub(crate) fn compile_test_shader_words_from_source(shader_file: &str) -> Option<Vec<u32>> {
     use std::path::PathBuf;
     use std::process::{Command, Stdio};
 
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let shader = manifest_dir.join("shaders/add_one.comp");
-    let output = std::env::temp_dir().join(format!("llmoop-add-one-{}.spv", std::process::id()));
+    let shader = manifest_dir.join("shaders").join(shader_file);
+    let output = std::env::temp_dir().join(format!(
+        "llmoop-{}-{}.spv",
+        shader_file.replace(['/', '.'], "-"),
+        std::process::id()
+    ));
     let compiled = if test_command_exists("glslangValidator") {
         Command::new("glslangValidator")
             .arg("-V")
