@@ -2121,9 +2121,20 @@ impl VulkanMountedPlacedStreamCircuit {
             };
         }
 
-        let descriptor_count =
+        let (descriptor_count, workgroup_count_x) =
             match self.resident_kernel_buffer_bindings_for_bound_dispatch(dispatch) {
-                Ok(bindings) => bindings.len(),
+                Ok(bindings) => {
+                    let workgroup_count_x =
+                        match resident_kernel_dispatch_workgroup_count_x(dispatch, &bindings) {
+                            Ok(workgroup_count_x) => workgroup_count_x,
+                            Err(error) => {
+                                return VulkanMountedPlacedResidentKernelDispatchStatus::Blocked {
+                                    error,
+                                };
+                            }
+                        };
+                    (bindings.len(), workgroup_count_x)
+                }
                 Err(error) => {
                     return VulkanMountedPlacedResidentKernelDispatchStatus::Blocked { error };
                 }
@@ -2137,7 +2148,7 @@ impl VulkanMountedPlacedStreamCircuit {
 
         VulkanMountedPlacedResidentKernelDispatchStatus::Instantiable {
             descriptor_count,
-            workgroup_count_x: 1,
+            workgroup_count_x,
             local_size_x: dispatch.local_size_x,
             push_constant_byte_count,
         }
@@ -2172,7 +2183,8 @@ impl VulkanMountedPlacedStreamCircuit {
                 }
             })?;
         let buffer_bindings = self.resident_kernel_buffer_bindings_for_bound_dispatch(dispatch)?;
-        let workgroup_count_x = 1;
+        let workgroup_count_x =
+            resident_kernel_dispatch_workgroup_count_x(dispatch, &buffer_bindings)?;
         device
             .create_resident_kernel_dispatch(
                 &artifact.words,
@@ -4942,6 +4954,24 @@ pub enum VulkanMountedPlacedResidentKernelDispatchError {
         scalar_type: String,
     },
     PushConstantByteCountOverflow,
+    MissingOutputDescriptorForWorkgroup {
+        dispatch_index: usize,
+        op: String,
+    },
+    MissingOutputBindingForWorkgroup {
+        dispatch_index: usize,
+        binding: usize,
+    },
+    InvalidOutputByteLengthForWorkgroup {
+        dispatch_index: usize,
+        binding: usize,
+        byte_len: usize,
+    },
+    WorkgroupCountOverflow {
+        dispatch_index: usize,
+        output_element_count: usize,
+        local_size_x: u32,
+    },
     Vulkan(VulkanError),
 }
 
@@ -5014,6 +5044,33 @@ impl Display for VulkanMountedPlacedResidentKernelDispatchError {
             Self::PushConstantByteCountOverflow => {
                 f.write_str("push-constant byte count overflowed")
             }
+            Self::MissingOutputDescriptorForWorkgroup { dispatch_index, op } => write!(
+                f,
+                "dispatch {dispatch_index} op {op:?} cannot plan workgroups because it has no output descriptor"
+            ),
+            Self::MissingOutputBindingForWorkgroup {
+                dispatch_index,
+                binding,
+            } => write!(
+                f,
+                "dispatch {dispatch_index} cannot plan workgroups because output descriptor binding {binding} is not mounted"
+            ),
+            Self::InvalidOutputByteLengthForWorkgroup {
+                dispatch_index,
+                binding,
+                byte_len,
+            } => write!(
+                f,
+                "dispatch {dispatch_index} cannot plan workgroups because output descriptor binding {binding} has invalid BF16 byte length {byte_len}"
+            ),
+            Self::WorkgroupCountOverflow {
+                dispatch_index,
+                output_element_count,
+                local_size_x,
+            } => write!(
+                f,
+                "dispatch {dispatch_index} cannot plan workgroups for {output_element_count} output elements with local_size_x {local_size_x}"
+            ),
             Self::Vulkan(error) => Display::fmt(error, f),
         }
     }
@@ -5044,6 +5101,83 @@ fn push_constant_scalar_byte_count(
             },
         ),
     }
+}
+
+fn resident_kernel_dispatch_workgroup_count_x(
+    dispatch: &VulkanMountedPlacedBoundDispatch,
+    buffer_bindings: &[VulkanResidentKernelBufferBinding<'_>],
+) -> Result<u32, VulkanMountedPlacedResidentKernelDispatchError> {
+    if dispatch.op != "linear" {
+        return Ok(1);
+    }
+    let output_descriptor = dispatch
+        .descriptors
+        .iter()
+        .find(|descriptor| descriptor.usage == VulkanKernelDescriptorUsage::OutputSignal)
+        .ok_or_else(|| {
+            VulkanMountedPlacedResidentKernelDispatchError::MissingOutputDescriptorForWorkgroup {
+                dispatch_index: dispatch.dispatch_index,
+                op: dispatch.op.clone(),
+            }
+        })?;
+    let output_binding = u32::try_from(output_descriptor.binding).map_err(|_| {
+        VulkanMountedPlacedResidentKernelDispatchError::DescriptorBindingOverflow {
+            dispatch_index: dispatch.dispatch_index,
+            binding: output_descriptor.binding,
+        }
+    })?;
+    let output_buffer = buffer_bindings
+        .iter()
+        .find(|binding| binding.binding == output_binding)
+        .ok_or_else(|| {
+            VulkanMountedPlacedResidentKernelDispatchError::MissingOutputBindingForWorkgroup {
+                dispatch_index: dispatch.dispatch_index,
+                binding: output_descriptor.binding,
+            }
+        })?;
+    if output_buffer.byte_len == 0 || output_buffer.byte_len % 2 != 0 {
+        return Err(
+            VulkanMountedPlacedResidentKernelDispatchError::InvalidOutputByteLengthForWorkgroup {
+                dispatch_index: dispatch.dispatch_index,
+                binding: output_descriptor.binding,
+                byte_len: output_buffer.byte_len,
+            },
+        );
+    }
+    let output_element_count = output_buffer.byte_len / 2;
+    let local_size_x = usize::try_from(dispatch.local_size_x).map_err(|_| {
+        VulkanMountedPlacedResidentKernelDispatchError::WorkgroupCountOverflow {
+            dispatch_index: dispatch.dispatch_index,
+            output_element_count,
+            local_size_x: dispatch.local_size_x,
+        }
+    })?;
+    if local_size_x == 0 {
+        return Err(
+            VulkanMountedPlacedResidentKernelDispatchError::WorkgroupCountOverflow {
+                dispatch_index: dispatch.dispatch_index,
+                output_element_count,
+                local_size_x: dispatch.local_size_x,
+            },
+        );
+    }
+    let workgroup_count = output_element_count
+        .checked_add(local_size_x - 1)
+        .and_then(|rounded| rounded.checked_div(local_size_x))
+        .ok_or_else(
+            || VulkanMountedPlacedResidentKernelDispatchError::WorkgroupCountOverflow {
+                dispatch_index: dispatch.dispatch_index,
+                output_element_count,
+                local_size_x: dispatch.local_size_x,
+            },
+        )?;
+    u32::try_from(workgroup_count).map_err(|_| {
+        VulkanMountedPlacedResidentKernelDispatchError::WorkgroupCountOverflow {
+            dispatch_index: dispatch.dispatch_index,
+            output_element_count,
+            local_size_x: dispatch.local_size_x,
+        }
+    })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -5508,6 +5642,8 @@ pub struct VulkanKernelDescriptorSlotSignature {
     pub binding: usize,
     pub usage: VulkanKernelDescriptorUsage,
     pub resource_class: VulkanKernelDescriptorResourceClass,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub byte_capacity: Option<usize>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -5570,6 +5706,7 @@ impl VulkanKernelDescriptorSlotSignature {
             binding: binding.binding,
             usage: binding.usage.clone(),
             resource_class: VulkanKernelDescriptorResourceClass::from_resource(&binding.resource),
+            byte_capacity: descriptor_resource_byte_capacity(&binding.resource),
         }
     }
 }
@@ -5580,6 +5717,43 @@ impl VulkanKernelDescriptorResourceClass {
             VulkanKernelDescriptorResource::Signal(_) => Self::SignalBuffer,
             VulkanKernelDescriptorResource::Parameter(_) => Self::ParameterBuffer,
             VulkanKernelDescriptorResource::State { .. } => Self::StateBuffer,
+        }
+    }
+}
+
+fn descriptor_resource_byte_capacity(resource: &VulkanKernelDescriptorResource) -> Option<usize> {
+    match resource {
+        VulkanKernelDescriptorResource::Signal(signal) => match &signal.resource {
+            VulkanSignalResource::BoundaryInput | VulkanSignalResource::BoundaryOutput => None,
+            VulkanSignalResource::StateBuffer {
+                static_bytes,
+                bytes_per_activation,
+                ..
+            }
+            | VulkanSignalResource::StateView {
+                static_bytes,
+                bytes_per_activation,
+                ..
+            } => match (static_bytes, bytes_per_activation) {
+                (Some(static_bytes), Some(bytes_per_activation)) => {
+                    static_bytes.checked_add(*bytes_per_activation)
+                }
+                (Some(static_bytes), None) => Some(*static_bytes),
+                (None, Some(bytes_per_activation)) => Some(*bytes_per_activation),
+                (None, None) => None,
+            },
+            VulkanSignalResource::ActivationSlot { bytes, .. } => *bytes,
+        },
+        VulkanKernelDescriptorResource::Parameter(parameter) => parameter.byte_count,
+        VulkanKernelDescriptorResource::State { binding, .. } => {
+            match (binding.static_bytes, binding.bytes_per_activation) {
+                (Some(static_bytes), Some(bytes_per_activation)) => {
+                    static_bytes.checked_add(bytes_per_activation)
+                }
+                (Some(static_bytes), None) => Some(static_bytes),
+                (None, Some(bytes_per_activation)) => Some(bytes_per_activation),
+                (None, None) => None,
+            }
         }
     }
 }
@@ -6661,6 +6835,7 @@ mod tests {
             VulkanMountedPlacedStreamTickStageStatus::Pending
         );
         let operator_norm_dispatch = mounted_bound.dispatch("layer_00", "operator_norm").unwrap();
+        let operator_norm_family_id = operator_norm_dispatch.reusable_family_id.as_str();
         let operator_norm_bindings = mounted
             .resident_kernel_buffer_bindings_for_bound_dispatch(operator_norm_dispatch)
             .unwrap();
@@ -6703,14 +6878,15 @@ mod tests {
                         dispatch_index: 0,
                         ref family_id,
                     },
-            } if family_id == "rms_norm"
+            } if family_id == operator_norm_family_id
         ));
 
         let rms_norm_family = mounted
             .placed_plan
             .reusable_kernel_plan
-            .family("rms_norm")
+            .family(operator_norm_family_id)
             .unwrap();
+        assert_eq!(operator_norm_family_id, "rms_norm.signature_1");
         let rms_norm_loaded_manifest = VulkanLoadedReusableKernelArtifactManifest {
             schema: VULKAN_REUSABLE_KERNEL_ARTIFACT_MANIFEST_SCHEMA.to_string(),
             backend_id: VULKAN_STREAM_CIRCUIT_BACKEND_ID.to_string(),
@@ -6718,9 +6894,9 @@ mod tests {
             artifacts: vec![VulkanLoadedReusableKernelArtifact {
                 artifact: VulkanReusableKernelArtifact::from_family(
                     rms_norm_family,
-                    "kernels/rms_norm.spv",
+                    format!("kernels/{operator_norm_family_id}.spv"),
                 ),
-                resolved_path: PathBuf::from("kernels/rms_norm.spv"),
+                resolved_path: PathBuf::from(format!("kernels/{operator_norm_family_id}.spv")),
                 words: vec![0x0723_0203, 0],
             }],
         };
@@ -6764,9 +6940,11 @@ mod tests {
                     artifacts: vec![VulkanLoadedReusableKernelArtifact {
                         artifact: VulkanReusableKernelArtifact::from_family(
                             rms_norm_family,
-                            "kernels/rms_norm.spv",
+                            format!("kernels/{operator_norm_family_id}.spv"),
                         ),
-                        resolved_path: PathBuf::from("kernels/rms_norm.spv"),
+                        resolved_path: PathBuf::from(format!(
+                            "kernels/{operator_norm_family_id}.spv"
+                        )),
                         words: spirv_words,
                     }],
                 };
@@ -6794,6 +6972,72 @@ mod tests {
                         0xbe, 0x3e, 0x12, 0x3f,
                     ]
                 );
+
+                mounted
+                    .parameter_buffers
+                    .load_parameter_from_tensor_index(
+                        &tensor_index,
+                        "model.layers.0.conv.in_proj.weight",
+                    )
+                    .unwrap();
+                if let Some(linear_spirv_words) =
+                    crate::vulkan_compute::compile_test_shader_words_from_source(
+                        "linear_bf16_1024x3072.comp",
+                    )
+                {
+                    let conv_in_dispatch = mounted_bound
+                        .dispatch("layer_00", "conv_in_projection")
+                        .unwrap();
+                    assert_eq!(conv_in_dispatch.reusable_family_id, "linear.signature_3");
+                    let conv_in_bindings = mounted
+                        .resident_kernel_buffer_bindings_for_bound_dispatch(conv_in_dispatch)
+                        .unwrap();
+                    assert_eq!(conv_in_bindings[0].byte_len, 5_120);
+                    assert_eq!(conv_in_bindings[1].byte_len, 6_144);
+                    assert_eq!(conv_in_bindings[2].byte_len, 6_291_456);
+                    let linear_family = mounted
+                        .placed_plan
+                        .reusable_kernel_plan
+                        .family(&conv_in_dispatch.reusable_family_id)
+                        .unwrap();
+                    let linear_kernel_manifest = VulkanLoadedReusableKernelArtifactManifest {
+                        schema: VULKAN_REUSABLE_KERNEL_ARTIFACT_MANIFEST_SCHEMA.to_string(),
+                        backend_id: VULKAN_STREAM_CIRCUIT_BACKEND_ID.to_string(),
+                        total_word_count: linear_spirv_words.len(),
+                        artifacts: vec![VulkanLoadedReusableKernelArtifact {
+                            artifact: VulkanReusableKernelArtifact::from_family(
+                                linear_family,
+                                "kernels/linear.signature_3.spv",
+                            ),
+                            resolved_path: PathBuf::from("kernels/linear.signature_3.spv"),
+                            words: linear_spirv_words,
+                        }],
+                    };
+                    let linear_dispatch = mounted
+                        .create_resident_kernel_dispatch_for_bound_dispatch(
+                            &device,
+                            conv_in_dispatch,
+                            &linear_kernel_manifest,
+                        )
+                        .unwrap();
+                    assert_eq!(linear_dispatch.workgroup_count_x(), 48);
+
+                    device
+                        .run_resident_kernel_dispatch(&linear_dispatch, &[0u8; 16])
+                        .unwrap();
+
+                    assert_eq!(
+                        conv_in_bindings[1].buffer.read_bytes(16).unwrap(),
+                        vec![
+                            0xc7, 0x3e, 0x74, 0xbe, 0x7f, 0x3e, 0x97, 0x3e, 0x5a, 0xbe, 0xd2, 0xbe,
+                            0xab, 0xbe, 0xc5, 0xbd,
+                        ]
+                    );
+                } else {
+                    eprintln!(
+                        "skipping linear BF16 Vulkan dispatch: no GLSL to SPIR-V compiler found"
+                    );
+                }
             } else {
                 eprintln!(
                     "skipping serial RMSNorm Vulkan dispatch: no GLSL to SPIR-V compiler found"
@@ -7950,13 +8194,14 @@ mod tests {
 
         assert_eq!(reusable_plan.backend_id, VULKAN_STREAM_CIRCUIT_BACKEND_ID);
         assert_eq!(reusable_plan.total_command_count, 242);
-        assert_eq!(reusable_plan.total_family_count(), 12);
-        assert_eq!(reusable_plan.reusable_family_count(), 12);
-        assert_eq!(reusable_plan.families_for_op("rms_norm").len(), 1);
+        assert_eq!(reusable_plan.total_family_count(), 25);
+        assert_eq!(reusable_plan.reusable_family_count(), 25);
+        assert_eq!(reusable_plan.families_for_op("rms_norm").len(), 4);
+        assert_eq!(reusable_plan.families_for_op("linear").len(), 5);
 
-        let linear = reusable_plan.family("linear").unwrap();
+        let linear = reusable_plan.family("linear.signature_3").unwrap();
         assert_eq!(linear.op, "linear");
-        assert_eq!(linear.command_refs.len(), 82);
+        assert_eq!(linear.command_refs.len(), 8);
         assert!(!linear.uses_stream_tick);
         assert_eq!(
             linear.descriptor_signature,
@@ -7965,16 +8210,19 @@ mod tests {
                     binding: 0,
                     usage: VulkanKernelDescriptorUsage::InputSignal,
                     resource_class: VulkanKernelDescriptorResourceClass::SignalBuffer,
+                    byte_capacity: Some(5_120),
                 },
                 VulkanKernelDescriptorSlotSignature {
                     binding: 1,
                     usage: VulkanKernelDescriptorUsage::OutputSignal,
                     resource_class: VulkanKernelDescriptorResourceClass::SignalBuffer,
+                    byte_capacity: Some(6_144),
                 },
                 VulkanKernelDescriptorSlotSignature {
                     binding: 2,
                     usage: VulkanKernelDescriptorUsage::Parameter,
                     resource_class: VulkanKernelDescriptorResourceClass::ParameterBuffer,
+                    byte_capacity: Some(6_291_456),
                 },
             ]
         );
@@ -7985,11 +8233,19 @@ mod tests {
         );
         assert_eq!(
             linear.command_refs.last().unwrap().kernel_id,
-            "layer_13.ffn_down_projection"
+            "layer_13.conv_in_projection"
         );
 
         let rope = reusable_plan.family("rotary_position_embedding").unwrap();
-        assert_eq!(rope.command_refs.len(), 12);
+        assert_eq!(rope.command_refs.len(), 6);
+        assert_eq!(
+            reusable_plan
+                .families_for_op("rotary_position_embedding")
+                .iter()
+                .map(|family| family.command_refs.len())
+                .sum::<usize>(),
+            12
+        );
         assert!(rope.uses_stream_tick);
         assert_eq!(
             rope.push_constants
@@ -8096,9 +8352,9 @@ mod tests {
 
         let empty = reusable_plan.coverage_report(std::iter::empty::<&str>());
         assert!(!empty.all_available());
-        assert_eq!(empty.required_family_count, 12);
+        assert_eq!(empty.required_family_count, 25);
         assert_eq!(empty.available_family_count, 0);
-        assert_eq!(empty.missing_family_count, 12);
+        assert_eq!(empty.missing_family_count, 25);
         assert_eq!(empty.required_command_count, 242);
         assert_eq!(empty.covered_command_count, 0);
         assert_eq!(empty.missing_command_count, 242);
@@ -8106,16 +8362,24 @@ mod tests {
             empty
                 .missing_families()
                 .iter()
-                .any(|family| family.family_id == "linear" && family.command_count == 82)
+                .any(|family| family.family_id == "linear.signature_3" && family.command_count == 8)
         );
 
-        let partial = reusable_plan.coverage_report(["linear", "rms_norm"]);
+        let partial_family_ids = ["linear.signature_3", "rms_norm.signature_1"];
+        let partial_covered_command_count = partial_family_ids
+            .iter()
+            .map(|family_id| reusable_plan.family(family_id).unwrap().command_refs.len())
+            .sum::<usize>();
+        let partial = reusable_plan.coverage_report(partial_family_ids);
         assert!(!partial.all_available());
         assert_eq!(partial.available_family_count, 2);
-        assert_eq!(partial.missing_family_count, 10);
-        assert_eq!(partial.covered_command_count, 82 + 28);
-        assert_eq!(partial.missing_command_count, 242 - 82 - 28);
-        assert_eq!(partial.missing_families().len(), 10);
+        assert_eq!(partial.missing_family_count, 23);
+        assert_eq!(partial.covered_command_count, partial_covered_command_count);
+        assert_eq!(
+            partial.missing_command_count,
+            242 - partial_covered_command_count
+        );
+        assert_eq!(partial.missing_families().len(), 23);
 
         let full = reusable_plan.coverage_report(
             reusable_plan
@@ -8124,7 +8388,7 @@ mod tests {
                 .map(|family| family.family_id.as_str()),
         );
         assert!(full.all_available());
-        assert_eq!(full.available_family_count, 12);
+        assert_eq!(full.available_family_count, 25);
         assert_eq!(full.missing_family_count, 0);
         assert_eq!(full.covered_command_count, 242);
         assert_eq!(full.missing_command_count, 0);
@@ -8173,10 +8437,10 @@ mod tests {
             VULKAN_REUSABLE_KERNEL_ARTIFACT_MANIFEST_SCHEMA
         );
         assert_eq!(manifest.backend_id, VULKAN_STREAM_CIRCUIT_BACKEND_ID);
-        assert_eq!(manifest.artifacts.len(), 12);
+        assert_eq!(manifest.artifacts.len(), 25);
         assert!(link_plan.is_fully_linked());
-        assert_eq!(link_plan.required_family_count, 12);
-        assert_eq!(link_plan.linked_family_count, 12);
+        assert_eq!(link_plan.required_family_count, 25);
+        assert_eq!(link_plan.linked_family_count, 25);
         assert_eq!(link_plan.missing_family_count, 0);
         assert_eq!(link_plan.incompatible_family_count, 0);
         assert_eq!(link_plan.required_command_count, 242);
@@ -8185,10 +8449,13 @@ mod tests {
         assert_eq!(link_plan.incompatible_command_count, 0);
         assert!(link_plan.issues.is_empty());
 
-        let linear = link_plan.family("linear").unwrap();
+        let linear = link_plan.family("linear.signature_3").unwrap();
         assert_eq!(linear.status, VulkanReusableKernelLinkStatus::Linked);
-        assert_eq!(linear.command_count, 82);
-        assert_eq!(linear.artifact_path.as_deref(), Some("kernels/linear.spv"));
+        assert_eq!(linear.command_count, 8);
+        assert_eq!(
+            linear.artifact_path.as_deref(),
+            Some("kernels/linear.signature_3.spv")
+        );
 
         let manifest_path = std::env::temp_dir().join(format!(
             "llmoop-reusable-kernel-manifest-{}.json",
@@ -8198,7 +8465,7 @@ mod tests {
         let read = VulkanReusableKernelArtifactManifest::from_json_file(&manifest_path).unwrap();
         std::fs::remove_file(&manifest_path).unwrap();
         assert_eq!(read, manifest);
-        assert_eq!(read.family_ids().len(), 12);
+        assert_eq!(read.family_ids().len(), 25);
 
         let artifact_root = std::env::temp_dir().join(format!(
             "llmoop-reusable-kernel-artifacts-{}",
@@ -8220,14 +8487,14 @@ mod tests {
             VULKAN_REUSABLE_KERNEL_ARTIFACT_MANIFEST_SCHEMA
         );
         assert_eq!(loaded.backend_id, VULKAN_STREAM_CIRCUIT_BACKEND_ID);
-        assert_eq!(loaded.artifacts.len(), 12);
-        assert_eq!(loaded.family_ids().len(), 12);
-        assert_eq!(loaded.total_word_count, 24);
-        let loaded_linear = loaded.artifact("linear").unwrap();
-        assert_eq!(loaded_linear.artifact.family_id, "linear");
+        assert_eq!(loaded.artifacts.len(), 25);
+        assert_eq!(loaded.family_ids().len(), 25);
+        assert_eq!(loaded.total_word_count, 50);
+        let loaded_linear = loaded.artifact("linear.signature_3").unwrap();
+        assert_eq!(loaded_linear.artifact.family_id, "linear.signature_3");
         assert_eq!(
             loaded_linear.resolved_path,
-            artifact_root.join("kernels/linear.spv")
+            artifact_root.join("kernels/linear.signature_3.spv")
         );
         assert_eq!(loaded_linear.words[0], 0x0723_0203);
         std::fs::remove_dir_all(&artifact_root).unwrap();
@@ -8256,21 +8523,21 @@ mod tests {
         .unwrap();
         let dispatch_plan = VulkanKernelDispatchPlan::from_binding_plan(&binding_plan);
         let reusable_plan = VulkanReusableKernelPlan::from_dispatch_plan(&dispatch_plan);
-        let linear = reusable_plan.family("linear").unwrap();
+        let linear = reusable_plan.family("linear.signature_3").unwrap();
 
         let partial_manifest = VulkanReusableKernelArtifactManifest::empty().with_artifact(
-            VulkanReusableKernelArtifact::from_family(linear, "kernels/linear.spv"),
+            VulkanReusableKernelArtifact::from_family(linear, "kernels/linear.signature_3.spv"),
         );
         let partial_link = reusable_plan.link_artifacts(&partial_manifest);
 
         assert!(!partial_link.is_fully_linked());
         assert_eq!(partial_link.linked_family_count, 1);
-        assert_eq!(partial_link.missing_family_count, 11);
+        assert_eq!(partial_link.missing_family_count, 24);
         assert_eq!(partial_link.incompatible_family_count, 0);
-        assert_eq!(partial_link.linked_command_count, 82);
-        assert_eq!(partial_link.missing_command_count, 242 - 82);
+        assert_eq!(partial_link.linked_command_count, 8);
+        assert_eq!(partial_link.missing_command_count, 242 - 8);
         assert_eq!(
-            partial_link.family("linear").unwrap().status,
+            partial_link.family("linear.signature_3").unwrap().status,
             VulkanReusableKernelLinkStatus::Linked
         );
         assert!(
@@ -8291,11 +8558,11 @@ mod tests {
 
         assert!(!incompatible_link.is_fully_linked());
         assert_eq!(incompatible_link.linked_family_count, 0);
-        assert_eq!(incompatible_link.missing_family_count, 11);
+        assert_eq!(incompatible_link.missing_family_count, 24);
         assert_eq!(incompatible_link.incompatible_family_count, 1);
-        assert_eq!(incompatible_link.incompatible_command_count, 82);
-        assert_eq!(incompatible_link.missing_command_count, 242 - 82);
-        let linear_link = incompatible_link.family("linear").unwrap();
+        assert_eq!(incompatible_link.incompatible_command_count, 8);
+        assert_eq!(incompatible_link.missing_command_count, 242 - 8);
+        let linear_link = incompatible_link.family("linear.signature_3").unwrap();
         assert_eq!(
             linear_link.status,
             VulkanReusableKernelLinkStatus::Incompatible
@@ -8370,23 +8637,23 @@ mod tests {
         .unwrap();
 
         assert_eq!(prepared.backend_id, VULKAN_STREAM_CIRCUIT_BACKEND_ID);
-        assert_eq!(prepared.reusable_family_count, 12);
+        assert_eq!(prepared.reusable_family_count, 25);
         assert_eq!(prepared.dispatches.len(), 242);
         assert_eq!(prepared.total_descriptor_count, 794);
 
         let first = prepared.dispatch("layer_00", "operator_norm").unwrap();
         assert_eq!(first.dispatch_index, 0);
         assert_eq!(first.kernel_id, "layer_00.operator_norm");
-        assert_eq!(first.reusable_family_id, "rms_norm");
-        assert_eq!(first.artifact_path, "kernels/rms_norm.spv");
+        assert_eq!(first.reusable_family_id, "rms_norm.signature_1");
+        assert_eq!(first.artifact_path, "kernels/rms_norm.signature_1.spv");
         assert_eq!(first.entry_point, DEFAULT_SPIRV_ENTRY_POINT);
         assert_eq!(first.local_size_x, DEFAULT_COMPUTE_LOCAL_SIZE_X);
         assert_eq!(first.descriptors.len(), 3);
 
         let linear = prepared.dispatch("layer_00", "conv_in_projection").unwrap();
         assert_eq!(linear.dispatch_index, 1);
-        assert_eq!(linear.reusable_family_id, "linear");
-        assert_eq!(linear.artifact_path, "kernels/linear.spv");
+        assert_eq!(linear.reusable_family_id, "linear.signature_3");
+        assert_eq!(linear.artifact_path, "kernels/linear.signature_3.spv");
         assert_eq!(linear.descriptors.len(), 3);
 
         let kv_append = prepared.dispatch("layer_02", "kv_memory_append").unwrap();
@@ -8440,9 +8707,9 @@ mod tests {
         let reusable_plan = VulkanReusableKernelPlan::from_dispatch_plan(&dispatch_plan);
         let descriptor_plan =
             VulkanDescriptorResourcePlan::from_plans(&dispatch_plan, &resident_plan, 4).unwrap();
-        let linear = reusable_plan.family("linear").unwrap();
+        let linear = reusable_plan.family("linear.signature_3").unwrap();
         let partial_manifest = VulkanReusableKernelArtifactManifest::empty().with_artifact(
-            VulkanReusableKernelArtifact::from_family(linear, "kernels/linear.spv"),
+            VulkanReusableKernelArtifact::from_family(linear, "kernels/linear.signature_3.spv"),
         );
 
         let error = VulkanPreparedDispatchPlan::from_plans(
@@ -8457,9 +8724,9 @@ mod tests {
             panic!("expected reusable kernel link failure");
         };
         assert_eq!(link_plan.linked_family_count, 1);
-        assert_eq!(link_plan.missing_family_count, 11);
-        assert_eq!(link_plan.linked_command_count, 82);
-        assert_eq!(link_plan.missing_command_count, 242 - 82);
+        assert_eq!(link_plan.missing_family_count, 24);
+        assert_eq!(link_plan.linked_command_count, 8);
+        assert_eq!(link_plan.missing_command_count, 242 - 8);
         assert!(
             link_plan
                 .family("append_state_update")
@@ -8631,16 +8898,16 @@ mod tests {
         assert_eq!(mounted.binding_plan.total_node_count(), 242);
         assert_eq!(mounted.kernel_interface_plan.total_kernel_count(), 242);
         assert_eq!(mounted.dispatch_plan.total_dispatch_count(), 242);
-        assert_eq!(mounted.reusable_kernel_plan.total_family_count(), 12);
+        assert_eq!(mounted.reusable_kernel_plan.total_family_count(), 25);
         assert_eq!(mounted.reusable_kernel_plan.total_command_count, 242);
         let empty_coverage = mounted.reusable_kernel_coverage_report(std::iter::empty::<&str>());
         assert!(!empty_coverage.all_available());
-        assert_eq!(empty_coverage.missing_family_count, 12);
+        assert_eq!(empty_coverage.missing_family_count, 25);
         assert_eq!(empty_coverage.missing_command_count, 242);
         let empty_link =
             mounted.link_reusable_kernels(&VulkanReusableKernelArtifactManifest::empty());
         assert!(!empty_link.is_fully_linked());
-        assert_eq!(empty_link.missing_family_count, 12);
+        assert_eq!(empty_link.missing_family_count, 25);
         assert_eq!(empty_link.missing_command_count, 242);
         let descriptor_plan = mounted.descriptor_resource_plan().unwrap();
         assert_eq!(descriptor_plan.total_descriptor_count, 794);
