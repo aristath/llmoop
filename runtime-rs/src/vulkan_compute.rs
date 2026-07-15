@@ -1652,13 +1652,18 @@ pub(crate) fn compile_test_shader_words() -> Option<Vec<u32>> {
 pub(crate) fn compile_test_shader_words_from_source(shader_file: &str) -> Option<Vec<u32>> {
     use std::path::PathBuf;
     use std::process::{Command, Stdio};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COMPILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let shader = manifest_dir.join("shaders").join(shader_file);
+    let compile_id = COMPILE_COUNTER.fetch_add(1, Ordering::Relaxed);
     let output = std::env::temp_dir().join(format!(
-        "llmoop-{}-{}.spv",
+        "llmoop-{}-{}-{}.spv",
         shader_file.replace(['/', '.'], "-"),
-        std::process::id()
+        std::process::id(),
+        compile_id
     ));
     let compiled = if test_command_exists("glslangValidator") {
         Command::new("glslangValidator")
@@ -1687,7 +1692,8 @@ pub(crate) fn compile_test_shader_words_from_source(shader_file: &str) -> Option
     if !compiled {
         return None;
     }
-    let bytes = std::fs::read(output).ok()?;
+    let bytes = std::fs::read(&output).ok()?;
+    let _ = std::fs::remove_file(&output);
     if bytes.len() % 4 != 0 {
         return None;
     }

@@ -6821,6 +6821,32 @@ mod tests {
         }
     }
 
+    fn load_lfm2_attention_layer_parameters(
+        mounted: &VulkanMountedPlacedStreamCircuit,
+        tensor_index: &TensorIndex,
+        layer_index: usize,
+    ) {
+        for suffix in [
+            "operator_norm.weight",
+            "self_attn.q_proj.weight",
+            "self_attn.k_proj.weight",
+            "self_attn.v_proj.weight",
+            "self_attn.q_layernorm.weight",
+            "self_attn.k_layernorm.weight",
+            "self_attn.out_proj.weight",
+            "ffn_norm.weight",
+            "feed_forward.w1.weight",
+            "feed_forward.w2.weight",
+            "feed_forward.w3.weight",
+        ] {
+            let tensor = format!("model.layers.{layer_index}.{suffix}");
+            mounted
+                .parameter_buffers
+                .load_parameter_from_tensor_index(tensor_index, &tensor)
+                .unwrap();
+        }
+    }
+
     fn write_layer_00_unit_input_and_zero_state(mounted: &VulkanMountedPlacedStreamCircuit) {
         let mut input_frame = Vec::with_capacity(2_048);
         for _ in 0..1024 {
@@ -6847,40 +6873,188 @@ mod tests {
             .unwrap();
     }
 
+    fn zero_lfm2_kv_memory(mounted: &VulkanMountedPlacedStreamCircuit, pedal_id: &str) {
+        let kv_memory = mounted.buffers.state_buffer(pedal_id, "kv_memory").unwrap();
+        kv_memory
+            .buffer
+            .write_bytes(&vec![0u8; kv_memory.byte_capacity])
+            .unwrap();
+    }
+
     fn layer_00_level_1_loaded_kernel_pack(
         mounted: &VulkanMountedPlacedStreamCircuit,
         mounted_bound: &VulkanMountedPlacedBoundDispatchPlan,
     ) -> Option<VulkanLoadedReusableKernelArtifactManifest> {
-        let node_shaders = [
-            ("operator_norm", "rms_norm_bf16_serial.comp"),
-            ("conv_in_projection", "linear_bf16_1024x3072.comp"),
-            ("split_b_c_x", "split_bf16_3072_to_3x1024.comp"),
-            ("input_gate", "multiply_bf16_1024.comp"),
-            (
-                "temporal_memory_update",
-                "rolling_state_update_bf16_3x1024.comp",
-            ),
-            (
-                "depthwise_temporal_conv",
-                "depthwise_conv1d_bf16_3x1024.comp",
-            ),
-            ("output_gate", "multiply_bf16_1024.comp"),
-            ("conv_out_projection", "linear_bf16_1024x1024.comp"),
-            ("operator_residual", "add_bf16_1024.comp"),
-            ("ffn_norm", "rms_norm_bf16_serial.comp"),
-            ("ffn_gate_projection", "linear_bf16_1024x2560.comp"),
-            ("ffn_up_projection", "linear_bf16_1024x2560.comp"),
-            ("ffn_gate_activation", "silu_bf16_2560.comp"),
-            ("ffn_gate_multiply", "multiply_bf16_2560.comp"),
-            ("ffn_down_projection", "linear_bf16_2560x1024.comp"),
-            ("ffn_residual", "add_bf16_1024.comp"),
-        ];
+        loaded_kernel_pack_for_dispatch_shaders(
+            mounted,
+            mounted_bound,
+            &[
+                ("layer_00", "operator_norm", "rms_norm_bf16_serial.comp"),
+                (
+                    "layer_00",
+                    "conv_in_projection",
+                    "linear_bf16_1024x3072.comp",
+                ),
+                ("layer_00", "split_b_c_x", "split_bf16_3072_to_3x1024.comp"),
+                ("layer_00", "input_gate", "multiply_bf16_1024.comp"),
+                (
+                    "layer_00",
+                    "temporal_memory_update",
+                    "rolling_state_update_bf16_3x1024.comp",
+                ),
+                (
+                    "layer_00",
+                    "depthwise_temporal_conv",
+                    "depthwise_conv1d_bf16_3x1024.comp",
+                ),
+                ("layer_00", "output_gate", "multiply_bf16_1024.comp"),
+                (
+                    "layer_00",
+                    "conv_out_projection",
+                    "linear_bf16_1024x1024.comp",
+                ),
+                ("layer_00", "operator_residual", "add_bf16_1024.comp"),
+                ("layer_00", "ffn_norm", "rms_norm_bf16_serial.comp"),
+                (
+                    "layer_00",
+                    "ffn_gate_projection",
+                    "linear_bf16_1024x2560.comp",
+                ),
+                (
+                    "layer_00",
+                    "ffn_up_projection",
+                    "linear_bf16_1024x2560.comp",
+                ),
+                ("layer_00", "ffn_gate_activation", "silu_bf16_2560.comp"),
+                ("layer_00", "ffn_gate_multiply", "multiply_bf16_2560.comp"),
+                (
+                    "layer_00",
+                    "ffn_down_projection",
+                    "linear_bf16_2560x1024.comp",
+                ),
+                ("layer_00", "ffn_residual", "add_bf16_1024.comp"),
+            ],
+        )
+    }
+
+    fn lfm2_level_1_loaded_kernel_pack_through_layer_02(
+        mounted: &VulkanMountedPlacedStreamCircuit,
+        mounted_bound: &VulkanMountedPlacedBoundDispatchPlan,
+    ) -> Option<VulkanLoadedReusableKernelArtifactManifest> {
+        loaded_kernel_pack_for_dispatch_shaders(
+            mounted,
+            mounted_bound,
+            &[
+                ("layer_00", "operator_norm", "rms_norm_bf16_serial.comp"),
+                (
+                    "layer_00",
+                    "conv_in_projection",
+                    "linear_bf16_1024x3072.comp",
+                ),
+                ("layer_00", "split_b_c_x", "split_bf16_3072_to_3x1024.comp"),
+                ("layer_00", "input_gate", "multiply_bf16_1024.comp"),
+                (
+                    "layer_00",
+                    "temporal_memory_update",
+                    "rolling_state_update_bf16_3x1024.comp",
+                ),
+                (
+                    "layer_00",
+                    "depthwise_temporal_conv",
+                    "depthwise_conv1d_bf16_3x1024.comp",
+                ),
+                ("layer_00", "output_gate", "multiply_bf16_1024.comp"),
+                (
+                    "layer_00",
+                    "conv_out_projection",
+                    "linear_bf16_1024x1024.comp",
+                ),
+                ("layer_00", "operator_residual", "add_bf16_1024.comp"),
+                ("layer_00", "ffn_norm", "rms_norm_bf16_serial.comp"),
+                (
+                    "layer_00",
+                    "ffn_gate_projection",
+                    "linear_bf16_1024x2560.comp",
+                ),
+                (
+                    "layer_00",
+                    "ffn_up_projection",
+                    "linear_bf16_1024x2560.comp",
+                ),
+                ("layer_00", "ffn_gate_activation", "silu_bf16_2560.comp"),
+                ("layer_00", "ffn_gate_multiply", "multiply_bf16_2560.comp"),
+                (
+                    "layer_00",
+                    "ffn_down_projection",
+                    "linear_bf16_2560x1024.comp",
+                ),
+                ("layer_00", "ffn_residual", "add_bf16_1024.comp"),
+                ("layer_02", "operator_norm", "rms_norm_bf16_serial.comp"),
+                ("layer_02", "q_projection", "linear_bf16_1024x1024.comp"),
+                ("layer_02", "k_projection", "linear_bf16_1024x512.comp"),
+                ("layer_02", "v_projection", "linear_bf16_1024x512.comp"),
+                (
+                    "layer_02",
+                    "q_head_norm",
+                    "rms_norm_per_head_bf16_16x64.comp",
+                ),
+                (
+                    "layer_02",
+                    "k_head_norm",
+                    "rms_norm_per_head_bf16_8x64.comp",
+                ),
+                ("layer_02", "q_rope", "rotary_bf16_16x64.comp"),
+                ("layer_02", "k_rope", "rotary_bf16_8x64.comp"),
+                (
+                    "layer_02",
+                    "kv_memory_append",
+                    "append_kv_state_bf16_8x64.comp",
+                ),
+                (
+                    "layer_02",
+                    "attention_read",
+                    "gqa_attention_bf16_q16_kv8_d64_cap4.comp",
+                ),
+                (
+                    "layer_02",
+                    "attention_out_projection",
+                    "linear_bf16_1024x1024.comp",
+                ),
+                ("layer_02", "operator_residual", "add_bf16_1024.comp"),
+                ("layer_02", "ffn_norm", "rms_norm_bf16_serial.comp"),
+                (
+                    "layer_02",
+                    "ffn_gate_projection",
+                    "linear_bf16_1024x2560.comp",
+                ),
+                (
+                    "layer_02",
+                    "ffn_up_projection",
+                    "linear_bf16_1024x2560.comp",
+                ),
+                ("layer_02", "ffn_gate_activation", "silu_bf16_2560.comp"),
+                ("layer_02", "ffn_gate_multiply", "multiply_bf16_2560.comp"),
+                (
+                    "layer_02",
+                    "ffn_down_projection",
+                    "linear_bf16_2560x1024.comp",
+                ),
+                ("layer_02", "ffn_residual", "add_bf16_1024.comp"),
+            ],
+        )
+    }
+
+    fn loaded_kernel_pack_for_dispatch_shaders(
+        mounted: &VulkanMountedPlacedStreamCircuit,
+        mounted_bound: &VulkanMountedPlacedBoundDispatchPlan,
+        dispatch_shaders: &[(&str, &str, &str)],
+    ) -> Option<VulkanLoadedReusableKernelArtifactManifest> {
         let mut loaded_artifacts = Vec::new();
         let mut loaded_families = BTreeSet::new();
         let mut total_word_count = 0usize;
 
-        for (node_id, shader_file) in node_shaders {
-            let dispatch = mounted_bound.dispatch("layer_00", node_id).unwrap();
+        for (pedal_id, node_id, shader_file) in dispatch_shaders {
+            let dispatch = mounted_bound.dispatch(pedal_id, node_id).unwrap();
             if !loaded_families.insert(dispatch.reusable_family_id.clone()) {
                 continue;
             }
@@ -7383,6 +7557,84 @@ mod tests {
             vec![
                 0x86, 0x3f, 0x84, 0x3f, 0x80, 0x3f, 0x7f, 0x3f, 0x83, 0x3f, 0x84, 0x3f, 0x88, 0x3f,
                 0x83, 0x3f,
+            ]
+        );
+    }
+
+    #[test]
+    fn resident_pedalboard_runner_executes_attention_layer_02_with_per_pedal_kv_state() {
+        let device = match VulkanComputeDevice::new() {
+            Ok(device) => device,
+            Err(error) => {
+                eprintln!("skipping resident attention pedalboard runner: {error}");
+                return;
+            }
+        };
+        let (tensor_index, mounted, _manifest, mounted_bound) =
+            mount_lfm2_single_device_stream_circuit(&device);
+        let Some(loaded_manifest) =
+            lfm2_level_1_loaded_kernel_pack_through_layer_02(&mounted, &mounted_bound)
+        else {
+            eprintln!(
+                "skipping resident attention pedalboard runner: no GLSL to SPIR-V compiler found"
+            );
+            return;
+        };
+        load_layer_00_parameters(&mounted, &tensor_index);
+        load_lfm2_conv_layer_parameters(&mounted, &tensor_index, 1);
+        load_lfm2_attention_layer_parameters(&mounted, &tensor_index, 2);
+        write_layer_00_unit_input_and_zero_state(&mounted);
+        zero_lfm2_temporal_memory(&mounted, "layer_01");
+        zero_lfm2_kv_memory(&mounted, "layer_02");
+
+        let runner = mounted
+            .create_resident_pedalboard_runner(
+                &device,
+                &mounted_bound,
+                ["layer_00", "layer_01", "layer_02"],
+                &loaded_manifest,
+            )
+            .unwrap();
+        assert_eq!(runner.device_id, "gpu0");
+        assert_eq!(runner.pedal_count(), 3);
+        assert_eq!(runner.pedal_ids(), vec!["layer_00", "layer_01", "layer_02"]);
+        assert_eq!(runner.dispatch_count(), 51);
+        assert_eq!(runner.total_descriptor_count, 167);
+        assert_eq!(runner.total_push_constant_byte_count, 816);
+
+        let run = runner
+            .run_with_stream_control(
+                &device,
+                VulkanMountedPlacedStreamControl {
+                    stream_tick: 0,
+                    control_flags: 0,
+                    dynamic_state_capacity_activations: mounted
+                        .buffers
+                        .dynamic_state_capacity_activations
+                        as u32,
+                },
+            )
+            .unwrap();
+        assert_eq!(run.device_id, "gpu0");
+        assert_eq!(run.pedal_count(), 3);
+        assert_eq!(run.pedal_ids(), vec!["layer_00", "layer_01", "layer_02"]);
+        assert_eq!(run.dispatch_count(), 51);
+
+        let kv_memory = mounted
+            .buffers
+            .state_buffer("layer_02", "kv_memory")
+            .unwrap();
+        assert_ne!(kv_memory.buffer.read_bytes(16).unwrap(), vec![0; 16]);
+
+        let layer_02_output_dispatch = mounted_bound.dispatch("layer_02", "ffn_residual").unwrap();
+        let layer_02_output_bindings = mounted
+            .resident_kernel_buffer_bindings_for_bound_dispatch(layer_02_output_dispatch)
+            .unwrap();
+        assert_eq!(
+            layer_02_output_bindings[2].buffer.read_bytes(16).unwrap(),
+            vec![
+                0x8b, 0x3f, 0x7e, 0x3f, 0x87, 0x3f, 0x6b, 0x3f, 0x71, 0x3f, 0x87, 0x3f, 0x8a, 0x3f,
+                0x7e, 0x3f,
             ]
         );
     }
