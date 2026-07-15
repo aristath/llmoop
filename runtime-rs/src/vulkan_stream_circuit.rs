@@ -534,6 +534,151 @@ impl From<VulkanError> for VulkanStreamCircuitMountError {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanKernelInterfacePlan {
+    pub backend_id: String,
+    pub circuits: Vec<VulkanCircuitKernelInterface>,
+}
+
+impl VulkanKernelInterfacePlan {
+    pub fn from_binding_plan(binding_plan: &VulkanStreamCircuitBindingPlan) -> Self {
+        Self {
+            backend_id: VULKAN_STREAM_CIRCUIT_BACKEND_ID.to_string(),
+            circuits: binding_plan
+                .circuits
+                .iter()
+                .map(VulkanCircuitKernelInterface::from_binding_plan)
+                .collect(),
+        }
+    }
+
+    pub fn total_kernel_count(&self) -> usize {
+        self.circuits
+            .iter()
+            .map(|circuit| circuit.kernels.len())
+            .sum()
+    }
+
+    pub fn kernel(&self, pedal_id: &str, node_id: &str) -> Option<&VulkanKernelInterface> {
+        self.circuits
+            .iter()
+            .find(|circuit| circuit.pedal_id == pedal_id)
+            .and_then(|circuit| circuit.kernel(node_id))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanCircuitKernelInterface {
+    pub pedal_id: String,
+    pub circuit_id: String,
+    pub kernels: Vec<VulkanKernelInterface>,
+}
+
+impl VulkanCircuitKernelInterface {
+    fn from_binding_plan(circuit: &VulkanCircuitBindingPlan) -> Self {
+        Self {
+            pedal_id: circuit.pedal_id.clone(),
+            circuit_id: circuit.circuit_id.clone(),
+            kernels: circuit
+                .nodes
+                .iter()
+                .map(|node| VulkanKernelInterface::from_node_binding(&circuit.pedal_id, node))
+                .collect(),
+        }
+    }
+
+    pub fn kernel(&self, node_id: &str) -> Option<&VulkanKernelInterface> {
+        self.kernels.iter().find(|kernel| kernel.node_id == node_id)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanKernelInterface {
+    pub kernel_id: String,
+    pub pedal_id: String,
+    pub node_index: usize,
+    pub node_id: String,
+    pub op: String,
+    pub inputs: Vec<VulkanSignalBinding>,
+    pub outputs: Vec<VulkanSignalBinding>,
+    pub parameters: Vec<VulkanParameterBinding>,
+    pub state_reads: Vec<VulkanStateBinding>,
+    pub state_writes: Vec<VulkanStateBinding>,
+    pub state_views: Vec<VulkanSignalBinding>,
+    pub stream_metadata: VulkanKernelStreamMetadata,
+}
+
+impl VulkanKernelInterface {
+    fn from_node_binding(pedal_id: &str, node: &VulkanNodeBinding) -> Self {
+        let state_views = node
+            .inputs
+            .iter()
+            .chain(&node.outputs)
+            .filter(|binding| matches!(binding.resource, VulkanSignalResource::StateView { .. }))
+            .cloned()
+            .collect();
+
+        Self {
+            kernel_id: format!("{}.{}", pedal_id, node.node_id),
+            pedal_id: pedal_id.to_string(),
+            node_index: node.node_index,
+            node_id: node.node_id.clone(),
+            op: node.op.clone(),
+            inputs: node.inputs.clone(),
+            outputs: node.outputs.clone(),
+            parameters: node.parameters.clone(),
+            state_reads: node.state_reads.clone(),
+            state_writes: node.state_writes.clone(),
+            state_views,
+            stream_metadata: VulkanKernelStreamMetadata::for_op(&node.op),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanKernelStreamMetadata {
+    pub stream_tick: VulkanKernelScalarBinding,
+    pub control_flags: VulkanKernelScalarBinding,
+    pub dynamic_state_capacity_activations: VulkanKernelScalarBinding,
+    pub uses_stream_tick: bool,
+}
+
+impl VulkanKernelStreamMetadata {
+    fn for_op(op: &str) -> Self {
+        Self {
+            stream_tick: VulkanKernelScalarBinding::push_constant("stream_tick", "u64"),
+            control_flags: VulkanKernelScalarBinding::push_constant("control_flags", "u32"),
+            dynamic_state_capacity_activations: VulkanKernelScalarBinding::push_constant(
+                "dynamic_state_capacity_activations",
+                "u32",
+            ),
+            uses_stream_tick: matches!(op, "rotary_position_embedding" | "append_state_update"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanKernelScalarBinding {
+    pub name: String,
+    pub scalar_type: String,
+    pub source: VulkanKernelScalarSource,
+}
+
+impl VulkanKernelScalarBinding {
+    fn push_constant(name: impl Into<String>, scalar_type: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            scalar_type: scalar_type.into(),
+            source: VulkanKernelScalarSource::PushConstant,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VulkanKernelScalarSource {
+    PushConstant,
+}
+
 fn parameter_binding_index(
     resource_plan: &StreamCircuitResourcePlan,
     resident_plan: &VulkanStreamCircuitResidentPlan,
@@ -1246,6 +1391,116 @@ mod tests {
                 slot: 0,
                 bytes: Some(2048),
             }
+        );
+    }
+
+    #[test]
+    fn kernel_interfaces_describe_lfm2_compiled_pedal_abi() {
+        let graph = ResolvedLoweredPedalboard::from_index_file(lfm2_index_path()).unwrap();
+        let tensor_index = TensorIndex::from_json_file(lfm2_tensor_index_path()).unwrap();
+        let execution_plan =
+            StreamCircuitExecutionPlan::from_graph_with_tensor_index(&graph, &tensor_index)
+                .unwrap();
+        let resource_plan =
+            StreamCircuitResourcePlan::from_graph_and_plan(&graph, &execution_plan).unwrap();
+        let resident_plan = VulkanStreamCircuitResidentPlan::from_resource_plan(
+            &resource_plan,
+            Some(&tensor_index),
+            Some(2),
+        )
+        .unwrap();
+        let binding_plan = VulkanStreamCircuitBindingPlan::from_plans(
+            &execution_plan,
+            &resource_plan,
+            &resident_plan,
+        )
+        .unwrap();
+
+        let kernel_plan = VulkanKernelInterfacePlan::from_binding_plan(&binding_plan);
+
+        assert_eq!(kernel_plan.backend_id, VULKAN_STREAM_CIRCUIT_BACKEND_ID);
+        assert_eq!(kernel_plan.circuits.len(), 14);
+        assert_eq!(kernel_plan.total_kernel_count(), 242);
+
+        let conv_in = kernel_plan
+            .kernel("layer_00", "conv_in_projection")
+            .unwrap();
+        assert_eq!(conv_in.kernel_id, "layer_00.conv_in_projection");
+        assert_eq!(conv_in.op, "linear");
+        assert_eq!(conv_in.inputs.len(), 1);
+        assert_eq!(conv_in.outputs.len(), 1);
+        assert_eq!(conv_in.parameters.len(), 1);
+        assert!(conv_in.state_reads.is_empty());
+        assert!(conv_in.state_writes.is_empty());
+        assert!(conv_in.state_views.is_empty());
+        assert!(!conv_in.stream_metadata.uses_stream_tick);
+        assert_eq!(
+            conv_in.parameters[0],
+            VulkanParameterBinding {
+                param_id: "conv_in_projection".to_string(),
+                tensor: "model.layers.0.conv.in_proj.weight".to_string(),
+                byte_count: Some(6_291_456),
+            }
+        );
+        assert_eq!(
+            conv_in.outputs[0].resource,
+            VulkanSignalResource::ActivationSlot {
+                pedal_id: "layer_00".to_string(),
+                slot: 1,
+                bytes: Some(6144),
+            }
+        );
+
+        let q_rope = kernel_plan.kernel("layer_02", "q_rope").unwrap();
+        assert_eq!(q_rope.op, "rotary_position_embedding");
+        assert!(q_rope.stream_metadata.uses_stream_tick);
+        assert_eq!(
+            q_rope.stream_metadata.stream_tick,
+            VulkanKernelScalarBinding {
+                name: "stream_tick".to_string(),
+                scalar_type: "u64".to_string(),
+                source: VulkanKernelScalarSource::PushConstant,
+            }
+        );
+        assert_eq!(q_rope.stream_metadata.control_flags.name, "control_flags");
+        assert_eq!(
+            q_rope.outputs[0].resource,
+            VulkanSignalResource::ActivationSlot {
+                pedal_id: "layer_02".to_string(),
+                slot: 2,
+                bytes: Some(5120),
+            }
+        );
+
+        let kv_append = kernel_plan.kernel("layer_02", "kv_memory_append").unwrap();
+        assert_eq!(kv_append.op, "append_state_update");
+        assert!(kv_append.stream_metadata.uses_stream_tick);
+        assert_eq!(kv_append.inputs.len(), 3);
+        assert_eq!(kv_append.outputs.len(), 2);
+        assert_eq!(kv_append.state_reads.len(), 1);
+        assert_eq!(kv_append.state_writes.len(), 1);
+        assert_eq!(kv_append.state_views.len(), 2);
+        assert_eq!(
+            kv_append.inputs[2].resource,
+            VulkanSignalResource::StateBuffer {
+                pedal_id: "layer_02".to_string(),
+                state_id: "kv_memory".to_string(),
+                static_bytes: None,
+                bytes_per_activation: Some(2048),
+            }
+        );
+        assert!(
+            kv_append
+                .state_views
+                .iter()
+                .all(|view| matches!(view.resource, VulkanSignalResource::StateView { .. }))
+        );
+        assert_eq!(
+            kv_append
+                .stream_metadata
+                .dynamic_state_capacity_activations
+                .name,
+            "dynamic_state_capacity_activations"
         );
     }
 
