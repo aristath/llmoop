@@ -100,6 +100,12 @@ struct VulkanU32StreamAdvance {
     public_token: Option<TokenId>,
 }
 
+struct VulkanU32QueuedAdvance {
+    input: InputSignal,
+    public_output: Option<PublicOutputSignal>,
+    has_more_work: bool,
+}
+
 struct VulkanU32MountedStream {
     ports: VulkanU32StreamPorts,
 }
@@ -205,6 +211,48 @@ impl VulkanU32Stream {
             .pop_front()
             .or_else(|| self.pending_feedback.pop_front())
     }
+
+    fn advance_queued_once(
+        &mut self,
+        device: &VulkanComputeDevice,
+        pedalboard: &VulkanU32Pedalboard,
+        dispatch_tick: u64,
+    ) -> Result<Option<VulkanU32QueuedAdvance>, VulkanBackendError> {
+        let input = self.next_input();
+        let can_emit =
+            input.is_some() && self.remaining_outputs > 0 && self.pending_external.is_empty();
+        let Some(input) = input else {
+            return Ok(None);
+        };
+
+        let advance = self
+            .mounted
+            .advance_once(device, pedalboard, input.token_id, can_emit)?;
+        let public_output = advance.public_token.map(|public_token| {
+            let public = PublicOutputSignal::token(
+                format!("public_{}", self.public_counter),
+                public_token,
+                dispatch_tick,
+            );
+            self.public_counter += 1;
+            self.remaining_outputs -= 1;
+
+            let feedback = InputSignal::feedback(
+                format!("feedback_{}", self.feedback_counter),
+                advance.private_feedback_token,
+            );
+            self.feedback_counter += 1;
+            self.pending_feedback.push_back(feedback);
+
+            public
+        });
+
+        Ok(Some(VulkanU32QueuedAdvance {
+            input,
+            public_output,
+            has_more_work: self.has_work(),
+        }))
+    }
 }
 
 pub struct VulkanU32Backend {
@@ -301,21 +349,6 @@ impl VulkanU32Backend {
         if !self.active_queue.iter().any(|active| active == stream_id) {
             self.active_queue.push_back(stream_id.to_string());
         }
-    }
-
-    fn advance_stream_once(
-        &self,
-        stream_id: &str,
-        token_id: TokenId,
-        emit_public: bool,
-    ) -> Result<VulkanU32StreamAdvance, VulkanBackendError> {
-        let stream = self
-            .streams
-            .get(stream_id)
-            .ok_or_else(|| BackendError::UnknownStream(stream_id.to_string()))?;
-        stream
-            .mounted
-            .advance_once(&self.device, &self.pedalboard, token_id, emit_public)
     }
 }
 
@@ -443,53 +476,32 @@ impl DeviceBackend for VulkanU32Backend {
                 .expect("queue checked as non-empty");
             let dispatch_tick = self.dispatch_tick;
 
-            let (input, can_emit) = {
-                let stream = self.stream_mut(&stream_id)?;
-                let input = stream.next_input();
-                let can_emit = input.is_some()
-                    && stream.remaining_outputs > 0
-                    && stream.pending_external.is_empty();
-                (input, can_emit)
+            let advance = {
+                let device = &self.device;
+                let pedalboard = &self.pedalboard;
+                let stream = self
+                    .streams
+                    .get_mut(&stream_id)
+                    .ok_or_else(|| BackendError::UnknownStream(stream_id.clone()))?;
+                stream.advance_queued_once(device, pedalboard, dispatch_tick)?
             };
-            let Some(input) = input else {
+            let Some(advance) = advance else {
                 continue;
             };
 
-            let advance = self.advance_stream_once(&stream_id, input.token_id, can_emit)?;
-            let mut output = None;
-            let reschedule = {
-                let device_id = self.device_id.clone();
-                let stream = self.stream_mut(&stream_id)?;
-                if let Some(public_token) = advance.public_token {
-                    let public = PublicOutputSignal::token(
-                        format!("public_{}", stream.public_counter),
-                        public_token,
-                        dispatch_tick,
-                    );
-                    stream.public_counter += 1;
-                    stream.remaining_outputs -= 1;
-                    let feedback = InputSignal::feedback(
-                        format!("feedback_{}", stream.feedback_counter),
-                        advance.private_feedback_token,
-                    );
-                    stream.feedback_counter += 1;
-                    stream.pending_feedback.push_back(feedback);
-                    output = Some(DeviceOutputEvent {
-                        device_id,
-                        stream_id: stream_id.clone(),
-                        output: public,
-                        dispatch_tick,
-                    });
-                }
-                stream.has_work()
-            };
+            let output = advance.public_output.map(|public| DeviceOutputEvent {
+                device_id: self.device_id.clone(),
+                stream_id: stream_id.clone(),
+                output: public,
+                dispatch_tick,
+            });
 
             self.dispatch_tick += 1;
             ticks.push(DeviceDispatchTick {
                 device_id: self.device_id.clone(),
                 dispatch_tick,
                 stream_id: stream_id.clone(),
-                input,
+                input: advance.input,
                 status: "processed".to_string(),
             });
 
@@ -497,7 +509,7 @@ impl DeviceBackend for VulkanU32Backend {
                 self.output_queue.push(event.clone());
                 outputs.push(event);
             }
-            if reschedule {
+            if advance.has_more_work {
                 self.schedule(&stream_id);
             }
         }
@@ -710,6 +722,43 @@ mod tests {
         assert_eq!(public_advance.public_token, Some(3));
         assert_eq!(mounted.ports.private_feedback.read(1).unwrap(), vec![3]);
         assert_eq!(mounted.ports.public_output.read(1).unwrap(), vec![3]);
+    }
+
+    #[test]
+    fn stream_advance_owns_queued_feedback_bookkeeping() {
+        let Some(backend) = backend_with_adders(1) else {
+            return;
+        };
+        let mut stream = match VulkanU32Stream::new(&backend.device) {
+            Ok(stream) => stream,
+            Err(error) => {
+                eprintln!("skipping stream advance smoke: {error}");
+                return;
+            }
+        };
+        stream
+            .pending_external
+            .push_back(InputSignal::external("input_0", 1, "test"));
+        stream.remaining_outputs = 1;
+
+        let advance = stream
+            .advance_queued_once(&backend.device, &backend.pedalboard, 7)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(advance.input.token_id, 1);
+        assert_eq!(advance.public_output.unwrap().token_id, 2);
+        assert_eq!(stream.public_counter, 1);
+        assert_eq!(stream.feedback_counter, 1);
+        assert_eq!(stream.remaining_outputs, 0);
+        assert_eq!(stream.pending_feedback.len(), 1);
+        assert_eq!(stream.pending_feedback[0].token_id, 2);
+        assert!(advance.has_more_work);
+        assert_eq!(stream.mounted.ports.public_output.read(1).unwrap(), vec![2]);
+        assert_eq!(
+            stream.mounted.ports.private_feedback.read(1).unwrap(),
+            vec![2]
+        );
     }
 
     #[test]
