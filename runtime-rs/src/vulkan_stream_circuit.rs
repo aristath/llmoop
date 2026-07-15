@@ -7600,6 +7600,103 @@ mod tests {
                                                         0x80, 0x3f, 0x80, 0x3f,
                                                     ]
                                                 );
+
+                                                mounted
+                                                    .parameter_buffers
+                                                    .load_parameter_from_tensor_index(
+                                                        &tensor_index,
+                                                        "model.layers.0.ffn_norm.weight",
+                                                    )
+                                                    .unwrap();
+                                                if let Some(ffn_norm_spirv_words) =
+                                                    crate::vulkan_compute::compile_test_shader_words_from_source(
+                                                        "rms_norm_bf16_serial.comp",
+                                                    )
+                                                {
+                                                    let ffn_norm_dispatch = mounted_bound
+                                                        .dispatch("layer_00", "ffn_norm")
+                                                        .unwrap();
+                                                    assert_eq!(ffn_norm_dispatch.op, "rms_norm");
+                                                    let ffn_norm_bindings = mounted
+                                                        .resident_kernel_buffer_bindings_for_bound_dispatch(
+                                                            ffn_norm_dispatch,
+                                                        )
+                                                        .unwrap();
+                                                    assert_eq!(ffn_norm_bindings.len(), 3);
+                                                    assert!(ffn_norm_bindings[0].byte_len >= 2_048);
+                                                    assert!(ffn_norm_bindings[1].byte_len >= 2_048);
+                                                    assert_eq!(ffn_norm_bindings[2].byte_len, 2_048);
+                                                    let ffn_norm_family = mounted
+                                                        .placed_plan
+                                                        .reusable_kernel_plan
+                                                        .family(
+                                                            &ffn_norm_dispatch.reusable_family_id,
+                                                        )
+                                                        .unwrap();
+                                                    let ffn_norm_artifact_path = format!(
+                                                        "kernels/{}.spv",
+                                                        ffn_norm_dispatch.reusable_family_id
+                                                    );
+                                                    let ffn_norm_kernel_manifest =
+                                                        VulkanLoadedReusableKernelArtifactManifest {
+                                                            schema:
+                                                                VULKAN_REUSABLE_KERNEL_ARTIFACT_MANIFEST_SCHEMA
+                                                                    .to_string(),
+                                                            backend_id:
+                                                                VULKAN_STREAM_CIRCUIT_BACKEND_ID
+                                                                    .to_string(),
+                                                            total_word_count:
+                                                                ffn_norm_spirv_words.len(),
+                                                            artifacts: vec![
+                                                                VulkanLoadedReusableKernelArtifact {
+                                                                    artifact:
+                                                                        VulkanReusableKernelArtifact::from_family(
+                                                                            ffn_norm_family,
+                                                                            ffn_norm_artifact_path.clone(),
+                                                                        ),
+                                                                    resolved_path: PathBuf::from(
+                                                                        ffn_norm_artifact_path,
+                                                                    ),
+                                                                    words: ffn_norm_spirv_words,
+                                                                },
+                                                            ],
+                                                        };
+                                                    let ffn_norm_resident_dispatch = mounted
+                                                        .create_resident_kernel_dispatch_for_bound_dispatch(
+                                                            &device,
+                                                            ffn_norm_dispatch,
+                                                            &ffn_norm_kernel_manifest,
+                                                        )
+                                                        .unwrap();
+                                                    assert_eq!(
+                                                        ffn_norm_resident_dispatch
+                                                            .workgroup_count_x(),
+                                                        1
+                                                    );
+
+                                                    device
+                                                        .run_resident_kernel_dispatch(
+                                                            &ffn_norm_resident_dispatch,
+                                                            &[0u8; 16],
+                                                        )
+                                                        .unwrap();
+
+                                                    assert_eq!(
+                                                        ffn_norm_bindings[1]
+                                                            .buffer
+                                                            .read_bytes(16)
+                                                            .unwrap(),
+                                                        vec![
+                                                            0x6b, 0x3e, 0x6e, 0x3e, 0x69, 0x3e,
+                                                            0x6e, 0x3e, 0x78, 0x3e, 0x6e, 0x3e,
+                                                            0x79, 0x3e, 0x99, 0x3e,
+                                                        ]
+                                                    );
+                                                } else {
+                                                    eprintln!(
+                                                        "skipping BF16 FFN RMSNorm Vulkan dispatch: no GLSL to SPIR-V compiler found"
+                                                    );
+                                                }
                                             } else {
                                                 eprintln!(
                                                     "skipping BF16 operator residual Vulkan dispatch: no GLSL to SPIR-V compiler found"
