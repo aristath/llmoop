@@ -6848,9 +6848,17 @@ mod tests {
     }
 
     fn write_layer_00_unit_input_and_zero_state(mounted: &VulkanMountedPlacedStreamCircuit) {
+        write_layer_00_constant_input(mounted, [0x80, 0x3f]);
+        zero_lfm2_temporal_memory(mounted, "layer_00");
+    }
+
+    fn write_layer_00_constant_input(
+        mounted: &VulkanMountedPlacedStreamCircuit,
+        bf16_little_endian: [u8; 2],
+    ) {
         let mut input_frame = Vec::with_capacity(2_048);
         for _ in 0..1024 {
-            input_frame.extend_from_slice(&[0x80, 0x3f]);
+            input_frame.extend_from_slice(&bf16_little_endian);
         }
         mounted
             .boundary_io
@@ -6859,7 +6867,6 @@ mod tests {
             .buffer
             .write_bytes(&input_frame)
             .unwrap();
-        zero_lfm2_temporal_memory(mounted, "layer_00");
     }
 
     fn zero_lfm2_temporal_memory(mounted: &VulkanMountedPlacedStreamCircuit, pedal_id: &str) {
@@ -7637,6 +7644,111 @@ mod tests {
                 0x7e, 0x3f,
             ]
         );
+    }
+
+    #[test]
+    fn resident_attention_pedal_reuses_kv_state_across_stream_ticks() {
+        let device = match VulkanComputeDevice::new() {
+            Ok(device) => device,
+            Err(error) => {
+                eprintln!("skipping resident multi-tick attention runner: {error}");
+                return;
+            }
+        };
+        let (tensor_index, mounted, _manifest, mounted_bound) =
+            mount_lfm2_single_device_stream_circuit(&device);
+        let Some(loaded_manifest) =
+            lfm2_level_1_loaded_kernel_pack_through_layer_02(&mounted, &mounted_bound)
+        else {
+            eprintln!(
+                "skipping resident multi-tick attention runner: no GLSL to SPIR-V compiler found"
+            );
+            return;
+        };
+        load_layer_00_parameters(&mounted, &tensor_index);
+        load_lfm2_conv_layer_parameters(&mounted, &tensor_index, 1);
+        load_lfm2_attention_layer_parameters(&mounted, &tensor_index, 2);
+        write_layer_00_unit_input_and_zero_state(&mounted);
+        zero_lfm2_temporal_memory(&mounted, "layer_01");
+        zero_lfm2_kv_memory(&mounted, "layer_02");
+
+        let runner = mounted
+            .create_resident_pedalboard_runner(
+                &device,
+                &mounted_bound,
+                ["layer_00", "layer_01", "layer_02"],
+                &loaded_manifest,
+            )
+            .unwrap();
+        let layer_02_runner = mounted
+            .create_resident_pedal_runner(&device, &mounted_bound, "layer_02", &loaded_manifest)
+            .unwrap();
+        let dynamic_state_capacity_activations =
+            mounted.buffers.dynamic_state_capacity_activations as u32;
+
+        runner
+            .run_with_stream_control(
+                &device,
+                VulkanMountedPlacedStreamControl {
+                    stream_tick: 0,
+                    control_flags: 0,
+                    dynamic_state_capacity_activations,
+                },
+            )
+            .unwrap();
+        let kv_memory = mounted
+            .buffers
+            .state_buffer("layer_02", "kv_memory")
+            .unwrap();
+        let kv_after_tick_0 = kv_memory.buffer.read_bytes(2_064).unwrap();
+        let tick_0_slot_0 = kv_after_tick_0[0..16].to_vec();
+        assert_ne!(tick_0_slot_0, vec![0; 16]);
+        assert_eq!(&kv_after_tick_0[2_048..2_064], &[0u8; 16]);
+
+        write_layer_00_constant_input(&mounted, [0x00, 0x3f]);
+        runner
+            .run_with_stream_control(
+                &device,
+                VulkanMountedPlacedStreamControl {
+                    stream_tick: 1,
+                    control_flags: 0,
+                    dynamic_state_capacity_activations,
+                },
+            )
+            .unwrap();
+
+        let layer_02_output_dispatch = mounted_bound.dispatch("layer_02", "ffn_residual").unwrap();
+        let layer_02_output_bindings = mounted
+            .resident_kernel_buffer_bindings_for_bound_dispatch(layer_02_output_dispatch)
+            .unwrap();
+        let historical_output = layer_02_output_bindings[2]
+            .buffer
+            .read_bytes(2_048)
+            .unwrap();
+        let kv_after_tick_1 = kv_memory.buffer.read_bytes(4_112).unwrap();
+        assert_eq!(&kv_after_tick_1[0..16], tick_0_slot_0.as_slice());
+        assert_ne!(&kv_after_tick_1[2_048..2_064], &[0u8; 16]);
+        assert_ne!(&kv_after_tick_1[2_048..2_064], tick_0_slot_0.as_slice());
+
+        zero_lfm2_kv_memory(&mounted, "layer_02");
+        layer_02_runner
+            .run_with_stream_control(
+                &device,
+                VulkanMountedPlacedStreamControl {
+                    stream_tick: 1,
+                    control_flags: 0,
+                    dynamic_state_capacity_activations,
+                },
+            )
+            .unwrap();
+        let no_history_output = layer_02_output_bindings[2]
+            .buffer
+            .read_bytes(2_048)
+            .unwrap();
+        let kv_after_no_history = kv_memory.buffer.read_bytes(4_112).unwrap();
+        assert_eq!(&kv_after_no_history[0..16], &[0u8; 16]);
+        assert_ne!(&kv_after_no_history[2_048..2_064], &[0u8; 16]);
+        assert_ne!(historical_output, no_history_output);
     }
 
     #[test]
