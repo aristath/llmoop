@@ -8,16 +8,22 @@ use crate::types::{
     ControlCommand, DeviceDispatchRun, DeviceDispatchTick, DeviceMemoryPlan, DeviceOutputEvent,
     DispatchStatus, ForkPolicy, ForkRequest, HostPortsManifest, InputSignal,
     InstalledProcessorManifest, MemoryRegion, MemoryRegionKind, MemorySharing,
-    PermanentCircuitManifest, PromptInjection, PublicOutputSignal, RandomPolicy, StreamId,
-    StreamTemplate, TokenId,
+    PermanentCircuitManifest, PromptInjection, PublicOutputSignal, RandomPolicy, StateAllocation,
+    StreamId, StreamTemplate, TokenId,
 };
 use crate::vulkan::{
     VULKAN_SPIRV_BACKEND_ID, VulkanBackendArtifactManifest, VulkanBackendDescriptor,
 };
 use crate::vulkan_compute::{
-    VulkanComputeDevice, VulkanError, VulkanPipelineCacheStats, VulkanU32ShaderPedal,
+    VulkanComputeDevice, VulkanError, VulkanPipelineCacheStats, VulkanU32ResidentBuffer,
+    VulkanU32ShaderPedal,
 };
 use crate::vulkan_pedalboard::VulkanU32Pedalboard;
+
+const VULKAN_U32_TOKEN_PORT_CAPACITY: usize = 1;
+const VULKAN_U32_STREAM_PORT_COUNT: usize = 3;
+const VULKAN_U32_STREAM_PORT_BYTES: usize =
+    VULKAN_U32_STREAM_PORT_COUNT * std::mem::size_of::<u32>();
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum VulkanBackendError {
@@ -54,8 +60,43 @@ impl From<VulkanError> for VulkanBackendError {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+struct VulkanU32StreamPorts {
+    signal_frame: VulkanU32ResidentBuffer,
+    public_output: VulkanU32ResidentBuffer,
+    private_feedback: VulkanU32ResidentBuffer,
+}
+
+impl VulkanU32StreamPorts {
+    fn new(device: &VulkanComputeDevice) -> Result<Self, VulkanError> {
+        let ports = Self {
+            signal_frame: device.create_u32_resident_buffer(VULKAN_U32_TOKEN_PORT_CAPACITY)?,
+            public_output: device.create_u32_resident_buffer(VULKAN_U32_TOKEN_PORT_CAPACITY)?,
+            private_feedback: device.create_u32_resident_buffer(VULKAN_U32_TOKEN_PORT_CAPACITY)?,
+        };
+        ports.clear()?;
+        Ok(ports)
+    }
+
+    fn clone_from(device: &VulkanComputeDevice, source: &Self) -> Result<Self, VulkanError> {
+        let ports = Self::new(device)?;
+        ports.signal_frame.write(&source.signal_frame.read(1)?)?;
+        ports.public_output.write(&source.public_output.read(1)?)?;
+        ports
+            .private_feedback
+            .write(&source.private_feedback.read(1)?)?;
+        Ok(ports)
+    }
+
+    fn clear(&self) -> Result<(), VulkanError> {
+        self.signal_frame.write(&[0])?;
+        self.public_output.write(&[0])?;
+        self.private_feedback.write(&[0])?;
+        Ok(())
+    }
+}
+
 struct VulkanU32Stream {
+    ports: VulkanU32StreamPorts,
     pending_external: VecDeque<InputSignal>,
     pending_feedback: VecDeque<InputSignal>,
     remaining_outputs: u32,
@@ -65,6 +106,40 @@ struct VulkanU32Stream {
 }
 
 impl VulkanU32Stream {
+    fn new(device: &VulkanComputeDevice) -> Result<Self, VulkanError> {
+        Ok(Self {
+            ports: VulkanU32StreamPorts::new(device)?,
+            pending_external: VecDeque::new(),
+            pending_feedback: VecDeque::new(),
+            remaining_outputs: 0,
+            input_counter: 0,
+            public_counter: 0,
+            feedback_counter: 0,
+        })
+    }
+
+    fn fork_clone(&self, device: &VulkanComputeDevice) -> Result<Self, VulkanError> {
+        Ok(Self {
+            ports: VulkanU32StreamPorts::clone_from(device, &self.ports)?,
+            pending_external: self.pending_external.clone(),
+            pending_feedback: self.pending_feedback.clone(),
+            remaining_outputs: self.remaining_outputs,
+            input_counter: self.input_counter,
+            public_counter: self.public_counter,
+            feedback_counter: self.feedback_counter,
+        })
+    }
+
+    fn reset_state(&mut self) -> Result<(), VulkanError> {
+        self.pending_external.clear();
+        self.pending_feedback.clear();
+        self.remaining_outputs = 0;
+        self.input_counter = 0;
+        self.public_counter = 0;
+        self.feedback_counter = 0;
+        self.ports.clear()
+    }
+
     fn has_work(&self) -> bool {
         !self.pending_external.is_empty() || !self.pending_feedback.is_empty()
     }
@@ -172,16 +247,34 @@ impl VulkanU32Backend {
         }
     }
 
-    fn process_token(&self, token_id: TokenId) -> Result<TokenId, VulkanBackendError> {
+    fn process_stream_token(
+        &self,
+        stream_id: &str,
+        token_id: TokenId,
+    ) -> Result<TokenId, VulkanBackendError> {
         let token =
             u32::try_from(token_id).map_err(|_| VulkanBackendError::InvalidToken(token_id))?;
-        let run = self.pedalboard.process(&self.device, &[token])?;
+        let stream = self
+            .streams
+            .get(stream_id)
+            .ok_or_else(|| BackendError::UnknownStream(stream_id.to_string()))?;
+        stream.ports.signal_frame.write(&[token])?;
+        let run = self
+            .pedalboard
+            .process_resident(&self.device, &stream.ports.signal_frame, 1)?;
         let output = run
             .output
             .first()
             .copied()
             .ok_or(VulkanBackendError::EmptyPedalOutput)?;
+        stream.ports.private_feedback.write(&[output])?;
         Ok(TokenId::from(output))
+    }
+}
+
+impl Drop for VulkanU32Backend {
+    fn drop(&mut self) {
+        self.streams.clear();
     }
 }
 
@@ -205,7 +298,7 @@ impl DeviceBackend for VulkanU32Backend {
             return Err(BackendError::DuplicateStream(stream_id.to_string()).into());
         }
         self.streams
-            .insert(stream_id.to_string(), VulkanU32Stream::default());
+            .insert(stream_id.to_string(), VulkanU32Stream::new(&self.device)?);
         Ok(())
     }
 
@@ -259,7 +352,7 @@ impl DeviceBackend for VulkanU32Backend {
                 stream.remaining_outputs = 0;
             }
             ControlCommand::ResetState { .. } => {
-                *stream = VulkanU32Stream::default();
+                stream.reset_state()?;
             }
             ControlCommand::ReseedRandom { .. } => {}
         }
@@ -278,8 +371,8 @@ impl DeviceBackend for VulkanU32Backend {
                 .streams
                 .get(&request.parent_stream_id)
                 .ok_or_else(|| BackendError::UnknownStream(request.parent_stream_id.clone()))?
-                .clone(),
-            ForkPolicy::Fresh => VulkanU32Stream::default(),
+                .fork_clone(&self.device)?,
+            ForkPolicy::Fresh => VulkanU32Stream::new(&self.device)?,
         };
         let child_has_work = child.has_work();
         self.streams.insert(request.child_stream_id.clone(), child);
@@ -315,12 +408,15 @@ impl DeviceBackend for VulkanU32Backend {
                 continue;
             };
 
-            let processed_token = self.process_token(input.token_id)?;
+            let processed_token = self.process_stream_token(&stream_id, input.token_id)?;
             let mut output = None;
             let reschedule = {
                 let device_id = self.device_id.clone();
                 let stream = self.stream_mut(&stream_id)?;
                 if can_emit {
+                    let public_token = u32::try_from(processed_token)
+                        .map_err(|_| VulkanBackendError::InvalidToken(processed_token))?;
+                    stream.ports.public_output.write(&[public_token])?;
                     let public = PublicOutputSignal::token(
                         format!("public_{}", stream.public_counter),
                         processed_token,
@@ -402,7 +498,29 @@ impl DeviceBackend for VulkanU32Backend {
             },
             stream_template: StreamTemplate {
                 id: "stream_template".to_string(),
-                state_allocations: Vec::new(),
+                state_allocations: vec![
+                    StateAllocation {
+                        pedal_id: "stream_ports".to_string(),
+                        state_id: "signal_frame".to_string(),
+                        state_type: "u32_resident_signal_port".to_string(),
+                        static_shape: Some(vec![VULKAN_U32_TOKEN_PORT_CAPACITY]),
+                        elements_per_token: Some(1),
+                    },
+                    StateAllocation {
+                        pedal_id: "stream_ports".to_string(),
+                        state_id: "public_output".to_string(),
+                        state_type: "u32_resident_public_output_port".to_string(),
+                        static_shape: Some(vec![VULKAN_U32_TOKEN_PORT_CAPACITY]),
+                        elements_per_token: Some(1),
+                    },
+                    StateAllocation {
+                        pedal_id: "stream_ports".to_string(),
+                        state_id: "private_feedback".to_string(),
+                        state_type: "u32_resident_feedback_port".to_string(),
+                        static_shape: Some(vec![VULKAN_U32_TOKEN_PORT_CAPACITY]),
+                        elements_per_token: Some(1),
+                    },
+                ],
             },
             memory_plan: DeviceMemoryPlan {
                 regions: vec![
@@ -416,7 +534,7 @@ impl DeviceBackend for VulkanU32Backend {
                         id: "stream_transient_state".to_string(),
                         kind: MemoryRegionKind::StreamTransientState,
                         sharing: MemorySharing::PerStream,
-                        bytes: None,
+                        bytes: Some(VULKAN_U32_STREAM_PORT_BYTES),
                     },
                     MemoryRegion {
                         id: "input_queue".to_string(),
@@ -497,6 +615,77 @@ mod tests {
     }
 
     #[test]
+    fn vulkan_stream_ports_retain_signal_public_and_private_feedback() {
+        let Some(mut backend) = backend_with_adders(1) else {
+            return;
+        };
+        backend.create_stream("s0").unwrap();
+        backend
+            .inject_prompt(PromptInjection::new("s0", vec![1], 2))
+            .unwrap();
+
+        let run = backend.dispatch(16).unwrap();
+        let stream = backend.streams.get("s0").unwrap();
+
+        assert_eq!(run.status, DispatchStatus::Idle);
+        assert_eq!(stream.ports.signal_frame.read(1).unwrap(), vec![4]);
+        assert_eq!(stream.ports.public_output.read(1).unwrap(), vec![3]);
+        assert_eq!(stream.ports.private_feedback.read(1).unwrap(), vec![4]);
+    }
+
+    #[test]
+    fn vulkan_clone_fork_copies_resident_ports_without_sharing_them() {
+        let Some(mut backend) = backend_with_adders(1) else {
+            return;
+        };
+        backend.create_stream("parent").unwrap();
+        backend
+            .inject_prompt(PromptInjection::new("parent", vec![1], 1))
+            .unwrap();
+        backend.dispatch(1).unwrap();
+        backend
+            .fork_stream(ForkRequest {
+                parent_stream_id: "parent".to_string(),
+                child_stream_id: "child".to_string(),
+                state_policy: ForkPolicy::Clone,
+                random_policy: RandomPolicy::Clone,
+                random_seed: None,
+            })
+            .unwrap();
+
+        let parent_before_reset = backend.streams.get("parent").unwrap();
+        let child_before_reset = backend.streams.get("child").unwrap();
+        assert_eq!(
+            parent_before_reset.ports.private_feedback.read(1).unwrap(),
+            vec![2]
+        );
+        assert_eq!(
+            child_before_reset.ports.private_feedback.read(1).unwrap(),
+            vec![2]
+        );
+
+        backend
+            .control(
+                "parent",
+                ControlCommand::ResetState {
+                    reason: "test reset".to_string(),
+                },
+            )
+            .unwrap();
+
+        let parent_after_reset = backend.streams.get("parent").unwrap();
+        let child_after_reset = backend.streams.get("child").unwrap();
+        assert_eq!(
+            parent_after_reset.ports.private_feedback.read(1).unwrap(),
+            vec![0]
+        );
+        assert_eq!(
+            child_after_reset.ports.private_feedback.read(1).unwrap(),
+            vec![2]
+        );
+    }
+
+    #[test]
     fn vulkan_backend_uses_series_pedals_for_token_transform() {
         let Some(mut backend) = backend_with_adders(2) else {
             return;
@@ -528,6 +717,14 @@ mod tests {
             manifest.host_ports.private_feedback,
             "device_owned_insert_loop"
         );
+        assert_eq!(manifest.stream_template.state_allocations.len(), 3);
+        assert!(
+            manifest
+                .stream_template
+                .state_allocations
+                .iter()
+                .any(|allocation| allocation.state_id == "private_feedback")
+        );
         assert!(
             manifest
                 .memory_plan
@@ -541,6 +738,14 @@ mod tests {
                 .regions
                 .iter()
                 .any(|region| region.kind == MemoryRegionKind::StreamTransientState)
+        );
+        assert!(
+            manifest
+                .memory_plan
+                .regions
+                .iter()
+                .any(|region| region.id == "stream_transient_state"
+                    && region.bytes == Some(VULKAN_U32_STREAM_PORT_BYTES))
         );
     }
 

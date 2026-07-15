@@ -100,6 +100,29 @@ impl VulkanU32ShaderPedal {
         })
     }
 
+    pub fn process_resident(
+        &self,
+        device: &VulkanComputeDevice,
+        buffer: &VulkanU32ResidentBuffer,
+        len: usize,
+    ) -> Result<VulkanU32PedalRun, VulkanError> {
+        let input = buffer.read(len)?;
+        device.run_u32_storage_shader_on_resident_buffer(
+            &self.program.words,
+            buffer,
+            len,
+            self.local_size_x,
+        )?;
+        let output = buffer.read(len)?;
+        Ok(VulkanU32PedalRun {
+            pedal_id: self.program.pedal_id.clone(),
+            operator_type: self.program.operator_type.clone(),
+            device_name: device.device_name().to_string(),
+            input,
+            output,
+        })
+    }
+
     pub fn install_on_device(&self, device: &VulkanComputeDevice) -> Result<(), VulkanError> {
         device.install_u32_storage_shader(&self.program.words, self.local_size_x)
     }
@@ -136,6 +159,72 @@ struct VulkanU32StoragePipeline {
     pipeline_layout: vk::PipelineLayout,
     shader_module: vk::ShaderModule,
     pipeline: vk::Pipeline,
+}
+
+pub struct VulkanU32ResidentBuffer {
+    device: ash::Device,
+    buffer: vk::Buffer,
+    memory: vk::DeviceMemory,
+    capacity: usize,
+    byte_capacity: vk::DeviceSize,
+}
+
+impl VulkanU32ResidentBuffer {
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    pub fn write(&self, input: &[u32]) -> Result<(), VulkanError> {
+        let byte_len = self.byte_len(input.len())?;
+        unsafe { write_u32_memory(&self.device, self.memory, byte_len, input) }
+    }
+
+    pub fn read(&self, len: usize) -> Result<Vec<u32>, VulkanError> {
+        let byte_len = self.byte_len(len)?;
+        unsafe { read_u32_memory(&self.device, self.memory, byte_len, len) }
+    }
+
+    fn byte_len(&self, len: usize) -> Result<vk::DeviceSize, VulkanError> {
+        if len == 0 {
+            return Err(VulkanError(
+                "resident buffer length must not be zero".to_string(),
+            ));
+        }
+        if len > self.capacity {
+            return Err(VulkanError(format!(
+                "resident buffer capacity {} cannot hold {} u32 values",
+                self.capacity, len
+            )));
+        }
+        let byte_len = len
+            .checked_mul(std::mem::size_of::<u32>())
+            .ok_or_else(|| VulkanError("resident buffer byte length overflowed".to_string()))?
+            as vk::DeviceSize;
+        if byte_len > self.byte_capacity {
+            return Err(VulkanError(format!(
+                "resident buffer byte capacity {} cannot hold {} bytes",
+                self.byte_capacity, byte_len
+            )));
+        }
+        Ok(byte_len)
+    }
+
+    fn descriptor_buffer(&self, len: usize) -> Result<vk::DescriptorBufferInfo, VulkanError> {
+        Ok(vk::DescriptorBufferInfo {
+            buffer: self.buffer,
+            offset: 0,
+            range: self.byte_len(len)?,
+        })
+    }
+}
+
+impl Drop for VulkanU32ResidentBuffer {
+    fn drop(&mut self) {
+        unsafe {
+            self.device.destroy_buffer(self.buffer, None);
+            self.device.free_memory(self.memory, None);
+        }
+    }
 }
 
 impl VulkanComputeDevice {
@@ -205,6 +294,74 @@ impl VulkanComputeDevice {
         }
     }
 
+    pub fn create_u32_resident_buffer(
+        &self,
+        capacity: usize,
+    ) -> Result<VulkanU32ResidentBuffer, VulkanError> {
+        if capacity == 0 {
+            return Err(VulkanError(
+                "resident buffer capacity must not be zero".to_string(),
+            ));
+        }
+        let byte_capacity = capacity
+            .checked_mul(std::mem::size_of::<u32>())
+            .ok_or_else(|| VulkanError("resident buffer byte capacity overflowed".to_string()))?
+            as vk::DeviceSize;
+
+        unsafe {
+            let buffer_info = vk::BufferCreateInfo::default()
+                .size(byte_capacity)
+                .usage(vk::BufferUsageFlags::STORAGE_BUFFER)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE);
+            let buffer = self
+                .device
+                .create_buffer(&buffer_info, None)
+                .map_err(|error| {
+                    VulkanError(format!(
+                        "failed to create resident storage buffer: {error:?}"
+                    ))
+                })?;
+            let requirements = self.device.get_buffer_memory_requirements(buffer);
+            let memory_type_index = find_memory_type(
+                &self.instance,
+                self.physical_device,
+                requirements.memory_type_bits,
+                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+            )
+            .ok_or_else(|| {
+                VulkanError(
+                    "no host-visible coherent memory type for resident storage buffer".to_string(),
+                )
+            })?;
+            let memory_info = vk::MemoryAllocateInfo::default()
+                .allocation_size(requirements.size)
+                .memory_type_index(memory_type_index);
+            let memory = self
+                .device
+                .allocate_memory(&memory_info, None)
+                .map_err(|error| {
+                    VulkanError(format!(
+                        "failed to allocate resident storage buffer memory: {error:?}"
+                    ))
+                })?;
+            self.device
+                .bind_buffer_memory(buffer, memory, 0)
+                .map_err(|error| {
+                    VulkanError(format!(
+                        "failed to bind resident storage buffer memory: {error:?}"
+                    ))
+                })?;
+
+            Ok(VulkanU32ResidentBuffer {
+                device: self.device.clone(),
+                buffer,
+                memory,
+                capacity,
+                byte_capacity,
+            })
+        }
+    }
+
     pub fn install_u32_storage_shader(
         &self,
         spirv_words: &[u32],
@@ -236,50 +393,40 @@ impl VulkanComputeDevice {
             return Err(VulkanError("local_size_x must not be zero".to_string()));
         }
 
+        let resident_buffer = self.create_u32_resident_buffer(input.len())?;
+        resident_buffer.write(input)?;
+        self.run_u32_storage_shader_on_resident_buffer(
+            spirv_words,
+            &resident_buffer,
+            input.len(),
+            local_size_x,
+        )?;
+        resident_buffer.read(input.len())
+    }
+
+    pub fn run_u32_storage_shader_on_resident_buffer(
+        &self,
+        spirv_words: &[u32],
+        resident_buffer: &VulkanU32ResidentBuffer,
+        len: usize,
+        local_size_x: u32,
+    ) -> Result<(), VulkanError> {
+        if len == 0 {
+            return Err(VulkanError(
+                "resident dispatch length must not be zero".to_string(),
+            ));
+        }
+        if spirv_words.is_empty() {
+            return Err(VulkanError("SPIR-V module must not be empty".to_string()));
+        }
+        if local_size_x == 0 {
+            return Err(VulkanError("local_size_x must not be zero".to_string()));
+        }
+
         let (descriptor_set_layout, pipeline_layout, pipeline) =
             self.u32_storage_pipeline(spirv_words, local_size_x)?;
 
         unsafe {
-            let byte_len = std::mem::size_of_val(input) as vk::DeviceSize;
-            let buffer_info = vk::BufferCreateInfo::default()
-                .size(byte_len)
-                .usage(vk::BufferUsageFlags::STORAGE_BUFFER)
-                .sharing_mode(vk::SharingMode::EXCLUSIVE);
-            let buffer = self
-                .device
-                .create_buffer(&buffer_info, None)
-                .map_err(|error| {
-                    VulkanError(format!("failed to create storage buffer: {error:?}"))
-                })?;
-            let requirements = self.device.get_buffer_memory_requirements(buffer);
-            let memory_type_index = find_memory_type(
-                &self.instance,
-                self.physical_device,
-                requirements.memory_type_bits,
-                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-            )
-            .ok_or_else(|| {
-                VulkanError("no host-visible coherent memory type for storage buffer".to_string())
-            })?;
-            let memory_info = vk::MemoryAllocateInfo::default()
-                .allocation_size(requirements.size)
-                .memory_type_index(memory_type_index);
-            let memory = self
-                .device
-                .allocate_memory(&memory_info, None)
-                .map_err(|error| {
-                    VulkanError(format!(
-                        "failed to allocate storage buffer memory: {error:?}"
-                    ))
-                })?;
-            self.device
-                .bind_buffer_memory(buffer, memory, 0)
-                .map_err(|error| {
-                    VulkanError(format!("failed to bind storage buffer memory: {error:?}"))
-                })?;
-
-            write_u32_memory(&self.device, memory, byte_len, input)?;
-
             let set_layouts = [descriptor_set_layout];
             let pool_sizes = [vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::STORAGE_BUFFER,
@@ -304,11 +451,7 @@ impl VulkanComputeDevice {
                     VulkanError(format!("failed to allocate descriptor set: {error:?}"))
                 })?
                 .remove(0);
-            let descriptor_buffer = [vk::DescriptorBufferInfo {
-                buffer,
-                offset: 0,
-                range: byte_len,
-            }];
+            let descriptor_buffer = [resident_buffer.descriptor_buffer(len)?];
             let descriptor_writes = [vk::WriteDescriptorSet::default()
                 .dst_set(descriptor_set)
                 .dst_binding(0)
@@ -353,7 +496,7 @@ impl VulkanComputeDevice {
                 &[descriptor_set],
                 &[],
             );
-            let workgroups = (input.len() as u32).div_ceil(local_size_x);
+            let workgroups = (len as u32).div_ceil(local_size_x);
             self.device.cmd_dispatch(command_buffer, workgroups, 1, 1);
             self.device
                 .end_command_buffer(command_buffer)
@@ -370,14 +513,10 @@ impl VulkanComputeDevice {
                 VulkanError(format!("failed waiting for Vulkan queue: {error:?}"))
             })?;
 
-            let output = read_u32_memory(&self.device, memory, byte_len, input.len())?;
-
             self.device.destroy_command_pool(command_pool, None);
             self.device.destroy_descriptor_pool(descriptor_pool, None);
-            self.device.destroy_buffer(buffer, None);
-            self.device.free_memory(memory, None);
 
-            Ok(output)
+            Ok(())
         }
     }
 
@@ -754,6 +893,36 @@ mod tests {
     }
 
     #[test]
+    fn resident_buffer_can_be_reused_across_dispatches() {
+        let Some(spirv_words) = compile_test_shader_words() else {
+            eprintln!("skipping Vulkan smoke: no GLSL to SPIR-V compiler found");
+            return;
+        };
+        let device = match VulkanComputeDevice::new() {
+            Ok(device) => device,
+            Err(error) => {
+                eprintln!("skipping Vulkan smoke: {error}");
+                return;
+            }
+        };
+        let buffer = device.create_u32_resident_buffer(4).unwrap();
+
+        buffer.write(&[1, 2, 3]).unwrap();
+        device
+            .run_u32_storage_shader_on_resident_buffer(&spirv_words, &buffer, 3, 64)
+            .unwrap();
+        assert_eq!(buffer.read(3).unwrap(), vec![2, 3, 4]);
+
+        buffer.write(&[40, 41]).unwrap();
+        device
+            .run_u32_storage_shader_on_resident_buffer(&spirv_words, &buffer, 2, 64)
+            .unwrap();
+
+        assert_eq!(buffer.capacity(), 4);
+        assert_eq!(buffer.read(2).unwrap(), vec![41, 42]);
+    }
+
+    #[test]
     fn u32_shader_pedal_runs_on_compute_device() {
         let Some(spirv_words) = compile_test_shader_words() else {
             eprintln!("skipping Vulkan smoke: no GLSL to SPIR-V compiler found");
@@ -779,5 +948,31 @@ mod tests {
         assert!(!run.device_name.is_empty());
         assert_eq!(run.input, vec![4, 5, 6]);
         assert_eq!(run.output, vec![5, 6, 7]);
+    }
+
+    #[test]
+    fn u32_shader_pedal_can_process_a_resident_buffer() {
+        let Some(spirv_words) = compile_test_shader_words() else {
+            eprintln!("skipping Vulkan smoke: no GLSL to SPIR-V compiler found");
+            return;
+        };
+        let device = match VulkanComputeDevice::new() {
+            Ok(device) => device,
+            Err(error) => {
+                eprintln!("skipping Vulkan smoke: {error}");
+                return;
+            }
+        };
+        let pedal =
+            VulkanU32ShaderPedal::new("pedal_add_one", "u32_token_transform", spirv_words, 64)
+                .unwrap();
+        let buffer = device.create_u32_resident_buffer(3).unwrap();
+        buffer.write(&[8, 9, 10]).unwrap();
+
+        let run = pedal.process_resident(&device, &buffer, 3).unwrap();
+
+        assert_eq!(run.input, vec![8, 9, 10]);
+        assert_eq!(run.output, vec![9, 10, 11]);
+        assert_eq!(buffer.read(3).unwrap(), vec![9, 10, 11]);
     }
 }

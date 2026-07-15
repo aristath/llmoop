@@ -1,5 +1,6 @@
 use crate::vulkan_compute::{
-    VulkanComputeDevice, VulkanError, VulkanU32PedalRun, VulkanU32ShaderPedal,
+    VulkanComputeDevice, VulkanError, VulkanU32PedalRun, VulkanU32ResidentBuffer,
+    VulkanU32ShaderPedal,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -72,6 +73,25 @@ impl VulkanU32Pedalboard {
             device_name: device.device_name().to_string(),
             input: input.to_vec(),
             output: current,
+            steps,
+        })
+    }
+
+    pub fn process_resident(
+        &self,
+        device: &VulkanComputeDevice,
+        buffer: &VulkanU32ResidentBuffer,
+        len: usize,
+    ) -> Result<VulkanU32PedalboardRun, VulkanError> {
+        let input = buffer.read(len)?;
+        let mut steps = Vec::with_capacity(self.pedals.len());
+        for pedal in &self.pedals {
+            steps.push(pedal.process_resident(device, buffer, len)?);
+        }
+        Ok(VulkanU32PedalboardRun {
+            device_name: device.device_name().to_string(),
+            input,
+            output: buffer.read(len)?,
             steps,
         })
     }
@@ -157,5 +177,29 @@ mod tests {
         assert_eq!(run.input, vec![9, 10]);
         assert_eq!(run.output, vec![9, 10]);
         assert!(run.steps.is_empty());
+    }
+
+    #[test]
+    fn series_pedals_can_process_one_resident_signal_buffer() {
+        let Some(device) = test_device() else {
+            return;
+        };
+        let Some(first) = add_one_pedal("add_one_a") else {
+            return;
+        };
+        let Some(second) = add_one_pedal("add_one_b") else {
+            return;
+        };
+        let buffer = device.create_u32_resident_buffer(3).unwrap();
+        buffer.write(&[10, 20, 30]).unwrap();
+        let board = VulkanU32Pedalboard::new(vec![first, second]);
+        board.install(&device).unwrap();
+
+        let run = board.process_resident(&device, &buffer, 3).unwrap();
+
+        assert_eq!(run.input, vec![10, 20, 30]);
+        assert_eq!(run.output, vec![12, 22, 32]);
+        assert_eq!(run.steps.len(), 2);
+        assert_eq!(buffer.read(3).unwrap(), vec![12, 22, 32]);
     }
 }
