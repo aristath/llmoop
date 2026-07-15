@@ -746,6 +746,25 @@ pub struct VulkanPlacedCableIoBuffers {
 }
 
 impl VulkanPlacedCableIoBuffers {
+    pub fn buffer(
+        &self,
+        direction: VulkanPlacedCableDirection,
+        cable_index: usize,
+    ) -> Option<(usize, &VulkanPlacedCableBufferAllocation)> {
+        match direction {
+            VulkanPlacedCableDirection::Incoming => self
+                .incoming_buffers
+                .iter()
+                .enumerate()
+                .find(|(_, buffer)| buffer.endpoint.cable_index == cable_index),
+            VulkanPlacedCableDirection::Outgoing => self
+                .outgoing_buffers
+                .iter()
+                .enumerate()
+                .find(|(_, buffer)| buffer.endpoint.cable_index == cable_index),
+        }
+    }
+
     pub fn incoming_buffer(
         &self,
         cable_index: usize,
@@ -1239,6 +1258,17 @@ impl VulkanMountedPlacedStreamCircuit {
             &bound_plan,
             &self.placed_plan.placed_resident_plan,
         ))
+    }
+
+    pub fn mounted_placed_bound_dispatch_plan(
+        &self,
+        manifest: &VulkanReusableKernelArtifactManifest,
+    ) -> Result<VulkanMountedPlacedBoundDispatchPlan, VulkanBoundDispatchPlanError> {
+        let placed_bound_plan = self.placed_bound_dispatch_plan(manifest)?;
+        VulkanMountedPlacedBoundDispatchPlan::from_placed_bound_plan(
+            &placed_bound_plan,
+            &self.cable_io,
+        )
     }
 }
 
@@ -2838,6 +2868,267 @@ impl VulkanPlacedBoundDispatchPlan {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanMountedPlacedBoundDispatchPlan {
+    pub backend_id: String,
+    pub device_id: String,
+    pub dispatches: Vec<VulkanMountedPlacedBoundDispatch>,
+    pub total_descriptor_count: usize,
+    pub resident_descriptor_count: usize,
+    pub model_boundary_descriptor_count: usize,
+    pub local_cable_descriptor_count: usize,
+    pub cable_endpoint_descriptor_count: usize,
+    pub incoming_cable_descriptor_count: usize,
+    pub outgoing_cable_descriptor_count: usize,
+}
+
+impl VulkanMountedPlacedBoundDispatchPlan {
+    pub fn from_placed_bound_plan(
+        placed_bound_plan: &VulkanPlacedBoundDispatchPlan,
+        cable_io: &VulkanPlacedCableIoBuffers,
+    ) -> Result<Self, VulkanBoundDispatchPlanError> {
+        if placed_bound_plan.device_id != cable_io.plan.device_id {
+            return Err(VulkanBoundDispatchPlanError::CableIoDeviceMismatch {
+                plan_device_id: placed_bound_plan.device_id.clone(),
+                cable_io_device_id: cable_io.plan.device_id.clone(),
+            });
+        }
+
+        let mut resident_descriptor_count = 0usize;
+        let mut model_boundary_descriptor_count = 0usize;
+        let mut local_cable_descriptor_count = 0usize;
+        let mut cable_endpoint_descriptor_count = 0usize;
+        let mut incoming_cable_descriptor_count = 0usize;
+        let mut outgoing_cable_descriptor_count = 0usize;
+        let mut dispatches = Vec::with_capacity(placed_bound_plan.dispatches.len());
+
+        for dispatch in &placed_bound_plan.dispatches {
+            let mut descriptors = Vec::with_capacity(dispatch.descriptors.len());
+            for descriptor in &dispatch.descriptors {
+                let target = VulkanMountedPlacedBoundDescriptorTarget::from_placed_target(
+                    dispatch, descriptor, cable_io,
+                )?;
+                match target {
+                    VulkanMountedPlacedBoundDescriptorTarget::Resident { .. } => {
+                        resident_descriptor_count += 1;
+                    }
+                    VulkanMountedPlacedBoundDescriptorTarget::ModelInput { .. }
+                    | VulkanMountedPlacedBoundDescriptorTarget::ModelOutput { .. } => {
+                        model_boundary_descriptor_count += 1;
+                    }
+                    VulkanMountedPlacedBoundDescriptorTarget::LocalCableInput { .. }
+                    | VulkanMountedPlacedBoundDescriptorTarget::LocalCableOutput { .. } => {
+                        local_cable_descriptor_count += 1;
+                    }
+                    VulkanMountedPlacedBoundDescriptorTarget::IncomingCableBuffer { .. } => {
+                        incoming_cable_descriptor_count += 1;
+                        cable_endpoint_descriptor_count += 1;
+                    }
+                    VulkanMountedPlacedBoundDescriptorTarget::OutgoingCableBuffer { .. } => {
+                        outgoing_cable_descriptor_count += 1;
+                        cable_endpoint_descriptor_count += 1;
+                    }
+                }
+                descriptors.push(VulkanMountedPlacedBoundDescriptor {
+                    binding: descriptor.binding,
+                    usage: descriptor.usage.clone(),
+                    name: descriptor.name.clone(),
+                    target,
+                });
+            }
+
+            dispatches.push(VulkanMountedPlacedBoundDispatch {
+                dispatch_index: dispatch.dispatch_index,
+                kernel_id: dispatch.kernel_id.clone(),
+                pedal_id: dispatch.pedal_id.clone(),
+                circuit_id: dispatch.circuit_id.clone(),
+                node_index: dispatch.node_index,
+                node_id: dispatch.node_id.clone(),
+                op: dispatch.op.clone(),
+                reusable_family_id: dispatch.reusable_family_id.clone(),
+                artifact_path: dispatch.artifact_path.clone(),
+                entry_point: dispatch.entry_point.clone(),
+                local_size_x: dispatch.local_size_x,
+                descriptors,
+                push_constants: dispatch.push_constants.clone(),
+                uses_stream_tick: dispatch.uses_stream_tick,
+            });
+        }
+
+        let total_descriptor_count = resident_descriptor_count
+            + model_boundary_descriptor_count
+            + local_cable_descriptor_count
+            + cable_endpoint_descriptor_count;
+
+        Ok(Self {
+            backend_id: placed_bound_plan.backend_id.clone(),
+            device_id: placed_bound_plan.device_id.clone(),
+            dispatches,
+            total_descriptor_count,
+            resident_descriptor_count,
+            model_boundary_descriptor_count,
+            local_cable_descriptor_count,
+            cable_endpoint_descriptor_count,
+            incoming_cable_descriptor_count,
+            outgoing_cable_descriptor_count,
+        })
+    }
+
+    pub fn dispatch(
+        &self,
+        pedal_id: &str,
+        node_id: &str,
+    ) -> Option<&VulkanMountedPlacedBoundDispatch> {
+        self.dispatches
+            .iter()
+            .find(|dispatch| dispatch.pedal_id == pedal_id && dispatch.node_id == node_id)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanMountedPlacedBoundDispatch {
+    pub dispatch_index: usize,
+    pub kernel_id: String,
+    pub pedal_id: String,
+    pub circuit_id: String,
+    pub node_index: usize,
+    pub node_id: String,
+    pub op: String,
+    pub reusable_family_id: String,
+    pub artifact_path: String,
+    pub entry_point: String,
+    pub local_size_x: u32,
+    pub descriptors: Vec<VulkanMountedPlacedBoundDescriptor>,
+    pub push_constants: Vec<VulkanKernelScalarBinding>,
+    pub uses_stream_tick: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanMountedPlacedBoundDescriptor {
+    pub binding: usize,
+    pub usage: VulkanKernelDescriptorUsage,
+    pub name: String,
+    pub target: VulkanMountedPlacedBoundDescriptorTarget,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VulkanMountedPlacedBoundDescriptorTarget {
+    Resident {
+        target: VulkanBoundDescriptorTarget,
+    },
+    ModelInput {
+        signal_id: String,
+    },
+    ModelOutput {
+        signal_id: String,
+    },
+    LocalCableInput {
+        cable: PedalCablePlacement,
+    },
+    LocalCableOutput {
+        cable: PedalCablePlacement,
+    },
+    IncomingCableBuffer {
+        endpoint: VulkanPlacedCableEndpointBufferBinding,
+    },
+    OutgoingCableBuffer {
+        endpoint: VulkanPlacedCableEndpointBufferBinding,
+    },
+}
+
+impl VulkanMountedPlacedBoundDescriptorTarget {
+    fn from_placed_target(
+        dispatch: &VulkanPlacedBoundDispatch,
+        descriptor: &VulkanPlacedBoundDescriptor,
+        cable_io: &VulkanPlacedCableIoBuffers,
+    ) -> Result<Self, VulkanBoundDispatchPlanError> {
+        match &descriptor.target {
+            VulkanPlacedBoundDescriptorTarget::Resident { target } => Ok(Self::Resident {
+                target: target.clone(),
+            }),
+            VulkanPlacedBoundDescriptorTarget::ModelInput { signal_id } => Ok(Self::ModelInput {
+                signal_id: signal_id.clone(),
+            }),
+            VulkanPlacedBoundDescriptorTarget::ModelOutput { signal_id } => Ok(Self::ModelOutput {
+                signal_id: signal_id.clone(),
+            }),
+            VulkanPlacedBoundDescriptorTarget::LocalCableInput { cable } => {
+                Ok(Self::LocalCableInput {
+                    cable: cable.clone(),
+                })
+            }
+            VulkanPlacedBoundDescriptorTarget::LocalCableOutput { cable } => {
+                Ok(Self::LocalCableOutput {
+                    cable: cable.clone(),
+                })
+            }
+            VulkanPlacedBoundDescriptorTarget::IncomingCable { cable } => {
+                Ok(Self::IncomingCableBuffer {
+                    endpoint: bind_cable_endpoint_buffer(
+                        dispatch,
+                        descriptor,
+                        VulkanPlacedCableDirection::Incoming,
+                        cable.cable_index,
+                        cable_io,
+                    )?,
+                })
+            }
+            VulkanPlacedBoundDescriptorTarget::OutgoingCable { cable } => {
+                Ok(Self::OutgoingCableBuffer {
+                    endpoint: bind_cable_endpoint_buffer(
+                        dispatch,
+                        descriptor,
+                        VulkanPlacedCableDirection::Outgoing,
+                        cable.cable_index,
+                        cable_io,
+                    )?,
+                })
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanPlacedCableEndpointBufferBinding {
+    pub buffer_index: usize,
+    pub endpoint: VulkanPlacedCableEndpoint,
+    pub byte_capacity: usize,
+}
+
+fn bind_cable_endpoint_buffer(
+    dispatch: &VulkanPlacedBoundDispatch,
+    descriptor: &VulkanPlacedBoundDescriptor,
+    direction: VulkanPlacedCableDirection,
+    cable_index: usize,
+    cable_io: &VulkanPlacedCableIoBuffers,
+) -> Result<VulkanPlacedCableEndpointBufferBinding, VulkanBoundDispatchPlanError> {
+    let (buffer_index, allocation) = cable_io.buffer(direction, cable_index).ok_or_else(|| {
+        VulkanBoundDispatchPlanError::MissingCableEndpointBuffer {
+            dispatch_index: dispatch.dispatch_index,
+            binding: descriptor.binding,
+            direction,
+            cable_index,
+        }
+    })?;
+    if allocation.endpoint.byte_capacity != Some(allocation.byte_capacity) {
+        return Err(
+            VulkanBoundDispatchPlanError::CableEndpointByteCapacityMismatch {
+                dispatch_index: dispatch.dispatch_index,
+                binding: descriptor.binding,
+                cable_index,
+                endpoint_byte_capacity: allocation.endpoint.byte_capacity,
+                mounted_byte_capacity: allocation.byte_capacity,
+            },
+        );
+    }
+
+    Ok(VulkanPlacedCableEndpointBufferBinding {
+        buffer_index,
+        endpoint: allocation.endpoint.clone(),
+        byte_capacity: allocation.byte_capacity,
+    })
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VulkanPlacedBoundDispatch {
     pub dispatch_index: usize,
     pub kernel_id: String,
@@ -3164,6 +3455,10 @@ fn validate_bound_byte_capacity(
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum VulkanBoundDispatchPlanError {
     PreparedDispatch(VulkanPreparedDispatchPlanError),
+    CableIoDeviceMismatch {
+        plan_device_id: String,
+        cable_io_device_id: String,
+    },
     MissingStateBuffer {
         dispatch_index: usize,
         binding: usize,
@@ -3176,10 +3471,23 @@ pub enum VulkanBoundDispatchPlanError {
         pedal_id: String,
         slot: usize,
     },
+    MissingCableEndpointBuffer {
+        dispatch_index: usize,
+        binding: usize,
+        direction: VulkanPlacedCableDirection,
+        cable_index: usize,
+    },
     ByteCapacityMismatch {
         dispatch_index: usize,
         binding: usize,
         expected_byte_capacity: usize,
+        mounted_byte_capacity: usize,
+    },
+    CableEndpointByteCapacityMismatch {
+        dispatch_index: usize,
+        binding: usize,
+        cable_index: usize,
+        endpoint_byte_capacity: Option<usize>,
         mounted_byte_capacity: usize,
     },
 }
@@ -3188,6 +3496,13 @@ impl Display for VulkanBoundDispatchPlanError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::PreparedDispatch(error) => Display::fmt(error, f),
+            Self::CableIoDeviceMismatch {
+                plan_device_id,
+                cable_io_device_id,
+            } => write!(
+                f,
+                "placed bound plan for device {plan_device_id:?} cannot bind cable I/O for device {cable_io_device_id:?}"
+            ),
             Self::MissingStateBuffer {
                 dispatch_index,
                 binding,
@@ -3206,6 +3521,15 @@ impl Display for VulkanBoundDispatchPlanError {
                 f,
                 "dispatch {dispatch_index} descriptor {binding} references missing activation slot buffer {pedal_id}.slot_{slot}"
             ),
+            Self::MissingCableEndpointBuffer {
+                dispatch_index,
+                binding,
+                direction,
+                cable_index,
+            } => write!(
+                f,
+                "dispatch {dispatch_index} descriptor {binding} references missing {direction:?} cable endpoint buffer for cable {cable_index}"
+            ),
             Self::ByteCapacityMismatch {
                 dispatch_index,
                 binding,
@@ -3214,6 +3538,16 @@ impl Display for VulkanBoundDispatchPlanError {
             } => write!(
                 f,
                 "dispatch {dispatch_index} descriptor {binding} expects {expected_byte_capacity} bytes but mounted buffer has {mounted_byte_capacity} bytes"
+            ),
+            Self::CableEndpointByteCapacityMismatch {
+                dispatch_index,
+                binding,
+                cable_index,
+                endpoint_byte_capacity,
+                mounted_byte_capacity,
+            } => write!(
+                f,
+                "dispatch {dispatch_index} descriptor {binding} cable {cable_index} endpoint expects {endpoint_byte_capacity:?} bytes but mounted buffer has {mounted_byte_capacity} bytes"
             ),
         }
     }
@@ -4293,6 +4627,84 @@ mod tests {
                 .target,
             VulkanPlacedBoundDescriptorTarget::OutgoingCable {
                 cable: mounted.placed_plan.placed_resident_plan.outgoing_cables[0].clone(),
+            }
+        );
+
+        let mounted_bound = mounted
+            .mounted_placed_bound_dispatch_plan(&manifest)
+            .unwrap();
+        assert_eq!(mounted_bound.device_id, "gpu1");
+        assert_eq!(mounted_bound.dispatches.len(), 19);
+        assert_eq!(
+            mounted_bound.total_descriptor_count,
+            placed_bound.total_descriptor_count
+        );
+        assert_eq!(
+            mounted_bound.resident_descriptor_count,
+            placed_bound.resident_descriptor_count
+        );
+        assert_eq!(mounted_bound.model_boundary_descriptor_count, 0);
+        assert_eq!(mounted_bound.local_cable_descriptor_count, 0);
+        assert_eq!(mounted_bound.cable_endpoint_descriptor_count, 3);
+        assert_eq!(mounted_bound.incoming_cable_descriptor_count, 2);
+        assert_eq!(mounted_bound.outgoing_cable_descriptor_count, 1);
+        assert_eq!(
+            mounted_bound
+                .dispatch("layer_02", "operator_norm")
+                .unwrap()
+                .descriptors[0]
+                .target,
+            VulkanMountedPlacedBoundDescriptorTarget::IncomingCableBuffer {
+                endpoint: VulkanPlacedCableEndpointBufferBinding {
+                    buffer_index: 0,
+                    endpoint: mounted
+                        .cable_io
+                        .incoming_buffer(1)
+                        .unwrap()
+                        .endpoint
+                        .clone(),
+                    byte_capacity: 2_048,
+                },
+            }
+        );
+        assert_eq!(
+            mounted_bound
+                .dispatch("layer_02", "operator_residual")
+                .unwrap()
+                .descriptors[0]
+                .target,
+            VulkanMountedPlacedBoundDescriptorTarget::IncomingCableBuffer {
+                endpoint: VulkanPlacedCableEndpointBufferBinding {
+                    buffer_index: 0,
+                    endpoint: mounted
+                        .cable_io
+                        .incoming_buffer(1)
+                        .unwrap()
+                        .endpoint
+                        .clone(),
+                    byte_capacity: 2_048,
+                },
+            }
+        );
+        assert_eq!(
+            mounted_bound
+                .dispatch("layer_02", "ffn_residual")
+                .unwrap()
+                .descriptors
+                .last()
+                .unwrap()
+                .target,
+            VulkanMountedPlacedBoundDescriptorTarget::OutgoingCableBuffer {
+                endpoint: VulkanPlacedCableEndpointBufferBinding {
+                    buffer_index: 0,
+                    endpoint: mounted
+                        .cable_io
+                        .outgoing_buffer(2)
+                        .unwrap()
+                        .endpoint
+                        .clone(),
+                    byte_capacity: 2_048,
+                },
             }
         );
 
