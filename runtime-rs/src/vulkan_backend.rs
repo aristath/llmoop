@@ -95,8 +95,64 @@ impl VulkanU32StreamPorts {
     }
 }
 
-struct VulkanU32Stream {
+struct VulkanU32StreamAdvance {
+    private_feedback_token: TokenId,
+    public_token: Option<TokenId>,
+}
+
+struct VulkanU32MountedStream {
     ports: VulkanU32StreamPorts,
+}
+
+impl VulkanU32MountedStream {
+    fn new(device: &VulkanComputeDevice) -> Result<Self, VulkanError> {
+        Ok(Self {
+            ports: VulkanU32StreamPorts::new(device)?,
+        })
+    }
+
+    fn clone_from(device: &VulkanComputeDevice, source: &Self) -> Result<Self, VulkanError> {
+        Ok(Self {
+            ports: VulkanU32StreamPorts::clone_from(device, &source.ports)?,
+        })
+    }
+
+    fn reset(&self) -> Result<(), VulkanError> {
+        self.ports.clear()
+    }
+
+    fn advance_once(
+        &self,
+        device: &VulkanComputeDevice,
+        pedalboard: &VulkanU32Pedalboard,
+        input_token: TokenId,
+        emit_public: bool,
+    ) -> Result<VulkanU32StreamAdvance, VulkanBackendError> {
+        let token = u32::try_from(input_token)
+            .map_err(|_| VulkanBackendError::InvalidToken(input_token))?;
+        self.ports.signal_frame.write(&[token])?;
+
+        let run = pedalboard.process_resident(device, &self.ports.signal_frame, 1)?;
+        let output = run
+            .output
+            .first()
+            .copied()
+            .ok_or(VulkanBackendError::EmptyPedalOutput)?;
+        self.ports.private_feedback.write(&[output])?;
+        if emit_public {
+            self.ports.public_output.write(&[output])?;
+        }
+
+        let output_token = TokenId::from(output);
+        Ok(VulkanU32StreamAdvance {
+            private_feedback_token: output_token,
+            public_token: emit_public.then_some(output_token),
+        })
+    }
+}
+
+struct VulkanU32Stream {
+    mounted: VulkanU32MountedStream,
     pending_external: VecDeque<InputSignal>,
     pending_feedback: VecDeque<InputSignal>,
     remaining_outputs: u32,
@@ -108,7 +164,7 @@ struct VulkanU32Stream {
 impl VulkanU32Stream {
     fn new(device: &VulkanComputeDevice) -> Result<Self, VulkanError> {
         Ok(Self {
-            ports: VulkanU32StreamPorts::new(device)?,
+            mounted: VulkanU32MountedStream::new(device)?,
             pending_external: VecDeque::new(),
             pending_feedback: VecDeque::new(),
             remaining_outputs: 0,
@@ -120,7 +176,7 @@ impl VulkanU32Stream {
 
     fn fork_clone(&self, device: &VulkanComputeDevice) -> Result<Self, VulkanError> {
         Ok(Self {
-            ports: VulkanU32StreamPorts::clone_from(device, &self.ports)?,
+            mounted: VulkanU32MountedStream::clone_from(device, &self.mounted)?,
             pending_external: self.pending_external.clone(),
             pending_feedback: self.pending_feedback.clone(),
             remaining_outputs: self.remaining_outputs,
@@ -137,7 +193,7 @@ impl VulkanU32Stream {
         self.input_counter = 0;
         self.public_counter = 0;
         self.feedback_counter = 0;
-        self.ports.clear()
+        self.mounted.reset()
     }
 
     fn has_work(&self) -> bool {
@@ -247,28 +303,19 @@ impl VulkanU32Backend {
         }
     }
 
-    fn process_stream_token(
+    fn advance_stream_once(
         &self,
         stream_id: &str,
         token_id: TokenId,
-    ) -> Result<TokenId, VulkanBackendError> {
-        let token =
-            u32::try_from(token_id).map_err(|_| VulkanBackendError::InvalidToken(token_id))?;
+        emit_public: bool,
+    ) -> Result<VulkanU32StreamAdvance, VulkanBackendError> {
         let stream = self
             .streams
             .get(stream_id)
             .ok_or_else(|| BackendError::UnknownStream(stream_id.to_string()))?;
-        stream.ports.signal_frame.write(&[token])?;
-        let run = self
-            .pedalboard
-            .process_resident(&self.device, &stream.ports.signal_frame, 1)?;
-        let output = run
-            .output
-            .first()
-            .copied()
-            .ok_or(VulkanBackendError::EmptyPedalOutput)?;
-        stream.ports.private_feedback.write(&[output])?;
-        Ok(TokenId::from(output))
+        stream
+            .mounted
+            .advance_once(&self.device, &self.pedalboard, token_id, emit_public)
     }
 }
 
@@ -408,25 +455,22 @@ impl DeviceBackend for VulkanU32Backend {
                 continue;
             };
 
-            let processed_token = self.process_stream_token(&stream_id, input.token_id)?;
+            let advance = self.advance_stream_once(&stream_id, input.token_id, can_emit)?;
             let mut output = None;
             let reschedule = {
                 let device_id = self.device_id.clone();
                 let stream = self.stream_mut(&stream_id)?;
-                if can_emit {
-                    let public_token = u32::try_from(processed_token)
-                        .map_err(|_| VulkanBackendError::InvalidToken(processed_token))?;
-                    stream.ports.public_output.write(&[public_token])?;
+                if let Some(public_token) = advance.public_token {
                     let public = PublicOutputSignal::token(
                         format!("public_{}", stream.public_counter),
-                        processed_token,
+                        public_token,
                         dispatch_tick,
                     );
                     stream.public_counter += 1;
                     stream.remaining_outputs -= 1;
                     let feedback = InputSignal::feedback(
                         format!("feedback_{}", stream.feedback_counter),
-                        processed_token,
+                        advance.private_feedback_token,
                     );
                     stream.feedback_counter += 1;
                     stream.pending_feedback.push_back(feedback);
@@ -500,21 +544,21 @@ impl DeviceBackend for VulkanU32Backend {
                 id: "stream_template".to_string(),
                 state_allocations: vec![
                     StateAllocation {
-                        pedal_id: "stream_ports".to_string(),
+                        pedal_id: "mounted_stream".to_string(),
                         state_id: "signal_frame".to_string(),
                         state_type: "u32_resident_signal_port".to_string(),
                         static_shape: Some(vec![VULKAN_U32_TOKEN_PORT_CAPACITY]),
                         elements_per_token: Some(1),
                     },
                     StateAllocation {
-                        pedal_id: "stream_ports".to_string(),
+                        pedal_id: "mounted_stream".to_string(),
                         state_id: "public_output".to_string(),
                         state_type: "u32_resident_public_output_port".to_string(),
                         static_shape: Some(vec![VULKAN_U32_TOKEN_PORT_CAPACITY]),
                         elements_per_token: Some(1),
                     },
                     StateAllocation {
-                        pedal_id: "stream_ports".to_string(),
+                        pedal_id: "mounted_stream".to_string(),
                         state_id: "private_feedback".to_string(),
                         state_type: "u32_resident_feedback_port".to_string(),
                         static_shape: Some(vec![VULKAN_U32_TOKEN_PORT_CAPACITY]),
@@ -628,9 +672,44 @@ mod tests {
         let stream = backend.streams.get("s0").unwrap();
 
         assert_eq!(run.status, DispatchStatus::Idle);
-        assert_eq!(stream.ports.signal_frame.read(1).unwrap(), vec![4]);
-        assert_eq!(stream.ports.public_output.read(1).unwrap(), vec![3]);
-        assert_eq!(stream.ports.private_feedback.read(1).unwrap(), vec![4]);
+        assert_eq!(stream.mounted.ports.signal_frame.read(1).unwrap(), vec![4]);
+        assert_eq!(stream.mounted.ports.public_output.read(1).unwrap(), vec![3]);
+        assert_eq!(
+            stream.mounted.ports.private_feedback.read(1).unwrap(),
+            vec![4]
+        );
+    }
+
+    #[test]
+    fn mounted_stream_advance_owns_public_and_private_routing() {
+        let Some(backend) = backend_with_adders(1) else {
+            return;
+        };
+        let mounted = match VulkanU32MountedStream::new(&backend.device) {
+            Ok(mounted) => mounted,
+            Err(error) => {
+                eprintln!("skipping mounted stream smoke: {error}");
+                return;
+            }
+        };
+
+        let private_advance = mounted
+            .advance_once(&backend.device, &backend.pedalboard, 1, false)
+            .unwrap();
+
+        assert_eq!(private_advance.private_feedback_token, 2);
+        assert_eq!(private_advance.public_token, None);
+        assert_eq!(mounted.ports.private_feedback.read(1).unwrap(), vec![2]);
+        assert_eq!(mounted.ports.public_output.read(1).unwrap(), vec![0]);
+
+        let public_advance = mounted
+            .advance_once(&backend.device, &backend.pedalboard, 2, true)
+            .unwrap();
+
+        assert_eq!(public_advance.private_feedback_token, 3);
+        assert_eq!(public_advance.public_token, Some(3));
+        assert_eq!(mounted.ports.private_feedback.read(1).unwrap(), vec![3]);
+        assert_eq!(mounted.ports.public_output.read(1).unwrap(), vec![3]);
     }
 
     #[test]
@@ -656,11 +735,21 @@ mod tests {
         let parent_before_reset = backend.streams.get("parent").unwrap();
         let child_before_reset = backend.streams.get("child").unwrap();
         assert_eq!(
-            parent_before_reset.ports.private_feedback.read(1).unwrap(),
+            parent_before_reset
+                .mounted
+                .ports
+                .private_feedback
+                .read(1)
+                .unwrap(),
             vec![2]
         );
         assert_eq!(
-            child_before_reset.ports.private_feedback.read(1).unwrap(),
+            child_before_reset
+                .mounted
+                .ports
+                .private_feedback
+                .read(1)
+                .unwrap(),
             vec![2]
         );
 
@@ -676,11 +765,21 @@ mod tests {
         let parent_after_reset = backend.streams.get("parent").unwrap();
         let child_after_reset = backend.streams.get("child").unwrap();
         assert_eq!(
-            parent_after_reset.ports.private_feedback.read(1).unwrap(),
+            parent_after_reset
+                .mounted
+                .ports
+                .private_feedback
+                .read(1)
+                .unwrap(),
             vec![0]
         );
         assert_eq!(
-            child_after_reset.ports.private_feedback.read(1).unwrap(),
+            child_after_reset
+                .mounted
+                .ports
+                .private_feedback
+                .read(1)
+                .unwrap(),
             vec![2]
         );
     }
