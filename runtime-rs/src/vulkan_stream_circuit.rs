@@ -309,6 +309,12 @@ impl VulkanStreamCircuitStreamBuffers {
             .find(|buffer| buffer.pedal_id == pedal_id && buffer.state_id == state_id)
     }
 
+    pub fn state_buffer_index(&self, pedal_id: &str, state_id: &str) -> Option<usize> {
+        self.state_buffers
+            .iter()
+            .position(|buffer| buffer.pedal_id == pedal_id && buffer.state_id == state_id)
+    }
+
     pub fn activation_slot_buffer(
         &self,
         pedal_id: &str,
@@ -317,6 +323,12 @@ impl VulkanStreamCircuitStreamBuffers {
         self.activation_slot_buffers
             .iter()
             .find(|buffer| buffer.pedal_id == pedal_id && buffer.slot == slot)
+    }
+
+    pub fn activation_slot_buffer_index(&self, pedal_id: &str, slot: usize) -> Option<usize> {
+        self.activation_slot_buffers
+            .iter()
+            .position(|buffer| buffer.pedal_id == pedal_id && buffer.slot == slot)
     }
 }
 
@@ -564,6 +576,16 @@ impl VulkanMountedStreamCircuit {
             &descriptor_plan,
             manifest,
         )
+    }
+
+    pub fn bound_dispatch_plan(
+        &self,
+        manifest: &VulkanReusableKernelArtifactManifest,
+    ) -> Result<VulkanBoundDispatchPlan, VulkanBoundDispatchPlanError> {
+        let prepared_plan = self
+            .prepared_dispatch_plan(manifest)
+            .map_err(VulkanBoundDispatchPlanError::PreparedDispatch)?;
+        VulkanBoundDispatchPlan::from_prepared_plan(&prepared_plan, &self.buffers)
     }
 }
 
@@ -1995,6 +2017,368 @@ impl Display for VulkanPreparedDispatchPlanError {
 }
 
 impl Error for VulkanPreparedDispatchPlanError {}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanBoundDispatchPlan {
+    pub backend_id: String,
+    pub dispatches: Vec<VulkanBoundDispatch>,
+    pub total_descriptor_count: usize,
+    pub boundary_descriptor_count: usize,
+    pub permanent_parameter_descriptor_count: usize,
+    pub stream_state_descriptor_count: usize,
+    pub activation_slot_descriptor_count: usize,
+}
+
+impl VulkanBoundDispatchPlan {
+    pub fn from_prepared_plan(
+        prepared_plan: &VulkanPreparedDispatchPlan,
+        buffers: &VulkanStreamCircuitStreamBuffers,
+    ) -> Result<Self, VulkanBoundDispatchPlanError> {
+        let mut boundary_descriptor_count = 0usize;
+        let mut permanent_parameter_descriptor_count = 0usize;
+        let mut stream_state_descriptor_count = 0usize;
+        let mut activation_slot_descriptor_count = 0usize;
+        let mut dispatches = Vec::with_capacity(prepared_plan.dispatches.len());
+
+        for prepared in &prepared_plan.dispatches {
+            let mut descriptors = Vec::with_capacity(prepared.descriptors.len());
+            for descriptor in &prepared.descriptors {
+                let target =
+                    VulkanBoundDescriptorTarget::from_resource(prepared, descriptor, buffers)?;
+                match target {
+                    VulkanBoundDescriptorTarget::BoundaryInput { .. }
+                    | VulkanBoundDescriptorTarget::BoundaryOutput { .. } => {
+                        boundary_descriptor_count += 1;
+                    }
+                    VulkanBoundDescriptorTarget::PermanentParameter { .. } => {
+                        permanent_parameter_descriptor_count += 1;
+                    }
+                    VulkanBoundDescriptorTarget::StreamStateBuffer { .. }
+                    | VulkanBoundDescriptorTarget::StreamStateView { .. } => {
+                        stream_state_descriptor_count += 1;
+                    }
+                    VulkanBoundDescriptorTarget::ActivationSlot { .. } => {
+                        activation_slot_descriptor_count += 1;
+                    }
+                }
+                descriptors.push(VulkanBoundDescriptor {
+                    binding: descriptor.binding,
+                    usage: descriptor.usage.clone(),
+                    name: descriptor.name.clone(),
+                    target,
+                });
+            }
+
+            dispatches.push(VulkanBoundDispatch {
+                dispatch_index: prepared.dispatch_index,
+                kernel_id: prepared.kernel_id.clone(),
+                pedal_id: prepared.pedal_id.clone(),
+                circuit_id: prepared.circuit_id.clone(),
+                node_index: prepared.node_index,
+                node_id: prepared.node_id.clone(),
+                op: prepared.op.clone(),
+                reusable_family_id: prepared.reusable_family_id.clone(),
+                artifact_path: prepared.artifact_path.clone(),
+                entry_point: prepared.entry_point.clone(),
+                local_size_x: prepared.local_size_x,
+                descriptors,
+                push_constants: prepared.push_constants.clone(),
+                uses_stream_tick: prepared.uses_stream_tick,
+            });
+        }
+
+        let total_descriptor_count = boundary_descriptor_count
+            + permanent_parameter_descriptor_count
+            + stream_state_descriptor_count
+            + activation_slot_descriptor_count;
+        Ok(Self {
+            backend_id: prepared_plan.backend_id.clone(),
+            dispatches,
+            total_descriptor_count,
+            boundary_descriptor_count,
+            permanent_parameter_descriptor_count,
+            stream_state_descriptor_count,
+            activation_slot_descriptor_count,
+        })
+    }
+
+    pub fn dispatch(&self, pedal_id: &str, node_id: &str) -> Option<&VulkanBoundDispatch> {
+        self.dispatches
+            .iter()
+            .find(|dispatch| dispatch.pedal_id == pedal_id && dispatch.node_id == node_id)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanBoundDispatch {
+    pub dispatch_index: usize,
+    pub kernel_id: String,
+    pub pedal_id: String,
+    pub circuit_id: String,
+    pub node_index: usize,
+    pub node_id: String,
+    pub op: String,
+    pub reusable_family_id: String,
+    pub artifact_path: String,
+    pub entry_point: String,
+    pub local_size_x: u32,
+    pub descriptors: Vec<VulkanBoundDescriptor>,
+    pub push_constants: Vec<VulkanKernelScalarBinding>,
+    pub uses_stream_tick: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanBoundDescriptor {
+    pub binding: usize,
+    pub usage: VulkanKernelDescriptorUsage,
+    pub name: String,
+    pub target: VulkanBoundDescriptorTarget,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VulkanBoundDescriptorTarget {
+    BoundaryInput {
+        signal_id: String,
+    },
+    BoundaryOutput {
+        signal_id: String,
+    },
+    PermanentParameter {
+        param_id: String,
+        tensor: String,
+        byte_count: Option<usize>,
+    },
+    ActivationSlot {
+        buffer_index: usize,
+        pedal_id: String,
+        circuit_id: String,
+        slot: usize,
+        byte_capacity: usize,
+    },
+    StreamStateBuffer {
+        buffer_index: usize,
+        pedal_id: String,
+        state_id: String,
+        state_type: String,
+        byte_capacity: usize,
+        static_bytes: Option<usize>,
+        bytes_per_activation: Option<usize>,
+    },
+    StreamStateView {
+        buffer_index: usize,
+        pedal_id: String,
+        state_id: String,
+        state_type: String,
+        byte_capacity: usize,
+        static_bytes: Option<usize>,
+        bytes_per_activation: Option<usize>,
+    },
+}
+
+impl VulkanBoundDescriptorTarget {
+    fn from_resource(
+        dispatch: &VulkanPreparedDispatch,
+        descriptor: &VulkanResolvedDescriptorBinding,
+        buffers: &VulkanStreamCircuitStreamBuffers,
+    ) -> Result<Self, VulkanBoundDispatchPlanError> {
+        match &descriptor.resource {
+            VulkanDescriptorResourceAddress::BoundaryInput { signal_id } => {
+                Ok(Self::BoundaryInput {
+                    signal_id: signal_id.clone(),
+                })
+            }
+            VulkanDescriptorResourceAddress::BoundaryOutput { signal_id } => {
+                Ok(Self::BoundaryOutput {
+                    signal_id: signal_id.clone(),
+                })
+            }
+            VulkanDescriptorResourceAddress::PermanentParameter {
+                param_id,
+                tensor,
+                byte_count,
+            } => Ok(Self::PermanentParameter {
+                param_id: param_id.clone(),
+                tensor: tensor.clone(),
+                byte_count: *byte_count,
+            }),
+            VulkanDescriptorResourceAddress::ActivationSlot {
+                pedal_id,
+                slot,
+                byte_capacity,
+            } => {
+                let buffer_index = buffers
+                    .activation_slot_buffer_index(pedal_id, *slot)
+                    .ok_or_else(
+                        || VulkanBoundDispatchPlanError::MissingActivationSlotBuffer {
+                            dispatch_index: dispatch.dispatch_index,
+                            binding: descriptor.binding,
+                            pedal_id: pedal_id.clone(),
+                            slot: *slot,
+                        },
+                    )?;
+                let buffer = &buffers.activation_slot_buffers[buffer_index];
+                validate_bound_byte_capacity(
+                    dispatch,
+                    descriptor,
+                    *byte_capacity,
+                    buffer.byte_capacity,
+                )?;
+                Ok(Self::ActivationSlot {
+                    buffer_index,
+                    pedal_id: pedal_id.clone(),
+                    circuit_id: buffer.circuit_id.clone(),
+                    slot: *slot,
+                    byte_capacity: *byte_capacity,
+                })
+            }
+            VulkanDescriptorResourceAddress::StateBuffer {
+                pedal_id,
+                state_id,
+                state_type,
+                byte_capacity,
+                static_bytes,
+                bytes_per_activation,
+            } => {
+                let buffer_index =
+                    buffers
+                        .state_buffer_index(pedal_id, state_id)
+                        .ok_or_else(|| VulkanBoundDispatchPlanError::MissingStateBuffer {
+                            dispatch_index: dispatch.dispatch_index,
+                            binding: descriptor.binding,
+                            pedal_id: pedal_id.clone(),
+                            state_id: state_id.clone(),
+                        })?;
+                let buffer = &buffers.state_buffers[buffer_index];
+                validate_bound_byte_capacity(
+                    dispatch,
+                    descriptor,
+                    *byte_capacity,
+                    buffer.byte_capacity,
+                )?;
+                Ok(Self::StreamStateBuffer {
+                    buffer_index,
+                    pedal_id: pedal_id.clone(),
+                    state_id: state_id.clone(),
+                    state_type: state_type.clone(),
+                    byte_capacity: *byte_capacity,
+                    static_bytes: *static_bytes,
+                    bytes_per_activation: *bytes_per_activation,
+                })
+            }
+            VulkanDescriptorResourceAddress::StateView {
+                pedal_id,
+                state_id,
+                state_type,
+                byte_capacity,
+                static_bytes,
+                bytes_per_activation,
+            } => {
+                let buffer_index =
+                    buffers
+                        .state_buffer_index(pedal_id, state_id)
+                        .ok_or_else(|| VulkanBoundDispatchPlanError::MissingStateBuffer {
+                            dispatch_index: dispatch.dispatch_index,
+                            binding: descriptor.binding,
+                            pedal_id: pedal_id.clone(),
+                            state_id: state_id.clone(),
+                        })?;
+                let buffer = &buffers.state_buffers[buffer_index];
+                validate_bound_byte_capacity(
+                    dispatch,
+                    descriptor,
+                    *byte_capacity,
+                    buffer.byte_capacity,
+                )?;
+                Ok(Self::StreamStateView {
+                    buffer_index,
+                    pedal_id: pedal_id.clone(),
+                    state_id: state_id.clone(),
+                    state_type: state_type.clone(),
+                    byte_capacity: *byte_capacity,
+                    static_bytes: *static_bytes,
+                    bytes_per_activation: *bytes_per_activation,
+                })
+            }
+        }
+    }
+}
+
+fn validate_bound_byte_capacity(
+    dispatch: &VulkanPreparedDispatch,
+    descriptor: &VulkanResolvedDescriptorBinding,
+    expected_byte_capacity: usize,
+    mounted_byte_capacity: usize,
+) -> Result<(), VulkanBoundDispatchPlanError> {
+    if expected_byte_capacity != mounted_byte_capacity {
+        return Err(VulkanBoundDispatchPlanError::ByteCapacityMismatch {
+            dispatch_index: dispatch.dispatch_index,
+            binding: descriptor.binding,
+            expected_byte_capacity,
+            mounted_byte_capacity,
+        });
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VulkanBoundDispatchPlanError {
+    PreparedDispatch(VulkanPreparedDispatchPlanError),
+    MissingStateBuffer {
+        dispatch_index: usize,
+        binding: usize,
+        pedal_id: String,
+        state_id: String,
+    },
+    MissingActivationSlotBuffer {
+        dispatch_index: usize,
+        binding: usize,
+        pedal_id: String,
+        slot: usize,
+    },
+    ByteCapacityMismatch {
+        dispatch_index: usize,
+        binding: usize,
+        expected_byte_capacity: usize,
+        mounted_byte_capacity: usize,
+    },
+}
+
+impl Display for VulkanBoundDispatchPlanError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PreparedDispatch(error) => Display::fmt(error, f),
+            Self::MissingStateBuffer {
+                dispatch_index,
+                binding,
+                pedal_id,
+                state_id,
+            } => write!(
+                f,
+                "dispatch {dispatch_index} descriptor {binding} references missing stream state buffer {pedal_id}.{state_id}"
+            ),
+            Self::MissingActivationSlotBuffer {
+                dispatch_index,
+                binding,
+                pedal_id,
+                slot,
+            } => write!(
+                f,
+                "dispatch {dispatch_index} descriptor {binding} references missing activation slot buffer {pedal_id}.slot_{slot}"
+            ),
+            Self::ByteCapacityMismatch {
+                dispatch_index,
+                binding,
+                expected_byte_capacity,
+                mounted_byte_capacity,
+            } => write!(
+                f,
+                "dispatch {dispatch_index} descriptor {binding} expects {expected_byte_capacity} bytes but mounted buffer has {mounted_byte_capacity} bytes"
+            ),
+        }
+    }
+}
+
+impl Error for VulkanBoundDispatchPlanError {}
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct VulkanKernelDescriptorSlotSignature {
@@ -3764,6 +4148,133 @@ mod tests {
     }
 
     #[test]
+    fn bound_dispatch_plan_maps_prepared_descriptors_to_mounted_stream_buffers() {
+        let device = match VulkanComputeDevice::new() {
+            Ok(device) => device,
+            Err(error) => {
+                eprintln!("skipping Vulkan stream-circuit binding: {error}");
+                return;
+            }
+        };
+        let graph = ResolvedLoweredPedalboard::from_index_file(lfm2_index_path()).unwrap();
+        let tensor_index = TensorIndex::from_json_file(lfm2_tensor_index_path()).unwrap();
+        let execution_plan =
+            StreamCircuitExecutionPlan::from_graph_with_tensor_index(&graph, &tensor_index)
+                .unwrap();
+        let resource_plan =
+            StreamCircuitResourcePlan::from_graph_and_plan(&graph, &execution_plan).unwrap();
+        let resident_plan = VulkanStreamCircuitResidentPlan::from_resource_plan(
+            &resource_plan,
+            Some(&tensor_index),
+            Some(2),
+        )
+        .unwrap();
+        let binding_plan = VulkanStreamCircuitBindingPlan::from_plans(
+            &execution_plan,
+            &resource_plan,
+            &resident_plan,
+        )
+        .unwrap();
+        let dispatch_plan = VulkanKernelDispatchPlan::from_binding_plan(&binding_plan);
+        let reusable_plan = VulkanReusableKernelPlan::from_dispatch_plan(&dispatch_plan);
+        let descriptor_plan =
+            VulkanDescriptorResourcePlan::from_plans(&dispatch_plan, &resident_plan, 4).unwrap();
+        let manifest = VulkanReusableKernelArtifactManifest::new(
+            reusable_plan
+                .families
+                .iter()
+                .map(|family| {
+                    VulkanReusableKernelArtifact::from_family(
+                        family,
+                        format!("kernels/{}.spv", family.family_id),
+                    )
+                })
+                .collect(),
+        );
+        let prepared = VulkanPreparedDispatchPlan::from_plans(
+            &dispatch_plan,
+            &reusable_plan,
+            &descriptor_plan,
+            &manifest,
+        )
+        .unwrap();
+        let buffers = resident_plan.allocate_stream_buffers(&device, 4).unwrap();
+
+        let bound = VulkanBoundDispatchPlan::from_prepared_plan(&prepared, &buffers).unwrap();
+
+        assert_eq!(bound.backend_id, VULKAN_STREAM_CIRCUIT_BACKEND_ID);
+        assert_eq!(bound.dispatches.len(), 242);
+        assert_eq!(bound.total_descriptor_count, 794);
+        assert_eq!(bound.boundary_descriptor_count, 42);
+        assert_eq!(bound.permanent_parameter_descriptor_count, 130);
+        assert_eq!(bound.stream_state_descriptor_count, 122);
+        assert_eq!(bound.activation_slot_descriptor_count, 500);
+        assert_eq!(
+            bound.boundary_descriptor_count
+                + bound.permanent_parameter_descriptor_count
+                + bound.stream_state_descriptor_count
+                + bound.activation_slot_descriptor_count,
+            bound.total_descriptor_count
+        );
+
+        let first = bound.dispatch("layer_00", "operator_norm").unwrap();
+        assert_eq!(first.dispatch_index, 0);
+        assert_eq!(
+            first.descriptors[0].target,
+            VulkanBoundDescriptorTarget::BoundaryInput {
+                signal_id: "input_frame".to_string(),
+            }
+        );
+        assert_eq!(
+            first.descriptors[1].target,
+            VulkanBoundDescriptorTarget::ActivationSlot {
+                buffer_index: buffers.activation_slot_buffer_index("layer_00", 0).unwrap(),
+                pedal_id: "layer_00".to_string(),
+                circuit_id: "layer_00_exact_lfm2_conv_circuit_v1".to_string(),
+                slot: 0,
+                byte_capacity: 5120,
+            }
+        );
+        assert_eq!(
+            first.descriptors[2].target,
+            VulkanBoundDescriptorTarget::PermanentParameter {
+                param_id: "operator_norm".to_string(),
+                tensor: "model.layers.0.operator_norm.weight".to_string(),
+                byte_count: Some(2048),
+            }
+        );
+
+        let kv_append = bound.dispatch("layer_02", "kv_memory_append").unwrap();
+        assert!(matches!(
+            kv_append.descriptors[2].target,
+            VulkanBoundDescriptorTarget::StreamStateBuffer {
+                ref pedal_id,
+                ref state_id,
+                byte_capacity: 8192,
+                ..
+            } if pedal_id == "layer_02" && state_id == "kv_memory"
+        ));
+        assert!(matches!(
+            kv_append.descriptors[6].target,
+            VulkanBoundDescriptorTarget::StreamStateBuffer {
+                ref pedal_id,
+                ref state_id,
+                byte_capacity: 8192,
+                ..
+            } if pedal_id == "layer_02" && state_id == "kv_memory"
+        ));
+        assert!(matches!(
+            kv_append.descriptors[7].target,
+            VulkanBoundDescriptorTarget::StreamStateView {
+                ref pedal_id,
+                ref state_id,
+                byte_capacity: 8192,
+                ..
+            } if pedal_id == "layer_02" && state_id == "kv_memory"
+        ));
+    }
+
+    #[test]
     fn mounts_lfm2_stream_circuit_resources_without_claiming_execution() {
         let device = match VulkanComputeDevice::new() {
             Ok(device) => device,
@@ -3830,6 +4341,9 @@ mod tests {
         let prepared = mounted.prepared_dispatch_plan(&manifest).unwrap();
         assert_eq!(prepared.dispatches.len(), 242);
         assert_eq!(prepared.total_descriptor_count, 794);
+        let bound = mounted.bound_dispatch_plan(&manifest).unwrap();
+        assert_eq!(bound.dispatches.len(), 242);
+        assert_eq!(bound.total_descriptor_count, 794);
         assert_eq!(mounted.buffers.state_buffers.len(), 14);
         assert_eq!(mounted.buffers.activation_slot_buffers.len(), 56);
         assert_eq!(mounted.buffers.total_byte_capacity, 374_784);
