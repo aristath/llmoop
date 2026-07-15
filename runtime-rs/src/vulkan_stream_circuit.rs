@@ -9,8 +9,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::stream_circuit::{CableTransport, PedalCablePlacement, StreamCircuitPlacementPlan};
 use crate::stream_plan::{
-    CircuitActivationPlan, PlannedNode, SignalProducer, SignalStorage, StreamCircuitExecutionPlan,
-    StreamCircuitResourcePlan, TensorIndex,
+    CircuitActivationPlan, PlannedNode, PlannedPort, SignalProducer, SignalStorage,
+    StreamCircuitExecutionPlan, StreamCircuitResourcePlan, TensorIndex,
 };
 use crate::vulkan::{DEFAULT_COMPUTE_LOCAL_SIZE_X, DEFAULT_SPIRV_ENTRY_POINT, read_spirv_words};
 use crate::vulkan_compute::{
@@ -284,6 +284,272 @@ impl VulkanStreamCircuitResidentPlan {
         })
     }
 }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanModelBoundaryBufferPlan {
+    pub backend_id: String,
+    pub device_id: String,
+    pub signal_element_bytes: Option<usize>,
+    pub inputs: Vec<VulkanModelBoundaryBuffer>,
+    pub outputs: Vec<VulkanModelBoundaryBuffer>,
+    pub input_count: usize,
+    pub output_count: usize,
+    pub total_buffer_count: usize,
+    pub total_byte_capacity: Option<usize>,
+    pub unresolved_byte_signals: Vec<String>,
+}
+
+impl VulkanModelBoundaryBufferPlan {
+    pub fn from_placed_plan(
+        placed_plan: &VulkanPlacedStreamCircuitPlan,
+    ) -> Result<Self, VulkanModelBoundaryBufferPlanError> {
+        let mut inputs = Vec::new();
+        let mut outputs = Vec::new();
+        let mut total_byte_capacity = Some(0usize);
+        let mut unresolved_byte_signals = Vec::new();
+        let signal_element_bytes = placed_plan.placed_resident_plan.signal_element_bytes;
+
+        for circuit in &placed_plan.binding_plan.circuits {
+            for input in &circuit.input_ports {
+                if placed_plan
+                    .placed_resident_plan
+                    .local_cables
+                    .iter()
+                    .chain(&placed_plan.placed_resident_plan.incoming_cables)
+                    .any(|cable| {
+                        cable.destination_pedal_id == circuit.pedal_id
+                            && cable.destination_port_id == input.id
+                    })
+                {
+                    continue;
+                }
+                let boundary = VulkanModelBoundaryBuffer::from_port(
+                    inputs.len(),
+                    &circuit.pedal_id,
+                    input,
+                    signal_element_bytes,
+                )?;
+                total_byte_capacity =
+                    add_optional_boundary_bytes(total_byte_capacity, boundary.byte_capacity)?;
+                if boundary.byte_capacity.is_none() {
+                    unresolved_byte_signals.push(boundary.signal_id.clone());
+                }
+                inputs.push(boundary);
+            }
+
+            for output in &circuit.output_ports {
+                if placed_plan
+                    .placed_resident_plan
+                    .local_cables
+                    .iter()
+                    .chain(&placed_plan.placed_resident_plan.outgoing_cables)
+                    .any(|cable| {
+                        cable.source_pedal_id == circuit.pedal_id
+                            && cable.source_port_id == output.id
+                    })
+                {
+                    continue;
+                }
+                let boundary = VulkanModelBoundaryBuffer::from_port(
+                    outputs.len(),
+                    &circuit.pedal_id,
+                    output,
+                    signal_element_bytes,
+                )?;
+                total_byte_capacity =
+                    add_optional_boundary_bytes(total_byte_capacity, boundary.byte_capacity)?;
+                if boundary.byte_capacity.is_none() {
+                    unresolved_byte_signals.push(boundary.signal_id.clone());
+                }
+                outputs.push(boundary);
+            }
+        }
+
+        let input_count = inputs.len();
+        let output_count = outputs.len();
+        Ok(Self {
+            backend_id: VULKAN_STREAM_CIRCUIT_BACKEND_ID.to_string(),
+            device_id: placed_plan.device_id.clone(),
+            signal_element_bytes,
+            total_buffer_count: input_count + output_count,
+            input_count,
+            output_count,
+            inputs,
+            outputs,
+            total_byte_capacity,
+            unresolved_byte_signals,
+        })
+    }
+
+    pub fn allocate_buffers(
+        &self,
+        device: &VulkanComputeDevice,
+    ) -> Result<VulkanModelBoundaryBuffers, VulkanError> {
+        let mut input_buffers = Vec::with_capacity(self.inputs.len());
+        let mut output_buffers = Vec::with_capacity(self.outputs.len());
+        let mut total_byte_capacity = 0usize;
+
+        for boundary in &self.inputs {
+            let byte_capacity = boundary.byte_capacity.ok_or_else(|| {
+                VulkanError(format!(
+                    "{} model input boundary {:?} has unknown byte capacity",
+                    self.device_id, boundary.signal_id
+                ))
+            })?;
+            total_byte_capacity = checked_add_bytes(
+                total_byte_capacity,
+                byte_capacity,
+                "model input boundary buffer allocation",
+            )?;
+            input_buffers.push(VulkanModelBoundaryBufferAllocation {
+                boundary: boundary.clone(),
+                byte_capacity,
+                buffer: device.create_resident_buffer(byte_capacity)?,
+            });
+        }
+
+        for boundary in &self.outputs {
+            let byte_capacity = boundary.byte_capacity.ok_or_else(|| {
+                VulkanError(format!(
+                    "{} model output boundary {:?} has unknown byte capacity",
+                    self.device_id, boundary.signal_id
+                ))
+            })?;
+            total_byte_capacity = checked_add_bytes(
+                total_byte_capacity,
+                byte_capacity,
+                "model output boundary buffer allocation",
+            )?;
+            output_buffers.push(VulkanModelBoundaryBufferAllocation {
+                boundary: boundary.clone(),
+                byte_capacity,
+                buffer: device.create_resident_buffer(byte_capacity)?,
+            });
+        }
+
+        Ok(VulkanModelBoundaryBuffers {
+            plan: self.clone(),
+            input_buffers,
+            output_buffers,
+            total_byte_capacity,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanModelBoundaryBuffer {
+    pub buffer_index: usize,
+    pub signal_id: String,
+    pub signal: String,
+    pub shape: Vec<usize>,
+    pub element_count: usize,
+    pub byte_capacity: Option<usize>,
+    pub pedal_id: String,
+    pub port_id: String,
+    pub source_signal_id: Option<String>,
+}
+
+impl VulkanModelBoundaryBuffer {
+    fn from_port(
+        buffer_index: usize,
+        pedal_id: &str,
+        port: &PlannedPort,
+        signal_element_bytes: Option<usize>,
+    ) -> Result<Self, VulkanModelBoundaryBufferPlanError> {
+        let element_count = product(&port.shape).ok_or_else(|| {
+            VulkanModelBoundaryBufferPlanError(format!(
+                "{} model boundary port {:?} shape {:?} overflows",
+                pedal_id, port.id, port.shape
+            ))
+        })?;
+        if element_count == 0 {
+            return Err(VulkanModelBoundaryBufferPlanError(format!(
+                "{} model boundary port {:?} shape {:?} has zero elements",
+                pedal_id, port.id, port.shape
+            )));
+        }
+        let byte_capacity = signal_element_bytes
+            .map(|bytes| {
+                element_count.checked_mul(bytes).ok_or_else(|| {
+                    VulkanModelBoundaryBufferPlanError(format!(
+                        "{} model boundary port {:?} byte capacity overflowed",
+                        pedal_id, port.id
+                    ))
+                })
+            })
+            .transpose()?;
+
+        Ok(Self {
+            buffer_index,
+            signal_id: port.source.clone().unwrap_or_else(|| port.id.clone()),
+            signal: port.signal.clone(),
+            shape: port.shape.clone(),
+            element_count,
+            byte_capacity,
+            pedal_id: pedal_id.to_string(),
+            port_id: port.id.clone(),
+            source_signal_id: port.source.clone(),
+        })
+    }
+}
+
+fn add_optional_boundary_bytes(
+    total: Option<usize>,
+    byte_capacity: Option<usize>,
+) -> Result<Option<usize>, VulkanModelBoundaryBufferPlanError> {
+    match (total, byte_capacity) {
+        (Some(total), Some(bytes)) => total.checked_add(bytes).map(Some).ok_or_else(|| {
+            VulkanModelBoundaryBufferPlanError(
+                "model boundary total byte capacity overflowed".to_string(),
+            )
+        }),
+        _ => Ok(None),
+    }
+}
+
+pub struct VulkanModelBoundaryBuffers {
+    pub plan: VulkanModelBoundaryBufferPlan,
+    pub input_buffers: Vec<VulkanModelBoundaryBufferAllocation>,
+    pub output_buffers: Vec<VulkanModelBoundaryBufferAllocation>,
+    pub total_byte_capacity: usize,
+}
+
+impl VulkanModelBoundaryBuffers {
+    pub fn input_buffer(&self, signal_id: &str) -> Option<&VulkanModelBoundaryBufferAllocation> {
+        self.input_buffers
+            .iter()
+            .find(|buffer| buffer.boundary.signal_id == signal_id)
+    }
+
+    pub fn output_buffer(&self, signal_id: &str) -> Option<&VulkanModelBoundaryBufferAllocation> {
+        self.output_buffers
+            .iter()
+            .find(|buffer| buffer.boundary.signal_id == signal_id)
+    }
+}
+
+pub struct VulkanModelBoundaryBufferAllocation {
+    pub boundary: VulkanModelBoundaryBuffer,
+    pub byte_capacity: usize,
+    pub buffer: VulkanResidentBuffer,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VulkanModelBoundaryDirection {
+    Input,
+    Output,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanModelBoundaryBufferPlanError(pub String);
+
+impl Display for VulkanModelBoundaryBufferPlanError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl Error for VulkanModelBoundaryBufferPlanError {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VulkanPlacedStreamCircuitResidentPlan {
@@ -1107,6 +1373,8 @@ impl VulkanPlacedStreamCircuitPlan {
 pub struct VulkanCircuitBindingPlan {
     pub pedal_id: String,
     pub circuit_id: String,
+    pub input_ports: Vec<PlannedPort>,
+    pub output_ports: Vec<PlannedPort>,
     pub nodes: Vec<VulkanNodeBinding>,
 }
 
@@ -1303,6 +1571,7 @@ impl VulkanMountedStreamCircuit {
 #[derive(Debug)]
 pub enum VulkanStreamCircuitMountError {
     Binding(VulkanBindingPlanError),
+    BoundaryIo(VulkanModelBoundaryBufferPlanError),
     CableIo(VulkanPlacedCableIoPlanError),
     Vulkan(VulkanError),
 }
@@ -1311,6 +1580,7 @@ impl Display for VulkanStreamCircuitMountError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Binding(error) => Display::fmt(error, f),
+            Self::BoundaryIo(error) => Display::fmt(error, f),
             Self::CableIo(error) => Display::fmt(error, f),
             Self::Vulkan(error) => Display::fmt(error, f),
         }
@@ -1322,6 +1592,12 @@ impl Error for VulkanStreamCircuitMountError {}
 impl From<VulkanBindingPlanError> for VulkanStreamCircuitMountError {
     fn from(error: VulkanBindingPlanError) -> Self {
         Self::Binding(error)
+    }
+}
+
+impl From<VulkanModelBoundaryBufferPlanError> for VulkanStreamCircuitMountError {
+    fn from(error: VulkanModelBoundaryBufferPlanError) -> Self {
+        Self::BoundaryIo(error)
     }
 }
 
@@ -1340,6 +1616,7 @@ impl From<VulkanError> for VulkanStreamCircuitMountError {
 pub struct VulkanMountedPlacedStreamCircuit {
     pub placed_plan: VulkanPlacedStreamCircuitPlan,
     pub buffers: VulkanStreamCircuitStreamBuffers,
+    pub boundary_io: VulkanModelBoundaryBuffers,
     pub cable_io: VulkanPlacedCableIoBuffers,
 }
 
@@ -1353,12 +1630,15 @@ impl VulkanMountedPlacedStreamCircuit {
             .placed_resident_plan
             .resident_plan
             .allocate_stream_buffers(device, dynamic_state_capacity_activations)?;
+        let boundary_io_plan = VulkanModelBoundaryBufferPlan::from_placed_plan(&placed_plan)?;
+        let boundary_io = boundary_io_plan.allocate_buffers(device)?;
         let cable_io_plan =
             VulkanPlacedCableIoPlan::from_placed_resident_plan(&placed_plan.placed_resident_plan)?;
         let cable_io = cable_io_plan.allocate_buffers(device)?;
         Ok(Self {
             placed_plan,
             buffers,
+            boundary_io,
             cable_io,
         })
     }
@@ -1504,15 +1784,27 @@ impl VulkanMountedPlacedStreamCircuit {
             VulkanMountedPlacedBoundDescriptorTarget::Resident { target } => {
                 self.resident_kernel_buffer_for_resident_target(dispatch, descriptor, target)?
             }
-            VulkanMountedPlacedBoundDescriptorTarget::ModelInput { signal_id }
-            | VulkanMountedPlacedBoundDescriptorTarget::ModelOutput { signal_id } => {
-                return Err(
-                    VulkanMountedPlacedResidentKernelDispatchError::ModelBoundaryBufferUnavailable {
+            VulkanMountedPlacedBoundDescriptorTarget::ModelInput { signal_id } => {
+                let allocation = self.boundary_io.input_buffer(signal_id).ok_or_else(|| {
+                    VulkanMountedPlacedResidentKernelDispatchError::MissingModelBoundaryBuffer {
                         dispatch_index: dispatch.dispatch_index,
                         binding: descriptor.binding,
+                        direction: VulkanModelBoundaryDirection::Input,
                         signal_id: signal_id.clone(),
-                    },
-                );
+                    }
+                })?;
+                (&allocation.buffer, allocation.byte_capacity)
+            }
+            VulkanMountedPlacedBoundDescriptorTarget::ModelOutput { signal_id } => {
+                let allocation = self.boundary_io.output_buffer(signal_id).ok_or_else(|| {
+                    VulkanMountedPlacedResidentKernelDispatchError::MissingModelBoundaryBuffer {
+                        dispatch_index: dispatch.dispatch_index,
+                        binding: descriptor.binding,
+                        direction: VulkanModelBoundaryDirection::Output,
+                        signal_id: signal_id.clone(),
+                    }
+                })?;
+                (&allocation.buffer, allocation.byte_capacity)
             }
             VulkanMountedPlacedBoundDescriptorTarget::LocalCableInputBuffer { cable }
             | VulkanMountedPlacedBoundDescriptorTarget::LocalCableOutputBuffer { cable } => {
@@ -4079,6 +4371,12 @@ pub enum VulkanMountedPlacedResidentKernelDispatchError {
         buffer_kind: String,
         buffer_index: usize,
     },
+    MissingModelBoundaryBuffer {
+        dispatch_index: usize,
+        binding: usize,
+        direction: VulkanModelBoundaryDirection,
+        signal_id: String,
+    },
     PermanentParameterBufferUnavailable {
         dispatch_index: usize,
         binding: usize,
@@ -4123,6 +4421,15 @@ impl Display for VulkanMountedPlacedResidentKernelDispatchError {
             } => write!(
                 f,
                 "dispatch {dispatch_index} descriptor {binding} references missing mounted {buffer_kind} buffer {buffer_index}"
+            ),
+            Self::MissingModelBoundaryBuffer {
+                dispatch_index,
+                binding,
+                direction,
+                signal_id,
+            } => write!(
+                f,
+                "dispatch {dispatch_index} descriptor {binding} references missing mounted model {direction:?} boundary buffer {signal_id:?}"
             ),
             Self::PermanentParameterBufferUnavailable {
                 dispatch_index,
@@ -4920,6 +5227,8 @@ fn bind_circuit(
     Ok(VulkanCircuitBindingPlan {
         pedal_id: circuit.pedal_id.clone(),
         circuit_id: circuit.circuit_id.clone(),
+        input_ports: circuit.input_ports.clone(),
+        output_ports: circuit.output_ports.clone(),
         nodes,
     })
 }
@@ -5593,6 +5902,23 @@ mod tests {
             mounted.placed_plan.dispatch_plan.total_dispatch_count(),
             242
         );
+        assert_eq!(mounted.boundary_io.plan.device_id, "gpu0");
+        assert_eq!(mounted.boundary_io.plan.input_count, 1);
+        assert_eq!(mounted.boundary_io.plan.output_count, 1);
+        assert_eq!(mounted.boundary_io.plan.total_buffer_count, 2);
+        assert_eq!(mounted.boundary_io.plan.total_byte_capacity, Some(4_096));
+        assert_eq!(mounted.boundary_io.total_byte_capacity, 4_096);
+        let model_input = mounted.boundary_io.input_buffer("input_frame").unwrap();
+        assert_eq!(model_input.boundary.pedal_id, "layer_00");
+        assert_eq!(model_input.boundary.port_id, "input_frame");
+        assert_eq!(model_input.boundary.shape, vec![1024]);
+        assert_eq!(model_input.byte_capacity, 2_048);
+        model_input.buffer.write_bytes(&[1, 2, 3, 4]).unwrap();
+        assert_eq!(model_input.buffer.read_bytes(4).unwrap(), vec![1, 2, 3, 4]);
+        let model_output = mounted.boundary_io.output_buffer("output_frame").unwrap();
+        assert_eq!(model_output.boundary.pedal_id, "layer_13");
+        assert_eq!(model_output.boundary.port_id, "output_frame");
+        assert_eq!(model_output.byte_capacity, 2_048);
         assert_eq!(mounted.cable_io.plan.local_cable_count, 13);
         assert_eq!(mounted.cable_io.plan.total_endpoint_count, 0);
         assert_eq!(mounted.cable_io.plan.total_buffer_count, 13);
@@ -5723,12 +6049,14 @@ mod tests {
                     .unwrap()
             ),
             Err(
-                VulkanMountedPlacedResidentKernelDispatchError::ModelBoundaryBufferUnavailable {
+                VulkanMountedPlacedResidentKernelDispatchError::PermanentParameterBufferUnavailable {
                     dispatch_index: 0,
-                    binding: 0,
-                    ref signal_id,
+                    binding: 2,
+                    ref param_id,
+                    ref tensor,
+                    byte_count: Some(2_048),
                 }
-            ) if signal_id == "input_frame"
+            ) if param_id == "operator_norm" && tensor == "model.layers.0.operator_norm.weight"
         ));
 
         assert_eq!(
@@ -5871,6 +6199,12 @@ mod tests {
         assert!(!mounted.can_execute());
         assert_eq!(mounted.placed_plan.binding_plan.circuits.len(), 1);
         assert_eq!(mounted.placed_plan.dispatch_plan.total_dispatch_count(), 19);
+        assert_eq!(mounted.boundary_io.plan.device_id, "gpu1");
+        assert_eq!(mounted.boundary_io.plan.input_count, 0);
+        assert_eq!(mounted.boundary_io.plan.output_count, 0);
+        assert_eq!(mounted.boundary_io.plan.total_buffer_count, 0);
+        assert_eq!(mounted.boundary_io.plan.total_byte_capacity, Some(0));
+        assert_eq!(mounted.boundary_io.total_byte_capacity, 0);
         assert_eq!(mounted.buffers.state_buffers.len(), 1);
         assert_eq!(mounted.buffers.activation_slot_buffers.len(), 4);
         assert_eq!(mounted.buffers.total_byte_capacity, 25_600);
