@@ -477,6 +477,7 @@ pub struct VulkanMountedStreamCircuit {
     pub binding_plan: VulkanStreamCircuitBindingPlan,
     pub kernel_interface_plan: VulkanKernelInterfacePlan,
     pub dispatch_plan: VulkanKernelDispatchPlan,
+    pub reusable_kernel_plan: VulkanReusableKernelPlan,
     pub buffers: VulkanStreamCircuitStreamBuffers,
 }
 
@@ -496,6 +497,7 @@ impl VulkanMountedStreamCircuit {
         let kernel_interface_plan = VulkanKernelInterfacePlan::from_binding_plan(&binding_plan);
         let dispatch_plan =
             VulkanKernelDispatchPlan::from_kernel_interfaces(&kernel_interface_plan);
+        let reusable_kernel_plan = VulkanReusableKernelPlan::from_dispatch_plan(&dispatch_plan);
         let buffers =
             resident_plan.allocate_stream_buffers(device, dynamic_state_capacity_activations)?;
         Ok(Self {
@@ -503,6 +505,7 @@ impl VulkanMountedStreamCircuit {
             binding_plan,
             kernel_interface_plan,
             dispatch_plan,
+            reusable_kernel_plan,
             buffers,
         })
     }
@@ -672,7 +675,7 @@ impl VulkanKernelStreamMetadata {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct VulkanKernelScalarBinding {
     pub name: String,
     pub scalar_type: String,
@@ -689,7 +692,7 @@ impl VulkanKernelScalarBinding {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum VulkanKernelScalarSource {
     PushConstant,
 }
@@ -789,7 +792,7 @@ pub struct VulkanKernelDescriptorBinding {
     pub resource: VulkanKernelDescriptorResource,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum VulkanKernelDescriptorUsage {
     InputSignal,
     OutputSignal,
@@ -807,6 +810,170 @@ pub enum VulkanKernelDescriptorResource {
         pedal_id: String,
         binding: VulkanStateBinding,
     },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanReusableKernelPlan {
+    pub backend_id: String,
+    pub total_command_count: usize,
+    pub families: Vec<VulkanReusableKernelFamily>,
+}
+
+impl VulkanReusableKernelPlan {
+    pub fn from_dispatch_plan(dispatch_plan: &VulkanKernelDispatchPlan) -> Self {
+        let mut grouped: BTreeMap<VulkanReusableKernelKey, Vec<VulkanKernelDispatchRef>> =
+            BTreeMap::new();
+
+        for command in &dispatch_plan.commands {
+            grouped
+                .entry(VulkanReusableKernelKey::from_command(command))
+                .or_default()
+                .push(VulkanKernelDispatchRef::from_command(command));
+        }
+
+        let mut op_family_indices = BTreeMap::new();
+        let families = grouped
+            .into_iter()
+            .map(|(key, command_refs)| {
+                let op_family_index = op_family_indices.entry(key.op.clone()).or_insert(0usize);
+                let family_id = if *op_family_index == 0 {
+                    key.op.clone()
+                } else {
+                    format!("{}.signature_{}", key.op, op_family_index)
+                };
+                *op_family_index += 1;
+
+                VulkanReusableKernelFamily {
+                    family_id,
+                    op: key.op,
+                    descriptor_signature: key.descriptor_signature,
+                    push_constants: key.push_constants,
+                    uses_stream_tick: key.uses_stream_tick,
+                    command_refs,
+                }
+            })
+            .collect();
+
+        Self {
+            backend_id: VULKAN_STREAM_CIRCUIT_BACKEND_ID.to_string(),
+            total_command_count: dispatch_plan.total_dispatch_count(),
+            families,
+        }
+    }
+
+    pub fn total_family_count(&self) -> usize {
+        self.families.len()
+    }
+
+    pub fn reusable_family_count(&self) -> usize {
+        self.families
+            .iter()
+            .filter(|family| family.command_refs.len() > 1)
+            .count()
+    }
+
+    pub fn family(&self, family_id: &str) -> Option<&VulkanReusableKernelFamily> {
+        self.families
+            .iter()
+            .find(|family| family.family_id == family_id)
+    }
+
+    pub fn families_for_op(&self, op: &str) -> Vec<&VulkanReusableKernelFamily> {
+        self.families
+            .iter()
+            .filter(|family| family.op == op)
+            .collect()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanReusableKernelFamily {
+    pub family_id: String,
+    pub op: String,
+    pub descriptor_signature: Vec<VulkanKernelDescriptorSlotSignature>,
+    pub push_constants: Vec<VulkanKernelScalarBinding>,
+    pub uses_stream_tick: bool,
+    pub command_refs: Vec<VulkanKernelDispatchRef>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct VulkanKernelDescriptorSlotSignature {
+    pub binding: usize,
+    pub usage: VulkanKernelDescriptorUsage,
+    pub resource_class: VulkanKernelDescriptorResourceClass,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum VulkanKernelDescriptorResourceClass {
+    SignalBuffer,
+    ParameterBuffer,
+    StateBuffer,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanKernelDispatchRef {
+    pub dispatch_index: usize,
+    pub kernel_id: String,
+    pub pedal_id: String,
+    pub circuit_index: usize,
+    pub node_index: usize,
+    pub node_id: String,
+}
+
+impl VulkanKernelDispatchRef {
+    fn from_command(command: &VulkanKernelDispatchCommand) -> Self {
+        Self {
+            dispatch_index: command.dispatch_index,
+            kernel_id: command.kernel_id.clone(),
+            pedal_id: command.pedal_id.clone(),
+            circuit_index: command.circuit_index,
+            node_index: command.node_index,
+            node_id: command.node_id.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct VulkanReusableKernelKey {
+    op: String,
+    descriptor_signature: Vec<VulkanKernelDescriptorSlotSignature>,
+    push_constants: Vec<VulkanKernelScalarBinding>,
+    uses_stream_tick: bool,
+}
+
+impl VulkanReusableKernelKey {
+    fn from_command(command: &VulkanKernelDispatchCommand) -> Self {
+        Self {
+            op: command.op.clone(),
+            descriptor_signature: command
+                .descriptor_bindings
+                .iter()
+                .map(VulkanKernelDescriptorSlotSignature::from_binding)
+                .collect(),
+            push_constants: command.push_constants.clone(),
+            uses_stream_tick: command.uses_stream_tick,
+        }
+    }
+}
+
+impl VulkanKernelDescriptorSlotSignature {
+    fn from_binding(binding: &VulkanKernelDescriptorBinding) -> Self {
+        Self {
+            binding: binding.binding,
+            usage: binding.usage.clone(),
+            resource_class: VulkanKernelDescriptorResourceClass::from_resource(&binding.resource),
+        }
+    }
+}
+
+impl VulkanKernelDescriptorResourceClass {
+    fn from_resource(resource: &VulkanKernelDescriptorResource) -> Self {
+        match resource {
+            VulkanKernelDescriptorResource::Signal(_) => Self::SignalBuffer,
+            VulkanKernelDescriptorResource::Parameter(_) => Self::ParameterBuffer,
+            VulkanKernelDescriptorResource::State { .. } => Self::StateBuffer,
+        }
+    }
 }
 
 fn descriptor_bindings_for_kernel(
@@ -1843,6 +2010,153 @@ mod tests {
     }
 
     #[test]
+    fn reusable_kernel_plan_collapses_lfm2_dispatches_into_op_families() {
+        let graph = ResolvedLoweredPedalboard::from_index_file(lfm2_index_path()).unwrap();
+        let tensor_index = TensorIndex::from_json_file(lfm2_tensor_index_path()).unwrap();
+        let execution_plan =
+            StreamCircuitExecutionPlan::from_graph_with_tensor_index(&graph, &tensor_index)
+                .unwrap();
+        let resource_plan =
+            StreamCircuitResourcePlan::from_graph_and_plan(&graph, &execution_plan).unwrap();
+        let resident_plan = VulkanStreamCircuitResidentPlan::from_resource_plan(
+            &resource_plan,
+            Some(&tensor_index),
+            Some(2),
+        )
+        .unwrap();
+        let binding_plan = VulkanStreamCircuitBindingPlan::from_plans(
+            &execution_plan,
+            &resource_plan,
+            &resident_plan,
+        )
+        .unwrap();
+        let dispatch_plan = VulkanKernelDispatchPlan::from_binding_plan(&binding_plan);
+
+        let reusable_plan = VulkanReusableKernelPlan::from_dispatch_plan(&dispatch_plan);
+
+        assert_eq!(reusable_plan.backend_id, VULKAN_STREAM_CIRCUIT_BACKEND_ID);
+        assert_eq!(reusable_plan.total_command_count, 242);
+        assert_eq!(reusable_plan.total_family_count(), 12);
+        assert_eq!(reusable_plan.reusable_family_count(), 12);
+        assert_eq!(reusable_plan.families_for_op("rms_norm").len(), 1);
+
+        let linear = reusable_plan.family("linear").unwrap();
+        assert_eq!(linear.op, "linear");
+        assert_eq!(linear.command_refs.len(), 82);
+        assert!(!linear.uses_stream_tick);
+        assert_eq!(
+            linear.descriptor_signature,
+            vec![
+                VulkanKernelDescriptorSlotSignature {
+                    binding: 0,
+                    usage: VulkanKernelDescriptorUsage::InputSignal,
+                    resource_class: VulkanKernelDescriptorResourceClass::SignalBuffer,
+                },
+                VulkanKernelDescriptorSlotSignature {
+                    binding: 1,
+                    usage: VulkanKernelDescriptorUsage::OutputSignal,
+                    resource_class: VulkanKernelDescriptorResourceClass::SignalBuffer,
+                },
+                VulkanKernelDescriptorSlotSignature {
+                    binding: 2,
+                    usage: VulkanKernelDescriptorUsage::Parameter,
+                    resource_class: VulkanKernelDescriptorResourceClass::ParameterBuffer,
+                },
+            ]
+        );
+        assert_eq!(linear.command_refs[0].dispatch_index, 1);
+        assert_eq!(
+            linear.command_refs[0].kernel_id,
+            "layer_00.conv_in_projection"
+        );
+        assert_eq!(
+            linear.command_refs.last().unwrap().kernel_id,
+            "layer_13.ffn_down_projection"
+        );
+
+        let rope = reusable_plan.family("rotary_position_embedding").unwrap();
+        assert_eq!(rope.command_refs.len(), 12);
+        assert!(rope.uses_stream_tick);
+        assert_eq!(
+            rope.push_constants
+                .iter()
+                .map(|binding| binding.name.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "stream_tick",
+                "control_flags",
+                "dynamic_state_capacity_activations"
+            ]
+        );
+
+        let append = reusable_plan.family("append_state_update").unwrap();
+        assert_eq!(append.command_refs.len(), 6);
+        assert!(append.uses_stream_tick);
+        assert_eq!(
+            append
+                .descriptor_signature
+                .iter()
+                .map(|slot| (
+                    slot.binding,
+                    slot.usage.clone(),
+                    slot.resource_class.clone()
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    0,
+                    VulkanKernelDescriptorUsage::InputSignal,
+                    VulkanKernelDescriptorResourceClass::SignalBuffer,
+                ),
+                (
+                    1,
+                    VulkanKernelDescriptorUsage::InputSignal,
+                    VulkanKernelDescriptorResourceClass::SignalBuffer,
+                ),
+                (
+                    2,
+                    VulkanKernelDescriptorUsage::InputSignal,
+                    VulkanKernelDescriptorResourceClass::SignalBuffer,
+                ),
+                (
+                    3,
+                    VulkanKernelDescriptorUsage::OutputSignal,
+                    VulkanKernelDescriptorResourceClass::SignalBuffer,
+                ),
+                (
+                    4,
+                    VulkanKernelDescriptorUsage::OutputSignal,
+                    VulkanKernelDescriptorResourceClass::SignalBuffer,
+                ),
+                (
+                    5,
+                    VulkanKernelDescriptorUsage::StateRead,
+                    VulkanKernelDescriptorResourceClass::StateBuffer,
+                ),
+                (
+                    6,
+                    VulkanKernelDescriptorUsage::StateWrite,
+                    VulkanKernelDescriptorResourceClass::StateBuffer,
+                ),
+                (
+                    7,
+                    VulkanKernelDescriptorUsage::StateView,
+                    VulkanKernelDescriptorResourceClass::SignalBuffer,
+                ),
+                (
+                    8,
+                    VulkanKernelDescriptorUsage::StateView,
+                    VulkanKernelDescriptorResourceClass::SignalBuffer,
+                ),
+            ]
+        );
+
+        let split = reusable_plan.family("split").unwrap();
+        assert_eq!(split.command_refs.len(), 8);
+        assert_eq!(split.descriptor_signature.len(), 4);
+    }
+
+    #[test]
     fn mounts_lfm2_stream_circuit_resources_without_claiming_execution() {
         let device = match VulkanComputeDevice::new() {
             Ok(device) => device,
@@ -1879,6 +2193,8 @@ mod tests {
         assert_eq!(mounted.binding_plan.total_node_count(), 242);
         assert_eq!(mounted.kernel_interface_plan.total_kernel_count(), 242);
         assert_eq!(mounted.dispatch_plan.total_dispatch_count(), 242);
+        assert_eq!(mounted.reusable_kernel_plan.total_family_count(), 12);
+        assert_eq!(mounted.reusable_kernel_plan.total_command_count, 242);
         assert_eq!(mounted.buffers.state_buffers.len(), 14);
         assert_eq!(mounted.buffers.activation_slot_buffers.len(), 56);
         assert_eq!(mounted.buffers.total_byte_capacity, 374_784);
