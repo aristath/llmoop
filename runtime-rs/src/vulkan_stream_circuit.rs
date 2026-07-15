@@ -1424,6 +1424,16 @@ impl VulkanMountedPlacedStreamCircuit {
             &self.cable_io,
         )
     }
+
+    pub fn stream_tick_plan(
+        &self,
+        manifest: &VulkanReusableKernelArtifactManifest,
+    ) -> Result<VulkanMountedPlacedStreamTickPlan, VulkanBoundDispatchPlanError> {
+        let mounted_bound_plan = self.mounted_placed_bound_dispatch_plan(manifest)?;
+        Ok(VulkanMountedPlacedStreamTickPlan::from_mounted_bound_plan(
+            &mounted_bound_plan,
+        ))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3332,6 +3342,298 @@ fn bind_cable_endpoint_buffer(
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanMountedPlacedStreamTickPlan {
+    pub backend_id: String,
+    pub device_id: String,
+    pub stages: Vec<VulkanMountedPlacedStreamTickStage>,
+    pub stage_count: usize,
+    pub receive_stage_count: usize,
+    pub dispatch_stage_count: usize,
+    pub publish_stage_count: usize,
+    pub local_cable_read_count: usize,
+    pub local_cable_write_count: usize,
+    pub incoming_cable_read_count: usize,
+    pub outgoing_cable_write_count: usize,
+    pub model_input_read_count: usize,
+    pub model_output_write_count: usize,
+    pub can_execute: bool,
+}
+
+impl VulkanMountedPlacedStreamTickPlan {
+    pub fn from_mounted_bound_plan(
+        mounted_bound_plan: &VulkanMountedPlacedBoundDispatchPlan,
+    ) -> Self {
+        let mut stages = Vec::new();
+        let mut incoming_endpoints =
+            BTreeMap::<(usize, usize), VulkanPlacedCableEndpointBufferBinding>::new();
+        let mut outgoing_endpoints =
+            BTreeMap::<(usize, usize), VulkanPlacedCableEndpointBufferBinding>::new();
+
+        let mut local_cable_read_count = 0usize;
+        let mut local_cable_write_count = 0usize;
+        let mut incoming_cable_read_count = 0usize;
+        let mut outgoing_cable_write_count = 0usize;
+        let mut model_input_read_count = 0usize;
+        let mut model_output_write_count = 0usize;
+
+        let dispatch_stages = mounted_bound_plan
+            .dispatches
+            .iter()
+            .map(|dispatch| {
+                let dispatch_stage =
+                    VulkanMountedPlacedStreamTickDispatch::from_bound_dispatch(dispatch);
+                local_cable_read_count += dispatch_stage
+                    .reads
+                    .iter()
+                    .filter(|io| {
+                        matches!(io, VulkanMountedPlacedStreamTickIo::LocalCableBuffer { .. })
+                    })
+                    .count();
+                local_cable_write_count += dispatch_stage
+                    .writes
+                    .iter()
+                    .filter(|io| {
+                        matches!(io, VulkanMountedPlacedStreamTickIo::LocalCableBuffer { .. })
+                    })
+                    .count();
+                incoming_cable_read_count += dispatch_stage
+                    .reads
+                    .iter()
+                    .filter(|io| {
+                        matches!(
+                            io,
+                            VulkanMountedPlacedStreamTickIo::IncomingCableBuffer { .. }
+                        )
+                    })
+                    .count();
+                outgoing_cable_write_count += dispatch_stage
+                    .writes
+                    .iter()
+                    .filter(|io| {
+                        matches!(
+                            io,
+                            VulkanMountedPlacedStreamTickIo::OutgoingCableBuffer { .. }
+                        )
+                    })
+                    .count();
+                model_input_read_count += dispatch_stage
+                    .reads
+                    .iter()
+                    .filter(|io| matches!(io, VulkanMountedPlacedStreamTickIo::ModelSignal { .. }))
+                    .count();
+                model_output_write_count += dispatch_stage
+                    .writes
+                    .iter()
+                    .filter(|io| matches!(io, VulkanMountedPlacedStreamTickIo::ModelSignal { .. }))
+                    .count();
+
+                for descriptor in &dispatch.descriptors {
+                    match &descriptor.target {
+                        VulkanMountedPlacedBoundDescriptorTarget::IncomingCableBuffer {
+                            endpoint,
+                        } => {
+                            incoming_endpoints
+                                .entry((endpoint.endpoint.cable_index, endpoint.buffer_index))
+                                .or_insert_with(|| endpoint.clone());
+                        }
+                        VulkanMountedPlacedBoundDescriptorTarget::OutgoingCableBuffer {
+                            endpoint,
+                        } => {
+                            outgoing_endpoints
+                                .entry((endpoint.endpoint.cable_index, endpoint.buffer_index))
+                                .or_insert_with(|| endpoint.clone());
+                        }
+                        _ => {}
+                    }
+                }
+
+                dispatch_stage
+            })
+            .collect::<Vec<_>>();
+
+        for endpoint in incoming_endpoints.values() {
+            stages.push(VulkanMountedPlacedStreamTickStage::ReceiveCable {
+                stage_index: stages.len(),
+                cable_index: endpoint.endpoint.cable_index,
+                endpoint_id: endpoint.endpoint.endpoint_id.clone(),
+                buffer_index: endpoint.buffer_index,
+                byte_capacity: endpoint.byte_capacity,
+                remote_device_id: endpoint.endpoint.remote_device_id.clone(),
+                remote_pedal_id: endpoint.endpoint.remote_pedal_id.clone(),
+            });
+        }
+
+        for dispatch in dispatch_stages {
+            stages.push(VulkanMountedPlacedStreamTickStage::Dispatch {
+                stage_index: stages.len(),
+                dispatch,
+            });
+        }
+
+        for endpoint in outgoing_endpoints.values() {
+            stages.push(VulkanMountedPlacedStreamTickStage::PublishCable {
+                stage_index: stages.len(),
+                cable_index: endpoint.endpoint.cable_index,
+                endpoint_id: endpoint.endpoint.endpoint_id.clone(),
+                buffer_index: endpoint.buffer_index,
+                byte_capacity: endpoint.byte_capacity,
+                remote_device_id: endpoint.endpoint.remote_device_id.clone(),
+                remote_pedal_id: endpoint.endpoint.remote_pedal_id.clone(),
+            });
+        }
+
+        let receive_stage_count = incoming_endpoints.len();
+        let publish_stage_count = outgoing_endpoints.len();
+        let dispatch_stage_count = mounted_bound_plan.dispatches.len();
+        let stage_count = stages.len();
+
+        Self {
+            backend_id: mounted_bound_plan.backend_id.clone(),
+            device_id: mounted_bound_plan.device_id.clone(),
+            stages,
+            stage_count,
+            receive_stage_count,
+            dispatch_stage_count,
+            publish_stage_count,
+            local_cable_read_count,
+            local_cable_write_count,
+            incoming_cable_read_count,
+            outgoing_cable_write_count,
+            model_input_read_count,
+            model_output_write_count,
+            can_execute: false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VulkanMountedPlacedStreamTickStage {
+    ReceiveCable {
+        stage_index: usize,
+        cable_index: usize,
+        endpoint_id: String,
+        buffer_index: usize,
+        byte_capacity: usize,
+        remote_device_id: String,
+        remote_pedal_id: String,
+    },
+    Dispatch {
+        stage_index: usize,
+        dispatch: VulkanMountedPlacedStreamTickDispatch,
+    },
+    PublishCable {
+        stage_index: usize,
+        cable_index: usize,
+        endpoint_id: String,
+        buffer_index: usize,
+        byte_capacity: usize,
+        remote_device_id: String,
+        remote_pedal_id: String,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanMountedPlacedStreamTickDispatch {
+    pub dispatch_index: usize,
+    pub kernel_id: String,
+    pub pedal_id: String,
+    pub node_id: String,
+    pub op: String,
+    pub descriptor_count: usize,
+    pub resident_descriptor_count: usize,
+    pub reads: Vec<VulkanMountedPlacedStreamTickIo>,
+    pub writes: Vec<VulkanMountedPlacedStreamTickIo>,
+}
+
+impl VulkanMountedPlacedStreamTickDispatch {
+    fn from_bound_dispatch(dispatch: &VulkanMountedPlacedBoundDispatch) -> Self {
+        let mut resident_descriptor_count = 0usize;
+        let mut reads = Vec::new();
+        let mut writes = Vec::new();
+
+        for descriptor in &dispatch.descriptors {
+            match &descriptor.target {
+                VulkanMountedPlacedBoundDescriptorTarget::Resident { .. } => {
+                    resident_descriptor_count += 1;
+                }
+                VulkanMountedPlacedBoundDescriptorTarget::ModelInput { signal_id } => {
+                    reads.push(VulkanMountedPlacedStreamTickIo::ModelSignal {
+                        signal_id: signal_id.clone(),
+                    });
+                }
+                VulkanMountedPlacedBoundDescriptorTarget::ModelOutput { signal_id } => {
+                    writes.push(VulkanMountedPlacedStreamTickIo::ModelSignal {
+                        signal_id: signal_id.clone(),
+                    });
+                }
+                VulkanMountedPlacedBoundDescriptorTarget::LocalCableInputBuffer { cable } => {
+                    reads.push(VulkanMountedPlacedStreamTickIo::LocalCableBuffer {
+                        cable_index: cable.cable.cable_index,
+                        buffer_index: cable.buffer_index,
+                        byte_capacity: cable.byte_capacity,
+                    });
+                }
+                VulkanMountedPlacedBoundDescriptorTarget::LocalCableOutputBuffer { cable } => {
+                    writes.push(VulkanMountedPlacedStreamTickIo::LocalCableBuffer {
+                        cable_index: cable.cable.cable_index,
+                        buffer_index: cable.buffer_index,
+                        byte_capacity: cable.byte_capacity,
+                    });
+                }
+                VulkanMountedPlacedBoundDescriptorTarget::IncomingCableBuffer { endpoint } => {
+                    reads.push(VulkanMountedPlacedStreamTickIo::IncomingCableBuffer {
+                        cable_index: endpoint.endpoint.cable_index,
+                        buffer_index: endpoint.buffer_index,
+                        byte_capacity: endpoint.byte_capacity,
+                    });
+                }
+                VulkanMountedPlacedBoundDescriptorTarget::OutgoingCableBuffer { endpoint } => {
+                    writes.push(VulkanMountedPlacedStreamTickIo::OutgoingCableBuffer {
+                        cable_index: endpoint.endpoint.cable_index,
+                        buffer_index: endpoint.buffer_index,
+                        byte_capacity: endpoint.byte_capacity,
+                    });
+                }
+            }
+        }
+
+        Self {
+            dispatch_index: dispatch.dispatch_index,
+            kernel_id: dispatch.kernel_id.clone(),
+            pedal_id: dispatch.pedal_id.clone(),
+            node_id: dispatch.node_id.clone(),
+            op: dispatch.op.clone(),
+            descriptor_count: dispatch.descriptors.len(),
+            resident_descriptor_count,
+            reads,
+            writes,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VulkanMountedPlacedStreamTickIo {
+    ModelSignal {
+        signal_id: String,
+    },
+    LocalCableBuffer {
+        cable_index: usize,
+        buffer_index: usize,
+        byte_capacity: usize,
+    },
+    IncomingCableBuffer {
+        cable_index: usize,
+        buffer_index: usize,
+        byte_capacity: usize,
+    },
+    OutgoingCableBuffer {
+        cable_index: usize,
+        buffer_index: usize,
+        byte_capacity: usize,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VulkanPlacedBoundDispatch {
     pub dispatch_index: usize,
     pub kernel_id: String,
@@ -4805,6 +5107,43 @@ mod tests {
         assert_eq!(mounted_bound.incoming_cable_descriptor_count, 0);
         assert_eq!(mounted_bound.outgoing_cable_descriptor_count, 0);
 
+        let tick_plan = mounted.stream_tick_plan(&manifest).unwrap();
+        assert_eq!(tick_plan.device_id, "gpu0");
+        assert!(!tick_plan.can_execute);
+        assert_eq!(tick_plan.stage_count, 242);
+        assert_eq!(tick_plan.receive_stage_count, 0);
+        assert_eq!(tick_plan.dispatch_stage_count, 242);
+        assert_eq!(tick_plan.publish_stage_count, 0);
+        assert_eq!(tick_plan.local_cable_read_count, 26);
+        assert_eq!(tick_plan.local_cable_write_count, 13);
+        assert_eq!(tick_plan.incoming_cable_read_count, 0);
+        assert_eq!(tick_plan.outgoing_cable_write_count, 0);
+        assert_eq!(tick_plan.model_input_read_count, 2);
+        assert_eq!(tick_plan.model_output_write_count, 1);
+        assert_eq!(
+            tick_plan.stages[0],
+            VulkanMountedPlacedStreamTickStage::Dispatch {
+                stage_index: 0,
+                dispatch: VulkanMountedPlacedStreamTickDispatch {
+                    dispatch_index: 0,
+                    kernel_id: "layer_00.operator_norm".to_string(),
+                    pedal_id: "layer_00".to_string(),
+                    node_id: "operator_norm".to_string(),
+                    op: "rms_norm".to_string(),
+                    descriptor_count: mounted_bound
+                        .dispatch("layer_00", "operator_norm")
+                        .unwrap()
+                        .descriptors
+                        .len(),
+                    resident_descriptor_count: 2,
+                    reads: vec![VulkanMountedPlacedStreamTickIo::ModelSignal {
+                        signal_id: "input_frame".to_string(),
+                    }],
+                    writes: vec![],
+                },
+            }
+        );
+
         assert_eq!(
             mounted_bound
                 .dispatch("layer_00", "operator_norm")
@@ -4885,6 +5224,20 @@ mod tests {
             VulkanMountedPlacedBoundDescriptorTarget::ModelOutput {
                 signal_id: "output_frame".to_string(),
             }
+        );
+        let layer_01_norm_tick = match &tick_plan.stages[16] {
+            VulkanMountedPlacedStreamTickStage::Dispatch { dispatch, .. } => dispatch,
+            stage => panic!("expected layer_01 operator_norm dispatch, got {stage:?}"),
+        };
+        assert_eq!(layer_01_norm_tick.pedal_id, "layer_01");
+        assert_eq!(layer_01_norm_tick.node_id, "operator_norm");
+        assert_eq!(
+            layer_01_norm_tick.reads,
+            vec![VulkanMountedPlacedStreamTickIo::LocalCableBuffer {
+                cable_index: 0,
+                buffer_index: 0,
+                byte_capacity: 2_048,
+            }]
         );
     }
 
@@ -5136,6 +5489,69 @@ mod tests {
                         .clone(),
                     byte_capacity: 2_048,
                 },
+            }
+        );
+
+        let tick_plan = mounted.stream_tick_plan(&manifest).unwrap();
+        assert_eq!(tick_plan.device_id, "gpu1");
+        assert!(!tick_plan.can_execute);
+        assert_eq!(tick_plan.stage_count, 21);
+        assert_eq!(tick_plan.receive_stage_count, 1);
+        assert_eq!(tick_plan.dispatch_stage_count, 19);
+        assert_eq!(tick_plan.publish_stage_count, 1);
+        assert_eq!(tick_plan.local_cable_read_count, 0);
+        assert_eq!(tick_plan.local_cable_write_count, 0);
+        assert_eq!(tick_plan.incoming_cable_read_count, 2);
+        assert_eq!(tick_plan.outgoing_cable_write_count, 1);
+        assert_eq!(tick_plan.model_input_read_count, 0);
+        assert_eq!(tick_plan.model_output_write_count, 0);
+        assert_eq!(
+            tick_plan.stages[0],
+            VulkanMountedPlacedStreamTickStage::ReceiveCable {
+                stage_index: 0,
+                cable_index: 1,
+                endpoint_id: "cable_1_in".to_string(),
+                buffer_index: 0,
+                byte_capacity: 2_048,
+                remote_device_id: "cpu0".to_string(),
+                remote_pedal_id: "layer_01".to_string(),
+            }
+        );
+        assert_eq!(
+            tick_plan.stages[1],
+            VulkanMountedPlacedStreamTickStage::Dispatch {
+                stage_index: 1,
+                dispatch: VulkanMountedPlacedStreamTickDispatch {
+                    dispatch_index: 0,
+                    kernel_id: "layer_02.operator_norm".to_string(),
+                    pedal_id: "layer_02".to_string(),
+                    node_id: "operator_norm".to_string(),
+                    op: "rms_norm".to_string(),
+                    descriptor_count: mounted_bound
+                        .dispatch("layer_02", "operator_norm")
+                        .unwrap()
+                        .descriptors
+                        .len(),
+                    resident_descriptor_count: 2,
+                    reads: vec![VulkanMountedPlacedStreamTickIo::IncomingCableBuffer {
+                        cable_index: 1,
+                        buffer_index: 0,
+                        byte_capacity: 2_048,
+                    }],
+                    writes: vec![],
+                },
+            }
+        );
+        assert_eq!(
+            tick_plan.stages[20],
+            VulkanMountedPlacedStreamTickStage::PublishCable {
+                stage_index: 20,
+                cable_index: 2,
+                endpoint_id: "cable_2_out".to_string(),
+                buffer_index: 0,
+                byte_capacity: 2_048,
+                remote_device_id: "lan:worker-a".to_string(),
+                remote_pedal_id: "layer_03".to_string(),
             }
         );
 
