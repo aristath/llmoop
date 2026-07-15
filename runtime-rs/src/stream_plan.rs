@@ -82,6 +82,13 @@ impl StreamCircuitExecutionPlan {
         }
         counts
     }
+
+    pub fn layer_local_activation_slot_count(&self) -> usize {
+        self.circuits
+            .iter()
+            .map(|circuit| circuit.activation_frame_plan().slot_count)
+            .sum()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -243,6 +250,84 @@ impl CircuitActivationPlan {
     pub fn signal(&self, signal_id: &str) -> Option<&PlannedSignal> {
         self.signals.get(signal_id)
     }
+
+    pub fn activation_frame_plan(&self) -> ActivationFramePlan {
+        let liveness = self.signal_liveness();
+        let mut slot_free_after: Vec<usize> = Vec::new();
+        let mut assignments = Vec::with_capacity(liveness.len());
+
+        for live in &liveness {
+            let reusable_slot = slot_free_after
+                .iter()
+                .position(|free_after| *free_after < live.produced_at);
+            let slot = if let Some(slot) = reusable_slot {
+                slot_free_after[slot] = live.last_consumed_at;
+                slot
+            } else {
+                let slot = slot_free_after.len();
+                slot_free_after.push(live.last_consumed_at);
+                slot
+            };
+            assignments.push(SignalSlotAssignment {
+                signal_id: live.signal_id.clone(),
+                slot,
+                produced_at: live.produced_at,
+                last_consumed_at: live.last_consumed_at,
+            });
+        }
+
+        ActivationFramePlan {
+            liveness,
+            assignments,
+            slot_count: slot_free_after.len(),
+        }
+    }
+
+    fn signal_liveness(&self) -> Vec<SignalLiveness> {
+        let temporary_signals: BTreeSet<_> = self.temporary_signals.iter().cloned().collect();
+        let node_indices: BTreeMap<_, _> = self
+            .nodes
+            .iter()
+            .map(|node| (node.id.as_str(), node.index))
+            .collect();
+        let mut liveness = Vec::new();
+
+        for node in &self.nodes {
+            for output in &node.outputs {
+                if !temporary_signals.contains(output) {
+                    continue;
+                }
+                let signal = self
+                    .signals
+                    .get(output)
+                    .expect("temporary signal is in the planned signal table");
+                let consumer_indices: Vec<_> = signal
+                    .consumers
+                    .iter()
+                    .map(|consumer| {
+                        if consumer.starts_with("boundary.output:") {
+                            self.nodes.len()
+                        } else {
+                            *node_indices.get(consumer.as_str()).unwrap_or_else(|| {
+                                panic!("unknown consumer {consumer:?} for signal {output:?}")
+                            })
+                        }
+                    })
+                    .collect();
+                let last_consumed_at = consumer_indices.iter().copied().max().unwrap_or(node.index);
+                liveness.push(SignalLiveness {
+                    signal_id: output.clone(),
+                    produced_by: node.id.clone(),
+                    produced_at: node.index,
+                    consumers: signal.consumers.clone(),
+                    consumer_indices,
+                    last_consumed_at,
+                });
+            }
+        }
+
+        liveness
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -326,6 +411,46 @@ pub enum SignalProducer {
     Node { node_id: String },
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ActivationFramePlan {
+    pub liveness: Vec<SignalLiveness>,
+    pub assignments: Vec<SignalSlotAssignment>,
+    pub slot_count: usize,
+}
+
+impl ActivationFramePlan {
+    pub fn slot_for(&self, signal_id: &str) -> Option<usize> {
+        self.assignments
+            .iter()
+            .find(|assignment| assignment.signal_id == signal_id)
+            .map(|assignment| assignment.slot)
+    }
+
+    pub fn liveness_for(&self, signal_id: &str) -> Option<&SignalLiveness> {
+        self.liveness
+            .iter()
+            .find(|liveness| liveness.signal_id == signal_id)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SignalLiveness {
+    pub signal_id: String,
+    pub produced_by: String,
+    pub produced_at: usize,
+    pub consumers: Vec<String>,
+    pub consumer_indices: Vec<usize>,
+    pub last_consumed_at: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SignalSlotAssignment {
+    pub signal_id: String,
+    pub slot: usize,
+    pub produced_at: usize,
+    pub last_consumed_at: usize,
+}
+
 fn validate_node_dependencies(
     pedal_id: &str,
     node: &CircuitNode,
@@ -392,6 +517,7 @@ mod tests {
         assert_eq!(plan.total_node_count(), 242);
         assert_eq!(plan.produced_signal_count(), 264);
         assert_eq!(plan.temporary_signal_count(), 250);
+        assert_eq!(plan.layer_local_activation_slot_count(), 62);
         assert_eq!(plan.operator_counts().get("linear"), Some(&82));
         assert_eq!(
             plan.state_type_counts().get("append_only_attention_memory"),
@@ -399,9 +525,11 @@ mod tests {
         );
 
         let layer_00 = &plan.circuits[0];
+        let layer_00_frame = layer_00.activation_frame_plan();
         assert_eq!(layer_00.pedal_id, "layer_00");
         assert_eq!(layer_00.nodes.len(), 16);
         assert_eq!(layer_00.temporary_signals.len(), 17);
+        assert_eq!(layer_00_frame.slot_count, 4);
         assert_eq!(layer_00.input_ports[0].id, "input_frame");
         assert_eq!(layer_00.output_ports[0].id, "output_frame");
         assert_eq!(
@@ -415,6 +543,7 @@ mod tests {
         );
 
         let layer_02 = &plan.circuits[2];
+        assert_eq!(layer_02.activation_frame_plan().slot_count, 5);
         assert!(
             layer_02
                 .nodes
@@ -456,6 +585,30 @@ mod tests {
         assert_eq!(
             output_frame.consumers,
             vec!["boundary.output:output_frame".to_string()]
+        );
+    }
+
+    #[test]
+    fn activation_frame_plan_reuses_temporary_signal_slots_by_liveness() {
+        let graph = ResolvedLoweredPedalboard::from_index_file(lfm2_index_path()).unwrap();
+        let plan = StreamCircuitExecutionPlan::from_graph(&graph).unwrap();
+        let frame = plan.circuits[0].activation_frame_plan();
+
+        assert_eq!(frame.liveness.len(), 17);
+        assert_eq!(frame.slot_count, 4);
+        assert_eq!(frame.slot_for("operator_norm_out"), Some(0));
+        assert_eq!(frame.slot_for("gate_b"), Some(0));
+        assert_eq!(frame.slot_for("gate_c"), Some(2));
+        assert_eq!(frame.slot_for("projected_x"), Some(3));
+        assert_eq!(frame.slot_for("operator_residual_out"), Some(0));
+
+        let residual = frame.liveness_for("operator_residual_out").unwrap();
+        assert_eq!(residual.produced_by, "operator_residual");
+        assert_eq!(residual.produced_at, 8);
+        assert_eq!(residual.last_consumed_at, 15);
+        assert_eq!(
+            residual.consumers,
+            vec!["ffn_norm".to_string(), "ffn_residual".to_string()]
         );
     }
 
