@@ -2,6 +2,7 @@ use std::error::Error;
 use std::fmt::{Display, Formatter};
 
 use crate::stream_plan::{StreamCircuitResourcePlan, TensorIndex};
+use crate::vulkan_compute::{VulkanComputeDevice, VulkanError, VulkanResidentBuffer};
 
 pub const VULKAN_STREAM_CIRCUIT_BACKEND_ID: &str = "vulkan_stream_circuit_ir";
 
@@ -164,6 +165,64 @@ impl VulkanStreamCircuitResidentPlan {
             .iter()
             .find(|bank| bank.pedal_id == pedal_id)
     }
+
+    pub fn allocate_stream_buffers(
+        &self,
+        device: &VulkanComputeDevice,
+        dynamic_state_capacity_activations: usize,
+    ) -> Result<VulkanStreamCircuitStreamBuffers, VulkanError> {
+        let mut state_buffers = Vec::with_capacity(self.stream_state_buffers.len());
+        let mut activation_slot_buffers = Vec::new();
+        let mut total_byte_capacity = 0usize;
+
+        for state in &self.stream_state_buffers {
+            let byte_capacity =
+                stream_state_byte_capacity(state, dynamic_state_capacity_activations)?;
+            total_byte_capacity = checked_add_bytes(
+                total_byte_capacity,
+                byte_capacity,
+                "stream state buffer allocation",
+            )?;
+            state_buffers.push(VulkanStreamStateBufferAllocation {
+                pedal_id: state.pedal_id.clone(),
+                state_id: state.state_id.clone(),
+                state_type: state.state_type.clone(),
+                byte_capacity,
+                buffer: device.create_resident_buffer(byte_capacity)?,
+            });
+        }
+
+        for bank in &self.activation_banks {
+            for slot in &bank.slots {
+                let byte_capacity = slot.bytes.ok_or_else(|| {
+                    VulkanError(format!(
+                        "{} activation slot {} has unknown byte size",
+                        bank.pedal_id, slot.slot
+                    ))
+                })?;
+                total_byte_capacity = checked_add_bytes(
+                    total_byte_capacity,
+                    byte_capacity,
+                    "activation slot buffer allocation",
+                )?;
+                activation_slot_buffers.push(VulkanActivationSlotBufferAllocation {
+                    pedal_id: bank.pedal_id.clone(),
+                    circuit_id: bank.circuit_id.clone(),
+                    slot: slot.slot,
+                    signal_ids: slot.signal_ids.clone(),
+                    byte_capacity,
+                    buffer: device.create_resident_buffer(byte_capacity)?,
+                });
+            }
+        }
+
+        Ok(VulkanStreamCircuitStreamBuffers {
+            dynamic_state_capacity_activations,
+            state_buffers,
+            activation_slot_buffers,
+            total_byte_capacity,
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -203,6 +262,30 @@ pub struct VulkanResidentActivationSlot {
     pub bytes: Option<usize>,
 }
 
+pub struct VulkanStreamCircuitStreamBuffers {
+    pub dynamic_state_capacity_activations: usize,
+    pub state_buffers: Vec<VulkanStreamStateBufferAllocation>,
+    pub activation_slot_buffers: Vec<VulkanActivationSlotBufferAllocation>,
+    pub total_byte_capacity: usize,
+}
+
+pub struct VulkanStreamStateBufferAllocation {
+    pub pedal_id: String,
+    pub state_id: String,
+    pub state_type: String,
+    pub byte_capacity: usize,
+    pub buffer: VulkanResidentBuffer,
+}
+
+pub struct VulkanActivationSlotBufferAllocation {
+    pub pedal_id: String,
+    pub circuit_id: String,
+    pub slot: usize,
+    pub signal_ids: Vec<String>,
+    pub byte_capacity: usize,
+    pub buffer: VulkanResidentBuffer,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VulkanResidentPlanError(pub String);
 
@@ -226,6 +309,50 @@ fn optional_mul(
         )?)),
         _ => Ok(None),
     }
+}
+
+fn stream_state_byte_capacity(
+    state: &VulkanResidentStateBuffer,
+    dynamic_state_capacity_activations: usize,
+) -> Result<usize, VulkanError> {
+    let static_bytes = state.static_bytes.unwrap_or(0);
+    let dynamic_bytes = match state.bytes_per_activation {
+        Some(bytes_per_activation) => {
+            if dynamic_state_capacity_activations == 0 {
+                return Err(VulkanError(format!(
+                    "{}.{} requires non-zero dynamic state capacity",
+                    state.pedal_id, state.state_id
+                )));
+            }
+            bytes_per_activation
+                .checked_mul(dynamic_state_capacity_activations)
+                .ok_or_else(|| {
+                    VulkanError(format!(
+                        "{}.{} dynamic state byte capacity overflowed",
+                        state.pedal_id, state.state_id
+                    ))
+                })?
+        }
+        None => 0,
+    };
+    let total = static_bytes.checked_add(dynamic_bytes).ok_or_else(|| {
+        VulkanError(format!(
+            "{}.{} state byte capacity overflowed",
+            state.pedal_id, state.state_id
+        ))
+    })?;
+    if total == 0 {
+        return Err(VulkanError(format!(
+            "{}.{} has unknown or zero byte capacity",
+            state.pedal_id, state.state_id
+        )));
+    }
+    Ok(total)
+}
+
+fn checked_add_bytes(left: usize, right: usize, label: &str) -> Result<usize, VulkanError> {
+    left.checked_add(right)
+        .ok_or_else(|| VulkanError(format!("{label} overflowed")))
 }
 
 fn product(shape: &[usize]) -> Option<usize> {
@@ -362,5 +489,63 @@ mod tests {
         assert_eq!(resident_plan.per_stream_activation_slot_elements, None);
         assert_eq!(resident_plan.per_stream_activation_slot_bytes, None);
         assert!(!resident_plan.unresolved_activation_slots.is_empty());
+    }
+
+    #[test]
+    fn allocates_lfm2_per_stream_vulkan_buffers_from_resident_plan() {
+        let device = match VulkanComputeDevice::new() {
+            Ok(device) => device,
+            Err(error) => {
+                eprintln!("skipping Vulkan stream-circuit allocation: {error}");
+                return;
+            }
+        };
+        let graph = ResolvedLoweredPedalboard::from_index_file(lfm2_index_path()).unwrap();
+        let tensor_index = TensorIndex::from_json_file(lfm2_tensor_index_path()).unwrap();
+        let resource_plan =
+            StreamCircuitResourcePlan::from_graph_with_tensor_index(&graph, &tensor_index).unwrap();
+        let resident_plan = VulkanStreamCircuitResidentPlan::from_resource_plan(
+            &resource_plan,
+            Some(&tensor_index),
+            Some(2),
+        )
+        .unwrap();
+
+        let buffers = resident_plan.allocate_stream_buffers(&device, 4).unwrap();
+
+        assert_eq!(buffers.dynamic_state_capacity_activations, 4);
+        assert_eq!(buffers.state_buffers.len(), 14);
+        assert_eq!(buffers.activation_slot_buffers.len(), 56);
+        assert_eq!(buffers.total_byte_capacity, 49_152 + 12_288 * 4 + 276_480);
+
+        let layer_00_state = buffers
+            .state_buffers
+            .iter()
+            .find(|buffer| buffer.pedal_id == "layer_00")
+            .unwrap();
+        assert_eq!(layer_00_state.state_id, "temporal_memory");
+        assert_eq!(layer_00_state.byte_capacity, 6_144);
+        assert_eq!(layer_00_state.buffer.byte_capacity(), 6_144);
+
+        let layer_02_state = buffers
+            .state_buffers
+            .iter()
+            .find(|buffer| buffer.pedal_id == "layer_02")
+            .unwrap();
+        assert_eq!(layer_02_state.state_id, "kv_memory");
+        assert_eq!(layer_02_state.byte_capacity, 8_192);
+        assert_eq!(layer_02_state.buffer.byte_capacity(), 8_192);
+
+        let layer_00_slot_1 = buffers
+            .activation_slot_buffers
+            .iter()
+            .find(|buffer| buffer.pedal_id == "layer_00" && buffer.slot == 1)
+            .unwrap();
+        assert_eq!(layer_00_slot_1.byte_capacity, 6_144);
+        assert!(
+            layer_00_slot_1
+                .signal_ids
+                .contains(&"conv_projected".to_string())
+        );
     }
 }
