@@ -10,6 +10,8 @@ pub mod vulkan_backend;
 pub mod vulkan_compute;
 #[cfg(feature = "vulkan")]
 pub mod vulkan_pedalboard;
+#[cfg(feature = "vulkan")]
+pub mod vulkan_stream_circuit;
 
 pub use backend::{BackendError, DeviceBackend};
 pub use contract_backend::ContractDeviceBackend;
@@ -23,3 +25,5 @@ pub use vulkan_backend::*;
 pub use vulkan_compute::*;
 #[cfg(feature = "vulkan")]
 pub use vulkan_pedalboard::*;
+#[cfg(feature = "vulkan")]
+pub use vulkan_stream_circuit::*;
