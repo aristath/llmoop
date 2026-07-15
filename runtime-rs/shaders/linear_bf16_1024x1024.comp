@@ -1,0 +1,63 @@
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer InputFrame {
+    uint words[];
+} input_frame;
+
+layout(set = 0, binding = 1) buffer OutputFrame {
+    uint words[];
+} output_frame;
+
+layout(set = 0, binding = 2) readonly buffer Weight {
+    uint words[];
+} weight;
+
+const uint INPUT_SIZE = 1024u;
+const uint OUTPUT_SIZE = 1024u;
+const uint OUTPUT_WORDS = OUTPUT_SIZE / 2u;
+
+float bf16_to_f32(uint value) {
+    return uintBitsToFloat((value & 0xffffu) << 16);
+}
+
+uint f32_to_bf16(float value) {
+    uint bits = floatBitsToUint(value);
+    uint lsb = (bits >> 16) & 1u;
+    uint rounding_bias = 0x7fffu + lsb;
+    return (bits + rounding_bias) >> 16;
+}
+
+float read_input(uint index) {
+    uint packed = input_frame.words[index >> 1];
+    uint value = ((index & 1u) == 0u) ? (packed & 0xffffu) : (packed >> 16);
+    return bf16_to_f32(value);
+}
+
+float read_weight(uint element_index) {
+    uint packed = weight.words[element_index >> 1];
+    uint value = ((element_index & 1u) == 0u) ? (packed & 0xffffu) : (packed >> 16);
+    return bf16_to_f32(value);
+}
+
+float linear_row(uint row) {
+    float sum = 0.0;
+    uint weight_offset = row * INPUT_SIZE;
+    for (uint column = 0u; column < INPUT_SIZE; column = column + 1u) {
+        sum = sum + read_input(column) * read_weight(weight_offset + column);
+    }
+    return sum;
+}
+
+void main() {
+    uint word_index = gl_GlobalInvocationID.x;
+    if (word_index >= OUTPUT_WORDS) {
+        return;
+    }
+
+    uint lo_row = word_index * 2u;
+    uint hi_row = lo_row + 1u;
+    output_frame.words[word_index] = (f32_to_bf16(linear_row(hi_row)) << 16)
+        | f32_to_bf16(linear_row(lo_row));
+}

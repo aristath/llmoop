@@ -7404,6 +7404,113 @@ mod tests {
                                                 0x86, 0xb7, 0xe5, 0xb4, 0x79, 0xb6, 0x21, 0xba,
                                             ]
                                         );
+
+                                        mounted
+                                            .parameter_buffers
+                                            .load_parameter_from_tensor_index(
+                                                &tensor_index,
+                                                "model.layers.0.conv.out_proj.weight",
+                                            )
+                                            .unwrap();
+                                        if let Some(conv_out_projection_spirv_words) =
+                                            crate::vulkan_compute::compile_test_shader_words_from_source(
+                                                "linear_bf16_1024x1024.comp",
+                                            )
+                                        {
+                                            let conv_out_projection_dispatch = mounted_bound
+                                                .dispatch("layer_00", "conv_out_projection")
+                                                .unwrap();
+                                            assert_eq!(
+                                                conv_out_projection_dispatch.op,
+                                                "linear"
+                                            );
+                                            let conv_out_projection_bindings = mounted
+                                                .resident_kernel_buffer_bindings_for_bound_dispatch(
+                                                    conv_out_projection_dispatch,
+                                                )
+                                                .unwrap();
+                                            assert_eq!(conv_out_projection_bindings.len(), 3);
+                                            assert!(
+                                                conv_out_projection_bindings[0].byte_len >= 2_048
+                                            );
+                                            assert!(
+                                                conv_out_projection_bindings[1].byte_len >= 2_048
+                                            );
+                                            assert_eq!(
+                                                conv_out_projection_bindings[2].byte_len,
+                                                2_097_152
+                                            );
+                                            let conv_out_projection_family = mounted
+                                                .placed_plan
+                                                .reusable_kernel_plan
+                                                .family(
+                                                    &conv_out_projection_dispatch
+                                                        .reusable_family_id,
+                                                )
+                                                .unwrap();
+                                            let conv_out_projection_artifact_path = format!(
+                                                "kernels/{}.spv",
+                                                conv_out_projection_dispatch.reusable_family_id
+                                            );
+                                            let conv_out_projection_kernel_manifest =
+                                                VulkanLoadedReusableKernelArtifactManifest {
+                                                    schema:
+                                                        VULKAN_REUSABLE_KERNEL_ARTIFACT_MANIFEST_SCHEMA
+                                                            .to_string(),
+                                                    backend_id: VULKAN_STREAM_CIRCUIT_BACKEND_ID
+                                                        .to_string(),
+                                                    total_word_count:
+                                                        conv_out_projection_spirv_words.len(),
+                                                    artifacts: vec![
+                                                        VulkanLoadedReusableKernelArtifact {
+                                                            artifact:
+                                                                VulkanReusableKernelArtifact::from_family(
+                                                                    conv_out_projection_family,
+                                                                    conv_out_projection_artifact_path.clone(),
+                                                                ),
+                                                            resolved_path: PathBuf::from(
+                                                                conv_out_projection_artifact_path,
+                                                            ),
+                                                            words: conv_out_projection_spirv_words,
+                                                        },
+                                                    ],
+                                                };
+                                            let conv_out_projection_resident_dispatch = mounted
+                                                .create_resident_kernel_dispatch_for_bound_dispatch(
+                                                    &device,
+                                                    conv_out_projection_dispatch,
+                                                    &conv_out_projection_kernel_manifest,
+                                                )
+                                                .unwrap();
+                                            assert!(
+                                                conv_out_projection_resident_dispatch
+                                                    .workgroup_count_x()
+                                                    >= 8
+                                            );
+
+                                            device
+                                                .run_resident_kernel_dispatch(
+                                                    &conv_out_projection_resident_dispatch,
+                                                    &[0u8; 16],
+                                                )
+                                                .unwrap();
+
+                                            assert_eq!(
+                                                conv_out_projection_bindings[1]
+                                                    .buffer
+                                                    .read_bytes(16)
+                                                    .unwrap(),
+                                                vec![
+                                                    0x2f, 0xb9, 0xe4, 0xb9, 0xa3, 0xb9, 0x0c,
+                                                    0xb9, 0x4d, 0xba, 0x82, 0xb9, 0xfd, 0x39,
+                                                    0x26, 0x3a,
+                                                ]
+                                            );
+                                        } else {
+                                            eprintln!(
+                                                "skipping BF16 conv out projection Vulkan dispatch: no GLSL to SPIR-V compiler found"
+                                            );
+                                        }
                                     } else {
                                         eprintln!(
                                             "skipping BF16 output gate Vulkan dispatch: no GLSL to SPIR-V compiler found"
