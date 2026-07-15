@@ -7506,6 +7506,105 @@ mod tests {
                                                     0x26, 0x3a,
                                                 ]
                                             );
+
+                                            if let Some(residual_spirv_words) =
+                                                crate::vulkan_compute::compile_test_shader_words_from_source(
+                                                    "add_bf16_1024.comp",
+                                                )
+                                            {
+                                                let residual_dispatch = mounted_bound
+                                                    .dispatch("layer_00", "operator_residual")
+                                                    .unwrap();
+                                                assert_eq!(
+                                                    residual_dispatch.op,
+                                                    "residual_add"
+                                                );
+                                                let residual_bindings = mounted
+                                                    .resident_kernel_buffer_bindings_for_bound_dispatch(
+                                                        residual_dispatch,
+                                                    )
+                                                    .unwrap();
+                                                assert_eq!(residual_bindings.len(), 3);
+                                                assert!(residual_bindings[0].byte_len >= 2_048);
+                                                assert!(residual_bindings[1].byte_len >= 2_048);
+                                                assert!(residual_bindings[2].byte_len >= 2_048);
+                                                let residual_family = mounted
+                                                    .placed_plan
+                                                    .reusable_kernel_plan
+                                                    .family(
+                                                        &residual_dispatch.reusable_family_id,
+                                                    )
+                                                    .unwrap();
+                                                let residual_artifact_path = format!(
+                                                    "kernels/{}.spv",
+                                                    residual_dispatch.reusable_family_id
+                                                );
+                                                let residual_kernel_manifest =
+                                                    VulkanLoadedReusableKernelArtifactManifest {
+                                                        schema:
+                                                            VULKAN_REUSABLE_KERNEL_ARTIFACT_MANIFEST_SCHEMA
+                                                                .to_string(),
+                                                        backend_id: VULKAN_STREAM_CIRCUIT_BACKEND_ID
+                                                            .to_string(),
+                                                        total_word_count: residual_spirv_words.len(),
+                                                        artifacts: vec![
+                                                            VulkanLoadedReusableKernelArtifact {
+                                                                artifact:
+                                                                    VulkanReusableKernelArtifact::from_family(
+                                                                        residual_family,
+                                                                        residual_artifact_path.clone(),
+                                                                    ),
+                                                                resolved_path: PathBuf::from(
+                                                                    residual_artifact_path,
+                                                                ),
+                                                                words: residual_spirv_words,
+                                                            },
+                                                        ],
+                                                    };
+                                                let residual_resident_dispatch = mounted
+                                                    .create_resident_kernel_dispatch_for_bound_dispatch(
+                                                        &device,
+                                                        residual_dispatch,
+                                                        &residual_kernel_manifest,
+                                                    )
+                                                    .unwrap();
+                                                assert_eq!(
+                                                    residual_resident_dispatch.workgroup_count_x(),
+                                                    1
+                                                );
+
+                                                device
+                                                    .run_resident_kernel_dispatch(
+                                                        &residual_resident_dispatch,
+                                                        &[0u8; 16],
+                                                    )
+                                                    .unwrap();
+
+                                                let residual_output = residual_bindings[2]
+                                                    .buffer
+                                                    .read_bytes(2_048)
+                                                    .unwrap();
+                                                assert_eq!(
+                                                    &residual_output[..16],
+                                                    &[
+                                                        0x80, 0x3f, 0x80, 0x3f, 0x80, 0x3f,
+                                                        0x80, 0x3f, 0x80, 0x3f, 0x80, 0x3f,
+                                                        0x80, 0x3f, 0x80, 0x3f,
+                                                    ]
+                                                );
+                                                assert_eq!(
+                                                    &residual_output[588..604],
+                                                    &[
+                                                        0x7e, 0x3f, 0x80, 0x3f, 0x80, 0x3f,
+                                                        0x80, 0x3f, 0x80, 0x3f, 0x80, 0x3f,
+                                                        0x80, 0x3f, 0x80, 0x3f,
+                                                    ]
+                                                );
+                                            } else {
+                                                eprintln!(
+                                                    "skipping BF16 operator residual Vulkan dispatch: no GLSL to SPIR-V compiler found"
+                                                );
+                                            }
                                         } else {
                                             eprintln!(
                                                 "skipping BF16 conv out projection Vulkan dispatch: no GLSL to SPIR-V compiler found"
