@@ -117,7 +117,7 @@ def build_vulkan_resident_greedy_package_manifest(
         required_shader_files(dimensions),
     )
 
-    reusable_kernel_shaders, cap8_overrides = reusable_shader_refs(
+    pedal_executions, cap8_overrides = pedal_execution_specs(
         lowered_index=lowered_index,
         lowered_dir=lowered_dir,
         tensor_index=tensor_index,
@@ -185,30 +185,31 @@ def build_vulkan_resident_greedy_package_manifest(
             },
             "shader_path": f"shaders/greedy_sampler_f32_{vocab_size}.comp",
         },
-        "reusable_kernel_shaders": reusable_kernel_shaders,
+        "pedal_executions": pedal_executions,
         "capacity_profiles": [
             {
                 "min_dynamic_state_capacity_activations": 5,
                 "max_dynamic_state_capacity_activations": 8,
-                "reusable_kernel_shader_overrides": cap8_overrides,
+                "pedal_execution_shader_overrides": cap8_overrides,
             }
         ],
     }
 
 
-def reusable_shader_refs(
+def pedal_execution_specs(
     *,
     lowered_index: Json,
     lowered_dir: Path,
     tensor_index: Json,
     dimensions: Json,
 ) -> tuple[list[Json], list[Json]]:
-    refs: list[Json] = []
+    executions: list[Json] = []
     cap8_overrides: list[Json] = []
 
     for circuit_ref in lowered_index["graph"]["circuits"]:
         circuit = read_json(lowered_dir / circuit_ref["circuit"])
-        for node in circuit["nodes"]:
+        kernels = []
+        for index, node in enumerate(circuit["nodes"]):
             shader_file = shader_file_for_node(
                 circuit,
                 node,
@@ -216,10 +217,11 @@ def reusable_shader_refs(
                 dimensions,
                 attention_capacity=4,
             )
-            refs.append(
+            kernels.append(
                 {
-                    "pedal_id": circuit_ref["id"],
+                    "execution_index": index,
                     "node_id": node["id"],
+                    "op": node["op"],
                     "shader_path": f"shaders/{shader_file}",
                 }
             )
@@ -240,8 +242,16 @@ def reusable_shader_refs(
                         ),
                     }
                 )
+        executions.append(
+            {
+                "pedal_id": circuit_ref["id"],
+                "operator_type": circuit_ref["operator_type"],
+                "implementation": circuit_ref["implementation"],
+                "kernels": kernels,
+            }
+        )
 
-    return refs, cap8_overrides
+    return executions, cap8_overrides
 
 
 def shader_file_for_node(

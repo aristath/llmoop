@@ -5775,7 +5775,7 @@ pub struct VulkanResidentGreedyModelPackageManifest {
     pub input_transducer: VulkanResidentInputEmbeddingTransducerPackageSpec,
     pub output_transducer: VulkanResidentOutputTransducerPackageSpec,
     pub sampler: VulkanResidentGreedySamplerPackageSpec,
-    pub reusable_kernel_shaders: Vec<VulkanResidentReusableKernelShaderRef>,
+    pub pedal_executions: Vec<VulkanResidentPedalExecutionSpec>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub capacity_profiles: Vec<VulkanResidentGreedyModelPackageCapacityProfile>,
 }
@@ -5831,7 +5831,23 @@ pub struct VulkanResidentGreedySamplerPackageSpec {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct VulkanResidentReusableKernelShaderRef {
+pub struct VulkanResidentPedalExecutionSpec {
+    pub pedal_id: String,
+    pub operator_type: String,
+    pub implementation: String,
+    pub kernels: Vec<VulkanResidentPedalKernelSpec>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VulkanResidentPedalKernelSpec {
+    pub execution_index: usize,
+    pub node_id: String,
+    pub op: String,
+    pub shader_path: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VulkanResidentPedalKernelShaderRef {
     pub pedal_id: String,
     pub node_id: String,
     pub shader_path: String,
@@ -5842,7 +5858,7 @@ pub struct VulkanResidentGreedyModelPackageCapacityProfile {
     pub min_dynamic_state_capacity_activations: usize,
     pub max_dynamic_state_capacity_activations: usize,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub reusable_kernel_shader_overrides: Vec<VulkanResidentReusableKernelShaderRef>,
+    pub pedal_execution_shader_overrides: Vec<VulkanResidentPedalKernelShaderRef>,
 }
 
 impl VulkanResidentGreedyModelPackageCapacityProfile {
@@ -6003,13 +6019,13 @@ impl VulkanResidentGreedyModelPackage {
                     "failed to bind Vulkan stream circuit dispatch plan: {error}"
                 ))
             })?;
-        let reusable_kernel_shaders =
-            resident_greedy_package_reusable_kernel_shader_refs_for_capacity(&manifest, capacity);
+        let pedal_kernel_shaders =
+            resident_greedy_package_pedal_kernel_shader_refs_for_capacity(&manifest, capacity);
         let loaded_manifest = loaded_kernel_pack_from_package_shader_refs(
             manifest_dir,
             &probe_mounted,
             &mounted_bound,
-            &reusable_kernel_shaders,
+            &pedal_kernel_shaders,
         )?;
 
         Ok(Self {
@@ -6190,11 +6206,28 @@ fn validate_capacity_profiles(
         }
     }
 
-    if manifest.reusable_kernel_shaders.is_empty() {
+    if manifest.pedal_executions.is_empty() {
         return Err(VulkanResidentTokenModelPackageError::new(format!(
-            "resident model package {:?} does not declare reusable kernel shaders",
+            "resident model package {:?} does not declare pedal executions",
             manifest.package_id
         )));
+    }
+    let mut declared_kernels = BTreeSet::new();
+    for pedal in &manifest.pedal_executions {
+        if pedal.kernels.is_empty() {
+            return Err(VulkanResidentTokenModelPackageError::new(format!(
+                "resident model package {:?} declares pedal {:?} with no executable kernels",
+                manifest.package_id, pedal.pedal_id
+            )));
+        }
+        for kernel in &pedal.kernels {
+            if !declared_kernels.insert((pedal.pedal_id.as_str(), kernel.node_id.as_str())) {
+                return Err(VulkanResidentTokenModelPackageError::new(format!(
+                    "resident model package {:?} declares duplicate pedal kernel {}.{}",
+                    manifest.package_id, pedal.pedal_id, kernel.node_id
+                )));
+            }
+        }
     }
 
     if manifest
@@ -6342,43 +6375,40 @@ fn resident_greedy_package_reusable_kernel_manifest(
     )
 }
 
-fn resident_greedy_package_reusable_kernel_shader_refs_for_capacity(
+fn resident_greedy_package_pedal_kernel_shader_refs_for_capacity(
     manifest: &VulkanResidentGreedyModelPackageManifest,
     capacity: usize,
-) -> Vec<VulkanResidentReusableKernelShaderRef> {
-    let mut shader_by_dispatch: BTreeMap<(String, String), String> = manifest
-        .reusable_kernel_shaders
-        .iter()
-        .map(|shader| {
-            (
-                (shader.pedal_id.clone(), shader.node_id.clone()),
-                shader.shader_path.clone(),
-            )
-        })
-        .collect();
-
+) -> Vec<VulkanResidentPedalKernelShaderRef> {
+    let mut shader_overrides_by_dispatch: BTreeMap<(String, String), String> = BTreeMap::new();
     if let Some(profile) = manifest
         .capacity_profiles
         .iter()
         .find(|profile| profile.matches_capacity(capacity))
     {
-        for shader in &profile.reusable_kernel_shader_overrides {
-            shader_by_dispatch.insert(
+        for shader in &profile.pedal_execution_shader_overrides {
+            shader_overrides_by_dispatch.insert(
                 (shader.pedal_id.clone(), shader.node_id.clone()),
                 shader.shader_path.clone(),
             );
         }
     }
 
-    shader_by_dispatch
-        .into_iter()
-        .map(
-            |((pedal_id, node_id), shader_path)| VulkanResidentReusableKernelShaderRef {
-                pedal_id,
-                node_id,
-                shader_path,
-            },
-        )
+    manifest
+        .pedal_executions
+        .iter()
+        .flat_map(|pedal| {
+            pedal.kernels.iter().map(|kernel| {
+                let shader_path = shader_overrides_by_dispatch
+                    .get(&(pedal.pedal_id.clone(), kernel.node_id.clone()))
+                    .cloned()
+                    .unwrap_or_else(|| kernel.shader_path.clone());
+                VulkanResidentPedalKernelShaderRef {
+                    pedal_id: pedal.pedal_id.clone(),
+                    node_id: kernel.node_id.clone(),
+                    shader_path,
+                }
+            })
+        })
         .collect()
 }
 
@@ -6386,7 +6416,7 @@ fn loaded_kernel_pack_from_package_shader_refs(
     manifest_dir: &Path,
     mounted: &VulkanMountedPlacedStreamCircuit,
     mounted_bound: &VulkanMountedPlacedBoundDispatchPlan,
-    dispatch_shaders: &[VulkanResidentReusableKernelShaderRef],
+    dispatch_shaders: &[VulkanResidentPedalKernelShaderRef],
 ) -> Result<VulkanLoadedReusableKernelArtifactManifest, VulkanResidentTokenModelPackageError> {
     let mut loaded_artifacts = Vec::new();
     let mut loaded_families = BTreeSet::new();

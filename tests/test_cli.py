@@ -92,6 +92,42 @@ class CompiledPackageTest(unittest.TestCase):
             self.assertEqual("weights", source_file.parts[0])
             self.assertTrue((fixture.lowered_dir / source_file).is_file())
 
+    def test_compiled_package_declares_pedal_executions(self) -> None:
+        fixture = compiled_model_or_skip()
+        manifest = json.loads(fixture.package_manifest.read_text())
+
+        self.assertNotIn("reusable_kernel_shaders", manifest)
+        executions = manifest["pedal_executions"]
+        self.assertEqual(14, len(executions))
+        layer_00 = executions[0]
+        self.assertEqual("layer_00", layer_00["pedal_id"])
+        self.assertEqual("conv", layer_00["operator_type"])
+        self.assertEqual(
+            [
+                "operator_norm",
+                "conv_in_projection",
+                "split_b_c_x",
+                "input_gate",
+                "temporal_memory_update",
+                "depthwise_temporal_conv",
+                "output_gate",
+                "conv_out_projection",
+                "operator_residual",
+                "ffn_norm",
+                "ffn_gate_projection",
+                "ffn_up_projection",
+                "ffn_gate_activation",
+                "ffn_gate_multiply",
+                "ffn_down_projection",
+                "ffn_residual",
+            ],
+            [kernel["node_id"] for kernel in layer_00["kernels"]],
+        )
+        self.assertEqual(list(range(16)), [kernel["execution_index"] for kernel in layer_00["kernels"]])
+        for profile in manifest["capacity_profiles"]:
+            self.assertIn("pedal_execution_shader_overrides", profile)
+            self.assertNotIn("reusable_kernel_shader_overrides", profile)
+
     def test_compiled_package_does_not_reference_source_or_transpiled_paths(self) -> None:
         fixture = compiled_model_or_skip()
 
