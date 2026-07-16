@@ -6888,6 +6888,132 @@ mod tests {
             .unwrap();
     }
 
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Lfm2LayerKind {
+        ShortConv,
+        Attention,
+    }
+
+    fn lfm2_layer_kind(layer_index: usize) -> Lfm2LayerKind {
+        match layer_index {
+            0 | 1 | 3 | 5 | 7 | 9 | 11 | 13 => Lfm2LayerKind::ShortConv,
+            2 | 4 | 6 | 8 | 10 | 12 => Lfm2LayerKind::Attention,
+            _ => panic!("unknown LFM2 layer index {layer_index}"),
+        }
+    }
+
+    fn lfm2_layer_id(layer_index: usize) -> String {
+        format!("layer_{layer_index:02}")
+    }
+
+    fn lfm2_prefix_pedal_ids(last_layer_index: usize) -> Vec<String> {
+        (0..=last_layer_index).map(lfm2_layer_id).collect()
+    }
+
+    fn load_lfm2_layer_parameters(
+        mounted: &VulkanMountedPlacedStreamCircuit,
+        tensor_index: &TensorIndex,
+        layer_index: usize,
+    ) {
+        match lfm2_layer_kind(layer_index) {
+            Lfm2LayerKind::ShortConv => {
+                load_lfm2_conv_layer_parameters(mounted, tensor_index, layer_index);
+            }
+            Lfm2LayerKind::Attention => {
+                load_lfm2_attention_layer_parameters(mounted, tensor_index, layer_index);
+            }
+        }
+    }
+
+    fn zero_lfm2_layer_state(mounted: &VulkanMountedPlacedStreamCircuit, layer_index: usize) {
+        let pedal_id = lfm2_layer_id(layer_index);
+        match lfm2_layer_kind(layer_index) {
+            Lfm2LayerKind::ShortConv => {
+                zero_lfm2_temporal_memory(mounted, &pedal_id);
+            }
+            Lfm2LayerKind::Attention => {
+                zero_lfm2_kv_memory(mounted, &pedal_id);
+            }
+        }
+    }
+
+    fn prepare_lfm2_resident_prefix(
+        mounted: &VulkanMountedPlacedStreamCircuit,
+        tensor_index: &TensorIndex,
+        last_layer_index: usize,
+    ) -> Vec<String> {
+        for layer_index in 0..=last_layer_index {
+            load_lfm2_layer_parameters(mounted, tensor_index, layer_index);
+        }
+
+        write_layer_00_unit_input_and_zero_state(mounted);
+        for layer_index in 1..=last_layer_index {
+            zero_lfm2_layer_state(mounted, layer_index);
+        }
+
+        lfm2_prefix_pedal_ids(last_layer_index)
+    }
+
+    fn lfm2_stream_control(
+        mounted: &VulkanMountedPlacedStreamCircuit,
+        stream_tick: u64,
+    ) -> VulkanMountedPlacedStreamControl {
+        VulkanMountedPlacedStreamControl {
+            stream_tick,
+            control_flags: 0,
+            dynamic_state_capacity_activations: mounted.buffers.dynamic_state_capacity_activations
+                as u32,
+        }
+    }
+
+    fn create_lfm2_resident_prefix_runner(
+        device: &VulkanComputeDevice,
+        mounted: &VulkanMountedPlacedStreamCircuit,
+        mounted_bound: &VulkanMountedPlacedBoundDispatchPlan,
+        loaded_manifest: &VulkanLoadedReusableKernelArtifactManifest,
+        pedal_ids: &[String],
+    ) -> VulkanMountedPlacedResidentPedalboardRunner {
+        mounted
+            .create_resident_pedalboard_runner(
+                device,
+                mounted_bound,
+                pedal_ids.iter().map(String::as_str),
+                loaded_manifest,
+            )
+            .unwrap()
+    }
+
+    fn assert_lfm2_resident_prefix_runner(
+        runner: &VulkanMountedPlacedResidentPedalboardRunner,
+        pedal_ids: &[String],
+        dispatch_count: usize,
+        descriptor_count: usize,
+        push_constant_byte_count: u32,
+    ) {
+        let expected_pedal_ids = pedal_ids.iter().map(String::as_str).collect::<Vec<_>>();
+        assert_eq!(runner.device_id, "gpu0");
+        assert_eq!(runner.pedal_count(), pedal_ids.len());
+        assert_eq!(runner.pedal_ids(), expected_pedal_ids);
+        assert_eq!(runner.dispatch_count(), dispatch_count);
+        assert_eq!(runner.total_descriptor_count, descriptor_count);
+        assert_eq!(
+            runner.total_push_constant_byte_count,
+            push_constant_byte_count
+        );
+    }
+
+    fn assert_lfm2_resident_prefix_run(
+        run: &VulkanMountedPlacedResidentPedalboardRun,
+        pedal_ids: &[String],
+        dispatch_count: usize,
+    ) {
+        let expected_pedal_ids = pedal_ids.iter().map(String::as_str).collect::<Vec<_>>();
+        assert_eq!(run.device_id, "gpu0");
+        assert_eq!(run.pedal_count(), pedal_ids.len());
+        assert_eq!(run.pedal_ids(), expected_pedal_ids);
+        assert_eq!(run.dispatch_count(), dispatch_count);
+    }
+
     fn layer_00_level_1_loaded_kernel_pack(
         mounted: &VulkanMountedPlacedStreamCircuit,
         mounted_bound: &VulkanMountedPlacedBoundDispatchPlan,
@@ -7517,31 +7643,19 @@ mod tests {
             eprintln!("skipping resident pedalboard runner: no GLSL to SPIR-V compiler found");
             return;
         };
-        load_layer_00_parameters(&mounted, &tensor_index);
-        load_lfm2_conv_layer_parameters(&mounted, &tensor_index, 1);
-        write_layer_00_unit_input_and_zero_state(&mounted);
-        zero_lfm2_temporal_memory(&mounted, "layer_01");
+        let pedal_ids = prepare_lfm2_resident_prefix(&mounted, &tensor_index, 1);
 
-        let runner = mounted
-            .create_resident_pedalboard_runner(
-                &device,
-                &mounted_bound,
-                ["layer_00", "layer_01"],
-                &loaded_manifest,
-            )
-            .unwrap();
-        assert_eq!(runner.device_id, "gpu0");
-        assert_eq!(runner.pedal_count(), 2);
-        assert_eq!(runner.pedal_ids(), vec!["layer_00", "layer_01"]);
-        assert_eq!(runner.dispatch_count(), 32);
-        assert_eq!(runner.total_descriptor_count, 104);
-        assert_eq!(runner.total_push_constant_byte_count, 512);
+        let runner = create_lfm2_resident_prefix_runner(
+            &device,
+            &mounted,
+            &mounted_bound,
+            &loaded_manifest,
+            &pedal_ids,
+        );
+        assert_lfm2_resident_prefix_runner(&runner, &pedal_ids, 32, 104, 512);
 
         let run = runner.run_zeroed_push_constants(&device).unwrap();
-        assert_eq!(run.device_id, "gpu0");
-        assert_eq!(run.pedal_count(), 2);
-        assert_eq!(run.pedal_ids(), vec!["layer_00", "layer_01"]);
-        assert_eq!(run.dispatch_count(), 32);
+        assert_lfm2_resident_prefix_run(&run, &pedal_ids, 32);
 
         let layer_00_output_dispatch = mounted_bound.dispatch("layer_00", "ffn_residual").unwrap();
         let layer_00_output_bindings = mounted
@@ -7588,45 +7702,21 @@ mod tests {
             );
             return;
         };
-        load_layer_00_parameters(&mounted, &tensor_index);
-        load_lfm2_conv_layer_parameters(&mounted, &tensor_index, 1);
-        load_lfm2_attention_layer_parameters(&mounted, &tensor_index, 2);
-        write_layer_00_unit_input_and_zero_state(&mounted);
-        zero_lfm2_temporal_memory(&mounted, "layer_01");
-        zero_lfm2_kv_memory(&mounted, "layer_02");
+        let pedal_ids = prepare_lfm2_resident_prefix(&mounted, &tensor_index, 2);
 
-        let runner = mounted
-            .create_resident_pedalboard_runner(
-                &device,
-                &mounted_bound,
-                ["layer_00", "layer_01", "layer_02"],
-                &loaded_manifest,
-            )
-            .unwrap();
-        assert_eq!(runner.device_id, "gpu0");
-        assert_eq!(runner.pedal_count(), 3);
-        assert_eq!(runner.pedal_ids(), vec!["layer_00", "layer_01", "layer_02"]);
-        assert_eq!(runner.dispatch_count(), 51);
-        assert_eq!(runner.total_descriptor_count, 167);
-        assert_eq!(runner.total_push_constant_byte_count, 816);
+        let runner = create_lfm2_resident_prefix_runner(
+            &device,
+            &mounted,
+            &mounted_bound,
+            &loaded_manifest,
+            &pedal_ids,
+        );
+        assert_lfm2_resident_prefix_runner(&runner, &pedal_ids, 51, 167, 816);
 
         let run = runner
-            .run_with_stream_control(
-                &device,
-                VulkanMountedPlacedStreamControl {
-                    stream_tick: 0,
-                    control_flags: 0,
-                    dynamic_state_capacity_activations: mounted
-                        .buffers
-                        .dynamic_state_capacity_activations
-                        as u32,
-                },
-            )
+            .run_with_stream_control(&device, lfm2_stream_control(&mounted, 0))
             .unwrap();
-        assert_eq!(run.device_id, "gpu0");
-        assert_eq!(run.pedal_count(), 3);
-        assert_eq!(run.pedal_ids(), vec!["layer_00", "layer_01", "layer_02"]);
-        assert_eq!(run.dispatch_count(), 51);
+        assert_lfm2_resident_prefix_run(&run, &pedal_ids, 51);
 
         let kv_memory = mounted
             .buffers
@@ -7667,21 +7757,15 @@ mod tests {
             );
             return;
         };
-        load_layer_00_parameters(&mounted, &tensor_index);
-        load_lfm2_conv_layer_parameters(&mounted, &tensor_index, 1);
-        load_lfm2_attention_layer_parameters(&mounted, &tensor_index, 2);
-        write_layer_00_unit_input_and_zero_state(&mounted);
-        zero_lfm2_temporal_memory(&mounted, "layer_01");
-        zero_lfm2_kv_memory(&mounted, "layer_02");
+        let pedal_ids = prepare_lfm2_resident_prefix(&mounted, &tensor_index, 2);
 
-        let runner = mounted
-            .create_resident_pedalboard_runner(
-                &device,
-                &mounted_bound,
-                ["layer_00", "layer_01", "layer_02"],
-                &loaded_manifest,
-            )
-            .unwrap();
+        let runner = create_lfm2_resident_prefix_runner(
+            &device,
+            &mounted,
+            &mounted_bound,
+            &loaded_manifest,
+            &pedal_ids,
+        );
         let layer_02_runner = mounted
             .create_resident_pedal_runner(&device, &mounted_bound, "layer_02", &loaded_manifest)
             .unwrap();
@@ -7771,53 +7855,21 @@ mod tests {
             eprintln!("skipping resident layer_03 prefix runner: no GLSL to SPIR-V compiler found");
             return;
         };
-        load_lfm2_conv_layer_parameters(&mounted, &tensor_index, 0);
-        load_lfm2_conv_layer_parameters(&mounted, &tensor_index, 1);
-        load_lfm2_attention_layer_parameters(&mounted, &tensor_index, 2);
-        load_lfm2_conv_layer_parameters(&mounted, &tensor_index, 3);
-        write_layer_00_unit_input_and_zero_state(&mounted);
-        zero_lfm2_temporal_memory(&mounted, "layer_01");
-        zero_lfm2_kv_memory(&mounted, "layer_02");
-        zero_lfm2_temporal_memory(&mounted, "layer_03");
+        let pedal_ids = prepare_lfm2_resident_prefix(&mounted, &tensor_index, 3);
 
-        let runner = mounted
-            .create_resident_pedalboard_runner(
-                &device,
-                &mounted_bound,
-                ["layer_00", "layer_01", "layer_02", "layer_03"],
-                &loaded_manifest,
-            )
-            .unwrap();
-        assert_eq!(runner.device_id, "gpu0");
-        assert_eq!(runner.pedal_count(), 4);
-        assert_eq!(
-            runner.pedal_ids(),
-            vec!["layer_00", "layer_01", "layer_02", "layer_03"]
+        let runner = create_lfm2_resident_prefix_runner(
+            &device,
+            &mounted,
+            &mounted_bound,
+            &loaded_manifest,
+            &pedal_ids,
         );
-        assert_eq!(runner.dispatch_count(), 67);
-        assert_eq!(runner.total_descriptor_count, 219);
-        assert_eq!(runner.total_push_constant_byte_count, 1072);
+        assert_lfm2_resident_prefix_runner(&runner, &pedal_ids, 67, 219, 1072);
 
         let run = runner
-            .run_with_stream_control(
-                &device,
-                VulkanMountedPlacedStreamControl {
-                    stream_tick: 0,
-                    control_flags: 0,
-                    dynamic_state_capacity_activations: mounted
-                        .buffers
-                        .dynamic_state_capacity_activations
-                        as u32,
-                },
-            )
+            .run_with_stream_control(&device, lfm2_stream_control(&mounted, 0))
             .unwrap();
-        assert_eq!(run.device_id, "gpu0");
-        assert_eq!(run.pedal_count(), 4);
-        assert_eq!(
-            run.pedal_ids(),
-            vec!["layer_00", "layer_01", "layer_02", "layer_03"]
-        );
-        assert_eq!(run.dispatch_count(), 67);
+        assert_lfm2_resident_prefix_run(&run, &pedal_ids, 67);
 
         let layer_03_output_dispatch = mounted_bound.dispatch("layer_03", "ffn_residual").unwrap();
         let layer_03_output_bindings = mounted
@@ -7850,55 +7902,21 @@ mod tests {
             eprintln!("skipping resident layer_04 prefix runner: no GLSL to SPIR-V compiler found");
             return;
         };
-        load_lfm2_conv_layer_parameters(&mounted, &tensor_index, 0);
-        load_lfm2_conv_layer_parameters(&mounted, &tensor_index, 1);
-        load_lfm2_attention_layer_parameters(&mounted, &tensor_index, 2);
-        load_lfm2_conv_layer_parameters(&mounted, &tensor_index, 3);
-        load_lfm2_attention_layer_parameters(&mounted, &tensor_index, 4);
-        write_layer_00_unit_input_and_zero_state(&mounted);
-        zero_lfm2_temporal_memory(&mounted, "layer_01");
-        zero_lfm2_kv_memory(&mounted, "layer_02");
-        zero_lfm2_temporal_memory(&mounted, "layer_03");
-        zero_lfm2_kv_memory(&mounted, "layer_04");
+        let pedal_ids = prepare_lfm2_resident_prefix(&mounted, &tensor_index, 4);
 
-        let runner = mounted
-            .create_resident_pedalboard_runner(
-                &device,
-                &mounted_bound,
-                ["layer_00", "layer_01", "layer_02", "layer_03", "layer_04"],
-                &loaded_manifest,
-            )
-            .unwrap();
-        assert_eq!(runner.device_id, "gpu0");
-        assert_eq!(runner.pedal_count(), 5);
-        assert_eq!(
-            runner.pedal_ids(),
-            vec!["layer_00", "layer_01", "layer_02", "layer_03", "layer_04"]
+        let runner = create_lfm2_resident_prefix_runner(
+            &device,
+            &mounted,
+            &mounted_bound,
+            &loaded_manifest,
+            &pedal_ids,
         );
-        assert_eq!(runner.dispatch_count(), 86);
-        assert_eq!(runner.total_descriptor_count, 282);
-        assert_eq!(runner.total_push_constant_byte_count, 1376);
+        assert_lfm2_resident_prefix_runner(&runner, &pedal_ids, 86, 282, 1376);
 
         let run = runner
-            .run_with_stream_control(
-                &device,
-                VulkanMountedPlacedStreamControl {
-                    stream_tick: 0,
-                    control_flags: 0,
-                    dynamic_state_capacity_activations: mounted
-                        .buffers
-                        .dynamic_state_capacity_activations
-                        as u32,
-                },
-            )
+            .run_with_stream_control(&device, lfm2_stream_control(&mounted, 0))
             .unwrap();
-        assert_eq!(run.device_id, "gpu0");
-        assert_eq!(run.pedal_count(), 5);
-        assert_eq!(
-            run.pedal_ids(),
-            vec!["layer_00", "layer_01", "layer_02", "layer_03", "layer_04"]
-        );
-        assert_eq!(run.dispatch_count(), 86);
+        assert_lfm2_resident_prefix_run(&run, &pedal_ids, 86);
 
         let layer_02_kv = mounted
             .buffers
@@ -7927,6 +7945,71 @@ mod tests {
             vec![
                 0x8c, 0x3f, 0x62, 0x3f, 0x88, 0x3f, 0x62, 0x3f, 0x73, 0x3f, 0x85, 0x3f, 0x89, 0x3f,
                 0x84, 0x3f,
+            ]
+        );
+    }
+
+    #[test]
+    fn resident_pedalboard_runner_executes_second_attention_output_into_next_conv_layer() {
+        let device = match VulkanComputeDevice::new() {
+            Ok(device) => device,
+            Err(error) => {
+                eprintln!("skipping resident layer_05 prefix runner: {error}");
+                return;
+            }
+        };
+        let (tensor_index, mounted, _manifest, mounted_bound) =
+            mount_lfm2_single_device_stream_circuit(&device);
+        let Some(loaded_manifest) = lfm2_level_1_loaded_kernel_pack_for_conv_and_attention_families(
+            &mounted,
+            &mounted_bound,
+        ) else {
+            eprintln!("skipping resident layer_05 prefix runner: no GLSL to SPIR-V compiler found");
+            return;
+        };
+        let pedal_ids = prepare_lfm2_resident_prefix(&mounted, &tensor_index, 5);
+
+        let runner = create_lfm2_resident_prefix_runner(
+            &device,
+            &mounted,
+            &mounted_bound,
+            &loaded_manifest,
+            &pedal_ids,
+        );
+        assert_lfm2_resident_prefix_runner(&runner, &pedal_ids, 102, 334, 1632);
+
+        let run = runner
+            .run_with_stream_control(&device, lfm2_stream_control(&mounted, 0))
+            .unwrap();
+        assert_lfm2_resident_prefix_run(&run, &pedal_ids, 102);
+
+        let layer_02_kv = mounted
+            .buffers
+            .state_buffer("layer_02", "kv_memory")
+            .unwrap()
+            .buffer
+            .read_bytes(16)
+            .unwrap();
+        let layer_04_kv = mounted
+            .buffers
+            .state_buffer("layer_04", "kv_memory")
+            .unwrap()
+            .buffer
+            .read_bytes(16)
+            .unwrap();
+        assert_ne!(layer_02_kv, vec![0; 16]);
+        assert_ne!(layer_04_kv, vec![0; 16]);
+        assert_ne!(layer_02_kv, layer_04_kv);
+
+        let layer_05_output_dispatch = mounted_bound.dispatch("layer_05", "ffn_residual").unwrap();
+        let layer_05_output_bindings = mounted
+            .resident_kernel_buffer_bindings_for_bound_dispatch(layer_05_output_dispatch)
+            .unwrap();
+        assert_eq!(
+            layer_05_output_bindings[2].buffer.read_bytes(16).unwrap(),
+            vec![
+                0x8a, 0x3f, 0x61, 0x3f, 0x86, 0x3f, 0x61, 0x3f, 0x74, 0x3f, 0x85, 0x3f, 0x8a, 0x3f,
+                0x83, 0x3f,
             ]
         );
     }
