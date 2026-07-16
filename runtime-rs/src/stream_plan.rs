@@ -175,6 +175,8 @@ pub struct StreamCircuitResourcePlan {
     pub node_count: usize,
     pub parameter_ref_count: usize,
     pub parameters: Vec<PlannedParameterResource>,
+    pub transducer_parameter_ref_count: usize,
+    pub transducer_parameters: Vec<PlannedParameterResource>,
     pub state_allocations: Vec<PlannedStateResource>,
     pub activation_banks: Vec<PlannedActivationSlotBank>,
     pub temporary_signal_count: usize,
@@ -213,6 +215,9 @@ impl StreamCircuitResourcePlan {
 
         let mut parameter_ref_count = 0;
         let mut parameters_by_tensor: BTreeMap<String, Vec<PlannedParameterUse>> = BTreeMap::new();
+        let mut transducer_parameter_ref_count = 0;
+        let mut transducer_parameters_by_tensor: BTreeMap<String, Vec<PlannedParameterUse>> =
+            BTreeMap::new();
         let mut state_allocations = Vec::new();
         let mut activation_banks = Vec::new();
         let mut unknown_temporary_shape_count = 0;
@@ -303,7 +308,22 @@ impl StreamCircuitResourcePlan {
             });
         }
 
+        transducer_parameter_ref_count += collect_transducer_component_parameters(
+            "input_transducer",
+            &graph.index.graph.input_transducer,
+            "input_transducer",
+            &mut transducer_parameters_by_tensor,
+        )?;
+        transducer_parameter_ref_count += collect_output_transducer_parameters(
+            &graph.index.graph.output_transducer,
+            &mut transducer_parameters_by_tensor,
+        )?;
+
         let parameters = parameters_by_tensor
+            .into_iter()
+            .map(|(tensor, uses)| PlannedParameterResource { tensor, uses })
+            .collect();
+        let transducer_parameters = transducer_parameters_by_tensor
             .into_iter()
             .map(|(tensor, uses)| PlannedParameterResource { tensor, uses })
             .collect();
@@ -313,6 +333,8 @@ impl StreamCircuitResourcePlan {
             node_count: execution_plan.total_node_count(),
             parameter_ref_count,
             parameters,
+            transducer_parameter_ref_count,
+            transducer_parameters,
             state_allocations,
             activation_banks,
             temporary_signal_count: execution_plan.temporary_signal_count(),
@@ -327,6 +349,10 @@ impl StreamCircuitResourcePlan {
         self.parameters.len()
     }
 
+    pub fn unique_transducer_parameter_tensor_count(&self) -> usize {
+        self.transducer_parameters.len()
+    }
+
     pub fn stream_state_count(&self) -> usize {
         self.state_allocations.len()
     }
@@ -334,6 +360,86 @@ impl StreamCircuitResourcePlan {
     pub fn intermediate_activation_shapes_known(&self) -> bool {
         self.unknown_temporary_shape_count == 0
     }
+}
+
+fn collect_output_transducer_parameters(
+    output_transducer: &serde_json::Value,
+    parameters_by_tensor: &mut BTreeMap<String, Vec<PlannedParameterUse>>,
+) -> Result<usize, CircuitPlanError> {
+    let Some(components) = output_transducer
+        .get("components")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return collect_transducer_component_parameters(
+            "output_transducer",
+            output_transducer,
+            "output_transducer",
+            parameters_by_tensor,
+        );
+    };
+
+    let mut parameter_ref_count = 0usize;
+    for (component_index, component) in components.iter().enumerate() {
+        parameter_ref_count += collect_transducer_component_parameters(
+            "output_transducer",
+            component,
+            &format!("component_{component_index}"),
+            parameters_by_tensor,
+        )?;
+    }
+    Ok(parameter_ref_count)
+}
+
+fn collect_transducer_component_parameters(
+    transducer_id: &str,
+    component: &serde_json::Value,
+    fallback_component_id: &str,
+    parameters_by_tensor: &mut BTreeMap<String, Vec<PlannedParameterUse>>,
+) -> Result<usize, CircuitPlanError> {
+    if component.is_null() {
+        return Ok(0);
+    }
+
+    let component_id = component
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(fallback_component_id);
+    let component_type = component
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    let Some(params) = component
+        .get("params")
+        .and_then(serde_json::Value::as_object)
+    else {
+        return Ok(0);
+    };
+
+    let mut parameter_ref_count = 0usize;
+    for (param_id, param_ref) in params {
+        let tensor = param_ref
+            .get("tensor")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                CircuitPlanError(format!(
+                    "{transducer_id}.{component_id} transducer parameter {param_id:?} has no source tensor"
+                ))
+            })?;
+        parameter_ref_count += 1;
+        parameters_by_tensor
+            .entry(tensor.to_string())
+            .or_default()
+            .push(PlannedParameterUse {
+                pedal_id: format!("{transducer_id}.{component_id}"),
+                circuit_id: transducer_id.to_string(),
+                param_id: param_id.clone(),
+                role: component_type.clone(),
+                layout: "transducer".to_string(),
+                storage: "source_tensor_refs".to_string(),
+            });
+    }
+
+    Ok(parameter_ref_count)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1236,6 +1342,8 @@ mod tests {
         assert_eq!(resource_plan.node_count, 242);
         assert_eq!(resource_plan.parameter_ref_count, 130);
         assert_eq!(resource_plan.unique_parameter_tensor_count(), 130);
+        assert_eq!(resource_plan.transducer_parameter_ref_count, 3);
+        assert_eq!(resource_plan.unique_transducer_parameter_tensor_count(), 2);
         assert_eq!(resource_plan.stream_state_count(), 14);
         assert_eq!(resource_plan.temporary_signal_count, 230);
         assert_eq!(resource_plan.state_view_signal_count, 20);
@@ -1257,6 +1365,46 @@ mod tests {
             Some("short_convolution_input_projection")
         );
         assert_eq!(conv_in.uses[0].storage, "source_tensor_refs");
+
+        let embed_tokens = resource_plan
+            .transducer_parameters
+            .iter()
+            .find(|parameter| parameter.tensor == "model.embed_tokens.weight")
+            .unwrap();
+        assert_eq!(embed_tokens.uses.len(), 2);
+        assert_eq!(
+            embed_tokens
+                .uses
+                .iter()
+                .map(|parameter_use| parameter_use.pedal_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "input_transducer.token_embedding",
+                "output_transducer.tied_output_projection",
+            ]
+        );
+        assert_eq!(embed_tokens.uses[0].param_id, "weight");
+        assert_eq!(
+            embed_tokens.uses[0].role.as_deref(),
+            Some("embedding_lookup")
+        );
+        assert_eq!(embed_tokens.uses[0].layout, "transducer");
+        assert_eq!(
+            embed_tokens.uses[1].role.as_deref(),
+            Some("linear_projection")
+        );
+
+        let embedding_norm = resource_plan
+            .transducer_parameters
+            .iter()
+            .find(|parameter| parameter.tensor == "model.embedding_norm.weight")
+            .unwrap();
+        assert_eq!(embedding_norm.uses.len(), 1);
+        assert_eq!(
+            embedding_norm.uses[0].pedal_id,
+            "output_transducer.embedding_norm"
+        );
+        assert_eq!(embedding_norm.uses[0].role.as_deref(), Some("rms_norm"));
 
         let rolling_states = resource_plan
             .state_allocations
