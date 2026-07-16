@@ -30,7 +30,7 @@ def main() -> None:
         "--run-model",
         type=Path,
         metavar="LOWERED_DIR",
-        help="run a compiled lowered model package with the Python circuit runtime",
+        help="run lowered compiler/oracle circuits with assets from --package-dir",
     )
     parser.add_argument(
         "--prompt",

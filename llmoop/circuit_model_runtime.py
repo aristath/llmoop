@@ -150,12 +150,12 @@ class CircuitModelRuntime:
         board = CircuitPedalboard.from_dir(circuit_dir)
         config_path = package_dir / "config.json"
         if not config_path.is_file():
-            raise FileNotFoundError(f"compiled circuit package is missing {config_path}")
+            raise FileNotFoundError(f"runtime package is missing {config_path}")
         config = json.loads(config_path.read_text())
 
         tensor_index = package_dir / "tensors.json"
         if not tensor_index.is_file():
-            raise FileNotFoundError(f"compiled circuit package is missing {tensor_index}")
+            raise FileNotFoundError(f"runtime package is missing {tensor_index}")
         tensor_store = SafetensorsTensorStore.from_tensor_index(
             tensor_index=tensor_index,
             torch=torch,

@@ -422,15 +422,15 @@ def copy_tokenizer_package(model_dir: Path, dest_dir: Path) -> Json:
     }
 
 
-def copy_config_package(model_dir: Path, lowered_dir: Path) -> None:
+def copy_config_package(model_dir: Path, package_dir: Path) -> None:
     source = model_dir / CONFIG_PACKAGE_FILE
     if not source.is_file():
         raise ModelCompileError(f"source model does not contain required config file {source}")
-    shutil.copy2(source, lowered_dir / CONFIG_PACKAGE_FILE)
+    shutil.copy2(source, package_dir / CONFIG_PACKAGE_FILE)
 
 
-def copy_tensor_package(tensor_index: Json, lowered_dir: Path) -> Json:
-    weights_dir = lowered_dir / WEIGHTS_PACKAGE_DIR
+def copy_tensor_package(tensor_index: Json, package_dir: Path) -> Json:
+    weights_dir = package_dir / WEIGHTS_PACKAGE_DIR
     if weights_dir.exists():
         shutil.rmtree(weights_dir)
     weights_dir.mkdir(parents=True, exist_ok=True)
@@ -467,7 +467,7 @@ def copy_tensor_package(tensor_index: Json, lowered_dir: Path) -> Json:
     packaged["source"] = {
         "packaged": True,
         "weights_dir": WEIGHTS_PACKAGE_DIR,
-        "weights_file": relative_json_path(lowered_dir, dest_by_source[source_files[0]]),
+        "weights_file": relative_json_path(package_dir, dest_by_source[source_files[0]]),
         "weights_files": [
             {
                 **{
@@ -475,16 +475,16 @@ def copy_tensor_package(tensor_index: Json, lowered_dir: Path) -> Json:
                     for key, value in source_records.get(source, {}).items()
                     if key != "path"
                 },
-                "path": relative_json_path(lowered_dir, dest_by_source[source]),
+                "path": relative_json_path(package_dir, dest_by_source[source]),
             }
             for source in source_files
         ],
     }
     for info in packaged["tensors"].values():
         source = Path(info["source_file"])
-        info["source_file"] = relative_json_path(lowered_dir, dest_by_source[source])
+        info["source_file"] = relative_json_path(package_dir, dest_by_source[source])
 
-    write_json(lowered_dir / "tensors.json", packaged)
+    write_json(package_dir / "tensors.json", packaged)
     return packaged
 
 
