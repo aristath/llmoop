@@ -11438,8 +11438,8 @@ mod tests {
 
     fn fixture_model_package_manifest_path() -> PathBuf {
         compiled_artifact_dir(
-            "LLMOOP_TEST_LOWERED_DIR",
-            "lowered",
+            "LLMOOP_TEST_PACKAGE_DIR",
+            "packages",
             "vulkan_resident_greedy_package.json",
         )
         .join("vulkan_resident_greedy_package.json")
