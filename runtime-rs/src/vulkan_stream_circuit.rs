@@ -2983,6 +2983,145 @@ fn validate_lfm2_embedding_norm_weight(
     Ok(())
 }
 
+pub struct VulkanResidentSingleTokenTickRunner {
+    pub device_id: String,
+    pub pedal_count: usize,
+    pub dispatch_count: usize,
+    pub total_descriptor_count: usize,
+    pub total_push_constant_byte_count: u32,
+    input_transducer: VulkanResidentInputEmbeddingTransducerRunner,
+    pedalboard: VulkanMountedPlacedResidentPedalboardRunner,
+    output_transducer: VulkanResidentOutputTransducerRunner,
+}
+
+impl VulkanResidentSingleTokenTickRunner {
+    pub fn new(
+        input_transducer: VulkanResidentInputEmbeddingTransducerRunner,
+        pedalboard: VulkanMountedPlacedResidentPedalboardRunner,
+        output_transducer: VulkanResidentOutputTransducerRunner,
+    ) -> Result<Self, VulkanResidentSingleTokenTickRunnerError> {
+        let dispatch_count = 1usize
+            .checked_add(pedalboard.dispatch_count())
+            .and_then(|count| count.checked_add(output_transducer.dispatch_count))
+            .ok_or(VulkanResidentSingleTokenTickRunnerError::DispatchCountOverflow)?;
+        let total_descriptor_count = input_transducer
+            .descriptor_count
+            .checked_add(pedalboard.total_descriptor_count)
+            .and_then(|count| count.checked_add(output_transducer.total_descriptor_count))
+            .ok_or(VulkanResidentSingleTokenTickRunnerError::DescriptorCountOverflow)?;
+        let total_push_constant_byte_count = input_transducer
+            .push_constant_byte_count
+            .checked_add(pedalboard.total_push_constant_byte_count)
+            .and_then(|count| count.checked_add(output_transducer.total_push_constant_byte_count))
+            .ok_or(VulkanResidentSingleTokenTickRunnerError::PushConstantByteCountOverflow)?;
+
+        Ok(Self {
+            device_id: pedalboard.device_id.clone(),
+            pedal_count: pedalboard.pedal_count(),
+            dispatch_count,
+            total_descriptor_count,
+            total_push_constant_byte_count,
+            input_transducer,
+            pedalboard,
+            output_transducer,
+        })
+    }
+
+    pub fn run_token_id_with_stream_control(
+        &self,
+        device: &VulkanComputeDevice,
+        token_id: u32,
+        control: VulkanMountedPlacedStreamControl,
+    ) -> Result<VulkanResidentSingleTokenTickRun, VulkanResidentSingleTokenTickRunnerError> {
+        let input_run = self.input_transducer.run_token_id(device, token_id)?;
+        let pedalboard_run = self.pedalboard.run_with_stream_control(device, control)?;
+        let output_run = self.output_transducer.run(device)?;
+        Ok(VulkanResidentSingleTokenTickRun {
+            device_id: self.device_id.clone(),
+            token_id,
+            input_run,
+            pedalboard_run,
+            output_run,
+            dispatch_count: self.dispatch_count,
+            total_descriptor_count: self.total_descriptor_count,
+            total_push_constant_byte_count: self.total_push_constant_byte_count,
+        })
+    }
+
+    pub fn read_logits_bytes(&self, len: usize) -> Result<Vec<u8>, VulkanError> {
+        self.output_transducer.read_logits_bytes(len)
+    }
+
+    pub fn read_normalized_frame_bytes(&self, len: usize) -> Result<Vec<u8>, VulkanError> {
+        self.output_transducer.read_normalized_frame_bytes(len)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanResidentSingleTokenTickRun {
+    pub device_id: String,
+    pub token_id: u32,
+    pub input_run: VulkanResidentInputEmbeddingTransducerRun,
+    pub pedalboard_run: VulkanMountedPlacedResidentPedalboardRun,
+    pub output_run: VulkanResidentOutputTransducerRun,
+    pub dispatch_count: usize,
+    pub total_descriptor_count: usize,
+    pub total_push_constant_byte_count: u32,
+}
+
+#[derive(Debug)]
+pub enum VulkanResidentSingleTokenTickRunnerError {
+    DispatchCountOverflow,
+    DescriptorCountOverflow,
+    PushConstantByteCountOverflow,
+    InputTransducer(VulkanResidentInputEmbeddingTransducerRunnerError),
+    Pedalboard(VulkanMountedPlacedResidentKernelDispatchError),
+    OutputTransducer(VulkanResidentOutputTransducerRunnerError),
+}
+
+impl Display for VulkanResidentSingleTokenTickRunnerError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DispatchCountOverflow => {
+                f.write_str("single-token tick dispatch count overflowed")
+            }
+            Self::DescriptorCountOverflow => {
+                f.write_str("single-token tick descriptor count overflowed")
+            }
+            Self::PushConstantByteCountOverflow => {
+                f.write_str("single-token tick push constant byte count overflowed")
+            }
+            Self::InputTransducer(error) => Display::fmt(error, f),
+            Self::Pedalboard(error) => Display::fmt(error, f),
+            Self::OutputTransducer(error) => Display::fmt(error, f),
+        }
+    }
+}
+
+impl Error for VulkanResidentSingleTokenTickRunnerError {}
+
+impl From<VulkanResidentInputEmbeddingTransducerRunnerError>
+    for VulkanResidentSingleTokenTickRunnerError
+{
+    fn from(error: VulkanResidentInputEmbeddingTransducerRunnerError) -> Self {
+        Self::InputTransducer(error)
+    }
+}
+
+impl From<VulkanMountedPlacedResidentKernelDispatchError>
+    for VulkanResidentSingleTokenTickRunnerError
+{
+    fn from(error: VulkanMountedPlacedResidentKernelDispatchError) -> Self {
+        Self::Pedalboard(error)
+    }
+}
+
+impl From<VulkanResidentOutputTransducerRunnerError> for VulkanResidentSingleTokenTickRunnerError {
+    fn from(error: VulkanResidentOutputTransducerRunnerError) -> Self {
+        Self::OutputTransducer(error)
+    }
+}
+
 pub struct VulkanMountedPlacedResidentPedalRunner {
     pub pedal_id: String,
     pub dispatches: Vec<VulkanMountedPlacedResidentPedalDispatch>,
@@ -7388,6 +7527,39 @@ mod tests {
         bytes
     }
 
+    fn load_lfm2_transducer_parameter_buffers(
+        device: &VulkanComputeDevice,
+        tensor_index: &TensorIndex,
+    ) -> VulkanPermanentParameterBuffers {
+        let graph = ResolvedLoweredPedalboard::from_index_file(lfm2_index_path()).unwrap();
+        let execution_plan =
+            StreamCircuitExecutionPlan::from_graph_with_tensor_index(&graph, tensor_index).unwrap();
+        let resource_plan =
+            StreamCircuitResourcePlan::from_graph_and_plan(&graph, &execution_plan).unwrap();
+        let transducer_parameter_plan =
+            VulkanPermanentParameterBufferPlan::from_transducer_parameters(
+                "gpu0",
+                &resource_plan,
+                Some(tensor_index),
+            )
+            .unwrap();
+        assert_eq!(transducer_parameter_plan.parameter_count, 2);
+        assert_eq!(
+            transducer_parameter_plan.total_byte_capacity,
+            Some(134_219_776)
+        );
+        assert!(transducer_parameter_plan.unresolved_tensors.is_empty());
+        let transducer_parameter_buffers =
+            transducer_parameter_plan.allocate_buffers(device).unwrap();
+        let loaded = transducer_parameter_buffers
+            .load_from_tensor_index(tensor_index)
+            .unwrap();
+        assert_eq!(loaded.parameter_count, 2);
+        assert_eq!(loaded.loaded_count, 2);
+        assert_eq!(loaded.total_bytes_loaded, 134_219_776);
+        transducer_parameter_buffers
+    }
+
     fn load_lfm2_conv_layer_parameters(
         mounted: &VulkanMountedPlacedStreamCircuit,
         tensor_index: &TensorIndex,
@@ -8464,6 +8636,135 @@ mod tests {
             vec![
                 0x8e, 0x09, 0xa6, 0x3f, 0x10, 0x7a, 0x4f, 0xbd, 0x22, 0xee, 0x7a, 0xc0, 0xdd, 0x90,
                 0xa1, 0x3f,
+            ]
+        );
+    }
+
+    #[test]
+    fn resident_single_token_tick_runs_input_board_and_output_to_logits() {
+        let device = match VulkanComputeDevice::new() {
+            Ok(device) => device,
+            Err(error) => {
+                eprintln!("skipping resident single-token tick runner: {error}");
+                return;
+            }
+        };
+        let (tensor_index, mounted, _manifest, mounted_bound) =
+            mount_lfm2_single_device_stream_circuit(&device);
+        let Some(loaded_manifest) = lfm2_level_1_loaded_kernel_pack_for_conv_and_attention_families(
+            &mounted,
+            &mounted_bound,
+        ) else {
+            eprintln!(
+                "skipping resident single-token tick runner: no GLSL to SPIR-V compiler found"
+            );
+            return;
+        };
+        let Some(input_transducer_spirv_words) =
+            crate::vulkan_compute::compile_test_shader_words_from_source(
+                "embedding_lookup_bf16_65536x1024.comp",
+            )
+        else {
+            eprintln!(
+                "skipping resident single-token tick runner: no GLSL to SPIR-V compiler found"
+            );
+            return;
+        };
+        let Some(embedding_norm_spirv_words) =
+            crate::vulkan_compute::compile_test_shader_words_from_source(
+                "rms_norm_bf16_serial.comp",
+            )
+        else {
+            eprintln!(
+                "skipping resident single-token tick runner: no GLSL to SPIR-V compiler found"
+            );
+            return;
+        };
+        let Some(tied_projection_spirv_words) =
+            crate::vulkan_compute::compile_test_shader_words_from_source(
+                "tied_output_projection_bf16_65536x1024_to_f32.comp",
+            )
+        else {
+            eprintln!(
+                "skipping resident single-token tick runner: no GLSL to SPIR-V compiler found"
+            );
+            return;
+        };
+
+        let transducer_parameter_buffers =
+            load_lfm2_transducer_parameter_buffers(&device, &tensor_index);
+        let pedal_ids = prepare_lfm2_resident_prefix(&mounted, &tensor_index, 13);
+        let input_transducer =
+            VulkanResidentInputEmbeddingTransducerRunner::from_mounted_lfm2_token_embedding(
+                &device,
+                &mounted,
+                &transducer_parameter_buffers,
+                &input_transducer_spirv_words,
+            )
+            .unwrap();
+        let pedalboard = create_lfm2_resident_prefix_runner(
+            &device,
+            &mounted,
+            &mounted_bound,
+            &loaded_manifest,
+            &pedal_ids,
+        );
+        let output_transducer =
+            VulkanResidentOutputTransducerRunner::from_mounted_lfm2_output_transducer(
+                &device,
+                &mounted,
+                &transducer_parameter_buffers,
+                &embedding_norm_spirv_words,
+                &tied_projection_spirv_words,
+            )
+            .unwrap();
+        let runner = VulkanResidentSingleTokenTickRunner::new(
+            input_transducer,
+            pedalboard,
+            output_transducer,
+        )
+        .unwrap();
+        assert_eq!(runner.device_id, "gpu0");
+        assert_eq!(runner.pedal_count, 14);
+        assert_eq!(runner.dispatch_count, 245);
+        assert_eq!(runner.total_descriptor_count, 802);
+        assert_eq!(runner.total_push_constant_byte_count, 3_876);
+
+        let token_id = 1u32;
+        let run = runner
+            .run_token_id_with_stream_control(&device, token_id, lfm2_stream_control(&mounted, 0))
+            .unwrap();
+        assert_eq!(run.device_id, "gpu0");
+        assert_eq!(run.token_id, token_id);
+        assert_eq!(run.dispatch_count, 245);
+        assert_eq!(run.total_descriptor_count, 802);
+        assert_eq!(run.total_push_constant_byte_count, 3_876);
+        assert_eq!(run.input_run.dispatch_count, 1);
+        assert_eq!(run.input_run.output_signal_id, LFM2_INPUT_FRAME_SIGNAL);
+        assert_lfm2_resident_prefix_run(&run.pedalboard_run, &pedal_ids, 242);
+        assert_eq!(run.output_run.dispatch_count, 2);
+        assert_eq!(run.output_run.logits_byte_capacity, LFM2_LOGITS_BYTES);
+
+        let input_frame = mounted
+            .boundary_io
+            .input_buffer(LFM2_INPUT_FRAME_SIGNAL)
+            .unwrap();
+        assert_eq!(
+            input_frame.buffer.read_bytes(LFM2_FRAME_BYTES).unwrap(),
+            lfm2_embedding_row_bytes(&tensor_index, token_id)
+        );
+        assert_eq!(
+            runner.read_normalized_frame_bytes(16).unwrap(),
+            vec![
+                0xb5, 0xbf, 0xee, 0xbf, 0x51, 0x3f, 0x99, 0xbf, 0x35, 0xbf, 0xc4, 0xbe, 0x7a, 0x3f,
+                0x94, 0xbf,
+            ]
+        );
+        assert_eq!(
+            runner.read_logits_bytes(16).unwrap(),
+            vec![
+                0xa3, 0xc8, 0x12, 0xc0, 0xf7, 0xc1, 0x9d, 0x41, 0x84, 0x92, 0x6a, 0x41, 0x16, 0x9c,
+                0x17, 0xc0,
             ]
         );
     }
