@@ -369,5 +369,5 @@ Options:
 
 Example:
   python -m llmoop --compile-model <MODEL_DIR>
-  cargo run --manifest-path runtime-rs/Cargo.toml --features 'vulkan tokenizers' --bin llmoop-runtime -- --package lowered/model_xxx/vulkan_resident_greedy_package.json --prompt Hello --max-new-tokens 4"
+  cargo run --manifest-path runtime-rs/Cargo.toml --features 'vulkan tokenizers' --bin llmoop-runtime -- --package packages/model_xxx/vulkan_resident_greedy_package.json --prompt Hello --max-new-tokens 4"
 }

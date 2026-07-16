@@ -20,7 +20,7 @@ CLI_DEPS_AVAILABLE = all(
 
 
 class RuntimeCliCommandTest(unittest.TestCase):
-    def test_resolve_runtime_package_manifest_accepts_lowered_dir_or_manifest(self) -> None:
+    def test_resolve_runtime_package_manifest_accepts_package_dir_or_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as raw_root:
             root = Path(raw_root)
             manifest = root / "vulkan_resident_greedy_package.json"
@@ -30,7 +30,7 @@ class RuntimeCliCommandTest(unittest.TestCase):
             self.assertEqual(manifest, resolve_runtime_package_manifest(manifest))
 
     def test_build_runtime_command_prefers_explicit_runtime_binary(self) -> None:
-        package = Path("lowered/model_x/vulkan_resident_greedy_package.json")
+        package = Path("packages/model_x/vulkan_resident_greedy_package.json")
         args = Namespace(
             prompt="Hello",
             max_new_tokens=4,
@@ -69,14 +69,14 @@ class CompiledPackageTest(unittest.TestCase):
 
         self.assertEqual("tokenizer", manifest["tokenizer"]["path"])
         self.assertEqual("config.json", manifest["config_path"])
-        self.assertTrue((fixture.lowered_dir / "config.json").is_file())
+        self.assertTrue((fixture.package_dir / "config.json").is_file())
         self.assertIn("tokenizer.json", manifest["tokenizer"]["files"])
-        self.assertTrue((fixture.lowered_dir / "tokenizer" / "tokenizer.json").is_file())
+        self.assertTrue((fixture.package_dir / "tokenizer" / "tokenizer.json").is_file())
 
     def test_compiled_package_contains_weight_files_and_local_tensor_index(self) -> None:
         fixture = compiled_model_or_skip()
         manifest = json.loads(fixture.package_manifest.read_text())
-        tensor_index_path = fixture.lowered_dir / manifest["tensor_index_path"]
+        tensor_index_path = fixture.package_dir / manifest["tensor_index_path"]
         tensor_index = json.loads(tensor_index_path.read_text())
 
         self.assertEqual("tensors.json", manifest["tensor_index_path"])
@@ -90,7 +90,7 @@ class CompiledPackageTest(unittest.TestCase):
             source_file = Path(info["source_file"])
             self.assertFalse(source_file.is_absolute())
             self.assertEqual("weights", source_file.parts[0])
-            self.assertTrue((fixture.lowered_dir / source_file).is_file())
+            self.assertTrue((fixture.package_dir / source_file).is_file())
 
     def test_compiled_package_declares_pedal_executions(self) -> None:
         fixture = compiled_model_or_skip()
@@ -146,11 +146,27 @@ class CompiledPackageTest(unittest.TestCase):
     def test_compiled_package_does_not_reference_source_or_transpiled_paths(self) -> None:
         fixture = compiled_model_or_skip()
 
-        for artifact in fixture.lowered_dir.rglob("*.json"):
-            payload = artifact.read_text()
-            self.assertNotIn(str(fixture.source_model_dir), payload, artifact)
-            self.assertNotIn("transpiled/", payload, artifact)
-            self.assertNotIn("source_model_dir", payload, artifact)
+        for root in (fixture.lowered_dir, fixture.package_dir):
+            for artifact in root.rglob("*.json"):
+                payload = artifact.read_text()
+                self.assertNotIn(str(fixture.source_model_dir), payload, artifact)
+                self.assertNotIn("transpiled/", payload, artifact)
+                self.assertNotIn("source_model_dir", payload, artifact)
+
+    def test_runtime_package_is_separate_from_lowered_workspace(self) -> None:
+        fixture = compiled_model_or_skip()
+
+        self.assertEqual(fixture.package_dir, fixture.package_manifest.parent)
+        self.assertNotEqual(fixture.lowered_dir, fixture.package_dir)
+        self.assertFalse((fixture.lowered_dir / "vulkan_resident_greedy_package.json").exists())
+        self.assertFalse(
+            any(
+                artifact.name == "vulkan_resident_greedy_package.json"
+                for artifact in fixture.lowered_dir.rglob("*.json")
+            )
+        )
+        self.assertTrue((fixture.lowered_dir / "pedalboard.circuits.json").is_file())
+        self.assertTrue(fixture.package_manifest.is_file())
 
 
 @unittest.skipUnless(CLI_DEPS_AVAILABLE, "CLI generation dependencies are not installed")

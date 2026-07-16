@@ -8,6 +8,7 @@ __pycache__/
 runtime-rs/target/
 
 lowered/
+packages/
 transpiled/
 
 .DS_Store

@@ -23,7 +23,7 @@ def main() -> None:
     parser.add_argument(
         "--run",
         type=Path,
-        metavar="LOWERED_DIR_OR_PACKAGE",
+        metavar="PACKAGE_DIR_OR_MANIFEST",
         help="run a compiled model package with the Rust/Vulkan runtime engine",
     )
     parser.add_argument(
@@ -49,7 +49,12 @@ def main() -> None:
     parser.add_argument(
         "--lowered-dir",
         type=Path,
-        help="directory for lowered circuit/package artifacts",
+        help="directory for lowered compiler/oracle artifacts",
+    )
+    parser.add_argument(
+        "--package-dir",
+        type=Path,
+        help="directory for runtime package artifacts",
     )
     parser.add_argument(
         "--shader-source-dir",
@@ -152,6 +157,7 @@ def main() -> None:
         args.compile_model,
         transpiled_dir=args.transpiled_dir,
         lowered_dir=args.lowered_dir,
+        package_dir=args.package_dir,
         clean=not args.no_clean,
         shader_source_dir=args.shader_source_dir,
         default_dynamic_state_capacity_activations=args.capacity or 4,
@@ -163,6 +169,7 @@ def main() -> None:
         print(f"  model_type: {report.model_type}")
         print(f"  transpiled: {report.transpiled_dir}")
         print(f"  lowered:    {report.lowered_dir}")
+        print(f"  package_dir: {report.package_dir}")
         print(f"  package:    {report.package_manifest}")
         print(f"  circuits:   {report.circuit_count}")
         print(f"  shaders:    {report.shader_count}")

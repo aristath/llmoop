@@ -18,6 +18,12 @@ def main() -> None:
         description="Compare the Python circuit runtime with the Rust/Vulkan runtime for one compiled package."
     )
     parser.add_argument("--lowered-dir", type=Path, required=True)
+    parser.add_argument(
+        "--package-dir",
+        type=Path,
+        required=True,
+        help="runtime package directory or manifest",
+    )
     parser.add_argument("--prompt-text", "--prompt", dest="prompt_text", default="Hello")
     parser.add_argument("--max-new-tokens", type=int, default=4)
     parser.add_argument("--runtime-bin", type=Path, default=None)
@@ -69,7 +75,7 @@ def run_rust_vulkan_runtime(args: argparse.Namespace) -> dict[str, Any]:
         "-m",
         "llmoop",
         "--run",
-        str(args.lowered_dir),
+        str(args.package_dir),
         "--prompt",
         args.prompt_text,
         "--max-new-tokens",

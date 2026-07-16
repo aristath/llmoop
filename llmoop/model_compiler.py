@@ -22,6 +22,7 @@ class CompiledModelReport:
     model_dir: Path
     transpiled_dir: Path
     lowered_dir: Path
+    package_dir: Path
     package_manifest: Path
     model_type: str
     circuit_count: int
@@ -34,6 +35,7 @@ class CompiledModelReport:
             "model_type": self.model_type,
             "transpiled_dir": str(self.transpiled_dir),
             "lowered_dir": str(self.lowered_dir),
+            "package_dir": str(self.package_dir),
             "package_manifest": str(self.package_manifest),
             "circuit_count": self.circuit_count,
             "shader_count": self.shader_count,
@@ -45,6 +47,7 @@ def compile_model(
     *,
     transpiled_dir: Path | None = None,
     lowered_dir: Path | None = None,
+    package_dir: Path | None = None,
     clean: bool = True,
     shader_source_dir: Path = Path("runtime-rs/shaders"),
     default_dynamic_state_capacity_activations: int = 4,
@@ -56,6 +59,7 @@ def compile_model(
         model_dir,
         transpiled_dir=transpiled_dir,
         lowered_dir=lowered_dir,
+        package_dir=package_dir,
         clean=clean,
         shader_source_dir=shader_source_dir,
         default_dynamic_state_capacity_activations=default_dynamic_state_capacity_activations,

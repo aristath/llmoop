@@ -40,6 +40,7 @@ def compile_model_package(
     *,
     transpiled_dir: Path | None,
     lowered_dir: Path | None,
+    package_dir: Path | None,
     clean: bool,
     shader_source_dir: Path,
     default_dynamic_state_capacity_activations: int,
@@ -47,35 +48,45 @@ def compile_model_package(
     slug = compiled_model_slug(model_dir)
     transpiled_dir = transpiled_dir or Path("transpiled") / slug
     lowered_dir = lowered_dir or Path("lowered") / slug
+    package_dir = package_dir or Path("packages") / slug
 
     structure = transpile_model(model_dir, transpiled_dir, clean=clean)
     lowered = lower_pedalboard(transpiled_dir, lowered_dir)
     tensor_index = read_json(transpiled_dir / "tensors.json")
     model_graph = read_json(transpiled_dir / "model.json")
     copy_config_package(model_dir, lowered_dir)
-    tokenizer_manifest = copy_tokenizer_package(model_dir, lowered_dir / TOKENIZER_PACKAGE_DIR)
-    packaged_tensor_index = copy_tensor_package(tensor_index, lowered_dir)
+    copy_tokenizer_package(model_dir, lowered_dir / TOKENIZER_PACKAGE_DIR)
+    copy_tensor_package(tensor_index, lowered_dir)
+
+    if clean and package_dir.exists():
+        shutil.rmtree(package_dir)
+    package_dir.mkdir(parents=True, exist_ok=True)
+    copy_config_package(model_dir, package_dir)
+    tokenizer_manifest = copy_tokenizer_package(model_dir, package_dir / TOKENIZER_PACKAGE_DIR)
+    packaged_tensor_index = copy_tensor_package(tensor_index, package_dir)
     package_manifest = build_vulkan_resident_greedy_package_manifest(
         model_graph=model_graph,
         tensor_index=packaged_tensor_index,
         lowered_index=lowered["index"],
         lowered_dir=lowered_dir,
+        package_dir=package_dir,
         package_id=f"{slug}_vulkan_resident_greedy",
         shader_source_dir=shader_source_dir,
         default_dynamic_state_capacity_activations=default_dynamic_state_capacity_activations,
         tokenizer_manifest=tokenizer_manifest,
     )
-    package_manifest_path = lowered_dir / "vulkan_resident_greedy_package.json"
+    package_manifest_path = package_dir / "vulkan_resident_greedy_package.json"
     write_json(package_manifest_path, package_manifest)
 
     return CompiledModelReport(
         model_dir=model_dir,
         transpiled_dir=transpiled_dir,
         lowered_dir=lowered_dir,
+        package_dir=package_dir,
         package_manifest=package_manifest_path,
         model_type=structure.model_type or "unknown",
         circuit_count=lowered["index"]["summary"]["circuit_count"],
-        shader_count=len(list((lowered_dir / "shaders").glob("*.comp"))),
+        shader_count=len(list((package_dir / "shaders").glob("*.comp"))),
     )
 
 
@@ -85,6 +96,7 @@ def build_vulkan_resident_greedy_package_manifest(
     tensor_index: Json,
     lowered_index: Json,
     lowered_dir: Path,
+    package_dir: Path,
     package_id: str,
     shader_source_dir: Path,
     default_dynamic_state_capacity_activations: int,
@@ -113,7 +125,7 @@ def build_vulkan_resident_greedy_package_manifest(
 
     copy_shader_templates(
         shader_source_dir,
-        lowered_dir / "shaders",
+        package_dir / "shaders",
         required_shader_files(dimensions),
     )
 

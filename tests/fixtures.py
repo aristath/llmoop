@@ -18,6 +18,7 @@ class CompiledModelFixture:
     source_model_dir: Path
     transpiled_dir: Path
     lowered_dir: Path
+    package_dir: Path
     package_manifest: Path
 
 
@@ -39,11 +40,13 @@ def compiled_model_or_skip() -> CompiledModelFixture:
         model_dir,
         transpiled_dir=root / "transpiled",
         lowered_dir=root / "lowered",
+        package_dir=root / "package",
         clean=True,
     )
     return CompiledModelFixture(
         source_model_dir=model_dir,
         transpiled_dir=report.transpiled_dir,
         lowered_dir=report.lowered_dir,
+        package_dir=report.package_dir,
         package_manifest=report.package_manifest,
     )
