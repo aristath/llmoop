@@ -5768,6 +5768,7 @@ pub struct VulkanResidentGreedyModelPackageManifest {
     pub schema: String,
     pub package_id: String,
     pub device_id: String,
+    pub placement: StreamCircuitPlacementSpec,
     pub circuit_graph: VulkanResidentPackageCircuitGraph,
     pub tensor_index_path: String,
     pub config_path: String,
@@ -6046,6 +6047,7 @@ impl VulkanResidentGreedyModelPackage {
         let (tensor_index, resource_plan, placed_plan) =
             plan_resident_greedy_package_single_device_stream_circuit(
                 &manifest.device_id,
+                &manifest.placement,
                 &manifest.circuit_graph,
                 manifest_dir,
                 &tensor_index_path,
@@ -6462,6 +6464,7 @@ fn resolve_resident_model_package_path(manifest_dir: &Path, path: &str) -> PathB
 
 fn plan_resident_greedy_package_single_device_stream_circuit(
     device_id: &str,
+    placement_spec: &StreamCircuitPlacementSpec,
     circuit_graph: &VulkanResidentPackageCircuitGraph,
     manifest_dir: &Path,
     tensor_index_path: &Path,
@@ -6495,8 +6498,7 @@ fn plan_resident_greedy_package_single_device_stream_circuit(
                 "failed to create stream resource plan: {error}"
             ))
         })?;
-    let placement_spec = StreamCircuitPlacementSpec::new(device_id);
-    let placement_plan = graph.placement_plan(&placement_spec).map_err(|error| {
+    let placement_plan = graph.placement_plan(placement_spec).map_err(|error| {
         VulkanResidentTokenModelPackageError::new(format!(
             "failed to create placement plan for {device_id:?}: {error}"
         ))

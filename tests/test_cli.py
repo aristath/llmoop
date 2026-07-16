@@ -133,6 +133,14 @@ class CompiledPackageTest(unittest.TestCase):
         manifest = json.loads(fixture.package_manifest.read_text())
 
         self.assertNotIn("circuit_index_path", manifest)
+        self.assertEqual(
+            {
+                "schema": "llmoop.stream_circuit_placement.v1",
+                "default_device_id": "gpu0",
+                "pedal_devices": {},
+            },
+            manifest["placement"],
+        )
         circuit_graph = manifest["circuit_graph"]
         self.assertEqual("series", circuit_graph["wiring"])
         self.assertEqual(14, len(circuit_graph["pedals"]))

@@ -139,6 +139,11 @@ def build_vulkan_resident_greedy_package_manifest(
         "schema": PACKAGE_SCHEMA,
         "package_id": package_id,
         "device_id": "gpu0",
+        "placement": {
+            "schema": "llmoop.stream_circuit_placement.v1",
+            "default_device_id": "gpu0",
+            "pedal_devices": {},
+        },
         "circuit_graph": package_circuit_graph(lowered_index, lowered_dir),
         "tensor_index_path": "tensors.json",
         "config_path": CONFIG_PACKAGE_FILE,
