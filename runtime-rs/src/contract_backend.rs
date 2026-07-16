@@ -269,7 +269,6 @@ impl DeviceBackend for ContractDeviceBackend {
                 pedal_count: 0,
                 input_signal: "token".to_string(),
                 output_signal: "token".to_string(),
-                source_model_dir: None,
             },
             host_ports: HostPortsManifest {
                 inputs: vec![

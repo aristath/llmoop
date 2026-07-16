@@ -60,7 +60,7 @@ class SafetensorsTensorStore:
         if name not in self._cache:
             from safetensors.torch import safe_open
 
-            weights_file = self.infos().get(name, TensorInfo(name, "", (), self.weights_file)).source_file
+            weights_file = self.infos()[name].source_file
             with safe_open(weights_file, framework="pt", device=self.device or "cpu") as tensors:
                 if name not in tensors.keys():
                     raise KeyError(f"tensor {name!r} not found in {weights_file}")

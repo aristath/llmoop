@@ -62,7 +62,6 @@ def lower_pedalboard(pedalboard_dir: Path, out_dir: Path) -> Json:
             {
                 "id": source_pedal["id"],
                 "operator_type": source_pedal["operator_type"],
-                "pedal_file": str(source_pedal["file"]),
                 "circuit": str(circuit_rel),
                 "params": str(params_rel),
                 "state": str(state_rel),
@@ -74,9 +73,8 @@ def lower_pedalboard(pedalboard_dir: Path, out_dir: Path) -> Json:
     index = {
         "schema": "llmoop.lowered_pedalboard.v1",
         "source": {
-            "pedalboard_dir": str(pedalboard_dir),
-            "model_file": str(pedalboard_dir / "model.json"),
-            "source_model_dir": model["source"]["model_dir"],
+            "format": "llmoop.compiled_pedalboard_artifact.v1",
+            "artifact_root": ".",
         },
         "architecture": model["architecture"],
         "dimensions": model["dimensions"],
@@ -176,7 +174,6 @@ def _base_circuit(
         "id": circuit_id,
         "source": {
             "pedal_id": pedal["id"],
-            "pedal_file": str(pedal_path),
             "source_layer_index": pedal["source_layer_index"],
             "source_operator_type": operator_type,
         },

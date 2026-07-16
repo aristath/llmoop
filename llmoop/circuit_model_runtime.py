@@ -148,13 +148,14 @@ class CircuitModelRuntime:
         board = CircuitPedalboard.from_dir(circuit_dir)
         config = json.loads((model_dir / "config.json").read_text())
 
-        model_file = Path(board.index["source"]["model_file"])
-        tensor_index = model_file.parent / "tensors.json"
+        tensor_index = circuit_dir / "tensors.json"
+        if not tensor_index.is_file():
+            raise FileNotFoundError(f"compiled circuit package is missing {tensor_index}")
         tensor_store = SafetensorsTensorStore.from_model_dir(
             model_dir=model_dir,
             torch=torch,
             dtype=torch.float32,
-            tensor_index=tensor_index if tensor_index.exists() else None,
+            tensor_index=tensor_index,
         )
         input_embedding_tensor = board.index["graph"]["input_transducer"]["params"]["weight"]["tensor"]
         output_components = board.index["graph"]["output_transducer"]["components"]

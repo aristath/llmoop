@@ -248,7 +248,6 @@ class InstalledStreamProcessor:
                 "pedal_count": len(board.pedals),
                 "input_signal": board.pedals[0].input_port.signal,
                 "output_signal": board.pedals[-1].output_port.signal,
-                "source_model_dir": str(self.processor.runtime.board.index["source"]["source_model_dir"]),
             },
             "host_ports": {
                 "inputs": ["external_input", "control", "random_input"],

@@ -21,9 +21,12 @@ class PedalboardCircuitLoweringTest(unittest.TestCase):
             self.assertEqual(14, index["summary"]["circuit_count"])
             self.assertEqual({"conv": 8, "full_attention": 6}, index["summary"]["operator_counts"])
             self.assertEqual("series", index["graph"]["wiring"])
+            self.assertEqual("llmoop.compiled_pedalboard_artifact.v1", index["source"]["format"])
+            self.assertEqual(".", index["source"]["artifact_root"])
             self.assertTrue(result["index_path"].exists())
 
             for circuit_entry in index["graph"]["circuits"]:
+                self.assertNotIn("pedal_file", circuit_entry)
                 circuit_path = out_dir / circuit_entry["circuit"]
                 params_path = out_dir / circuit_entry["params"]
                 state_path = out_dir / circuit_entry["state"]
@@ -35,6 +38,7 @@ class PedalboardCircuitLoweringTest(unittest.TestCase):
                 report = validate_circuit(circuit)
                 self.assertTrue(report.ok, [issue.to_json() for issue in report.errors])
                 self.assertEqual(circuit_entry["id"], circuit["source"]["pedal_id"])
+                self.assertNotIn("pedal_file", circuit["source"])
 
                 params = read_json(params_path)
                 state = read_json(state_path)

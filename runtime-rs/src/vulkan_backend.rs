@@ -697,7 +697,6 @@ impl DeviceBackend for VulkanU32Backend {
                 pedal_count: self.pedalboard.pedals().len(),
                 input_signal: "u32_token".to_string(),
                 output_signal: "u32_token".to_string(),
-                source_model_dir: None,
             },
             host_ports: HostPortsManifest {
                 inputs: vec![

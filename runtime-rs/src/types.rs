@@ -182,7 +182,6 @@ pub struct PermanentCircuitManifest {
     pub pedal_count: usize,
     pub input_signal: String,
     pub output_signal: String,
-    pub source_model_dir: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

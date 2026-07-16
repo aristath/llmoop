@@ -80,11 +80,24 @@ class CompiledPackageTest(unittest.TestCase):
         self.assertEqual("tensors.json", manifest["tensor_index_path"])
         self.assertEqual("weights", tensor_index["source"]["weights_dir"])
         self.assertTrue(tensor_index["source"]["packaged"])
+        self.assertNotIn("model_dir", tensor_index["source"])
+        self.assertFalse(Path(tensor_index["source"]["weights_file"]).is_absolute())
+        for source_record in tensor_index["source"]["weights_files"]:
+            self.assertFalse(Path(source_record["path"]).is_absolute())
         for info in tensor_index["tensors"].values():
             source_file = Path(info["source_file"])
             self.assertFalse(source_file.is_absolute())
             self.assertEqual("weights", source_file.parts[0])
             self.assertTrue((fixture.lowered_dir / source_file).is_file())
+
+    def test_compiled_package_does_not_reference_source_or_transpiled_paths(self) -> None:
+        fixture = compiled_model_or_skip()
+
+        for artifact in fixture.lowered_dir.rglob("*.json"):
+            payload = artifact.read_text()
+            self.assertNotIn(str(fixture.source_model_dir), payload, artifact)
+            self.assertNotIn("transpiled/", payload, artifact)
+            self.assertNotIn("source_model_dir", payload, artifact)
 
 
 @unittest.skipUnless(CLI_DEPS_AVAILABLE, "CLI generation dependencies are not installed")

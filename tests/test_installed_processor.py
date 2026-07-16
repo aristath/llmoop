@@ -79,6 +79,7 @@ class InstalledProcessorTest(unittest.TestCase):
         self.assertIn("external_input", manifest["host_ports"]["inputs"])
         self.assertIn("public_output", manifest["host_ports"]["outputs"])
         self.assertEqual(14, manifest["permanent_circuit"]["pedal_count"])
+        self.assertNotIn("source_model_dir", manifest["permanent_circuit"])
         self.assertEqual("gpuish_0", manifest["device"]["device_id"])
         self.assertEqual("python_device_loop", manifest["device"]["backend_id"])
         self.assertEqual(14, len(manifest["stream_template"]["state_allocations"]))

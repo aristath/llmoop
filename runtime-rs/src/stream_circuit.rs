@@ -74,7 +74,6 @@ pub struct CircuitBoundary {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CircuitSource {
     pub pedal_id: String,
-    pub pedal_file: String,
     pub source_layer_index: usize,
     pub source_operator_type: String,
 }
@@ -322,16 +321,14 @@ impl CircuitStateArtifact {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct LoweredPedalboardSource {
-    pub pedalboard_dir: String,
-    pub model_file: String,
-    pub source_model_dir: String,
+    pub format: String,
+    pub artifact_root: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct LoweredCircuitRef {
     pub id: String,
     pub operator_type: String,
-    pub pedal_file: String,
     pub circuit: String,
     pub params: String,
     pub state: String,
@@ -688,7 +685,6 @@ impl ResolvedLoweredPedalboard {
                 pedal_count: self.circuits.len(),
                 input_signal: first_input,
                 output_signal: last_output,
-                source_model_dir: Some(self.index.source.source_model_dir.clone()),
             },
             host_ports: HostPortsManifest {
                 inputs: vec![
@@ -1602,7 +1598,6 @@ mod tests {
         assert_eq!(manifest.permanent_circuit.pedal_count, 14);
         assert_eq!(manifest.permanent_circuit.input_signal, "frame");
         assert_eq!(manifest.permanent_circuit.output_signal, "frame");
-        assert!(manifest.permanent_circuit.source_model_dir.is_some());
         assert_eq!(manifest.stream_template.state_allocations.len(), 14);
         assert!(
             manifest

@@ -403,20 +403,24 @@ def copy_tensor_package(tensor_index: Json, lowered_dir: Path) -> Json:
         dest_by_source[source] = dest
 
     packaged = deepcopy(tensor_index)
+    source_records = {
+        Path(source_record["path"]): source_record
+        for source_record in tensor_index.get("source", {}).get("weights_files", [])
+    }
     packaged["source"] = {
-        **packaged.get("source", {}),
         "packaged": True,
         "weights_dir": WEIGHTS_PACKAGE_DIR,
         "weights_file": relative_json_path(lowered_dir, dest_by_source[source_files[0]]),
         "weights_files": [
             {
-                **source_record,
-                "path": relative_json_path(
-                    lowered_dir,
-                    dest_by_source[Path(source_record["path"])],
-                ),
+                **{
+                    key: value
+                    for key, value in source_records.get(source, {}).items()
+                    if key != "path"
+                },
+                "path": relative_json_path(lowered_dir, dest_by_source[source]),
             }
-            for source_record in packaged.get("source", {}).get("weights_files", [])
+            for source in source_files
         ],
     }
     for info in packaged["tensors"].values():
