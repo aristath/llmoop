@@ -24,6 +24,7 @@ pub const VULKAN_REUSABLE_KERNEL_ARTIFACT_MANIFEST_SCHEMA: &str =
 const LFM2_TOKEN_EMBEDDING_TRANSDUCER_ID: &str = "input_transducer.token_embedding";
 const LFM2_OUTPUT_EMBEDDING_NORM_TRANSDUCER_ID: &str = "output_transducer.embedding_norm";
 const LFM2_TIED_OUTPUT_PROJECTION_TRANSDUCER_ID: &str = "output_transducer.tied_output_projection";
+const LFM2_GREEDY_SAMPLER_PEDAL_ID: &str = "greedy_sampler";
 const LFM2_EMBED_TOKENS_TENSOR: &str = "model.embed_tokens.weight";
 const LFM2_EMBEDDING_NORM_TENSOR: &str = "model.embedding_norm.weight";
 const LFM2_INPUT_FRAME_SIGNAL: &str = "input_frame";
@@ -33,9 +34,11 @@ const LFM2_HIDDEN_SIZE: usize = 1_024;
 const LFM2_FRAME_BYTES: usize = LFM2_HIDDEN_SIZE * 2;
 const LFM2_FRAME_WORDS: usize = LFM2_FRAME_BYTES / 4;
 const LFM2_LOGITS_BYTES: usize = LFM2_VOCAB_SIZE * 4;
+const LFM2_SAMPLER_OUTPUT_BYTES: usize = 16;
 const LFM2_EMBED_TOKENS_BYTES: usize = LFM2_VOCAB_SIZE * LFM2_FRAME_BYTES;
 const VULKAN_INPUT_EMBEDDING_LOOKUP_LOCAL_SIZE_X: u32 = 256;
 const VULKAN_OUTPUT_PROJECTION_LOCAL_SIZE_X: u32 = 64;
+const VULKAN_GREEDY_SAMPLER_LOCAL_SIZE_X: u32 = 64;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VulkanStreamCircuitResidentPlan {
@@ -2837,6 +2840,10 @@ impl VulkanResidentOutputTransducerRunner {
         self.logits_buffer.read_bytes(len)
     }
 
+    pub fn logits_buffer(&self) -> &VulkanResidentBuffer {
+        &self.logits_buffer
+    }
+
     pub fn read_normalized_frame_bytes(&self, len: usize) -> Result<Vec<u8>, VulkanError> {
         self.normalized_frame_buffer.read_bytes(len)
     }
@@ -2983,6 +2990,138 @@ fn validate_lfm2_embedding_norm_weight(
     Ok(())
 }
 
+pub struct VulkanResidentGreedySamplerRunner {
+    pub sampler_id: String,
+    pub logits_byte_capacity: usize,
+    pub output_byte_capacity: usize,
+    pub descriptor_count: usize,
+    pub workgroup_count_x: u32,
+    pub push_constant_byte_count: u32,
+    output_buffer: VulkanResidentBuffer,
+    resident_dispatch: VulkanResidentKernelDispatch,
+}
+
+impl VulkanResidentGreedySamplerRunner {
+    pub fn from_output_transducer(
+        device: &VulkanComputeDevice,
+        output_transducer: &VulkanResidentOutputTransducerRunner,
+        spirv_words: &[u32],
+    ) -> Result<Self, VulkanResidentGreedySamplerRunnerError> {
+        Self::from_logits_buffer(
+            device,
+            output_transducer.logits_buffer(),
+            output_transducer.logits_byte_capacity,
+            spirv_words,
+        )
+    }
+
+    pub fn from_logits_buffer(
+        device: &VulkanComputeDevice,
+        logits_buffer: &VulkanResidentBuffer,
+        logits_byte_capacity: usize,
+        spirv_words: &[u32],
+    ) -> Result<Self, VulkanResidentGreedySamplerRunnerError> {
+        if logits_byte_capacity != LFM2_LOGITS_BYTES {
+            return Err(
+                VulkanResidentGreedySamplerRunnerError::InvalidLogitsByteCapacity {
+                    byte_capacity: logits_byte_capacity,
+                    expected_byte_capacity: LFM2_LOGITS_BYTES,
+                },
+            );
+        }
+        let output_buffer = device.create_resident_buffer(LFM2_SAMPLER_OUTPUT_BYTES)?;
+        let bindings = [
+            VulkanResidentKernelBufferBinding::new(0, logits_buffer, logits_byte_capacity),
+            VulkanResidentKernelBufferBinding::new(1, &output_buffer, LFM2_SAMPLER_OUTPUT_BYTES),
+        ];
+        let resident_dispatch = device.create_resident_kernel_dispatch(
+            spirv_words,
+            &bindings,
+            1,
+            VULKAN_GREEDY_SAMPLER_LOCAL_SIZE_X,
+            0,
+        )?;
+
+        Ok(Self {
+            sampler_id: LFM2_GREEDY_SAMPLER_PEDAL_ID.to_string(),
+            logits_byte_capacity,
+            output_byte_capacity: LFM2_SAMPLER_OUTPUT_BYTES,
+            descriptor_count: resident_dispatch.descriptor_count(),
+            workgroup_count_x: resident_dispatch.workgroup_count_x(),
+            push_constant_byte_count: resident_dispatch.push_constant_byte_count(),
+            output_buffer,
+            resident_dispatch,
+        })
+    }
+
+    pub fn run(
+        &self,
+        device: &VulkanComputeDevice,
+    ) -> Result<VulkanResidentGreedySamplerRun, VulkanResidentGreedySamplerRunnerError> {
+        device.run_resident_kernel_dispatch(&self.resident_dispatch, &[])?;
+        let output = self.output_buffer.read_bytes(LFM2_SAMPLER_OUTPUT_BYTES)?;
+        let token_id = u32::from_le_bytes([output[0], output[1], output[2], output[3]]);
+        let selected_logit_bits = u32::from_le_bytes([output[4], output[5], output[6], output[7]]);
+        let control_flags = u32::from_le_bytes([output[8], output[9], output[10], output[11]]);
+        Ok(VulkanResidentGreedySamplerRun {
+            sampler_id: self.sampler_id.clone(),
+            token_id,
+            selected_logit_bits,
+            control_flags,
+            descriptor_count: self.descriptor_count,
+            workgroup_count_x: self.workgroup_count_x,
+            push_constant_byte_count: self.push_constant_byte_count,
+        })
+    }
+
+    pub fn read_output_bytes(&self) -> Result<Vec<u8>, VulkanError> {
+        self.output_buffer.read_bytes(LFM2_SAMPLER_OUTPUT_BYTES)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanResidentGreedySamplerRun {
+    pub sampler_id: String,
+    pub token_id: u32,
+    pub selected_logit_bits: u32,
+    pub control_flags: u32,
+    pub descriptor_count: usize,
+    pub workgroup_count_x: u32,
+    pub push_constant_byte_count: u32,
+}
+
+#[derive(Debug)]
+pub enum VulkanResidentGreedySamplerRunnerError {
+    InvalidLogitsByteCapacity {
+        byte_capacity: usize,
+        expected_byte_capacity: usize,
+    },
+    Vulkan(VulkanError),
+}
+
+impl Display for VulkanResidentGreedySamplerRunnerError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidLogitsByteCapacity {
+                byte_capacity,
+                expected_byte_capacity,
+            } => write!(
+                f,
+                "greedy sampler logits buffer has {byte_capacity} bytes, expected {expected_byte_capacity}"
+            ),
+            Self::Vulkan(error) => Display::fmt(error, f),
+        }
+    }
+}
+
+impl Error for VulkanResidentGreedySamplerRunnerError {}
+
+impl From<VulkanError> for VulkanResidentGreedySamplerRunnerError {
+    fn from(error: VulkanError) -> Self {
+        Self::Vulkan(error)
+    }
+}
+
 pub struct VulkanResidentSingleTokenTickRunner {
     pub device_id: String,
     pub pedal_count: usize,
@@ -3119,6 +3258,172 @@ impl From<VulkanMountedPlacedResidentKernelDispatchError>
 impl From<VulkanResidentOutputTransducerRunnerError> for VulkanResidentSingleTokenTickRunnerError {
     fn from(error: VulkanResidentOutputTransducerRunnerError) -> Self {
         Self::OutputTransducer(error)
+    }
+}
+
+pub struct VulkanResidentGreedyFeedbackLoopRunner {
+    pub device_id: String,
+    pub pedal_count: usize,
+    pub per_tick_dispatch_count: usize,
+    pub per_tick_descriptor_count: usize,
+    pub per_tick_push_constant_byte_count: u32,
+    tick_runner: VulkanResidentSingleTokenTickRunner,
+    sampler: VulkanResidentGreedySamplerRunner,
+}
+
+impl VulkanResidentGreedyFeedbackLoopRunner {
+    pub fn new(
+        tick_runner: VulkanResidentSingleTokenTickRunner,
+        sampler: VulkanResidentGreedySamplerRunner,
+    ) -> Result<Self, VulkanResidentGreedyFeedbackLoopRunnerError> {
+        let per_tick_dispatch_count = tick_runner
+            .dispatch_count
+            .checked_add(1)
+            .ok_or(VulkanResidentGreedyFeedbackLoopRunnerError::DispatchCountOverflow)?;
+        let per_tick_descriptor_count = tick_runner
+            .total_descriptor_count
+            .checked_add(sampler.descriptor_count)
+            .ok_or(VulkanResidentGreedyFeedbackLoopRunnerError::DescriptorCountOverflow)?;
+        let per_tick_push_constant_byte_count = tick_runner
+            .total_push_constant_byte_count
+            .checked_add(sampler.push_constant_byte_count)
+            .ok_or(VulkanResidentGreedyFeedbackLoopRunnerError::PushConstantByteCountOverflow)?;
+
+        Ok(Self {
+            device_id: tick_runner.device_id.clone(),
+            pedal_count: tick_runner.pedal_count,
+            per_tick_dispatch_count,
+            per_tick_descriptor_count,
+            per_tick_push_constant_byte_count,
+            tick_runner,
+            sampler,
+        })
+    }
+
+    pub fn run_bounded(
+        &self,
+        device: &VulkanComputeDevice,
+        initial_token_id: u32,
+        start_stream_tick: u64,
+        dynamic_state_capacity_activations: u32,
+        max_ticks: usize,
+    ) -> Result<VulkanResidentGreedyFeedbackLoopRun, VulkanResidentGreedyFeedbackLoopRunnerError>
+    {
+        if max_ticks == 0 {
+            return Err(VulkanResidentGreedyFeedbackLoopRunnerError::ZeroTickBudget);
+        }
+
+        let mut input_token_id = initial_token_id;
+        let mut tick_runs = Vec::with_capacity(max_ticks);
+        let mut sampled_token_ids = Vec::with_capacity(max_ticks);
+
+        for tick_index in 0..max_ticks {
+            let stream_tick =
+                start_stream_tick
+                    .checked_add(u64::try_from(tick_index).map_err(|_| {
+                        VulkanResidentGreedyFeedbackLoopRunnerError::StreamTickOverflow
+                    })?)
+                    .ok_or(VulkanResidentGreedyFeedbackLoopRunnerError::StreamTickOverflow)?;
+            let tick_run = self.tick_runner.run_token_id_with_stream_control(
+                device,
+                input_token_id,
+                VulkanMountedPlacedStreamControl {
+                    stream_tick,
+                    control_flags: 0,
+                    dynamic_state_capacity_activations,
+                },
+            )?;
+            let sampler_run = self.sampler.run(device)?;
+            let sampled_token_id = sampler_run.token_id;
+            sampled_token_ids.push(sampled_token_id);
+            tick_runs.push(VulkanResidentGreedyFeedbackTickRun {
+                stream_tick,
+                input_token_id,
+                sampled_token_id,
+                tick_run,
+                sampler_run,
+            });
+            input_token_id = sampled_token_id;
+        }
+
+        Ok(VulkanResidentGreedyFeedbackLoopRun {
+            device_id: self.device_id.clone(),
+            initial_token_id,
+            sampled_token_ids,
+            tick_runs,
+            per_tick_dispatch_count: self.per_tick_dispatch_count,
+            per_tick_descriptor_count: self.per_tick_descriptor_count,
+            per_tick_push_constant_byte_count: self.per_tick_push_constant_byte_count,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanResidentGreedyFeedbackLoopRun {
+    pub device_id: String,
+    pub initial_token_id: u32,
+    pub sampled_token_ids: Vec<u32>,
+    pub tick_runs: Vec<VulkanResidentGreedyFeedbackTickRun>,
+    pub per_tick_dispatch_count: usize,
+    pub per_tick_descriptor_count: usize,
+    pub per_tick_push_constant_byte_count: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanResidentGreedyFeedbackTickRun {
+    pub stream_tick: u64,
+    pub input_token_id: u32,
+    pub sampled_token_id: u32,
+    pub tick_run: VulkanResidentSingleTokenTickRun,
+    pub sampler_run: VulkanResidentGreedySamplerRun,
+}
+
+#[derive(Debug)]
+pub enum VulkanResidentGreedyFeedbackLoopRunnerError {
+    ZeroTickBudget,
+    StreamTickOverflow,
+    DispatchCountOverflow,
+    DescriptorCountOverflow,
+    PushConstantByteCountOverflow,
+    Tick(VulkanResidentSingleTokenTickRunnerError),
+    Sampler(VulkanResidentGreedySamplerRunnerError),
+}
+
+impl Display for VulkanResidentGreedyFeedbackLoopRunnerError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ZeroTickBudget => {
+                f.write_str("greedy feedback loop tick budget must not be zero")
+            }
+            Self::StreamTickOverflow => f.write_str("greedy feedback loop stream tick overflowed"),
+            Self::DispatchCountOverflow => {
+                f.write_str("greedy feedback loop dispatch count overflowed")
+            }
+            Self::DescriptorCountOverflow => {
+                f.write_str("greedy feedback loop descriptor count overflowed")
+            }
+            Self::PushConstantByteCountOverflow => {
+                f.write_str("greedy feedback loop push constant byte count overflowed")
+            }
+            Self::Tick(error) => Display::fmt(error, f),
+            Self::Sampler(error) => Display::fmt(error, f),
+        }
+    }
+}
+
+impl Error for VulkanResidentGreedyFeedbackLoopRunnerError {}
+
+impl From<VulkanResidentSingleTokenTickRunnerError>
+    for VulkanResidentGreedyFeedbackLoopRunnerError
+{
+    fn from(error: VulkanResidentSingleTokenTickRunnerError) -> Self {
+        Self::Tick(error)
+    }
+}
+
+impl From<VulkanResidentGreedySamplerRunnerError> for VulkanResidentGreedyFeedbackLoopRunnerError {
+    fn from(error: VulkanResidentGreedySamplerRunnerError) -> Self {
+        Self::Sampler(error)
     }
 }
 
@@ -8641,6 +8946,62 @@ mod tests {
     }
 
     #[test]
+    fn resident_greedy_sampler_selects_largest_logit() {
+        let device = match VulkanComputeDevice::new() {
+            Ok(device) => device,
+            Err(error) => {
+                eprintln!("skipping resident greedy sampler: {error}");
+                return;
+            }
+        };
+        let Some(sampler_spirv_words) =
+            crate::vulkan_compute::compile_test_shader_words_from_source(
+                "greedy_sampler_f32_65536.comp",
+            )
+        else {
+            eprintln!("skipping resident greedy sampler: no GLSL to SPIR-V compiler found");
+            return;
+        };
+
+        let logits_buffer = device.create_resident_buffer(LFM2_LOGITS_BYTES).unwrap();
+        let mut logits = vec![0u8; LFM2_LOGITS_BYTES];
+        let token_7 = 7usize;
+        let token_1024 = 1_024usize;
+        logits[(token_7 * 4)..((token_7 + 1) * 4)].copy_from_slice(&3.5f32.to_le_bytes());
+        logits[(token_1024 * 4)..((token_1024 + 1) * 4)].copy_from_slice(&9.25f32.to_le_bytes());
+        logits_buffer.write_bytes(&logits).unwrap();
+
+        let runner = VulkanResidentGreedySamplerRunner::from_logits_buffer(
+            &device,
+            &logits_buffer,
+            LFM2_LOGITS_BYTES,
+            &sampler_spirv_words,
+        )
+        .unwrap();
+        assert_eq!(runner.sampler_id, LFM2_GREEDY_SAMPLER_PEDAL_ID);
+        assert_eq!(runner.logits_byte_capacity, LFM2_LOGITS_BYTES);
+        assert_eq!(runner.output_byte_capacity, LFM2_SAMPLER_OUTPUT_BYTES);
+        assert_eq!(runner.descriptor_count, 2);
+        assert_eq!(runner.workgroup_count_x, 1);
+        assert_eq!(runner.push_constant_byte_count, 0);
+
+        let run = runner.run(&device).unwrap();
+        assert_eq!(run.sampler_id, LFM2_GREEDY_SAMPLER_PEDAL_ID);
+        assert_eq!(run.token_id, token_1024 as u32);
+        assert_eq!(run.selected_logit_bits, 9.25f32.to_bits());
+        assert_eq!(run.control_flags, 0);
+        assert_eq!(run.descriptor_count, 2);
+        assert_eq!(run.workgroup_count_x, 1);
+        assert_eq!(run.push_constant_byte_count, 0);
+        assert_eq!(
+            runner.read_output_bytes().unwrap(),
+            vec![
+                0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x14, 0x41, 0, 0, 0, 0, 0, 0, 0, 0
+            ]
+        );
+    }
+
+    #[test]
     fn resident_single_token_tick_runs_input_board_and_output_to_logits() {
         let device = match VulkanComputeDevice::new() {
             Ok(device) => device,
@@ -8766,6 +9127,142 @@ mod tests {
                 0xa3, 0xc8, 0x12, 0xc0, 0xf7, 0xc1, 0x9d, 0x41, 0x84, 0x92, 0x6a, 0x41, 0x16, 0x9c,
                 0x17, 0xc0,
             ]
+        );
+    }
+
+    #[test]
+    fn resident_greedy_feedback_loop_runs_two_ticks() {
+        let device = match VulkanComputeDevice::new() {
+            Ok(device) => device,
+            Err(error) => {
+                eprintln!("skipping resident greedy feedback loop: {error}");
+                return;
+            }
+        };
+        let (tensor_index, mounted, _manifest, mounted_bound) =
+            mount_lfm2_single_device_stream_circuit(&device);
+        let Some(loaded_manifest) = lfm2_level_1_loaded_kernel_pack_for_conv_and_attention_families(
+            &mounted,
+            &mounted_bound,
+        ) else {
+            eprintln!("skipping resident greedy feedback loop: no GLSL to SPIR-V compiler found");
+            return;
+        };
+        let Some(input_transducer_spirv_words) =
+            crate::vulkan_compute::compile_test_shader_words_from_source(
+                "embedding_lookup_bf16_65536x1024.comp",
+            )
+        else {
+            eprintln!("skipping resident greedy feedback loop: no GLSL to SPIR-V compiler found");
+            return;
+        };
+        let Some(embedding_norm_spirv_words) =
+            crate::vulkan_compute::compile_test_shader_words_from_source(
+                "rms_norm_bf16_serial.comp",
+            )
+        else {
+            eprintln!("skipping resident greedy feedback loop: no GLSL to SPIR-V compiler found");
+            return;
+        };
+        let Some(tied_projection_spirv_words) =
+            crate::vulkan_compute::compile_test_shader_words_from_source(
+                "tied_output_projection_bf16_65536x1024_to_f32.comp",
+            )
+        else {
+            eprintln!("skipping resident greedy feedback loop: no GLSL to SPIR-V compiler found");
+            return;
+        };
+        let Some(sampler_spirv_words) =
+            crate::vulkan_compute::compile_test_shader_words_from_source(
+                "greedy_sampler_f32_65536.comp",
+            )
+        else {
+            eprintln!("skipping resident greedy feedback loop: no GLSL to SPIR-V compiler found");
+            return;
+        };
+
+        let transducer_parameter_buffers =
+            load_lfm2_transducer_parameter_buffers(&device, &tensor_index);
+        let pedal_ids = prepare_lfm2_resident_prefix(&mounted, &tensor_index, 13);
+        let input_transducer =
+            VulkanResidentInputEmbeddingTransducerRunner::from_mounted_lfm2_token_embedding(
+                &device,
+                &mounted,
+                &transducer_parameter_buffers,
+                &input_transducer_spirv_words,
+            )
+            .unwrap();
+        let pedalboard = create_lfm2_resident_prefix_runner(
+            &device,
+            &mounted,
+            &mounted_bound,
+            &loaded_manifest,
+            &pedal_ids,
+        );
+        let output_transducer =
+            VulkanResidentOutputTransducerRunner::from_mounted_lfm2_output_transducer(
+                &device,
+                &mounted,
+                &transducer_parameter_buffers,
+                &embedding_norm_spirv_words,
+                &tied_projection_spirv_words,
+            )
+            .unwrap();
+        let sampler = VulkanResidentGreedySamplerRunner::from_output_transducer(
+            &device,
+            &output_transducer,
+            &sampler_spirv_words,
+        )
+        .unwrap();
+        let tick_runner = VulkanResidentSingleTokenTickRunner::new(
+            input_transducer,
+            pedalboard,
+            output_transducer,
+        )
+        .unwrap();
+        let loop_runner =
+            VulkanResidentGreedyFeedbackLoopRunner::new(tick_runner, sampler).unwrap();
+        assert_eq!(loop_runner.device_id, "gpu0");
+        assert_eq!(loop_runner.pedal_count, 14);
+        assert_eq!(loop_runner.per_tick_dispatch_count, 246);
+        assert_eq!(loop_runner.per_tick_descriptor_count, 804);
+        assert_eq!(loop_runner.per_tick_push_constant_byte_count, 3_876);
+
+        let run = loop_runner
+            .run_bounded(
+                &device,
+                1,
+                0,
+                mounted.buffers.dynamic_state_capacity_activations as u32,
+                2,
+            )
+            .unwrap();
+        assert_eq!(run.device_id, "gpu0");
+        assert_eq!(run.initial_token_id, 1);
+        assert_eq!(run.tick_runs.len(), 2);
+        assert_eq!(run.per_tick_dispatch_count, 246);
+        assert_eq!(run.per_tick_descriptor_count, 804);
+        assert_eq!(run.per_tick_push_constant_byte_count, 3_876);
+        assert_eq!(run.tick_runs[0].stream_tick, 0);
+        assert_eq!(run.tick_runs[0].input_token_id, 1);
+        assert_eq!(run.tick_runs[1].stream_tick, 1);
+        assert_eq!(
+            run.tick_runs[1].input_token_id,
+            run.tick_runs[0].sampled_token_id
+        );
+        assert_eq!(run.tick_runs[0].tick_run.dispatch_count, 245);
+        assert_eq!(run.tick_runs[0].sampler_run.descriptor_count, 2);
+        assert_eq!(run.tick_runs[1].tick_run.dispatch_count, 245);
+        assert_eq!(run.tick_runs[1].sampler_run.descriptor_count, 2);
+        assert_eq!(run.sampled_token_ids, vec![1, 1]);
+        assert_eq!(run.tick_runs[0].sampler_run.token_id, 1);
+        assert_eq!(run.tick_runs[1].sampler_run.token_id, 1);
+        assert_eq!(
+            run.tick_runs
+                .iter()
+                .map(|tick| tick.sampler_run.selected_logit_bits)
+                .collect::<Vec<_>>(),
+            vec![1_100_857_847, 1_101_580_110]
         );
     }
 
