@@ -2,7 +2,8 @@ use std::error::Error;
 use std::io;
 
 use llmoop_runtime::{
-    VulkanComputeDevice, VulkanResidentTokenInputEvent, VulkanResidentTokenStreamRun,
+    VulkanComputeDevice, VulkanResidentTokenInputEvent, VulkanResidentTokenRuntime,
+    VulkanResidentTokenRuntimeCycleRun, VulkanResidentTokenRuntimeCycleStopCondition,
     create_default_lfm2_5_230m_resident_greedy_stream_processor,
 };
 
@@ -13,6 +14,7 @@ struct Args {
     max_new_tokens: usize,
     then_prompt: Vec<u32>,
     then_max_new_tokens: usize,
+    cycle_ticks: usize,
 }
 
 impl Default for Args {
@@ -23,6 +25,7 @@ impl Default for Args {
             max_new_tokens: 3,
             then_prompt: vec![36_309],
             then_max_new_tokens: 1,
+            cycle_ticks: 2,
         }
     }
 }
@@ -62,25 +65,43 @@ fn run() -> Result<(), Box<dyn Error>> {
         processor.dynamic_state_capacity_activations
     );
 
-    let mut stream = processor.into_token_stream("demo_stream");
-    let first = stream.submit_external_event(
-        &device,
+    let mut runtime = VulkanResidentTokenRuntime::from_processor("demo_stream", processor);
+    runtime.enqueue_input_event(
         VulkanResidentTokenInputEvent::new("first", args.prompt, args.max_new_tokens)
             .with_origin("cli"),
     )?;
-    print_run("first", &first);
-
-    let second = stream.submit_external_event(
-        &device,
+    runtime.enqueue_input_event(
         VulkanResidentTokenInputEvent::new("second", args.then_prompt, args.then_max_new_tokens)
             .with_origin("cli"),
     )?;
-    print_run("second", &second);
 
-    let snapshot = stream.snapshot();
-    println!("stream.next_stream_tick={}", snapshot.next_stream_tick);
-    println!("stream.public_outputs={}", snapshot.total_public_outputs);
-    println!("stream.idle={}", snapshot.idle);
+    println!("cycle_ticks={}", args.cycle_ticks);
+
+    let mut generated = Vec::new();
+    let mut cycle_index = 0usize;
+    while runtime.snapshot().running {
+        let cycle = runtime.run_cycle(&device, args.cycle_ticks)?;
+        generated.extend(cycle.output_events.iter().map(|event| event.token_id));
+        print_cycle(cycle_index, &cycle);
+        cycle_index += 1;
+    }
+
+    let snapshot = runtime.snapshot();
+    println!("runtime.generated={generated:?}");
+    println!("runtime.cycles={cycle_index}");
+    println!(
+        "runtime.next_stream_tick={}",
+        snapshot.stream.next_stream_tick
+    );
+    println!(
+        "runtime.public_outputs={}",
+        snapshot.stream.total_public_outputs
+    );
+    println!(
+        "runtime.pending_inputs={}",
+        snapshot.pending_input_event_count
+    );
+    println!("runtime.idle={}", snapshot.idle);
 
     Ok(())
 }
@@ -106,6 +127,9 @@ fn parse_args() -> Result<Args, String> {
             "--then-max-new-tokens" => {
                 parsed.then_max_new_tokens = parse_next(&mut raw, "--then-max-new-tokens")?;
             }
+            "--cycle-ticks" => {
+                parsed.cycle_ticks = parse_next(&mut raw, "--cycle-ticks")?;
+            }
             _ => {
                 return Err(format!("unknown argument {arg:?}\n\n{}", usage()));
             }
@@ -117,6 +141,9 @@ fn parse_args() -> Result<Args, String> {
     }
     if parsed.then_prompt.is_empty() {
         return Err("--then-prompt must contain at least one token id".to_string());
+    }
+    if parsed.cycle_ticks == 0 {
+        return Err("--cycle-ticks must be at least 1".to_string());
     }
 
     Ok(parsed)
@@ -151,19 +178,45 @@ fn parse_token_list(value: &str) -> Result<Vec<u32>, String> {
         .collect()
 }
 
-fn print_run(label: &str, run: &VulkanResidentTokenStreamRun) {
+fn print_cycle(index: usize, cycle: &VulkanResidentTokenRuntimeCycleRun) {
     println!(
-        "{label}.input_event={} {label}.tokens={:?} {label}.generated={:?}",
-        run.input_event.id, run.input_event.token_ids, run.generated_token_ids
+        "cycle_{index}.start_stream_tick={} cycle_{index}.next_stream_tick={} cycle_{index}.ticks_used={} cycle_{index}.stop={}",
+        cycle.start_stream_tick,
+        cycle.next_stream_tick,
+        cycle.ticks_used,
+        cycle_stop_label(cycle.stop_condition)
     );
     println!(
-        "{label}.start_stream_tick={} {label}.next_stream_tick={} {label}.stop_reason={}",
-        run.start_stream_tick, run.next_stream_tick, run.stop_reason
+        "cycle_{index}.queued_inputs={:?} cycle_{index}.pending_inputs={} cycle_{index}.stream_idle={}",
+        cycle
+            .queued_input_events
+            .iter()
+            .map(|event| event.input_event.id.as_str())
+            .collect::<Vec<_>>(),
+        cycle.pending_input_event_count,
+        cycle.stream_idle
     );
     println!(
-        "{label}.processed_ticks={} {label}.idle_ticks={}",
-        run.processed_tick_count, run.idle_tick_count
+        "cycle_{index}.outputs={:?} cycle_{index}.processed_ticks={} cycle_{index}.idle_ticks={}",
+        cycle
+            .output_events
+            .iter()
+            .map(|event| (
+                event.input_event_id.as_str(),
+                event.output_index,
+                event.token_id
+            ))
+            .collect::<Vec<_>>(),
+        cycle.processed_tick_count,
+        cycle.idle_tick_count
     );
+}
+
+fn cycle_stop_label(stop: VulkanResidentTokenRuntimeCycleStopCondition) -> &'static str {
+    match stop {
+        VulkanResidentTokenRuntimeCycleStopCondition::Idle => "idle",
+        VulkanResidentTokenRuntimeCycleStopCondition::TickBudget => "tick_budget",
+    }
 }
 
 fn print_usage() {
@@ -179,8 +232,9 @@ Options:
   --max-new-tokens <N>        Public outputs to emit after the first prompt. Default: 3
   --then-prompt <TOKENS>      Comma-separated later external token event. Default: 36309
   --then-max-new-tokens <N>   Public outputs to emit after later input. Default: 1
+  --cycle-ticks <N>           Max runtime ticks per always-on cycle. Default: 2
   -h, --help                  Show this help
 
 Example:
-  cargo run --manifest-path runtime-rs/Cargo.toml --features vulkan --bin resident-token-demo -- --capacity 8 --prompt 1 --max-new-tokens 3 --then-prompt 36309 --then-max-new-tokens 1"
+  cargo run --manifest-path runtime-rs/Cargo.toml --features vulkan --bin resident-token-demo -- --capacity 8 --prompt 1 --max-new-tokens 3 --then-prompt 36309 --then-max-new-tokens 1 --cycle-ticks 2"
 }
