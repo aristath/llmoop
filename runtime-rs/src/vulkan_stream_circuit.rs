@@ -5993,6 +5993,183 @@ pub struct VulkanResidentGreedyModelPackage {
     sampler_spec: VulkanResidentGreedySamplerSpec,
 }
 
+pub struct VulkanResidentGreedyModelPackageDeviceSlice {
+    pub package_id: String,
+    pub device_id: String,
+    pub dynamic_state_capacity_activations: usize,
+    pub hosted_pedal_count: usize,
+    pub incoming_cable_count: usize,
+    pub outgoing_cable_count: usize,
+    pub permanent_parameter_count: usize,
+    pub permanent_parameter_bytes: usize,
+    pub reusable_kernel_word_count: usize,
+    placed_plan: VulkanPlacedStreamCircuitPlan,
+    loaded_manifest: VulkanLoadedReusableKernelArtifactManifest,
+    parameter_buffers: Arc<VulkanPermanentParameterBuffers>,
+}
+
+impl VulkanResidentGreedyModelPackageDeviceSlice {
+    pub fn from_manifest_file_for_device(
+        device: &VulkanComputeDevice,
+        manifest_path: impl AsRef<Path>,
+        device_id: impl AsRef<str>,
+        dynamic_state_capacity_activations: Option<usize>,
+    ) -> Result<Self, VulkanResidentTokenModelPackageError> {
+        let manifest_path = manifest_path.as_ref();
+        let manifest = VulkanResidentGreedyModelPackageManifest::from_json_file(manifest_path)
+            .map_err(|error| {
+                VulkanResidentTokenModelPackageError::new(format!(
+                    "failed to load resident model package manifest {:?}: {error}",
+                    manifest_path
+                ))
+            })?;
+        let manifest_dir = manifest_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        Self::from_manifest_for_device(
+            device,
+            &manifest_dir,
+            manifest,
+            device_id,
+            dynamic_state_capacity_activations,
+        )
+    }
+
+    pub fn from_manifest_for_device(
+        device: &VulkanComputeDevice,
+        manifest_dir: impl AsRef<Path>,
+        manifest: VulkanResidentGreedyModelPackageManifest,
+        device_id: impl AsRef<str>,
+        dynamic_state_capacity_activations: Option<usize>,
+    ) -> Result<Self, VulkanResidentTokenModelPackageError> {
+        let manifest_dir = manifest_dir.as_ref();
+        let device_id = device_id.as_ref();
+        let capacity = dynamic_state_capacity_activations
+            .unwrap_or(manifest.dynamic_state_capacity_activations);
+        if capacity == 0 {
+            return Err(VulkanResidentTokenModelPackageError::new(
+                "resident dynamic state capacity must be at least 1 activation",
+            ));
+        }
+        validate_capacity_profiles(&manifest, capacity)?;
+
+        let tensor_index_path =
+            resolve_resident_model_package_path(manifest_dir, &manifest.tensor_index_path);
+        let (tensor_index, _resource_plan, _placement_plan, placed_plan) =
+            plan_resident_greedy_package_placed_stream_circuit(
+                device_id,
+                &manifest.placement,
+                &manifest.circuit_graph,
+                manifest_dir,
+                &tensor_index_path,
+                manifest.activation_element_bytes,
+            )?;
+        let hosted_pedal_count = placed_plan.binding_plan.circuits.len();
+        if hosted_pedal_count == 0 {
+            return Err(VulkanResidentTokenModelPackageError::new(format!(
+                "resident model package {:?} has no pedals assigned to device {device_id:?}",
+                manifest.package_id
+            )));
+        }
+
+        let parameter_buffer_plan = VulkanPermanentParameterBufferPlan::from_placed_resident_plan(
+            &placed_plan.placed_resident_plan,
+        )
+        .map_err(|error| {
+            VulkanResidentTokenModelPackageError::new(format!(
+                "failed to create resident parameter buffer plan for device {device_id:?}: {error}"
+            ))
+        })?;
+        let parameter_buffers = Arc::new(parameter_buffer_plan.allocate_buffers(device).map_err(
+            |error| {
+                VulkanResidentTokenModelPackageError::new(format!(
+                    "failed to allocate resident parameter buffers for device {device_id:?}: {error}"
+                ))
+            },
+        )?);
+        parameter_buffers
+            .load_from_tensor_index(&tensor_index)
+            .map_err(|error| {
+                VulkanResidentTokenModelPackageError::new(format!(
+                    "failed to load resident model parameters for device {device_id:?}: {error}"
+                ))
+            })?;
+
+        let probe_mounted =
+            VulkanMountedPlacedStreamCircuit::from_placed_plan_with_parameter_buffers(
+                device,
+                placed_plan.clone(),
+                capacity,
+                parameter_buffers.clone(),
+            )
+            .map_err(|error| {
+                VulkanResidentTokenModelPackageError::new(format!(
+                    "failed to mount Vulkan stream circuit for device {device_id:?}: {error}"
+                ))
+            })?;
+        let reusable_manifest =
+            resident_greedy_package_reusable_kernel_manifest(&probe_mounted.placed_plan);
+        let mounted_bound = probe_mounted
+            .mounted_placed_bound_dispatch_plan(&reusable_manifest)
+            .map_err(|error| {
+                VulkanResidentTokenModelPackageError::new(format!(
+                    "failed to bind Vulkan stream circuit dispatch plan for device {device_id:?}: {error}"
+                ))
+            })?;
+        validate_pedal_executions_cover_mounted_dispatches(&manifest, &mounted_bound)?;
+        let pedal_kernel_shaders =
+            resident_greedy_package_pedal_kernel_shader_refs_for_capacity_and_mounted_dispatches(
+                &manifest,
+                capacity,
+                &mounted_bound,
+            );
+        let loaded_manifest = loaded_kernel_pack_from_package_shader_refs(
+            manifest_dir,
+            &probe_mounted,
+            &mounted_bound,
+            &pedal_kernel_shaders,
+        )?;
+
+        Ok(Self {
+            package_id: manifest.package_id,
+            device_id: device_id.to_string(),
+            dynamic_state_capacity_activations: capacity,
+            hosted_pedal_count,
+            incoming_cable_count: probe_mounted.cable_io.incoming_buffers.len(),
+            outgoing_cable_count: probe_mounted.cable_io.outgoing_buffers.len(),
+            permanent_parameter_count: parameter_buffers.plan.parameter_count,
+            permanent_parameter_bytes: parameter_buffers.total_byte_capacity,
+            reusable_kernel_word_count: loaded_manifest.total_word_count,
+            placed_plan,
+            loaded_manifest,
+            parameter_buffers,
+        })
+    }
+
+    pub fn create_mounted_stream_circuit(
+        &self,
+        device: &VulkanComputeDevice,
+    ) -> Result<VulkanMountedPlacedStreamCircuit, VulkanResidentTokenModelPackageError> {
+        VulkanMountedPlacedStreamCircuit::from_placed_plan_with_parameter_buffers(
+            device,
+            self.placed_plan.clone(),
+            self.dynamic_state_capacity_activations,
+            self.parameter_buffers.clone(),
+        )
+        .map_err(|error| {
+            VulkanResidentTokenModelPackageError::new(format!(
+                "failed to mount Vulkan stream circuit for device {:?}: {error}",
+                self.device_id
+            ))
+        })
+    }
+
+    pub fn loaded_manifest(&self) -> &VulkanLoadedReusableKernelArtifactManifest {
+        &self.loaded_manifest
+    }
+}
+
 impl VulkanResidentGreedyModelPackage {
     pub fn from_manifest_file(
         device: &VulkanComputeDevice,
@@ -6453,6 +6630,98 @@ fn validate_pedal_executions_against_mounted_dispatches(
     Ok(())
 }
 
+fn validate_pedal_executions_cover_mounted_dispatches(
+    manifest: &VulkanResidentGreedyModelPackageManifest,
+    mounted_bound: &VulkanMountedPlacedBoundDispatchPlan,
+) -> Result<(), VulkanResidentTokenModelPackageError> {
+    let declared_pedals = manifest
+        .pedal_executions
+        .iter()
+        .map(|pedal| pedal.pedal_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let mounted_pedals = mounted_bound
+        .dispatches
+        .iter()
+        .map(|dispatch| dispatch.pedal_id.as_str())
+        .collect::<BTreeSet<_>>();
+
+    let missing_pedals = mounted_pedals
+        .difference(&declared_pedals)
+        .copied()
+        .collect::<Vec<_>>();
+    if !missing_pedals.is_empty() {
+        return Err(VulkanResidentTokenModelPackageError::new(format!(
+            "resident model package {:?} is missing pedal executions for mounted pedals: {}",
+            manifest.package_id,
+            missing_pedals.join(", ")
+        )));
+    }
+
+    for pedal in manifest
+        .pedal_executions
+        .iter()
+        .filter(|pedal| mounted_pedals.contains(pedal.pedal_id.as_str()))
+    {
+        let mounted_dispatches = mounted_bound
+            .dispatches
+            .iter()
+            .filter(|dispatch| dispatch.pedal_id == pedal.pedal_id)
+            .collect::<Vec<_>>();
+        if pedal.kernels.len() != mounted_dispatches.len() {
+            return Err(VulkanResidentTokenModelPackageError::new(format!(
+                "resident model package {:?} declares {} kernels for mounted pedal {}, but mounted dispatch plan has {}",
+                manifest.package_id,
+                pedal.kernels.len(),
+                pedal.pedal_id,
+                mounted_dispatches.len()
+            )));
+        }
+
+        for (expected_index, (kernel, dispatch)) in
+            pedal.kernels.iter().zip(mounted_dispatches).enumerate()
+        {
+            if kernel.execution_index != expected_index {
+                return Err(VulkanResidentTokenModelPackageError::new(format!(
+                    "resident model package {:?} declares pedal {} kernel {} with execution_index {}, expected {}",
+                    manifest.package_id,
+                    pedal.pedal_id,
+                    kernel.node_id,
+                    kernel.execution_index,
+                    expected_index
+                )));
+            }
+            if kernel.node_id != dispatch.node_id {
+                return Err(VulkanResidentTokenModelPackageError::new(format!(
+                    "resident model package {:?} declares mounted pedal {} execution_index {} as node {}, but mounted dispatch plan has node {}",
+                    manifest.package_id,
+                    pedal.pedal_id,
+                    expected_index,
+                    kernel.node_id,
+                    dispatch.node_id
+                )));
+            }
+            if kernel.op != dispatch.op {
+                return Err(VulkanResidentTokenModelPackageError::new(format!(
+                    "resident model package {:?} declares mounted pedal {} node {} op {}, but mounted dispatch plan has op {}",
+                    manifest.package_id, pedal.pedal_id, kernel.node_id, kernel.op, dispatch.op
+                )));
+            }
+            if kernel.execution_index != dispatch.node_index {
+                return Err(VulkanResidentTokenModelPackageError::new(format!(
+                    "resident model package {:?} declares mounted pedal {} node {} execution_index {}, but mounted dispatch plan has node_index {}",
+                    manifest.package_id,
+                    pedal.pedal_id,
+                    kernel.node_id,
+                    kernel.execution_index,
+                    dispatch.node_index
+                )));
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn resolve_resident_model_package_path(manifest_dir: &Path, path: &str) -> PathBuf {
     let path = Path::new(path);
     if path.is_absolute() {
@@ -6473,6 +6742,35 @@ fn plan_resident_greedy_package_single_device_stream_circuit(
     (
         TensorIndex,
         StreamCircuitResourcePlan,
+        VulkanPlacedStreamCircuitPlan,
+    ),
+    VulkanResidentTokenModelPackageError,
+> {
+    let (tensor_index, resource_plan, placement_plan, placed_plan) =
+        plan_resident_greedy_package_placed_stream_circuit(
+            device_id,
+            placement_spec,
+            circuit_graph,
+            manifest_dir,
+            tensor_index_path,
+            activation_element_bytes,
+        )?;
+    validate_single_device_resident_package_placement(device_id, &placement_plan)?;
+    Ok((tensor_index, resource_plan, placed_plan))
+}
+
+fn plan_resident_greedy_package_placed_stream_circuit(
+    device_id: &str,
+    placement_spec: &StreamCircuitPlacementSpec,
+    circuit_graph: &VulkanResidentPackageCircuitGraph,
+    manifest_dir: &Path,
+    tensor_index_path: &Path,
+    activation_element_bytes: Option<usize>,
+) -> Result<
+    (
+        TensorIndex,
+        StreamCircuitResourcePlan,
+        StreamCircuitPlacementPlan,
         VulkanPlacedStreamCircuitPlan,
     ),
     VulkanResidentTokenModelPackageError,
@@ -6503,7 +6801,6 @@ fn plan_resident_greedy_package_single_device_stream_circuit(
             "failed to create placement plan for {device_id:?}: {error}"
         ))
     })?;
-    validate_single_device_resident_package_placement(device_id, &placement_plan)?;
     let resident = VulkanPlacedStreamCircuitResidentPlan::from_resource_plan_for_device(
         &resource_plan,
         &placement_plan,
@@ -6523,7 +6820,7 @@ fn plan_resident_greedy_package_single_device_stream_circuit(
                     "failed to create Vulkan placed stream circuit plan: {error}"
                 ))
             })?;
-    Ok((tensor_index, resource_plan, placed_plan))
+    Ok((tensor_index, resource_plan, placement_plan, placed_plan))
 }
 
 fn validate_single_device_resident_package_placement(
@@ -6636,6 +6933,21 @@ fn resident_greedy_package_pedal_kernel_shader_refs_for_capacity(
                     shader_path,
                 }
             })
+        })
+        .collect()
+}
+
+fn resident_greedy_package_pedal_kernel_shader_refs_for_capacity_and_mounted_dispatches(
+    manifest: &VulkanResidentGreedyModelPackageManifest,
+    capacity: usize,
+    mounted_bound: &VulkanMountedPlacedBoundDispatchPlan,
+) -> Vec<VulkanResidentPedalKernelShaderRef> {
+    resident_greedy_package_pedal_kernel_shader_refs_for_capacity(manifest, capacity)
+        .into_iter()
+        .filter(|shader| {
+            mounted_bound
+                .dispatch(&shader.pedal_id, &shader.node_id)
+                .is_some()
         })
         .collect()
 }
@@ -11643,6 +11955,81 @@ mod tests {
         assert!(error
             .to_string()
             .contains("single-device resident package for \"gpu0\" cannot host remote pedals: layer_00@gpu1"));
+    }
+
+    #[test]
+    fn package_device_slice_mounts_only_pedals_assigned_to_device() {
+        let device = match VulkanComputeDevice::new() {
+            Ok(device) => device,
+            Err(error) => {
+                eprintln!("skipping package device slice mount: {error}");
+                return;
+            }
+        };
+        let mut manifest = fixture_model_package_manifest();
+        manifest.placement = StreamCircuitPlacementSpec::new("gpu0")
+            .with_pedal_device("layer_01", "cpu0")
+            .with_pedal_device("layer_02", "gpu1")
+            .with_pedal_device("layer_03", "lan:worker-a");
+        let manifest_path = fixture_model_package_manifest_path();
+        let manifest_dir = manifest_path.parent().unwrap();
+
+        let slice = VulkanResidentGreedyModelPackageDeviceSlice::from_manifest_for_device(
+            &device,
+            manifest_dir,
+            manifest,
+            "gpu1",
+            Some(4),
+        )
+        .unwrap();
+
+        assert_eq!(slice.device_id, "gpu1");
+        assert_eq!(slice.hosted_pedal_count, 1);
+        assert_eq!(slice.incoming_cable_count, 1);
+        assert_eq!(slice.outgoing_cable_count, 1);
+        assert_eq!(slice.permanent_parameter_count, 11);
+        assert!(slice.permanent_parameter_bytes > 0);
+        assert!(slice.reusable_kernel_word_count > 0);
+        assert!(!slice.loaded_manifest().artifacts.is_empty());
+
+        let mounted = slice.create_mounted_stream_circuit(&device).unwrap();
+        let reusable_manifest =
+            resident_greedy_package_reusable_kernel_manifest(&mounted.placed_plan);
+        let mounted_bound = mounted
+            .mounted_placed_bound_dispatch_plan(&reusable_manifest)
+            .unwrap();
+
+        assert_eq!(mounted.device_id(), "gpu1");
+        assert_eq!(mounted.placed_plan.binding_plan.circuits.len(), 1);
+        assert_eq!(mounted_bound.dispatches.len(), 19);
+        assert!(
+            mounted_bound
+                .dispatch("layer_02", "kv_memory_append")
+                .is_some()
+        );
+        assert!(
+            mounted_bound
+                .dispatch("layer_00", "operator_norm")
+                .is_none()
+        );
+        assert_eq!(mounted_bound.model_boundary_descriptor_count, 0);
+        assert_eq!(mounted_bound.incoming_cable_descriptor_count, 2);
+        assert_eq!(mounted_bound.outgoing_cable_descriptor_count, 1);
+
+        let tick_plan = mounted.stream_tick_plan(&reusable_manifest).unwrap();
+        assert_eq!(tick_plan.device_id, "gpu1");
+        assert_eq!(tick_plan.stage_count, 21);
+        assert_eq!(tick_plan.receive_stage_count, 1);
+        assert_eq!(tick_plan.dispatch_stage_count, 19);
+        assert_eq!(tick_plan.publish_stage_count, 1);
+        let tick_run = mounted.advance_stream_tick(&reusable_manifest, 7).unwrap();
+        assert_eq!(
+            tick_run.status,
+            VulkanMountedPlacedStreamTickRunStatus::Blocked {
+                stage_index: 0,
+                reason: VulkanMountedPlacedStreamTickBlockReason::CableReceiveTransportUnavailable,
+            }
+        );
     }
 
     fn fixture_model_embedding_row_bytes(tensor_index: &TensorIndex, token_id: u32) -> Vec<u8> {
