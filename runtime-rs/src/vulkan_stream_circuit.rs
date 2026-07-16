@@ -5335,6 +5335,42 @@ impl VulkanResidentTokenEngine {
         )
     }
 
+    pub fn submit_text_until_idle<C>(
+        &mut self,
+        stream_id: &str,
+        input_event_id: impl Into<String>,
+        input_text: impl Into<String>,
+        max_public_tokens: usize,
+        origin: impl Into<String>,
+        budget: VulkanResidentTokenEngineRunBudget,
+        codec: &C,
+    ) -> Result<VulkanResidentTokenEngineSubmittedTextRun, VulkanResidentTokenEngineError>
+    where
+        C: VulkanResidentTokenTextCodec,
+    {
+        let input_event_id = input_event_id.into();
+        let input_text = input_text.into();
+        let encoded_token_ids = codec.encode_text(&input_text)?;
+        let submitted_tokens = self.submit_tokens_until_idle(
+            stream_id,
+            input_event_id.clone(),
+            encoded_token_ids.clone(),
+            max_public_tokens,
+            origin,
+            budget,
+        )?;
+        let generated_text = codec.decode_tokens(&submitted_tokens.generated_token_ids)?;
+
+        Ok(VulkanResidentTokenEngineSubmittedTextRun {
+            stream_id: stream_id.to_string(),
+            input_event_id,
+            input_text,
+            encoded_token_ids,
+            generated_text,
+            submitted_tokens,
+        })
+    }
+
     pub fn snapshot(&self) -> VulkanResidentTokenEngineSnapshot {
         let mut stream_counts_by_model = BTreeMap::new();
         for stream in self.streams.values() {
@@ -5458,11 +5494,88 @@ pub struct VulkanResidentTokenEngineSubmittedInputRun {
     pub generated_token_ids: Vec<u32>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanResidentTokenEngineSubmittedTextRun {
+    pub stream_id: String,
+    pub input_event_id: String,
+    pub input_text: String,
+    pub encoded_token_ids: Vec<u32>,
+    pub generated_text: String,
+    pub submitted_tokens: VulkanResidentTokenEngineSubmittedInputRun,
+}
+
+pub trait VulkanResidentTokenTextCodec {
+    fn encode_text(&self, text: &str) -> Result<Vec<u32>, VulkanResidentTokenTextCodecError>;
+
+    fn decode_tokens(&self, token_ids: &[u32])
+    -> Result<String, VulkanResidentTokenTextCodecError>;
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VulkanResidentTokenIdTextCodec;
+
+impl VulkanResidentTokenTextCodec for VulkanResidentTokenIdTextCodec {
+    fn encode_text(&self, text: &str) -> Result<Vec<u32>, VulkanResidentTokenTextCodecError> {
+        let mut tokens = Vec::new();
+        for fragment in text
+            .split(|character: char| character == ',' || character.is_whitespace())
+            .filter(|fragment| !fragment.is_empty())
+        {
+            tokens.push(fragment.parse::<u32>().map_err(|error| {
+                VulkanResidentTokenTextCodecError::new(format!(
+                    "invalid numeric token fragment {fragment:?}: {error}"
+                ))
+            })?);
+        }
+
+        if tokens.is_empty() {
+            return Err(VulkanResidentTokenTextCodecError::new(
+                "numeric token text must contain at least one token id",
+            ));
+        }
+
+        Ok(tokens)
+    }
+
+    fn decode_tokens(
+        &self,
+        token_ids: &[u32],
+    ) -> Result<String, VulkanResidentTokenTextCodecError> {
+        Ok(token_ids
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(" "))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanResidentTokenTextCodecError {
+    message: String,
+}
+
+impl VulkanResidentTokenTextCodecError {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl Display for VulkanResidentTokenTextCodecError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl Error for VulkanResidentTokenTextCodecError {}
+
 #[derive(Debug)]
 pub enum VulkanResidentTokenEngineError {
     Device(VulkanError),
     Build(VulkanLfm2ResidentGreedyStreamProcessorBuildError),
     Scheduler(VulkanResidentTokenRuntimeSchedulerError),
+    TextCodec(VulkanResidentTokenTextCodecError),
     DuplicateModel(String),
     UnknownModel(String),
     RunCycleCountOverflow,
@@ -5475,6 +5588,7 @@ impl Display for VulkanResidentTokenEngineError {
             Self::Device(error) => Display::fmt(error, f),
             Self::Build(error) => Display::fmt(error, f),
             Self::Scheduler(error) => Display::fmt(error, f),
+            Self::TextCodec(error) => Display::fmt(error, f),
             Self::DuplicateModel(model_id) => {
                 write!(
                     f,
@@ -5511,6 +5625,12 @@ impl From<VulkanLfm2ResidentGreedyStreamProcessorBuildError> for VulkanResidentT
 impl From<VulkanResidentTokenRuntimeSchedulerError> for VulkanResidentTokenEngineError {
     fn from(error: VulkanResidentTokenRuntimeSchedulerError) -> Self {
         Self::Scheduler(error)
+    }
+}
+
+impl From<VulkanResidentTokenTextCodecError> for VulkanResidentTokenEngineError {
+    fn from(error: VulkanResidentTokenTextCodecError) -> Self {
+        Self::TextCodec(error)
     }
 }
 
@@ -12990,6 +13110,16 @@ mod tests {
     }
 
     #[test]
+    fn resident_token_id_text_codec_encodes_and_decodes_numeric_token_text() {
+        let codec = VulkanResidentTokenIdTextCodec;
+
+        assert_eq!(codec.encode_text("1, 2\n3\t4").unwrap(), vec![1, 2, 3, 4]);
+        assert_eq!(codec.decode_tokens(&[1, 2, 3, 4]).unwrap(), "1 2 3 4");
+        assert!(codec.encode_text("").is_err());
+        assert!(codec.encode_text("not-a-token").is_err());
+    }
+
+    #[test]
     fn resident_token_engine_owns_device_scheduler_and_registered_stream() {
         let device = match VulkanComputeDevice::new() {
             Ok(device) => device,
@@ -13022,16 +13152,23 @@ mod tests {
         assert!(initial.scheduler.idle);
         assert!(!initial.scheduler.running);
 
-        let submitted = engine
-            .submit_tokens_until_idle(
+        let submitted_text = engine
+            .submit_text_until_idle(
                 "engine_stream_0",
                 "event_0",
-                vec![1],
+                "1",
                 2,
                 "test_host",
                 VulkanResidentTokenEngineRunBudget::new(8, 1, 2),
+                &VulkanResidentTokenIdTextCodec,
             )
             .unwrap();
+        assert_eq!(submitted_text.stream_id, "engine_stream_0");
+        assert_eq!(submitted_text.input_event_id, "event_0");
+        assert_eq!(submitted_text.input_text, "1");
+        assert_eq!(submitted_text.encoded_token_ids, vec![1]);
+        assert_eq!(submitted_text.generated_text, "1 1");
+        let submitted = submitted_text.submitted_tokens;
         assert_eq!(submitted.stream_id, "engine_stream_0");
         assert_eq!(submitted.input_event_id, "event_0");
         assert_eq!(submitted.queued_input_event.pending_input_event_count, 1);
