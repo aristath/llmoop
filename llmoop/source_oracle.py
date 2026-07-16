@@ -59,12 +59,12 @@ class SourceModelContractReport:
         }
 
 
-def check_lfm2_source_layer_contract(
+def check_source_layer_contract(
     model_dir: Path,
     pedal_file: Path,
     layer_index: int,
 ) -> SourceLayerContractReport:
-    """Check one transpiled pedal against the real LFM2 source layer.
+    """Check one transpiled pedal against the real source layer.
 
     This is a contract/oscilloscope check, not a replacement implementation.
     It verifies that the source model can treat a layer as one black-box pedal
@@ -74,15 +74,15 @@ def check_lfm2_source_layer_contract(
     torch, auto_model, _ = _oracle_imports()
     model = auto_model.from_pretrained(model_dir, dtype=torch.float32)
     model.eval()
-    return _check_lfm2_source_layer_contract(model=model, model_dir=model_dir, pedal_file=pedal_file, layer_index=layer_index)
+    return _check_source_layer_contract(model=model, model_dir=model_dir, pedal_file=pedal_file, layer_index=layer_index)
 
 
-def check_lfm2_source_model_contract(model_dir: Path, pedals_dir: Path) -> SourceModelContractReport:
+def check_source_model_contract(model_dir: Path, pedals_dir: Path) -> SourceModelContractReport:
     torch, auto_model, _ = _oracle_imports()
     model = auto_model.from_pretrained(model_dir, dtype=torch.float32)
     model.eval()
     layer_reports = tuple(
-        _check_lfm2_source_layer_contract(
+        _check_source_layer_contract(
             model=model,
             model_dir=model_dir,
             pedal_file=pedals_dir / f"layer_{layer_index:02d}.json",
@@ -97,7 +97,7 @@ def check_lfm2_source_model_contract(model_dir: Path, pedals_dir: Path) -> Sourc
     )
 
 
-def _check_lfm2_source_layer_contract(
+def _check_source_layer_contract(
     model: Any,
     model_dir: Path,
     pedal_file: Path,

@@ -18,8 +18,8 @@ from llmoop.text_generation import generate_text, load_tokenizer
 def main() -> None:
     parser = argparse.ArgumentParser(description="Generate text with the circuit pedalboard runtime.")
     parser.add_argument("prompt", help="Prompt text to feed into the input transducer.")
-    parser.add_argument("--circuit-dir", type=Path, default=Path("lowered/lfm2_5_230m"))
-    parser.add_argument("--model-dir", type=Path, default=Path("/home/aristath/models/lfm2.5/230m"))
+    parser.add_argument("--circuit-dir", type=Path, required=True)
+    parser.add_argument("--model-dir", type=Path, required=True)
     parser.add_argument("--max-new-tokens", type=int, default=32)
     parser.add_argument("--temperature", type=float, default=None, help="Use stochastic temperature sampling instead of greedy.")
     parser.add_argument("--top-k", type=int, default=None, help="Restrict stochastic sampling to the top K logits.")

@@ -13,14 +13,10 @@ if str(ROOT) not in sys.path:
 from llmoop.circuit_lowering import lower_pedalboard
 
 
-DEFAULT_PEDALBOARD = Path("transpiled/lfm2_5_230m")
-DEFAULT_OUT_DIR = Path("lowered/lfm2_5_230m")
-
-
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Lower every LFM2 pedal into explicit stream-circuit IR artifacts.")
-    parser.add_argument("--pedalboard-dir", type=Path, default=DEFAULT_PEDALBOARD)
-    parser.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR)
+    parser = argparse.ArgumentParser(description="Lower every model pedal into explicit stream-circuit IR artifacts.")
+    parser.add_argument("--pedalboard-dir", type=Path, required=True)
+    parser.add_argument("--out-dir", type=Path, required=True)
     parser.add_argument("--summary", action="store_true")
     args = parser.parse_args()
 

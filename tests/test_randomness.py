@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import importlib.util
 import unittest
-from pathlib import Path
 
 from llmoop.circuit_model_runtime import CircuitModelRuntime
 from llmoop.randomness import RandomSignal, RandomSource
 from llmoop.samplers import TemperatureSamplerPedal
 from llmoop.source_oracle import _oracle_imports
 from llmoop.stream_processor import PrivateFeedbackSignal, StreamProcessor
+from tests.fixtures import compiled_model_or_skip
 
 
 RANDOMNESS_DEPS_AVAILABLE = all(
@@ -68,10 +68,11 @@ class TemperatureSamplerTest(unittest.TestCase):
 class StreamRandomnessTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
+        cls.fixture = compiled_model_or_skip()
         cls.torch, _, _ = _oracle_imports()
         cls.runtime = CircuitModelRuntime.from_dirs(
-            circuit_dir=Path("lowered/lfm2_5_230m"),
-            model_dir=Path("/home/aristath/models/lfm2.5/230m"),
+            circuit_dir=cls.fixture.lowered_dir,
+            model_dir=cls.fixture.source_model_dir,
             torch=cls.torch,
         )
 

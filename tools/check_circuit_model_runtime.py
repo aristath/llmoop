@@ -17,8 +17,8 @@ from llmoop.source_oracle import _oracle_imports
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Check the direct circuit model runtime against the source model oracle.")
-    parser.add_argument("--circuit-dir", type=Path, default=Path("lowered/lfm2_5_230m"))
-    parser.add_argument("--model-dir", type=Path, default=Path("/home/aristath/models/lfm2.5/230m"))
+    parser.add_argument("--circuit-dir", type=Path, required=True)
+    parser.add_argument("--model-dir", type=Path, required=True)
     parser.add_argument("--input-ids", type=str, default=None, help="comma-separated token ids for full-sequence mode")
     parser.add_argument("--stream-input-ids", type=str, default=None, help="comma-separated teacher-forced token ids")
     parser.add_argument("--summary", action="store_true")

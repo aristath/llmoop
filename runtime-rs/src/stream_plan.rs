@@ -1166,25 +1166,42 @@ mod tests {
     use super::*;
     use crate::stream_circuit::ResolvedLoweredPedalboard;
 
-    fn lfm2_index_path() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
+    fn compiled_artifact_dir(env_var: &str, root_name: &str, marker_file: &str) -> PathBuf {
+        if let Ok(path) = std::env::var(env_var) {
+            return PathBuf::from(path);
+        }
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("..")
-            .join("lowered")
-            .join("lfm2_5_230m")
-            .join("pedalboard.circuits.json")
+            .join(root_name);
+        let mut candidates = std::fs::read_dir(&root)
+            .unwrap_or_else(|_| panic!("set {env_var} or compile a model into {}", root.display()))
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.is_dir() && path.join(marker_file).exists())
+            .collect::<Vec<_>>();
+        candidates.sort();
+        candidates
+            .pop()
+            .unwrap_or_else(|| panic!("set {env_var} or compile a model into {}", root.display()))
     }
 
-    fn lfm2_tensor_index_path() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("transpiled")
-            .join("lfm2_5_230m")
+    fn fixture_model_index_path() -> PathBuf {
+        compiled_artifact_dir(
+            "LLMOOP_TEST_LOWERED_DIR",
+            "lowered",
+            "pedalboard.circuits.json",
+        )
+        .join("pedalboard.circuits.json")
+    }
+
+    fn fixture_model_tensor_index_path() -> PathBuf {
+        compiled_artifact_dir("LLMOOP_TEST_TRANSPILED_DIR", "transpiled", "tensors.json")
             .join("tensors.json")
     }
 
     #[test]
-    fn plans_lfm2_lowered_pedalboard_activation_schedule() {
-        let graph = ResolvedLoweredPedalboard::from_index_file(lfm2_index_path()).unwrap();
+    fn plans_fixture_model_lowered_pedalboard_activation_schedule() {
+        let graph = ResolvedLoweredPedalboard::from_index_file(fixture_model_index_path()).unwrap();
 
         let plan = StreamCircuitExecutionPlan::from_graph(&graph).unwrap();
 
@@ -1245,9 +1262,9 @@ mod tests {
     }
 
     #[test]
-    fn tensor_index_enables_lfm2_signal_shape_planning() {
-        let graph = ResolvedLoweredPedalboard::from_index_file(lfm2_index_path()).unwrap();
-        let tensor_index = TensorIndex::from_json_file(lfm2_tensor_index_path()).unwrap();
+    fn tensor_index_enables_fixture_model_signal_shape_planning() {
+        let graph = ResolvedLoweredPedalboard::from_index_file(fixture_model_index_path()).unwrap();
+        let tensor_index = TensorIndex::from_json_file(fixture_model_tensor_index_path()).unwrap();
 
         let plan = StreamCircuitExecutionPlan::from_graph_with_tensor_index(&graph, &tensor_index)
             .unwrap();
@@ -1331,8 +1348,8 @@ mod tests {
     }
 
     #[test]
-    fn resource_plan_names_lfm2_mount_resources() {
-        let graph = ResolvedLoweredPedalboard::from_index_file(lfm2_index_path()).unwrap();
+    fn resource_plan_names_fixture_model_mount_resources() {
+        let graph = ResolvedLoweredPedalboard::from_index_file(fixture_model_index_path()).unwrap();
         let execution_plan = StreamCircuitExecutionPlan::from_graph(&graph).unwrap();
 
         let resource_plan =
@@ -1380,7 +1397,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 "input_transducer.token_embedding",
-                "output_transducer.tied_output_projection",
+                "output_transducer.output_projection",
             ]
         );
         assert_eq!(embed_tokens.uses[0].param_id, "weight");
@@ -1402,7 +1419,7 @@ mod tests {
         assert_eq!(embedding_norm.uses.len(), 1);
         assert_eq!(
             embedding_norm.uses[0].pedal_id,
-            "output_transducer.embedding_norm"
+            "output_transducer.output_norm"
         );
         assert_eq!(embedding_norm.uses[0].role.as_deref(), Some("rms_norm"));
 
@@ -1459,7 +1476,7 @@ mod tests {
 
     #[test]
     fn resource_plan_rejects_mismatched_execution_plan() {
-        let graph = ResolvedLoweredPedalboard::from_index_file(lfm2_index_path()).unwrap();
+        let graph = ResolvedLoweredPedalboard::from_index_file(fixture_model_index_path()).unwrap();
         let mut execution_plan = StreamCircuitExecutionPlan::from_graph(&graph).unwrap();
         execution_plan.circuits.pop();
 
@@ -1471,7 +1488,7 @@ mod tests {
 
     #[test]
     fn activation_plan_tracks_signal_producers_and_consumers() {
-        let graph = ResolvedLoweredPedalboard::from_index_file(lfm2_index_path()).unwrap();
+        let graph = ResolvedLoweredPedalboard::from_index_file(fixture_model_index_path()).unwrap();
         let plan = StreamCircuitExecutionPlan::from_graph(&graph).unwrap();
         let layer_00 = &plan.circuits[0];
 
@@ -1508,7 +1525,7 @@ mod tests {
 
     #[test]
     fn activation_frame_plan_reuses_temporary_signal_slots_by_liveness() {
-        let graph = ResolvedLoweredPedalboard::from_index_file(lfm2_index_path()).unwrap();
+        let graph = ResolvedLoweredPedalboard::from_index_file(fixture_model_index_path()).unwrap();
         let plan = StreamCircuitExecutionPlan::from_graph(&graph).unwrap();
         let frame = plan.circuits[0].activation_frame_plan();
 
@@ -1533,7 +1550,7 @@ mod tests {
 
     #[test]
     fn activation_plan_rejects_unscheduled_signal_dependency() {
-        let graph = ResolvedLoweredPedalboard::from_index_file(lfm2_index_path()).unwrap();
+        let graph = ResolvedLoweredPedalboard::from_index_file(fixture_model_index_path()).unwrap();
         let mut circuit = graph.circuits[0].circuit.clone();
         circuit.nodes[0].inputs = vec!["not_available_yet".to_string()];
 

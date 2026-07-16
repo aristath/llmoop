@@ -10,22 +10,22 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from llmoop.source_oracle import check_lfm2_source_layer_contract, check_lfm2_source_model_contract
+from llmoop.source_oracle import check_source_layer_contract, check_source_model_contract
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Check a transpiled pedal against the real LFM2 source layer.")
-    parser.add_argument("--model-dir", type=Path, default=Path("/home/aristath/models/lfm2.5/230m"))
-    parser.add_argument("--pedals-dir", type=Path, default=Path("transpiled/lfm2_5_230m/layers"))
+    parser = argparse.ArgumentParser(description="Check a transpiled pedal against the real source layer.")
+    parser.add_argument("--model-dir", type=Path, required=True)
+    parser.add_argument("--pedals-dir", type=Path, required=True)
     parser.add_argument("--layer", type=int, default=0)
     parser.add_argument("--all", action="store_true", help="check every transpiled layer pedal")
     parser.add_argument("--summary", action="store_true", help="print a compact summary instead of the full JSON report")
     args = parser.parse_args()
 
     if args.all:
-        report = check_lfm2_source_model_contract(model_dir=args.model_dir, pedals_dir=args.pedals_dir)
+        report = check_source_model_contract(model_dir=args.model_dir, pedals_dir=args.pedals_dir)
     else:
-        report = check_lfm2_source_layer_contract(
+        report = check_source_layer_contract(
             model_dir=args.model_dir,
             pedal_file=args.pedals_dir / f"layer_{args.layer:02d}.json",
             layer_index=args.layer,

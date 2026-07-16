@@ -93,7 +93,7 @@ def lower_pedalboard(pedalboard_dir: Path, out_dir: Path) -> Json:
         "notes": [
             "This index maps the source pedalboard to stream-circuit artifacts.",
             "The artifacts preserve pedal boundaries for now; a backend may later fuse or replace connected regions.",
-            "Only layer_00 currently has a proven direct tensor exact-lowering implementation.",
+            "No layer receives privileged treatment; every pedal is addressed through the same boundary contract.",
         ],
     }
 
@@ -108,34 +108,17 @@ def lower_pedalboard(pedalboard_dir: Path, out_dir: Path) -> Json:
 
 
 def build_conv_circuit(pedal: Json, pedal_path: Path) -> Json:
-    layer_index = pedal["source_layer_index"]
     hidden_size = pedal["ports"]["inputs"][0]["shape"][0]
-    behavioral_role = "exact_lowering_reference_circuit" if pedal["id"] == "layer_00" else "source_reference_circuit"
-    implementation = (
-        "exact_lowering_lfm2_conv_layer_v1"
-        if pedal["id"] == "layer_00"
-        else "reference_lfm2_shortconv_layer_circuit_v1"
-    )
-    circuit_id = (
-        "layer_00_exact_lfm2_conv_circuit_v1"
-        if pedal["id"] == "layer_00"
-        else f"{pedal['id']}_lfm2_shortconv_circuit_v1"
-    )
     return _base_circuit(
         pedal=pedal,
         pedal_path=pedal_path,
-        behavioral_role=behavioral_role,
-        implementation=implementation,
-        circuit_id=circuit_id,
+        behavioral_role="source_reference_circuit",
+        implementation="reference_shortconv_layer_circuit_v1",
+        circuit_id=f"{pedal['id']}_shortconv_circuit_v1",
         nodes=_conv_nodes(hidden_size),
         behavioral_notes=(
             "This circuit preserves the source short-convolution layer decomposition.",
-            "For layer_00, the matching direct tensor exact lowering is already installed in the reference executor.",
-        )
-        if layer_index == 0
-        else (
-            "This circuit preserves the source short-convolution layer decomposition.",
-            "It is a structural lowering artifact; a direct tensor implementation has not yet replaced this source pedal.",
+            "It is a structural lowering artifact; a backend may replace this source pedal with an executable implementation.",
         ),
     )
 
@@ -146,8 +129,8 @@ def build_attention_circuit(pedal: Json, pedal_path: Path) -> Json:
         pedal=pedal,
         pedal_path=pedal_path,
         behavioral_role="source_reference_circuit",
-        implementation="reference_lfm2_gqa_attention_layer_circuit_v1",
-        circuit_id=f"{pedal['id']}_lfm2_gqa_attention_circuit_v1",
+        implementation="reference_gqa_attention_layer_circuit_v1",
+        circuit_id=f"{pedal['id']}_gqa_attention_circuit_v1",
         nodes=_attention_nodes(heads),
         behavioral_notes=(
             "This circuit preserves the source grouped-query attention layer decomposition.",

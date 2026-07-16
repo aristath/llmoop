@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import importlib.util
 import unittest
-from pathlib import Path
 
 from llmoop.circuit_model_runtime import CircuitModelRuntime
 from llmoop.source_oracle import _oracle_imports
 from llmoop.text_generation import generate_text, load_tokenizer
+from tests.fixtures import compiled_model_or_skip
 from tools.check_circuit_generation import _source_greedy_generate
 
 
@@ -19,15 +19,15 @@ TEXT_GENERATION_DEPS_AVAILABLE = all(
 class TextGenerationTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
+        cls.fixture = compiled_model_or_skip()
         cls.torch, cls.auto_model, cls.dynamic_cache = _oracle_imports()
-        cls.model_dir = Path("/home/aristath/models/lfm2.5/230m")
         cls.runtime = CircuitModelRuntime.from_dirs(
-            circuit_dir=Path("lowered/lfm2_5_230m"),
-            model_dir=cls.model_dir,
+            circuit_dir=cls.fixture.lowered_dir,
+            model_dir=cls.fixture.source_model_dir,
             torch=cls.torch,
         )
-        cls.tokenizer = load_tokenizer(cls.model_dir)
-        cls.source = cls.auto_model.from_pretrained(cls.model_dir, dtype=cls.torch.float32)
+        cls.tokenizer = load_tokenizer(cls.fixture.source_model_dir)
+        cls.source = cls.auto_model.from_pretrained(cls.fixture.source_model_dir, dtype=cls.torch.float32)
         cls.source.eval()
 
     def test_text_prompt_generation_matches_source_oracle(self) -> None:

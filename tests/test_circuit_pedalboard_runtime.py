@@ -1,26 +1,24 @@
 from __future__ import annotations
 
 import unittest
-from pathlib import Path
 
 from llmoop.circuit_pedalboard import CircuitPedalboard
 from llmoop.pedalboard import PedalboardRuntime
-
-
-CIRCUIT_DIR = Path("lowered/lfm2_5_230m")
+from tests.fixtures import compiled_model_or_skip
 
 
 class CircuitPedalboardRuntimeTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        cls.board = CircuitPedalboard.from_dir(CIRCUIT_DIR)
+        cls.fixture = compiled_model_or_skip()
+        cls.board = CircuitPedalboard.from_dir(cls.fixture.lowered_dir)
 
     def test_circuit_pedalboard_loads_all_lowered_pedals(self) -> None:
         summary = self.board.summary()
 
         self.assertEqual(14, summary["circuit_count"])
         self.assertEqual({"conv": 8, "full_attention": 6}, summary["operator_counts"])
-        self.assertEqual({"exact_lowering_reference_circuit": 1, "source_reference_circuit": 13}, summary["behavioral_roles"])
+        self.assertEqual({"source_reference_circuit": 14}, summary["behavioral_roles"])
         self.assertEqual([1024], summary["input_shape"])
         self.assertEqual([1024], summary["output_shape"])
         self.assertEqual(14, summary["stream_state_count"])

@@ -14,7 +14,7 @@ class ShortConvCircuitPedal:
     """Executable short-conv stream circuit.
 
     This is the first reusable numeric circuit executor: one implementation
-    runs every LFM2 short-conv layer by swapping only parameter refs and the
+    runs every compatible short-conv layer by swapping only parameter refs and the
     layer-owned transient state index.
     """
 
@@ -27,7 +27,7 @@ class ShortConvCircuitPedal:
     circuit_id: str
     weights: dict[str, Any]
 
-    implementation = "executable_lfm2_shortconv_circuit_v1"
+    implementation = "executable_shortconv_circuit_v1"
 
     @classmethod
     def from_circuit(cls, model: Any, torch: Any, circuit: Json) -> "ShortConvCircuitPedal":
@@ -173,7 +173,7 @@ class GQAAttentionCircuitPedal:
     circuit_id: str
     weights: dict[str, Any]
 
-    implementation = "executable_lfm2_gqa_attention_circuit_v1"
+    implementation = "executable_gqa_attention_circuit_v1"
 
     @classmethod
     def from_circuit(cls, model: Any, torch: Any, circuit: Json) -> "GQAAttentionCircuitPedal":

@@ -193,7 +193,7 @@ class StreamProcessor:
     @classmethod
     def from_dirs(
         cls,
-        circuit_dir: Path = Path("lowered/lfm2_5_230m"),
+        circuit_dir: Path,
         model_dir: Path | None = None,
         torch: Any | None = None,
         sampler: Any | None = None,

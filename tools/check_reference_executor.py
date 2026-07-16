@@ -15,31 +15,28 @@ from llmoop.circuit_executors import (
     install_attention_circuit_pedals,
     install_shortconv_circuit_pedals,
 )
-from llmoop.exact_lowerings import ExactLayer00ConvPedal
 from llmoop.pedalboard import Pedalboard
 from llmoop.reference_runtime import ReferencePedalExecutor
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run the source-backed reference pedal executor.")
-    parser.add_argument("--model-dir", type=Path, default=Path("/home/aristath/models/lfm2.5/230m"))
-    parser.add_argument("--pedalboard-dir", type=Path, default=Path("transpiled/lfm2_5_230m"))
-    parser.add_argument("--circuit-dir", type=Path, default=Path("lowered/lfm2_5_230m"))
+    parser.add_argument("--model-dir", type=Path, required=True)
+    parser.add_argument("--pedalboard-dir", type=Path, required=True)
+    parser.add_argument("--circuit-dir", type=Path)
     parser.add_argument("--token-id", type=int, default=None)
     parser.add_argument("--stream-input-ids", type=str, default=None, help="comma-separated teacher-forced token ids")
-    parser.add_argument("--exact-layer00", action="store_true", help="replace layer_00 with the exact direct lowering")
     parser.add_argument("--circuit-conv-pedals", action="store_true", help="replace every conv pedal with the reusable executable short-conv circuit")
     parser.add_argument("--circuit-attention-pedals", action="store_true", help="replace every attention pedal with the reusable executable GQA attention circuit")
     parser.add_argument("--all-circuit-pedals", action="store_true", help="replace every layer pedal with executable circuit implementations")
     parser.add_argument("--custom-stream-state", action="store_true", help="use llmoop per-pedal stream state instead of Transformers DynamicCache for executable pedals")
-    parser.add_argument("--candidate-layer00", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--summary", action="store_true", help="print a compact summary instead of every pedal step")
     args = parser.parse_args()
 
     pedalboard = Pedalboard.from_dir(args.pedalboard_dir)
     executor = ReferencePedalExecutor.from_model_dir(pedalboard=pedalboard, model_dir=args.model_dir)
-    if args.exact_layer00 or args.candidate_layer00:
-        executor.install_pedal_implementation("layer_00", ExactLayer00ConvPedal.from_model(executor.model, executor.torch))
+    if (args.all_circuit_pedals or args.circuit_attention_pedals or args.circuit_conv_pedals) and args.circuit_dir is None:
+        raise SystemExit("--circuit-dir is required when installing executable circuit pedals")
     if args.all_circuit_pedals:
         install_all_circuit_pedals(executor, args.circuit_dir)
     else:

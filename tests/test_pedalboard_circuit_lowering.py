@@ -6,16 +6,15 @@ from pathlib import Path
 
 from llmoop.circuit_ir import load_circuit, validate_circuit
 from llmoop.circuit_lowering import lower_pedalboard, read_json
-
-
-PEDALBOARD_DIR = Path("transpiled/lfm2_5_230m")
+from tests.fixtures import compiled_model_or_skip
 
 
 class PedalboardCircuitLoweringTest(unittest.TestCase):
     def test_lower_pedalboard_writes_one_circuit_per_pedal(self) -> None:
+        fixture = compiled_model_or_skip()
         with tempfile.TemporaryDirectory() as tempdir:
             out_dir = Path(tempdir)
-            result = lower_pedalboard(PEDALBOARD_DIR, out_dir)
+            result = lower_pedalboard(fixture.transpiled_dir, out_dir)
             index = result["index"]
 
             self.assertEqual("llmoop.lowered_pedalboard.v1", index["schema"])
@@ -43,13 +42,14 @@ class PedalboardCircuitLoweringTest(unittest.TestCase):
                 self.assertEqual(circuit["id"], state["circuit"])
 
     def test_attention_circuit_declares_kv_as_stream_owned_transient_state(self) -> None:
+        fixture = compiled_model_or_skip()
         with tempfile.TemporaryDirectory() as tempdir:
-            result = lower_pedalboard(PEDALBOARD_DIR, Path(tempdir))
+            result = lower_pedalboard(fixture.transpiled_dir, Path(tempdir))
             attention = next(circuit for circuit in result["index"]["graph"]["circuits"] if circuit["operator_type"] == "full_attention")
             circuit = load_circuit(Path(tempdir) / attention["circuit"])
 
             self.assertEqual("source_reference_circuit", circuit["behavioral_role"])
-            self.assertEqual("reference_lfm2_gqa_attention_layer_circuit_v1", circuit["implementation"])
+            self.assertEqual("reference_gqa_attention_layer_circuit_v1", circuit["implementation"])
             self.assertEqual("kv_memory", circuit["state_ports"][0]["id"])
             self.assertEqual("append_only_attention_memory", circuit["state_ports"][0]["type"])
             self.assertEqual("stream", circuit["state_ports"][0]["owner"])

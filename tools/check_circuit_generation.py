@@ -18,8 +18,8 @@ from llmoop.text_generation import generate_text, load_tokenizer
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Check greedy circuit generation against the source model oracle.")
-    parser.add_argument("--circuit-dir", type=Path, default=Path("lowered/lfm2_5_230m"))
-    parser.add_argument("--model-dir", type=Path, default=Path("/home/aristath/models/lfm2.5/230m"))
+    parser.add_argument("--circuit-dir", type=Path, required=True)
+    parser.add_argument("--model-dir", type=Path, required=True)
     parser.add_argument("--prompt-ids", type=str, default=None)
     parser.add_argument("--prompt-text", type=str, default=None)
     parser.add_argument("--max-new-tokens", type=int, default=8)

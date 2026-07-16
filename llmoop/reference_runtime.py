@@ -108,7 +108,7 @@ class ReferenceStreamRun:
 
 
 class ReferencePedalExecutor:
-    """Executes transpiled pedals by delegating each pedal to the source LFM2 layer.
+    """Executes transpiled pedals by delegating each pedal to the source Transformers layer.
 
     This is a reference backend, not a new inference implementation. Its purpose
     is to prove that the pedalboard can carry real source behavior behind the

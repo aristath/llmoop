@@ -16,7 +16,7 @@ from llmoop.stream_engine import SymbolicStreamingEngine
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Inspect and symbolically wire an llmoop pedalboard.")
-    parser.add_argument("--model-dir", type=Path, default=Path("transpiled/lfm2_5_230m"))
+    parser.add_argument("--model-dir", type=Path, required=True)
     parser.add_argument("--trace", action="store_true", help="include the series activation trace")
     parser.add_argument("--step", action="store_true", help="run one symbolic frame through the board")
     parser.add_argument("--stream", type=int, default=0, help="enqueue N symbolic frames and tick the stream loop")

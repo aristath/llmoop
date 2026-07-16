@@ -1,20 +1,18 @@
 from __future__ import annotations
 
 import unittest
-from pathlib import Path
 
 from llmoop.pedalboard import Pedalboard, PedalboardRuntime
 from llmoop.stream_engine import FeedbackPacket, SymbolicOutputPacket, SymbolicStreamingEngine, TokenPacket
 from llmoop.validation import validate_pedalboard
-
-
-MODEL_DIR = Path("transpiled/lfm2_5_230m")
+from tests.fixtures import compiled_model_or_skip
 
 
 class Level1RuntimeTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        cls.pedalboard = Pedalboard.from_dir(MODEL_DIR)
+        cls.fixture = compiled_model_or_skip()
+        cls.pedalboard = Pedalboard.from_dir(cls.fixture.transpiled_dir)
 
     def test_transpiled_pedalboard_validates(self) -> None:
         report = validate_pedalboard(self.pedalboard)

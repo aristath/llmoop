@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import importlib.util
 import unittest
-from pathlib import Path
 
 from llmoop.circuit_model_runtime import CircuitModelRuntime
 from llmoop.source_oracle import _oracle_imports
+from tests.fixtures import compiled_model_or_skip
 
 
 RUNTIME_DEPS_AVAILABLE = all(
@@ -17,14 +17,14 @@ RUNTIME_DEPS_AVAILABLE = all(
 class CircuitModelRuntimeTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
+        cls.fixture = compiled_model_or_skip()
         cls.torch, cls.auto_model, cls.dynamic_cache = _oracle_imports()
-        cls.model_dir = Path("/home/aristath/models/lfm2.5/230m")
         cls.runtime = CircuitModelRuntime.from_dirs(
-            circuit_dir=Path("lowered/lfm2_5_230m"),
-            model_dir=cls.model_dir,
+            circuit_dir=cls.fixture.lowered_dir,
+            model_dir=cls.fixture.source_model_dir,
             torch=cls.torch,
         )
-        cls.source = cls.auto_model.from_pretrained(cls.model_dir, dtype=cls.torch.float32)
+        cls.source = cls.auto_model.from_pretrained(cls.fixture.source_model_dir, dtype=cls.torch.float32)
         cls.source.eval()
 
     def test_circuit_model_runtime_matches_source_hidden_and_logits(self) -> None:
@@ -39,7 +39,7 @@ class CircuitModelRuntimeTest(unittest.TestCase):
         self.assertEqual((1, 4, 1024), tuple(candidate.hidden_states.shape))
         self.assertEqual((1, 4, 65536), tuple(candidate.logits.shape))
         self.assertTrue(
-            all(step.implementation.startswith("executable_lfm2_") for step in candidate.steps)
+            all(step.implementation.startswith("executable_") for step in candidate.steps)
         )
         self.assertTrue(self.torch.allclose(candidate.hidden_states, source_hidden, atol=1e-6, rtol=1e-6))
         self.assertTrue(self.torch.allclose(candidate.logits, source_logits, atol=1e-6, rtol=1e-6))

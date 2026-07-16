@@ -1,1 +1,0 @@
-"""Model-family compiler adapters."""

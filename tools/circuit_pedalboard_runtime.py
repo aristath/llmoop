@@ -16,7 +16,7 @@ from llmoop.pedalboard import PedalboardRuntime
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run symbolic checks from the lowered circuit pedalboard.")
-    parser.add_argument("--circuit-dir", type=Path, default=Path("lowered/lfm2_5_230m"))
+    parser.add_argument("--circuit-dir", type=Path, required=True)
     parser.add_argument("--trace", action="store_true")
     args = parser.parse_args()
 

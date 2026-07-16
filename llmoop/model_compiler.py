@@ -50,23 +50,15 @@ def compile_model(
     default_dynamic_state_capacity_activations: int = 4,
 ) -> CompiledModelReport:
     model_dir = model_dir.expanduser()
-    config = read_json(model_dir / "config.json")
-    model_type = config.get("model_type")
+    from llmoop.model_package import compile_model_package
 
-    if model_type == "lfm2":
-        from llmoop.model_adapters.lfm2 import compile_lfm2_model
-
-        return compile_lfm2_model(
-            model_dir,
-            transpiled_dir=transpiled_dir,
-            lowered_dir=lowered_dir,
-            clean=clean,
-            shader_source_dir=shader_source_dir,
-            default_dynamic_state_capacity_activations=default_dynamic_state_capacity_activations,
-        )
-
-    raise ModelCompileError(
-        f"unsupported model_type {model_type!r}; no compiler adapter is registered yet"
+    return compile_model_package(
+        model_dir,
+        transpiled_dir=transpiled_dir,
+        lowered_dir=lowered_dir,
+        clean=clean,
+        shader_source_dir=shader_source_dir,
+        default_dynamic_state_capacity_activations=default_dynamic_state_capacity_activations,
     )
 
 

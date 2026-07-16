@@ -11150,80 +11150,101 @@ mod tests {
     use crate::stream_circuit::{ResolvedLoweredPedalboard, StreamCircuitPlacementSpec};
     use crate::stream_plan::{StreamCircuitExecutionPlan, StreamCircuitResourcePlan};
 
-    const LFM2_TOKEN_EMBEDDING_TRANSDUCER_ID: &str = "input_transducer.token_embedding";
-    const LFM2_OUTPUT_EMBEDDING_NORM_TRANSDUCER_ID: &str = "output_transducer.embedding_norm";
-    const LFM2_TIED_OUTPUT_PROJECTION_TRANSDUCER_ID: &str =
+    const FIXTURE_MODEL_TOKEN_EMBEDDING_TRANSDUCER_ID: &str = "input_transducer.token_embedding";
+    const FIXTURE_MODEL_OUTPUT_EMBEDDING_NORM_TRANSDUCER_ID: &str = "output_transducer.embedding_norm";
+    const FIXTURE_MODEL_TIED_OUTPUT_PROJECTION_TRANSDUCER_ID: &str =
         "output_transducer.tied_output_projection";
-    const LFM2_GREEDY_SAMPLER_PEDAL_ID: &str = "greedy_sampler";
-    const LFM2_EMBED_TOKENS_TENSOR: &str = "model.embed_tokens.weight";
-    const LFM2_INPUT_FRAME_SIGNAL: &str = "input_frame";
-    const LFM2_OUTPUT_FRAME_SIGNAL: &str = "output_frame";
-    const LFM2_HIDDEN_SIZE: usize = 1_024;
-    const LFM2_FRAME_BYTES: usize = LFM2_HIDDEN_SIZE * 2;
-    const LFM2_LOGITS_BYTES: usize = 65_536 * 4;
-    const LFM2_SAMPLER_OUTPUT_BYTES: usize = 16;
-    const LFM2_EMBED_TOKENS_BYTES: usize = 65_536 * LFM2_FRAME_BYTES;
+    const FIXTURE_MODEL_GREEDY_SAMPLER_PEDAL_ID: &str = "greedy_sampler";
+    const FIXTURE_MODEL_EMBED_TOKENS_TENSOR: &str = "model.embed_tokens.weight";
+    const FIXTURE_MODEL_INPUT_FRAME_SIGNAL: &str = "input_frame";
+    const FIXTURE_MODEL_OUTPUT_FRAME_SIGNAL: &str = "output_frame";
+    const FIXTURE_MODEL_HIDDEN_SIZE: usize = 1_024;
+    const FIXTURE_MODEL_FRAME_BYTES: usize = FIXTURE_MODEL_HIDDEN_SIZE * 2;
+    const FIXTURE_MODEL_LOGITS_BYTES: usize = 65_536 * 4;
+    const FIXTURE_MODEL_SAMPLER_OUTPUT_BYTES: usize = 16;
+    const FIXTURE_MODEL_EMBED_TOKENS_BYTES: usize = 65_536 * FIXTURE_MODEL_FRAME_BYTES;
 
-    fn lfm2_index_path() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
+    fn compiled_artifact_dir(env_var: &str, root_name: &str, marker_file: &str) -> PathBuf {
+        if let Ok(path) = std::env::var(env_var) {
+            return PathBuf::from(path);
+        }
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("..")
-            .join("lowered")
-            .join("lfm2_5_230m")
-            .join("pedalboard.circuits.json")
+            .join(root_name);
+        let mut candidates = std::fs::read_dir(&root)
+            .unwrap_or_else(|_| panic!("set {env_var} or compile a model into {}", root.display()))
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.is_dir() && path.join(marker_file).exists())
+            .collect::<Vec<_>>();
+        candidates.sort();
+        candidates
+            .pop()
+            .unwrap_or_else(|| panic!("set {env_var} or compile a model into {}", root.display()))
     }
 
-    fn lfm2_tensor_index_path() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("transpiled")
-            .join("lfm2_5_230m")
+    fn fixture_model_index_path() -> PathBuf {
+        compiled_artifact_dir(
+            "LLMOOP_TEST_LOWERED_DIR",
+            "lowered",
+            "pedalboard.circuits.json",
+        )
+        .join("pedalboard.circuits.json")
+    }
+
+    fn fixture_model_tensor_index_path() -> PathBuf {
+        compiled_artifact_dir("LLMOOP_TEST_TRANSPILED_DIR", "transpiled", "tensors.json")
             .join("tensors.json")
     }
 
-    fn lfm2_package_manifest_path() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("lowered")
-            .join("lfm2_5_230m")
-            .join("vulkan_resident_greedy_package.json")
+    fn fixture_model_package_manifest_path() -> PathBuf {
+        compiled_artifact_dir(
+            "LLMOOP_TEST_LOWERED_DIR",
+            "lowered",
+            "vulkan_resident_greedy_package.json",
+        )
+        .join("vulkan_resident_greedy_package.json")
     }
 
-    fn lfm2_package_manifest() -> VulkanResidentGreedyModelPackageManifest {
-        VulkanResidentGreedyModelPackageManifest::from_json_file(lfm2_package_manifest_path())
+    fn fixture_model_package_manifest() -> VulkanResidentGreedyModelPackageManifest {
+        VulkanResidentGreedyModelPackageManifest::from_json_file(fixture_model_package_manifest_path())
             .unwrap()
     }
 
-    fn lfm2_input_embedding_transducer_spec() -> VulkanResidentInputEmbeddingTransducerSpec {
-        lfm2_package_manifest().input_transducer.spec
+    fn fixture_model_input_embedding_transducer_spec() -> VulkanResidentInputEmbeddingTransducerSpec {
+        fixture_model_package_manifest().input_transducer.spec
     }
 
-    fn lfm2_output_transducer_spec() -> VulkanResidentOutputTransducerSpec {
-        lfm2_package_manifest().output_transducer.spec
+    fn fixture_model_output_transducer_spec() -> VulkanResidentOutputTransducerSpec {
+        fixture_model_package_manifest().output_transducer.spec
     }
 
-    fn lfm2_greedy_sampler_spec() -> VulkanResidentGreedySamplerSpec {
-        lfm2_package_manifest().sampler.spec
+    fn fixture_model_greedy_sampler_spec() -> VulkanResidentGreedySamplerSpec {
+        fixture_model_package_manifest().sampler.spec
     }
 
-    fn lfm2_resident_greedy_model(
+    fn fixture_model_resident_greedy_model(
         device: &VulkanComputeDevice,
         capacity: usize,
     ) -> Result<VulkanResidentGreedyModelPackage, VulkanResidentTokenModelPackageError> {
         VulkanResidentGreedyModelPackage::from_manifest_file_with_capacity(
             device,
-            lfm2_package_manifest_path(),
+            fixture_model_package_manifest_path(),
             Some(capacity),
         )
     }
 
     #[cfg(feature = "tokenizers")]
-    fn lfm2_model_dir_path() -> PathBuf {
-        Path::new("/home/aristath/models/lfm2.5/230m").to_path_buf()
+    fn fixture_model_model_dir_path() -> Option<PathBuf> {
+        std::env::var("LLMOOP_TEST_MODEL_DIR").ok().map(PathBuf::from)
     }
 
     #[cfg(feature = "tokenizers")]
-    fn lfm2_tokenizer_codec_or_skip(test_name: &str) -> Option<VulkanResidentHfTokenizerTextCodec> {
-        let model_dir = lfm2_model_dir_path();
+    fn fixture_model_tokenizer_codec_or_skip(test_name: &str) -> Option<VulkanResidentHfTokenizerTextCodec> {
+        let Some(model_dir) = fixture_model_model_dir_path() else {
+            eprintln!("skipping {test_name}: set LLMOOP_TEST_MODEL_DIR for tokenizer tests");
+            return None;
+        };
         if !model_dir.join("tokenizer.json").is_file() {
             eprintln!(
                 "skipping {test_name}: {:?} does not contain tokenizer.json",
@@ -11234,7 +11255,7 @@ mod tests {
         Some(VulkanResidentHfTokenizerTextCodec::from_model_dir(model_dir).unwrap())
     }
 
-    fn mount_lfm2_single_device_stream_circuit(
+    fn mount_fixture_model_single_device_stream_circuit(
         device: &VulkanComputeDevice,
     ) -> (
         TensorIndex,
@@ -11242,10 +11263,10 @@ mod tests {
         VulkanReusableKernelArtifactManifest,
         VulkanMountedPlacedBoundDispatchPlan,
     ) {
-        mount_lfm2_single_device_stream_circuit_with_capacity(device, 4)
+        mount_fixture_model_single_device_stream_circuit_with_capacity(device, 4)
     }
 
-    fn mount_lfm2_single_device_stream_circuit_with_capacity(
+    fn mount_fixture_model_single_device_stream_circuit_with_capacity(
         device: &VulkanComputeDevice,
         dynamic_state_capacity_activations: usize,
     ) -> (
@@ -11254,8 +11275,8 @@ mod tests {
         VulkanReusableKernelArtifactManifest,
         VulkanMountedPlacedBoundDispatchPlan,
     ) {
-        let graph = ResolvedLoweredPedalboard::from_index_file(lfm2_index_path()).unwrap();
-        let tensor_index = TensorIndex::from_json_file(lfm2_tensor_index_path()).unwrap();
+        let graph = ResolvedLoweredPedalboard::from_index_file(fixture_model_index_path()).unwrap();
+        let tensor_index = TensorIndex::from_json_file(fixture_model_tensor_index_path()).unwrap();
         let execution_plan =
             StreamCircuitExecutionPlan::from_graph_with_tensor_index(&graph, &tensor_index)
                 .unwrap();
@@ -11304,14 +11325,14 @@ mod tests {
         mounted: &VulkanMountedPlacedStreamCircuit,
         tensor_index: &TensorIndex,
     ) {
-        load_lfm2_conv_layer_parameters(mounted, tensor_index, 0);
+        load_fixture_model_conv_layer_parameters(mounted, tensor_index, 0);
     }
 
-    fn lfm2_embedding_row_bytes(tensor_index: &TensorIndex, token_id: u32) -> Vec<u8> {
-        let metadata = tensor_index.tensors.get(LFM2_EMBED_TOKENS_TENSOR).unwrap();
+    fn fixture_model_embedding_row_bytes(tensor_index: &TensorIndex, token_id: u32) -> Vec<u8> {
+        let metadata = tensor_index.tensors.get(FIXTURE_MODEL_EMBED_TOKENS_TENSOR).unwrap();
         let offsets = metadata.data_offsets.as_ref().unwrap();
         let data_start = offsets[0];
-        let row_offset = usize::try_from(token_id).unwrap() * LFM2_FRAME_BYTES;
+        let row_offset = usize::try_from(token_id).unwrap() * FIXTURE_MODEL_FRAME_BYTES;
         let absolute_tensor_offset = data_start + row_offset;
         let source_file = metadata.source_file.as_ref().unwrap();
         let data_base = safetensors_data_start(Path::new(source_file)).unwrap();
@@ -11320,16 +11341,16 @@ mod tests {
             data_base + u64::try_from(absolute_tensor_offset).unwrap(),
         ))
         .unwrap();
-        let mut bytes = vec![0u8; LFM2_FRAME_BYTES];
+        let mut bytes = vec![0u8; FIXTURE_MODEL_FRAME_BYTES];
         file.read_exact(&mut bytes).unwrap();
         bytes
     }
 
-    fn load_lfm2_transducer_parameter_buffers(
+    fn load_fixture_model_transducer_parameter_buffers(
         device: &VulkanComputeDevice,
         tensor_index: &TensorIndex,
     ) -> VulkanPermanentParameterBuffers {
-        let graph = ResolvedLoweredPedalboard::from_index_file(lfm2_index_path()).unwrap();
+        let graph = ResolvedLoweredPedalboard::from_index_file(fixture_model_index_path()).unwrap();
         let execution_plan =
             StreamCircuitExecutionPlan::from_graph_with_tensor_index(&graph, tensor_index).unwrap();
         let resource_plan =
@@ -11358,7 +11379,7 @@ mod tests {
         transducer_parameter_buffers
     }
 
-    fn load_lfm2_conv_layer_parameters(
+    fn load_fixture_model_conv_layer_parameters(
         mounted: &VulkanMountedPlacedStreamCircuit,
         tensor_index: &TensorIndex,
         layer_index: usize,
@@ -11381,7 +11402,7 @@ mod tests {
         }
     }
 
-    fn load_lfm2_attention_layer_parameters(
+    fn load_fixture_model_attention_layer_parameters(
         mounted: &VulkanMountedPlacedStreamCircuit,
         tensor_index: &TensorIndex,
         layer_index: usize,
@@ -11409,7 +11430,7 @@ mod tests {
 
     fn write_layer_00_unit_input_and_zero_state(mounted: &VulkanMountedPlacedStreamCircuit) {
         write_layer_00_constant_input(mounted, [0x80, 0x3f]);
-        zero_lfm2_temporal_memory(mounted, "layer_00");
+        zero_fixture_model_temporal_memory(mounted, "layer_00");
     }
 
     fn write_layer_00_constant_input(
@@ -11429,24 +11450,24 @@ mod tests {
             .unwrap();
     }
 
-    fn write_lfm2_constant_output_frame(
+    fn write_fixture_model_constant_output_frame(
         mounted: &VulkanMountedPlacedStreamCircuit,
         bf16_little_endian: [u8; 2],
     ) {
-        let mut output_frame = Vec::with_capacity(LFM2_FRAME_BYTES);
-        for _ in 0..LFM2_HIDDEN_SIZE {
+        let mut output_frame = Vec::with_capacity(FIXTURE_MODEL_FRAME_BYTES);
+        for _ in 0..FIXTURE_MODEL_HIDDEN_SIZE {
             output_frame.extend_from_slice(&bf16_little_endian);
         }
         mounted
             .boundary_io
-            .output_buffer(LFM2_OUTPUT_FRAME_SIGNAL)
+            .output_buffer(FIXTURE_MODEL_OUTPUT_FRAME_SIGNAL)
             .unwrap()
             .buffer
             .write_bytes(&output_frame)
             .unwrap();
     }
 
-    fn zero_lfm2_temporal_memory(mounted: &VulkanMountedPlacedStreamCircuit, pedal_id: &str) {
+    fn zero_fixture_model_temporal_memory(mounted: &VulkanMountedPlacedStreamCircuit, pedal_id: &str) {
         let temporal_memory = mounted
             .buffers
             .state_buffer(pedal_id, "temporal_memory")
@@ -11457,7 +11478,7 @@ mod tests {
             .unwrap();
     }
 
-    fn zero_lfm2_kv_memory(mounted: &VulkanMountedPlacedStreamCircuit, pedal_id: &str) {
+    fn zero_fixture_model_kv_memory(mounted: &VulkanMountedPlacedStreamCircuit, pedal_id: &str) {
         let kv_memory = mounted.buffers.state_buffer(pedal_id, "kv_memory").unwrap();
         kv_memory
             .buffer
@@ -11466,72 +11487,72 @@ mod tests {
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    enum Lfm2LayerKind {
+    enum FixtureModelLayerKind {
         ShortConv,
         Attention,
     }
 
-    fn lfm2_layer_kind(layer_index: usize) -> Lfm2LayerKind {
+    fn fixture_model_layer_kind(layer_index: usize) -> FixtureModelLayerKind {
         match layer_index {
-            0 | 1 | 3 | 5 | 7 | 9 | 11 | 13 => Lfm2LayerKind::ShortConv,
-            2 | 4 | 6 | 8 | 10 | 12 => Lfm2LayerKind::Attention,
-            _ => panic!("unknown LFM2 layer index {layer_index}"),
+            0 | 1 | 3 | 5 | 7 | 9 | 11 | 13 => FixtureModelLayerKind::ShortConv,
+            2 | 4 | 6 | 8 | 10 | 12 => FixtureModelLayerKind::Attention,
+            _ => panic!("unknown FIXTURE_MODEL layer index {layer_index}"),
         }
     }
 
-    fn lfm2_layer_id(layer_index: usize) -> String {
+    fn fixture_model_layer_id(layer_index: usize) -> String {
         format!("layer_{layer_index:02}")
     }
 
-    fn lfm2_prefix_pedal_ids(last_layer_index: usize) -> Vec<String> {
-        (0..=last_layer_index).map(lfm2_layer_id).collect()
+    fn fixture_model_prefix_pedal_ids(last_layer_index: usize) -> Vec<String> {
+        (0..=last_layer_index).map(fixture_model_layer_id).collect()
     }
 
-    fn load_lfm2_layer_parameters(
+    fn load_fixture_model_layer_parameters(
         mounted: &VulkanMountedPlacedStreamCircuit,
         tensor_index: &TensorIndex,
         layer_index: usize,
     ) {
-        match lfm2_layer_kind(layer_index) {
-            Lfm2LayerKind::ShortConv => {
-                load_lfm2_conv_layer_parameters(mounted, tensor_index, layer_index);
+        match fixture_model_layer_kind(layer_index) {
+            FixtureModelLayerKind::ShortConv => {
+                load_fixture_model_conv_layer_parameters(mounted, tensor_index, layer_index);
             }
-            Lfm2LayerKind::Attention => {
-                load_lfm2_attention_layer_parameters(mounted, tensor_index, layer_index);
-            }
-        }
-    }
-
-    fn zero_lfm2_layer_state(mounted: &VulkanMountedPlacedStreamCircuit, layer_index: usize) {
-        let pedal_id = lfm2_layer_id(layer_index);
-        match lfm2_layer_kind(layer_index) {
-            Lfm2LayerKind::ShortConv => {
-                zero_lfm2_temporal_memory(mounted, &pedal_id);
-            }
-            Lfm2LayerKind::Attention => {
-                zero_lfm2_kv_memory(mounted, &pedal_id);
+            FixtureModelLayerKind::Attention => {
+                load_fixture_model_attention_layer_parameters(mounted, tensor_index, layer_index);
             }
         }
     }
 
-    fn prepare_lfm2_resident_prefix(
+    fn zero_fixture_model_layer_state(mounted: &VulkanMountedPlacedStreamCircuit, layer_index: usize) {
+        let pedal_id = fixture_model_layer_id(layer_index);
+        match fixture_model_layer_kind(layer_index) {
+            FixtureModelLayerKind::ShortConv => {
+                zero_fixture_model_temporal_memory(mounted, &pedal_id);
+            }
+            FixtureModelLayerKind::Attention => {
+                zero_fixture_model_kv_memory(mounted, &pedal_id);
+            }
+        }
+    }
+
+    fn prepare_fixture_model_resident_prefix(
         mounted: &VulkanMountedPlacedStreamCircuit,
         tensor_index: &TensorIndex,
         last_layer_index: usize,
     ) -> Vec<String> {
         for layer_index in 0..=last_layer_index {
-            load_lfm2_layer_parameters(mounted, tensor_index, layer_index);
+            load_fixture_model_layer_parameters(mounted, tensor_index, layer_index);
         }
 
         write_layer_00_unit_input_and_zero_state(mounted);
         for layer_index in 1..=last_layer_index {
-            zero_lfm2_layer_state(mounted, layer_index);
+            zero_fixture_model_layer_state(mounted, layer_index);
         }
 
-        lfm2_prefix_pedal_ids(last_layer_index)
+        fixture_model_prefix_pedal_ids(last_layer_index)
     }
 
-    fn lfm2_stream_control(
+    fn fixture_model_stream_control(
         mounted: &VulkanMountedPlacedStreamCircuit,
         stream_tick: u64,
     ) -> VulkanMountedPlacedStreamControl {
@@ -11543,7 +11564,7 @@ mod tests {
         }
     }
 
-    fn create_lfm2_resident_prefix_runner(
+    fn create_fixture_model_resident_prefix_runner(
         device: &VulkanComputeDevice,
         mounted: &VulkanMountedPlacedStreamCircuit,
         mounted_bound: &VulkanMountedPlacedBoundDispatchPlan,
@@ -11560,7 +11581,7 @@ mod tests {
             .unwrap()
     }
 
-    fn assert_lfm2_resident_prefix_runner(
+    fn assert_fixture_model_resident_prefix_runner(
         runner: &VulkanMountedPlacedResidentPedalboardRunner,
         pedal_ids: &[String],
         dispatch_count: usize,
@@ -11579,7 +11600,7 @@ mod tests {
         );
     }
 
-    fn assert_lfm2_resident_prefix_run(
+    fn assert_fixture_model_resident_prefix_run(
         run: &VulkanMountedPlacedResidentPedalboardRun,
         pedal_ids: &[String],
         dispatch_count: usize,
@@ -11647,18 +11668,18 @@ mod tests {
         )
     }
 
-    fn lfm2_level_1_loaded_kernel_pack_for_conv_and_attention_families(
+    fn fixture_model_level_1_loaded_kernel_pack_for_conv_and_attention_families(
         mounted: &VulkanMountedPlacedStreamCircuit,
         mounted_bound: &VulkanMountedPlacedBoundDispatchPlan,
     ) -> Option<VulkanLoadedReusableKernelArtifactManifest> {
-        lfm2_level_1_loaded_kernel_pack_for_conv_and_attention_families_with_attention_shader(
+        fixture_model_level_1_loaded_kernel_pack_for_conv_and_attention_families_with_attention_shader(
             mounted,
             mounted_bound,
             "gqa_attention_bf16_q16_kv8_d64_cap4.comp",
         )
     }
 
-    fn lfm2_level_1_loaded_kernel_pack_for_conv_and_attention_families_with_attention_shader(
+    fn fixture_model_level_1_loaded_kernel_pack_for_conv_and_attention_families_with_attention_shader(
         mounted: &VulkanMountedPlacedStreamCircuit,
         mounted_bound: &VulkanMountedPlacedBoundDispatchPlan,
         attention_shader: &str,
@@ -11821,9 +11842,9 @@ mod tests {
     }
 
     #[test]
-    fn plans_lfm2_vulkan_resident_allocations_from_stream_circuit_resources() {
-        let graph = ResolvedLoweredPedalboard::from_index_file(lfm2_index_path()).unwrap();
-        let tensor_index = TensorIndex::from_json_file(lfm2_tensor_index_path()).unwrap();
+    fn plans_fixture_model_vulkan_resident_allocations_from_stream_circuit_resources() {
+        let graph = ResolvedLoweredPedalboard::from_index_file(fixture_model_index_path()).unwrap();
+        let tensor_index = TensorIndex::from_json_file(fixture_model_tensor_index_path()).unwrap();
         let resource_plan =
             StreamCircuitResourcePlan::from_graph_with_tensor_index(&graph, &tensor_index).unwrap();
 
@@ -11895,8 +11916,8 @@ mod tests {
 
     #[test]
     fn placed_resident_plan_hosts_only_the_pedals_assigned_to_a_device() {
-        let graph = ResolvedLoweredPedalboard::from_index_file(lfm2_index_path()).unwrap();
-        let tensor_index = TensorIndex::from_json_file(lfm2_tensor_index_path()).unwrap();
+        let graph = ResolvedLoweredPedalboard::from_index_file(fixture_model_index_path()).unwrap();
+        let tensor_index = TensorIndex::from_json_file(fixture_model_tensor_index_path()).unwrap();
         let execution_plan =
             StreamCircuitExecutionPlan::from_graph_with_tensor_index(&graph, &tensor_index)
                 .unwrap();
@@ -12022,8 +12043,8 @@ mod tests {
 
     #[test]
     fn placed_stream_circuit_plan_dispatches_only_hosted_pedals() {
-        let graph = ResolvedLoweredPedalboard::from_index_file(lfm2_index_path()).unwrap();
-        let tensor_index = TensorIndex::from_json_file(lfm2_tensor_index_path()).unwrap();
+        let graph = ResolvedLoweredPedalboard::from_index_file(fixture_model_index_path()).unwrap();
+        let tensor_index = TensorIndex::from_json_file(fixture_model_tensor_index_path()).unwrap();
         let execution_plan =
             StreamCircuitExecutionPlan::from_graph_with_tensor_index(&graph, &tensor_index)
                 .unwrap();
@@ -12145,7 +12166,7 @@ mod tests {
             }
         };
         let (tensor_index, mounted, _manifest, mounted_bound) =
-            mount_lfm2_single_device_stream_circuit(&device);
+            mount_fixture_model_single_device_stream_circuit(&device);
         let Some(loaded_manifest) = layer_00_level_1_loaded_kernel_pack(&mounted, &mounted_bound)
         else {
             eprintln!("skipping layer_00 resident pedal runner: no GLSL to SPIR-V compiler found");
@@ -12222,7 +12243,7 @@ mod tests {
             }
         };
         let (tensor_index, mounted, _manifest, mounted_bound) =
-            mount_lfm2_single_device_stream_circuit(&device);
+            mount_fixture_model_single_device_stream_circuit(&device);
         let Some(loaded_manifest) = layer_00_level_1_loaded_kernel_pack(&mounted, &mounted_bound)
         else {
             eprintln!("skipping resident input transducer: no GLSL to SPIR-V compiler found");
@@ -12236,7 +12257,7 @@ mod tests {
             eprintln!("skipping resident input transducer: no GLSL to SPIR-V compiler found");
             return;
         };
-        let graph = ResolvedLoweredPedalboard::from_index_file(lfm2_index_path()).unwrap();
+        let graph = ResolvedLoweredPedalboard::from_index_file(fixture_model_index_path()).unwrap();
         let execution_plan =
             StreamCircuitExecutionPlan::from_graph_with_tensor_index(&graph, &tensor_index)
                 .unwrap();
@@ -12258,10 +12279,10 @@ mod tests {
         let embed_tokens = transducer_parameter_plan
             .parameters
             .iter()
-            .find(|parameter| parameter.tensor == LFM2_EMBED_TOKENS_TENSOR)
+            .find(|parameter| parameter.tensor == FIXTURE_MODEL_EMBED_TOKENS_TENSOR)
             .unwrap();
         assert_eq!(embed_tokens.use_count, 2);
-        assert_eq!(embed_tokens.byte_capacity, Some(LFM2_EMBED_TOKENS_BYTES));
+        assert_eq!(embed_tokens.byte_capacity, Some(FIXTURE_MODEL_EMBED_TOKENS_BYTES));
         let transducer_parameter_buffers =
             transducer_parameter_plan.allocate_buffers(&device).unwrap();
         assert_eq!(
@@ -12274,9 +12295,9 @@ mod tests {
                 .is_some()
         );
         let loaded_embedding = transducer_parameter_buffers
-            .load_parameter_from_tensor_index(&tensor_index, LFM2_EMBED_TOKENS_TENSOR)
+            .load_parameter_from_tensor_index(&tensor_index, FIXTURE_MODEL_EMBED_TOKENS_TENSOR)
             .unwrap();
-        assert_eq!(loaded_embedding.byte_count, LFM2_EMBED_TOKENS_BYTES);
+        assert_eq!(loaded_embedding.byte_count, FIXTURE_MODEL_EMBED_TOKENS_BYTES);
         let token_id = 1u32;
 
         let input_transducer_runner =
@@ -12285,20 +12306,20 @@ mod tests {
                 &mounted,
                 &transducer_parameter_buffers,
                 &input_transducer_spirv_words,
-                &lfm2_input_embedding_transducer_spec(),
+                &fixture_model_input_embedding_transducer_spec(),
             )
             .unwrap();
         assert_eq!(
             input_transducer_runner.transducer_id,
-            LFM2_TOKEN_EMBEDDING_TRANSDUCER_ID
+            FIXTURE_MODEL_TOKEN_EMBEDDING_TRANSDUCER_ID
         );
         assert_eq!(
             input_transducer_runner.parameter_tensor,
-            LFM2_EMBED_TOKENS_TENSOR
+            FIXTURE_MODEL_EMBED_TOKENS_TENSOR
         );
         assert_eq!(
             input_transducer_runner.output_signal_id,
-            LFM2_INPUT_FRAME_SIGNAL
+            FIXTURE_MODEL_INPUT_FRAME_SIGNAL
         );
         assert_eq!(input_transducer_runner.descriptor_count, 2);
         assert_eq!(input_transducer_runner.workgroup_count_x, 2);
@@ -12309,30 +12330,30 @@ mod tests {
             .unwrap();
         assert_eq!(
             transducer_run.transducer_id,
-            LFM2_TOKEN_EMBEDDING_TRANSDUCER_ID
+            FIXTURE_MODEL_TOKEN_EMBEDDING_TRANSDUCER_ID
         );
         assert_eq!(transducer_run.token_id, token_id);
-        assert_eq!(transducer_run.output_signal_id, LFM2_INPUT_FRAME_SIGNAL);
+        assert_eq!(transducer_run.output_signal_id, FIXTURE_MODEL_INPUT_FRAME_SIGNAL);
         assert_eq!(transducer_run.dispatch_count, 1);
         assert_eq!(transducer_run.descriptor_count, 2);
         assert_eq!(transducer_run.workgroup_count_x, 2);
         assert_eq!(transducer_run.push_constant_byte_count, 4);
         let input_frame = mounted
             .boundary_io
-            .input_buffer(LFM2_INPUT_FRAME_SIGNAL)
+            .input_buffer(FIXTURE_MODEL_INPUT_FRAME_SIGNAL)
             .unwrap();
         assert_eq!(
-            input_frame.buffer.read_bytes(LFM2_FRAME_BYTES).unwrap(),
-            lfm2_embedding_row_bytes(&tensor_index, token_id)
+            input_frame.buffer.read_bytes(FIXTURE_MODEL_FRAME_BYTES).unwrap(),
+            fixture_model_embedding_row_bytes(&tensor_index, token_id)
         );
 
         load_layer_00_parameters(&mounted, &tensor_index);
-        zero_lfm2_temporal_memory(&mounted, "layer_00");
+        zero_fixture_model_temporal_memory(&mounted, "layer_00");
         let runner = mounted
             .create_resident_pedal_runner(&device, &mounted_bound, "layer_00", &loaded_manifest)
             .unwrap();
         let run = runner
-            .run_with_stream_control(&device, lfm2_stream_control(&mounted, 0))
+            .run_with_stream_control(&device, fixture_model_stream_control(&mounted, 0))
             .unwrap();
         assert_eq!(run.pedal_id, "layer_00");
         assert_eq!(run.dispatch_count(), 16);
@@ -12360,7 +12381,7 @@ mod tests {
             }
         };
         let (tensor_index, mounted, _manifest, _mounted_bound) =
-            mount_lfm2_single_device_stream_circuit(&device);
+            mount_fixture_model_single_device_stream_circuit(&device);
         let Some(embedding_norm_spirv_words) =
             crate::vulkan_compute::compile_test_shader_words_from_source(
                 "rms_norm_bf16_serial.comp",
@@ -12377,7 +12398,7 @@ mod tests {
             eprintln!("skipping resident output transducer: no GLSL to SPIR-V compiler found");
             return;
         };
-        let graph = ResolvedLoweredPedalboard::from_index_file(lfm2_index_path()).unwrap();
+        let graph = ResolvedLoweredPedalboard::from_index_file(fixture_model_index_path()).unwrap();
         let execution_plan =
             StreamCircuitExecutionPlan::from_graph_with_tensor_index(&graph, &tensor_index)
                 .unwrap();
@@ -12399,38 +12420,38 @@ mod tests {
         assert_eq!(loaded_transducers.loaded_count, 2);
         assert_eq!(loaded_transducers.total_bytes_loaded, 134_219_776);
 
-        write_lfm2_constant_output_frame(&mounted, [0x80, 0x3f]);
+        write_fixture_model_constant_output_frame(&mounted, [0x80, 0x3f]);
         let runner = VulkanResidentOutputTransducerRunner::from_mounted_output_transducer(
             &device,
             &mounted,
             &transducer_parameter_buffers,
             &embedding_norm_spirv_words,
             &tied_projection_spirv_words,
-            &lfm2_output_transducer_spec(),
+            &fixture_model_output_transducer_spec(),
         )
         .unwrap();
         assert_eq!(runner.transducer_id, "output_transducer");
-        assert_eq!(runner.input_signal_id, LFM2_OUTPUT_FRAME_SIGNAL);
-        assert_eq!(runner.logits_byte_capacity, LFM2_LOGITS_BYTES);
+        assert_eq!(runner.input_signal_id, FIXTURE_MODEL_OUTPUT_FRAME_SIGNAL);
+        assert_eq!(runner.logits_byte_capacity, FIXTURE_MODEL_LOGITS_BYTES);
         assert_eq!(runner.dispatch_count, 2);
         assert_eq!(runner.total_descriptor_count, 6);
         assert_eq!(runner.total_push_constant_byte_count, 0);
 
         let run = runner.run(&device).unwrap();
         assert_eq!(run.transducer_id, "output_transducer");
-        assert_eq!(run.input_signal_id, LFM2_OUTPUT_FRAME_SIGNAL);
+        assert_eq!(run.input_signal_id, FIXTURE_MODEL_OUTPUT_FRAME_SIGNAL);
         assert_eq!(run.dispatch_count, 2);
         assert_eq!(
             run.node_ids,
             vec![
-                LFM2_OUTPUT_EMBEDDING_NORM_TRANSDUCER_ID.to_string(),
-                LFM2_TIED_OUTPUT_PROJECTION_TRANSDUCER_ID.to_string(),
+                FIXTURE_MODEL_OUTPUT_EMBEDDING_NORM_TRANSDUCER_ID.to_string(),
+                FIXTURE_MODEL_TIED_OUTPUT_PROJECTION_TRANSDUCER_ID.to_string(),
             ]
         );
         assert_eq!(run.descriptor_counts, vec![3, 3]);
         assert_eq!(run.workgroup_counts_x, vec![1, 1024]);
         assert_eq!(run.push_constant_byte_counts, vec![0, 0]);
-        assert_eq!(run.logits_byte_capacity, LFM2_LOGITS_BYTES);
+        assert_eq!(run.logits_byte_capacity, FIXTURE_MODEL_LOGITS_BYTES);
 
         assert_eq!(
             runner.read_normalized_frame_bytes(16).unwrap(),
@@ -12466,8 +12487,8 @@ mod tests {
             return;
         };
 
-        let logits_buffer = device.create_resident_buffer(LFM2_LOGITS_BYTES).unwrap();
-        let mut logits = vec![0u8; LFM2_LOGITS_BYTES];
+        let logits_buffer = device.create_resident_buffer(FIXTURE_MODEL_LOGITS_BYTES).unwrap();
+        let mut logits = vec![0u8; FIXTURE_MODEL_LOGITS_BYTES];
         let token_7 = 7usize;
         let token_1024 = 1_024usize;
         logits[(token_7 * 4)..((token_7 + 1) * 4)].copy_from_slice(&3.5f32.to_le_bytes());
@@ -12477,20 +12498,20 @@ mod tests {
         let runner = VulkanResidentGreedySamplerRunner::from_logits_buffer(
             &device,
             &logits_buffer,
-            LFM2_LOGITS_BYTES,
+            FIXTURE_MODEL_LOGITS_BYTES,
             &sampler_spirv_words,
-            &lfm2_greedy_sampler_spec(),
+            &fixture_model_greedy_sampler_spec(),
         )
         .unwrap();
-        assert_eq!(runner.sampler_id, LFM2_GREEDY_SAMPLER_PEDAL_ID);
-        assert_eq!(runner.logits_byte_capacity, LFM2_LOGITS_BYTES);
-        assert_eq!(runner.output_byte_capacity, LFM2_SAMPLER_OUTPUT_BYTES);
+        assert_eq!(runner.sampler_id, FIXTURE_MODEL_GREEDY_SAMPLER_PEDAL_ID);
+        assert_eq!(runner.logits_byte_capacity, FIXTURE_MODEL_LOGITS_BYTES);
+        assert_eq!(runner.output_byte_capacity, FIXTURE_MODEL_SAMPLER_OUTPUT_BYTES);
         assert_eq!(runner.descriptor_count, 2);
         assert_eq!(runner.workgroup_count_x, 1);
         assert_eq!(runner.push_constant_byte_count, 0);
 
         let run = runner.run(&device).unwrap();
-        assert_eq!(run.sampler_id, LFM2_GREEDY_SAMPLER_PEDAL_ID);
+        assert_eq!(run.sampler_id, FIXTURE_MODEL_GREEDY_SAMPLER_PEDAL_ID);
         assert_eq!(run.token_id, token_1024 as u32);
         assert_eq!(run.selected_logit_bits, 9.25f32.to_bits());
         assert_eq!(run.control_flags, 0);
@@ -12515,8 +12536,8 @@ mod tests {
             }
         };
         let (tensor_index, mounted, _manifest, mounted_bound) =
-            mount_lfm2_single_device_stream_circuit(&device);
-        let Some(loaded_manifest) = lfm2_level_1_loaded_kernel_pack_for_conv_and_attention_families(
+            mount_fixture_model_single_device_stream_circuit(&device);
+        let Some(loaded_manifest) = fixture_model_level_1_loaded_kernel_pack_for_conv_and_attention_families(
             &mounted,
             &mounted_bound,
         ) else {
@@ -12557,18 +12578,18 @@ mod tests {
         };
 
         let transducer_parameter_buffers =
-            load_lfm2_transducer_parameter_buffers(&device, &tensor_index);
-        let pedal_ids = prepare_lfm2_resident_prefix(&mounted, &tensor_index, 13);
+            load_fixture_model_transducer_parameter_buffers(&device, &tensor_index);
+        let pedal_ids = prepare_fixture_model_resident_prefix(&mounted, &tensor_index, 13);
         let input_transducer =
             VulkanResidentInputEmbeddingTransducerRunner::from_mounted_token_embedding(
                 &device,
                 &mounted,
                 &transducer_parameter_buffers,
                 &input_transducer_spirv_words,
-                &lfm2_input_embedding_transducer_spec(),
+                &fixture_model_input_embedding_transducer_spec(),
             )
             .unwrap();
-        let pedalboard = create_lfm2_resident_prefix_runner(
+        let pedalboard = create_fixture_model_resident_prefix_runner(
             &device,
             &mounted,
             &mounted_bound,
@@ -12582,7 +12603,7 @@ mod tests {
                 &transducer_parameter_buffers,
                 &embedding_norm_spirv_words,
                 &tied_projection_spirv_words,
-                &lfm2_output_transducer_spec(),
+                &fixture_model_output_transducer_spec(),
             )
             .unwrap();
         let runner = VulkanResidentSingleTokenTickRunner::new(
@@ -12599,7 +12620,7 @@ mod tests {
 
         let token_id = 1u32;
         let run = runner
-            .run_token_id_with_stream_control(&device, token_id, lfm2_stream_control(&mounted, 0))
+            .run_token_id_with_stream_control(&device, token_id, fixture_model_stream_control(&mounted, 0))
             .unwrap();
         assert_eq!(run.device_id, "gpu0");
         assert_eq!(run.token_id, token_id);
@@ -12607,18 +12628,18 @@ mod tests {
         assert_eq!(run.total_descriptor_count, 802);
         assert_eq!(run.total_push_constant_byte_count, 3_876);
         assert_eq!(run.input_run.dispatch_count, 1);
-        assert_eq!(run.input_run.output_signal_id, LFM2_INPUT_FRAME_SIGNAL);
-        assert_lfm2_resident_prefix_run(&run.pedalboard_run, &pedal_ids, 242);
+        assert_eq!(run.input_run.output_signal_id, FIXTURE_MODEL_INPUT_FRAME_SIGNAL);
+        assert_fixture_model_resident_prefix_run(&run.pedalboard_run, &pedal_ids, 242);
         assert_eq!(run.output_run.dispatch_count, 2);
-        assert_eq!(run.output_run.logits_byte_capacity, LFM2_LOGITS_BYTES);
+        assert_eq!(run.output_run.logits_byte_capacity, FIXTURE_MODEL_LOGITS_BYTES);
 
         let input_frame = mounted
             .boundary_io
-            .input_buffer(LFM2_INPUT_FRAME_SIGNAL)
+            .input_buffer(FIXTURE_MODEL_INPUT_FRAME_SIGNAL)
             .unwrap();
         assert_eq!(
-            input_frame.buffer.read_bytes(LFM2_FRAME_BYTES).unwrap(),
-            lfm2_embedding_row_bytes(&tensor_index, token_id)
+            input_frame.buffer.read_bytes(FIXTURE_MODEL_FRAME_BYTES).unwrap(),
+            fixture_model_embedding_row_bytes(&tensor_index, token_id)
         );
         assert_eq!(
             runner.read_normalized_frame_bytes(16).unwrap(),
@@ -12636,11 +12657,11 @@ mod tests {
         );
     }
 
-    fn create_lfm2_resident_greedy_stream_processor(
+    fn create_fixture_model_resident_greedy_stream_processor(
         device: &VulkanComputeDevice,
         skip_label: &str,
     ) -> Option<VulkanResidentGreedyStreamProcessor> {
-        create_lfm2_resident_greedy_stream_processor_with_capacity(
+        create_fixture_model_resident_greedy_stream_processor_with_capacity(
             device,
             skip_label,
             4,
@@ -12648,19 +12669,19 @@ mod tests {
         )
     }
 
-    fn create_lfm2_resident_greedy_stream_processor_with_capacity(
+    fn create_fixture_model_resident_greedy_stream_processor_with_capacity(
         device: &VulkanComputeDevice,
         skip_label: &str,
         dynamic_state_capacity_activations: usize,
         attention_shader: &str,
     ) -> Option<VulkanResidentGreedyStreamProcessor> {
         let (tensor_index, mounted, _manifest, mounted_bound) =
-            mount_lfm2_single_device_stream_circuit_with_capacity(
+            mount_fixture_model_single_device_stream_circuit_with_capacity(
                 device,
                 dynamic_state_capacity_activations,
             );
         let Some(loaded_manifest) =
-            lfm2_level_1_loaded_kernel_pack_for_conv_and_attention_families_with_attention_shader(
+            fixture_model_level_1_loaded_kernel_pack_for_conv_and_attention_families_with_attention_shader(
                 &mounted,
                 &mounted_bound,
                 attention_shader,
@@ -12702,21 +12723,21 @@ mod tests {
             return None;
         };
 
-        let transducer_parameter_buffers = Arc::new(load_lfm2_transducer_parameter_buffers(
+        let transducer_parameter_buffers = Arc::new(load_fixture_model_transducer_parameter_buffers(
             device,
             &tensor_index,
         ));
-        let pedal_ids = prepare_lfm2_resident_prefix(&mounted, &tensor_index, 13);
+        let pedal_ids = prepare_fixture_model_resident_prefix(&mounted, &tensor_index, 13);
         let input_transducer =
             VulkanResidentInputEmbeddingTransducerRunner::from_mounted_token_embedding(
                 device,
                 &mounted,
                 &transducer_parameter_buffers,
                 &input_transducer_spirv_words,
-                &lfm2_input_embedding_transducer_spec(),
+                &fixture_model_input_embedding_transducer_spec(),
             )
             .unwrap();
-        let pedalboard = create_lfm2_resident_prefix_runner(
+        let pedalboard = create_fixture_model_resident_prefix_runner(
             device,
             &mounted,
             &mounted_bound,
@@ -12730,14 +12751,14 @@ mod tests {
                 &transducer_parameter_buffers,
                 &embedding_norm_spirv_words,
                 &tied_projection_spirv_words,
-                &lfm2_output_transducer_spec(),
+                &fixture_model_output_transducer_spec(),
             )
             .unwrap();
         let sampler = VulkanResidentGreedySamplerRunner::from_output_transducer_with_spec(
             device,
             &output_transducer,
             &sampler_spirv_words,
-            &lfm2_greedy_sampler_spec(),
+            &fixture_model_greedy_sampler_spec(),
         )
         .unwrap();
         let tick_runner = VulkanResidentSingleTokenTickRunner::new(
@@ -12765,7 +12786,7 @@ mod tests {
             }
         };
         let Some(processor) =
-            create_lfm2_resident_greedy_stream_processor(&device, "resident greedy feedback loop")
+            create_fixture_model_resident_greedy_stream_processor(&device, "resident greedy feedback loop")
         else {
             return;
         };
@@ -12816,7 +12837,7 @@ mod tests {
             }
         };
         let Some(processor) =
-            create_lfm2_resident_greedy_stream_processor(&device, "resident greedy prompt event")
+            create_fixture_model_resident_greedy_stream_processor(&device, "resident greedy prompt event")
         else {
             return;
         };
@@ -12894,7 +12915,7 @@ mod tests {
             }
         };
         let Some(processor) =
-            create_lfm2_resident_greedy_stream_processor(&device, "resident greedy running stream")
+            create_fixture_model_resident_greedy_stream_processor(&device, "resident greedy running stream")
         else {
             return;
         };
@@ -13008,7 +13029,7 @@ mod tests {
                 return;
             }
         };
-        let Some(processor) = create_lfm2_resident_greedy_stream_processor_with_capacity(
+        let Some(processor) = create_fixture_model_resident_greedy_stream_processor_with_capacity(
             &device,
             "resident greedy running stream capacity",
             8,
@@ -13064,7 +13085,7 @@ mod tests {
                 return;
             }
         };
-        let Some(processor) = create_lfm2_resident_greedy_stream_processor_with_capacity(
+        let Some(processor) = create_fixture_model_resident_greedy_stream_processor_with_capacity(
             &device,
             "resident token stream API",
             8,
@@ -13150,7 +13171,7 @@ mod tests {
                 return;
             }
         };
-        let Some(processor) = create_lfm2_resident_greedy_stream_processor_with_capacity(
+        let Some(processor) = create_fixture_model_resident_greedy_stream_processor_with_capacity(
             &device,
             "resident token stream pump",
             8,
@@ -13233,7 +13254,7 @@ mod tests {
                 return;
             }
         };
-        let Some(processor) = create_lfm2_resident_greedy_stream_processor_with_capacity(
+        let Some(processor) = create_fixture_model_resident_greedy_stream_processor_with_capacity(
             &device,
             "resident token stream bounded pump",
             8,
@@ -13322,7 +13343,7 @@ mod tests {
                 return;
             }
         };
-        let Some(processor) = create_lfm2_resident_greedy_stream_processor_with_capacity(
+        let Some(processor) = create_fixture_model_resident_greedy_stream_processor_with_capacity(
             &device,
             "resident token runtime cycle",
             8,
@@ -13460,7 +13481,7 @@ mod tests {
                 return;
             }
         };
-        let Some(processor) = create_lfm2_resident_greedy_stream_processor_with_capacity(
+        let Some(processor) = create_fixture_model_resident_greedy_stream_processor_with_capacity(
             &device,
             "resident token runtime scheduler",
             8,
@@ -13639,8 +13660,8 @@ mod tests {
 
     #[cfg(feature = "tokenizers")]
     #[test]
-    fn resident_hf_tokenizer_text_codec_loads_lfm2_tokenizer_json() {
-        let Some(codec) = lfm2_tokenizer_codec_or_skip("resident hf tokenizer text codec") else {
+    fn resident_hf_tokenizer_text_codec_loads_fixture_model_tokenizer_json() {
+        let Some(codec) = fixture_model_tokenizer_codec_or_skip("resident hf tokenizer text codec") else {
             return;
         };
 
@@ -13665,7 +13686,7 @@ mod tests {
                 return;
             }
         };
-        let Some(processor) = create_lfm2_resident_greedy_stream_processor_with_capacity(
+        let Some(processor) = create_fixture_model_resident_greedy_stream_processor_with_capacity(
             &device,
             "resident token engine",
             8,
@@ -13747,7 +13768,7 @@ mod tests {
                 return;
             }
         };
-        let Some(processor) = create_lfm2_resident_greedy_stream_processor_with_capacity(
+        let Some(processor) = create_fixture_model_resident_greedy_stream_processor_with_capacity(
             &device,
             "resident token text cycle engine",
             8,
@@ -13816,7 +13837,7 @@ mod tests {
                 return;
             }
         };
-        let Some(processor) = create_lfm2_resident_greedy_stream_processor_with_capacity(
+        let Some(processor) = create_fixture_model_resident_greedy_stream_processor_with_capacity(
             &device,
             "resident token live text turn engine",
             8,
@@ -13878,14 +13899,14 @@ mod tests {
                 return;
             }
         };
-        let model = lfm2_resident_greedy_model(&device, 8).unwrap();
+        let model = fixture_model_resident_greedy_model(&device, 8).unwrap();
         let mut engine = VulkanResidentTokenEngine::new(device);
-        engine.add_model_package("shared_lfm2", model).unwrap();
+        engine.add_model_package("shared_compiled_model", model).unwrap();
         engine
-            .create_stream_from_model("shared_lfm2", "text_batch_stream_a")
+            .create_stream_from_model("shared_compiled_model", "text_batch_stream_a")
             .unwrap();
         engine
-            .create_stream_from_model("shared_lfm2", "text_batch_stream_b")
+            .create_stream_from_model("shared_compiled_model", "text_batch_stream_b")
             .unwrap();
         let codec = VulkanResidentTokenIdTextCodec;
 
@@ -13951,7 +13972,7 @@ mod tests {
     #[cfg(feature = "tokenizers")]
     #[test]
     fn resident_token_engine_accepts_hf_tokenizer_text_input() {
-        let Some(codec) = lfm2_tokenizer_codec_or_skip("resident token engine hf tokenizer input")
+        let Some(codec) = fixture_model_tokenizer_codec_or_skip("resident token engine hf tokenizer input")
         else {
             return;
         };
@@ -13962,7 +13983,7 @@ mod tests {
                 return;
             }
         };
-        let Some(processor) = create_lfm2_resident_greedy_stream_processor_with_capacity(
+        let Some(processor) = create_fixture_model_resident_greedy_stream_processor_with_capacity(
             &device,
             "resident token engine hf tokenizer input",
             8,
@@ -14013,10 +14034,10 @@ mod tests {
                 return;
             }
         };
-        let model = lfm2_resident_greedy_model(&device, 8).unwrap();
+        let model = fixture_model_resident_greedy_model(&device, 8).unwrap();
         let mut engine = VulkanResidentTokenEngine::new(device);
-        let loaded_model = engine.add_model_package("shared_lfm2", model).unwrap();
-        assert_eq!(loaded_model.model_id, "shared_lfm2");
+        let loaded_model = engine.add_model_package("shared_compiled_model", model).unwrap();
+        assert_eq!(loaded_model.model_id, "shared_compiled_model");
         assert_eq!(loaded_model.device_id, "gpu0");
         assert_eq!(loaded_model.registered_stream_count, 0);
         assert_eq!(loaded_model.dynamic_state_capacity_activations, 8);
@@ -14027,13 +14048,13 @@ mod tests {
         assert!(loaded_model.reusable_kernel_word_count > 0);
 
         let stream_a = engine
-            .create_stream_from_model("shared_lfm2", "shared_stream_a")
+            .create_stream_from_model("shared_compiled_model", "shared_stream_a")
             .unwrap();
         let stream_b = engine
-            .create_stream_from_model("shared_lfm2", "shared_stream_b")
+            .create_stream_from_model("shared_compiled_model", "shared_stream_b")
             .unwrap();
-        assert_eq!(stream_a.model_id.as_deref(), Some("shared_lfm2"));
-        assert_eq!(stream_b.model_id.as_deref(), Some("shared_lfm2"));
+        assert_eq!(stream_a.model_id.as_deref(), Some("shared_compiled_model"));
+        assert_eq!(stream_b.model_id.as_deref(), Some("shared_compiled_model"));
         assert_eq!(
             stream_a.residency,
             VulkanResidentTokenEngineStreamResidency::SharedModel
@@ -14050,7 +14071,7 @@ mod tests {
 
         let registered = engine.snapshot();
         assert_eq!(registered.models.len(), 1);
-        assert_eq!(registered.models[0].model_id, "shared_lfm2");
+        assert_eq!(registered.models[0].model_id, "shared_compiled_model");
         assert_eq!(registered.models[0].registered_stream_count, 2);
         assert_eq!(registered.streams.len(), 2);
         assert_eq!(registered.scheduler.registered_runtime_count, 2);
@@ -14122,7 +14143,7 @@ mod tests {
                 return;
             }
         };
-        let Some(processor) = create_lfm2_resident_greedy_stream_processor(
+        let Some(processor) = create_fixture_model_resident_greedy_stream_processor(
             &device,
             "resident greedy running stream interrupt",
         ) else {
@@ -14184,7 +14205,7 @@ mod tests {
                 return;
             }
         };
-        let Some(processor) = create_lfm2_resident_greedy_stream_processor(
+        let Some(processor) = create_fixture_model_resident_greedy_stream_processor(
             &device,
             "resident greedy running stream stop-after-current",
         ) else {
@@ -14272,25 +14293,25 @@ mod tests {
             }
         };
         let (tensor_index, mounted, _manifest, mounted_bound) =
-            mount_lfm2_single_device_stream_circuit(&device);
+            mount_fixture_model_single_device_stream_circuit(&device);
         let Some(loaded_manifest) = layer_00_level_1_loaded_kernel_pack(&mounted, &mounted_bound)
         else {
             eprintln!("skipping resident pedalboard runner: no GLSL to SPIR-V compiler found");
             return;
         };
-        let pedal_ids = prepare_lfm2_resident_prefix(&mounted, &tensor_index, 1);
+        let pedal_ids = prepare_fixture_model_resident_prefix(&mounted, &tensor_index, 1);
 
-        let runner = create_lfm2_resident_prefix_runner(
+        let runner = create_fixture_model_resident_prefix_runner(
             &device,
             &mounted,
             &mounted_bound,
             &loaded_manifest,
             &pedal_ids,
         );
-        assert_lfm2_resident_prefix_runner(&runner, &pedal_ids, 32, 104, 512);
+        assert_fixture_model_resident_prefix_runner(&runner, &pedal_ids, 32, 104, 512);
 
         let run = runner.run_zeroed_push_constants(&device).unwrap();
-        assert_lfm2_resident_prefix_run(&run, &pedal_ids, 32);
+        assert_fixture_model_resident_prefix_run(&run, &pedal_ids, 32);
 
         let layer_00_output_dispatch = mounted_bound.dispatch("layer_00", "ffn_residual").unwrap();
         let layer_00_output_bindings = mounted
@@ -14327,8 +14348,8 @@ mod tests {
             }
         };
         let (tensor_index, mounted, _manifest, mounted_bound) =
-            mount_lfm2_single_device_stream_circuit(&device);
-        let Some(loaded_manifest) = lfm2_level_1_loaded_kernel_pack_for_conv_and_attention_families(
+            mount_fixture_model_single_device_stream_circuit(&device);
+        let Some(loaded_manifest) = fixture_model_level_1_loaded_kernel_pack_for_conv_and_attention_families(
             &mounted,
             &mounted_bound,
         ) else {
@@ -14337,21 +14358,21 @@ mod tests {
             );
             return;
         };
-        let pedal_ids = prepare_lfm2_resident_prefix(&mounted, &tensor_index, 2);
+        let pedal_ids = prepare_fixture_model_resident_prefix(&mounted, &tensor_index, 2);
 
-        let runner = create_lfm2_resident_prefix_runner(
+        let runner = create_fixture_model_resident_prefix_runner(
             &device,
             &mounted,
             &mounted_bound,
             &loaded_manifest,
             &pedal_ids,
         );
-        assert_lfm2_resident_prefix_runner(&runner, &pedal_ids, 51, 167, 816);
+        assert_fixture_model_resident_prefix_runner(&runner, &pedal_ids, 51, 167, 816);
 
         let run = runner
-            .run_with_stream_control(&device, lfm2_stream_control(&mounted, 0))
+            .run_with_stream_control(&device, fixture_model_stream_control(&mounted, 0))
             .unwrap();
-        assert_lfm2_resident_prefix_run(&run, &pedal_ids, 51);
+        assert_fixture_model_resident_prefix_run(&run, &pedal_ids, 51);
 
         let kv_memory = mounted
             .buffers
@@ -14382,8 +14403,8 @@ mod tests {
             }
         };
         let (tensor_index, mounted, _manifest, mounted_bound) =
-            mount_lfm2_single_device_stream_circuit(&device);
-        let Some(loaded_manifest) = lfm2_level_1_loaded_kernel_pack_for_conv_and_attention_families(
+            mount_fixture_model_single_device_stream_circuit(&device);
+        let Some(loaded_manifest) = fixture_model_level_1_loaded_kernel_pack_for_conv_and_attention_families(
             &mounted,
             &mounted_bound,
         ) else {
@@ -14392,9 +14413,9 @@ mod tests {
             );
             return;
         };
-        let pedal_ids = prepare_lfm2_resident_prefix(&mounted, &tensor_index, 2);
+        let pedal_ids = prepare_fixture_model_resident_prefix(&mounted, &tensor_index, 2);
 
-        let runner = create_lfm2_resident_prefix_runner(
+        let runner = create_fixture_model_resident_prefix_runner(
             &device,
             &mounted,
             &mounted_bound,
@@ -14451,7 +14472,7 @@ mod tests {
         assert_ne!(&kv_after_tick_1[2_048..2_064], &[0u8; 16]);
         assert_ne!(&kv_after_tick_1[2_048..2_064], tick_0_slot_0.as_slice());
 
-        zero_lfm2_kv_memory(&mounted, "layer_02");
+        zero_fixture_model_kv_memory(&mounted, "layer_02");
         layer_02_runner
             .run_with_stream_control(
                 &device,
@@ -14482,29 +14503,29 @@ mod tests {
             }
         };
         let (tensor_index, mounted, _manifest, mounted_bound) =
-            mount_lfm2_single_device_stream_circuit(&device);
-        let Some(loaded_manifest) = lfm2_level_1_loaded_kernel_pack_for_conv_and_attention_families(
+            mount_fixture_model_single_device_stream_circuit(&device);
+        let Some(loaded_manifest) = fixture_model_level_1_loaded_kernel_pack_for_conv_and_attention_families(
             &mounted,
             &mounted_bound,
         ) else {
             eprintln!("skipping resident layer_03 prefix runner: no GLSL to SPIR-V compiler found");
             return;
         };
-        let pedal_ids = prepare_lfm2_resident_prefix(&mounted, &tensor_index, 3);
+        let pedal_ids = prepare_fixture_model_resident_prefix(&mounted, &tensor_index, 3);
 
-        let runner = create_lfm2_resident_prefix_runner(
+        let runner = create_fixture_model_resident_prefix_runner(
             &device,
             &mounted,
             &mounted_bound,
             &loaded_manifest,
             &pedal_ids,
         );
-        assert_lfm2_resident_prefix_runner(&runner, &pedal_ids, 67, 219, 1072);
+        assert_fixture_model_resident_prefix_runner(&runner, &pedal_ids, 67, 219, 1072);
 
         let run = runner
-            .run_with_stream_control(&device, lfm2_stream_control(&mounted, 0))
+            .run_with_stream_control(&device, fixture_model_stream_control(&mounted, 0))
             .unwrap();
-        assert_lfm2_resident_prefix_run(&run, &pedal_ids, 67);
+        assert_fixture_model_resident_prefix_run(&run, &pedal_ids, 67);
 
         let layer_03_output_dispatch = mounted_bound.dispatch("layer_03", "ffn_residual").unwrap();
         let layer_03_output_bindings = mounted
@@ -14529,29 +14550,29 @@ mod tests {
             }
         };
         let (tensor_index, mounted, _manifest, mounted_bound) =
-            mount_lfm2_single_device_stream_circuit(&device);
-        let Some(loaded_manifest) = lfm2_level_1_loaded_kernel_pack_for_conv_and_attention_families(
+            mount_fixture_model_single_device_stream_circuit(&device);
+        let Some(loaded_manifest) = fixture_model_level_1_loaded_kernel_pack_for_conv_and_attention_families(
             &mounted,
             &mounted_bound,
         ) else {
             eprintln!("skipping resident layer_04 prefix runner: no GLSL to SPIR-V compiler found");
             return;
         };
-        let pedal_ids = prepare_lfm2_resident_prefix(&mounted, &tensor_index, 4);
+        let pedal_ids = prepare_fixture_model_resident_prefix(&mounted, &tensor_index, 4);
 
-        let runner = create_lfm2_resident_prefix_runner(
+        let runner = create_fixture_model_resident_prefix_runner(
             &device,
             &mounted,
             &mounted_bound,
             &loaded_manifest,
             &pedal_ids,
         );
-        assert_lfm2_resident_prefix_runner(&runner, &pedal_ids, 86, 282, 1376);
+        assert_fixture_model_resident_prefix_runner(&runner, &pedal_ids, 86, 282, 1376);
 
         let run = runner
-            .run_with_stream_control(&device, lfm2_stream_control(&mounted, 0))
+            .run_with_stream_control(&device, fixture_model_stream_control(&mounted, 0))
             .unwrap();
-        assert_lfm2_resident_prefix_run(&run, &pedal_ids, 86);
+        assert_fixture_model_resident_prefix_run(&run, &pedal_ids, 86);
 
         let layer_02_kv = mounted
             .buffers
@@ -14594,29 +14615,29 @@ mod tests {
             }
         };
         let (tensor_index, mounted, _manifest, mounted_bound) =
-            mount_lfm2_single_device_stream_circuit(&device);
-        let Some(loaded_manifest) = lfm2_level_1_loaded_kernel_pack_for_conv_and_attention_families(
+            mount_fixture_model_single_device_stream_circuit(&device);
+        let Some(loaded_manifest) = fixture_model_level_1_loaded_kernel_pack_for_conv_and_attention_families(
             &mounted,
             &mounted_bound,
         ) else {
             eprintln!("skipping resident layer_05 prefix runner: no GLSL to SPIR-V compiler found");
             return;
         };
-        let pedal_ids = prepare_lfm2_resident_prefix(&mounted, &tensor_index, 5);
+        let pedal_ids = prepare_fixture_model_resident_prefix(&mounted, &tensor_index, 5);
 
-        let runner = create_lfm2_resident_prefix_runner(
+        let runner = create_fixture_model_resident_prefix_runner(
             &device,
             &mounted,
             &mounted_bound,
             &loaded_manifest,
             &pedal_ids,
         );
-        assert_lfm2_resident_prefix_runner(&runner, &pedal_ids, 102, 334, 1632);
+        assert_fixture_model_resident_prefix_runner(&runner, &pedal_ids, 102, 334, 1632);
 
         let run = runner
-            .run_with_stream_control(&device, lfm2_stream_control(&mounted, 0))
+            .run_with_stream_control(&device, fixture_model_stream_control(&mounted, 0))
             .unwrap();
-        assert_lfm2_resident_prefix_run(&run, &pedal_ids, 102);
+        assert_fixture_model_resident_prefix_run(&run, &pedal_ids, 102);
 
         let layer_02_kv = mounted
             .buffers
@@ -14659,29 +14680,29 @@ mod tests {
             }
         };
         let (tensor_index, mounted, _manifest, mounted_bound) =
-            mount_lfm2_single_device_stream_circuit(&device);
-        let Some(loaded_manifest) = lfm2_level_1_loaded_kernel_pack_for_conv_and_attention_families(
+            mount_fixture_model_single_device_stream_circuit(&device);
+        let Some(loaded_manifest) = fixture_model_level_1_loaded_kernel_pack_for_conv_and_attention_families(
             &mounted,
             &mounted_bound,
         ) else {
             eprintln!("skipping resident layer_06 prefix runner: no GLSL to SPIR-V compiler found");
             return;
         };
-        let pedal_ids = prepare_lfm2_resident_prefix(&mounted, &tensor_index, 6);
+        let pedal_ids = prepare_fixture_model_resident_prefix(&mounted, &tensor_index, 6);
 
-        let runner = create_lfm2_resident_prefix_runner(
+        let runner = create_fixture_model_resident_prefix_runner(
             &device,
             &mounted,
             &mounted_bound,
             &loaded_manifest,
             &pedal_ids,
         );
-        assert_lfm2_resident_prefix_runner(&runner, &pedal_ids, 121, 397, 1936);
+        assert_fixture_model_resident_prefix_runner(&runner, &pedal_ids, 121, 397, 1936);
 
         let run = runner
-            .run_with_stream_control(&device, lfm2_stream_control(&mounted, 0))
+            .run_with_stream_control(&device, fixture_model_stream_control(&mounted, 0))
             .unwrap();
-        assert_lfm2_resident_prefix_run(&run, &pedal_ids, 121);
+        assert_fixture_model_resident_prefix_run(&run, &pedal_ids, 121);
 
         let layer_02_kv = mounted
             .buffers
@@ -14734,29 +14755,29 @@ mod tests {
             }
         };
         let (tensor_index, mounted, _manifest, mounted_bound) =
-            mount_lfm2_single_device_stream_circuit(&device);
-        let Some(loaded_manifest) = lfm2_level_1_loaded_kernel_pack_for_conv_and_attention_families(
+            mount_fixture_model_single_device_stream_circuit(&device);
+        let Some(loaded_manifest) = fixture_model_level_1_loaded_kernel_pack_for_conv_and_attention_families(
             &mounted,
             &mounted_bound,
         ) else {
             eprintln!("skipping resident layer_07 prefix runner: no GLSL to SPIR-V compiler found");
             return;
         };
-        let pedal_ids = prepare_lfm2_resident_prefix(&mounted, &tensor_index, 7);
+        let pedal_ids = prepare_fixture_model_resident_prefix(&mounted, &tensor_index, 7);
 
-        let runner = create_lfm2_resident_prefix_runner(
+        let runner = create_fixture_model_resident_prefix_runner(
             &device,
             &mounted,
             &mounted_bound,
             &loaded_manifest,
             &pedal_ids,
         );
-        assert_lfm2_resident_prefix_runner(&runner, &pedal_ids, 137, 449, 2192);
+        assert_fixture_model_resident_prefix_runner(&runner, &pedal_ids, 137, 449, 2192);
 
         let run = runner
-            .run_with_stream_control(&device, lfm2_stream_control(&mounted, 0))
+            .run_with_stream_control(&device, fixture_model_stream_control(&mounted, 0))
             .unwrap();
-        assert_lfm2_resident_prefix_run(&run, &pedal_ids, 137);
+        assert_fixture_model_resident_prefix_run(&run, &pedal_ids, 137);
 
         let layer_02_kv = mounted
             .buffers
@@ -14809,29 +14830,29 @@ mod tests {
             }
         };
         let (tensor_index, mounted, _manifest, mounted_bound) =
-            mount_lfm2_single_device_stream_circuit(&device);
-        let Some(loaded_manifest) = lfm2_level_1_loaded_kernel_pack_for_conv_and_attention_families(
+            mount_fixture_model_single_device_stream_circuit(&device);
+        let Some(loaded_manifest) = fixture_model_level_1_loaded_kernel_pack_for_conv_and_attention_families(
             &mounted,
             &mounted_bound,
         ) else {
             eprintln!("skipping resident layer_08 prefix runner: no GLSL to SPIR-V compiler found");
             return;
         };
-        let pedal_ids = prepare_lfm2_resident_prefix(&mounted, &tensor_index, 8);
+        let pedal_ids = prepare_fixture_model_resident_prefix(&mounted, &tensor_index, 8);
 
-        let runner = create_lfm2_resident_prefix_runner(
+        let runner = create_fixture_model_resident_prefix_runner(
             &device,
             &mounted,
             &mounted_bound,
             &loaded_manifest,
             &pedal_ids,
         );
-        assert_lfm2_resident_prefix_runner(&runner, &pedal_ids, 156, 512, 2496);
+        assert_fixture_model_resident_prefix_runner(&runner, &pedal_ids, 156, 512, 2496);
 
         let run = runner
-            .run_with_stream_control(&device, lfm2_stream_control(&mounted, 0))
+            .run_with_stream_control(&device, fixture_model_stream_control(&mounted, 0))
             .unwrap();
-        assert_lfm2_resident_prefix_run(&run, &pedal_ids, 156);
+        assert_fixture_model_resident_prefix_run(&run, &pedal_ids, 156);
 
         let layer_02_kv = mounted
             .buffers
@@ -14895,29 +14916,29 @@ mod tests {
             }
         };
         let (tensor_index, mounted, _manifest, mounted_bound) =
-            mount_lfm2_single_device_stream_circuit(&device);
-        let Some(loaded_manifest) = lfm2_level_1_loaded_kernel_pack_for_conv_and_attention_families(
+            mount_fixture_model_single_device_stream_circuit(&device);
+        let Some(loaded_manifest) = fixture_model_level_1_loaded_kernel_pack_for_conv_and_attention_families(
             &mounted,
             &mounted_bound,
         ) else {
             eprintln!("skipping resident layer_09 prefix runner: no GLSL to SPIR-V compiler found");
             return;
         };
-        let pedal_ids = prepare_lfm2_resident_prefix(&mounted, &tensor_index, 9);
+        let pedal_ids = prepare_fixture_model_resident_prefix(&mounted, &tensor_index, 9);
 
-        let runner = create_lfm2_resident_prefix_runner(
+        let runner = create_fixture_model_resident_prefix_runner(
             &device,
             &mounted,
             &mounted_bound,
             &loaded_manifest,
             &pedal_ids,
         );
-        assert_lfm2_resident_prefix_runner(&runner, &pedal_ids, 172, 564, 2752);
+        assert_fixture_model_resident_prefix_runner(&runner, &pedal_ids, 172, 564, 2752);
 
         let run = runner
-            .run_with_stream_control(&device, lfm2_stream_control(&mounted, 0))
+            .run_with_stream_control(&device, fixture_model_stream_control(&mounted, 0))
             .unwrap();
-        assert_lfm2_resident_prefix_run(&run, &pedal_ids, 172);
+        assert_fixture_model_resident_prefix_run(&run, &pedal_ids, 172);
 
         let layer_02_kv = mounted
             .buffers
@@ -14981,29 +15002,29 @@ mod tests {
             }
         };
         let (tensor_index, mounted, _manifest, mounted_bound) =
-            mount_lfm2_single_device_stream_circuit(&device);
-        let Some(loaded_manifest) = lfm2_level_1_loaded_kernel_pack_for_conv_and_attention_families(
+            mount_fixture_model_single_device_stream_circuit(&device);
+        let Some(loaded_manifest) = fixture_model_level_1_loaded_kernel_pack_for_conv_and_attention_families(
             &mounted,
             &mounted_bound,
         ) else {
             eprintln!("skipping resident layer_10 prefix runner: no GLSL to SPIR-V compiler found");
             return;
         };
-        let pedal_ids = prepare_lfm2_resident_prefix(&mounted, &tensor_index, 10);
+        let pedal_ids = prepare_fixture_model_resident_prefix(&mounted, &tensor_index, 10);
 
-        let runner = create_lfm2_resident_prefix_runner(
+        let runner = create_fixture_model_resident_prefix_runner(
             &device,
             &mounted,
             &mounted_bound,
             &loaded_manifest,
             &pedal_ids,
         );
-        assert_lfm2_resident_prefix_runner(&runner, &pedal_ids, 191, 627, 3056);
+        assert_fixture_model_resident_prefix_runner(&runner, &pedal_ids, 191, 627, 3056);
 
         let run = runner
-            .run_with_stream_control(&device, lfm2_stream_control(&mounted, 0))
+            .run_with_stream_control(&device, fixture_model_stream_control(&mounted, 0))
             .unwrap();
-        assert_lfm2_resident_prefix_run(&run, &pedal_ids, 191);
+        assert_fixture_model_resident_prefix_run(&run, &pedal_ids, 191);
 
         let layer_02_kv = mounted
             .buffers
@@ -15079,29 +15100,29 @@ mod tests {
             }
         };
         let (tensor_index, mounted, _manifest, mounted_bound) =
-            mount_lfm2_single_device_stream_circuit(&device);
-        let Some(loaded_manifest) = lfm2_level_1_loaded_kernel_pack_for_conv_and_attention_families(
+            mount_fixture_model_single_device_stream_circuit(&device);
+        let Some(loaded_manifest) = fixture_model_level_1_loaded_kernel_pack_for_conv_and_attention_families(
             &mounted,
             &mounted_bound,
         ) else {
             eprintln!("skipping resident layer_11 prefix runner: no GLSL to SPIR-V compiler found");
             return;
         };
-        let pedal_ids = prepare_lfm2_resident_prefix(&mounted, &tensor_index, 11);
+        let pedal_ids = prepare_fixture_model_resident_prefix(&mounted, &tensor_index, 11);
 
-        let runner = create_lfm2_resident_prefix_runner(
+        let runner = create_fixture_model_resident_prefix_runner(
             &device,
             &mounted,
             &mounted_bound,
             &loaded_manifest,
             &pedal_ids,
         );
-        assert_lfm2_resident_prefix_runner(&runner, &pedal_ids, 207, 679, 3312);
+        assert_fixture_model_resident_prefix_runner(&runner, &pedal_ids, 207, 679, 3312);
 
         let run = runner
-            .run_with_stream_control(&device, lfm2_stream_control(&mounted, 0))
+            .run_with_stream_control(&device, fixture_model_stream_control(&mounted, 0))
             .unwrap();
-        assert_lfm2_resident_prefix_run(&run, &pedal_ids, 207);
+        assert_fixture_model_resident_prefix_run(&run, &pedal_ids, 207);
 
         let layer_02_kv = mounted
             .buffers
@@ -15177,29 +15198,29 @@ mod tests {
             }
         };
         let (tensor_index, mounted, _manifest, mounted_bound) =
-            mount_lfm2_single_device_stream_circuit(&device);
-        let Some(loaded_manifest) = lfm2_level_1_loaded_kernel_pack_for_conv_and_attention_families(
+            mount_fixture_model_single_device_stream_circuit(&device);
+        let Some(loaded_manifest) = fixture_model_level_1_loaded_kernel_pack_for_conv_and_attention_families(
             &mounted,
             &mounted_bound,
         ) else {
             eprintln!("skipping resident layer_12 prefix runner: no GLSL to SPIR-V compiler found");
             return;
         };
-        let pedal_ids = prepare_lfm2_resident_prefix(&mounted, &tensor_index, 12);
+        let pedal_ids = prepare_fixture_model_resident_prefix(&mounted, &tensor_index, 12);
 
-        let runner = create_lfm2_resident_prefix_runner(
+        let runner = create_fixture_model_resident_prefix_runner(
             &device,
             &mounted,
             &mounted_bound,
             &loaded_manifest,
             &pedal_ids,
         );
-        assert_lfm2_resident_prefix_runner(&runner, &pedal_ids, 226, 742, 3616);
+        assert_fixture_model_resident_prefix_runner(&runner, &pedal_ids, 226, 742, 3616);
 
         let run = runner
-            .run_with_stream_control(&device, lfm2_stream_control(&mounted, 0))
+            .run_with_stream_control(&device, fixture_model_stream_control(&mounted, 0))
             .unwrap();
-        assert_lfm2_resident_prefix_run(&run, &pedal_ids, 226);
+        assert_fixture_model_resident_prefix_run(&run, &pedal_ids, 226);
 
         let layer_02_kv = mounted
             .buffers
@@ -15279,40 +15300,40 @@ mod tests {
     }
 
     #[test]
-    fn resident_pedalboard_runner_executes_full_lfm2_layer_stack() {
+    fn resident_pedalboard_runner_executes_full_fixture_model_layer_stack() {
         let device = match VulkanComputeDevice::new() {
             Ok(device) => device,
             Err(error) => {
-                eprintln!("skipping resident full LFM2 layer-stack runner: {error}");
+                eprintln!("skipping resident full FIXTURE_MODEL layer-stack runner: {error}");
                 return;
             }
         };
         let (tensor_index, mounted, _manifest, mounted_bound) =
-            mount_lfm2_single_device_stream_circuit(&device);
-        let Some(loaded_manifest) = lfm2_level_1_loaded_kernel_pack_for_conv_and_attention_families(
+            mount_fixture_model_single_device_stream_circuit(&device);
+        let Some(loaded_manifest) = fixture_model_level_1_loaded_kernel_pack_for_conv_and_attention_families(
             &mounted,
             &mounted_bound,
         ) else {
             eprintln!(
-                "skipping resident full LFM2 layer-stack runner: no GLSL to SPIR-V compiler found"
+                "skipping resident full FIXTURE_MODEL layer-stack runner: no GLSL to SPIR-V compiler found"
             );
             return;
         };
-        let pedal_ids = prepare_lfm2_resident_prefix(&mounted, &tensor_index, 13);
+        let pedal_ids = prepare_fixture_model_resident_prefix(&mounted, &tensor_index, 13);
 
-        let runner = create_lfm2_resident_prefix_runner(
+        let runner = create_fixture_model_resident_prefix_runner(
             &device,
             &mounted,
             &mounted_bound,
             &loaded_manifest,
             &pedal_ids,
         );
-        assert_lfm2_resident_prefix_runner(&runner, &pedal_ids, 242, 794, 3872);
+        assert_fixture_model_resident_prefix_runner(&runner, &pedal_ids, 242, 794, 3872);
 
         let run = runner
-            .run_with_stream_control(&device, lfm2_stream_control(&mounted, 0))
+            .run_with_stream_control(&device, fixture_model_stream_control(&mounted, 0))
             .unwrap();
-        assert_lfm2_resident_prefix_run(&run, &pedal_ids, 242);
+        assert_fixture_model_resident_prefix_run(&run, &pedal_ids, 242);
 
         let layer_02_kv = mounted
             .buffers
@@ -15400,8 +15421,8 @@ mod tests {
                 return;
             }
         };
-        let graph = ResolvedLoweredPedalboard::from_index_file(lfm2_index_path()).unwrap();
-        let tensor_index = TensorIndex::from_json_file(lfm2_tensor_index_path()).unwrap();
+        let graph = ResolvedLoweredPedalboard::from_index_file(fixture_model_index_path()).unwrap();
+        let tensor_index = TensorIndex::from_json_file(fixture_model_tensor_index_path()).unwrap();
         let execution_plan =
             StreamCircuitExecutionPlan::from_graph_with_tensor_index(&graph, &tensor_index)
                 .unwrap();
@@ -17347,8 +17368,8 @@ mod tests {
                 return;
             }
         };
-        let graph = ResolvedLoweredPedalboard::from_index_file(lfm2_index_path()).unwrap();
-        let tensor_index = TensorIndex::from_json_file(lfm2_tensor_index_path()).unwrap();
+        let graph = ResolvedLoweredPedalboard::from_index_file(fixture_model_index_path()).unwrap();
+        let tensor_index = TensorIndex::from_json_file(fixture_model_tensor_index_path()).unwrap();
         let execution_plan =
             StreamCircuitExecutionPlan::from_graph_with_tensor_index(&graph, &tensor_index)
                 .unwrap();
@@ -17765,7 +17786,7 @@ mod tests {
 
     #[test]
     fn resident_plan_keeps_sizes_unknown_without_tensor_and_element_metadata() {
-        let graph = ResolvedLoweredPedalboard::from_index_file(lfm2_index_path()).unwrap();
+        let graph = ResolvedLoweredPedalboard::from_index_file(fixture_model_index_path()).unwrap();
         let resource_plan = StreamCircuitResourcePlan::from_graph(&graph).unwrap();
 
         let resident_plan =
@@ -17787,7 +17808,7 @@ mod tests {
     }
 
     #[test]
-    fn allocates_lfm2_per_stream_vulkan_buffers_from_resident_plan() {
+    fn allocates_fixture_model_per_stream_vulkan_buffers_from_resident_plan() {
         let device = match VulkanComputeDevice::new() {
             Ok(device) => device,
             Err(error) => {
@@ -17795,8 +17816,8 @@ mod tests {
                 return;
             }
         };
-        let graph = ResolvedLoweredPedalboard::from_index_file(lfm2_index_path()).unwrap();
-        let tensor_index = TensorIndex::from_json_file(lfm2_tensor_index_path()).unwrap();
+        let graph = ResolvedLoweredPedalboard::from_index_file(fixture_model_index_path()).unwrap();
+        let tensor_index = TensorIndex::from_json_file(fixture_model_tensor_index_path()).unwrap();
         let resource_plan =
             StreamCircuitResourcePlan::from_graph_with_tensor_index(&graph, &tensor_index).unwrap();
         let resident_plan = VulkanStreamCircuitResidentPlan::from_resource_plan(
@@ -17857,9 +17878,9 @@ mod tests {
     }
 
     #[test]
-    fn binds_lfm2_nodes_to_vulkan_resident_resources() {
-        let graph = ResolvedLoweredPedalboard::from_index_file(lfm2_index_path()).unwrap();
-        let tensor_index = TensorIndex::from_json_file(lfm2_tensor_index_path()).unwrap();
+    fn binds_fixture_model_nodes_to_vulkan_resident_resources() {
+        let graph = ResolvedLoweredPedalboard::from_index_file(fixture_model_index_path()).unwrap();
+        let tensor_index = TensorIndex::from_json_file(fixture_model_tensor_index_path()).unwrap();
         let execution_plan =
             StreamCircuitExecutionPlan::from_graph_with_tensor_index(&graph, &tensor_index)
                 .unwrap();
@@ -17982,9 +18003,9 @@ mod tests {
     }
 
     #[test]
-    fn kernel_interfaces_describe_lfm2_compiled_pedal_abi() {
-        let graph = ResolvedLoweredPedalboard::from_index_file(lfm2_index_path()).unwrap();
-        let tensor_index = TensorIndex::from_json_file(lfm2_tensor_index_path()).unwrap();
+    fn kernel_interfaces_describe_fixture_model_compiled_pedal_abi() {
+        let graph = ResolvedLoweredPedalboard::from_index_file(fixture_model_index_path()).unwrap();
+        let tensor_index = TensorIndex::from_json_file(fixture_model_tensor_index_path()).unwrap();
         let execution_plan =
             StreamCircuitExecutionPlan::from_graph_with_tensor_index(&graph, &tensor_index)
                 .unwrap();
@@ -18114,9 +18135,9 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_plan_orders_lfm2_kernel_commands_for_stream_ticks() {
-        let graph = ResolvedLoweredPedalboard::from_index_file(lfm2_index_path()).unwrap();
-        let tensor_index = TensorIndex::from_json_file(lfm2_tensor_index_path()).unwrap();
+    fn dispatch_plan_orders_fixture_model_kernel_commands_for_stream_ticks() {
+        let graph = ResolvedLoweredPedalboard::from_index_file(fixture_model_index_path()).unwrap();
+        let tensor_index = TensorIndex::from_json_file(fixture_model_tensor_index_path()).unwrap();
         let execution_plan =
             StreamCircuitExecutionPlan::from_graph_with_tensor_index(&graph, &tensor_index)
                 .unwrap();
@@ -18245,9 +18266,9 @@ mod tests {
     }
 
     #[test]
-    fn descriptor_resource_plan_resolves_lfm2_dispatch_patch_bay() {
-        let graph = ResolvedLoweredPedalboard::from_index_file(lfm2_index_path()).unwrap();
-        let tensor_index = TensorIndex::from_json_file(lfm2_tensor_index_path()).unwrap();
+    fn descriptor_resource_plan_resolves_fixture_model_dispatch_patch_bay() {
+        let graph = ResolvedLoweredPedalboard::from_index_file(fixture_model_index_path()).unwrap();
+        let tensor_index = TensorIndex::from_json_file(fixture_model_tensor_index_path()).unwrap();
         let execution_plan =
             StreamCircuitExecutionPlan::from_graph_with_tensor_index(&graph, &tensor_index)
                 .unwrap();
@@ -18354,8 +18375,8 @@ mod tests {
 
     #[test]
     fn descriptor_resource_plan_requires_dynamic_capacity_for_kv_state() {
-        let graph = ResolvedLoweredPedalboard::from_index_file(lfm2_index_path()).unwrap();
-        let tensor_index = TensorIndex::from_json_file(lfm2_tensor_index_path()).unwrap();
+        let graph = ResolvedLoweredPedalboard::from_index_file(fixture_model_index_path()).unwrap();
+        let tensor_index = TensorIndex::from_json_file(fixture_model_tensor_index_path()).unwrap();
         let execution_plan =
             StreamCircuitExecutionPlan::from_graph_with_tensor_index(&graph, &tensor_index)
                 .unwrap();
@@ -18386,9 +18407,9 @@ mod tests {
     }
 
     #[test]
-    fn reusable_kernel_plan_collapses_lfm2_dispatches_into_op_families() {
-        let graph = ResolvedLoweredPedalboard::from_index_file(lfm2_index_path()).unwrap();
-        let tensor_index = TensorIndex::from_json_file(lfm2_tensor_index_path()).unwrap();
+    fn reusable_kernel_plan_collapses_fixture_model_dispatches_into_op_families() {
+        let graph = ResolvedLoweredPedalboard::from_index_file(fixture_model_index_path()).unwrap();
+        let tensor_index = TensorIndex::from_json_file(fixture_model_tensor_index_path()).unwrap();
         let execution_plan =
             StreamCircuitExecutionPlan::from_graph_with_tensor_index(&graph, &tensor_index)
                 .unwrap();
@@ -18549,8 +18570,8 @@ mod tests {
 
     #[test]
     fn reusable_kernel_coverage_reports_missing_gpu_pedal_circuits() {
-        let graph = ResolvedLoweredPedalboard::from_index_file(lfm2_index_path()).unwrap();
-        let tensor_index = TensorIndex::from_json_file(lfm2_tensor_index_path()).unwrap();
+        let graph = ResolvedLoweredPedalboard::from_index_file(fixture_model_index_path()).unwrap();
+        let tensor_index = TensorIndex::from_json_file(fixture_model_tensor_index_path()).unwrap();
         let execution_plan =
             StreamCircuitExecutionPlan::from_graph_with_tensor_index(&graph, &tensor_index)
                 .unwrap();
@@ -18619,9 +18640,9 @@ mod tests {
     }
 
     #[test]
-    fn reusable_kernel_artifact_manifest_links_lfm2_kernel_families() {
-        let graph = ResolvedLoweredPedalboard::from_index_file(lfm2_index_path()).unwrap();
-        let tensor_index = TensorIndex::from_json_file(lfm2_tensor_index_path()).unwrap();
+    fn reusable_kernel_artifact_manifest_links_fixture_model_kernel_families() {
+        let graph = ResolvedLoweredPedalboard::from_index_file(fixture_model_index_path()).unwrap();
+        let tensor_index = TensorIndex::from_json_file(fixture_model_tensor_index_path()).unwrap();
         let execution_plan =
             StreamCircuitExecutionPlan::from_graph_with_tensor_index(&graph, &tensor_index)
                 .unwrap();
@@ -18730,8 +18751,8 @@ mod tests {
 
     #[test]
     fn reusable_kernel_link_plan_reports_partial_and_incompatible_artifacts() {
-        let graph = ResolvedLoweredPedalboard::from_index_file(lfm2_index_path()).unwrap();
-        let tensor_index = TensorIndex::from_json_file(lfm2_tensor_index_path()).unwrap();
+        let graph = ResolvedLoweredPedalboard::from_index_file(fixture_model_index_path()).unwrap();
+        let tensor_index = TensorIndex::from_json_file(fixture_model_tensor_index_path()).unwrap();
         let execution_plan =
             StreamCircuitExecutionPlan::from_graph_with_tensor_index(&graph, &tensor_index)
                 .unwrap();
@@ -18822,8 +18843,8 @@ mod tests {
 
     #[test]
     fn prepared_dispatch_plan_links_artifacts_to_descriptor_resources() {
-        let graph = ResolvedLoweredPedalboard::from_index_file(lfm2_index_path()).unwrap();
-        let tensor_index = TensorIndex::from_json_file(lfm2_tensor_index_path()).unwrap();
+        let graph = ResolvedLoweredPedalboard::from_index_file(fixture_model_index_path()).unwrap();
+        let tensor_index = TensorIndex::from_json_file(fixture_model_tensor_index_path()).unwrap();
         let execution_plan =
             StreamCircuitExecutionPlan::from_graph_with_tensor_index(&graph, &tensor_index)
                 .unwrap();
@@ -18918,8 +18939,8 @@ mod tests {
 
     #[test]
     fn prepared_dispatch_plan_rejects_unlinked_reusable_kernels() {
-        let graph = ResolvedLoweredPedalboard::from_index_file(lfm2_index_path()).unwrap();
-        let tensor_index = TensorIndex::from_json_file(lfm2_tensor_index_path()).unwrap();
+        let graph = ResolvedLoweredPedalboard::from_index_file(fixture_model_index_path()).unwrap();
+        let tensor_index = TensorIndex::from_json_file(fixture_model_tensor_index_path()).unwrap();
         let execution_plan =
             StreamCircuitExecutionPlan::from_graph_with_tensor_index(&graph, &tensor_index)
                 .unwrap();
@@ -18977,8 +18998,8 @@ mod tests {
                 return;
             }
         };
-        let graph = ResolvedLoweredPedalboard::from_index_file(lfm2_index_path()).unwrap();
-        let tensor_index = TensorIndex::from_json_file(lfm2_tensor_index_path()).unwrap();
+        let graph = ResolvedLoweredPedalboard::from_index_file(fixture_model_index_path()).unwrap();
+        let tensor_index = TensorIndex::from_json_file(fixture_model_tensor_index_path()).unwrap();
         let execution_plan =
             StreamCircuitExecutionPlan::from_graph_with_tensor_index(&graph, &tensor_index)
                 .unwrap();
@@ -19051,7 +19072,7 @@ mod tests {
             VulkanBoundDescriptorTarget::ActivationSlot {
                 buffer_index: buffers.activation_slot_buffer_index("layer_00", 0).unwrap(),
                 pedal_id: "layer_00".to_string(),
-                circuit_id: "layer_00_exact_lfm2_conv_circuit_v1".to_string(),
+                circuit_id: "layer_00_shortconv_circuit_v1".to_string(),
                 slot: 0,
                 byte_capacity: 5120,
             }
@@ -19096,7 +19117,7 @@ mod tests {
     }
 
     #[test]
-    fn mounts_lfm2_stream_circuit_resources_without_claiming_execution() {
+    fn mounts_fixture_model_stream_circuit_resources_without_claiming_execution() {
         let device = match VulkanComputeDevice::new() {
             Ok(device) => device,
             Err(error) => {
@@ -19104,8 +19125,8 @@ mod tests {
                 return;
             }
         };
-        let graph = ResolvedLoweredPedalboard::from_index_file(lfm2_index_path()).unwrap();
-        let tensor_index = TensorIndex::from_json_file(lfm2_tensor_index_path()).unwrap();
+        let graph = ResolvedLoweredPedalboard::from_index_file(fixture_model_index_path()).unwrap();
+        let tensor_index = TensorIndex::from_json_file(fixture_model_tensor_index_path()).unwrap();
         let execution_plan =
             StreamCircuitExecutionPlan::from_graph_with_tensor_index(&graph, &tensor_index)
                 .unwrap();

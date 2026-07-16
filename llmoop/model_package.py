@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import shutil
-import sys
+from hashlib import blake2s
 from pathlib import Path
 
 from llmoop.circuit_lowering import lower_pedalboard
@@ -12,12 +12,12 @@ from llmoop.model_compiler import (
     ModelCompileError,
     read_json,
     relative_json_path,
-    sanitize_slug,
     write_json,
 )
+from llmoop.model_transpiler import transpile_model
 
 
-def compile_lfm2_model(
+def compile_model_package(
     model_dir: Path,
     *,
     transpiled_dir: Path | None,
@@ -26,11 +26,11 @@ def compile_lfm2_model(
     shader_source_dir: Path,
     default_dynamic_state_capacity_activations: int,
 ) -> CompiledModelReport:
-    slug = lfm2_compiled_model_slug(model_dir)
+    slug = compiled_model_slug(model_dir)
     transpiled_dir = transpiled_dir or Path("transpiled") / slug
     lowered_dir = lowered_dir or Path("lowered") / slug
 
-    transpile_lfm2(model_dir, transpiled_dir, clean=clean)
+    structure = transpile_model(model_dir, transpiled_dir, clean=clean)
     lowered = lower_pedalboard(transpiled_dir, lowered_dir)
     tensor_index = read_json(transpiled_dir / "tensors.json")
     model_graph = read_json(transpiled_dir / "model.json")
@@ -40,6 +40,7 @@ def compile_lfm2_model(
         lowered_index=lowered["index"],
         lowered_dir=lowered_dir,
         transpiled_dir=transpiled_dir,
+        package_id=f"{slug}_vulkan_resident_greedy",
         shader_source_dir=shader_source_dir,
         default_dynamic_state_capacity_activations=default_dynamic_state_capacity_activations,
     )
@@ -51,22 +52,10 @@ def compile_lfm2_model(
         transpiled_dir=transpiled_dir,
         lowered_dir=lowered_dir,
         package_manifest=package_manifest_path,
-        model_type="lfm2",
+        model_type=structure.model_type or "unknown",
         circuit_count=lowered["index"]["summary"]["circuit_count"],
         shader_count=len(list((lowered_dir / "shaders").glob("*.comp"))),
     )
-
-
-def transpile_lfm2(model_dir: Path, transpiled_dir: Path, *, clean: bool) -> None:
-    try:
-        from tools.transpile_lfm2 import transpile
-    except ModuleNotFoundError:
-        root = Path(__file__).resolve().parents[2]
-        if str(root) not in sys.path:
-            sys.path.insert(0, str(root))
-        from tools.transpile_lfm2 import transpile
-
-    transpile(model_dir, transpiled_dir, clean=clean)
 
 
 def build_vulkan_resident_greedy_package_manifest(
@@ -76,6 +65,7 @@ def build_vulkan_resident_greedy_package_manifest(
     lowered_index: Json,
     lowered_dir: Path,
     transpiled_dir: Path,
+    package_id: str,
     shader_source_dir: Path,
     default_dynamic_state_capacity_activations: int,
 ) -> Json:
@@ -115,7 +105,7 @@ def build_vulkan_resident_greedy_package_manifest(
 
     return {
         "schema": PACKAGE_SCHEMA,
-        "package_id": f"{lfm2_compiled_model_slug(Path(model_graph['source']['model_dir']))}_vulkan_resident_greedy",
+        "package_id": package_id,
         "device_id": "gpu0",
         "circuit_index_path": "pedalboard.circuits.json",
         "tensor_index_path": relative_json_path(lowered_dir, transpiled_dir / "tensors.json"),
@@ -371,5 +361,6 @@ def dtype_byte_count(dtype: str) -> int:
         raise ModelCompileError(f"unsupported dtype {dtype!r}") from error
 
 
-def lfm2_compiled_model_slug(model_dir: Path) -> str:
-    return sanitize_slug(f"{model_dir.parent.name}_{model_dir.name}")
+def compiled_model_slug(model_dir: Path) -> str:
+    digest = blake2s(str(model_dir.resolve()).encode("utf-8"), digest_size=4).hexdigest()
+    return f"model_{digest}"

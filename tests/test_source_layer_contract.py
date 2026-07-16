@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import importlib.util
 import unittest
-from pathlib import Path
 
-from llmoop.source_oracle import check_lfm2_source_model_contract
+from llmoop.source_oracle import check_source_model_contract
+from tests.fixtures import compiled_model_or_skip
 
 
 ORACLE_DEPS_AVAILABLE = all(importlib.util.find_spec(name) is not None for name in ("torch", "transformers"))
@@ -12,10 +12,11 @@ ORACLE_DEPS_AVAILABLE = all(importlib.util.find_spec(name) is not None for name 
 
 @unittest.skipUnless(ORACLE_DEPS_AVAILABLE, "source oracle dependencies are not installed")
 class SourceLayerContractTest(unittest.TestCase):
-    def test_all_layers_match_real_lfm2_contracts(self) -> None:
-        report = check_lfm2_source_model_contract(
-            model_dir=Path("/home/aristath/models/lfm2.5/230m"),
-            pedals_dir=Path("transpiled/lfm2_5_230m/layers"),
+    def test_all_layers_match_real_source_contracts(self) -> None:
+        fixture = compiled_model_or_skip()
+        report = check_source_model_contract(
+            model_dir=fixture.source_model_dir,
+            pedals_dir=fixture.transpiled_dir / "layers",
         )
 
         self.assertTrue(report.ok, report.errors)

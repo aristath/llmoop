@@ -119,20 +119,24 @@ class CircuitModelRuntime:
         config: Json,
         board: CircuitPedalboard,
         tensor_store: SafetensorsTensorStore,
+        input_embedding_tensor: str,
+        output_norm_tensor: str,
+        output_projection_tensor: str,
     ) -> None:
         self.torch = torch
         self.config = config
         self.board = board
         self.tensor_store = tensor_store
-        self.embed_tokens_weight = tensor_store.get("model.embed_tokens.weight")
-        self.embedding_norm_weight = tensor_store.get("model.embedding_norm.weight")
+        self.embed_tokens_weight = tensor_store.get(input_embedding_tensor)
+        self.embedding_norm_weight = tensor_store.get(output_norm_tensor)
+        self.output_projection_weight = tensor_store.get(output_projection_tensor)
         self.pedals = tuple(self._build_pedal(pedal) for pedal in board.pedals)
         self.inv_freq, self.attention_scaling = self._build_rope_parameters()
 
     @classmethod
     def from_dirs(
         cls,
-        circuit_dir: Path = Path("lowered/lfm2_5_230m"),
+        circuit_dir: Path,
         model_dir: Path | None = None,
         torch: Any | None = None,
     ) -> "CircuitModelRuntime":
@@ -153,7 +157,27 @@ class CircuitModelRuntime:
             dtype=torch.float32,
             tensor_index=tensor_index if tensor_index.exists() else None,
         )
-        return cls(torch=torch, config=config, board=board, tensor_store=tensor_store)
+        input_embedding_tensor = board.index["graph"]["input_transducer"]["params"]["weight"]["tensor"]
+        output_components = board.index["graph"]["output_transducer"]["components"]
+        output_norm_tensor = next(
+            component["params"]["weight"]["tensor"]
+            for component in output_components
+            if component["type"] == "rms_norm"
+        )
+        output_projection_tensor = next(
+            component["params"]["weight"]["tensor"]
+            for component in output_components
+            if component["type"] == "linear_projection"
+        )
+        return cls(
+            torch=torch,
+            config=config,
+            board=board,
+            tensor_store=tensor_store,
+            input_embedding_tensor=input_embedding_tensor,
+            output_norm_tensor=output_norm_tensor,
+            output_projection_tensor=output_projection_tensor,
+        )
 
     def open_stream(self) -> "CircuitModelStream":
         return CircuitModelStream(runtime=self)
@@ -216,7 +240,7 @@ class CircuitModelRuntime:
             )
 
         hidden = self.rms_norm(hidden, self.embedding_norm_weight)
-        logits = self.torch.nn.functional.linear(hidden, self.embed_tokens_weight)
+        logits = self.torch.nn.functional.linear(hidden, self.output_projection_weight)
         return CircuitModelOutput(
             input_ids=tuple(int(token) for token in input_ids),
             hidden_states=hidden,

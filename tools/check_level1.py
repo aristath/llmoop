@@ -17,7 +17,7 @@ from llmoop.validation import validate_pedalboard
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run the level-1 symbolic llmoop acceptance checks.")
-    parser.add_argument("--model-dir", type=Path, default=Path("transpiled/lfm2_5_230m"))
+    parser.add_argument("--model-dir", type=Path, required=True)
     args = parser.parse_args()
 
     pedalboard = Pedalboard.from_dir(args.model_dir)

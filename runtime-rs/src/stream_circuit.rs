@@ -1530,25 +1530,42 @@ fn product(shape: &[usize]) -> Option<usize> {
 mod tests {
     use super::*;
 
-    fn lfm2_index_path() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
+    fn compiled_artifact_dir(env_var: &str, root_name: &str, marker_file: &str) -> PathBuf {
+        if let Ok(path) = std::env::var(env_var) {
+            return PathBuf::from(path);
+        }
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("..")
-            .join("lowered")
-            .join("lfm2_5_230m")
-            .join("pedalboard.circuits.json")
+            .join(root_name);
+        let mut candidates = std::fs::read_dir(&root)
+            .unwrap_or_else(|_| panic!("set {env_var} or compile a model into {}", root.display()))
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.is_dir() && path.join(marker_file).exists())
+            .collect::<Vec<_>>();
+        candidates.sort();
+        candidates
+            .pop()
+            .unwrap_or_else(|| panic!("set {env_var} or compile a model into {}", root.display()))
     }
 
-    fn lfm2_tensor_index_path() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("transpiled")
-            .join("lfm2_5_230m")
+    fn fixture_model_index_path() -> PathBuf {
+        compiled_artifact_dir(
+            "LLMOOP_TEST_LOWERED_DIR",
+            "lowered",
+            "pedalboard.circuits.json",
+        )
+        .join("pedalboard.circuits.json")
+    }
+
+    fn fixture_model_tensor_index_path() -> PathBuf {
+        compiled_artifact_dir("LLMOOP_TEST_TRANSPILED_DIR", "transpiled", "tensors.json")
             .join("tensors.json")
     }
 
     #[test]
-    fn loads_lfm2_lowered_pedalboard_as_runtime_circuit_graph() {
-        let resolved = ResolvedLoweredPedalboard::from_index_file(lfm2_index_path()).unwrap();
+    fn loads_fixture_model_lowered_pedalboard_as_runtime_circuit_graph() {
+        let resolved = ResolvedLoweredPedalboard::from_index_file(fixture_model_index_path()).unwrap();
         let summary = resolved.summary();
 
         assert_eq!(resolved.index.schema, LOWERED_PEDALBOARD_SCHEMA);
@@ -1565,7 +1582,7 @@ mod tests {
         );
         assert_eq!(
             resolved.circuits[0].circuit.implementation,
-            "exact_lowering_lfm2_conv_layer_v1"
+            "reference_shortconv_layer_circuit_v1"
         );
         assert_eq!(
             resolved.circuits[2].circuit.state_ports[0].state_type,
@@ -1575,20 +1592,17 @@ mod tests {
 
     #[test]
     fn lowered_pedalboard_can_describe_an_installed_processor_manifest() {
-        let resolved = ResolvedLoweredPedalboard::from_index_file(lfm2_index_path()).unwrap();
+        let resolved = ResolvedLoweredPedalboard::from_index_file(fixture_model_index_path()).unwrap();
 
         let manifest = resolved
-            .to_installed_processor_manifest("lfm2_5_230m_stream_circuit", "stream_circuit_ir");
+            .to_installed_processor_manifest("compiled_model_stream_circuit", "stream_circuit_ir");
 
-        assert_eq!(manifest.install_id, "lfm2_5_230m_stream_circuit");
+        assert_eq!(manifest.install_id, "compiled_model_stream_circuit");
         assert_eq!(manifest.backend, "stream_circuit_ir");
         assert_eq!(manifest.permanent_circuit.pedal_count, 14);
         assert_eq!(manifest.permanent_circuit.input_signal, "frame");
         assert_eq!(manifest.permanent_circuit.output_signal, "frame");
-        assert_eq!(
-            manifest.permanent_circuit.source_model_dir.as_deref(),
-            Some("/home/aristath/models/lfm2.5/230m")
-        );
+        assert!(manifest.permanent_circuit.source_model_dir.is_some());
         assert_eq!(manifest.stream_template.state_allocations.len(), 14);
         assert!(
             manifest
@@ -1614,8 +1628,8 @@ mod tests {
     #[test]
     fn installed_stream_circuit_creates_stream_transient_template() {
         let installed = InstalledStreamCircuit::from_index_file(
-            lfm2_index_path(),
-            "lfm2_5_230m_stream_circuit",
+            fixture_model_index_path(),
+            "compiled_model_stream_circuit",
             "stream_circuit_ir",
         )
         .unwrap();
@@ -1652,7 +1666,7 @@ mod tests {
 
     #[test]
     fn placement_plan_keeps_layer_pedals_as_deployable_units() {
-        let resolved = ResolvedLoweredPedalboard::from_index_file(lfm2_index_path()).unwrap();
+        let resolved = ResolvedLoweredPedalboard::from_index_file(fixture_model_index_path()).unwrap();
 
         let placement = resolved.single_device_placement_plan("gpu0").unwrap();
 
@@ -1667,7 +1681,7 @@ mod tests {
             &PedalPlacement {
                 pedal_index: 0,
                 pedal_id: "layer_00".to_string(),
-                circuit_id: "layer_00_exact_lfm2_conv_circuit_v1".to_string(),
+                circuit_id: "layer_00_shortconv_circuit_v1".to_string(),
                 operator_type: "conv".to_string(),
                 device_id: "gpu0".to_string(),
             }
@@ -1692,7 +1706,7 @@ mod tests {
 
     #[test]
     fn placement_plan_changes_cables_not_pedalboard_when_devices_differ() {
-        let resolved = ResolvedLoweredPedalboard::from_index_file(lfm2_index_path()).unwrap();
+        let resolved = ResolvedLoweredPedalboard::from_index_file(fixture_model_index_path()).unwrap();
         let spec = StreamCircuitPlacementSpec::new("gpu0")
             .with_pedal_device("layer_01", "cpu0")
             .with_pedal_device("layer_02", "gpu1")
@@ -1759,7 +1773,7 @@ mod tests {
 
     #[test]
     fn placement_plan_rejects_unknown_pedal_overrides() {
-        let resolved = ResolvedLoweredPedalboard::from_index_file(lfm2_index_path()).unwrap();
+        let resolved = ResolvedLoweredPedalboard::from_index_file(fixture_model_index_path()).unwrap();
         let spec = StreamCircuitPlacementSpec::new("gpu0").with_pedal_device("layer_99", "gpu1");
 
         let error = resolved.placement_plan(&spec).unwrap_err();
@@ -1771,12 +1785,12 @@ mod tests {
     #[test]
     fn installed_stream_circuit_exposes_mount_plans() {
         let installed = InstalledStreamCircuit::from_index_file(
-            lfm2_index_path(),
-            "lfm2_5_230m_stream_circuit",
+            fixture_model_index_path(),
+            "compiled_model_stream_circuit",
             "stream_circuit_ir",
         )
         .unwrap();
-        let tensor_index = TensorIndex::from_json_file(lfm2_tensor_index_path()).unwrap();
+        let tensor_index = TensorIndex::from_json_file(fixture_model_tensor_index_path()).unwrap();
 
         let execution_plan = installed.execution_plan().unwrap();
         let resource_plan = installed.resource_plan().unwrap();
@@ -1808,8 +1822,8 @@ mod tests {
     #[test]
     fn stream_circuit_capability_report_names_missing_executors() {
         let installed = InstalledStreamCircuit::from_index_file(
-            lfm2_index_path(),
-            "lfm2_5_230m_stream_circuit",
+            fixture_model_index_path(),
+            "compiled_model_stream_circuit",
             "stream_circuit_ir",
         )
         .unwrap();
@@ -1849,8 +1863,8 @@ mod tests {
     #[test]
     fn stream_circuit_capability_report_can_mark_graph_executable() {
         let installed = InstalledStreamCircuit::from_index_file(
-            lfm2_index_path(),
-            "lfm2_5_230m_stream_circuit",
+            fixture_model_index_path(),
+            "compiled_model_stream_circuit",
             "stream_circuit_ir",
         )
         .unwrap();
@@ -1872,7 +1886,7 @@ mod tests {
         let capabilities = StreamCircuitBackendCapabilities::new("stream_circuit_ir");
         let mut backend = StreamCircuitDeviceBackend::from_index_file(
             "device_0",
-            lfm2_index_path(),
+            fixture_model_index_path(),
             capabilities,
         )
         .unwrap();
@@ -1885,7 +1899,7 @@ mod tests {
         let manifest = backend.describe();
         let template = backend.stream_template("s0").unwrap();
         let resource_plan = backend.resource_plan().unwrap();
-        let tensor_index = TensorIndex::from_json_file(lfm2_tensor_index_path()).unwrap();
+        let tensor_index = TensorIndex::from_json_file(fixture_model_tensor_index_path()).unwrap();
         let shaped_resource_plan = backend
             .resource_plan_with_tensor_index(&tensor_index)
             .unwrap();
@@ -1922,7 +1936,7 @@ mod tests {
         let capabilities = StreamCircuitBackendCapabilities::new("stream_circuit_ir");
         let mut backend = StreamCircuitDeviceBackend::from_index_file(
             "device_0",
-            lfm2_index_path(),
+            fixture_model_index_path(),
             capabilities,
         )
         .unwrap();
