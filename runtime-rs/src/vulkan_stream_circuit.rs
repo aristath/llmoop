@@ -5036,8 +5036,47 @@ pub struct VulkanResidentTokenRuntimeSchedulerSnapshot {
 pub struct VulkanResidentTokenEngine {
     scheduler: VulkanResidentTokenRuntimeScheduler,
     streams: BTreeMap<String, VulkanResidentTokenEngineStream>,
-    models: BTreeMap<String, Arc<VulkanLfm2ResidentGreedyStreamProcessorModel>>,
+    models: BTreeMap<String, Arc<dyn VulkanResidentTokenModelPackage>>,
     device: VulkanComputeDevice,
+}
+
+pub trait VulkanResidentTokenModelPackage {
+    fn device_id(&self) -> &str;
+
+    fn dynamic_state_capacity_activations(&self) -> usize;
+
+    fn permanent_parameter_count(&self) -> usize;
+
+    fn permanent_parameter_bytes(&self) -> usize;
+
+    fn transducer_parameter_count(&self) -> usize;
+
+    fn transducer_parameter_bytes(&self) -> usize;
+
+    fn reusable_kernel_word_count(&self) -> usize;
+
+    fn create_stream_processor(
+        &self,
+        device: &VulkanComputeDevice,
+    ) -> Result<VulkanResidentGreedyStreamProcessor, VulkanResidentTokenModelPackageError>;
+
+    fn snapshot(
+        &self,
+        model_id: String,
+        registered_stream_count: usize,
+    ) -> VulkanResidentTokenEngineModelSnapshot {
+        VulkanResidentTokenEngineModelSnapshot {
+            model_id,
+            device_id: self.device_id().to_string(),
+            dynamic_state_capacity_activations: self.dynamic_state_capacity_activations(),
+            permanent_parameter_count: self.permanent_parameter_count(),
+            permanent_parameter_bytes: self.permanent_parameter_bytes(),
+            transducer_parameter_count: self.transducer_parameter_count(),
+            transducer_parameter_bytes: self.transducer_parameter_bytes(),
+            reusable_kernel_word_count: self.reusable_kernel_word_count(),
+            registered_stream_count,
+        }
+    }
 }
 
 impl VulkanResidentTokenEngine {
@@ -5048,17 +5087,6 @@ impl VulkanResidentTokenEngine {
             models: BTreeMap::new(),
             device,
         }
-    }
-
-    pub fn default_lfm2_5_230m(
-        stream_id: impl Into<String>,
-        dynamic_state_capacity_activations: usize,
-    ) -> Result<Self, VulkanResidentTokenEngineError> {
-        let device = VulkanComputeDevice::new()?;
-        let mut engine = Self::new(device);
-        engine.load_default_lfm2_5_230m_model("lfm2_5_230m", dynamic_state_capacity_activations)?;
-        engine.create_stream_from_model("lfm2_5_230m", stream_id)?;
-        Ok(engine)
     }
 
     pub fn from_processor(
@@ -5084,39 +5112,27 @@ impl VulkanResidentTokenEngine {
         )
     }
 
-    pub fn load_default_lfm2_5_230m_model(
+    pub fn add_model_package<M>(
         &mut self,
         model_id: impl Into<String>,
-        dynamic_state_capacity_activations: usize,
-    ) -> Result<VulkanResidentTokenEngineModelSnapshot, VulkanResidentTokenEngineError> {
-        let model = VulkanLfm2ResidentGreedyStreamProcessorModel::default_for_capacity(
-            &self.device,
-            dynamic_state_capacity_activations,
-        )?;
-        self.add_lfm2_model(model_id, model)
+        model: M,
+    ) -> Result<VulkanResidentTokenEngineModelSnapshot, VulkanResidentTokenEngineError>
+    where
+        M: VulkanResidentTokenModelPackage + 'static,
+    {
+        self.add_model_package_arc(model_id, Arc::new(model))
     }
 
-    pub fn add_lfm2_model(
+    fn add_model_package_arc(
         &mut self,
         model_id: impl Into<String>,
-        model: VulkanLfm2ResidentGreedyStreamProcessorModel,
+        model: Arc<dyn VulkanResidentTokenModelPackage>,
     ) -> Result<VulkanResidentTokenEngineModelSnapshot, VulkanResidentTokenEngineError> {
         let model_id = model_id.into();
         if self.models.contains_key(&model_id) {
             return Err(VulkanResidentTokenEngineError::DuplicateModel(model_id));
         }
-        let model = Arc::new(model);
-        let snapshot = VulkanResidentTokenEngineModelSnapshot {
-            model_id: model_id.clone(),
-            device_id: model.device_id.clone(),
-            dynamic_state_capacity_activations: model.dynamic_state_capacity_activations,
-            permanent_parameter_count: model.permanent_parameter_count,
-            permanent_parameter_bytes: model.permanent_parameter_bytes,
-            transducer_parameter_count: model.transducer_parameter_count,
-            transducer_parameter_bytes: model.transducer_parameter_bytes,
-            reusable_kernel_word_count: model.reusable_kernel_word_count,
-            registered_stream_count: 0,
-        };
+        let snapshot = model.snapshot(model_id.clone(), 0);
         self.models.insert(model_id, model);
         Ok(snapshot)
     }
@@ -5611,16 +5627,11 @@ impl VulkanResidentTokenEngine {
         let models = self
             .models
             .iter()
-            .map(|(model_id, model)| VulkanResidentTokenEngineModelSnapshot {
-                model_id: model_id.clone(),
-                device_id: model.device_id.clone(),
-                dynamic_state_capacity_activations: model.dynamic_state_capacity_activations,
-                permanent_parameter_count: model.permanent_parameter_count,
-                permanent_parameter_bytes: model.permanent_parameter_bytes,
-                transducer_parameter_count: model.transducer_parameter_count,
-                transducer_parameter_bytes: model.transducer_parameter_bytes,
-                reusable_kernel_word_count: model.reusable_kernel_word_count,
-                registered_stream_count: stream_counts_by_model.get(model_id).copied().unwrap_or(0),
+            .map(|(model_id, model)| {
+                model.snapshot(
+                    model_id.clone(),
+                    stream_counts_by_model.get(model_id).copied().unwrap_or(0),
+                )
             })
             .collect();
         VulkanResidentTokenEngineSnapshot {
@@ -5671,6 +5682,27 @@ pub struct VulkanResidentTokenEngineSnapshot {
     pub streams: Vec<VulkanResidentTokenEngineStream>,
     pub models: Vec<VulkanResidentTokenEngineModelSnapshot>,
 }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanResidentTokenModelPackageError {
+    message: String,
+}
+
+impl VulkanResidentTokenModelPackageError {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl Display for VulkanResidentTokenModelPackageError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl Error for VulkanResidentTokenModelPackageError {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VulkanResidentTokenEngineRunBudget {
@@ -5983,7 +6015,7 @@ impl Error for VulkanResidentTokenTextCodecError {}
 #[derive(Debug)]
 pub enum VulkanResidentTokenEngineError {
     Device(VulkanError),
-    Build(VulkanLfm2ResidentGreedyStreamProcessorBuildError),
+    Build(VulkanResidentTokenModelPackageError),
     Scheduler(VulkanResidentTokenRuntimeSchedulerError),
     TextCodec(VulkanResidentTokenTextCodecError),
     DuplicateModel(String),
@@ -6026,9 +6058,15 @@ impl From<VulkanError> for VulkanResidentTokenEngineError {
     }
 }
 
+impl From<VulkanResidentTokenModelPackageError> for VulkanResidentTokenEngineError {
+    fn from(error: VulkanResidentTokenModelPackageError) -> Self {
+        Self::Build(error)
+    }
+}
+
 impl From<VulkanLfm2ResidentGreedyStreamProcessorBuildError> for VulkanResidentTokenEngineError {
     fn from(error: VulkanLfm2ResidentGreedyStreamProcessorBuildError) -> Self {
-        Self::Build(error)
+        Self::Build(error.into())
     }
 }
 
@@ -10407,6 +10445,14 @@ impl Display for VulkanLfm2ResidentGreedyStreamProcessorBuildError {
 
 impl Error for VulkanLfm2ResidentGreedyStreamProcessorBuildError {}
 
+impl From<VulkanLfm2ResidentGreedyStreamProcessorBuildError>
+    for VulkanResidentTokenModelPackageError
+{
+    fn from(error: VulkanLfm2ResidentGreedyStreamProcessorBuildError) -> Self {
+        Self::new(error.to_string())
+    }
+}
+
 pub fn default_lfm2_5_230m_circuit_index_path() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("..")
@@ -10656,6 +10702,44 @@ impl VulkanLfm2ResidentGreedyStreamProcessorModel {
             self.transducer_parameter_buffers.clone(),
             loop_runner,
         ))
+    }
+}
+
+impl VulkanResidentTokenModelPackage for VulkanLfm2ResidentGreedyStreamProcessorModel {
+    fn device_id(&self) -> &str {
+        &self.device_id
+    }
+
+    fn dynamic_state_capacity_activations(&self) -> usize {
+        self.dynamic_state_capacity_activations
+    }
+
+    fn permanent_parameter_count(&self) -> usize {
+        self.permanent_parameter_count
+    }
+
+    fn permanent_parameter_bytes(&self) -> usize {
+        self.permanent_parameter_bytes
+    }
+
+    fn transducer_parameter_count(&self) -> usize {
+        self.transducer_parameter_count
+    }
+
+    fn transducer_parameter_bytes(&self) -> usize {
+        self.transducer_parameter_bytes
+    }
+
+    fn reusable_kernel_word_count(&self) -> usize {
+        self.reusable_kernel_word_count
+    }
+
+    fn create_stream_processor(
+        &self,
+        device: &VulkanComputeDevice,
+    ) -> Result<VulkanResidentGreedyStreamProcessor, VulkanResidentTokenModelPackageError> {
+        VulkanLfm2ResidentGreedyStreamProcessorModel::create_stream_processor(self, device)
+            .map_err(Into::into)
     }
 }
 
@@ -13788,10 +13872,10 @@ mod tests {
                 return;
             }
         };
+        let model =
+            VulkanLfm2ResidentGreedyStreamProcessorModel::default_for_capacity(&device, 8).unwrap();
         let mut engine = VulkanResidentTokenEngine::new(device);
-        engine
-            .load_default_lfm2_5_230m_model("shared_lfm2", 8)
-            .unwrap();
+        engine.add_model_package("shared_lfm2", model).unwrap();
         engine
             .create_stream_from_model("shared_lfm2", "text_batch_stream_a")
             .unwrap();
@@ -13924,10 +14008,10 @@ mod tests {
                 return;
             }
         };
+        let model =
+            VulkanLfm2ResidentGreedyStreamProcessorModel::default_for_capacity(&device, 8).unwrap();
         let mut engine = VulkanResidentTokenEngine::new(device);
-        let loaded_model = engine
-            .load_default_lfm2_5_230m_model("shared_lfm2", 8)
-            .unwrap();
+        let loaded_model = engine.add_model_package("shared_lfm2", model).unwrap();
         assert_eq!(loaded_model.model_id, "shared_lfm2");
         assert_eq!(loaded_model.device_id, "gpu0");
         assert_eq!(loaded_model.registered_stream_count, 0);

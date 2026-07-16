@@ -3,6 +3,7 @@ use std::io;
 use std::path::PathBuf;
 
 use llmoop_runtime::{
+    VulkanComputeDevice, VulkanLfm2ResidentGreedyStreamProcessorModel,
     VulkanResidentHfTokenizerTextCodec, VulkanResidentTokenEngine,
     VulkanResidentTokenEngineLiveTextTurnRun, VulkanResidentTokenEngineRunBudget,
     VulkanResidentTokenEngineRunStopCondition, VulkanResidentTokenRuntimeCycleRun,
@@ -61,7 +62,12 @@ fn run() -> Result<(), Box<dyn Error>> {
         .with_add_special_tokens(args.add_special_tokens)
         .with_skip_special_tokens(args.skip_special_tokens);
     let stream_id = "demo_text_stream";
-    let mut engine = VulkanResidentTokenEngine::default_lfm2_5_230m(stream_id, args.capacity)?;
+    let device = VulkanComputeDevice::new()?;
+    let model =
+        VulkanLfm2ResidentGreedyStreamProcessorModel::default_for_capacity(&device, args.capacity)?;
+    let mut engine = VulkanResidentTokenEngine::new(device);
+    engine.add_model_package("demo_model", model)?;
+    engine.create_stream_from_model("demo_model", stream_id)?;
     let stream = engine
         .stream(stream_id)
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "demo stream was not registered"))?;

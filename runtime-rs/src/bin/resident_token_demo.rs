@@ -2,9 +2,10 @@ use std::error::Error;
 use std::io;
 
 use llmoop_runtime::{
-    VulkanResidentTokenEngine, VulkanResidentTokenEngineRunBudget,
-    VulkanResidentTokenEngineRunStopCondition, VulkanResidentTokenEngineSubmittedInputRun,
-    VulkanResidentTokenRuntimeCycleRun, VulkanResidentTokenRuntimeCycleStopCondition,
+    VulkanComputeDevice, VulkanLfm2ResidentGreedyStreamProcessorModel, VulkanResidentTokenEngine,
+    VulkanResidentTokenEngineRunBudget, VulkanResidentTokenEngineRunStopCondition,
+    VulkanResidentTokenEngineSubmittedInputRun, VulkanResidentTokenRuntimeCycleRun,
+    VulkanResidentTokenRuntimeCycleStopCondition,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -50,7 +51,12 @@ fn run() -> Result<(), Box<dyn Error>> {
 
     let args = parse_args().map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
     let stream_id = "demo_stream";
-    let mut engine = VulkanResidentTokenEngine::default_lfm2_5_230m(stream_id, args.capacity)?;
+    let device = VulkanComputeDevice::new()?;
+    let model =
+        VulkanLfm2ResidentGreedyStreamProcessorModel::default_for_capacity(&device, args.capacity)?;
+    let mut engine = VulkanResidentTokenEngine::new(device);
+    engine.add_model_package("demo_model", model)?;
+    engine.create_stream_from_model("demo_model", stream_id)?;
     let stream = engine
         .stream(stream_id)
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "demo stream was not registered"))?;
