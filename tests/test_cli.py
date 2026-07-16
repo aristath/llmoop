@@ -34,7 +34,6 @@ class RuntimeCliCommandTest(unittest.TestCase):
         args = Namespace(
             prompt="Hello",
             max_new_tokens=4,
-            model_dir=Path("/models/example"),
             capacity=8,
             no_special_tokens=True,
             keep_special_tokens=True,
@@ -52,8 +51,6 @@ class RuntimeCliCommandTest(unittest.TestCase):
                 "Hello",
                 "--max-new-tokens",
                 "4",
-                "--model-dir",
-                "/models/example",
                 "--capacity",
                 "8",
                 "--no-special-tokens",

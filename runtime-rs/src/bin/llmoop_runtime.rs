@@ -3,7 +3,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use llmoop_runtime::{
-    LoweredPedalboard, VulkanComputeDevice, VulkanResidentGreedyModelPackage,
+    VulkanComputeDevice, VulkanResidentGreedyModelPackage,
     VulkanResidentGreedyModelPackageManifest, VulkanResidentHfTokenizerTextCodec,
     VulkanResidentTokenEngine, VulkanResidentTokenEngineRunBudget,
     VulkanResidentTokenEngineRunStopCondition, VulkanResidentTokenTextCodec,
@@ -13,7 +13,6 @@ use serde_json::json;
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Args {
     package_manifest: Option<PathBuf>,
-    model_dir: Option<PathBuf>,
     prompt: Option<String>,
     max_new_tokens: usize,
     capacity: Option<usize>,
@@ -29,7 +28,6 @@ impl Default for Args {
     fn default() -> Self {
         Self {
             package_manifest: None,
-            model_dir: None,
             prompt: None,
             max_new_tokens: 4,
             capacity: None,
@@ -70,16 +68,8 @@ fn run() -> Result<(), Box<dyn Error>> {
         .prompt
         .as_ref()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "--prompt is required"))?;
-    let model_dir = match args.model_dir.clone() {
-        Some(model_dir) => model_dir,
-        None => infer_model_dir_from_package(package_manifest)?.ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "--model-dir is required when the compiled package cannot infer a tokenizer path",
-            )
-        })?,
-    };
-    let codec = VulkanResidentHfTokenizerTextCodec::from_model_dir(&model_dir)?
+    let tokenizer_dir = tokenizer_dir_from_package(package_manifest)?;
+    let codec = VulkanResidentHfTokenizerTextCodec::from_model_dir(&tokenizer_dir)?
         .with_add_special_tokens(args.add_special_tokens)
         .with_skip_special_tokens(args.skip_special_tokens);
     let prompt_ids = codec.encode_text(prompt)?;
@@ -124,7 +114,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             serde_json::to_string_pretty(&json!({
                 "ok": true,
                 "package_manifest": package_manifest,
-                "model_dir": model_dir,
+                "tokenizer_dir": tokenizer_dir,
                 "device_name": snapshot.device_name,
                 "device_id": stream.device_id,
                 "pedal_count": stream.pedal_count,
@@ -156,33 +146,23 @@ fn run() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn infer_model_dir_from_package(
-    package_manifest: &Path,
-) -> Result<Option<PathBuf>, Box<dyn Error>> {
+fn tokenizer_dir_from_package(package_manifest: &Path) -> Result<PathBuf, Box<dyn Error>> {
     let manifest = VulkanResidentGreedyModelPackageManifest::from_json_file(package_manifest)?;
     let manifest_dir = package_manifest
         .parent()
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
-    if let Some(tokenizer) = &manifest.tokenizer {
-        let tokenizer_dir = resolve_package_path(&manifest_dir, &tokenizer.path);
-        if !tokenizer_dir.join("tokenizer.json").is_file() {
-            return Err(Box::new(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "compiled package declares tokenizer at {}, but tokenizer.json is missing",
-                    tokenizer_dir.display()
-                ),
-            )));
-        }
-        return Ok(Some(tokenizer_dir));
+    let tokenizer_dir = resolve_package_path(&manifest_dir, &manifest.tokenizer.path);
+    if !tokenizer_dir.join("tokenizer.json").is_file() {
+        return Err(Box::new(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "compiled package declares tokenizer at {}, but tokenizer.json is missing",
+                tokenizer_dir.display()
+            ),
+        )));
     }
-    if manifest_dir.join("tokenizer.json").is_file() {
-        return Ok(Some(manifest_dir));
-    }
-    let index_path = manifest_dir.join(manifest.circuit_index_path);
-    let index = LoweredPedalboard::from_json_file(index_path)?;
-    Ok(Some(PathBuf::from(index.source.source_model_dir)))
+    Ok(tokenizer_dir)
 }
 
 fn resolve_package_path(manifest_dir: &Path, raw_path: &str) -> PathBuf {
@@ -282,9 +262,6 @@ fn parse_args() -> Result<Args, String> {
             "--package" | "--package-manifest" => {
                 parsed.package_manifest = Some(PathBuf::from(next_value(&mut raw, &arg)?));
             }
-            "--model-dir" => {
-                parsed.model_dir = Some(PathBuf::from(next_value(&mut raw, "--model-dir")?));
-            }
             "--prompt" => {
                 parsed.prompt = Some(next_value(&mut raw, "--prompt")?);
             }
@@ -379,7 +356,6 @@ fn usage() -> &'static str {
 Options:
   --package <PATH>           Compiled resident model package manifest. Required.
   --package-manifest <PATH>  Alias for --package.
-  --model-dir <PATH>         Directory containing tokenizer.json. Inferred when possible.
   --prompt <TEXT>            External text event to inject into the resident stream. Required.
   --max-new-tokens <N>       Public output tokens to emit after the prompt. Default: 4
   --capacity <N>             Override resident activation capacity selected from the package.

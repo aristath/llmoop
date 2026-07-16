@@ -194,7 +194,7 @@ class StreamProcessor:
     def from_dirs(
         cls,
         circuit_dir: Path,
-        model_dir: Path | None = None,
+        model_dir: Path,
         torch: Any | None = None,
         sampler: Any | None = None,
         random_seed: int = 0,

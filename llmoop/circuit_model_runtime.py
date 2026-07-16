@@ -137,7 +137,7 @@ class CircuitModelRuntime:
     def from_dirs(
         cls,
         circuit_dir: Path,
-        model_dir: Path | None = None,
+        model_dir: Path,
         torch: Any | None = None,
     ) -> "CircuitModelRuntime":
         if torch is None:
@@ -146,7 +146,6 @@ class CircuitModelRuntime:
             torch = torch_module
 
         board = CircuitPedalboard.from_dir(circuit_dir)
-        model_dir = model_dir or Path(board.index["source"]["source_model_dir"])
         config = json.loads((model_dir / "config.json").read_text())
 
         model_file = Path(board.index["source"]["model_file"])

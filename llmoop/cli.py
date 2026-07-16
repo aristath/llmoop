@@ -35,7 +35,7 @@ def main() -> None:
     parser.add_argument(
         "--model-dir",
         type=Path,
-        help="source model directory override for runtime tokenization/tensor loading",
+        help="source model directory for --run-model debug/oracle execution",
     )
     parser.add_argument(
         "--prompt",
@@ -137,6 +137,8 @@ def main() -> None:
     if args.run is not None:
         if args.prompt is None:
             parser.error("--prompt is required with --run")
+        if args.model_dir is not None:
+            parser.error("--model-dir is only supported by --run-model")
         if args.temperature is not None:
             parser.error("--temperature is only supported by --run-model")
         if args.top_k is not None:
@@ -150,6 +152,8 @@ def main() -> None:
     if args.run_model is not None:
         if args.prompt is None:
             parser.error("--prompt is required with --run-model")
+        if args.model_dir is None:
+            parser.error("--model-dir is required with --run-model")
         run_model(args)
         return
 
@@ -201,8 +205,6 @@ def build_runtime_command(args: argparse.Namespace, package_manifest: Path) -> l
         "--max-new-tokens",
         str(args.max_new_tokens),
     ]
-    if args.model_dir is not None:
-        runtime_args.extend(["--model-dir", str(args.model_dir)])
     if args.capacity is not None:
         runtime_args.extend(["--capacity", str(args.capacity)])
     if args.no_special_tokens:
@@ -264,8 +266,7 @@ def run_model(args: argparse.Namespace) -> None:
         model_dir=args.model_dir,
         torch=torch,
     )
-    model_dir = args.model_dir or Path(runtime.board.index["source"]["source_model_dir"])
-    tokenizer = load_tokenizer(model_dir)
+    tokenizer = load_tokenizer(args.model_dir)
     eos_token_id = None if args.ignore_eos else int(runtime.config["eos_token_id"])
     sampler = None
     if args.temperature is not None:

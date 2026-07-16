@@ -5767,8 +5767,7 @@ pub struct VulkanResidentGreedyModelPackageManifest {
     pub device_id: String,
     pub circuit_index_path: String,
     pub tensor_index_path: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tokenizer: Option<VulkanResidentTokenizerPackageSpec>,
+    pub tokenizer: VulkanResidentTokenizerPackageSpec,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activation_element_bytes: Option<usize>,
     pub dynamic_state_capacity_activations: usize,
