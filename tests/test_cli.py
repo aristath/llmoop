@@ -71,6 +71,21 @@ class CompiledPackageTest(unittest.TestCase):
         self.assertIn("tokenizer.json", manifest["tokenizer"]["files"])
         self.assertTrue((fixture.lowered_dir / "tokenizer" / "tokenizer.json").is_file())
 
+    def test_compiled_package_contains_weight_files_and_local_tensor_index(self) -> None:
+        fixture = compiled_model_or_skip()
+        manifest = json.loads(fixture.package_manifest.read_text())
+        tensor_index_path = fixture.lowered_dir / manifest["tensor_index_path"]
+        tensor_index = json.loads(tensor_index_path.read_text())
+
+        self.assertEqual("tensors.json", manifest["tensor_index_path"])
+        self.assertEqual("weights", tensor_index["source"]["weights_dir"])
+        self.assertTrue(tensor_index["source"]["packaged"])
+        for info in tensor_index["tensors"].values():
+            source_file = Path(info["source_file"])
+            self.assertFalse(source_file.is_absolute())
+            self.assertEqual("weights", source_file.parts[0])
+            self.assertTrue((fixture.lowered_dir / source_file).is_file())
+
 
 @unittest.skipUnless(CLI_DEPS_AVAILABLE, "CLI generation dependencies are not installed")
 class CliTest(unittest.TestCase):

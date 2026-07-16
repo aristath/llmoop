@@ -72,12 +72,16 @@ class SafetensorsTensorStore:
         if self._infos is None:
             if self.tensor_index is not None and self.tensor_index.exists():
                 index = json.loads(self.tensor_index.read_text())
+                tensor_index_root = self.tensor_index.parent
                 self._infos = {
                     name: TensorInfo(
                         name=name,
                         dtype=info["dtype"],
                         shape=tuple(info["shape"]),
-                        source_file=Path(info["source_file"]),
+                        source_file=resolve_tensor_source_file(
+                            tensor_index_root,
+                            info["source_file"],
+                        ),
                     )
                     for name, info in index["tensors"].items()
                 }
@@ -105,3 +109,8 @@ class SafetensorsTensorStore:
             "dtype": str(self.dtype),
             "device": self.device or "cpu",
         }
+
+
+def resolve_tensor_source_file(tensor_index_root: Path, source_file: str) -> Path:
+    path = Path(source_file)
+    return path if path.is_absolute() else tensor_index_root / path

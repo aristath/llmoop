@@ -33,14 +33,25 @@ pub struct TensorIndex {
 
 impl TensorIndex {
     pub fn from_json_file(path: impl AsRef<Path>) -> Result<Self, CircuitPlanError> {
+        let path = path.as_ref();
         let bytes = fs::read(path).map_err(|error| CircuitPlanError(error.to_string()))?;
-        let index: Self =
+        let mut index: Self =
             serde_json::from_slice(&bytes).map_err(|error| CircuitPlanError(error.to_string()))?;
         if index.schema != TENSOR_INDEX_SCHEMA {
             return Err(CircuitPlanError(format!(
                 "unsupported tensor index schema {:?}",
                 index.schema
             )));
+        }
+        let root = path.parent().unwrap_or_else(|| Path::new("."));
+        for metadata in index.tensors.values_mut() {
+            if let Some(source_file) = &metadata.source_file {
+                let source_path = Path::new(source_file);
+                if !source_path.is_absolute() {
+                    metadata.source_file =
+                        Some(root.join(source_path).to_string_lossy().into_owned());
+                }
+            }
         }
         Ok(index)
     }

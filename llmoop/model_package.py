@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import shutil
+from copy import deepcopy
 from hashlib import blake2s
 from pathlib import Path
 
@@ -18,6 +19,7 @@ from llmoop.model_transpiler import transpile_model
 
 
 TOKENIZER_PACKAGE_DIR = "tokenizer"
+WEIGHTS_PACKAGE_DIR = "weights"
 TOKENIZER_PACKAGE_FILES = (
     "tokenizer.json",
     "tokenizer_config.json",
@@ -50,12 +52,12 @@ def compile_model_package(
     tensor_index = read_json(transpiled_dir / "tensors.json")
     model_graph = read_json(transpiled_dir / "model.json")
     tokenizer_manifest = copy_tokenizer_package(model_dir, lowered_dir / TOKENIZER_PACKAGE_DIR)
+    packaged_tensor_index = copy_tensor_package(tensor_index, lowered_dir)
     package_manifest = build_vulkan_resident_greedy_package_manifest(
         model_graph=model_graph,
-        tensor_index=tensor_index,
+        tensor_index=packaged_tensor_index,
         lowered_index=lowered["index"],
         lowered_dir=lowered_dir,
-        transpiled_dir=transpiled_dir,
         package_id=f"{slug}_vulkan_resident_greedy",
         shader_source_dir=shader_source_dir,
         default_dynamic_state_capacity_activations=default_dynamic_state_capacity_activations,
@@ -81,7 +83,6 @@ def build_vulkan_resident_greedy_package_manifest(
     tensor_index: Json,
     lowered_index: Json,
     lowered_dir: Path,
-    transpiled_dir: Path,
     package_id: str,
     shader_source_dir: Path,
     default_dynamic_state_capacity_activations: int,
@@ -126,7 +127,7 @@ def build_vulkan_resident_greedy_package_manifest(
         "package_id": package_id,
         "device_id": "gpu0",
         "circuit_index_path": "pedalboard.circuits.json",
-        "tensor_index_path": relative_json_path(lowered_dir, transpiled_dir / "tensors.json"),
+        "tensor_index_path": "tensors.json",
         "tokenizer": tokenizer_manifest,
         "activation_element_bytes": dtype_bytes,
         "dynamic_state_capacity_activations": default_dynamic_state_capacity_activations,
@@ -369,6 +370,61 @@ def copy_tokenizer_package(model_dir: Path, dest_dir: Path) -> Json:
         "path": TOKENIZER_PACKAGE_DIR,
         "files": copied_files,
     }
+
+
+def copy_tensor_package(tensor_index: Json, lowered_dir: Path) -> Json:
+    weights_dir = lowered_dir / WEIGHTS_PACKAGE_DIR
+    if weights_dir.exists():
+        shutil.rmtree(weights_dir)
+    weights_dir.mkdir(parents=True, exist_ok=True)
+
+    source_files = sorted(
+        {
+            Path(info["source_file"])
+            for info in tensor_index["tensors"].values()
+            if info.get("source_file")
+        }
+    )
+    if not source_files:
+        raise ModelCompileError("tensor index does not declare any source_file entries")
+
+    dest_by_source: dict[Path, Path] = {}
+    used_names: set[str] = set()
+    for source in source_files:
+        if not source.is_file():
+            raise ModelCompileError(f"tensor source file does not exist: {source}")
+        dest_name = source.name
+        if dest_name in used_names:
+            digest = blake2s(str(source.resolve()).encode("utf-8"), digest_size=4).hexdigest()
+            dest_name = f"{source.stem}-{digest}{source.suffix}"
+        used_names.add(dest_name)
+        dest = weights_dir / dest_name
+        shutil.copy2(source, dest)
+        dest_by_source[source] = dest
+
+    packaged = deepcopy(tensor_index)
+    packaged["source"] = {
+        **packaged.get("source", {}),
+        "packaged": True,
+        "weights_dir": WEIGHTS_PACKAGE_DIR,
+        "weights_file": relative_json_path(lowered_dir, dest_by_source[source_files[0]]),
+        "weights_files": [
+            {
+                **source_record,
+                "path": relative_json_path(
+                    lowered_dir,
+                    dest_by_source[Path(source_record["path"])],
+                ),
+            }
+            for source_record in packaged.get("source", {}).get("weights_files", [])
+        ],
+    }
+    for info in packaged["tensors"].values():
+        source = Path(info["source_file"])
+        info["source_file"] = relative_json_path(lowered_dir, dest_by_source[source])
+
+    write_json(lowered_dir / "tensors.json", packaged)
+    return packaged
 
 
 def parameter_shape_for_node(circuit: Json, node: Json, tensor_index: Json) -> list[int]:
