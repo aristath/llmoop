@@ -18,6 +18,11 @@ name = "resident-text-demo"
 path = "src/bin/resident_text_demo.rs"
 required-features = ["vulkan", "tokenizers"]
 
+[[bin]]
+name = "llmoop-runtime"
+path = "src/bin/llmoop_runtime.rs"
+required-features = ["vulkan", "tokenizers"]
+
 [features]
 default = []
 vulkan = ["dep:ash"]
