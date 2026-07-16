@@ -5511,6 +5511,85 @@ pub trait VulkanResidentTokenTextCodec {
     -> Result<String, VulkanResidentTokenTextCodecError>;
 }
 
+#[cfg(feature = "tokenizers")]
+pub struct VulkanResidentHfTokenizerTextCodec {
+    tokenizer: tokenizers::Tokenizer,
+    add_special_tokens: bool,
+    skip_special_tokens: bool,
+}
+
+#[cfg(feature = "tokenizers")]
+impl VulkanResidentHfTokenizerTextCodec {
+    pub fn from_model_dir(
+        model_dir: impl AsRef<Path>,
+    ) -> Result<Self, VulkanResidentTokenTextCodecError> {
+        Self::from_file(model_dir.as_ref().join("tokenizer.json"))
+    }
+
+    pub fn from_file(
+        tokenizer_path: impl AsRef<Path>,
+    ) -> Result<Self, VulkanResidentTokenTextCodecError> {
+        let tokenizer_path = tokenizer_path.as_ref();
+        let tokenizer = tokenizers::Tokenizer::from_file(tokenizer_path).map_err(|error| {
+            VulkanResidentTokenTextCodecError::new(format!(
+                "failed to load tokenizer file {:?}: {error}",
+                tokenizer_path
+            ))
+        })?;
+        Ok(Self {
+            tokenizer,
+            add_special_tokens: true,
+            skip_special_tokens: true,
+        })
+    }
+
+    pub fn with_add_special_tokens(mut self, add_special_tokens: bool) -> Self {
+        self.add_special_tokens = add_special_tokens;
+        self
+    }
+
+    pub fn with_skip_special_tokens(mut self, skip_special_tokens: bool) -> Self {
+        self.skip_special_tokens = skip_special_tokens;
+        self
+    }
+
+    pub fn add_special_tokens(&self) -> bool {
+        self.add_special_tokens
+    }
+
+    pub fn skip_special_tokens(&self) -> bool {
+        self.skip_special_tokens
+    }
+}
+
+#[cfg(feature = "tokenizers")]
+impl VulkanResidentTokenTextCodec for VulkanResidentHfTokenizerTextCodec {
+    fn encode_text(&self, text: &str) -> Result<Vec<u32>, VulkanResidentTokenTextCodecError> {
+        let encoding = self
+            .tokenizer
+            .encode(text, self.add_special_tokens)
+            .map_err(|error| {
+                VulkanResidentTokenTextCodecError::new(format!(
+                    "failed to encode text with tokenizer: {error}"
+                ))
+            })?;
+        Ok(encoding.get_ids().to_vec())
+    }
+
+    fn decode_tokens(
+        &self,
+        token_ids: &[u32],
+    ) -> Result<String, VulkanResidentTokenTextCodecError> {
+        self.tokenizer
+            .decode(token_ids, self.skip_special_tokens)
+            .map_err(|error| {
+                VulkanResidentTokenTextCodecError::new(format!(
+                    "failed to decode token ids with tokenizer: {error}"
+                ))
+            })
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct VulkanResidentTokenIdTextCodec;
 
@@ -10724,6 +10803,24 @@ mod tests {
             .join("tensors.json")
     }
 
+    #[cfg(feature = "tokenizers")]
+    fn lfm2_model_dir_path() -> PathBuf {
+        Path::new("/home/aristath/models/lfm2.5/230m").to_path_buf()
+    }
+
+    #[cfg(feature = "tokenizers")]
+    fn lfm2_tokenizer_codec_or_skip(test_name: &str) -> Option<VulkanResidentHfTokenizerTextCodec> {
+        let model_dir = lfm2_model_dir_path();
+        if !model_dir.join("tokenizer.json").is_file() {
+            eprintln!(
+                "skipping {test_name}: {:?} does not contain tokenizer.json",
+                model_dir
+            );
+            return None;
+        }
+        Some(VulkanResidentHfTokenizerTextCodec::from_model_dir(model_dir).unwrap())
+    }
+
     fn mount_lfm2_single_device_stream_circuit(
         device: &VulkanComputeDevice,
     ) -> (
@@ -13119,6 +13216,25 @@ mod tests {
         assert!(codec.encode_text("not-a-token").is_err());
     }
 
+    #[cfg(feature = "tokenizers")]
+    #[test]
+    fn resident_hf_tokenizer_text_codec_loads_lfm2_tokenizer_json() {
+        let Some(codec) = lfm2_tokenizer_codec_or_skip("resident hf tokenizer text codec") else {
+            return;
+        };
+
+        assert!(codec.add_special_tokens());
+        assert!(codec.skip_special_tokens());
+        assert_eq!(codec.encode_text("Hello").unwrap(), vec![1, 36_309]);
+        assert_eq!(codec.decode_tokens(&[1, 36_309]).unwrap(), "Hello");
+
+        let codec_with_specials = codec.with_skip_special_tokens(false);
+        assert_eq!(
+            codec_with_specials.decode_tokens(&[1, 36_309]).unwrap(),
+            "<|startoftext|>Hello"
+        );
+    }
+
     #[test]
     fn resident_token_engine_owns_device_scheduler_and_registered_stream() {
         let device = match VulkanComputeDevice::new() {
@@ -13199,6 +13315,62 @@ mod tests {
         assert!(!runtime.running);
         assert_eq!(runtime.stream.total_public_outputs, 2);
         assert_eq!(runtime.pending_input_event_count, 0);
+    }
+
+    #[cfg(feature = "tokenizers")]
+    #[test]
+    fn resident_token_engine_accepts_hf_tokenizer_text_input() {
+        let Some(codec) = lfm2_tokenizer_codec_or_skip("resident token engine hf tokenizer input")
+        else {
+            return;
+        };
+        let device = match VulkanComputeDevice::new() {
+            Ok(device) => device,
+            Err(error) => {
+                eprintln!("skipping resident token engine hf tokenizer input: {error}");
+                return;
+            }
+        };
+        let Some(processor) = create_lfm2_resident_greedy_stream_processor_with_capacity(
+            &device,
+            "resident token engine hf tokenizer input",
+            8,
+            "gqa_attention_bf16_q16_kv8_d64_cap8.comp",
+        ) else {
+            return;
+        };
+        let mut engine =
+            VulkanResidentTokenEngine::from_processor(device, "engine_text_stream", processor)
+                .unwrap();
+
+        let submitted = engine
+            .submit_text_until_idle(
+                "engine_text_stream",
+                "hello_event",
+                "Hello",
+                1,
+                "test_host",
+                VulkanResidentTokenEngineRunBudget::new(8, 1, 3),
+                &codec,
+            )
+            .unwrap();
+
+        assert_eq!(submitted.stream_id, "engine_text_stream");
+        assert_eq!(submitted.input_event_id, "hello_event");
+        assert_eq!(submitted.input_text, "Hello");
+        assert_eq!(submitted.encoded_token_ids, vec![1, 36_309]);
+        assert_eq!(submitted.submitted_tokens.generated_token_ids.len(), 1);
+        assert_eq!(
+            submitted.generated_text,
+            codec
+                .decode_tokens(&submitted.submitted_tokens.generated_token_ids)
+                .unwrap()
+        );
+        assert_eq!(
+            submitted.submitted_tokens.run.stop_condition,
+            VulkanResidentTokenEngineRunStopCondition::Idle
+        );
+        assert!(engine.runtime_snapshot("engine_text_stream").unwrap().idle);
     }
 
     #[test]
