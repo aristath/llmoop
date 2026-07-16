@@ -4253,6 +4253,8 @@ pub struct VulkanResidentGreedyRunningStreamRun {
 
 pub struct VulkanResidentTokenStream {
     inner: VulkanResidentGreedyRunningStream,
+    current_input_event_id: Option<String>,
+    current_output_index: usize,
 }
 
 impl VulkanResidentTokenStream {
@@ -4262,11 +4264,17 @@ impl VulkanResidentTokenStream {
     ) -> Self {
         Self {
             inner: VulkanResidentGreedyRunningStream::new(stream_id, processor),
+            current_input_event_id: None,
+            current_output_index: 0,
         }
     }
 
     pub fn from_running_stream(stream: VulkanResidentGreedyRunningStream) -> Self {
-        Self { inner: stream }
+        Self {
+            inner: stream,
+            current_input_event_id: None,
+            current_output_index: 0,
+        }
     }
 
     pub fn into_inner(self) -> VulkanResidentGreedyRunningStream {
@@ -4286,35 +4294,35 @@ impl VulkanResidentTokenStream {
         device: &VulkanComputeDevice,
         event: VulkanResidentTokenInputEvent,
     ) -> Result<VulkanResidentTokenStreamRun, VulkanResidentGreedyFeedbackLoopRunnerError> {
-        let start_public = self.inner.public_outputs.len();
         let start_stream_tick = self.inner.next_stream_tick;
-        self.inner.inject_external_tokens(
-            &event.token_ids,
-            event.max_public_tokens,
-            event.eos_token_id,
-            event.origin.clone(),
-        )?;
-        let ticks = self.inner.run_until_idle(device)?;
-        let output_events = self.inner.public_outputs[start_public..]
-            .iter()
-            .enumerate()
-            .map(|(output_index, output)| VulkanResidentTokenOutputEvent {
-                id: output.id.clone(),
-                input_event_id: event.id.clone(),
-                output_index,
-                token_id: output.token_id,
-                source_stream_tick: output.source_stream_tick,
-            })
-            .collect::<Vec<_>>();
+        let queued = self.enqueue_external_event(event)?;
+        let event = queued.input_event;
+        let mut output_events = Vec::new();
+        let mut processed_tick_count = 0usize;
+        let mut idle_tick_count = 0usize;
+
+        loop {
+            let tick = self.pump_once(device)?;
+            match tick.status {
+                VulkanResidentGreedyRunningStreamTickStatus::Processed => {
+                    processed_tick_count += 1;
+                }
+                VulkanResidentGreedyRunningStreamTickStatus::Idle => {
+                    idle_tick_count += 1;
+                }
+            }
+            if let Some(output_event) = tick.output_event {
+                output_events.push(output_event);
+            }
+            if tick.status == VulkanResidentGreedyRunningStreamTickStatus::Idle {
+                break;
+            }
+        }
+
         let generated_token_ids = output_events
             .iter()
             .map(|output| output.token_id)
             .collect::<Vec<_>>();
-        let processed_tick_count = ticks
-            .iter()
-            .filter(|tick| tick.stream_tick.is_some())
-            .count();
-        let idle_tick_count = ticks.len() - processed_tick_count;
 
         Ok(VulkanResidentTokenStreamRun {
             stream_id: self.inner.stream_id.clone(),
@@ -4330,6 +4338,60 @@ impl VulkanResidentTokenStream {
             next_stream_tick: self.inner.next_stream_tick,
             processed_tick_count,
             idle_tick_count,
+        })
+    }
+
+    pub fn enqueue_external_event(
+        &mut self,
+        event: VulkanResidentTokenInputEvent,
+    ) -> Result<VulkanResidentTokenQueuedInputEvent, VulkanResidentGreedyFeedbackLoopRunnerError>
+    {
+        let start_stream_tick = self.inner.next_stream_tick;
+        let enqueued_token_count = event.token_ids.len();
+        self.inner.inject_external_tokens(
+            &event.token_ids,
+            event.max_public_tokens,
+            event.eos_token_id,
+            event.origin.clone(),
+        )?;
+        self.current_input_event_id = Some(event.id.clone());
+        self.current_output_index = 0;
+
+        Ok(VulkanResidentTokenQueuedInputEvent {
+            input_event: event,
+            start_stream_tick,
+            enqueued_token_count,
+        })
+    }
+
+    pub fn pump_once(
+        &mut self,
+        device: &VulkanComputeDevice,
+    ) -> Result<VulkanResidentTokenStreamTick, VulkanResidentGreedyFeedbackLoopRunnerError> {
+        let tick = self.inner.tick(device)?;
+        let output_event = tick.public_output.as_ref().map(|output| {
+            let output_index = self.current_output_index;
+            self.current_output_index += 1;
+            VulkanResidentTokenOutputEvent {
+                id: output.id.clone(),
+                input_event_id: self
+                    .current_input_event_id
+                    .clone()
+                    .unwrap_or_else(|| "feedback_loop".to_string()),
+                output_index,
+                token_id: output.token_id,
+                source_stream_tick: output.source_stream_tick,
+            }
+        });
+
+        Ok(VulkanResidentTokenStreamTick {
+            stream_id: tick.stream_id,
+            status: tick.status,
+            stream_tick: tick.stream_tick,
+            input_token_id: tick.input_signal.as_ref().map(|signal| signal.token_id()),
+            input_route: tick.input_signal.as_ref().map(|signal| signal.route()),
+            output_event,
+            stop_reason: tick.stop_reason,
         })
     }
 
@@ -4393,12 +4455,30 @@ impl VulkanResidentTokenInputEvent {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanResidentTokenQueuedInputEvent {
+    pub input_event: VulkanResidentTokenInputEvent,
+    pub start_stream_tick: u64,
+    pub enqueued_token_count: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VulkanResidentTokenOutputEvent {
     pub id: String,
     pub input_event_id: String,
     pub output_index: usize,
     pub token_id: u32,
     pub source_stream_tick: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanResidentTokenStreamTick {
+    pub stream_id: String,
+    pub status: VulkanResidentGreedyRunningStreamTickStatus,
+    pub stream_tick: Option<u64>,
+    pub input_token_id: Option<u32>,
+    pub input_route: Option<VulkanResidentGreedyPromptEventInputRoute>,
+    pub output_event: Option<VulkanResidentTokenOutputEvent>,
+    pub stop_reason: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -11304,6 +11384,89 @@ mod tests {
         assert_eq!(snapshot.total_public_outputs, 4);
         assert_eq!(snapshot.total_ticks, 8);
         assert_eq!(snapshot.last_stop_reason.as_deref(), Some("max_new_tokens"));
+    }
+
+    #[test]
+    fn resident_token_stream_can_be_pumped_one_tick_at_a_time() {
+        let device = match VulkanComputeDevice::new() {
+            Ok(device) => device,
+            Err(error) => {
+                eprintln!("skipping resident token stream pump: {error}");
+                return;
+            }
+        };
+        let Some(processor) = create_lfm2_resident_greedy_stream_processor_with_capacity(
+            &device,
+            "resident token stream pump",
+            8,
+            "gqa_attention_bf16_q16_kv8_d64_cap8.comp",
+        ) else {
+            return;
+        };
+        let mut stream = processor.into_token_stream("host_stream_0");
+        let event =
+            VulkanResidentTokenInputEvent::new("event_0", vec![1], 2).with_origin("test_host");
+        let queued = stream.enqueue_external_event(event.clone()).unwrap();
+        assert_eq!(queued.input_event, event);
+        assert_eq!(queued.start_stream_tick, 0);
+        assert_eq!(queued.enqueued_token_count, 1);
+        assert!(!stream.snapshot().idle);
+
+        let first = stream.pump_once(&device).unwrap();
+        assert_eq!(first.stream_id, "host_stream_0");
+        assert_eq!(
+            first.status,
+            VulkanResidentGreedyRunningStreamTickStatus::Processed
+        );
+        assert_eq!(first.stream_tick, Some(0));
+        assert_eq!(first.input_token_id, Some(1));
+        assert_eq!(
+            first.input_route,
+            Some(VulkanResidentGreedyPromptEventInputRoute::ExternalInput)
+        );
+        assert_eq!(
+            first.output_event.as_ref().unwrap().input_event_id,
+            "event_0"
+        );
+        assert_eq!(first.output_event.as_ref().unwrap().output_index, 0);
+        assert_eq!(first.output_event.as_ref().unwrap().source_stream_tick, 0);
+
+        let second = stream.pump_once(&device).unwrap();
+        assert_eq!(second.stream_tick, Some(1));
+        assert_eq!(
+            second.input_route,
+            Some(VulkanResidentGreedyPromptEventInputRoute::PrivateFeedback)
+        );
+        assert_eq!(
+            second.output_event.as_ref().unwrap().input_event_id,
+            "event_0"
+        );
+        assert_eq!(second.output_event.as_ref().unwrap().output_index, 1);
+        assert_eq!(second.output_event.as_ref().unwrap().source_stream_tick, 1);
+
+        let closing = stream.pump_once(&device).unwrap();
+        assert_eq!(closing.stream_tick, Some(2));
+        assert_eq!(
+            closing.input_route,
+            Some(VulkanResidentGreedyPromptEventInputRoute::PrivateFeedback)
+        );
+        assert!(closing.output_event.is_none());
+        assert_eq!(closing.stop_reason.as_deref(), Some("max_new_tokens"));
+
+        let idle = stream.pump_once(&device).unwrap();
+        assert_eq!(
+            idle.status,
+            VulkanResidentGreedyRunningStreamTickStatus::Idle
+        );
+        assert_eq!(idle.stream_tick, None);
+        assert!(idle.output_event.is_none());
+        assert_eq!(idle.stop_reason.as_deref(), Some("max_new_tokens"));
+
+        let snapshot = stream.snapshot();
+        assert_eq!(snapshot.next_stream_tick, 3);
+        assert!(snapshot.idle);
+        assert_eq!(snapshot.total_public_outputs, 2);
+        assert_eq!(snapshot.total_ticks, 4);
     }
 
     #[test]
