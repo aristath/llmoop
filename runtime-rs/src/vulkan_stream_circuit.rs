@@ -1679,6 +1679,12 @@ pub struct VulkanPlacedCableTransportReceipt {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct VulkanPlacedCableTransportReceiveBatch {
+    pub received: Vec<VulkanPlacedCableTransportReceipt>,
+    pub missing_packets: Vec<VulkanPlacedCablePacketKey>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct VulkanInProcessPlacedCableTransport {
     packets: BTreeMap<VulkanPlacedCablePacketKey, VulkanPlacedCablePacket>,
 }
@@ -1734,6 +1740,22 @@ impl VulkanInProcessPlacedCableTransport {
         Ok(receipt)
     }
 
+    pub fn publish_all_outgoing_cables(
+        &mut self,
+        mounted: &VulkanMountedPlacedStreamCircuit,
+    ) -> Result<Vec<VulkanPlacedCableTransportReceipt>, VulkanPlacedCableTransportError> {
+        let cable_indices = mounted
+            .cable_io
+            .outgoing_buffers
+            .iter()
+            .map(|outgoing| outgoing.endpoint.cable_index)
+            .collect::<Vec<_>>();
+        cable_indices
+            .into_iter()
+            .map(|cable_index| self.publish_outgoing_cable(mounted, cable_index))
+            .collect()
+    }
+
     pub fn receive_incoming_cable(
         &mut self,
         mounted: &VulkanMountedPlacedStreamCircuit,
@@ -1771,6 +1793,29 @@ impl VulkanInProcessPlacedCableTransport {
             signal: packet.signal,
             byte_count: packet.byte_count,
         })
+    }
+
+    pub fn receive_available_incoming_cables(
+        &mut self,
+        mounted: &VulkanMountedPlacedStreamCircuit,
+    ) -> Result<VulkanPlacedCableTransportReceiveBatch, VulkanPlacedCableTransportError> {
+        let cable_indices = mounted
+            .cable_io
+            .incoming_buffers
+            .iter()
+            .map(|incoming| incoming.endpoint.cable_index)
+            .collect::<Vec<_>>();
+        let mut batch = VulkanPlacedCableTransportReceiveBatch::default();
+        for cable_index in cable_indices {
+            match self.receive_incoming_cable(mounted, cable_index) {
+                Ok(receipt) => batch.received.push(receipt),
+                Err(VulkanPlacedCableTransportError::MissingPacket { key }) => {
+                    batch.missing_packets.push(key);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(batch)
     }
 }
 
@@ -18964,7 +19009,9 @@ mod tests {
             .buffer
             .write_bytes(&layer_02_to_03)
             .unwrap();
-        let publish_back = transport.publish_outgoing_cable(&gpu1, 2).unwrap();
+        let published_back = transport.publish_all_outgoing_cables(&gpu1).unwrap();
+        assert_eq!(published_back.len(), 1);
+        let publish_back = &published_back[0];
         assert_eq!(
             publish_back.key,
             VulkanPlacedCablePacketKey {
@@ -18973,8 +19020,10 @@ mod tests {
                 to_device_id: "gpu0".to_string(),
             }
         );
-        let receive_back = transport.receive_incoming_cable(&gpu0, 2).unwrap();
-        assert_eq!(receive_back.key, publish_back.key);
+        let received_back = transport.receive_available_incoming_cables(&gpu0).unwrap();
+        assert_eq!(received_back.received.len(), 1);
+        assert_eq!(received_back.missing_packets.len(), 0);
+        assert_eq!(received_back.received[0].key, publish_back.key);
         assert_eq!(
             gpu0.cable_io
                 .incoming_buffer(2)
