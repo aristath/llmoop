@@ -6055,6 +6055,16 @@ impl VulkanResidentGreedyModelPackageManifest {
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         fs::write(path, bytes)
     }
+
+    pub fn placement_device_ids(&self) -> Vec<String> {
+        self.circuit_graph
+            .pedals
+            .iter()
+            .map(|pedal| self.placement.device_for_pedal(&pedal.pedal_id).to_string())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

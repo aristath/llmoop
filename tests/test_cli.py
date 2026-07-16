@@ -39,6 +39,7 @@ class RuntimeCliCommandTest(unittest.TestCase):
         package = Path("packages/model_x/vulkan_resident_greedy_package.json")
         args = Namespace(
             prompt="Hello",
+            inspect_placement=False,
             inspect_device_slice=None,
             max_new_tokens=4,
             capacity=8,
@@ -72,6 +73,7 @@ class RuntimeCliCommandTest(unittest.TestCase):
         package = Path("packages/model_x/vulkan_resident_greedy_package.json")
         args = Namespace(
             prompt=None,
+            inspect_placement=False,
             inspect_device_slice="gpu1",
             max_new_tokens=4,
             capacity=4,
@@ -89,6 +91,34 @@ class RuntimeCliCommandTest(unittest.TestCase):
                 str(package),
                 "--inspect-device-slice",
                 "gpu1",
+                "--capacity",
+                "4",
+                "--json",
+            ],
+            build_runtime_command(args, package),
+        )
+
+    def test_build_runtime_command_can_inspect_placement_without_prompt(self) -> None:
+        package = Path("packages/model_x/vulkan_resident_greedy_package.json")
+        args = Namespace(
+            prompt=None,
+            inspect_placement=True,
+            inspect_device_slice=None,
+            max_new_tokens=4,
+            capacity=4,
+            no_special_tokens=False,
+            keep_special_tokens=False,
+            generated_only=False,
+            json=True,
+            runtime_bin=Path("/tmp/llmoop-runtime"),
+        )
+
+        self.assertEqual(
+            [
+                "/tmp/llmoop-runtime",
+                "--package",
+                str(package),
+                "--inspect-placement",
                 "--capacity",
                 "4",
                 "--json",

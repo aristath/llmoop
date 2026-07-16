@@ -42,6 +42,11 @@ def main() -> None:
         help="mount and summarize only the compiled package pedals assigned to DEVICE_ID for --run",
     )
     parser.add_argument(
+        "--inspect-placement",
+        action="store_true",
+        help="mount and summarize every logical device slice in a compiled package for --run",
+    )
+    parser.add_argument(
         "--runtime-bin",
         type=Path,
         help="path to a built llmoop-runtime binary; defaults to cargo run from a source checkout",
@@ -156,10 +161,16 @@ def main() -> None:
             parser.error("--default-device-id is only supported with --compile-model")
         if args.place_pedal:
             parser.error("--place-pedal is only supported with --compile-model")
+        if args.inspect_placement and args.run is None:
+            parser.error("--inspect-placement is only supported with --run")
     elif args.inspect_device_slice is not None:
         parser.error("--inspect-device-slice is only supported with --run")
+    elif args.inspect_placement:
+        parser.error("--inspect-placement is only supported with --run")
     if args.run is not None:
-        if args.inspect_device_slice is None and args.prompt is None:
+        if args.inspect_device_slice is not None and args.inspect_placement:
+            parser.error("--inspect-device-slice and --inspect-placement are mutually exclusive")
+        if args.inspect_device_slice is None and not args.inspect_placement and args.prompt is None:
             parser.error("--prompt is required with --run")
         if args.temperature is not None:
             parser.error("--temperature is only supported by --run-model")
@@ -174,6 +185,8 @@ def main() -> None:
     if args.run_model is not None:
         if args.inspect_device_slice is not None:
             parser.error("--inspect-device-slice is only supported by --run")
+        if args.inspect_placement:
+            parser.error("--inspect-placement is only supported by --run")
         if args.prompt is None:
             parser.error("--prompt is required with --run-model")
         if args.package_dir is None:
@@ -249,7 +262,9 @@ def build_runtime_command(args: argparse.Namespace, package_manifest: Path) -> l
         "--package",
         str(package_manifest),
     ]
-    if args.inspect_device_slice is not None:
+    if args.inspect_placement:
+        runtime_args.append("--inspect-placement")
+    elif args.inspect_device_slice is not None:
         runtime_args.extend(["--inspect-device-slice", args.inspect_device_slice])
     else:
         runtime_args.extend(
