@@ -4594,6 +4594,199 @@ pub struct VulkanResidentTokenStreamSnapshot {
     pub last_stop_reason: Option<String>,
 }
 
+pub struct VulkanResidentTokenRuntime {
+    stream: VulkanResidentTokenStream,
+    pending_input_events: VecDeque<VulkanResidentTokenInputEvent>,
+}
+
+impl VulkanResidentTokenRuntime {
+    pub fn new(stream: VulkanResidentTokenStream) -> Self {
+        Self {
+            stream,
+            pending_input_events: VecDeque::new(),
+        }
+    }
+
+    pub fn from_processor(
+        stream_id: impl Into<String>,
+        processor: VulkanResidentGreedyStreamProcessor,
+    ) -> Self {
+        Self::new(processor.into_token_stream(stream_id))
+    }
+
+    pub fn stream(&self) -> &VulkanResidentTokenStream {
+        &self.stream
+    }
+
+    pub fn stream_mut(&mut self) -> &mut VulkanResidentTokenStream {
+        &mut self.stream
+    }
+
+    pub fn into_stream(self) -> VulkanResidentTokenStream {
+        self.stream
+    }
+
+    pub fn enqueue_input_event(
+        &mut self,
+        event: VulkanResidentTokenInputEvent,
+    ) -> Result<
+        VulkanResidentTokenRuntimeQueuedInputEvent,
+        VulkanResidentGreedyFeedbackLoopRunnerError,
+    > {
+        if event.token_ids.is_empty() {
+            return Err(VulkanResidentGreedyFeedbackLoopRunnerError::EmptyPromptEvent);
+        }
+        self.pending_input_events.push_back(event.clone());
+        Ok(VulkanResidentTokenRuntimeQueuedInputEvent {
+            input_event: event,
+            pending_input_event_count: self.pending_input_events.len(),
+        })
+    }
+
+    pub fn run_cycle(
+        &mut self,
+        device: &VulkanComputeDevice,
+        max_ticks: usize,
+    ) -> Result<VulkanResidentTokenRuntimeCycleRun, VulkanResidentGreedyFeedbackLoopRunnerError>
+    {
+        let stream_snapshot = self.stream.snapshot();
+        let start_stream_tick = stream_snapshot.next_stream_tick;
+        let mut remaining_tick_budget = max_ticks;
+        let mut queued_input_events = Vec::new();
+        let mut pump_runs = Vec::new();
+        let mut output_events = Vec::new();
+        let mut processed_tick_count = 0usize;
+        let mut idle_tick_count = 0usize;
+        let mut ticks_used = 0usize;
+        let stop_condition;
+
+        if remaining_tick_budget == 0 {
+            return Ok(VulkanResidentTokenRuntimeCycleRun {
+                stream_id: self.stream.stream_id().to_string(),
+                start_stream_tick,
+                next_stream_tick: self.stream.next_stream_tick(),
+                max_ticks,
+                ticks_used,
+                stop_condition: VulkanResidentTokenRuntimeCycleStopCondition::TickBudget,
+                queued_input_events,
+                pump_runs,
+                output_events,
+                processed_tick_count,
+                idle_tick_count,
+                pending_input_event_count: self.pending_input_events.len(),
+                stream_idle: self.stream.snapshot().idle,
+                last_stop_reason: self.stream.snapshot().last_stop_reason,
+            });
+        }
+
+        loop {
+            if self.stream.snapshot().idle {
+                if let Some(event) = self.pending_input_events.pop_front() {
+                    queued_input_events.push(self.stream.enqueue_external_event(event)?);
+                } else {
+                    stop_condition = VulkanResidentTokenRuntimeCycleStopCondition::Idle;
+                    break;
+                }
+            }
+
+            if remaining_tick_budget == 0 {
+                stop_condition = VulkanResidentTokenRuntimeCycleStopCondition::TickBudget;
+                break;
+            }
+
+            let pump_run = self.stream.pump_bounded(device, remaining_tick_budget)?;
+            let pump_ticks = pump_run.ticks.len();
+            ticks_used += pump_ticks;
+            remaining_tick_budget = remaining_tick_budget.saturating_sub(pump_ticks);
+            processed_tick_count += pump_run.processed_tick_count;
+            idle_tick_count += pump_run.idle_tick_count;
+            output_events.extend(pump_run.output_events.iter().cloned());
+            let pump_stopped_on_budget =
+                pump_run.stop_condition == VulkanResidentTokenStreamPumpStopCondition::TickBudget;
+            pump_runs.push(pump_run);
+
+            if pump_stopped_on_budget {
+                stop_condition = VulkanResidentTokenRuntimeCycleStopCondition::TickBudget;
+                break;
+            }
+        }
+
+        let end_snapshot = self.stream.snapshot();
+        let mut stop_condition = stop_condition;
+        if stop_condition == VulkanResidentTokenRuntimeCycleStopCondition::Idle
+            && (!end_snapshot.idle || !self.pending_input_events.is_empty())
+        {
+            stop_condition = VulkanResidentTokenRuntimeCycleStopCondition::TickBudget;
+        }
+
+        Ok(VulkanResidentTokenRuntimeCycleRun {
+            stream_id: end_snapshot.stream_id,
+            start_stream_tick,
+            next_stream_tick: end_snapshot.next_stream_tick,
+            max_ticks,
+            ticks_used,
+            stop_condition,
+            queued_input_events,
+            pump_runs,
+            output_events,
+            processed_tick_count,
+            idle_tick_count,
+            pending_input_event_count: self.pending_input_events.len(),
+            stream_idle: end_snapshot.idle,
+            last_stop_reason: end_snapshot.last_stop_reason,
+        })
+    }
+
+    pub fn snapshot(&self) -> VulkanResidentTokenRuntimeSnapshot {
+        let stream = self.stream.snapshot();
+        let idle = stream.idle && self.pending_input_events.is_empty();
+        VulkanResidentTokenRuntimeSnapshot {
+            stream,
+            pending_input_event_count: self.pending_input_events.len(),
+            idle,
+            running: !idle,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanResidentTokenRuntimeQueuedInputEvent {
+    pub input_event: VulkanResidentTokenInputEvent,
+    pub pending_input_event_count: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VulkanResidentTokenRuntimeCycleStopCondition {
+    Idle,
+    TickBudget,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanResidentTokenRuntimeCycleRun {
+    pub stream_id: String,
+    pub start_stream_tick: u64,
+    pub next_stream_tick: u64,
+    pub max_ticks: usize,
+    pub ticks_used: usize,
+    pub stop_condition: VulkanResidentTokenRuntimeCycleStopCondition,
+    pub queued_input_events: Vec<VulkanResidentTokenQueuedInputEvent>,
+    pub pump_runs: Vec<VulkanResidentTokenStreamPumpRun>,
+    pub output_events: Vec<VulkanResidentTokenOutputEvent>,
+    pub processed_tick_count: usize,
+    pub idle_tick_count: usize,
+    pub pending_input_event_count: usize,
+    pub stream_idle: bool,
+    pub last_stop_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanResidentTokenRuntimeSnapshot {
+    pub stream: VulkanResidentTokenStreamSnapshot,
+    pub pending_input_event_count: usize,
+    pub idle: bool,
+    pub running: bool,
+}
+
 pub struct VulkanMountedPlacedResidentPedalRunner {
     pub pedal_id: String,
     pub dispatches: Vec<VulkanMountedPlacedResidentPedalDispatch>,
@@ -11645,6 +11838,144 @@ mod tests {
         assert!(no_budget.ticks.is_empty());
         assert_eq!(no_budget.start_stream_tick, 4);
         assert_eq!(no_budget.next_stream_tick, 4);
+    }
+
+    #[test]
+    fn resident_token_runtime_queues_events_and_runs_bounded_cycles() {
+        let device = match VulkanComputeDevice::new() {
+            Ok(device) => device,
+            Err(error) => {
+                eprintln!("skipping resident token runtime cycle: {error}");
+                return;
+            }
+        };
+        let Some(processor) = create_lfm2_resident_greedy_stream_processor_with_capacity(
+            &device,
+            "resident token runtime cycle",
+            8,
+            "gqa_attention_bf16_q16_kv8_d64_cap8.comp",
+        ) else {
+            return;
+        };
+        let mut runtime = VulkanResidentTokenRuntime::from_processor("runtime_stream_0", processor);
+        let initial = runtime.snapshot();
+        assert!(initial.idle);
+        assert!(!initial.running);
+        assert!(initial.stream.idle);
+        assert_eq!(initial.pending_input_event_count, 0);
+
+        let queued_first = runtime
+            .enqueue_input_event(
+                VulkanResidentTokenInputEvent::new("event_0", vec![1], 3).with_origin("test_host"),
+            )
+            .unwrap();
+        assert_eq!(queued_first.pending_input_event_count, 1);
+        let queued_second = runtime
+            .enqueue_input_event(
+                VulkanResidentTokenInputEvent::new("event_1", vec![36_309], 1)
+                    .with_origin("test_host"),
+            )
+            .unwrap();
+        assert_eq!(queued_second.pending_input_event_count, 2);
+        let queued_snapshot = runtime.snapshot();
+        assert!(!queued_snapshot.idle);
+        assert!(queued_snapshot.running);
+        assert!(queued_snapshot.stream.idle);
+        assert_eq!(queued_snapshot.pending_input_event_count, 2);
+
+        let no_budget = runtime.run_cycle(&device, 0).unwrap();
+        assert_eq!(
+            no_budget.stop_condition,
+            VulkanResidentTokenRuntimeCycleStopCondition::TickBudget
+        );
+        assert_eq!(no_budget.ticks_used, 0);
+        assert_eq!(no_budget.pending_input_event_count, 2);
+        assert!(no_budget.stream_idle);
+
+        let first_cycle = runtime.run_cycle(&device, 2).unwrap();
+        assert_eq!(first_cycle.stream_id, "runtime_stream_0");
+        assert_eq!(first_cycle.start_stream_tick, 0);
+        assert_eq!(first_cycle.next_stream_tick, 2);
+        assert_eq!(first_cycle.max_ticks, 2);
+        assert_eq!(first_cycle.ticks_used, 2);
+        assert_eq!(
+            first_cycle.stop_condition,
+            VulkanResidentTokenRuntimeCycleStopCondition::TickBudget
+        );
+        assert_eq!(first_cycle.queued_input_events.len(), 1);
+        assert_eq!(first_cycle.queued_input_events[0].input_event.id, "event_0");
+        assert_eq!(first_cycle.pending_input_event_count, 1);
+        assert!(!first_cycle.stream_idle);
+        assert_eq!(first_cycle.processed_tick_count, 2);
+        assert_eq!(first_cycle.idle_tick_count, 0);
+        assert_eq!(first_cycle.output_events.len(), 2);
+        assert_eq!(
+            first_cycle
+                .output_events
+                .iter()
+                .map(|event| (event.input_event_id.as_str(), event.output_index))
+                .collect::<Vec<_>>(),
+            vec![("event_0", 0), ("event_0", 1)]
+        );
+
+        let second_cycle = runtime.run_cycle(&device, 4).unwrap();
+        assert_eq!(second_cycle.start_stream_tick, 2);
+        assert_eq!(second_cycle.next_stream_tick, 5);
+        assert_eq!(second_cycle.ticks_used, 4);
+        assert_eq!(
+            second_cycle.stop_condition,
+            VulkanResidentTokenRuntimeCycleStopCondition::TickBudget
+        );
+        assert_eq!(second_cycle.queued_input_events.len(), 1);
+        assert_eq!(
+            second_cycle.queued_input_events[0].input_event.id,
+            "event_1"
+        );
+        assert_eq!(second_cycle.pending_input_event_count, 0);
+        assert!(!second_cycle.stream_idle);
+        assert_eq!(second_cycle.processed_tick_count, 3);
+        assert_eq!(second_cycle.idle_tick_count, 1);
+        assert_eq!(second_cycle.output_events.len(), 2);
+        assert_eq!(
+            second_cycle
+                .output_events
+                .iter()
+                .map(|event| (event.input_event_id.as_str(), event.output_index))
+                .collect::<Vec<_>>(),
+            vec![("event_0", 2), ("event_1", 0)]
+        );
+        assert_eq!(second_cycle.output_events[0].source_stream_tick, 2);
+        assert_eq!(second_cycle.output_events[1].source_stream_tick, 4);
+
+        let final_cycle = runtime.run_cycle(&device, 3).unwrap();
+        assert_eq!(final_cycle.start_stream_tick, 5);
+        assert_eq!(final_cycle.next_stream_tick, 6);
+        assert_eq!(
+            final_cycle.stop_condition,
+            VulkanResidentTokenRuntimeCycleStopCondition::Idle
+        );
+        assert_eq!(final_cycle.ticks_used, 2);
+        assert_eq!(final_cycle.processed_tick_count, 1);
+        assert_eq!(final_cycle.idle_tick_count, 1);
+        assert!(final_cycle.output_events.is_empty());
+        assert_eq!(final_cycle.pending_input_event_count, 0);
+        assert!(final_cycle.stream_idle);
+
+        let idle_cycle = runtime.run_cycle(&device, 3).unwrap();
+        assert_eq!(
+            idle_cycle.stop_condition,
+            VulkanResidentTokenRuntimeCycleStopCondition::Idle
+        );
+        assert_eq!(idle_cycle.ticks_used, 0);
+        assert_eq!(idle_cycle.pending_input_event_count, 0);
+        assert!(idle_cycle.stream_idle);
+
+        let final_snapshot = runtime.snapshot();
+        assert!(final_snapshot.idle);
+        assert!(!final_snapshot.running);
+        assert_eq!(final_snapshot.stream.next_stream_tick, 6);
+        assert_eq!(final_snapshot.stream.total_public_outputs, 4);
+        assert_eq!(final_snapshot.pending_input_event_count, 0);
     }
 
     #[test]
