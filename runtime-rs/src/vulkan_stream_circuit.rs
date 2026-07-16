@@ -4787,6 +4787,237 @@ pub struct VulkanResidentTokenRuntimeSnapshot {
     pub running: bool,
 }
 
+pub struct VulkanResidentTokenRuntimeScheduler {
+    runtimes: BTreeMap<String, VulkanResidentTokenRuntime>,
+    active_queue: VecDeque<String>,
+}
+
+impl VulkanResidentTokenRuntimeScheduler {
+    pub fn new() -> Self {
+        Self {
+            runtimes: BTreeMap::new(),
+            active_queue: VecDeque::new(),
+        }
+    }
+
+    pub fn add_runtime(
+        &mut self,
+        runtime: VulkanResidentTokenRuntime,
+    ) -> Result<(), VulkanResidentTokenRuntimeSchedulerError> {
+        let snapshot = runtime.snapshot();
+        let stream_id = snapshot.stream.stream_id.clone();
+        if self.runtimes.contains_key(&stream_id) {
+            return Err(VulkanResidentTokenRuntimeSchedulerError::DuplicateStream(
+                stream_id,
+            ));
+        }
+        let running = snapshot.running;
+        self.runtimes.insert(stream_id.clone(), runtime);
+        if running {
+            self.schedule(&stream_id);
+        }
+        Ok(())
+    }
+
+    pub fn has_runtime(&self, stream_id: &str) -> bool {
+        self.runtimes.contains_key(stream_id)
+    }
+
+    pub fn runtime(&self, stream_id: &str) -> Option<&VulkanResidentTokenRuntime> {
+        self.runtimes.get(stream_id)
+    }
+
+    pub fn runtime_mut(&mut self, stream_id: &str) -> Option<&mut VulkanResidentTokenRuntime> {
+        self.runtimes.get_mut(stream_id)
+    }
+
+    pub fn enqueue_input_event(
+        &mut self,
+        stream_id: &str,
+        event: VulkanResidentTokenInputEvent,
+    ) -> Result<VulkanResidentTokenRuntimeQueuedInputEvent, VulkanResidentTokenRuntimeSchedulerError>
+    {
+        let queued = self
+            .runtimes
+            .get_mut(stream_id)
+            .ok_or_else(|| {
+                VulkanResidentTokenRuntimeSchedulerError::UnknownStream(stream_id.to_string())
+            })?
+            .enqueue_input_event(event)?;
+        self.schedule(stream_id);
+        Ok(queued)
+    }
+
+    pub fn run_cycle(
+        &mut self,
+        device: &VulkanComputeDevice,
+        max_runtime_cycles: usize,
+        ticks_per_runtime: usize,
+    ) -> Result<VulkanResidentTokenRuntimeSchedulerRun, VulkanResidentTokenRuntimeSchedulerError>
+    {
+        let mut runtime_cycles = Vec::new();
+        let mut output_events = Vec::new();
+
+        if max_runtime_cycles == 0 || ticks_per_runtime == 0 {
+            return Ok(VulkanResidentTokenRuntimeSchedulerRun {
+                max_runtime_cycles,
+                ticks_per_runtime,
+                stop_condition: if self.active_queue.is_empty() {
+                    VulkanResidentTokenRuntimeSchedulerStopCondition::Idle
+                } else {
+                    VulkanResidentTokenRuntimeSchedulerStopCondition::RuntimeCycleBudget
+                },
+                runtime_cycles,
+                output_events,
+                active_runtime_count: self.active_queue.len(),
+                registered_runtime_count: self.runtimes.len(),
+            });
+        }
+
+        while runtime_cycles.len() < max_runtime_cycles {
+            let Some(stream_id) = self.active_queue.pop_front() else {
+                break;
+            };
+            let cycle = self
+                .runtimes
+                .get_mut(&stream_id)
+                .ok_or_else(|| {
+                    VulkanResidentTokenRuntimeSchedulerError::UnknownStream(stream_id.clone())
+                })?
+                .run_cycle(device, ticks_per_runtime)?;
+            output_events.extend(cycle.output_events.iter().cloned().map(|output_event| {
+                VulkanResidentTokenRuntimeSchedulerOutputEvent {
+                    stream_id: stream_id.clone(),
+                    output_event,
+                }
+            }));
+            runtime_cycles.push(cycle);
+
+            if self
+                .runtimes
+                .get(&stream_id)
+                .map(|runtime| runtime.snapshot().running)
+                .unwrap_or(false)
+            {
+                self.schedule(&stream_id);
+            }
+        }
+
+        let stop_condition = if self.active_queue.is_empty() {
+            VulkanResidentTokenRuntimeSchedulerStopCondition::Idle
+        } else {
+            VulkanResidentTokenRuntimeSchedulerStopCondition::RuntimeCycleBudget
+        };
+
+        Ok(VulkanResidentTokenRuntimeSchedulerRun {
+            max_runtime_cycles,
+            ticks_per_runtime,
+            stop_condition,
+            runtime_cycles,
+            output_events,
+            active_runtime_count: self.active_queue.len(),
+            registered_runtime_count: self.runtimes.len(),
+        })
+    }
+
+    pub fn snapshot(&self) -> VulkanResidentTokenRuntimeSchedulerSnapshot {
+        let runtimes = self
+            .runtimes
+            .values()
+            .map(VulkanResidentTokenRuntime::snapshot)
+            .collect::<Vec<_>>();
+        let running = runtimes.iter().any(|runtime| runtime.running);
+        VulkanResidentTokenRuntimeSchedulerSnapshot {
+            registered_runtime_count: self.runtimes.len(),
+            active_runtime_count: self.active_queue.len(),
+            idle: !running,
+            running,
+            runtimes,
+        }
+    }
+
+    fn schedule(&mut self, stream_id: &str) {
+        if !self.active_queue.iter().any(|active| active == stream_id) {
+            self.active_queue.push_back(stream_id.to_string());
+        }
+    }
+}
+
+impl Default for VulkanResidentTokenRuntimeScheduler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Debug)]
+pub enum VulkanResidentTokenRuntimeSchedulerError {
+    DuplicateStream(String),
+    UnknownStream(String),
+    Runtime(VulkanResidentGreedyFeedbackLoopRunnerError),
+}
+
+impl Display for VulkanResidentTokenRuntimeSchedulerError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DuplicateStream(stream_id) => {
+                write!(
+                    f,
+                    "resident token runtime stream {stream_id:?} is already registered"
+                )
+            }
+            Self::UnknownStream(stream_id) => {
+                write!(
+                    f,
+                    "resident token runtime stream {stream_id:?} is not registered"
+                )
+            }
+            Self::Runtime(error) => Display::fmt(error, f),
+        }
+    }
+}
+
+impl Error for VulkanResidentTokenRuntimeSchedulerError {}
+
+impl From<VulkanResidentGreedyFeedbackLoopRunnerError>
+    for VulkanResidentTokenRuntimeSchedulerError
+{
+    fn from(error: VulkanResidentGreedyFeedbackLoopRunnerError) -> Self {
+        Self::Runtime(error)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VulkanResidentTokenRuntimeSchedulerStopCondition {
+    Idle,
+    RuntimeCycleBudget,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanResidentTokenRuntimeSchedulerOutputEvent {
+    pub stream_id: String,
+    pub output_event: VulkanResidentTokenOutputEvent,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanResidentTokenRuntimeSchedulerRun {
+    pub max_runtime_cycles: usize,
+    pub ticks_per_runtime: usize,
+    pub stop_condition: VulkanResidentTokenRuntimeSchedulerStopCondition,
+    pub runtime_cycles: Vec<VulkanResidentTokenRuntimeCycleRun>,
+    pub output_events: Vec<VulkanResidentTokenRuntimeSchedulerOutputEvent>,
+    pub active_runtime_count: usize,
+    pub registered_runtime_count: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanResidentTokenRuntimeSchedulerSnapshot {
+    pub registered_runtime_count: usize,
+    pub active_runtime_count: usize,
+    pub idle: bool,
+    pub running: bool,
+    pub runtimes: Vec<VulkanResidentTokenRuntimeSnapshot>,
+}
+
 pub struct VulkanMountedPlacedResidentPedalRunner {
     pub pedal_id: String,
     pub dispatches: Vec<VulkanMountedPlacedResidentPedalDispatch>,
@@ -11976,6 +12207,182 @@ mod tests {
         assert_eq!(final_snapshot.stream.next_stream_tick, 6);
         assert_eq!(final_snapshot.stream.total_public_outputs, 4);
         assert_eq!(final_snapshot.pending_input_event_count, 0);
+    }
+
+    #[test]
+    fn resident_token_runtime_scheduler_round_robins_registered_runtime() {
+        let device = match VulkanComputeDevice::new() {
+            Ok(device) => device,
+            Err(error) => {
+                eprintln!("skipping resident token runtime scheduler: {error}");
+                return;
+            }
+        };
+        let Some(processor) = create_lfm2_resident_greedy_stream_processor_with_capacity(
+            &device,
+            "resident token runtime scheduler",
+            8,
+            "gqa_attention_bf16_q16_kv8_d64_cap8.comp",
+        ) else {
+            return;
+        };
+        let runtime = VulkanResidentTokenRuntime::from_processor("scheduler_stream_0", processor);
+        let mut scheduler = VulkanResidentTokenRuntimeScheduler::new();
+
+        let initial = scheduler.snapshot();
+        assert_eq!(initial.registered_runtime_count, 0);
+        assert_eq!(initial.active_runtime_count, 0);
+        assert!(initial.idle);
+        assert!(!initial.running);
+        assert!(initial.runtimes.is_empty());
+
+        scheduler.add_runtime(runtime).unwrap();
+        assert!(scheduler.has_runtime("scheduler_stream_0"));
+        let registered = scheduler.snapshot();
+        assert_eq!(registered.registered_runtime_count, 1);
+        assert_eq!(registered.active_runtime_count, 0);
+        assert!(registered.idle);
+        assert!(!registered.running);
+        assert_eq!(registered.runtimes.len(), 1);
+        assert_eq!(
+            registered.runtimes[0].stream.stream_id,
+            "scheduler_stream_0"
+        );
+
+        let queued_first = scheduler
+            .enqueue_input_event(
+                "scheduler_stream_0",
+                VulkanResidentTokenInputEvent::new("event_0", vec![1], 3).with_origin("test_host"),
+            )
+            .unwrap();
+        assert_eq!(queued_first.pending_input_event_count, 1);
+        let queued_second = scheduler
+            .enqueue_input_event(
+                "scheduler_stream_0",
+                VulkanResidentTokenInputEvent::new("event_1", vec![36_309], 1)
+                    .with_origin("test_host"),
+            )
+            .unwrap();
+        assert_eq!(queued_second.pending_input_event_count, 2);
+        let queued = scheduler.snapshot();
+        assert_eq!(queued.registered_runtime_count, 1);
+        assert_eq!(queued.active_runtime_count, 1);
+        assert!(!queued.idle);
+        assert!(queued.running);
+        assert_eq!(queued.runtimes[0].pending_input_event_count, 2);
+        assert!(queued.runtimes[0].stream.idle);
+
+        let no_budget = scheduler.run_cycle(&device, 0, 2).unwrap();
+        assert_eq!(
+            no_budget.stop_condition,
+            VulkanResidentTokenRuntimeSchedulerStopCondition::RuntimeCycleBudget
+        );
+        assert!(no_budget.runtime_cycles.is_empty());
+        assert!(no_budget.output_events.is_empty());
+        assert_eq!(no_budget.active_runtime_count, 1);
+        assert_eq!(no_budget.registered_runtime_count, 1);
+
+        let first = scheduler.run_cycle(&device, 1, 2).unwrap();
+        assert_eq!(
+            first.stop_condition,
+            VulkanResidentTokenRuntimeSchedulerStopCondition::RuntimeCycleBudget
+        );
+        assert_eq!(first.runtime_cycles.len(), 1);
+        assert_eq!(first.runtime_cycles[0].stream_id, "scheduler_stream_0");
+        assert_eq!(first.runtime_cycles[0].start_stream_tick, 0);
+        assert_eq!(first.runtime_cycles[0].next_stream_tick, 2);
+        assert_eq!(first.runtime_cycles[0].pending_input_event_count, 1);
+        assert_eq!(first.output_events.len(), 2);
+        assert!(
+            first
+                .output_events
+                .iter()
+                .all(|event| event.stream_id == "scheduler_stream_0")
+        );
+        assert_eq!(
+            first
+                .output_events
+                .iter()
+                .map(|event| {
+                    (
+                        event.output_event.input_event_id.as_str(),
+                        event.output_event.output_index,
+                    )
+                })
+                .collect::<Vec<_>>(),
+            vec![("event_0", 0), ("event_0", 1)]
+        );
+        assert_eq!(first.active_runtime_count, 1);
+        assert_eq!(first.registered_runtime_count, 1);
+
+        let second = scheduler.run_cycle(&device, 1, 4).unwrap();
+        assert_eq!(
+            second.stop_condition,
+            VulkanResidentTokenRuntimeSchedulerStopCondition::RuntimeCycleBudget
+        );
+        assert_eq!(second.runtime_cycles.len(), 1);
+        assert_eq!(second.runtime_cycles[0].stream_id, "scheduler_stream_0");
+        assert_eq!(second.runtime_cycles[0].start_stream_tick, 2);
+        assert_eq!(second.runtime_cycles[0].next_stream_tick, 5);
+        assert_eq!(second.runtime_cycles[0].pending_input_event_count, 0);
+        assert_eq!(second.output_events.len(), 2);
+        assert!(
+            second
+                .output_events
+                .iter()
+                .all(|event| event.stream_id == "scheduler_stream_0")
+        );
+        assert_eq!(
+            second
+                .output_events
+                .iter()
+                .map(|event| {
+                    (
+                        event.output_event.input_event_id.as_str(),
+                        event.output_event.output_index,
+                    )
+                })
+                .collect::<Vec<_>>(),
+            vec![("event_0", 2), ("event_1", 0)]
+        );
+        assert_eq!(second.active_runtime_count, 1);
+        assert_eq!(second.registered_runtime_count, 1);
+
+        let final_run = scheduler.run_cycle(&device, 1, 3).unwrap();
+        assert_eq!(
+            final_run.stop_condition,
+            VulkanResidentTokenRuntimeSchedulerStopCondition::Idle
+        );
+        assert_eq!(final_run.runtime_cycles.len(), 1);
+        assert_eq!(final_run.runtime_cycles[0].stream_id, "scheduler_stream_0");
+        assert_eq!(final_run.runtime_cycles[0].start_stream_tick, 5);
+        assert_eq!(final_run.runtime_cycles[0].next_stream_tick, 6);
+        assert_eq!(
+            final_run.runtime_cycles[0].stop_condition,
+            VulkanResidentTokenRuntimeCycleStopCondition::Idle
+        );
+        assert!(final_run.output_events.is_empty());
+        assert_eq!(final_run.active_runtime_count, 0);
+        assert_eq!(final_run.registered_runtime_count, 1);
+
+        let idle_run = scheduler.run_cycle(&device, 1, 3).unwrap();
+        assert_eq!(
+            idle_run.stop_condition,
+            VulkanResidentTokenRuntimeSchedulerStopCondition::Idle
+        );
+        assert!(idle_run.runtime_cycles.is_empty());
+        assert!(idle_run.output_events.is_empty());
+        assert_eq!(idle_run.active_runtime_count, 0);
+        assert_eq!(idle_run.registered_runtime_count, 1);
+
+        let final_snapshot = scheduler.snapshot();
+        assert_eq!(final_snapshot.registered_runtime_count, 1);
+        assert_eq!(final_snapshot.active_runtime_count, 0);
+        assert!(final_snapshot.idle);
+        assert!(!final_snapshot.running);
+        assert_eq!(final_snapshot.runtimes[0].stream.next_stream_tick, 6);
+        assert_eq!(final_snapshot.runtimes[0].stream.total_public_outputs, 4);
+        assert_eq!(final_snapshot.runtimes[0].pending_input_event_count, 0);
     }
 
     #[test]
