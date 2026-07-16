@@ -8563,6 +8563,18 @@ mod tests {
         VulkanReusableKernelArtifactManifest,
         VulkanMountedPlacedBoundDispatchPlan,
     ) {
+        mount_lfm2_single_device_stream_circuit_with_capacity(device, 4)
+    }
+
+    fn mount_lfm2_single_device_stream_circuit_with_capacity(
+        device: &VulkanComputeDevice,
+        dynamic_state_capacity_activations: usize,
+    ) -> (
+        TensorIndex,
+        VulkanMountedPlacedStreamCircuit,
+        VulkanReusableKernelArtifactManifest,
+        VulkanMountedPlacedBoundDispatchPlan,
+    ) {
         let graph = ResolvedLoweredPedalboard::from_index_file(lfm2_index_path()).unwrap();
         let tensor_index = TensorIndex::from_json_file(lfm2_tensor_index_path()).unwrap();
         let execution_plan =
@@ -8583,8 +8595,12 @@ mod tests {
         let placed_plan =
             VulkanPlacedStreamCircuitPlan::from_plans(&execution_plan, &resource_plan, resident)
                 .unwrap();
-        let mounted =
-            VulkanMountedPlacedStreamCircuit::from_placed_plan(device, placed_plan, 4).unwrap();
+        let mounted = VulkanMountedPlacedStreamCircuit::from_placed_plan(
+            device,
+            placed_plan,
+            dynamic_state_capacity_activations,
+        )
+        .unwrap();
         let manifest = VulkanReusableKernelArtifactManifest::new(
             mounted
                 .placed_plan
@@ -8956,6 +8972,18 @@ mod tests {
         mounted: &VulkanMountedPlacedStreamCircuit,
         mounted_bound: &VulkanMountedPlacedBoundDispatchPlan,
     ) -> Option<VulkanLoadedReusableKernelArtifactManifest> {
+        lfm2_level_1_loaded_kernel_pack_for_conv_and_attention_families_with_attention_shader(
+            mounted,
+            mounted_bound,
+            "gqa_attention_bf16_q16_kv8_d64_cap4.comp",
+        )
+    }
+
+    fn lfm2_level_1_loaded_kernel_pack_for_conv_and_attention_families_with_attention_shader(
+        mounted: &VulkanMountedPlacedStreamCircuit,
+        mounted_bound: &VulkanMountedPlacedBoundDispatchPlan,
+        attention_shader: &str,
+    ) -> Option<VulkanLoadedReusableKernelArtifactManifest> {
         loaded_kernel_pack_for_dispatch_shaders(
             mounted,
             mounted_bound,
@@ -9025,11 +9053,7 @@ mod tests {
                     "kv_memory_append",
                     "append_kv_state_bf16_8x64.comp",
                 ),
-                (
-                    "layer_02",
-                    "attention_read",
-                    "gqa_attention_bf16_q16_kv8_d64_cap4.comp",
-                ),
+                ("layer_02", "attention_read", attention_shader),
                 (
                     "layer_02",
                     "attention_out_projection",
@@ -9932,12 +9956,32 @@ mod tests {
         device: &VulkanComputeDevice,
         skip_label: &str,
     ) -> Option<VulkanResidentGreedyStreamProcessor> {
+        create_lfm2_resident_greedy_stream_processor_with_capacity(
+            device,
+            skip_label,
+            4,
+            "gqa_attention_bf16_q16_kv8_d64_cap4.comp",
+        )
+    }
+
+    fn create_lfm2_resident_greedy_stream_processor_with_capacity(
+        device: &VulkanComputeDevice,
+        skip_label: &str,
+        dynamic_state_capacity_activations: usize,
+        attention_shader: &str,
+    ) -> Option<VulkanResidentGreedyStreamProcessor> {
         let (tensor_index, mounted, _manifest, mounted_bound) =
-            mount_lfm2_single_device_stream_circuit(device);
-        let Some(loaded_manifest) = lfm2_level_1_loaded_kernel_pack_for_conv_and_attention_families(
-            &mounted,
-            &mounted_bound,
-        ) else {
+            mount_lfm2_single_device_stream_circuit_with_capacity(
+                device,
+                dynamic_state_capacity_activations,
+            );
+        let Some(loaded_manifest) =
+            lfm2_level_1_loaded_kernel_pack_for_conv_and_attention_families_with_attention_shader(
+                &mounted,
+                &mounted_bound,
+                attention_shader,
+            )
+        else {
             eprintln!("skipping {skip_label}: no GLSL to SPIR-V compiler found");
             return None;
         };
@@ -10264,6 +10308,62 @@ mod tests {
         ));
         assert_eq!(stream.pending_external_input_count(), 1);
         assert_eq!(stream.next_stream_tick, 4);
+    }
+
+    #[test]
+    fn resident_greedy_running_stream_uses_configured_capacity() {
+        let device = match VulkanComputeDevice::new() {
+            Ok(device) => device,
+            Err(error) => {
+                eprintln!("skipping resident greedy running stream capacity: {error}");
+                return;
+            }
+        };
+        let Some(processor) = create_lfm2_resident_greedy_stream_processor_with_capacity(
+            &device,
+            "resident greedy running stream capacity",
+            8,
+            "gqa_attention_bf16_q16_kv8_d64_cap8.comp",
+        ) else {
+            return;
+        };
+        assert_eq!(processor.dynamic_state_capacity_activations, 8);
+
+        let mut stream = processor.into_running_stream("stream_0");
+        let run = stream.run_prompt(&device, &[1], 7, None).unwrap();
+        assert_eq!(run.prompt_token_ids, vec![1]);
+        assert_eq!(run.generated_token_ids.len(), 7);
+        assert_eq!(run.output_token_ids.len(), 8);
+        assert_eq!(run.stop_reason, "max_new_tokens");
+        assert_eq!(run.start_stream_tick, 0);
+        assert_eq!(run.next_stream_tick, 8);
+        assert_eq!(stream.next_stream_tick, 8);
+        assert_eq!(stream.public_outputs().len(), 7);
+        assert_eq!(stream.private_feedback_history().len(), 7);
+        assert_eq!(run.ticks.len(), 9);
+        assert_eq!(run.ticks[0].stream_tick, Some(0));
+        assert_eq!(run.ticks[7].stream_tick, Some(7));
+        assert_eq!(
+            run.ticks[7].input_signal.as_ref().unwrap().route(),
+            VulkanResidentGreedyPromptEventInputRoute::PrivateFeedback
+        );
+        assert_eq!(
+            run.ticks[8].status,
+            VulkanResidentGreedyRunningStreamTickStatus::Idle
+        );
+        assert_eq!(run.ticks[8].stream_tick, None);
+
+        stream.inject_prompt(&[36_309], 0, None).unwrap();
+        let error = stream.tick(&device).unwrap_err();
+        assert!(matches!(
+            error,
+            VulkanResidentGreedyFeedbackLoopRunnerError::StreamStateCapacityExceeded {
+                stream_tick: 8,
+                dynamic_state_capacity_activations: 8,
+            }
+        ));
+        assert_eq!(stream.pending_external_input_count(), 1);
+        assert_eq!(stream.next_stream_tick, 8);
     }
 
     #[test]
