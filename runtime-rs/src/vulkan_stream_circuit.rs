@@ -1152,6 +1152,17 @@ impl VulkanStreamCircuitStreamBuffers {
             .iter()
             .position(|buffer| buffer.pedal_id == pedal_id && buffer.slot == slot)
     }
+
+    pub fn zero_state_buffers(&self) -> Result<usize, VulkanError> {
+        let mut total_zeroed = 0usize;
+        for state in &self.state_buffers {
+            state.buffer.write_bytes(&vec![0u8; state.byte_capacity])?;
+            total_zeroed = total_zeroed
+                .checked_add(state.byte_capacity)
+                .ok_or_else(|| VulkanError("state zero byte count overflowed".to_string()))?;
+        }
+        Ok(total_zeroed)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2513,36 +2524,50 @@ pub struct VulkanResidentInputEmbeddingTransducerRunner {
     resident_dispatch: VulkanResidentKernelDispatch,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanResidentInputEmbeddingTransducerSpec {
+    pub transducer_id: String,
+    pub parameter_tensor: String,
+    pub parameter_dtype: String,
+    pub parameter_shape: Vec<usize>,
+    pub parameter_byte_capacity: usize,
+    pub output_signal_id: String,
+    pub output_frame_byte_capacity: usize,
+    pub output_frame_word_count: usize,
+    pub local_size_x: u32,
+}
+
 impl VulkanResidentInputEmbeddingTransducerRunner {
-    pub fn from_mounted_lfm2_token_embedding(
+    pub fn from_mounted_token_embedding(
         device: &VulkanComputeDevice,
         mounted: &VulkanMountedPlacedStreamCircuit,
         transducer_parameter_buffers: &VulkanPermanentParameterBuffers,
         spirv_words: &[u32],
+        spec: &VulkanResidentInputEmbeddingTransducerSpec,
     ) -> Result<Self, VulkanResidentInputEmbeddingTransducerRunnerError> {
         let embedding_weight = transducer_parameter_buffers
-            .parameter_buffer(LFM2_EMBED_TOKENS_TENSOR)
+            .parameter_buffer(&spec.parameter_tensor)
             .ok_or_else(|| {
                 VulkanResidentInputEmbeddingTransducerRunnerError::MissingTransducerParameterBuffer {
-                    tensor: LFM2_EMBED_TOKENS_TENSOR.to_string(),
+                    tensor: spec.parameter_tensor.clone(),
                 }
             })?;
-        validate_lfm2_embedding_weight(embedding_weight)?;
+        validate_input_embedding_weight(embedding_weight, spec)?;
 
         let output_frame = mounted
             .boundary_io
-            .input_buffer(LFM2_INPUT_FRAME_SIGNAL)
+            .input_buffer(&spec.output_signal_id)
             .ok_or_else(|| {
                 VulkanResidentInputEmbeddingTransducerRunnerError::MissingModelInputBuffer {
-                    signal_id: LFM2_INPUT_FRAME_SIGNAL.to_string(),
+                    signal_id: spec.output_signal_id.clone(),
                 }
             })?;
-        if output_frame.byte_capacity != LFM2_FRAME_BYTES {
+        if output_frame.byte_capacity != spec.output_frame_byte_capacity {
             return Err(
                 VulkanResidentInputEmbeddingTransducerRunnerError::InvalidOutputFrameByteCapacity {
-                    signal_id: LFM2_INPUT_FRAME_SIGNAL.to_string(),
+                    signal_id: spec.output_signal_id.clone(),
                     byte_capacity: output_frame.byte_capacity,
-                    expected_byte_capacity: LFM2_FRAME_BYTES,
+                    expected_byte_capacity: spec.output_frame_byte_capacity,
                 },
             );
         }
@@ -2560,26 +2585,42 @@ impl VulkanResidentInputEmbeddingTransducerRunner {
             ),
         ];
         let workgroup_count_x = u32::try_from(
-            LFM2_FRAME_WORDS.div_ceil(VULKAN_INPUT_EMBEDDING_LOOKUP_LOCAL_SIZE_X as usize),
+            spec.output_frame_word_count
+                .div_ceil(spec.local_size_x as usize),
         )
         .map_err(|_| VulkanResidentInputEmbeddingTransducerRunnerError::WorkgroupCountOverflow)?;
         let resident_dispatch = device.create_resident_kernel_dispatch(
             spirv_words,
             &bindings,
             workgroup_count_x,
-            VULKAN_INPUT_EMBEDDING_LOOKUP_LOCAL_SIZE_X,
+            spec.local_size_x,
             std::mem::size_of::<u32>() as u32,
         )?;
 
         Ok(Self {
-            transducer_id: LFM2_TOKEN_EMBEDDING_TRANSDUCER_ID.to_string(),
-            parameter_tensor: LFM2_EMBED_TOKENS_TENSOR.to_string(),
-            output_signal_id: LFM2_INPUT_FRAME_SIGNAL.to_string(),
+            transducer_id: spec.transducer_id.clone(),
+            parameter_tensor: spec.parameter_tensor.clone(),
+            output_signal_id: spec.output_signal_id.clone(),
             descriptor_count: resident_dispatch.descriptor_count(),
             workgroup_count_x: resident_dispatch.workgroup_count_x(),
             push_constant_byte_count: resident_dispatch.push_constant_byte_count(),
             resident_dispatch,
         })
+    }
+
+    pub fn from_mounted_lfm2_token_embedding(
+        device: &VulkanComputeDevice,
+        mounted: &VulkanMountedPlacedStreamCircuit,
+        transducer_parameter_buffers: &VulkanPermanentParameterBuffers,
+        spirv_words: &[u32],
+    ) -> Result<Self, VulkanResidentInputEmbeddingTransducerRunnerError> {
+        Self::from_mounted_token_embedding(
+            device,
+            mounted,
+            transducer_parameter_buffers,
+            spirv_words,
+            &lfm2_input_embedding_transducer_spec(),
+        )
     }
 
     pub fn run_token_id(
@@ -2682,12 +2723,13 @@ impl From<VulkanError> for VulkanResidentInputEmbeddingTransducerRunnerError {
     }
 }
 
-fn validate_lfm2_embedding_weight(
+fn validate_input_embedding_weight(
     allocation: &VulkanPermanentParameterBufferAllocation,
+    spec: &VulkanResidentInputEmbeddingTransducerSpec,
 ) -> Result<(), VulkanResidentInputEmbeddingTransducerRunnerError> {
-    if allocation.parameter.dtype.as_deref() != Some("BF16")
-        || allocation.parameter.shape.as_deref() != Some(&[LFM2_VOCAB_SIZE, LFM2_HIDDEN_SIZE])
-        || allocation.byte_capacity != LFM2_EMBED_TOKENS_BYTES
+    if allocation.parameter.dtype.as_deref() != Some(spec.parameter_dtype.as_str())
+        || allocation.parameter.shape.as_deref() != Some(spec.parameter_shape.as_slice())
+        || allocation.byte_capacity != spec.parameter_byte_capacity
     {
         return Err(
             VulkanResidentInputEmbeddingTransducerRunnerError::InvalidEmbeddingWeight {
@@ -2712,53 +2754,77 @@ pub struct VulkanResidentOutputTransducerRunner {
     logits_buffer: VulkanResidentBuffer,
     embedding_norm_dispatch: VulkanResidentKernelDispatch,
     tied_projection_dispatch: VulkanResidentKernelDispatch,
+    node_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanResidentOutputTransducerSpec {
+    pub transducer_id: String,
+    pub input_signal_id: String,
+    pub node_ids: Vec<String>,
+    pub norm_parameter_tensor: String,
+    pub norm_parameter_dtype: String,
+    pub norm_parameter_shape: Vec<usize>,
+    pub norm_parameter_byte_capacity: usize,
+    pub projection_parameter_tensor: String,
+    pub projection_parameter_dtype: String,
+    pub projection_parameter_shape: Vec<usize>,
+    pub projection_parameter_byte_capacity: usize,
+    pub input_frame_byte_capacity: usize,
+    pub normalized_frame_byte_capacity: usize,
+    pub logits_byte_capacity: usize,
+    pub projection_work_items: usize,
+    pub norm_local_size_x: u32,
+    pub projection_local_size_x: u32,
 }
 
 impl VulkanResidentOutputTransducerRunner {
-    pub fn from_mounted_lfm2_output_transducer(
+    pub fn from_mounted_output_transducer(
         device: &VulkanComputeDevice,
         mounted: &VulkanMountedPlacedStreamCircuit,
         transducer_parameter_buffers: &VulkanPermanentParameterBuffers,
         embedding_norm_spirv_words: &[u32],
         tied_projection_spirv_words: &[u32],
+        spec: &VulkanResidentOutputTransducerSpec,
     ) -> Result<Self, VulkanResidentOutputTransducerRunnerError> {
         let output_frame = mounted
             .boundary_io
-            .output_buffer(LFM2_OUTPUT_FRAME_SIGNAL)
+            .output_buffer(&spec.input_signal_id)
             .ok_or_else(
                 || VulkanResidentOutputTransducerRunnerError::MissingModelOutputBuffer {
-                    signal_id: LFM2_OUTPUT_FRAME_SIGNAL.to_string(),
+                    signal_id: spec.input_signal_id.clone(),
                 },
             )?;
-        if output_frame.byte_capacity != LFM2_FRAME_BYTES {
+        if output_frame.byte_capacity != spec.input_frame_byte_capacity {
             return Err(
                 VulkanResidentOutputTransducerRunnerError::InvalidInputFrameByteCapacity {
-                    signal_id: LFM2_OUTPUT_FRAME_SIGNAL.to_string(),
+                    signal_id: spec.input_signal_id.clone(),
                     byte_capacity: output_frame.byte_capacity,
-                    expected_byte_capacity: LFM2_FRAME_BYTES,
+                    expected_byte_capacity: spec.input_frame_byte_capacity,
                 },
             );
         }
 
         let embedding_norm_weight = transducer_parameter_buffers
-            .parameter_buffer(LFM2_EMBEDDING_NORM_TENSOR)
+            .parameter_buffer(&spec.norm_parameter_tensor)
             .ok_or_else(|| {
                 VulkanResidentOutputTransducerRunnerError::MissingTransducerParameterBuffer {
-                    tensor: LFM2_EMBEDDING_NORM_TENSOR.to_string(),
+                    tensor: spec.norm_parameter_tensor.clone(),
                 }
             })?;
-        validate_lfm2_embedding_norm_weight(embedding_norm_weight)?;
+        validate_output_embedding_norm_weight(embedding_norm_weight, spec)?;
         let embedding_weight = transducer_parameter_buffers
-            .parameter_buffer(LFM2_EMBED_TOKENS_TENSOR)
+            .parameter_buffer(&spec.projection_parameter_tensor)
             .ok_or_else(|| {
                 VulkanResidentOutputTransducerRunnerError::MissingTransducerParameterBuffer {
-                    tensor: LFM2_EMBED_TOKENS_TENSOR.to_string(),
+                    tensor: spec.projection_parameter_tensor.clone(),
                 }
             })?;
-        validate_lfm2_output_embedding_weight(embedding_weight)?;
+        validate_output_projection_weight(embedding_weight, spec)?;
 
-        let normalized_frame_buffer = device.create_resident_buffer(LFM2_FRAME_BYTES)?;
-        let logits_buffer = device.create_resident_buffer(LFM2_LOGITS_BYTES)?;
+        let normalized_frame_buffer =
+            device.create_resident_buffer(spec.normalized_frame_byte_capacity)?;
+        let logits_buffer = device.create_resident_buffer(spec.logits_byte_capacity)?;
 
         let embedding_norm_bindings = [
             VulkanResidentKernelBufferBinding::new(
@@ -2766,7 +2832,11 @@ impl VulkanResidentOutputTransducerRunner {
                 &output_frame.buffer,
                 output_frame.byte_capacity,
             ),
-            VulkanResidentKernelBufferBinding::new(1, &normalized_frame_buffer, LFM2_FRAME_BYTES),
+            VulkanResidentKernelBufferBinding::new(
+                1,
+                &normalized_frame_buffer,
+                spec.normalized_frame_byte_capacity,
+            ),
             VulkanResidentKernelBufferBinding::new(
                 2,
                 &embedding_norm_weight.buffer,
@@ -2777,27 +2847,33 @@ impl VulkanResidentOutputTransducerRunner {
             embedding_norm_spirv_words,
             &embedding_norm_bindings,
             1,
-            DEFAULT_COMPUTE_LOCAL_SIZE_X,
+            spec.norm_local_size_x,
             0,
         )?;
 
-        let projection_workgroup_count_x =
-            u32::try_from(LFM2_VOCAB_SIZE.div_ceil(VULKAN_OUTPUT_PROJECTION_LOCAL_SIZE_X as usize))
-                .map_err(|_| VulkanResidentOutputTransducerRunnerError::WorkgroupCountOverflow)?;
+        let projection_workgroup_count_x = u32::try_from(
+            spec.projection_work_items
+                .div_ceil(spec.projection_local_size_x as usize),
+        )
+        .map_err(|_| VulkanResidentOutputTransducerRunnerError::WorkgroupCountOverflow)?;
         let tied_projection_bindings = [
-            VulkanResidentKernelBufferBinding::new(0, &normalized_frame_buffer, LFM2_FRAME_BYTES),
+            VulkanResidentKernelBufferBinding::new(
+                0,
+                &normalized_frame_buffer,
+                spec.normalized_frame_byte_capacity,
+            ),
             VulkanResidentKernelBufferBinding::new(
                 1,
                 &embedding_weight.buffer,
                 embedding_weight.byte_capacity,
             ),
-            VulkanResidentKernelBufferBinding::new(2, &logits_buffer, LFM2_LOGITS_BYTES),
+            VulkanResidentKernelBufferBinding::new(2, &logits_buffer, spec.logits_byte_capacity),
         ];
         let tied_projection_dispatch = device.create_resident_kernel_dispatch(
             tied_projection_spirv_words,
             &tied_projection_bindings,
             projection_workgroup_count_x,
-            VULKAN_OUTPUT_PROJECTION_LOCAL_SIZE_X,
+            spec.projection_local_size_x,
             0,
         )?;
 
@@ -2811,9 +2887,9 @@ impl VulkanResidentOutputTransducerRunner {
             .ok_or(VulkanResidentOutputTransducerRunnerError::PushConstantByteCountOverflow)?;
 
         Ok(Self {
-            transducer_id: "output_transducer".to_string(),
-            input_signal_id: LFM2_OUTPUT_FRAME_SIGNAL.to_string(),
-            logits_byte_capacity: LFM2_LOGITS_BYTES,
+            transducer_id: spec.transducer_id.clone(),
+            input_signal_id: spec.input_signal_id.clone(),
+            logits_byte_capacity: spec.logits_byte_capacity,
             dispatch_count: 2,
             total_descriptor_count,
             total_push_constant_byte_count,
@@ -2821,7 +2897,25 @@ impl VulkanResidentOutputTransducerRunner {
             logits_buffer,
             embedding_norm_dispatch,
             tied_projection_dispatch,
+            node_ids: spec.node_ids.clone(),
         })
+    }
+
+    pub fn from_mounted_lfm2_output_transducer(
+        device: &VulkanComputeDevice,
+        mounted: &VulkanMountedPlacedStreamCircuit,
+        transducer_parameter_buffers: &VulkanPermanentParameterBuffers,
+        embedding_norm_spirv_words: &[u32],
+        tied_projection_spirv_words: &[u32],
+    ) -> Result<Self, VulkanResidentOutputTransducerRunnerError> {
+        Self::from_mounted_output_transducer(
+            device,
+            mounted,
+            transducer_parameter_buffers,
+            embedding_norm_spirv_words,
+            tied_projection_spirv_words,
+            &lfm2_output_transducer_spec(),
+        )
     }
 
     pub fn run(
@@ -2834,10 +2928,7 @@ impl VulkanResidentOutputTransducerRunner {
             transducer_id: self.transducer_id.clone(),
             input_signal_id: self.input_signal_id.clone(),
             dispatch_count: self.dispatch_count,
-            node_ids: vec![
-                LFM2_OUTPUT_EMBEDDING_NORM_TRANSDUCER_ID.to_string(),
-                LFM2_TIED_OUTPUT_PROJECTION_TRANSDUCER_ID.to_string(),
-            ],
+            node_ids: self.node_ids.clone(),
             descriptor_counts: vec![
                 self.embedding_norm_dispatch.descriptor_count(),
                 self.tied_projection_dispatch.descriptor_count(),
@@ -2970,12 +3061,13 @@ impl From<VulkanError> for VulkanResidentOutputTransducerRunnerError {
     }
 }
 
-fn validate_lfm2_output_embedding_weight(
+fn validate_output_projection_weight(
     allocation: &VulkanPermanentParameterBufferAllocation,
+    spec: &VulkanResidentOutputTransducerSpec,
 ) -> Result<(), VulkanResidentOutputTransducerRunnerError> {
-    if allocation.parameter.dtype.as_deref() != Some("BF16")
-        || allocation.parameter.shape.as_deref() != Some(&[LFM2_VOCAB_SIZE, LFM2_HIDDEN_SIZE])
-        || allocation.byte_capacity != LFM2_EMBED_TOKENS_BYTES
+    if allocation.parameter.dtype.as_deref() != Some(spec.projection_parameter_dtype.as_str())
+        || allocation.parameter.shape.as_deref() != Some(spec.projection_parameter_shape.as_slice())
+        || allocation.byte_capacity != spec.projection_parameter_byte_capacity
     {
         return Err(
             VulkanResidentOutputTransducerRunnerError::InvalidEmbeddingWeight {
@@ -2989,12 +3081,13 @@ fn validate_lfm2_output_embedding_weight(
     Ok(())
 }
 
-fn validate_lfm2_embedding_norm_weight(
+fn validate_output_embedding_norm_weight(
     allocation: &VulkanPermanentParameterBufferAllocation,
+    spec: &VulkanResidentOutputTransducerSpec,
 ) -> Result<(), VulkanResidentOutputTransducerRunnerError> {
-    if allocation.parameter.dtype.as_deref() != Some("BF16")
-        || allocation.parameter.shape.as_deref() != Some(&[LFM2_HIDDEN_SIZE])
-        || allocation.byte_capacity != LFM2_FRAME_BYTES
+    if allocation.parameter.dtype.as_deref() != Some(spec.norm_parameter_dtype.as_str())
+        || allocation.parameter.shape.as_deref() != Some(spec.norm_parameter_shape.as_slice())
+        || allocation.byte_capacity != spec.norm_parameter_byte_capacity
     {
         return Err(
             VulkanResidentOutputTransducerRunnerError::InvalidEmbeddingNormWeight {
@@ -3019,17 +3112,40 @@ pub struct VulkanResidentGreedySamplerRunner {
     resident_dispatch: VulkanResidentKernelDispatch,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanResidentGreedySamplerSpec {
+    pub sampler_id: String,
+    pub logits_byte_capacity: usize,
+    pub output_byte_capacity: usize,
+    pub local_size_x: u32,
+}
+
 impl VulkanResidentGreedySamplerRunner {
     pub fn from_output_transducer(
         device: &VulkanComputeDevice,
         output_transducer: &VulkanResidentOutputTransducerRunner,
         spirv_words: &[u32],
     ) -> Result<Self, VulkanResidentGreedySamplerRunnerError> {
+        Self::from_output_transducer_with_spec(
+            device,
+            output_transducer,
+            spirv_words,
+            &lfm2_greedy_sampler_spec(),
+        )
+    }
+
+    pub fn from_output_transducer_with_spec(
+        device: &VulkanComputeDevice,
+        output_transducer: &VulkanResidentOutputTransducerRunner,
+        spirv_words: &[u32],
+        spec: &VulkanResidentGreedySamplerSpec,
+    ) -> Result<Self, VulkanResidentGreedySamplerRunnerError> {
         Self::from_logits_buffer(
             device,
             output_transducer.logits_buffer(),
             output_transducer.logits_byte_capacity,
             spirv_words,
+            spec,
         )
     }
 
@@ -3038,32 +3154,33 @@ impl VulkanResidentGreedySamplerRunner {
         logits_buffer: &VulkanResidentBuffer,
         logits_byte_capacity: usize,
         spirv_words: &[u32],
+        spec: &VulkanResidentGreedySamplerSpec,
     ) -> Result<Self, VulkanResidentGreedySamplerRunnerError> {
-        if logits_byte_capacity != LFM2_LOGITS_BYTES {
+        if logits_byte_capacity != spec.logits_byte_capacity {
             return Err(
                 VulkanResidentGreedySamplerRunnerError::InvalidLogitsByteCapacity {
                     byte_capacity: logits_byte_capacity,
-                    expected_byte_capacity: LFM2_LOGITS_BYTES,
+                    expected_byte_capacity: spec.logits_byte_capacity,
                 },
             );
         }
-        let output_buffer = device.create_resident_buffer(LFM2_SAMPLER_OUTPUT_BYTES)?;
+        let output_buffer = device.create_resident_buffer(spec.output_byte_capacity)?;
         let bindings = [
             VulkanResidentKernelBufferBinding::new(0, logits_buffer, logits_byte_capacity),
-            VulkanResidentKernelBufferBinding::new(1, &output_buffer, LFM2_SAMPLER_OUTPUT_BYTES),
+            VulkanResidentKernelBufferBinding::new(1, &output_buffer, spec.output_byte_capacity),
         ];
         let resident_dispatch = device.create_resident_kernel_dispatch(
             spirv_words,
             &bindings,
             1,
-            VULKAN_GREEDY_SAMPLER_LOCAL_SIZE_X,
+            spec.local_size_x,
             0,
         )?;
 
         Ok(Self {
-            sampler_id: LFM2_GREEDY_SAMPLER_PEDAL_ID.to_string(),
+            sampler_id: spec.sampler_id.clone(),
             logits_byte_capacity,
-            output_byte_capacity: LFM2_SAMPLER_OUTPUT_BYTES,
+            output_byte_capacity: spec.output_byte_capacity,
             descriptor_count: resident_dispatch.descriptor_count(),
             workgroup_count_x: resident_dispatch.workgroup_count_x(),
             push_constant_byte_count: resident_dispatch.push_constant_byte_count(),
@@ -3077,7 +3194,7 @@ impl VulkanResidentGreedySamplerRunner {
         device: &VulkanComputeDevice,
     ) -> Result<VulkanResidentGreedySamplerRun, VulkanResidentGreedySamplerRunnerError> {
         device.run_resident_kernel_dispatch(&self.resident_dispatch, &[])?;
-        let output = self.output_buffer.read_bytes(LFM2_SAMPLER_OUTPUT_BYTES)?;
+        let output = self.output_buffer.read_bytes(self.output_byte_capacity)?;
         let token_id = u32::from_le_bytes([output[0], output[1], output[2], output[3]]);
         let selected_logit_bits = u32::from_le_bytes([output[4], output[5], output[6], output[7]]);
         let control_flags = u32::from_le_bytes([output[8], output[9], output[10], output[11]]);
@@ -3093,7 +3210,7 @@ impl VulkanResidentGreedySamplerRunner {
     }
 
     pub fn read_output_bytes(&self) -> Result<Vec<u8>, VulkanError> {
-        self.output_buffer.read_bytes(LFM2_SAMPLER_OUTPUT_BYTES)
+        self.output_buffer.read_bytes(self.output_byte_capacity)
     }
 }
 
@@ -10477,6 +10594,54 @@ pub fn lfm2_default_attention_shader_for_capacity(capacity: usize) -> Option<&'s
     }
 }
 
+fn lfm2_input_embedding_transducer_spec() -> VulkanResidentInputEmbeddingTransducerSpec {
+    VulkanResidentInputEmbeddingTransducerSpec {
+        transducer_id: LFM2_TOKEN_EMBEDDING_TRANSDUCER_ID.to_string(),
+        parameter_tensor: LFM2_EMBED_TOKENS_TENSOR.to_string(),
+        parameter_dtype: "BF16".to_string(),
+        parameter_shape: vec![LFM2_VOCAB_SIZE, LFM2_HIDDEN_SIZE],
+        parameter_byte_capacity: LFM2_EMBED_TOKENS_BYTES,
+        output_signal_id: LFM2_INPUT_FRAME_SIGNAL.to_string(),
+        output_frame_byte_capacity: LFM2_FRAME_BYTES,
+        output_frame_word_count: LFM2_FRAME_WORDS,
+        local_size_x: VULKAN_INPUT_EMBEDDING_LOOKUP_LOCAL_SIZE_X,
+    }
+}
+
+fn lfm2_output_transducer_spec() -> VulkanResidentOutputTransducerSpec {
+    VulkanResidentOutputTransducerSpec {
+        transducer_id: "output_transducer".to_string(),
+        input_signal_id: LFM2_OUTPUT_FRAME_SIGNAL.to_string(),
+        node_ids: vec![
+            LFM2_OUTPUT_EMBEDDING_NORM_TRANSDUCER_ID.to_string(),
+            LFM2_TIED_OUTPUT_PROJECTION_TRANSDUCER_ID.to_string(),
+        ],
+        norm_parameter_tensor: LFM2_EMBEDDING_NORM_TENSOR.to_string(),
+        norm_parameter_dtype: "BF16".to_string(),
+        norm_parameter_shape: vec![LFM2_HIDDEN_SIZE],
+        norm_parameter_byte_capacity: LFM2_FRAME_BYTES,
+        projection_parameter_tensor: LFM2_EMBED_TOKENS_TENSOR.to_string(),
+        projection_parameter_dtype: "BF16".to_string(),
+        projection_parameter_shape: vec![LFM2_VOCAB_SIZE, LFM2_HIDDEN_SIZE],
+        projection_parameter_byte_capacity: LFM2_EMBED_TOKENS_BYTES,
+        input_frame_byte_capacity: LFM2_FRAME_BYTES,
+        normalized_frame_byte_capacity: LFM2_FRAME_BYTES,
+        logits_byte_capacity: LFM2_LOGITS_BYTES,
+        projection_work_items: LFM2_VOCAB_SIZE,
+        norm_local_size_x: DEFAULT_COMPUTE_LOCAL_SIZE_X,
+        projection_local_size_x: VULKAN_OUTPUT_PROJECTION_LOCAL_SIZE_X,
+    }
+}
+
+fn lfm2_greedy_sampler_spec() -> VulkanResidentGreedySamplerSpec {
+    VulkanResidentGreedySamplerSpec {
+        sampler_id: LFM2_GREEDY_SAMPLER_PEDAL_ID.to_string(),
+        logits_byte_capacity: LFM2_LOGITS_BYTES,
+        output_byte_capacity: LFM2_SAMPLER_OUTPUT_BYTES,
+        local_size_x: VULKAN_GREEDY_SAMPLER_LOCAL_SIZE_X,
+    }
+}
+
 pub struct VulkanLfm2ResidentGreedyStreamProcessorModel {
     pub device_id: String,
     pub dynamic_state_capacity_activations: usize,
@@ -10494,6 +10659,9 @@ pub struct VulkanLfm2ResidentGreedyStreamProcessorModel {
     embedding_norm_spirv_words: Vec<u32>,
     tied_projection_spirv_words: Vec<u32>,
     sampler_spirv_words: Vec<u32>,
+    input_transducer_spec: VulkanResidentInputEmbeddingTransducerSpec,
+    output_transducer_spec: VulkanResidentOutputTransducerSpec,
+    sampler_spec: VulkanResidentGreedySamplerSpec,
 }
 
 impl VulkanLfm2ResidentGreedyStreamProcessorModel {
@@ -10534,11 +10702,13 @@ impl VulkanLfm2ResidentGreedyStreamProcessorModel {
                 ))
             },
         )?);
-        lfm2_load_resident_prefix_parameters(
-            &parameter_buffers,
-            &tensor_index,
-            LFM2_DEFAULT_LAST_LAYER_INDEX,
-        )?;
+        parameter_buffers
+            .load_from_tensor_index(&tensor_index)
+            .map_err(|error| {
+                VulkanLfm2ResidentGreedyStreamProcessorBuildError(format!(
+                    "failed to load resident model parameters: {error}"
+                ))
+            })?;
 
         let transducer_parameter_buffers = Arc::new(lfm2_load_transducer_parameter_buffers(
             device,
@@ -10610,6 +10780,9 @@ impl VulkanLfm2ResidentGreedyStreamProcessorModel {
             embedding_norm_spirv_words,
             tied_projection_spirv_words,
             sampler_spirv_words,
+            input_transducer_spec: lfm2_input_embedding_transducer_spec(),
+            output_transducer_spec: lfm2_output_transducer_spec(),
+            sampler_spec: lfm2_greedy_sampler_spec(),
         })
     }
 
@@ -10631,14 +10804,23 @@ impl VulkanLfm2ResidentGreedyStreamProcessorModel {
                 "failed to mount LFM2 Vulkan stream circuit for stream instance: {error}"
             ))
         })?;
-        lfm2_zero_resident_prefix_state(&mounted, LFM2_DEFAULT_LAST_LAYER_INDEX)?;
-        let pedal_ids = lfm2_prefix_pedal_ids(LFM2_DEFAULT_LAST_LAYER_INDEX);
+        mounted.buffers.zero_state_buffers().map_err(|error| {
+            VulkanLfm2ResidentGreedyStreamProcessorBuildError(format!(
+                "failed to zero stream state buffers: {error}"
+            ))
+        })?;
+        let pedal_ids = self
+            .placed_plan
+            .placed_resident_plan
+            .hosted_pedal_ids
+            .clone();
         let input_transducer =
-            VulkanResidentInputEmbeddingTransducerRunner::from_mounted_lfm2_token_embedding(
+            VulkanResidentInputEmbeddingTransducerRunner::from_mounted_token_embedding(
                 device,
                 &mounted,
                 &self.transducer_parameter_buffers,
                 &self.input_transducer_spirv_words,
+                &self.input_transducer_spec,
             )
             .map_err(|error| {
                 VulkanLfm2ResidentGreedyStreamProcessorBuildError(format!(
@@ -10658,22 +10840,24 @@ impl VulkanLfm2ResidentGreedyStreamProcessorModel {
                 ))
             })?;
         let output_transducer =
-            VulkanResidentOutputTransducerRunner::from_mounted_lfm2_output_transducer(
+            VulkanResidentOutputTransducerRunner::from_mounted_output_transducer(
                 device,
                 &mounted,
                 &self.transducer_parameter_buffers,
                 &self.embedding_norm_spirv_words,
                 &self.tied_projection_spirv_words,
+                &self.output_transducer_spec,
             )
             .map_err(|error| {
                 VulkanLfm2ResidentGreedyStreamProcessorBuildError(format!(
                     "failed to create LFM2 output transducer: {error}"
                 ))
             })?;
-        let sampler = VulkanResidentGreedySamplerRunner::from_output_transducer(
+        let sampler = VulkanResidentGreedySamplerRunner::from_output_transducer_with_spec(
             device,
             &output_transducer,
             &self.sampler_spirv_words,
+            &self.sampler_spec,
         )
         .map_err(|error| {
             VulkanLfm2ResidentGreedyStreamProcessorBuildError(format!(
@@ -11036,162 +11220,6 @@ fn compile_required_lfm2_shader(
             "failed to compile Vulkan shader {shader_file:?}; install glslangValidator or glslc and check runtime-rs/shaders/{shader_file}"
         ))
     })
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Lfm2LayerKind {
-    ShortConv,
-    Attention,
-}
-
-fn lfm2_layer_kind(
-    layer_index: usize,
-) -> Result<Lfm2LayerKind, VulkanLfm2ResidentGreedyStreamProcessorBuildError> {
-    match layer_index {
-        0 | 1 | 3 | 5 | 7 | 9 | 11 | 13 => Ok(Lfm2LayerKind::ShortConv),
-        2 | 4 | 6 | 8 | 10 | 12 => Ok(Lfm2LayerKind::Attention),
-        _ => Err(VulkanLfm2ResidentGreedyStreamProcessorBuildError(format!(
-            "unknown LFM2 layer index {layer_index}"
-        ))),
-    }
-}
-
-fn lfm2_layer_id(layer_index: usize) -> String {
-    format!("layer_{layer_index:02}")
-}
-
-fn lfm2_prefix_pedal_ids(last_layer_index: usize) -> Vec<String> {
-    (0..=last_layer_index).map(lfm2_layer_id).collect()
-}
-
-fn lfm2_load_resident_prefix_parameters(
-    parameter_buffers: &VulkanPermanentParameterBuffers,
-    tensor_index: &TensorIndex,
-    last_layer_index: usize,
-) -> Result<(), VulkanLfm2ResidentGreedyStreamProcessorBuildError> {
-    for layer_index in 0..=last_layer_index {
-        lfm2_load_layer_parameters(parameter_buffers, tensor_index, layer_index)?;
-    }
-    Ok(())
-}
-
-fn lfm2_zero_resident_prefix_state(
-    mounted: &VulkanMountedPlacedStreamCircuit,
-    last_layer_index: usize,
-) -> Result<(), VulkanLfm2ResidentGreedyStreamProcessorBuildError> {
-    for layer_index in 0..=last_layer_index {
-        lfm2_zero_layer_state(mounted, layer_index)?;
-    }
-    Ok(())
-}
-
-fn lfm2_load_layer_parameters(
-    parameter_buffers: &VulkanPermanentParameterBuffers,
-    tensor_index: &TensorIndex,
-    layer_index: usize,
-) -> Result<(), VulkanLfm2ResidentGreedyStreamProcessorBuildError> {
-    match lfm2_layer_kind(layer_index)? {
-        Lfm2LayerKind::ShortConv => {
-            lfm2_load_conv_layer_parameters(parameter_buffers, tensor_index, layer_index)
-        }
-        Lfm2LayerKind::Attention => {
-            lfm2_load_attention_layer_parameters(parameter_buffers, tensor_index, layer_index)
-        }
-    }
-}
-
-fn lfm2_load_conv_layer_parameters(
-    parameter_buffers: &VulkanPermanentParameterBuffers,
-    tensor_index: &TensorIndex,
-    layer_index: usize,
-) -> Result<(), VulkanLfm2ResidentGreedyStreamProcessorBuildError> {
-    for suffix in [
-        "operator_norm.weight",
-        "conv.in_proj.weight",
-        "conv.conv.weight",
-        "conv.out_proj.weight",
-        "ffn_norm.weight",
-        "feed_forward.w1.weight",
-        "feed_forward.w2.weight",
-        "feed_forward.w3.weight",
-    ] {
-        lfm2_load_parameter(parameter_buffers, tensor_index, layer_index, suffix)?;
-    }
-    Ok(())
-}
-
-fn lfm2_load_attention_layer_parameters(
-    parameter_buffers: &VulkanPermanentParameterBuffers,
-    tensor_index: &TensorIndex,
-    layer_index: usize,
-) -> Result<(), VulkanLfm2ResidentGreedyStreamProcessorBuildError> {
-    for suffix in [
-        "operator_norm.weight",
-        "self_attn.q_proj.weight",
-        "self_attn.k_proj.weight",
-        "self_attn.v_proj.weight",
-        "self_attn.q_layernorm.weight",
-        "self_attn.k_layernorm.weight",
-        "self_attn.out_proj.weight",
-        "ffn_norm.weight",
-        "feed_forward.w1.weight",
-        "feed_forward.w2.weight",
-        "feed_forward.w3.weight",
-    ] {
-        lfm2_load_parameter(parameter_buffers, tensor_index, layer_index, suffix)?;
-    }
-    Ok(())
-}
-
-fn lfm2_load_parameter(
-    parameter_buffers: &VulkanPermanentParameterBuffers,
-    tensor_index: &TensorIndex,
-    layer_index: usize,
-    suffix: &str,
-) -> Result<(), VulkanLfm2ResidentGreedyStreamProcessorBuildError> {
-    let tensor = format!("model.layers.{layer_index}.{suffix}");
-    parameter_buffers
-        .load_parameter_from_tensor_index(tensor_index, &tensor)
-        .map_err(|error| {
-            VulkanLfm2ResidentGreedyStreamProcessorBuildError(format!(
-                "failed to load LFM2 parameter {tensor:?}: {error}"
-            ))
-        })?;
-    Ok(())
-}
-
-fn lfm2_zero_layer_state(
-    mounted: &VulkanMountedPlacedStreamCircuit,
-    layer_index: usize,
-) -> Result<(), VulkanLfm2ResidentGreedyStreamProcessorBuildError> {
-    let pedal_id = lfm2_layer_id(layer_index);
-    match lfm2_layer_kind(layer_index)? {
-        Lfm2LayerKind::ShortConv => lfm2_zero_state_buffer(mounted, &pedal_id, "temporal_memory"),
-        Lfm2LayerKind::Attention => lfm2_zero_state_buffer(mounted, &pedal_id, "kv_memory"),
-    }
-}
-
-fn lfm2_zero_state_buffer(
-    mounted: &VulkanMountedPlacedStreamCircuit,
-    pedal_id: &str,
-    state_id: &str,
-) -> Result<(), VulkanLfm2ResidentGreedyStreamProcessorBuildError> {
-    let state = mounted
-        .buffers
-        .state_buffer(pedal_id, state_id)
-        .ok_or_else(|| {
-            VulkanLfm2ResidentGreedyStreamProcessorBuildError(format!(
-                "LFM2 state buffer {pedal_id}.{state_id} is missing"
-            ))
-        })?;
-    state
-        .buffer
-        .write_bytes(&vec![0u8; state.byte_capacity])
-        .map_err(|error| {
-            VulkanLfm2ResidentGreedyStreamProcessorBuildError(format!(
-                "failed to zero LFM2 state buffer {pedal_id}.{state_id}: {error}"
-            ))
-        })
 }
 
 #[cfg(test)]
@@ -12479,6 +12507,7 @@ mod tests {
             &logits_buffer,
             LFM2_LOGITS_BYTES,
             &sampler_spirv_words,
+            &lfm2_greedy_sampler_spec(),
         )
         .unwrap();
         assert_eq!(runner.sampler_id, LFM2_GREEDY_SAMPLER_PEDAL_ID);
