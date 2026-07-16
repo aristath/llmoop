@@ -5018,6 +5018,168 @@ pub struct VulkanResidentTokenRuntimeSchedulerSnapshot {
     pub runtimes: Vec<VulkanResidentTokenRuntimeSnapshot>,
 }
 
+pub struct VulkanResidentTokenEngine {
+    scheduler: VulkanResidentTokenRuntimeScheduler,
+    streams: BTreeMap<String, VulkanResidentTokenEngineStream>,
+    device: VulkanComputeDevice,
+}
+
+impl VulkanResidentTokenEngine {
+    pub fn new(device: VulkanComputeDevice) -> Self {
+        Self {
+            scheduler: VulkanResidentTokenRuntimeScheduler::new(),
+            streams: BTreeMap::new(),
+            device,
+        }
+    }
+
+    pub fn default_lfm2_5_230m(
+        stream_id: impl Into<String>,
+        dynamic_state_capacity_activations: usize,
+    ) -> Result<Self, VulkanResidentTokenEngineError> {
+        let device = VulkanComputeDevice::new()?;
+        let processor = create_default_lfm2_5_230m_resident_greedy_stream_processor(
+            &device,
+            dynamic_state_capacity_activations,
+        )?;
+        Self::from_processor(device, stream_id, processor)
+    }
+
+    pub fn from_processor(
+        device: VulkanComputeDevice,
+        stream_id: impl Into<String>,
+        processor: VulkanResidentGreedyStreamProcessor,
+    ) -> Result<Self, VulkanResidentTokenEngineError> {
+        let mut engine = Self::new(device);
+        engine.add_processor(stream_id, processor)?;
+        Ok(engine)
+    }
+
+    pub fn add_processor(
+        &mut self,
+        stream_id: impl Into<String>,
+        processor: VulkanResidentGreedyStreamProcessor,
+    ) -> Result<VulkanResidentTokenEngineStream, VulkanResidentTokenEngineError> {
+        let stream_id = stream_id.into();
+        let stream = VulkanResidentTokenEngineStream {
+            stream_id: stream_id.clone(),
+            device_id: processor.device_id.clone(),
+            pedal_count: processor.pedal_count,
+            per_tick_dispatch_count: processor.per_tick_dispatch_count,
+            per_tick_descriptor_count: processor.per_tick_descriptor_count,
+            per_tick_push_constant_byte_count: processor.per_tick_push_constant_byte_count,
+            dynamic_state_capacity_activations: processor.dynamic_state_capacity_activations,
+        };
+        let runtime = VulkanResidentTokenRuntime::from_processor(&stream_id, processor);
+        self.scheduler.add_runtime(runtime)?;
+        self.streams.insert(stream_id, stream.clone());
+        Ok(stream)
+    }
+
+    pub fn device(&self) -> &VulkanComputeDevice {
+        &self.device
+    }
+
+    pub fn scheduler(&self) -> &VulkanResidentTokenRuntimeScheduler {
+        &self.scheduler
+    }
+
+    pub fn scheduler_mut(&mut self) -> &mut VulkanResidentTokenRuntimeScheduler {
+        &mut self.scheduler
+    }
+
+    pub fn stream(&self, stream_id: &str) -> Option<&VulkanResidentTokenEngineStream> {
+        self.streams.get(stream_id)
+    }
+
+    pub fn runtime_snapshot(&self, stream_id: &str) -> Option<VulkanResidentTokenRuntimeSnapshot> {
+        self.scheduler
+            .runtime(stream_id)
+            .map(VulkanResidentTokenRuntime::snapshot)
+    }
+
+    pub fn enqueue_input_event(
+        &mut self,
+        stream_id: &str,
+        event: VulkanResidentTokenInputEvent,
+    ) -> Result<VulkanResidentTokenRuntimeQueuedInputEvent, VulkanResidentTokenEngineError> {
+        Ok(self.scheduler.enqueue_input_event(stream_id, event)?)
+    }
+
+    pub fn run_cycle(
+        &mut self,
+        max_runtime_cycles: usize,
+        ticks_per_runtime: usize,
+    ) -> Result<VulkanResidentTokenRuntimeSchedulerRun, VulkanResidentTokenEngineError> {
+        Ok(self
+            .scheduler
+            .run_cycle(&self.device, max_runtime_cycles, ticks_per_runtime)?)
+    }
+
+    pub fn snapshot(&self) -> VulkanResidentTokenEngineSnapshot {
+        VulkanResidentTokenEngineSnapshot {
+            device_name: self.device.device_name().to_string(),
+            scheduler: self.scheduler.snapshot(),
+            streams: self.streams.values().cloned().collect(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanResidentTokenEngineStream {
+    pub stream_id: String,
+    pub device_id: String,
+    pub pedal_count: usize,
+    pub per_tick_dispatch_count: usize,
+    pub per_tick_descriptor_count: usize,
+    pub per_tick_push_constant_byte_count: u32,
+    pub dynamic_state_capacity_activations: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanResidentTokenEngineSnapshot {
+    pub device_name: String,
+    pub scheduler: VulkanResidentTokenRuntimeSchedulerSnapshot,
+    pub streams: Vec<VulkanResidentTokenEngineStream>,
+}
+
+#[derive(Debug)]
+pub enum VulkanResidentTokenEngineError {
+    Device(VulkanError),
+    Build(VulkanLfm2ResidentGreedyStreamProcessorBuildError),
+    Scheduler(VulkanResidentTokenRuntimeSchedulerError),
+}
+
+impl Display for VulkanResidentTokenEngineError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Device(error) => Display::fmt(error, f),
+            Self::Build(error) => Display::fmt(error, f),
+            Self::Scheduler(error) => Display::fmt(error, f),
+        }
+    }
+}
+
+impl Error for VulkanResidentTokenEngineError {}
+
+impl From<VulkanError> for VulkanResidentTokenEngineError {
+    fn from(error: VulkanError) -> Self {
+        Self::Device(error)
+    }
+}
+
+impl From<VulkanLfm2ResidentGreedyStreamProcessorBuildError> for VulkanResidentTokenEngineError {
+    fn from(error: VulkanLfm2ResidentGreedyStreamProcessorBuildError) -> Self {
+        Self::Build(error)
+    }
+}
+
+impl From<VulkanResidentTokenRuntimeSchedulerError> for VulkanResidentTokenEngineError {
+    fn from(error: VulkanResidentTokenRuntimeSchedulerError) -> Self {
+        Self::Scheduler(error)
+    }
+}
+
 pub struct VulkanMountedPlacedResidentPedalRunner {
     pub pedal_id: String,
     pub dispatches: Vec<VulkanMountedPlacedResidentPedalDispatch>,
@@ -12383,6 +12545,82 @@ mod tests {
         assert_eq!(final_snapshot.runtimes[0].stream.next_stream_tick, 6);
         assert_eq!(final_snapshot.runtimes[0].stream.total_public_outputs, 4);
         assert_eq!(final_snapshot.runtimes[0].pending_input_event_count, 0);
+    }
+
+    #[test]
+    fn resident_token_engine_owns_device_scheduler_and_registered_stream() {
+        let device = match VulkanComputeDevice::new() {
+            Ok(device) => device,
+            Err(error) => {
+                eprintln!("skipping resident token engine: {error}");
+                return;
+            }
+        };
+        let Some(processor) = create_lfm2_resident_greedy_stream_processor_with_capacity(
+            &device,
+            "resident token engine",
+            8,
+            "gqa_attention_bf16_q16_kv8_d64_cap8.comp",
+        ) else {
+            return;
+        };
+        let mut engine =
+            VulkanResidentTokenEngine::from_processor(device, "engine_stream_0", processor)
+                .unwrap();
+
+        let initial = engine.snapshot();
+        assert!(!initial.device_name.is_empty());
+        assert_eq!(initial.streams.len(), 1);
+        assert_eq!(initial.streams[0].stream_id, "engine_stream_0");
+        assert_eq!(initial.streams[0].device_id, "gpu0");
+        assert_eq!(initial.streams[0].pedal_count, 14);
+        assert_eq!(initial.streams[0].dynamic_state_capacity_activations, 8);
+        assert_eq!(initial.scheduler.registered_runtime_count, 1);
+        assert_eq!(initial.scheduler.active_runtime_count, 0);
+        assert!(initial.scheduler.idle);
+        assert!(!initial.scheduler.running);
+
+        let queued = engine
+            .enqueue_input_event(
+                "engine_stream_0",
+                VulkanResidentTokenInputEvent::new("event_0", vec![1], 2).with_origin("test_host"),
+            )
+            .unwrap();
+        assert_eq!(queued.pending_input_event_count, 1);
+        assert_eq!(engine.snapshot().scheduler.active_runtime_count, 1);
+
+        let mut generated = Vec::new();
+        let mut cycle_count = 0usize;
+        while engine.snapshot().scheduler.running {
+            let run = engine.run_cycle(1, 2).unwrap();
+            assert!(
+                !run.runtime_cycles.is_empty(),
+                "running engine should produce a bounded runtime cycle"
+            );
+            generated.extend(
+                run.output_events
+                    .iter()
+                    .map(|event| event.output_event.token_id),
+            );
+            cycle_count += run.runtime_cycles.len();
+            assert!(
+                cycle_count < 8,
+                "engine did not drain within the test budget"
+            );
+        }
+
+        assert_eq!(generated, vec![1, 1]);
+        assert!(cycle_count >= 1);
+        let final_snapshot = engine.snapshot();
+        assert_eq!(final_snapshot.scheduler.registered_runtime_count, 1);
+        assert_eq!(final_snapshot.scheduler.active_runtime_count, 0);
+        assert!(final_snapshot.scheduler.idle);
+        assert!(!final_snapshot.scheduler.running);
+        let runtime = engine.runtime_snapshot("engine_stream_0").unwrap();
+        assert!(runtime.idle);
+        assert!(!runtime.running);
+        assert_eq!(runtime.stream.total_public_outputs, 2);
+        assert_eq!(runtime.pending_input_event_count, 0);
     }
 
     #[test]

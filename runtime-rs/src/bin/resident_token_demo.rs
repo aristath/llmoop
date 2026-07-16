@@ -2,10 +2,8 @@ use std::error::Error;
 use std::io;
 
 use llmoop_runtime::{
-    VulkanComputeDevice, VulkanResidentTokenInputEvent, VulkanResidentTokenRuntime,
-    VulkanResidentTokenRuntimeCycleRun, VulkanResidentTokenRuntimeCycleStopCondition,
-    VulkanResidentTokenRuntimeScheduler,
-    create_default_lfm2_5_230m_resident_greedy_stream_processor,
+    VulkanResidentTokenEngine, VulkanResidentTokenInputEvent, VulkanResidentTokenRuntimeCycleRun,
+    VulkanResidentTokenRuntimeCycleStopCondition,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -48,34 +46,34 @@ fn run() -> Result<(), Box<dyn Error>> {
     }
 
     let args = parse_args().map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
-    let device = VulkanComputeDevice::new()?;
-    let processor =
-        create_default_lfm2_5_230m_resident_greedy_stream_processor(&device, args.capacity)?;
+    let stream_id = "demo_stream";
+    let mut engine = VulkanResidentTokenEngine::default_lfm2_5_230m(stream_id, args.capacity)?;
+    let stream = engine
+        .stream(stream_id)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "demo stream was not registered"))?;
+    let engine_snapshot = engine.snapshot();
 
     println!("resident-token-demo");
-    println!("device_id={}", processor.device_id);
+    println!("device_name={}", engine_snapshot.device_name);
+    println!("device_id={}", stream.device_id);
     println!(
         "pedals={} dispatches_per_tick={} descriptors_per_tick={} push_constant_bytes_per_tick={}",
-        processor.pedal_count,
-        processor.per_tick_dispatch_count,
-        processor.per_tick_descriptor_count,
-        processor.per_tick_push_constant_byte_count
+        stream.pedal_count,
+        stream.per_tick_dispatch_count,
+        stream.per_tick_descriptor_count,
+        stream.per_tick_push_constant_byte_count
     );
     println!(
         "resident_capacity_activations={}",
-        processor.dynamic_state_capacity_activations
+        stream.dynamic_state_capacity_activations
     );
 
-    let stream_id = "demo_stream";
-    let runtime = VulkanResidentTokenRuntime::from_processor(stream_id, processor);
-    let mut scheduler = VulkanResidentTokenRuntimeScheduler::new();
-    scheduler.add_runtime(runtime)?;
-    scheduler.enqueue_input_event(
+    engine.enqueue_input_event(
         stream_id,
         VulkanResidentTokenInputEvent::new("first", args.prompt, args.max_new_tokens)
             .with_origin("cli"),
     )?;
-    scheduler.enqueue_input_event(
+    engine.enqueue_input_event(
         stream_id,
         VulkanResidentTokenInputEvent::new("second", args.then_prompt, args.then_max_new_tokens)
             .with_origin("cli"),
@@ -86,11 +84,11 @@ fn run() -> Result<(), Box<dyn Error>> {
 
     let mut generated = Vec::new();
     let mut cycle_index = 0usize;
-    while scheduler.snapshot().running {
-        let run = scheduler.run_cycle(&device, 1, args.cycle_ticks)?;
-        if run.runtime_cycles.is_empty() && scheduler.snapshot().running {
+    while engine.snapshot().scheduler.running {
+        let run = engine.run_cycle(1, args.cycle_ticks)?;
+        if run.runtime_cycles.is_empty() && engine.snapshot().scheduler.running {
             return Err(io::Error::other(
-                "resident token scheduler is running but produced no runtime cycles",
+                "resident token engine is running but produced no runtime cycles",
             )
             .into());
         }
@@ -105,11 +103,10 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
     }
 
-    let scheduler_snapshot = scheduler.snapshot();
-    let snapshot = scheduler
-        .runtime(stream_id)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "demo stream disappeared"))?
-        .snapshot();
+    let engine_snapshot = engine.snapshot();
+    let snapshot = engine
+        .runtime_snapshot(stream_id)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "demo stream disappeared"))?;
     println!("runtime.generated={generated:?}");
     println!("runtime.cycles={cycle_index}");
     println!(
@@ -127,13 +124,13 @@ fn run() -> Result<(), Box<dyn Error>> {
     println!("runtime.idle={}", snapshot.idle);
     println!(
         "scheduler.registered_runtimes={}",
-        scheduler_snapshot.registered_runtime_count
+        engine_snapshot.scheduler.registered_runtime_count
     );
     println!(
         "scheduler.active_runtimes={}",
-        scheduler_snapshot.active_runtime_count
+        engine_snapshot.scheduler.active_runtime_count
     );
-    println!("scheduler.idle={}", scheduler_snapshot.idle);
+    println!("scheduler.idle={}", engine_snapshot.scheduler.idle);
 
     Ok(())
 }
