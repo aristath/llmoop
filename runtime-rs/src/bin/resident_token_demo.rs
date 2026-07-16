@@ -1,8 +1,9 @@
 use std::error::Error;
 use std::io;
+use std::path::PathBuf;
 
 use llmoop_runtime::{
-    VulkanComputeDevice, VulkanLfm2ResidentGreedyStreamProcessorModel, VulkanResidentTokenEngine,
+    VulkanComputeDevice, VulkanResidentGreedyModelPackage, VulkanResidentTokenEngine,
     VulkanResidentTokenEngineRunBudget, VulkanResidentTokenEngineRunStopCondition,
     VulkanResidentTokenEngineSubmittedInputRun, VulkanResidentTokenRuntimeCycleRun,
     VulkanResidentTokenRuntimeCycleStopCondition,
@@ -10,6 +11,7 @@ use llmoop_runtime::{
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Args {
+    package_manifest: Option<PathBuf>,
     capacity: usize,
     prompt: Vec<u32>,
     max_new_tokens: usize,
@@ -22,6 +24,7 @@ struct Args {
 impl Default for Args {
     fn default() -> Self {
         Self {
+            package_manifest: None,
             capacity: 8,
             prompt: vec![1],
             max_new_tokens: 3,
@@ -51,9 +54,18 @@ fn run() -> Result<(), Box<dyn Error>> {
 
     let args = parse_args().map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
     let stream_id = "demo_stream";
+    let package_manifest = args.package_manifest.as_ref().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--package-manifest is required; run `python -m llmoop --compile-model <MODEL_DIR>` first",
+        )
+    })?;
     let device = VulkanComputeDevice::new()?;
-    let model =
-        VulkanLfm2ResidentGreedyStreamProcessorModel::default_for_capacity(&device, args.capacity)?;
+    let model = VulkanResidentGreedyModelPackage::from_manifest_file_with_capacity(
+        &device,
+        package_manifest,
+        Some(args.capacity),
+    )?;
     let mut engine = VulkanResidentTokenEngine::new(device);
     engine.add_model_package("demo_model", model)?;
     engine.create_stream_from_model("demo_model", stream_id)?;
@@ -63,6 +75,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let engine_snapshot = engine.snapshot();
 
     println!("resident-token-demo");
+    println!("package_manifest={}", package_manifest.display());
     println!("device_name={}", engine_snapshot.device_name);
     println!("device_id={}", stream.device_id);
     println!(
@@ -165,6 +178,10 @@ fn parse_args() -> Result<Args, String> {
 
     while let Some(arg) = raw.next() {
         match arg.as_str() {
+            "--package-manifest" => {
+                parsed.package_manifest =
+                    Some(PathBuf::from(next_value(&mut raw, "--package-manifest")?));
+            }
             "--capacity" => {
                 parsed.capacity = parse_next(&mut raw, "--capacity")?;
             }
@@ -318,6 +335,7 @@ fn usage() -> &'static str {
     "Usage: resident-token-demo [OPTIONS]
 
 Options:
+  --package-manifest <PATH>  Compiled resident model package manifest. Required.
   --capacity <N>              Resident activation capacity. Default: 8
   --prompt <TOKENS>           Comma-separated first external token event. Default: 1
   --max-new-tokens <N>        Public outputs to emit after the first prompt. Default: 3
@@ -328,5 +346,6 @@ Options:
   -h, --help                  Show this help
 
 Example:
-  cargo run --manifest-path runtime-rs/Cargo.toml --features vulkan --bin resident-token-demo -- --capacity 8 --prompt 1 --max-new-tokens 3 --then-prompt 36309 --then-max-new-tokens 1 --cycle-ticks 2"
+  python -m llmoop --compile-model <MODEL_DIR>
+  cargo run --manifest-path runtime-rs/Cargo.toml --features vulkan --bin resident-token-demo -- --package-manifest <COMPILED_PACKAGE.json> --capacity 8 --prompt 1 --max-new-tokens 3 --then-prompt 1 --then-max-new-tokens 1 --cycle-ticks 2"
 }

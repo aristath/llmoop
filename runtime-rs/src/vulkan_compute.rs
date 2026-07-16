@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::ffi::CString;
 use std::fmt::{Display, Formatter};
+use std::path::Path;
 
 use ash::{Entry, vk};
 
@@ -1648,16 +1649,25 @@ pub(crate) fn compile_test_shader_words() -> Option<Vec<u32>> {
     compile_shader_words_from_source("add_one.comp")
 }
 
+#[cfg(test)]
 pub(crate) fn compile_shader_words_from_source(shader_file: &str) -> Option<Vec<u32>> {
     use std::path::PathBuf;
+
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    compile_shader_words_from_source_path(&manifest_dir.join("shaders").join(shader_file))
+}
+
+pub(crate) fn compile_shader_words_from_source_path(shader: &Path) -> Option<Vec<u32>> {
     use std::process::{Command, Stdio};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static COMPILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let shader = manifest_dir.join("shaders").join(shader_file);
     let compile_id = COMPILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let shader_file = shader
+        .file_name()
+        .and_then(|file_name| file_name.to_str())
+        .unwrap_or("shader");
     let output = std::env::temp_dir().join(format!(
         "llmoop-{}-{}-{}.spv",
         shader_file.replace(['/', '.'], "-"),

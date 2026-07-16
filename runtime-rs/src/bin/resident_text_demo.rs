@@ -3,16 +3,17 @@ use std::io;
 use std::path::PathBuf;
 
 use llmoop_runtime::{
-    VulkanComputeDevice, VulkanLfm2ResidentGreedyStreamProcessorModel,
-    VulkanResidentHfTokenizerTextCodec, VulkanResidentTokenEngine,
-    VulkanResidentTokenEngineLiveTextTurnRun, VulkanResidentTokenEngineRunBudget,
-    VulkanResidentTokenEngineRunStopCondition, VulkanResidentTokenRuntimeCycleRun,
-    VulkanResidentTokenRuntimeCycleStopCondition, VulkanResidentTokenTextCodec,
+    VulkanComputeDevice, VulkanResidentGreedyModelPackage, VulkanResidentHfTokenizerTextCodec,
+    VulkanResidentTokenEngine, VulkanResidentTokenEngineLiveTextTurnRun,
+    VulkanResidentTokenEngineRunBudget, VulkanResidentTokenEngineRunStopCondition,
+    VulkanResidentTokenRuntimeCycleRun, VulkanResidentTokenRuntimeCycleStopCondition,
+    VulkanResidentTokenTextCodec,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Args {
-    model_dir: PathBuf,
+    model_dir: Option<PathBuf>,
+    package_manifest: Option<PathBuf>,
     capacity: usize,
     prompt: String,
     max_new_tokens: usize,
@@ -27,7 +28,8 @@ struct Args {
 impl Default for Args {
     fn default() -> Self {
         Self {
-            model_dir: PathBuf::from("/home/aristath/models/lfm2.5/230m"),
+            model_dir: None,
+            package_manifest: None,
             capacity: 8,
             prompt: "Hello".to_string(),
             max_new_tokens: 3,
@@ -58,13 +60,28 @@ fn run() -> Result<(), Box<dyn Error>> {
     }
 
     let args = parse_args().map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
-    let codec = VulkanResidentHfTokenizerTextCodec::from_model_dir(&args.model_dir)?
+    let model_dir = args.model_dir.as_ref().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--model-dir is required for tokenizer loading",
+        )
+    })?;
+    let codec = VulkanResidentHfTokenizerTextCodec::from_model_dir(model_dir)?
         .with_add_special_tokens(args.add_special_tokens)
         .with_skip_special_tokens(args.skip_special_tokens);
     let stream_id = "demo_text_stream";
+    let package_manifest = args.package_manifest.as_ref().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--package-manifest is required; run `python -m llmoop --compile-model <MODEL_DIR>` first",
+        )
+    })?;
     let device = VulkanComputeDevice::new()?;
-    let model =
-        VulkanLfm2ResidentGreedyStreamProcessorModel::default_for_capacity(&device, args.capacity)?;
+    let model = VulkanResidentGreedyModelPackage::from_manifest_file_with_capacity(
+        &device,
+        package_manifest,
+        Some(args.capacity),
+    )?;
     let mut engine = VulkanResidentTokenEngine::new(device);
     engine.add_model_package("demo_model", model)?;
     engine.create_stream_from_model("demo_model", stream_id)?;
@@ -74,7 +91,8 @@ fn run() -> Result<(), Box<dyn Error>> {
     let engine_snapshot = engine.snapshot();
 
     println!("resident-text-demo");
-    println!("model_dir={}", args.model_dir.display());
+    println!("model_dir={}", model_dir.display());
+    println!("package_manifest={}", package_manifest.display());
     println!("device_name={}", engine_snapshot.device_name);
     println!("device_id={}", stream.device_id);
     println!(
@@ -192,7 +210,11 @@ fn parse_args() -> Result<Args, String> {
     while let Some(arg) = raw.next() {
         match arg.as_str() {
             "--model-dir" => {
-                parsed.model_dir = PathBuf::from(next_value(&mut raw, "--model-dir")?);
+                parsed.model_dir = Some(PathBuf::from(next_value(&mut raw, "--model-dir")?));
+            }
+            "--package-manifest" => {
+                parsed.package_manifest =
+                    Some(PathBuf::from(next_value(&mut raw, "--package-manifest")?));
             }
             "--capacity" => {
                 parsed.capacity = parse_next(&mut raw, "--capacity")?;
@@ -398,7 +420,8 @@ fn usage() -> &'static str {
     "Usage: resident-text-demo [OPTIONS]
 
 Options:
-  --model-dir <PATH>          Directory containing tokenizer.json. Default: /home/aristath/models/lfm2.5/230m
+  --model-dir <PATH>          Directory containing tokenizer.json. Required.
+  --package-manifest <PATH>  Compiled resident model package manifest. Required.
   --capacity <N>              Resident activation capacity. Default: 8
   --prompt <TEXT>             First external text event. Default: Hello
   --max-new-tokens <N>        Public outputs to emit after the first prompt. Default: 3
@@ -411,5 +434,6 @@ Options:
   -h, --help                  Show this help
 
 Example:
-  cargo run --manifest-path runtime-rs/Cargo.toml --features 'vulkan tokenizers' --bin resident-text-demo -- --prompt Hello --max-new-tokens 3 --then-prompt ' again' --then-max-new-tokens 1"
+  python -m llmoop --compile-model <MODEL_DIR>
+  cargo run --manifest-path runtime-rs/Cargo.toml --features 'vulkan tokenizers' --bin resident-text-demo -- --model-dir <MODEL_DIR> --package-manifest <COMPILED_PACKAGE.json> --prompt Hello --max-new-tokens 3 --then-prompt ' again' --then-max-new-tokens 1"
 }
