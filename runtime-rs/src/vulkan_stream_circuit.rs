@@ -6503,6 +6503,7 @@ fn plan_resident_greedy_package_single_device_stream_circuit(
             "failed to create placement plan for {device_id:?}: {error}"
         ))
     })?;
+    validate_single_device_resident_package_placement(device_id, &placement_plan)?;
     let resident = VulkanPlacedStreamCircuitResidentPlan::from_resource_plan_for_device(
         &resource_plan,
         &placement_plan,
@@ -6523,6 +6524,31 @@ fn plan_resident_greedy_package_single_device_stream_circuit(
                 ))
             })?;
     Ok((tensor_index, resource_plan, placed_plan))
+}
+
+fn validate_single_device_resident_package_placement(
+    device_id: &str,
+    placement_plan: &StreamCircuitPlacementPlan,
+) -> Result<(), VulkanResidentTokenModelPackageError> {
+    let remote_pedals = placement_plan
+        .pedals
+        .iter()
+        .filter(|pedal| pedal.device_id != device_id)
+        .map(|pedal| format!("{}@{}", pedal.pedal_id, pedal.device_id))
+        .collect::<Vec<_>>();
+    if !remote_pedals.is_empty() {
+        return Err(VulkanResidentTokenModelPackageError::new(format!(
+            "single-device resident package for {device_id:?} cannot host remote pedals: {}",
+            remote_pedals.join(", ")
+        )));
+    }
+    if placement_plan.cross_device_cable_count != 0 {
+        return Err(VulkanResidentTokenModelPackageError::new(format!(
+            "single-device resident package for {device_id:?} cannot host {} cross-device cables",
+            placement_plan.cross_device_cable_count
+        )));
+    }
+    Ok(())
 }
 
 fn load_resident_greedy_package_transducer_parameter_buffers(
@@ -11591,6 +11617,32 @@ mod tests {
         assert!(error
             .to_string()
             .contains("declares pedal layer_00 kernel conv_in_projection with execution_index 1, expected 0"));
+    }
+
+    #[test]
+    fn single_device_package_rejects_remote_pedal_placement() {
+        let mut manifest = fixture_model_package_manifest();
+        manifest
+            .placement
+            .pedal_devices
+            .insert("layer_00".to_string(), "gpu1".to_string());
+        let manifest_path = fixture_model_package_manifest_path();
+        let manifest_dir = manifest_path.parent().unwrap();
+        let tensor_index_path =
+            resolve_resident_model_package_path(manifest_dir, &manifest.tensor_index_path);
+
+        let error = plan_resident_greedy_package_single_device_stream_circuit(
+            &manifest.device_id,
+            &manifest.placement,
+            &manifest.circuit_graph,
+            manifest_dir,
+            &tensor_index_path,
+            manifest.activation_element_bytes,
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("single-device resident package for \"gpu0\" cannot host remote pedals: layer_00@gpu1"));
     }
 
     fn fixture_model_embedding_row_bytes(tensor_index: &TensorIndex, token_id: u32) -> Vec<u8> {
