@@ -6944,7 +6944,7 @@ mod tests {
         )
     }
 
-    fn lfm2_level_1_loaded_kernel_pack_through_layer_02(
+    fn lfm2_level_1_loaded_kernel_pack_for_conv_and_attention_families(
         mounted: &VulkanMountedPlacedStreamCircuit,
         mounted_bound: &VulkanMountedPlacedBoundDispatchPlan,
     ) -> Option<VulkanLoadedReusableKernelArtifactManifest> {
@@ -7579,9 +7579,10 @@ mod tests {
         };
         let (tensor_index, mounted, _manifest, mounted_bound) =
             mount_lfm2_single_device_stream_circuit(&device);
-        let Some(loaded_manifest) =
-            lfm2_level_1_loaded_kernel_pack_through_layer_02(&mounted, &mounted_bound)
-        else {
+        let Some(loaded_manifest) = lfm2_level_1_loaded_kernel_pack_for_conv_and_attention_families(
+            &mounted,
+            &mounted_bound,
+        ) else {
             eprintln!(
                 "skipping resident attention pedalboard runner: no GLSL to SPIR-V compiler found"
             );
@@ -7657,9 +7658,10 @@ mod tests {
         };
         let (tensor_index, mounted, _manifest, mounted_bound) =
             mount_lfm2_single_device_stream_circuit(&device);
-        let Some(loaded_manifest) =
-            lfm2_level_1_loaded_kernel_pack_through_layer_02(&mounted, &mounted_bound)
-        else {
+        let Some(loaded_manifest) = lfm2_level_1_loaded_kernel_pack_for_conv_and_attention_families(
+            &mounted,
+            &mounted_bound,
+        ) else {
             eprintln!(
                 "skipping resident multi-tick attention runner: no GLSL to SPIR-V compiler found"
             );
@@ -7762,9 +7764,10 @@ mod tests {
         };
         let (tensor_index, mounted, _manifest, mounted_bound) =
             mount_lfm2_single_device_stream_circuit(&device);
-        let Some(loaded_manifest) =
-            lfm2_level_1_loaded_kernel_pack_through_layer_02(&mounted, &mounted_bound)
-        else {
+        let Some(loaded_manifest) = lfm2_level_1_loaded_kernel_pack_for_conv_and_attention_families(
+            &mounted,
+            &mounted_bound,
+        ) else {
             eprintln!("skipping resident layer_03 prefix runner: no GLSL to SPIR-V compiler found");
             return;
         };
@@ -7825,6 +7828,105 @@ mod tests {
             vec![
                 0x89, 0x3f, 0x73, 0x3f, 0x86, 0x3f, 0x6c, 0x3f, 0x6f, 0x3f, 0x88, 0x3f, 0x88, 0x3f,
                 0x83, 0x3f,
+            ]
+        );
+    }
+
+    #[test]
+    fn resident_pedalboard_runner_executes_second_attention_layer_with_independent_kv_state() {
+        let device = match VulkanComputeDevice::new() {
+            Ok(device) => device,
+            Err(error) => {
+                eprintln!("skipping resident layer_04 prefix runner: {error}");
+                return;
+            }
+        };
+        let (tensor_index, mounted, _manifest, mounted_bound) =
+            mount_lfm2_single_device_stream_circuit(&device);
+        let Some(loaded_manifest) = lfm2_level_1_loaded_kernel_pack_for_conv_and_attention_families(
+            &mounted,
+            &mounted_bound,
+        ) else {
+            eprintln!("skipping resident layer_04 prefix runner: no GLSL to SPIR-V compiler found");
+            return;
+        };
+        load_lfm2_conv_layer_parameters(&mounted, &tensor_index, 0);
+        load_lfm2_conv_layer_parameters(&mounted, &tensor_index, 1);
+        load_lfm2_attention_layer_parameters(&mounted, &tensor_index, 2);
+        load_lfm2_conv_layer_parameters(&mounted, &tensor_index, 3);
+        load_lfm2_attention_layer_parameters(&mounted, &tensor_index, 4);
+        write_layer_00_unit_input_and_zero_state(&mounted);
+        zero_lfm2_temporal_memory(&mounted, "layer_01");
+        zero_lfm2_kv_memory(&mounted, "layer_02");
+        zero_lfm2_temporal_memory(&mounted, "layer_03");
+        zero_lfm2_kv_memory(&mounted, "layer_04");
+
+        let runner = mounted
+            .create_resident_pedalboard_runner(
+                &device,
+                &mounted_bound,
+                ["layer_00", "layer_01", "layer_02", "layer_03", "layer_04"],
+                &loaded_manifest,
+            )
+            .unwrap();
+        assert_eq!(runner.device_id, "gpu0");
+        assert_eq!(runner.pedal_count(), 5);
+        assert_eq!(
+            runner.pedal_ids(),
+            vec!["layer_00", "layer_01", "layer_02", "layer_03", "layer_04"]
+        );
+        assert_eq!(runner.dispatch_count(), 86);
+        assert_eq!(runner.total_descriptor_count, 282);
+        assert_eq!(runner.total_push_constant_byte_count, 1376);
+
+        let run = runner
+            .run_with_stream_control(
+                &device,
+                VulkanMountedPlacedStreamControl {
+                    stream_tick: 0,
+                    control_flags: 0,
+                    dynamic_state_capacity_activations: mounted
+                        .buffers
+                        .dynamic_state_capacity_activations
+                        as u32,
+                },
+            )
+            .unwrap();
+        assert_eq!(run.device_id, "gpu0");
+        assert_eq!(run.pedal_count(), 5);
+        assert_eq!(
+            run.pedal_ids(),
+            vec!["layer_00", "layer_01", "layer_02", "layer_03", "layer_04"]
+        );
+        assert_eq!(run.dispatch_count(), 86);
+
+        let layer_02_kv = mounted
+            .buffers
+            .state_buffer("layer_02", "kv_memory")
+            .unwrap()
+            .buffer
+            .read_bytes(16)
+            .unwrap();
+        let layer_04_kv = mounted
+            .buffers
+            .state_buffer("layer_04", "kv_memory")
+            .unwrap()
+            .buffer
+            .read_bytes(16)
+            .unwrap();
+        assert_ne!(layer_02_kv, vec![0; 16]);
+        assert_ne!(layer_04_kv, vec![0; 16]);
+        assert_ne!(layer_02_kv, layer_04_kv);
+
+        let layer_04_output_dispatch = mounted_bound.dispatch("layer_04", "ffn_residual").unwrap();
+        let layer_04_output_bindings = mounted
+            .resident_kernel_buffer_bindings_for_bound_dispatch(layer_04_output_dispatch)
+            .unwrap();
+        assert_eq!(
+            layer_04_output_bindings[2].buffer.read_bytes(16).unwrap(),
+            vec![
+                0x8c, 0x3f, 0x62, 0x3f, 0x88, 0x3f, 0x62, 0x3f, 0x73, 0x3f, 0x85, 0x3f, 0x89, 0x3f,
+                0x84, 0x3f,
             ]
         );
     }
