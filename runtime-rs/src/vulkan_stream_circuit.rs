@@ -1636,6 +1636,210 @@ pub struct VulkanPlacedCableBufferAllocation {
     pub buffer: VulkanResidentBuffer,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct VulkanPlacedCablePacketKey {
+    pub cable_index: usize,
+    pub from_device_id: String,
+    pub to_device_id: String,
+}
+
+impl VulkanPlacedCablePacketKey {
+    pub fn from_outgoing_endpoint(endpoint: &VulkanPlacedCableEndpoint) -> Self {
+        Self {
+            cable_index: endpoint.cable_index,
+            from_device_id: endpoint.local_device_id.clone(),
+            to_device_id: endpoint.remote_device_id.clone(),
+        }
+    }
+
+    pub fn from_incoming_endpoint(endpoint: &VulkanPlacedCableEndpoint) -> Self {
+        Self {
+            cable_index: endpoint.cable_index,
+            from_device_id: endpoint.remote_device_id.clone(),
+            to_device_id: endpoint.local_device_id.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanPlacedCablePacket {
+    pub key: VulkanPlacedCablePacketKey,
+    pub signal: String,
+    pub source_pedal_id: String,
+    pub destination_pedal_id: String,
+    pub byte_count: usize,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanPlacedCableTransportReceipt {
+    pub key: VulkanPlacedCablePacketKey,
+    pub signal: String,
+    pub byte_count: usize,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct VulkanInProcessPlacedCableTransport {
+    packets: BTreeMap<VulkanPlacedCablePacketKey, VulkanPlacedCablePacket>,
+}
+
+impl VulkanInProcessPlacedCableTransport {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn packet_count(&self) -> usize {
+        self.packets.len()
+    }
+
+    pub fn contains_packet(&self, key: &VulkanPlacedCablePacketKey) -> bool {
+        self.packets.contains_key(key)
+    }
+
+    pub fn publish_outgoing_cable(
+        &mut self,
+        mounted: &VulkanMountedPlacedStreamCircuit,
+        cable_index: usize,
+    ) -> Result<VulkanPlacedCableTransportReceipt, VulkanPlacedCableTransportError> {
+        let outgoing = mounted
+            .cable_io
+            .outgoing_buffer(cable_index)
+            .ok_or_else(|| VulkanPlacedCableTransportError::MissingOutgoingCable {
+                device_id: mounted.device_id().to_string(),
+                cable_index,
+            })?;
+        let key = VulkanPlacedCablePacketKey::from_outgoing_endpoint(&outgoing.endpoint);
+        let bytes =
+            outgoing
+                .buffer
+                .read_bytes(outgoing.byte_capacity)
+                .map_err(|error| VulkanPlacedCableTransportError::Vulkan {
+                    operation: "read outgoing cable buffer",
+                    error,
+                })?;
+        let packet = VulkanPlacedCablePacket {
+            key: key.clone(),
+            signal: outgoing.endpoint.signal.clone(),
+            source_pedal_id: outgoing.endpoint.local_pedal_id.clone(),
+            destination_pedal_id: outgoing.endpoint.remote_pedal_id.clone(),
+            byte_count: bytes.len(),
+            bytes,
+        };
+        let receipt = VulkanPlacedCableTransportReceipt {
+            key: key.clone(),
+            signal: packet.signal.clone(),
+            byte_count: packet.byte_count,
+        };
+        self.packets.insert(key, packet);
+        Ok(receipt)
+    }
+
+    pub fn receive_incoming_cable(
+        &mut self,
+        mounted: &VulkanMountedPlacedStreamCircuit,
+        cable_index: usize,
+    ) -> Result<VulkanPlacedCableTransportReceipt, VulkanPlacedCableTransportError> {
+        let incoming = mounted
+            .cable_io
+            .incoming_buffer(cable_index)
+            .ok_or_else(|| VulkanPlacedCableTransportError::MissingIncomingCable {
+                device_id: mounted.device_id().to_string(),
+                cable_index,
+            })?;
+        let key = VulkanPlacedCablePacketKey::from_incoming_endpoint(&incoming.endpoint);
+        let packet =
+            self.packets
+                .remove(&key)
+                .ok_or_else(|| VulkanPlacedCableTransportError::MissingPacket {
+                    key: key.clone(),
+                })?;
+        if packet.byte_count != incoming.byte_capacity {
+            return Err(VulkanPlacedCableTransportError::ByteCapacityMismatch {
+                key,
+                packet_byte_count: packet.byte_count,
+                incoming_byte_capacity: incoming.byte_capacity,
+            });
+        }
+        incoming.buffer.write_bytes(&packet.bytes).map_err(|error| {
+            VulkanPlacedCableTransportError::Vulkan {
+                operation: "write incoming cable buffer",
+                error,
+            }
+        })?;
+        Ok(VulkanPlacedCableTransportReceipt {
+            key: packet.key,
+            signal: packet.signal,
+            byte_count: packet.byte_count,
+        })
+    }
+}
+
+#[derive(Debug)]
+pub enum VulkanPlacedCableTransportError {
+    MissingOutgoingCable {
+        device_id: String,
+        cable_index: usize,
+    },
+    MissingIncomingCable {
+        device_id: String,
+        cable_index: usize,
+    },
+    MissingPacket {
+        key: VulkanPlacedCablePacketKey,
+    },
+    ByteCapacityMismatch {
+        key: VulkanPlacedCablePacketKey,
+        packet_byte_count: usize,
+        incoming_byte_capacity: usize,
+    },
+    Vulkan {
+        operation: &'static str,
+        error: VulkanError,
+    },
+}
+
+impl Display for VulkanPlacedCableTransportError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingOutgoingCable {
+                device_id,
+                cable_index,
+            } => write!(
+                f,
+                "device {device_id:?} has no outgoing cable buffer for cable {cable_index}"
+            ),
+            Self::MissingIncomingCable {
+                device_id,
+                cable_index,
+            } => write!(
+                f,
+                "device {device_id:?} has no incoming cable buffer for cable {cable_index}"
+            ),
+            Self::MissingPacket { key } => write!(
+                f,
+                "no in-process cable packet for cable {} from {:?} to {:?}",
+                key.cable_index, key.from_device_id, key.to_device_id
+            ),
+            Self::ByteCapacityMismatch {
+                key,
+                packet_byte_count,
+                incoming_byte_capacity,
+            } => write!(
+                f,
+                "in-process cable packet for cable {} from {:?} to {:?} has {} bytes, but incoming buffer has {} bytes",
+                key.cable_index,
+                key.from_device_id,
+                key.to_device_id,
+                packet_byte_count,
+                incoming_byte_capacity
+            ),
+            Self::Vulkan { operation, error } => write!(f, "{operation} failed: {error}"),
+        }
+    }
+}
+
+impl Error for VulkanPlacedCableTransportError {}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VulkanPlacedCableIoPlanError(pub String);
 
@@ -18486,6 +18690,131 @@ mod tests {
                 "skipping resident kernel dispatch handle smoke: no GLSL to SPIR-V compiler found"
             );
         }
+    }
+
+    #[test]
+    fn in_process_cable_transport_moves_bytes_between_mounted_device_slices() {
+        let device = match VulkanComputeDevice::new() {
+            Ok(device) => device,
+            Err(error) => {
+                eprintln!("skipping in-process placed cable transport: {error}");
+                return;
+            }
+        };
+        let graph = ResolvedLoweredPedalboard::from_index_file(fixture_model_index_path()).unwrap();
+        let tensor_index = TensorIndex::from_json_file(fixture_model_tensor_index_path()).unwrap();
+        let execution_plan =
+            StreamCircuitExecutionPlan::from_graph_with_tensor_index(&graph, &tensor_index)
+                .unwrap();
+        let resource_plan =
+            StreamCircuitResourcePlan::from_graph_and_plan(&graph, &execution_plan).unwrap();
+        let placement_spec =
+            StreamCircuitPlacementSpec::new("gpu0").with_pedal_device("layer_02", "gpu1");
+        let placement_plan = graph.placement_plan(&placement_spec).unwrap();
+
+        let gpu0_resident = VulkanPlacedStreamCircuitResidentPlan::from_resource_plan_for_device(
+            &resource_plan,
+            &placement_plan,
+            "gpu0",
+            Some(&tensor_index),
+            Some(2),
+        )
+        .unwrap();
+        let gpu0_plan = VulkanPlacedStreamCircuitPlan::from_plans(
+            &execution_plan,
+            &resource_plan,
+            gpu0_resident,
+        )
+        .unwrap();
+        let gpu0 =
+            VulkanMountedPlacedStreamCircuit::from_placed_plan(&device, gpu0_plan, 4).unwrap();
+
+        let gpu1_resident = VulkanPlacedStreamCircuitResidentPlan::from_resource_plan_for_device(
+            &resource_plan,
+            &placement_plan,
+            "gpu1",
+            Some(&tensor_index),
+            Some(2),
+        )
+        .unwrap();
+        let gpu1_plan = VulkanPlacedStreamCircuitPlan::from_plans(
+            &execution_plan,
+            &resource_plan,
+            gpu1_resident,
+        )
+        .unwrap();
+        let gpu1 =
+            VulkanMountedPlacedStreamCircuit::from_placed_plan(&device, gpu1_plan, 4).unwrap();
+
+        assert_eq!(gpu0.cable_io.outgoing_buffer(1).unwrap().byte_capacity, 2_048);
+        assert_eq!(gpu1.cable_io.incoming_buffer(1).unwrap().byte_capacity, 2_048);
+        assert_eq!(gpu1.cable_io.outgoing_buffer(2).unwrap().byte_capacity, 2_048);
+        assert_eq!(gpu0.cable_io.incoming_buffer(2).unwrap().byte_capacity, 2_048);
+
+        let mut layer_01_to_02 = vec![0u8; 2_048];
+        layer_01_to_02[..8].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        gpu0.cable_io
+            .outgoing_buffer(1)
+            .unwrap()
+            .buffer
+            .write_bytes(&layer_01_to_02)
+            .unwrap();
+
+        let mut transport = VulkanInProcessPlacedCableTransport::new();
+        let publish = transport.publish_outgoing_cable(&gpu0, 1).unwrap();
+        assert_eq!(
+            publish.key,
+            VulkanPlacedCablePacketKey {
+                cable_index: 1,
+                from_device_id: "gpu0".to_string(),
+                to_device_id: "gpu1".to_string(),
+            }
+        );
+        assert_eq!(publish.byte_count, 2_048);
+        assert_eq!(transport.packet_count(), 1);
+        assert!(transport.contains_packet(&publish.key));
+
+        let receive = transport.receive_incoming_cable(&gpu1, 1).unwrap();
+        assert_eq!(receive.key, publish.key);
+        assert_eq!(
+            gpu1.cable_io
+                .incoming_buffer(1)
+                .unwrap()
+                .buffer
+                .read_bytes(8)
+                .unwrap(),
+            vec![1, 2, 3, 4, 5, 6, 7, 8]
+        );
+        assert_eq!(transport.packet_count(), 0);
+
+        let mut layer_02_to_03 = vec![0u8; 2_048];
+        layer_02_to_03[..8].copy_from_slice(&[21, 22, 23, 24, 25, 26, 27, 28]);
+        gpu1.cable_io
+            .outgoing_buffer(2)
+            .unwrap()
+            .buffer
+            .write_bytes(&layer_02_to_03)
+            .unwrap();
+        let publish_back = transport.publish_outgoing_cable(&gpu1, 2).unwrap();
+        assert_eq!(
+            publish_back.key,
+            VulkanPlacedCablePacketKey {
+                cable_index: 2,
+                from_device_id: "gpu1".to_string(),
+                to_device_id: "gpu0".to_string(),
+            }
+        );
+        let receive_back = transport.receive_incoming_cable(&gpu0, 2).unwrap();
+        assert_eq!(receive_back.key, publish_back.key);
+        assert_eq!(
+            gpu0.cable_io
+                .incoming_buffer(2)
+                .unwrap()
+                .buffer
+                .read_bytes(8)
+                .unwrap(),
+            vec![21, 22, 23, 24, 25, 26, 27, 28]
+        );
     }
 
     #[test]
