@@ -176,6 +176,7 @@ fn inspect_device_slice(
     );
     let mounted_bound = mounted.mounted_placed_bound_dispatch_plan(&reusable_manifest)?;
     let tick_plan = mounted.stream_tick_plan(&reusable_manifest)?;
+    let resident_plan = &mounted.placed_plan.placed_resident_plan;
 
     let payload = json!({
         "ok": true,
@@ -183,6 +184,33 @@ fn inspect_device_slice(
         "device_name": device.device_name(),
         "device_id": slice.device_id,
         "resident_capacity_activations": capacity,
+        "hosted_pedals": resident_plan.hosted_pedal_ids,
+        "local_cables": resident_plan.local_cables.iter().map(|cable| json!({
+            "cable_index": cable.cable_index,
+            "signal": cable.signal,
+            "source_pedal_id": cable.source_pedal_id,
+            "destination_pedal_id": cable.destination_pedal_id,
+            "device_id": cable.source_device_id,
+            "byte_capacity": mounted.cable_io.local_cable_buffer(cable.cable_index).map(|buffer| buffer.byte_capacity),
+        })).collect::<Vec<_>>(),
+        "incoming_cables": resident_plan.incoming_cables.iter().map(|cable| json!({
+            "cable_index": cable.cable_index,
+            "signal": cable.signal,
+            "source_device_id": cable.source_device_id,
+            "source_pedal_id": cable.source_pedal_id,
+            "destination_device_id": cable.destination_device_id,
+            "destination_pedal_id": cable.destination_pedal_id,
+            "byte_capacity": mounted.cable_io.incoming_buffer(cable.cable_index).map(|buffer| buffer.byte_capacity),
+        })).collect::<Vec<_>>(),
+        "outgoing_cables": resident_plan.outgoing_cables.iter().map(|cable| json!({
+            "cable_index": cable.cable_index,
+            "signal": cable.signal,
+            "source_device_id": cable.source_device_id,
+            "source_pedal_id": cable.source_pedal_id,
+            "destination_device_id": cable.destination_device_id,
+            "destination_pedal_id": cable.destination_pedal_id,
+            "byte_capacity": mounted.cable_io.outgoing_buffer(cable.cable_index).map(|buffer| buffer.byte_capacity),
+        })).collect::<Vec<_>>(),
         "hosted_pedal_count": slice.hosted_pedal_count,
         "incoming_cable_count": slice.incoming_cable_count,
         "outgoing_cable_count": slice.outgoing_cable_count,
