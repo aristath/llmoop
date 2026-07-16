@@ -4,6 +4,7 @@ use std::io;
 use llmoop_runtime::{
     VulkanComputeDevice, VulkanResidentTokenInputEvent, VulkanResidentTokenRuntime,
     VulkanResidentTokenRuntimeCycleRun, VulkanResidentTokenRuntimeCycleStopCondition,
+    VulkanResidentTokenRuntimeScheduler,
     create_default_lfm2_5_230m_resident_greedy_stream_processor,
 };
 
@@ -65,28 +66,50 @@ fn run() -> Result<(), Box<dyn Error>> {
         processor.dynamic_state_capacity_activations
     );
 
-    let mut runtime = VulkanResidentTokenRuntime::from_processor("demo_stream", processor);
-    runtime.enqueue_input_event(
+    let stream_id = "demo_stream";
+    let runtime = VulkanResidentTokenRuntime::from_processor(stream_id, processor);
+    let mut scheduler = VulkanResidentTokenRuntimeScheduler::new();
+    scheduler.add_runtime(runtime)?;
+    scheduler.enqueue_input_event(
+        stream_id,
         VulkanResidentTokenInputEvent::new("first", args.prompt, args.max_new_tokens)
             .with_origin("cli"),
     )?;
-    runtime.enqueue_input_event(
+    scheduler.enqueue_input_event(
+        stream_id,
         VulkanResidentTokenInputEvent::new("second", args.then_prompt, args.then_max_new_tokens)
             .with_origin("cli"),
     )?;
 
     println!("cycle_ticks={}", args.cycle_ticks);
+    println!("scheduler.max_runtime_cycles_per_turn=1");
 
     let mut generated = Vec::new();
     let mut cycle_index = 0usize;
-    while runtime.snapshot().running {
-        let cycle = runtime.run_cycle(&device, args.cycle_ticks)?;
-        generated.extend(cycle.output_events.iter().map(|event| event.token_id));
-        print_cycle(cycle_index, &cycle);
-        cycle_index += 1;
+    while scheduler.snapshot().running {
+        let run = scheduler.run_cycle(&device, 1, args.cycle_ticks)?;
+        if run.runtime_cycles.is_empty() && scheduler.snapshot().running {
+            return Err(io::Error::other(
+                "resident token scheduler is running but produced no runtime cycles",
+            )
+            .into());
+        }
+        generated.extend(
+            run.output_events
+                .iter()
+                .map(|event| event.output_event.token_id),
+        );
+        for cycle in &run.runtime_cycles {
+            print_cycle(cycle_index, cycle);
+            cycle_index += 1;
+        }
     }
 
-    let snapshot = runtime.snapshot();
+    let scheduler_snapshot = scheduler.snapshot();
+    let snapshot = scheduler
+        .runtime(stream_id)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "demo stream disappeared"))?
+        .snapshot();
     println!("runtime.generated={generated:?}");
     println!("runtime.cycles={cycle_index}");
     println!(
@@ -102,6 +125,15 @@ fn run() -> Result<(), Box<dyn Error>> {
         snapshot.pending_input_event_count
     );
     println!("runtime.idle={}", snapshot.idle);
+    println!(
+        "scheduler.registered_runtimes={}",
+        scheduler_snapshot.registered_runtime_count
+    );
+    println!(
+        "scheduler.active_runtimes={}",
+        scheduler_snapshot.active_runtime_count
+    );
+    println!("scheduler.idle={}", scheduler_snapshot.idle);
 
     Ok(())
 }
