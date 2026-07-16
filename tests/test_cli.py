@@ -183,6 +183,8 @@ class CliTest(unittest.TestCase):
                 "llmoop",
                 "--run-model",
                 str(self.fixture.lowered_dir),
+                "--package-dir",
+                str(self.fixture.package_dir),
                 "--prompt",
                 "Hello",
                 "--max-new-tokens",

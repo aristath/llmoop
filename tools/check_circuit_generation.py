@@ -19,6 +19,7 @@ from llmoop.text_generation import generate_text, load_tokenizer
 def main() -> None:
     parser = argparse.ArgumentParser(description="Check greedy circuit generation against the source model oracle.")
     parser.add_argument("--circuit-dir", type=Path, required=True)
+    parser.add_argument("--package-dir", type=Path, required=True)
     parser.add_argument("--model-dir", type=Path, required=True)
     parser.add_argument("--prompt-ids", type=str, default=None)
     parser.add_argument("--prompt-text", type=str, default=None)
@@ -32,11 +33,15 @@ def main() -> None:
         parser.error("--prompt-ids and --prompt-text are mutually exclusive")
 
     torch, auto_model, dynamic_cache = _oracle_imports()
-    runtime = CircuitModelRuntime.from_dirs(circuit_dir=args.circuit_dir, torch=torch)
+    runtime = CircuitModelRuntime.from_dirs(
+        circuit_dir=args.circuit_dir,
+        package_dir=args.package_dir,
+        torch=torch,
+    )
     source = auto_model.from_pretrained(args.model_dir, dtype=torch.float32)
     source.eval()
 
-    tokenizer = load_tokenizer(args.circuit_dir / "tokenizer") if args.prompt_text is not None else None
+    tokenizer = load_tokenizer(args.package_dir / "tokenizer") if args.prompt_text is not None else None
     if args.prompt_text is not None:
         prompt_ids = tuple(
             int(token)

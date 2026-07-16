@@ -24,6 +24,7 @@ class InstalledProcessorTest(unittest.TestCase):
         cls.torch, _, _ = _oracle_imports()
         cls.runtime = CircuitModelRuntime.from_dirs(
             circuit_dir=cls.fixture.lowered_dir,
+            package_dir=cls.fixture.package_dir,
             torch=cls.torch,
         )
 

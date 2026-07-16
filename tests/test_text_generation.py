@@ -23,9 +23,10 @@ class TextGenerationTest(unittest.TestCase):
         cls.torch, cls.auto_model, cls.dynamic_cache = _oracle_imports()
         cls.runtime = CircuitModelRuntime.from_dirs(
             circuit_dir=cls.fixture.lowered_dir,
+            package_dir=cls.fixture.package_dir,
             torch=cls.torch,
         )
-        cls.tokenizer = load_tokenizer(cls.fixture.lowered_dir / "tokenizer")
+        cls.tokenizer = load_tokenizer(cls.fixture.package_dir / "tokenizer")
         cls.source = cls.auto_model.from_pretrained(cls.fixture.source_model_dir, dtype=cls.torch.float32)
         cls.source.eval()
 

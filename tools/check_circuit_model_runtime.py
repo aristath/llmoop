@@ -18,6 +18,7 @@ from llmoop.source_oracle import _oracle_imports
 def main() -> None:
     parser = argparse.ArgumentParser(description="Check the direct circuit model runtime against the source model oracle.")
     parser.add_argument("--circuit-dir", type=Path, required=True)
+    parser.add_argument("--package-dir", type=Path, required=True)
     parser.add_argument("--model-dir", type=Path, required=True)
     parser.add_argument("--input-ids", type=str, default=None, help="comma-separated token ids for full-sequence mode")
     parser.add_argument("--stream-input-ids", type=str, default=None, help="comma-separated teacher-forced token ids")
@@ -26,7 +27,11 @@ def main() -> None:
 
     input_ids = _parse_ids(args.stream_input_ids or args.input_ids or "1,2,3,4")
     torch, auto_model, dynamic_cache = _oracle_imports()
-    runtime = CircuitModelRuntime.from_dirs(circuit_dir=args.circuit_dir, torch=torch)
+    runtime = CircuitModelRuntime.from_dirs(
+        circuit_dir=args.circuit_dir,
+        package_dir=args.package_dir,
+        torch=torch,
+    )
     source = auto_model.from_pretrained(args.model_dir, dtype=torch.float32)
     source.eval()
 

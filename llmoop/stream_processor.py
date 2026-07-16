@@ -194,13 +194,18 @@ class StreamProcessor:
     def from_dirs(
         cls,
         circuit_dir: Path,
+        package_dir: Path,
         torch: Any | None = None,
         sampler: Any | None = None,
         random_seed: int = 0,
     ) -> "StreamProcessor":
         from llmoop.circuit_model_runtime import CircuitModelRuntime
 
-        runtime = CircuitModelRuntime.from_dirs(circuit_dir=circuit_dir, torch=torch)
+        runtime = CircuitModelRuntime.from_dirs(
+            circuit_dir=circuit_dir,
+            package_dir=package_dir,
+            torch=torch,
+        )
         return cls(runtime=runtime, sampler=sampler, random_seed=random_seed)
 
     def open_stream(

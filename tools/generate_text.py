@@ -19,6 +19,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Generate text with the circuit pedalboard runtime.")
     parser.add_argument("prompt", help="Prompt text to feed into the input transducer.")
     parser.add_argument("--circuit-dir", type=Path, required=True)
+    parser.add_argument("--package-dir", type=Path, required=True)
     parser.add_argument("--max-new-tokens", type=int, default=32)
     parser.add_argument("--temperature", type=float, default=None, help="Use stochastic temperature sampling instead of greedy.")
     parser.add_argument("--top-k", type=int, default=None, help="Restrict stochastic sampling to the top K logits.")
@@ -32,8 +33,12 @@ def main() -> None:
 
     import torch
 
-    runtime = CircuitModelRuntime.from_dirs(circuit_dir=args.circuit_dir, torch=torch)
-    tokenizer = load_tokenizer(args.circuit_dir / "tokenizer")
+    runtime = CircuitModelRuntime.from_dirs(
+        circuit_dir=args.circuit_dir,
+        package_dir=args.package_dir,
+        torch=torch,
+    )
+    tokenizer = load_tokenizer(args.package_dir / "tokenizer")
     eos_token_id = None if args.ignore_eos else int(runtime.config["eos_token_id"])
     sampler = None
     if args.temperature is not None:

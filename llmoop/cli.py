@@ -150,6 +150,8 @@ def main() -> None:
     if args.run_model is not None:
         if args.prompt is None:
             parser.error("--prompt is required with --run-model")
+        if args.package_dir is None:
+            parser.error("--package-dir is required with --run-model")
         run_model(args)
         return
 
@@ -261,9 +263,10 @@ def run_model(args: argparse.Namespace) -> None:
 
     runtime = CircuitModelRuntime.from_dirs(
         circuit_dir=args.run_model,
+        package_dir=args.package_dir,
         torch=torch,
     )
-    tokenizer = load_tokenizer(args.run_model / "tokenizer")
+    tokenizer = load_tokenizer(args.package_dir / "tokenizer")
     eos_token_id = None if args.ignore_eos else int(runtime.config["eos_token_id"])
     sampler = None
     if args.temperature is not None:

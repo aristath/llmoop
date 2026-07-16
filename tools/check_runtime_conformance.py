@@ -58,6 +58,8 @@ def run_python_circuit_runtime(args: argparse.Namespace) -> dict[str, Any]:
         "llmoop",
         "--run-model",
         str(args.lowered_dir),
+        "--package-dir",
+        str(args.package_dir),
         "--prompt",
         args.prompt_text,
         "--max-new-tokens",

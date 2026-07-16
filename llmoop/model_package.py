@@ -51,12 +51,11 @@ def compile_model_package(
     package_dir = package_dir or Path("packages") / slug
 
     structure = transpile_model(model_dir, transpiled_dir, clean=clean)
+    if clean and lowered_dir.exists():
+        shutil.rmtree(lowered_dir)
     lowered = lower_pedalboard(transpiled_dir, lowered_dir)
     tensor_index = read_json(transpiled_dir / "tensors.json")
     model_graph = read_json(transpiled_dir / "model.json")
-    copy_config_package(model_dir, lowered_dir)
-    copy_tokenizer_package(model_dir, lowered_dir / TOKENIZER_PACKAGE_DIR)
-    copy_tensor_package(tensor_index, lowered_dir)
 
     if clean and package_dir.exists():
         shutil.rmtree(package_dir)

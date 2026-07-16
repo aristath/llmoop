@@ -84,6 +84,7 @@ class InstalledStreamProcessor:
     def from_dirs(
         cls,
         circuit_dir: Path,
+        package_dir: Path,
         torch: Any | None = None,
         sampler: Any | None = None,
         random_seed: int = 0,
@@ -91,7 +92,11 @@ class InstalledStreamProcessor:
         install_id: str = "installed_stream_processor",
         backend: str = "python_device_loop",
     ) -> "InstalledStreamProcessor":
-        runtime = CircuitModelRuntime.from_dirs(circuit_dir=circuit_dir, torch=torch)
+        runtime = CircuitModelRuntime.from_dirs(
+            circuit_dir=circuit_dir,
+            package_dir=package_dir,
+            torch=torch,
+        )
         return cls.from_runtime(
             runtime=runtime,
             sampler=sampler,
