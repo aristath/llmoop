@@ -2,9 +2,9 @@ use std::error::Error;
 use std::io;
 
 use llmoop_runtime::{
-    VulkanResidentTokenEngine, VulkanResidentTokenEngineRunStopCondition,
-    VulkanResidentTokenInputEvent, VulkanResidentTokenRuntimeCycleRun,
-    VulkanResidentTokenRuntimeCycleStopCondition,
+    VulkanResidentTokenEngine, VulkanResidentTokenEngineRunBudget,
+    VulkanResidentTokenEngineRunStopCondition, VulkanResidentTokenEngineSubmittedInputRun,
+    VulkanResidentTokenRuntimeCycleRun, VulkanResidentTokenRuntimeCycleStopCondition,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -71,33 +71,36 @@ fn run() -> Result<(), Box<dyn Error>> {
         stream.dynamic_state_capacity_activations
     );
 
-    engine.enqueue_input_event(
-        stream_id,
-        VulkanResidentTokenInputEvent::new("first", args.prompt, args.max_new_tokens)
-            .with_origin("cli"),
-    )?;
-    engine.enqueue_input_event(
-        stream_id,
-        VulkanResidentTokenInputEvent::new("second", args.then_prompt, args.then_max_new_tokens)
-            .with_origin("cli"),
-    )?;
-
     println!("cycle_ticks={}", args.cycle_ticks);
     println!("scheduler.max_runtime_cycles_per_turn=1");
     println!("engine.max_scheduler_turns={}", args.max_scheduler_turns);
 
-    let run = engine.run_until_idle(args.max_scheduler_turns, 1, args.cycle_ticks)?;
-    let generated = run
-        .output_events
+    let budget =
+        VulkanResidentTokenEngineRunBudget::new(args.max_scheduler_turns, 1, args.cycle_ticks);
+    let first = engine.submit_tokens_until_idle(
+        stream_id,
+        "first",
+        args.prompt,
+        args.max_new_tokens,
+        "cli",
+        budget,
+    )?;
+    let second = engine.submit_tokens_until_idle(
+        stream_id,
+        "second",
+        args.then_prompt,
+        args.then_max_new_tokens,
+        "cli",
+        budget,
+    )?;
+    let submitted_runs = [first, second];
+    let generated = submitted_runs
         .iter()
-        .map(|event| event.output_event.token_id)
+        .flat_map(|submitted| submitted.generated_token_ids.iter().copied())
         .collect::<Vec<_>>();
     let mut cycle_index = 0usize;
-    for scheduler_run in &run.scheduler_runs {
-        for cycle in &scheduler_run.runtime_cycles {
-            print_cycle(cycle_index, cycle);
-            cycle_index += 1;
-        }
+    for submitted in &submitted_runs {
+        print_submitted_run_cycles(submitted, &mut cycle_index);
     }
 
     let engine_snapshot = engine.snapshot();
@@ -106,9 +109,24 @@ fn run() -> Result<(), Box<dyn Error>> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "demo stream disappeared"))?;
     println!("runtime.generated={generated:?}");
     println!("runtime.cycles={cycle_index}");
-    println!("engine.scheduler_turns={}", run.scheduler_runs.len());
-    println!("engine.runtime_cycles={}", run.runtime_cycle_count);
-    println!("engine.stop={}", engine_stop_label(run.stop_condition));
+    println!(
+        "engine.scheduler_turns={}",
+        submitted_runs
+            .iter()
+            .map(|submitted| submitted.run.scheduler_runs.len())
+            .sum::<usize>()
+    );
+    println!(
+        "engine.runtime_cycles={}",
+        submitted_runs
+            .iter()
+            .map(|submitted| submitted.run.runtime_cycle_count)
+            .sum::<usize>()
+    );
+    println!(
+        "engine.stop={}",
+        engine_stop_label(aggregate_engine_stop(&submitted_runs))
+    );
     println!(
         "runtime.next_stream_tick={}",
         snapshot.stream.next_stream_tick
@@ -247,6 +265,18 @@ fn print_cycle(index: usize, cycle: &VulkanResidentTokenRuntimeCycleRun) {
     );
 }
 
+fn print_submitted_run_cycles(
+    submitted: &VulkanResidentTokenEngineSubmittedInputRun,
+    cycle_index: &mut usize,
+) {
+    for scheduler_run in &submitted.run.scheduler_runs {
+        for cycle in &scheduler_run.runtime_cycles {
+            print_cycle(*cycle_index, cycle);
+            *cycle_index += 1;
+        }
+    }
+}
+
 fn cycle_stop_label(stop: VulkanResidentTokenRuntimeCycleStopCondition) -> &'static str {
     match stop {
         VulkanResidentTokenRuntimeCycleStopCondition::Idle => "idle",
@@ -258,6 +288,19 @@ fn engine_stop_label(stop: VulkanResidentTokenEngineRunStopCondition) -> &'stati
     match stop {
         VulkanResidentTokenEngineRunStopCondition::Idle => "idle",
         VulkanResidentTokenEngineRunStopCondition::SchedulerTurnBudget => "scheduler_turn_budget",
+    }
+}
+
+fn aggregate_engine_stop(
+    submitted_runs: &[VulkanResidentTokenEngineSubmittedInputRun],
+) -> VulkanResidentTokenEngineRunStopCondition {
+    if submitted_runs.iter().any(|submitted| {
+        submitted.run.stop_condition
+            == VulkanResidentTokenEngineRunStopCondition::SchedulerTurnBudget
+    }) {
+        VulkanResidentTokenEngineRunStopCondition::SchedulerTurnBudget
+    } else {
+        VulkanResidentTokenEngineRunStopCondition::Idle
     }
 }
 

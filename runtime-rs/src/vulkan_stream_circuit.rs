@@ -5211,12 +5211,26 @@ impl VulkanResidentTokenEngine {
         max_runtime_cycles_per_turn: usize,
         ticks_per_runtime: usize,
     ) -> Result<VulkanResidentTokenEngineRun, VulkanResidentTokenEngineError> {
+        self.run_until_idle_with_budget(VulkanResidentTokenEngineRunBudget {
+            max_scheduler_turns,
+            max_runtime_cycles_per_turn,
+            ticks_per_runtime,
+        })
+    }
+
+    pub fn run_until_idle_with_budget(
+        &mut self,
+        budget: VulkanResidentTokenEngineRunBudget,
+    ) -> Result<VulkanResidentTokenEngineRun, VulkanResidentTokenEngineError> {
         let start_snapshot = self.snapshot();
         let mut scheduler_runs = Vec::new();
         let mut output_events = Vec::new();
         let mut runtime_cycle_count = 0usize;
 
-        if max_scheduler_turns == 0 || max_runtime_cycles_per_turn == 0 || ticks_per_runtime == 0 {
+        if budget.max_scheduler_turns == 0
+            || budget.max_runtime_cycles_per_turn == 0
+            || budget.ticks_per_runtime == 0
+        {
             let end_snapshot = self.snapshot();
             let stop_condition = if end_snapshot.scheduler.running {
                 VulkanResidentTokenEngineRunStopCondition::SchedulerTurnBudget
@@ -5224,9 +5238,9 @@ impl VulkanResidentTokenEngine {
                 VulkanResidentTokenEngineRunStopCondition::Idle
             };
             return Ok(VulkanResidentTokenEngineRun {
-                max_scheduler_turns,
-                max_runtime_cycles_per_turn,
-                ticks_per_runtime,
+                max_scheduler_turns: budget.max_scheduler_turns,
+                max_runtime_cycles_per_turn: budget.max_runtime_cycles_per_turn,
+                ticks_per_runtime: budget.ticks_per_runtime,
                 stop_condition,
                 scheduler_runs,
                 output_events,
@@ -5236,8 +5250,10 @@ impl VulkanResidentTokenEngine {
             });
         }
 
-        while scheduler_runs.len() < max_scheduler_turns && self.snapshot().scheduler.running {
-            let scheduler_run = self.run_cycle(max_runtime_cycles_per_turn, ticks_per_runtime)?;
+        while scheduler_runs.len() < budget.max_scheduler_turns && self.snapshot().scheduler.running
+        {
+            let scheduler_run =
+                self.run_cycle(budget.max_runtime_cycles_per_turn, budget.ticks_per_runtime)?;
             let produced_runtime_cycles = scheduler_run.runtime_cycles.len();
             runtime_cycle_count = runtime_cycle_count
                 .checked_add(produced_runtime_cycles)
@@ -5258,9 +5274,9 @@ impl VulkanResidentTokenEngine {
         };
 
         Ok(VulkanResidentTokenEngineRun {
-            max_scheduler_turns,
-            max_runtime_cycles_per_turn,
-            ticks_per_runtime,
+            max_scheduler_turns: budget.max_scheduler_turns,
+            max_runtime_cycles_per_turn: budget.max_runtime_cycles_per_turn,
+            ticks_per_runtime: budget.ticks_per_runtime,
             stop_condition,
             scheduler_runs,
             output_events,
@@ -5268,6 +5284,55 @@ impl VulkanResidentTokenEngine {
             start_snapshot,
             end_snapshot,
         })
+    }
+
+    pub fn submit_input_event_until_idle(
+        &mut self,
+        stream_id: &str,
+        event: VulkanResidentTokenInputEvent,
+        budget: VulkanResidentTokenEngineRunBudget,
+    ) -> Result<VulkanResidentTokenEngineSubmittedInputRun, VulkanResidentTokenEngineError> {
+        let input_event_id = event.id.clone();
+        let queued_input_event = self.enqueue_input_event(stream_id, event)?;
+        let run = self.run_until_idle_with_budget(budget)?;
+        let output_events = run
+            .output_events
+            .iter()
+            .filter(|event| {
+                event.stream_id == stream_id && event.output_event.input_event_id == input_event_id
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let generated_token_ids = output_events
+            .iter()
+            .map(|event| event.output_event.token_id)
+            .collect();
+
+        Ok(VulkanResidentTokenEngineSubmittedInputRun {
+            stream_id: stream_id.to_string(),
+            input_event_id,
+            queued_input_event,
+            run,
+            output_events,
+            generated_token_ids,
+        })
+    }
+
+    pub fn submit_tokens_until_idle(
+        &mut self,
+        stream_id: &str,
+        input_event_id: impl Into<String>,
+        token_ids: Vec<u32>,
+        max_public_tokens: usize,
+        origin: impl Into<String>,
+        budget: VulkanResidentTokenEngineRunBudget,
+    ) -> Result<VulkanResidentTokenEngineSubmittedInputRun, VulkanResidentTokenEngineError> {
+        self.submit_input_event_until_idle(
+            stream_id,
+            VulkanResidentTokenInputEvent::new(input_event_id, token_ids, max_public_tokens)
+                .with_origin(origin),
+            budget,
+        )
     }
 
     pub fn snapshot(&self) -> VulkanResidentTokenEngineSnapshot {
@@ -5344,6 +5409,27 @@ pub struct VulkanResidentTokenEngineSnapshot {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VulkanResidentTokenEngineRunBudget {
+    pub max_scheduler_turns: usize,
+    pub max_runtime_cycles_per_turn: usize,
+    pub ticks_per_runtime: usize,
+}
+
+impl VulkanResidentTokenEngineRunBudget {
+    pub fn new(
+        max_scheduler_turns: usize,
+        max_runtime_cycles_per_turn: usize,
+        ticks_per_runtime: usize,
+    ) -> Self {
+        Self {
+            max_scheduler_turns,
+            max_runtime_cycles_per_turn,
+            ticks_per_runtime,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VulkanResidentTokenEngineRunStopCondition {
     Idle,
     SchedulerTurnBudget,
@@ -5360,6 +5446,16 @@ pub struct VulkanResidentTokenEngineRun {
     pub runtime_cycle_count: usize,
     pub start_snapshot: VulkanResidentTokenEngineSnapshot,
     pub end_snapshot: VulkanResidentTokenEngineSnapshot,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanResidentTokenEngineSubmittedInputRun {
+    pub stream_id: String,
+    pub input_event_id: String,
+    pub queued_input_event: VulkanResidentTokenRuntimeQueuedInputEvent,
+    pub run: VulkanResidentTokenEngineRun,
+    pub output_events: Vec<VulkanResidentTokenRuntimeSchedulerOutputEvent>,
+    pub generated_token_ids: Vec<u32>,
 }
 
 #[derive(Debug)]
@@ -12926,23 +13022,30 @@ mod tests {
         assert!(initial.scheduler.idle);
         assert!(!initial.scheduler.running);
 
-        let queued = engine
-            .enqueue_input_event(
+        let submitted = engine
+            .submit_tokens_until_idle(
                 "engine_stream_0",
-                VulkanResidentTokenInputEvent::new("event_0", vec![1], 2).with_origin("test_host"),
+                "event_0",
+                vec![1],
+                2,
+                "test_host",
+                VulkanResidentTokenEngineRunBudget::new(8, 1, 2),
             )
             .unwrap();
-        assert_eq!(queued.pending_input_event_count, 1);
-        assert_eq!(engine.snapshot().scheduler.active_runtime_count, 1);
+        assert_eq!(submitted.stream_id, "engine_stream_0");
+        assert_eq!(submitted.input_event_id, "event_0");
+        assert_eq!(submitted.queued_input_event.pending_input_event_count, 1);
+        assert_eq!(submitted.generated_token_ids, vec![1, 1]);
+        assert_eq!(submitted.output_events.len(), 2);
+        assert!(
+            submitted
+                .output_events
+                .iter()
+                .all(|event| event.stream_id == "engine_stream_0"
+                    && event.output_event.input_event_id == "event_0")
+        );
+        let run = submitted.run;
 
-        let run = engine.run_until_idle(8, 1, 2).unwrap();
-        let generated = run
-            .output_events
-            .iter()
-            .map(|event| event.output_event.token_id)
-            .collect::<Vec<_>>();
-
-        assert_eq!(generated, vec![1, 1]);
         assert_eq!(
             run.stop_condition,
             VulkanResidentTokenEngineRunStopCondition::Idle
