@@ -20,6 +20,7 @@ from llmoop.model_transpiler import transpile_model
 
 TOKENIZER_PACKAGE_DIR = "tokenizer"
 WEIGHTS_PACKAGE_DIR = "weights"
+CONFIG_PACKAGE_FILE = "config.json"
 TOKENIZER_PACKAGE_FILES = (
     "tokenizer.json",
     "tokenizer_config.json",
@@ -51,6 +52,7 @@ def compile_model_package(
     lowered = lower_pedalboard(transpiled_dir, lowered_dir)
     tensor_index = read_json(transpiled_dir / "tensors.json")
     model_graph = read_json(transpiled_dir / "model.json")
+    copy_config_package(model_dir, lowered_dir)
     tokenizer_manifest = copy_tokenizer_package(model_dir, lowered_dir / TOKENIZER_PACKAGE_DIR)
     packaged_tensor_index = copy_tensor_package(tensor_index, lowered_dir)
     package_manifest = build_vulkan_resident_greedy_package_manifest(
@@ -128,6 +130,7 @@ def build_vulkan_resident_greedy_package_manifest(
         "device_id": "gpu0",
         "circuit_index_path": "pedalboard.circuits.json",
         "tensor_index_path": "tensors.json",
+        "config_path": CONFIG_PACKAGE_FILE,
         "tokenizer": tokenizer_manifest,
         "activation_element_bytes": dtype_bytes,
         "dynamic_state_capacity_activations": default_dynamic_state_capacity_activations,
@@ -370,6 +373,13 @@ def copy_tokenizer_package(model_dir: Path, dest_dir: Path) -> Json:
         "path": TOKENIZER_PACKAGE_DIR,
         "files": copied_files,
     }
+
+
+def copy_config_package(model_dir: Path, lowered_dir: Path) -> None:
+    source = model_dir / CONFIG_PACKAGE_FILE
+    if not source.is_file():
+        raise ModelCompileError(f"source model does not contain required config file {source}")
+    shutil.copy2(source, lowered_dir / CONFIG_PACKAGE_FILE)
 
 
 def copy_tensor_package(tensor_index: Json, lowered_dir: Path) -> Json:

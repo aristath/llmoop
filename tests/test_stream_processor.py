@@ -22,7 +22,6 @@ class StreamProcessorTest(unittest.TestCase):
         cls.torch, _, _ = _oracle_imports()
         cls.runtime = CircuitModelRuntime.from_dirs(
             circuit_dir=cls.fixture.lowered_dir,
-            model_dir=cls.fixture.source_model_dir,
             torch=cls.torch,
         )
         cls.processor = StreamProcessor(runtime=cls.runtime)

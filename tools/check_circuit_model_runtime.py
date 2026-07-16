@@ -26,7 +26,7 @@ def main() -> None:
 
     input_ids = _parse_ids(args.stream_input_ids or args.input_ids or "1,2,3,4")
     torch, auto_model, dynamic_cache = _oracle_imports()
-    runtime = CircuitModelRuntime.from_dirs(circuit_dir=args.circuit_dir, model_dir=args.model_dir, torch=torch)
+    runtime = CircuitModelRuntime.from_dirs(circuit_dir=args.circuit_dir, torch=torch)
     source = auto_model.from_pretrained(args.model_dir, dtype=torch.float32)
     source.eval()
 

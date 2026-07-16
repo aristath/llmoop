@@ -68,6 +68,8 @@ class CompiledPackageTest(unittest.TestCase):
         manifest = json.loads(fixture.package_manifest.read_text())
 
         self.assertEqual("tokenizer", manifest["tokenizer"]["path"])
+        self.assertEqual("config.json", manifest["config_path"])
+        self.assertTrue((fixture.lowered_dir / "config.json").is_file())
         self.assertIn("tokenizer.json", manifest["tokenizer"]["files"])
         self.assertTrue((fixture.lowered_dir / "tokenizer" / "tokenizer.json").is_file())
 
@@ -114,8 +116,6 @@ class CliTest(unittest.TestCase):
                 "llmoop",
                 "--run-model",
                 str(self.fixture.lowered_dir),
-                "--model-dir",
-                str(self.fixture.source_model_dir),
                 "--prompt",
                 "Hello",
                 "--max-new-tokens",

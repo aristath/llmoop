@@ -15,12 +15,11 @@ class TensorInfo:
 
 
 class SafetensorsTensorStore:
-    """Direct tensor access for source checkpoint tensors.
+    """Direct tensor access for packaged checkpoint tensors.
 
     The store is intentionally simple for now: tensors are loaded by name from
-    the safetensors checkpoint and converted to the runtime dtype on first use.
-    This removes the need to instantiate the Transformers model just to obtain
-    layer weights.
+    the compiled package tensor index and converted to the runtime dtype on
+    first use.
     """
 
     def __init__(
@@ -40,16 +39,18 @@ class SafetensorsTensorStore:
         self._infos: dict[str, TensorInfo] | None = None
 
     @classmethod
-    def from_model_dir(
+    def from_tensor_index(
         cls,
-        model_dir: Path,
+        tensor_index: Path,
         torch: Any,
         dtype: Any | None = None,
         device: str | None = None,
-        tensor_index: Path | None = None,
     ) -> "SafetensorsTensorStore":
+        tensor_index = tensor_index.expanduser()
+        index = json.loads(tensor_index.read_text())
+        weights_file = index["source"]["weights_file"]
         return cls(
-            weights_file=model_dir / "model.safetensors",
+            weights_file=resolve_tensor_source_file(tensor_index.parent, weights_file),
             torch=torch,
             dtype=dtype,
             device=device,

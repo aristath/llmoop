@@ -22,7 +22,6 @@ class CircuitGenerationTest(unittest.TestCase):
         cls.torch, cls.auto_model, cls.dynamic_cache = _oracle_imports()
         cls.runtime = CircuitModelRuntime.from_dirs(
             circuit_dir=cls.fixture.lowered_dir,
-            model_dir=cls.fixture.source_model_dir,
             torch=cls.torch,
         )
         cls.source = cls.auto_model.from_pretrained(cls.fixture.source_model_dir, dtype=cls.torch.float32)

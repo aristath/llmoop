@@ -33,11 +33,6 @@ def main() -> None:
         help="run a compiled lowered model package with the Python circuit runtime",
     )
     parser.add_argument(
-        "--model-dir",
-        type=Path,
-        help="source model directory for --run-model debug/oracle execution",
-    )
-    parser.add_argument(
         "--prompt",
         help="prompt text for --run/--run-model",
     )
@@ -137,8 +132,6 @@ def main() -> None:
     if args.run is not None:
         if args.prompt is None:
             parser.error("--prompt is required with --run")
-        if args.model_dir is not None:
-            parser.error("--model-dir is only supported by --run-model")
         if args.temperature is not None:
             parser.error("--temperature is only supported by --run-model")
         if args.top_k is not None:
@@ -152,8 +145,6 @@ def main() -> None:
     if args.run_model is not None:
         if args.prompt is None:
             parser.error("--prompt is required with --run-model")
-        if args.model_dir is None:
-            parser.error("--model-dir is required with --run-model")
         run_model(args)
         return
 
@@ -263,10 +254,9 @@ def run_model(args: argparse.Namespace) -> None:
 
     runtime = CircuitModelRuntime.from_dirs(
         circuit_dir=args.run_model,
-        model_dir=args.model_dir,
         torch=torch,
     )
-    tokenizer = load_tokenizer(args.model_dir)
+    tokenizer = load_tokenizer(args.run_model / "tokenizer")
     eos_token_id = None if args.ignore_eos else int(runtime.config["eos_token_id"])
     sampler = None
     if args.temperature is not None:

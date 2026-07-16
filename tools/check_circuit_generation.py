@@ -32,11 +32,11 @@ def main() -> None:
         parser.error("--prompt-ids and --prompt-text are mutually exclusive")
 
     torch, auto_model, dynamic_cache = _oracle_imports()
-    runtime = CircuitModelRuntime.from_dirs(circuit_dir=args.circuit_dir, model_dir=args.model_dir, torch=torch)
+    runtime = CircuitModelRuntime.from_dirs(circuit_dir=args.circuit_dir, torch=torch)
     source = auto_model.from_pretrained(args.model_dir, dtype=torch.float32)
     source.eval()
 
-    tokenizer = load_tokenizer(args.model_dir) if args.prompt_text is not None else None
+    tokenizer = load_tokenizer(args.circuit_dir / "tokenizer") if args.prompt_text is not None else None
     if args.prompt_text is not None:
         prompt_ids = tuple(
             int(token)

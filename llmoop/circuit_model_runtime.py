@@ -137,7 +137,6 @@ class CircuitModelRuntime:
     def from_dirs(
         cls,
         circuit_dir: Path,
-        model_dir: Path,
         torch: Any | None = None,
     ) -> "CircuitModelRuntime":
         if torch is None:
@@ -145,17 +144,20 @@ class CircuitModelRuntime:
 
             torch = torch_module
 
+        circuit_dir = circuit_dir.expanduser()
         board = CircuitPedalboard.from_dir(circuit_dir)
-        config = json.loads((model_dir / "config.json").read_text())
+        config_path = circuit_dir / "config.json"
+        if not config_path.is_file():
+            raise FileNotFoundError(f"compiled circuit package is missing {config_path}")
+        config = json.loads(config_path.read_text())
 
         tensor_index = circuit_dir / "tensors.json"
         if not tensor_index.is_file():
             raise FileNotFoundError(f"compiled circuit package is missing {tensor_index}")
-        tensor_store = SafetensorsTensorStore.from_model_dir(
-            model_dir=model_dir,
+        tensor_store = SafetensorsTensorStore.from_tensor_index(
+            tensor_index=tensor_index,
             torch=torch,
             dtype=torch.float32,
-            tensor_index=tensor_index,
         )
         input_embedding_tensor = board.index["graph"]["input_transducer"]["params"]["weight"]["tensor"]
         output_components = board.index["graph"]["output_transducer"]["components"]
