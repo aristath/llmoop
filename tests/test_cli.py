@@ -128,6 +128,21 @@ class CompiledPackageTest(unittest.TestCase):
             self.assertIn("pedal_execution_shader_overrides", profile)
             self.assertNotIn("reusable_kernel_shader_overrides", profile)
 
+    def test_compiled_package_embeds_runtime_circuit_graph(self) -> None:
+        fixture = compiled_model_or_skip()
+        manifest = json.loads(fixture.package_manifest.read_text())
+
+        self.assertNotIn("circuit_index_path", manifest)
+        circuit_graph = manifest["circuit_graph"]
+        self.assertEqual("series", circuit_graph["wiring"])
+        self.assertEqual(14, len(circuit_graph["pedals"]))
+        layer_00 = circuit_graph["pedals"][0]
+        self.assertEqual("layer_00", layer_00["pedal_id"])
+        self.assertEqual("conv", layer_00["operator_type"])
+        self.assertEqual("layer_00_shortconv_circuit_v1", layer_00["circuit"]["id"])
+        self.assertEqual("llmoop.circuit_params.v1", layer_00["params"]["schema"])
+        self.assertEqual("llmoop.circuit_state.v1", layer_00["state"]["schema"])
+
     def test_compiled_package_does_not_reference_source_or_transpiled_paths(self) -> None:
         fixture = compiled_model_or_skip()
 

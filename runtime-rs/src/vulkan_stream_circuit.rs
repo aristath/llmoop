@@ -7,10 +7,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::stream_circuit::{
-    CableTransport, PedalCablePlacement, ResolvedLoweredPedalboard, StreamCircuitPlacementPlan,
-    StreamCircuitPlacementSpec,
+    CableTransport, CircuitParamsArtifact, CircuitStateArtifact, LoweredCircuitRef,
+    LoweredPedalboard, LoweredPedalboardGraph, LoweredPedalboardSource, LoweredPedalboardSummary,
+    PedalCablePlacement, ResolvedCircuitArtifact, ResolvedLoweredPedalboard, StreamCircuit,
+    StreamCircuitPlacementPlan, StreamCircuitPlacementSpec, LOWERED_PEDALBOARD_SCHEMA,
 };
 use crate::stream_plan::{
     CircuitActivationPlan, PlannedNode, PlannedPort, SignalProducer, SignalStorage,
@@ -5760,12 +5763,12 @@ impl Display for VulkanResidentTokenModelPackageError {
 
 impl Error for VulkanResidentTokenModelPackageError {}
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct VulkanResidentGreedyModelPackageManifest {
     pub schema: String,
     pub package_id: String,
     pub device_id: String,
-    pub circuit_index_path: String,
+    pub circuit_graph: VulkanResidentPackageCircuitGraph,
     pub tensor_index_path: String,
     pub config_path: String,
     pub tokenizer: VulkanResidentTokenizerPackageSpec,
@@ -5802,6 +5805,104 @@ impl VulkanResidentGreedyModelPackageManifest {
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         fs::write(path, bytes)
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct VulkanResidentPackageCircuitGraph {
+    pub wiring: String,
+    #[serde(default)]
+    pub architecture: Value,
+    #[serde(default)]
+    pub dimensions: Value,
+    #[serde(default)]
+    pub input_transducer: Value,
+    #[serde(default)]
+    pub output_transducer: Value,
+    #[serde(default)]
+    pub pedals: Vec<VulkanResidentPackagePedalCircuit>,
+}
+
+impl VulkanResidentPackageCircuitGraph {
+    fn to_resolved_lowered_pedalboard(
+        &self,
+        package_root: impl Into<PathBuf>,
+    ) -> Result<ResolvedLoweredPedalboard, VulkanResidentTokenModelPackageError> {
+        let mut operator_counts = BTreeMap::new();
+        let mut circuit_refs = Vec::with_capacity(self.pedals.len());
+        let mut circuits = Vec::with_capacity(self.pedals.len());
+
+        for pedal in &self.pedals {
+            *operator_counts
+                .entry(pedal.operator_type.clone())
+                .or_insert(0) += 1;
+            let circuit_ref = LoweredCircuitRef {
+                id: pedal.pedal_id.clone(),
+                operator_type: pedal.operator_type.clone(),
+                circuit: format!("package://{}/circuit", pedal.pedal_id),
+                params: format!("package://{}/params", pedal.pedal_id),
+                state: format!("package://{}/state", pedal.pedal_id),
+                implementation: pedal.implementation.clone(),
+                behavioral_role: pedal.behavioral_role.clone(),
+            };
+            let resolved = ResolvedCircuitArtifact {
+                pedal: circuit_ref.clone(),
+                circuit: pedal.circuit.clone(),
+                params: pedal.params.clone(),
+                state: pedal.state.clone(),
+            };
+            resolved.validate().map_err(|error| {
+                VulkanResidentTokenModelPackageError::new(format!(
+                    "resident package circuit graph pedal {} is invalid: {error}",
+                    pedal.pedal_id
+                ))
+            })?;
+            circuit_refs.push(circuit_ref);
+            circuits.push(resolved);
+        }
+
+        let index = LoweredPedalboard {
+            schema: LOWERED_PEDALBOARD_SCHEMA.to_string(),
+            source: LoweredPedalboardSource {
+                format: VULKAN_RESIDENT_GREEDY_MODEL_PACKAGE_MANIFEST_SCHEMA.to_string(),
+                artifact_root: "package".to_string(),
+            },
+            architecture: self.architecture.clone(),
+            dimensions: self.dimensions.clone(),
+            graph: LoweredPedalboardGraph {
+                wiring: self.wiring.clone(),
+                circuits: circuit_refs,
+                input_transducer: self.input_transducer.clone(),
+                output_transducer: self.output_transducer.clone(),
+            },
+            summary: LoweredPedalboardSummary {
+                circuit_count: self.pedals.len(),
+                operator_counts,
+            },
+            notes: vec!["resolved from resident model package manifest".to_string()],
+        };
+        index.validate_index().map_err(|error| {
+            VulkanResidentTokenModelPackageError::new(format!(
+                "resident package circuit graph is invalid: {error}"
+            ))
+        })?;
+
+        Ok(ResolvedLoweredPedalboard {
+            artifact_root: package_root.into(),
+            index,
+            circuits,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct VulkanResidentPackagePedalCircuit {
+    pub pedal_id: String,
+    pub operator_type: String,
+    pub implementation: String,
+    pub behavioral_role: String,
+    pub circuit: StreamCircuit,
+    pub params: CircuitParamsArtifact,
+    pub state: CircuitStateArtifact,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -5940,14 +6041,13 @@ impl VulkanResidentGreedyModelPackage {
         }
         validate_capacity_profiles(&manifest, capacity)?;
 
-        let circuit_index_path =
-            resolve_resident_model_package_path(manifest_dir, &manifest.circuit_index_path);
         let tensor_index_path =
             resolve_resident_model_package_path(manifest_dir, &manifest.tensor_index_path);
         let (tensor_index, resource_plan, placed_plan) =
             plan_resident_greedy_package_single_device_stream_circuit(
                 &manifest.device_id,
-                &circuit_index_path,
+                &manifest.circuit_graph,
+                manifest_dir,
                 &tensor_index_path,
                 manifest.activation_element_bytes,
             )?;
@@ -6362,7 +6462,8 @@ fn resolve_resident_model_package_path(manifest_dir: &Path, path: &str) -> PathB
 
 fn plan_resident_greedy_package_single_device_stream_circuit(
     device_id: &str,
-    circuit_index_path: &Path,
+    circuit_graph: &VulkanResidentPackageCircuitGraph,
+    manifest_dir: &Path,
     tensor_index_path: &Path,
     activation_element_bytes: Option<usize>,
 ) -> Result<
@@ -6373,13 +6474,7 @@ fn plan_resident_greedy_package_single_device_stream_circuit(
     ),
     VulkanResidentTokenModelPackageError,
 > {
-    let graph =
-        ResolvedLoweredPedalboard::from_index_file(circuit_index_path).map_err(|error| {
-            VulkanResidentTokenModelPackageError::new(format!(
-                "failed to load lowered pedalboard {:?}: {error}",
-                circuit_index_path
-            ))
-        })?;
+    let graph = circuit_graph.to_resolved_lowered_pedalboard(manifest_dir.to_path_buf())?;
     let tensor_index = TensorIndex::from_json_file(tensor_index_path).map_err(|error| {
         VulkanResidentTokenModelPackageError::new(format!(
             "failed to load tensor index {:?}: {error}",

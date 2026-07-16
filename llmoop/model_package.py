@@ -128,7 +128,7 @@ def build_vulkan_resident_greedy_package_manifest(
         "schema": PACKAGE_SCHEMA,
         "package_id": package_id,
         "device_id": "gpu0",
-        "circuit_index_path": "pedalboard.circuits.json",
+        "circuit_graph": package_circuit_graph(lowered_index, lowered_dir),
         "tensor_index_path": "tensors.json",
         "config_path": CONFIG_PACKAGE_FILE,
         "tokenizer": tokenizer_manifest,
@@ -193,6 +193,32 @@ def build_vulkan_resident_greedy_package_manifest(
                 "pedal_execution_shader_overrides": cap8_overrides,
             }
         ],
+    }
+
+
+def package_circuit_graph(lowered_index: Json, lowered_dir: Path) -> Json:
+    graph = lowered_index["graph"]
+    pedals = []
+    for circuit_ref in graph["circuits"]:
+        pedals.append(
+            {
+                "pedal_id": circuit_ref["id"],
+                "operator_type": circuit_ref["operator_type"],
+                "implementation": circuit_ref["implementation"],
+                "behavioral_role": circuit_ref["behavioral_role"],
+                "circuit": read_json(lowered_dir / circuit_ref["circuit"]),
+                "params": read_json(lowered_dir / circuit_ref["params"]),
+                "state": read_json(lowered_dir / circuit_ref["state"]),
+            }
+        )
+
+    return {
+        "wiring": graph["wiring"],
+        "architecture": deepcopy(lowered_index.get("architecture", {})),
+        "dimensions": deepcopy(lowered_index.get("dimensions", {})),
+        "input_transducer": deepcopy(graph.get("input_transducer", {})),
+        "output_transducer": deepcopy(graph.get("output_transducer", {})),
+        "pedals": pedals,
     }
 
 
