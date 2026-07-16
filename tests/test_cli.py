@@ -4,8 +4,12 @@ import importlib.util
 import json
 import subprocess
 import sys
+import tempfile
 import unittest
+from argparse import Namespace
+from pathlib import Path
 
+from llmoop.cli import build_runtime_command, resolve_runtime_package_manifest
 from tests.fixtures import compiled_model_or_skip
 
 
@@ -13,6 +17,52 @@ CLI_DEPS_AVAILABLE = all(
     importlib.util.find_spec(name) is not None
     for name in ("torch", "transformers", "safetensors", "tokenizers")
 )
+
+
+class RuntimeCliCommandTest(unittest.TestCase):
+    def test_resolve_runtime_package_manifest_accepts_lowered_dir_or_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            manifest = root / "vulkan_resident_greedy_package.json"
+            manifest.write_text("{}", encoding="utf-8")
+
+            self.assertEqual(manifest, resolve_runtime_package_manifest(root))
+            self.assertEqual(manifest, resolve_runtime_package_manifest(manifest))
+
+    def test_build_runtime_command_prefers_explicit_runtime_binary(self) -> None:
+        package = Path("lowered/model_x/vulkan_resident_greedy_package.json")
+        args = Namespace(
+            prompt="Hello",
+            max_new_tokens=4,
+            model_dir=Path("/models/example"),
+            capacity=8,
+            no_special_tokens=True,
+            keep_special_tokens=True,
+            generated_only=True,
+            json=True,
+            runtime_bin=Path("/tmp/llmoop-runtime"),
+        )
+
+        self.assertEqual(
+            [
+                "/tmp/llmoop-runtime",
+                "--package",
+                str(package),
+                "--prompt",
+                "Hello",
+                "--max-new-tokens",
+                "4",
+                "--model-dir",
+                "/models/example",
+                "--capacity",
+                "8",
+                "--no-special-tokens",
+                "--keep-special-tokens",
+                "--generated-only",
+                "--json",
+            ],
+            build_runtime_command(args, package),
+        )
 
 
 @unittest.skipUnless(CLI_DEPS_AVAILABLE, "CLI generation dependencies are not installed")
