@@ -10282,6 +10282,103 @@ impl VulkanMountedPlacedStreamTickPlan {
             can_execute: self.can_execute,
         }
     }
+
+    pub fn advance_with_in_process_transport(
+        &self,
+        mounted: &VulkanMountedPlacedStreamCircuit,
+        transport: &mut VulkanInProcessPlacedCableTransport,
+        stream_tick: u64,
+    ) -> Result<VulkanMountedPlacedStreamTickRun, VulkanMountedPlacedStreamTickTransportError> {
+        if self.device_id != mounted.device_id() {
+            return Err(VulkanMountedPlacedStreamTickTransportError::DeviceMismatch {
+                plan_device_id: self.device_id.clone(),
+                mounted_device_id: mounted.device_id().to_string(),
+            });
+        }
+
+        let mut stages = Vec::with_capacity(self.stages.len());
+        let mut blocked = None;
+        let mut attempted_stage_count = 0usize;
+        let mut completed_stage_count = 0usize;
+
+        for stage in &self.stages {
+            let status = if blocked.is_some() {
+                VulkanMountedPlacedStreamTickStageStatus::Pending
+            } else {
+                attempted_stage_count += 1;
+                match stage {
+                    VulkanMountedPlacedStreamTickStage::ReceiveCable { cable_index, .. } => {
+                        match transport.receive_incoming_cable(mounted, *cable_index) {
+                            Ok(_) => {
+                                completed_stage_count += 1;
+                                VulkanMountedPlacedStreamTickStageStatus::Completed
+                            }
+                            Err(VulkanPlacedCableTransportError::MissingPacket { .. }) => {
+                                let reason =
+                                    VulkanMountedPlacedStreamTickBlockReason::CableReceiveTransportUnavailable;
+                                blocked = Some((stage.stage_index(), reason.clone()));
+                                VulkanMountedPlacedStreamTickStageStatus::Blocked { reason }
+                            }
+                            Err(error) => {
+                                return Err(
+                                    VulkanMountedPlacedStreamTickTransportError::Transport(error),
+                                );
+                            }
+                        }
+                    }
+                    VulkanMountedPlacedStreamTickStage::Dispatch { .. } => {
+                        let reason =
+                            VulkanMountedPlacedStreamTickBlockReason::KernelDispatchUnavailable;
+                        blocked = Some((stage.stage_index(), reason.clone()));
+                        VulkanMountedPlacedStreamTickStageStatus::Blocked { reason }
+                    }
+                    VulkanMountedPlacedStreamTickStage::PublishCable { cable_index, .. } => {
+                        transport
+                            .publish_outgoing_cable(mounted, *cable_index)
+                            .map_err(VulkanMountedPlacedStreamTickTransportError::Transport)?;
+                        completed_stage_count += 1;
+                        VulkanMountedPlacedStreamTickStageStatus::Completed
+                    }
+                }
+            };
+            stages.push(VulkanMountedPlacedStreamTickStageRun {
+                stage_index: stage.stage_index(),
+                stage: stage.clone(),
+                status,
+            });
+        }
+
+        let pending_stage_count = stages
+            .iter()
+            .filter(|stage| {
+                matches!(
+                    stage.status,
+                    VulkanMountedPlacedStreamTickStageStatus::Pending
+                )
+            })
+            .count();
+        let status = blocked
+            .map(
+                |(stage_index, reason)| VulkanMountedPlacedStreamTickRunStatus::Blocked {
+                    stage_index,
+                    reason,
+                },
+            )
+            .unwrap_or(VulkanMountedPlacedStreamTickRunStatus::Completed);
+
+        Ok(VulkanMountedPlacedStreamTickRun {
+            backend_id: self.backend_id.clone(),
+            device_id: self.device_id.clone(),
+            stream_tick,
+            stages,
+            planned_stage_count: self.stage_count,
+            attempted_stage_count,
+            completed_stage_count,
+            pending_stage_count,
+            status,
+            can_execute: self.can_execute,
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -10487,6 +10584,32 @@ impl From<VulkanBoundDispatchPlanError> for VulkanMountedPlacedStreamTickError {
         Self::BoundDispatchPlan(error)
     }
 }
+
+#[derive(Debug)]
+pub enum VulkanMountedPlacedStreamTickTransportError {
+    DeviceMismatch {
+        plan_device_id: String,
+        mounted_device_id: String,
+    },
+    Transport(VulkanPlacedCableTransportError),
+}
+
+impl Display for VulkanMountedPlacedStreamTickTransportError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DeviceMismatch {
+                plan_device_id,
+                mounted_device_id,
+            } => write!(
+                f,
+                "stream tick plan for device {plan_device_id:?} cannot advance mounted device {mounted_device_id:?}"
+            ),
+            Self::Transport(error) => Display::fmt(error, f),
+        }
+    }
+}
+
+impl Error for VulkanMountedPlacedStreamTickTransportError {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum VulkanMountedPlacedResidentKernelDispatchError {
@@ -18774,8 +18897,44 @@ mod tests {
         assert_eq!(transport.packet_count(), 1);
         assert!(transport.contains_packet(&publish.key));
 
-        let receive = transport.receive_incoming_cable(&gpu1, 1).unwrap();
-        assert_eq!(receive.key, publish.key);
+        let gpu1_manifest = VulkanReusableKernelArtifactManifest::new(
+            gpu1.placed_plan
+                .reusable_kernel_plan
+                .families
+                .iter()
+                .map(|family| {
+                    VulkanReusableKernelArtifact::from_family(
+                        family,
+                        format!("kernels/{}.spv", family.family_id),
+                    )
+                })
+                .collect(),
+        );
+        let gpu1_tick_plan = gpu1.stream_tick_plan(&gpu1_manifest).unwrap();
+        let transport_tick = gpu1_tick_plan
+            .advance_with_in_process_transport(&gpu1, &mut transport, 11)
+            .unwrap();
+        assert_eq!(transport_tick.stream_tick, 11);
+        assert_eq!(transport_tick.attempted_stage_count, 2);
+        assert_eq!(transport_tick.completed_stage_count, 1);
+        assert_eq!(transport_tick.pending_stage_count, 19);
+        assert_eq!(
+            transport_tick.status,
+            VulkanMountedPlacedStreamTickRunStatus::Blocked {
+                stage_index: 1,
+                reason: VulkanMountedPlacedStreamTickBlockReason::KernelDispatchUnavailable,
+            }
+        );
+        assert_eq!(
+            transport_tick.stages[0].status,
+            VulkanMountedPlacedStreamTickStageStatus::Completed
+        );
+        assert_eq!(
+            transport_tick.stages[1].status,
+            VulkanMountedPlacedStreamTickStageStatus::Blocked {
+                reason: VulkanMountedPlacedStreamTickBlockReason::KernelDispatchUnavailable,
+            }
+        );
         assert_eq!(
             gpu1.cable_io
                 .incoming_buffer(1)
@@ -18786,6 +18945,16 @@ mod tests {
             vec![1, 2, 3, 4, 5, 6, 7, 8]
         );
         assert_eq!(transport.packet_count(), 0);
+        let missing_transport_tick = gpu1_tick_plan
+            .advance_with_in_process_transport(&gpu1, &mut transport, 12)
+            .unwrap();
+        assert_eq!(
+            missing_transport_tick.status,
+            VulkanMountedPlacedStreamTickRunStatus::Blocked {
+                stage_index: 0,
+                reason: VulkanMountedPlacedStreamTickBlockReason::CableReceiveTransportUnavailable,
+            }
+        );
 
         let mut layer_02_to_03 = vec![0u8; 2_048];
         layer_02_to_03[..8].copy_from_slice(&[21, 22, 23, 24, 25, 26, 27, 28]);
