@@ -1,0 +1,48 @@
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer NormalizedFrame {
+    uint words[];
+} normalized_frame;
+
+layout(set = 0, binding = 1) readonly buffer EmbeddingWeight {
+    uint words[];
+} embedding_weight;
+
+layout(set = 0, binding = 2) buffer Logits {
+    float values[];
+} logits;
+
+const uint INPUT_SIZE = 1024u;
+const uint VOCAB_SIZE = 65536u;
+
+float bf16_to_f32(uint value) {
+    return uintBitsToFloat((value & 0xffffu) << 16);
+}
+
+float read_frame(uint index) {
+    uint packed = normalized_frame.words[index >> 1];
+    uint value = ((index & 1u) == 0u) ? (packed & 0xffffu) : (packed >> 16);
+    return bf16_to_f32(value);
+}
+
+float read_weight(uint element_index) {
+    uint packed = embedding_weight.words[element_index >> 1];
+    uint value = ((element_index & 1u) == 0u) ? (packed & 0xffffu) : (packed >> 16);
+    return bf16_to_f32(value);
+}
+
+void main() {
+    uint row = gl_GlobalInvocationID.x;
+    if (row >= VOCAB_SIZE) {
+        return;
+    }
+
+    float sum = 0.0;
+    uint weight_offset = row * INPUT_SIZE;
+    for (uint column = 0u; column < INPUT_SIZE; column = column + 1u) {
+        sum = sum + read_frame(column) * read_weight(weight_offset + column);
+    }
+    logits.values[row] = sum;
+}
