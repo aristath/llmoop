@@ -1645,11 +1645,10 @@ unsafe fn read_byte_memory(
 
 #[cfg(test)]
 pub(crate) fn compile_test_shader_words() -> Option<Vec<u32>> {
-    compile_test_shader_words_from_source("add_one.comp")
+    compile_shader_words_from_source("add_one.comp")
 }
 
-#[cfg(test)]
-pub(crate) fn compile_test_shader_words_from_source(shader_file: &str) -> Option<Vec<u32>> {
+pub(crate) fn compile_shader_words_from_source(shader_file: &str) -> Option<Vec<u32>> {
     use std::path::PathBuf;
     use std::process::{Command, Stdio};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1705,6 +1704,10 @@ pub(crate) fn compile_test_shader_words_from_source(shader_file: &str) -> Option
 }
 
 #[cfg(test)]
+pub(crate) fn compile_test_shader_words_from_source(shader_file: &str) -> Option<Vec<u32>> {
+    compile_shader_words_from_source(shader_file)
+}
+
 fn test_command_exists(command: &str) -> bool {
     use std::process::{Command, Stdio};
 

@@ -8,6 +8,11 @@ license = "MIT"
 name = "llmoop_runtime"
 path = "src/lib.rs"
 
+[[bin]]
+name = "resident-token-demo"
+path = "src/bin/resident_token_demo.rs"
+required-features = ["vulkan"]
+
 [features]
 default = []
 vulkan = ["dep:ash"]

@@ -7,7 +7,10 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::stream_circuit::{CableTransport, PedalCablePlacement, StreamCircuitPlacementPlan};
+use crate::stream_circuit::{
+    CableTransport, PedalCablePlacement, ResolvedLoweredPedalboard, StreamCircuitPlacementPlan,
+    StreamCircuitPlacementSpec,
+};
 use crate::stream_plan::{
     CircuitActivationPlan, PlannedNode, PlannedPort, SignalProducer, SignalStorage,
     StreamCircuitExecutionPlan, StreamCircuitResourcePlan, TensorIndex,
@@ -8529,6 +8532,660 @@ fn checked_add(left: usize, right: usize, label: &str) -> Result<usize, VulkanRe
 fn checked_mul(left: usize, right: usize, label: &str) -> Result<usize, VulkanResidentPlanError> {
     left.checked_mul(right)
         .ok_or_else(|| VulkanResidentPlanError(format!("{label} overflowed")))
+}
+
+pub const LFM2_DEFAULT_LAST_LAYER_INDEX: usize = 13;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanLfm2ResidentGreedyStreamProcessorConfig {
+    pub device_id: String,
+    pub circuit_index_path: PathBuf,
+    pub tensor_index_path: PathBuf,
+    pub dynamic_state_capacity_activations: usize,
+    pub attention_shader: String,
+}
+
+impl VulkanLfm2ResidentGreedyStreamProcessorConfig {
+    pub fn default_for_capacity(
+        dynamic_state_capacity_activations: usize,
+    ) -> Result<Self, VulkanLfm2ResidentGreedyStreamProcessorBuildError> {
+        let attention_shader = lfm2_default_attention_shader_for_capacity(
+            dynamic_state_capacity_activations,
+        )
+        .ok_or_else(|| {
+            VulkanLfm2ResidentGreedyStreamProcessorBuildError(format!(
+                "no default LFM2 attention shader exists for resident capacity {dynamic_state_capacity_activations}; available defaults cover 1..=8 activations"
+            ))
+        })?;
+
+        Ok(Self {
+            device_id: "gpu0".to_string(),
+            circuit_index_path: default_lfm2_5_230m_circuit_index_path(),
+            tensor_index_path: default_lfm2_5_230m_tensor_index_path(),
+            dynamic_state_capacity_activations,
+            attention_shader: attention_shader.to_string(),
+        })
+    }
+}
+
+impl Default for VulkanLfm2ResidentGreedyStreamProcessorConfig {
+    fn default() -> Self {
+        Self {
+            device_id: "gpu0".to_string(),
+            circuit_index_path: default_lfm2_5_230m_circuit_index_path(),
+            tensor_index_path: default_lfm2_5_230m_tensor_index_path(),
+            dynamic_state_capacity_activations: 4,
+            attention_shader: "gqa_attention_bf16_q16_kv8_d64_cap4.comp".to_string(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanLfm2ResidentGreedyStreamProcessorBuildError(pub String);
+
+impl Display for VulkanLfm2ResidentGreedyStreamProcessorBuildError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl Error for VulkanLfm2ResidentGreedyStreamProcessorBuildError {}
+
+pub fn default_lfm2_5_230m_circuit_index_path() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("lowered")
+        .join("lfm2_5_230m")
+        .join("pedalboard.circuits.json")
+}
+
+pub fn default_lfm2_5_230m_tensor_index_path() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("transpiled")
+        .join("lfm2_5_230m")
+        .join("tensors.json")
+}
+
+pub fn lfm2_default_attention_shader_for_capacity(capacity: usize) -> Option<&'static str> {
+    match capacity {
+        1..=4 => Some("gqa_attention_bf16_q16_kv8_d64_cap4.comp"),
+        5..=8 => Some("gqa_attention_bf16_q16_kv8_d64_cap8.comp"),
+        _ => None,
+    }
+}
+
+pub fn create_default_lfm2_5_230m_resident_greedy_stream_processor(
+    device: &VulkanComputeDevice,
+    dynamic_state_capacity_activations: usize,
+) -> Result<VulkanResidentGreedyStreamProcessor, VulkanLfm2ResidentGreedyStreamProcessorBuildError>
+{
+    let config = VulkanLfm2ResidentGreedyStreamProcessorConfig::default_for_capacity(
+        dynamic_state_capacity_activations,
+    )?;
+    create_lfm2_resident_greedy_stream_processor_from_config(device, &config)
+}
+
+pub fn create_lfm2_resident_greedy_stream_processor_from_config(
+    device: &VulkanComputeDevice,
+    config: &VulkanLfm2ResidentGreedyStreamProcessorConfig,
+) -> Result<VulkanResidentGreedyStreamProcessor, VulkanLfm2ResidentGreedyStreamProcessorBuildError>
+{
+    if config.dynamic_state_capacity_activations == 0 {
+        return Err(VulkanLfm2ResidentGreedyStreamProcessorBuildError(
+            "resident dynamic state capacity must be at least 1 activation".to_string(),
+        ));
+    }
+
+    let (tensor_index, resource_plan, mounted, mounted_bound) =
+        lfm2_mount_single_device_stream_circuit(device, config)?;
+    let loaded_manifest =
+        lfm2_level_1_loaded_kernel_pack_for_conv_and_attention_families_with_attention_shader(
+            &mounted,
+            &mounted_bound,
+            &config.attention_shader,
+        )?;
+    let input_transducer_spirv_words =
+        compile_required_lfm2_shader("embedding_lookup_bf16_65536x1024.comp")?;
+    let embedding_norm_spirv_words = compile_required_lfm2_shader("rms_norm_bf16_serial.comp")?;
+    let tied_projection_spirv_words =
+        compile_required_lfm2_shader("tied_output_projection_bf16_65536x1024_to_f32.comp")?;
+    let sampler_spirv_words = compile_required_lfm2_shader("greedy_sampler_f32_65536.comp")?;
+
+    let transducer_parameter_buffers = lfm2_load_transducer_parameter_buffers(
+        device,
+        &config.device_id,
+        &resource_plan,
+        &tensor_index,
+    )?;
+    let pedal_ids =
+        lfm2_prepare_resident_prefix(&mounted, &tensor_index, LFM2_DEFAULT_LAST_LAYER_INDEX)?;
+    let input_transducer =
+        VulkanResidentInputEmbeddingTransducerRunner::from_mounted_lfm2_token_embedding(
+            device,
+            &mounted,
+            &transducer_parameter_buffers,
+            &input_transducer_spirv_words,
+        )
+        .map_err(|error| {
+            VulkanLfm2ResidentGreedyStreamProcessorBuildError(format!(
+                "failed to create LFM2 input token embedding transducer: {error}"
+            ))
+        })?;
+    let pedalboard = mounted
+        .create_resident_pedalboard_runner(
+            device,
+            &mounted_bound,
+            pedal_ids.iter().map(String::as_str),
+            &loaded_manifest,
+        )
+        .map_err(|error| {
+            VulkanLfm2ResidentGreedyStreamProcessorBuildError(format!(
+                "failed to create LFM2 resident pedalboard runner: {error}"
+            ))
+        })?;
+    let output_transducer =
+        VulkanResidentOutputTransducerRunner::from_mounted_lfm2_output_transducer(
+            device,
+            &mounted,
+            &transducer_parameter_buffers,
+            &embedding_norm_spirv_words,
+            &tied_projection_spirv_words,
+        )
+        .map_err(|error| {
+            VulkanLfm2ResidentGreedyStreamProcessorBuildError(format!(
+                "failed to create LFM2 output transducer: {error}"
+            ))
+        })?;
+    let sampler = VulkanResidentGreedySamplerRunner::from_output_transducer(
+        device,
+        &output_transducer,
+        &sampler_spirv_words,
+    )
+    .map_err(|error| {
+        VulkanLfm2ResidentGreedyStreamProcessorBuildError(format!(
+            "failed to create LFM2 greedy sampler pedal: {error}"
+        ))
+    })?;
+    let tick_runner =
+        VulkanResidentSingleTokenTickRunner::new(input_transducer, pedalboard, output_transducer)
+            .map_err(|error| {
+            VulkanLfm2ResidentGreedyStreamProcessorBuildError(format!(
+                "failed to create LFM2 single-token tick runner: {error}"
+            ))
+        })?;
+    let loop_runner =
+        VulkanResidentGreedyFeedbackLoopRunner::new(tick_runner, sampler).map_err(|error| {
+            VulkanLfm2ResidentGreedyStreamProcessorBuildError(format!(
+                "failed to create LFM2 greedy feedback loop runner: {error}"
+            ))
+        })?;
+
+    Ok(VulkanResidentGreedyStreamProcessor::new(
+        mounted,
+        transducer_parameter_buffers,
+        loop_runner,
+    ))
+}
+
+fn lfm2_mount_single_device_stream_circuit(
+    device: &VulkanComputeDevice,
+    config: &VulkanLfm2ResidentGreedyStreamProcessorConfig,
+) -> Result<
+    (
+        TensorIndex,
+        StreamCircuitResourcePlan,
+        VulkanMountedPlacedStreamCircuit,
+        VulkanMountedPlacedBoundDispatchPlan,
+    ),
+    VulkanLfm2ResidentGreedyStreamProcessorBuildError,
+> {
+    let graph = ResolvedLoweredPedalboard::from_index_file(&config.circuit_index_path).map_err(
+        |error| {
+            VulkanLfm2ResidentGreedyStreamProcessorBuildError(format!(
+                "failed to load LFM2 lowered pedalboard {:?}: {error}",
+                config.circuit_index_path
+            ))
+        },
+    )?;
+    let tensor_index = TensorIndex::from_json_file(&config.tensor_index_path).map_err(|error| {
+        VulkanLfm2ResidentGreedyStreamProcessorBuildError(format!(
+            "failed to load LFM2 tensor index {:?}: {error}",
+            config.tensor_index_path
+        ))
+    })?;
+    let execution_plan =
+        StreamCircuitExecutionPlan::from_graph_with_tensor_index(&graph, &tensor_index).map_err(
+            |error| {
+                VulkanLfm2ResidentGreedyStreamProcessorBuildError(format!(
+                    "failed to create LFM2 stream execution plan: {error}"
+                ))
+            },
+        )?;
+    let resource_plan = StreamCircuitResourcePlan::from_graph_and_plan(&graph, &execution_plan)
+        .map_err(|error| {
+            VulkanLfm2ResidentGreedyStreamProcessorBuildError(format!(
+                "failed to create LFM2 stream resource plan: {error}"
+            ))
+        })?;
+    let placement_spec = StreamCircuitPlacementSpec::new(config.device_id.as_str());
+    let placement_plan = graph.placement_plan(&placement_spec).map_err(|error| {
+        VulkanLfm2ResidentGreedyStreamProcessorBuildError(format!(
+            "failed to create LFM2 placement plan for {:?}: {error}",
+            config.device_id
+        ))
+    })?;
+    let resident = VulkanPlacedStreamCircuitResidentPlan::from_resource_plan_for_device(
+        &resource_plan,
+        &placement_plan,
+        &config.device_id,
+        Some(&tensor_index),
+        Some(2),
+    )
+    .map_err(|error| {
+        VulkanLfm2ResidentGreedyStreamProcessorBuildError(format!(
+            "failed to create LFM2 Vulkan resident plan for {:?}: {error}",
+            config.device_id
+        ))
+    })?;
+    let placed_plan =
+        VulkanPlacedStreamCircuitPlan::from_plans(&execution_plan, &resource_plan, resident)
+            .map_err(|error| {
+                VulkanLfm2ResidentGreedyStreamProcessorBuildError(format!(
+                    "failed to create LFM2 Vulkan placed stream circuit plan: {error}"
+                ))
+            })?;
+    let mounted = VulkanMountedPlacedStreamCircuit::from_placed_plan(
+        device,
+        placed_plan,
+        config.dynamic_state_capacity_activations,
+    )
+    .map_err(|error| {
+        VulkanLfm2ResidentGreedyStreamProcessorBuildError(format!(
+            "failed to mount LFM2 Vulkan stream circuit: {error}"
+        ))
+    })?;
+    let manifest = VulkanReusableKernelArtifactManifest::new(
+        mounted
+            .placed_plan
+            .reusable_kernel_plan
+            .families
+            .iter()
+            .map(|family| {
+                VulkanReusableKernelArtifact::from_family(
+                    family,
+                    format!("kernels/{}.spv", family.family_id),
+                )
+            })
+            .collect(),
+    );
+    let mounted_bound = mounted
+        .mounted_placed_bound_dispatch_plan(&manifest)
+        .map_err(|error| {
+            VulkanLfm2ResidentGreedyStreamProcessorBuildError(format!(
+                "failed to bind LFM2 Vulkan stream circuit dispatch plan: {error}"
+            ))
+        })?;
+
+    Ok((tensor_index, resource_plan, mounted, mounted_bound))
+}
+
+fn lfm2_load_transducer_parameter_buffers(
+    device: &VulkanComputeDevice,
+    device_id: &str,
+    resource_plan: &StreamCircuitResourcePlan,
+    tensor_index: &TensorIndex,
+) -> Result<VulkanPermanentParameterBuffers, VulkanLfm2ResidentGreedyStreamProcessorBuildError> {
+    let transducer_parameter_plan = VulkanPermanentParameterBufferPlan::from_transducer_parameters(
+        device_id,
+        resource_plan,
+        Some(tensor_index),
+    )
+    .map_err(|error| {
+        VulkanLfm2ResidentGreedyStreamProcessorBuildError(format!(
+            "failed to create LFM2 transducer parameter plan: {error}"
+        ))
+    })?;
+    let transducer_parameter_buffers =
+        transducer_parameter_plan
+            .allocate_buffers(device)
+            .map_err(|error| {
+                VulkanLfm2ResidentGreedyStreamProcessorBuildError(format!(
+                    "failed to allocate LFM2 transducer parameter buffers: {error}"
+                ))
+            })?;
+    transducer_parameter_buffers
+        .load_from_tensor_index(tensor_index)
+        .map_err(|error| {
+            VulkanLfm2ResidentGreedyStreamProcessorBuildError(format!(
+                "failed to load LFM2 transducer parameters: {error}"
+            ))
+        })?;
+    Ok(transducer_parameter_buffers)
+}
+
+fn lfm2_level_1_loaded_kernel_pack_for_conv_and_attention_families_with_attention_shader(
+    mounted: &VulkanMountedPlacedStreamCircuit,
+    mounted_bound: &VulkanMountedPlacedBoundDispatchPlan,
+    attention_shader: &str,
+) -> Result<
+    VulkanLoadedReusableKernelArtifactManifest,
+    VulkanLfm2ResidentGreedyStreamProcessorBuildError,
+> {
+    lfm2_loaded_kernel_pack_for_dispatch_shaders(
+        mounted,
+        mounted_bound,
+        &[
+            ("layer_00", "operator_norm", "rms_norm_bf16_serial.comp"),
+            (
+                "layer_00",
+                "conv_in_projection",
+                "linear_bf16_1024x3072.comp",
+            ),
+            ("layer_00", "split_b_c_x", "split_bf16_3072_to_3x1024.comp"),
+            ("layer_00", "input_gate", "multiply_bf16_1024.comp"),
+            (
+                "layer_00",
+                "temporal_memory_update",
+                "rolling_state_update_bf16_3x1024.comp",
+            ),
+            (
+                "layer_00",
+                "depthwise_temporal_conv",
+                "depthwise_conv1d_bf16_3x1024.comp",
+            ),
+            ("layer_00", "output_gate", "multiply_bf16_1024.comp"),
+            (
+                "layer_00",
+                "conv_out_projection",
+                "linear_bf16_1024x1024.comp",
+            ),
+            ("layer_00", "operator_residual", "add_bf16_1024.comp"),
+            ("layer_00", "ffn_norm", "rms_norm_bf16_serial.comp"),
+            (
+                "layer_00",
+                "ffn_gate_projection",
+                "linear_bf16_1024x2560.comp",
+            ),
+            (
+                "layer_00",
+                "ffn_up_projection",
+                "linear_bf16_1024x2560.comp",
+            ),
+            ("layer_00", "ffn_gate_activation", "silu_bf16_2560.comp"),
+            ("layer_00", "ffn_gate_multiply", "multiply_bf16_2560.comp"),
+            (
+                "layer_00",
+                "ffn_down_projection",
+                "linear_bf16_2560x1024.comp",
+            ),
+            ("layer_00", "ffn_residual", "add_bf16_1024.comp"),
+            ("layer_02", "operator_norm", "rms_norm_bf16_serial.comp"),
+            ("layer_02", "q_projection", "linear_bf16_1024x1024.comp"),
+            ("layer_02", "k_projection", "linear_bf16_1024x512.comp"),
+            ("layer_02", "v_projection", "linear_bf16_1024x512.comp"),
+            (
+                "layer_02",
+                "q_head_norm",
+                "rms_norm_per_head_bf16_16x64.comp",
+            ),
+            (
+                "layer_02",
+                "k_head_norm",
+                "rms_norm_per_head_bf16_8x64.comp",
+            ),
+            ("layer_02", "q_rope", "rotary_bf16_16x64.comp"),
+            ("layer_02", "k_rope", "rotary_bf16_8x64.comp"),
+            (
+                "layer_02",
+                "kv_memory_append",
+                "append_kv_state_bf16_8x64.comp",
+            ),
+            ("layer_02", "attention_read", attention_shader),
+            (
+                "layer_02",
+                "attention_out_projection",
+                "linear_bf16_1024x1024.comp",
+            ),
+            ("layer_02", "operator_residual", "add_bf16_1024.comp"),
+            ("layer_02", "ffn_norm", "rms_norm_bf16_serial.comp"),
+            (
+                "layer_02",
+                "ffn_gate_projection",
+                "linear_bf16_1024x2560.comp",
+            ),
+            (
+                "layer_02",
+                "ffn_up_projection",
+                "linear_bf16_1024x2560.comp",
+            ),
+            ("layer_02", "ffn_gate_activation", "silu_bf16_2560.comp"),
+            ("layer_02", "ffn_gate_multiply", "multiply_bf16_2560.comp"),
+            (
+                "layer_02",
+                "ffn_down_projection",
+                "linear_bf16_2560x1024.comp",
+            ),
+            ("layer_02", "ffn_residual", "add_bf16_1024.comp"),
+        ],
+    )
+}
+
+fn lfm2_loaded_kernel_pack_for_dispatch_shaders(
+    mounted: &VulkanMountedPlacedStreamCircuit,
+    mounted_bound: &VulkanMountedPlacedBoundDispatchPlan,
+    dispatch_shaders: &[(&str, &str, &str)],
+) -> Result<
+    VulkanLoadedReusableKernelArtifactManifest,
+    VulkanLfm2ResidentGreedyStreamProcessorBuildError,
+> {
+    let mut loaded_artifacts = Vec::new();
+    let mut loaded_families = BTreeSet::new();
+    let mut total_word_count = 0usize;
+
+    for (pedal_id, node_id, shader_file) in dispatch_shaders {
+        let dispatch = mounted_bound.dispatch(pedal_id, node_id).ok_or_else(|| {
+            VulkanLfm2ResidentGreedyStreamProcessorBuildError(format!(
+                "LFM2 mounted dispatch {pedal_id}.{node_id} is missing"
+            ))
+        })?;
+        if !loaded_families.insert(dispatch.reusable_family_id.clone()) {
+            continue;
+        }
+        let spirv_words = compile_required_lfm2_shader(shader_file)?;
+        total_word_count = total_word_count
+            .checked_add(spirv_words.len())
+            .ok_or_else(|| {
+                VulkanLfm2ResidentGreedyStreamProcessorBuildError(
+                    "LFM2 reusable kernel artifact word count overflowed".to_string(),
+                )
+            })?;
+        let family = mounted
+            .placed_plan
+            .reusable_kernel_plan
+            .family(&dispatch.reusable_family_id)
+            .ok_or_else(|| {
+                VulkanLfm2ResidentGreedyStreamProcessorBuildError(format!(
+                    "LFM2 reusable kernel family {:?} is missing",
+                    dispatch.reusable_family_id
+                ))
+            })?;
+        let artifact_path = format!("kernels/{}.spv", dispatch.reusable_family_id);
+        loaded_artifacts.push(VulkanLoadedReusableKernelArtifact {
+            artifact: VulkanReusableKernelArtifact::from_family(family, artifact_path.clone()),
+            resolved_path: PathBuf::from(artifact_path),
+            words: spirv_words,
+        });
+    }
+
+    Ok(VulkanLoadedReusableKernelArtifactManifest {
+        schema: VULKAN_REUSABLE_KERNEL_ARTIFACT_MANIFEST_SCHEMA.to_string(),
+        backend_id: VULKAN_STREAM_CIRCUIT_BACKEND_ID.to_string(),
+        artifacts: loaded_artifacts,
+        total_word_count,
+    })
+}
+
+fn compile_required_lfm2_shader(
+    shader_file: &str,
+) -> Result<Vec<u32>, VulkanLfm2ResidentGreedyStreamProcessorBuildError> {
+    crate::vulkan_compute::compile_shader_words_from_source(shader_file).ok_or_else(|| {
+        VulkanLfm2ResidentGreedyStreamProcessorBuildError(format!(
+            "failed to compile Vulkan shader {shader_file:?}; install glslangValidator or glslc and check runtime-rs/shaders/{shader_file}"
+        ))
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Lfm2LayerKind {
+    ShortConv,
+    Attention,
+}
+
+fn lfm2_layer_kind(
+    layer_index: usize,
+) -> Result<Lfm2LayerKind, VulkanLfm2ResidentGreedyStreamProcessorBuildError> {
+    match layer_index {
+        0 | 1 | 3 | 5 | 7 | 9 | 11 | 13 => Ok(Lfm2LayerKind::ShortConv),
+        2 | 4 | 6 | 8 | 10 | 12 => Ok(Lfm2LayerKind::Attention),
+        _ => Err(VulkanLfm2ResidentGreedyStreamProcessorBuildError(format!(
+            "unknown LFM2 layer index {layer_index}"
+        ))),
+    }
+}
+
+fn lfm2_layer_id(layer_index: usize) -> String {
+    format!("layer_{layer_index:02}")
+}
+
+fn lfm2_prefix_pedal_ids(last_layer_index: usize) -> Vec<String> {
+    (0..=last_layer_index).map(lfm2_layer_id).collect()
+}
+
+fn lfm2_prepare_resident_prefix(
+    mounted: &VulkanMountedPlacedStreamCircuit,
+    tensor_index: &TensorIndex,
+    last_layer_index: usize,
+) -> Result<Vec<String>, VulkanLfm2ResidentGreedyStreamProcessorBuildError> {
+    for layer_index in 0..=last_layer_index {
+        lfm2_load_layer_parameters(mounted, tensor_index, layer_index)?;
+    }
+
+    for layer_index in 0..=last_layer_index {
+        lfm2_zero_layer_state(mounted, layer_index)?;
+    }
+
+    Ok(lfm2_prefix_pedal_ids(last_layer_index))
+}
+
+fn lfm2_load_layer_parameters(
+    mounted: &VulkanMountedPlacedStreamCircuit,
+    tensor_index: &TensorIndex,
+    layer_index: usize,
+) -> Result<(), VulkanLfm2ResidentGreedyStreamProcessorBuildError> {
+    match lfm2_layer_kind(layer_index)? {
+        Lfm2LayerKind::ShortConv => {
+            lfm2_load_conv_layer_parameters(mounted, tensor_index, layer_index)
+        }
+        Lfm2LayerKind::Attention => {
+            lfm2_load_attention_layer_parameters(mounted, tensor_index, layer_index)
+        }
+    }
+}
+
+fn lfm2_load_conv_layer_parameters(
+    mounted: &VulkanMountedPlacedStreamCircuit,
+    tensor_index: &TensorIndex,
+    layer_index: usize,
+) -> Result<(), VulkanLfm2ResidentGreedyStreamProcessorBuildError> {
+    for suffix in [
+        "operator_norm.weight",
+        "conv.in_proj.weight",
+        "conv.conv.weight",
+        "conv.out_proj.weight",
+        "ffn_norm.weight",
+        "feed_forward.w1.weight",
+        "feed_forward.w2.weight",
+        "feed_forward.w3.weight",
+    ] {
+        lfm2_load_parameter(mounted, tensor_index, layer_index, suffix)?;
+    }
+    Ok(())
+}
+
+fn lfm2_load_attention_layer_parameters(
+    mounted: &VulkanMountedPlacedStreamCircuit,
+    tensor_index: &TensorIndex,
+    layer_index: usize,
+) -> Result<(), VulkanLfm2ResidentGreedyStreamProcessorBuildError> {
+    for suffix in [
+        "operator_norm.weight",
+        "self_attn.q_proj.weight",
+        "self_attn.k_proj.weight",
+        "self_attn.v_proj.weight",
+        "self_attn.q_layernorm.weight",
+        "self_attn.k_layernorm.weight",
+        "self_attn.out_proj.weight",
+        "ffn_norm.weight",
+        "feed_forward.w1.weight",
+        "feed_forward.w2.weight",
+        "feed_forward.w3.weight",
+    ] {
+        lfm2_load_parameter(mounted, tensor_index, layer_index, suffix)?;
+    }
+    Ok(())
+}
+
+fn lfm2_load_parameter(
+    mounted: &VulkanMountedPlacedStreamCircuit,
+    tensor_index: &TensorIndex,
+    layer_index: usize,
+    suffix: &str,
+) -> Result<(), VulkanLfm2ResidentGreedyStreamProcessorBuildError> {
+    let tensor = format!("model.layers.{layer_index}.{suffix}");
+    mounted
+        .parameter_buffers
+        .load_parameter_from_tensor_index(tensor_index, &tensor)
+        .map_err(|error| {
+            VulkanLfm2ResidentGreedyStreamProcessorBuildError(format!(
+                "failed to load LFM2 parameter {tensor:?}: {error}"
+            ))
+        })?;
+    Ok(())
+}
+
+fn lfm2_zero_layer_state(
+    mounted: &VulkanMountedPlacedStreamCircuit,
+    layer_index: usize,
+) -> Result<(), VulkanLfm2ResidentGreedyStreamProcessorBuildError> {
+    let pedal_id = lfm2_layer_id(layer_index);
+    match lfm2_layer_kind(layer_index)? {
+        Lfm2LayerKind::ShortConv => lfm2_zero_state_buffer(mounted, &pedal_id, "temporal_memory"),
+        Lfm2LayerKind::Attention => lfm2_zero_state_buffer(mounted, &pedal_id, "kv_memory"),
+    }
+}
+
+fn lfm2_zero_state_buffer(
+    mounted: &VulkanMountedPlacedStreamCircuit,
+    pedal_id: &str,
+    state_id: &str,
+) -> Result<(), VulkanLfm2ResidentGreedyStreamProcessorBuildError> {
+    let state = mounted
+        .buffers
+        .state_buffer(pedal_id, state_id)
+        .ok_or_else(|| {
+            VulkanLfm2ResidentGreedyStreamProcessorBuildError(format!(
+                "LFM2 state buffer {pedal_id}.{state_id} is missing"
+            ))
+        })?;
+    state
+        .buffer
+        .write_bytes(&vec![0u8; state.byte_capacity])
+        .map_err(|error| {
+            VulkanLfm2ResidentGreedyStreamProcessorBuildError(format!(
+                "failed to zero LFM2 state buffer {pedal_id}.{state_id}: {error}"
+            ))
+        })
 }
 
 #[cfg(test)]
