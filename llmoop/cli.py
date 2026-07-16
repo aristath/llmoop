@@ -37,6 +37,11 @@ def main() -> None:
         help="prompt text for --run/--run-model",
     )
     parser.add_argument(
+        "--inspect-device-slice",
+        metavar="DEVICE_ID",
+        help="mount and summarize only the compiled package pedals assigned to DEVICE_ID for --run",
+    )
+    parser.add_argument(
         "--runtime-bin",
         type=Path,
         help="path to a built llmoop-runtime binary; defaults to cargo run from a source checkout",
@@ -151,8 +156,10 @@ def main() -> None:
             parser.error("--default-device-id is only supported with --compile-model")
         if args.place_pedal:
             parser.error("--place-pedal is only supported with --compile-model")
+    elif args.inspect_device_slice is not None:
+        parser.error("--inspect-device-slice is only supported with --run")
     if args.run is not None:
-        if args.prompt is None:
+        if args.inspect_device_slice is None and args.prompt is None:
             parser.error("--prompt is required with --run")
         if args.temperature is not None:
             parser.error("--temperature is only supported by --run-model")
@@ -165,6 +172,8 @@ def main() -> None:
         run_engine(args)
         return
     if args.run_model is not None:
+        if args.inspect_device_slice is not None:
+            parser.error("--inspect-device-slice is only supported by --run")
         if args.prompt is None:
             parser.error("--prompt is required with --run-model")
         if args.package_dir is None:
@@ -239,11 +248,18 @@ def build_runtime_command(args: argparse.Namespace, package_manifest: Path) -> l
     runtime_args = [
         "--package",
         str(package_manifest),
-        "--prompt",
-        args.prompt,
-        "--max-new-tokens",
-        str(args.max_new_tokens),
     ]
+    if args.inspect_device_slice is not None:
+        runtime_args.extend(["--inspect-device-slice", args.inspect_device_slice])
+    else:
+        runtime_args.extend(
+            [
+                "--prompt",
+                args.prompt,
+                "--max-new-tokens",
+                str(args.max_new_tokens),
+            ]
+        )
     if args.capacity is not None:
         runtime_args.extend(["--capacity", str(args.capacity)])
     if args.no_special_tokens:

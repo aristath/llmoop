@@ -4,9 +4,10 @@ use std::path::{Path, PathBuf};
 
 use llmoop_runtime::{
     VulkanComputeDevice, VulkanResidentGreedyModelPackage,
-    VulkanResidentGreedyModelPackageManifest, VulkanResidentHfTokenizerTextCodec,
-    VulkanResidentTokenEngine, VulkanResidentTokenEngineRunBudget,
-    VulkanResidentTokenEngineRunStopCondition, VulkanResidentTokenTextCodec,
+    VulkanResidentGreedyModelPackageDeviceSlice, VulkanResidentGreedyModelPackageManifest,
+    VulkanResidentHfTokenizerTextCodec, VulkanResidentTokenEngine,
+    VulkanResidentTokenEngineRunBudget, VulkanResidentTokenEngineRunStopCondition,
+    VulkanResidentTokenTextCodec, VulkanReusableKernelArtifactManifest,
 };
 use serde_json::json;
 
@@ -14,6 +15,7 @@ use serde_json::json;
 struct Args {
     package_manifest: Option<PathBuf>,
     prompt: Option<String>,
+    inspect_device_slice: Option<String>,
     max_new_tokens: usize,
     capacity: Option<usize>,
     cycle_ticks: usize,
@@ -29,6 +31,7 @@ impl Default for Args {
         Self {
             package_manifest: None,
             prompt: None,
+            inspect_device_slice: None,
             max_new_tokens: 4,
             capacity: None,
             cycle_ticks: 4,
@@ -64,6 +67,9 @@ fn run() -> Result<(), Box<dyn Error>> {
             "--package is required; run `python -m llmoop --compile-model <MODEL_DIR>` first",
         )
     })?;
+    if let Some(device_id) = args.inspect_device_slice.as_deref() {
+        return inspect_device_slice(&args, package_manifest, device_id);
+    }
     let prompt = args
         .prompt
         .as_ref()
@@ -141,6 +147,79 @@ fn run() -> Result<(), Box<dyn Error>> {
         print_text(&turn.generated_text);
     } else {
         print_text(&turn.output_text);
+    }
+
+    Ok(())
+}
+
+fn inspect_device_slice(
+    args: &Args,
+    package_manifest: &Path,
+    device_id: &str,
+) -> Result<(), Box<dyn Error>> {
+    let capacity = choose_runtime_capacity(package_manifest, args.capacity, 1)?;
+    let device = VulkanComputeDevice::new()?;
+    let slice = VulkanResidentGreedyModelPackageDeviceSlice::from_manifest_file_for_device(
+        &device,
+        package_manifest,
+        device_id,
+        Some(capacity),
+    )?;
+    let mounted = slice.create_mounted_stream_circuit(&device)?;
+    let reusable_manifest = VulkanReusableKernelArtifactManifest::new(
+        slice
+            .loaded_manifest()
+            .artifacts
+            .iter()
+            .map(|artifact| artifact.artifact.clone())
+            .collect(),
+    );
+    let mounted_bound = mounted.mounted_placed_bound_dispatch_plan(&reusable_manifest)?;
+    let tick_plan = mounted.stream_tick_plan(&reusable_manifest)?;
+
+    let payload = json!({
+        "ok": true,
+        "package_manifest": package_manifest,
+        "device_name": device.device_name(),
+        "device_id": slice.device_id,
+        "resident_capacity_activations": capacity,
+        "hosted_pedal_count": slice.hosted_pedal_count,
+        "incoming_cable_count": slice.incoming_cable_count,
+        "outgoing_cable_count": slice.outgoing_cable_count,
+        "permanent_parameter_count": slice.permanent_parameter_count,
+        "permanent_parameter_bytes": slice.permanent_parameter_bytes,
+        "reusable_kernel_word_count": slice.reusable_kernel_word_count,
+        "loaded_kernel_artifact_count": slice.loaded_manifest().artifacts.len(),
+        "dispatch_count": mounted_bound.dispatches.len(),
+        "descriptor_count": mounted_bound.total_descriptor_count,
+        "model_boundary_descriptor_count": mounted_bound.model_boundary_descriptor_count,
+        "incoming_cable_descriptor_count": mounted_bound.incoming_cable_descriptor_count,
+        "outgoing_cable_descriptor_count": mounted_bound.outgoing_cable_descriptor_count,
+        "tick_plan": {
+            "stage_count": tick_plan.stage_count,
+            "receive_stage_count": tick_plan.receive_stage_count,
+            "dispatch_stage_count": tick_plan.dispatch_stage_count,
+            "publish_stage_count": tick_plan.publish_stage_count,
+            "local_cable_read_count": tick_plan.local_cable_read_count,
+            "local_cable_write_count": tick_plan.local_cable_write_count,
+            "incoming_cable_read_count": tick_plan.incoming_cable_read_count,
+            "outgoing_cable_write_count": tick_plan.outgoing_cable_write_count,
+            "model_input_read_count": tick_plan.model_input_read_count,
+            "model_output_write_count": tick_plan.model_output_write_count,
+            "can_execute": tick_plan.can_execute,
+        },
+    });
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+    } else {
+        println!("device_id={}", payload["device_id"]);
+        println!("hosted_pedal_count={}", payload["hosted_pedal_count"]);
+        println!("incoming_cable_count={}", payload["incoming_cable_count"]);
+        println!("outgoing_cable_count={}", payload["outgoing_cable_count"]);
+        println!("dispatch_count={}", payload["dispatch_count"]);
+        println!("descriptor_count={}", payload["descriptor_count"]);
+        println!("tick_stage_count={}", payload["tick_plan"]["stage_count"]);
     }
 
     Ok(())
@@ -265,6 +344,9 @@ fn parse_args() -> Result<Args, String> {
             "--prompt" => {
                 parsed.prompt = Some(next_value(&mut raw, "--prompt")?);
             }
+            "--inspect-device-slice" => {
+                parsed.inspect_device_slice = Some(next_value(&mut raw, "--inspect-device-slice")?);
+            }
             "--max-new-tokens" => {
                 parsed.max_new_tokens = parse_next(&mut raw, "--max-new-tokens")?;
             }
@@ -297,6 +379,9 @@ fn parse_args() -> Result<Args, String> {
 
     if matches!(parsed.prompt.as_deref(), Some("")) {
         return Err("--prompt must not be empty".to_string());
+    }
+    if matches!(parsed.inspect_device_slice.as_deref(), Some("")) {
+        return Err("--inspect-device-slice must not be empty".to_string());
     }
     if parsed.max_new_tokens == 0 {
         return Err("--max-new-tokens must be at least 1".to_string());
@@ -357,6 +442,8 @@ Options:
   --package <PATH>           Compiled resident model package manifest. Required.
   --package-manifest <PATH>  Alias for --package.
   --prompt <TEXT>            External text event to inject into the resident stream. Required.
+  --inspect-device-slice <DEVICE_ID>
+                             Mount and summarize only the package pedals assigned to DEVICE_ID.
   --max-new-tokens <N>       Public output tokens to emit after the prompt. Default: 4
   --capacity <N>             Override resident activation capacity selected from the package.
   --cycle-ticks <N>          Max runtime ticks per always-on cycle. Default: 4
