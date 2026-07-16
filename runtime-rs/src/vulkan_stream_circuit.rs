@@ -8090,6 +8090,81 @@ mod tests {
     }
 
     #[test]
+    fn resident_pedalboard_runner_executes_third_attention_output_into_next_conv_layer() {
+        let device = match VulkanComputeDevice::new() {
+            Ok(device) => device,
+            Err(error) => {
+                eprintln!("skipping resident layer_07 prefix runner: {error}");
+                return;
+            }
+        };
+        let (tensor_index, mounted, _manifest, mounted_bound) =
+            mount_lfm2_single_device_stream_circuit(&device);
+        let Some(loaded_manifest) = lfm2_level_1_loaded_kernel_pack_for_conv_and_attention_families(
+            &mounted,
+            &mounted_bound,
+        ) else {
+            eprintln!("skipping resident layer_07 prefix runner: no GLSL to SPIR-V compiler found");
+            return;
+        };
+        let pedal_ids = prepare_lfm2_resident_prefix(&mounted, &tensor_index, 7);
+
+        let runner = create_lfm2_resident_prefix_runner(
+            &device,
+            &mounted,
+            &mounted_bound,
+            &loaded_manifest,
+            &pedal_ids,
+        );
+        assert_lfm2_resident_prefix_runner(&runner, &pedal_ids, 137, 449, 2192);
+
+        let run = runner
+            .run_with_stream_control(&device, lfm2_stream_control(&mounted, 0))
+            .unwrap();
+        assert_lfm2_resident_prefix_run(&run, &pedal_ids, 137);
+
+        let layer_02_kv = mounted
+            .buffers
+            .state_buffer("layer_02", "kv_memory")
+            .unwrap()
+            .buffer
+            .read_bytes(16)
+            .unwrap();
+        let layer_04_kv = mounted
+            .buffers
+            .state_buffer("layer_04", "kv_memory")
+            .unwrap()
+            .buffer
+            .read_bytes(16)
+            .unwrap();
+        let layer_06_kv = mounted
+            .buffers
+            .state_buffer("layer_06", "kv_memory")
+            .unwrap()
+            .buffer
+            .read_bytes(16)
+            .unwrap();
+        assert_ne!(layer_02_kv, vec![0; 16]);
+        assert_ne!(layer_04_kv, vec![0; 16]);
+        assert_ne!(layer_06_kv, vec![0; 16]);
+        assert_ne!(layer_02_kv, layer_04_kv);
+        assert_ne!(layer_02_kv, layer_06_kv);
+        assert_ne!(layer_04_kv, layer_06_kv);
+
+        let layer_07_output_dispatch = mounted_bound.dispatch("layer_07", "ffn_residual").unwrap();
+        let layer_07_output_bindings = mounted
+            .resident_kernel_buffer_bindings_for_bound_dispatch(layer_07_output_dispatch)
+            .unwrap();
+        assert_eq!(
+            layer_07_output_bindings[2].buffer.read_bytes(16).unwrap(),
+            vec![
+                0x8a, 0x3f, 0x62, 0x3f, 0x7f, 0x3f, 0x6f, 0x3f, 0x7c, 0x3f, 0x8a, 0x3f, 0x8a, 0x3f,
+                0x7f, 0x3f,
+            ]
+        );
+    }
+
+    #[test]
     fn mounted_single_device_stream_circuit_binds_local_cable_buffers() {
         let device = match VulkanComputeDevice::new() {
             Ok(device) => device,
