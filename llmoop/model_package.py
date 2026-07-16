@@ -17,6 +17,21 @@ from llmoop.model_compiler import (
 from llmoop.model_transpiler import transpile_model
 
 
+TOKENIZER_PACKAGE_DIR = "tokenizer"
+TOKENIZER_PACKAGE_FILES = (
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "special_tokens_map.json",
+    "added_tokens.json",
+    "chat_template.jinja",
+    "vocab.json",
+    "merges.txt",
+    "tokenizer.model",
+    "spiece.model",
+    "sentencepiece.bpe.model",
+)
+
+
 def compile_model_package(
     model_dir: Path,
     *,
@@ -34,6 +49,7 @@ def compile_model_package(
     lowered = lower_pedalboard(transpiled_dir, lowered_dir)
     tensor_index = read_json(transpiled_dir / "tensors.json")
     model_graph = read_json(transpiled_dir / "model.json")
+    tokenizer_manifest = copy_tokenizer_package(model_dir, lowered_dir / TOKENIZER_PACKAGE_DIR)
     package_manifest = build_vulkan_resident_greedy_package_manifest(
         model_graph=model_graph,
         tensor_index=tensor_index,
@@ -43,6 +59,7 @@ def compile_model_package(
         package_id=f"{slug}_vulkan_resident_greedy",
         shader_source_dir=shader_source_dir,
         default_dynamic_state_capacity_activations=default_dynamic_state_capacity_activations,
+        tokenizer_manifest=tokenizer_manifest,
     )
     package_manifest_path = lowered_dir / "vulkan_resident_greedy_package.json"
     write_json(package_manifest_path, package_manifest)
@@ -68,6 +85,7 @@ def build_vulkan_resident_greedy_package_manifest(
     package_id: str,
     shader_source_dir: Path,
     default_dynamic_state_capacity_activations: int,
+    tokenizer_manifest: Json,
 ) -> Json:
     dimensions = model_graph["dimensions"]
     hidden_size = int(dimensions["hidden_size"])
@@ -109,6 +127,7 @@ def build_vulkan_resident_greedy_package_manifest(
         "device_id": "gpu0",
         "circuit_index_path": "pedalboard.circuits.json",
         "tensor_index_path": relative_json_path(lowered_dir, transpiled_dir / "tensors.json"),
+        "tokenizer": tokenizer_manifest,
         "activation_element_bytes": dtype_bytes,
         "dynamic_state_capacity_activations": default_dynamic_state_capacity_activations,
         "input_transducer": {
@@ -326,6 +345,30 @@ def copy_shader_templates(source_dir: Path, dest_dir: Path, shader_files: set[st
         if not source.exists():
             raise ModelCompileError(f"missing shader template {source}")
         shutil.copy2(source, dest_dir / shader_file)
+
+
+def copy_tokenizer_package(model_dir: Path, dest_dir: Path) -> Json:
+    tokenizer_json = model_dir / "tokenizer.json"
+    if not tokenizer_json.is_file():
+        raise ModelCompileError(
+            f"source model does not contain required tokenizer file {tokenizer_json}"
+        )
+
+    if dest_dir.exists():
+        shutil.rmtree(dest_dir)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    copied_files = []
+    for filename in TOKENIZER_PACKAGE_FILES:
+        source = model_dir / filename
+        if source.is_file():
+            shutil.copy2(source, dest_dir / filename)
+            copied_files.append(filename)
+
+    return {
+        "path": TOKENIZER_PACKAGE_DIR,
+        "files": copied_files,
+    }
 
 
 def parameter_shape_for_node(circuit: Json, node: Json, tensor_index: Json) -> list[int]:

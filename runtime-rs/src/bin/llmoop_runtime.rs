@@ -164,9 +164,34 @@ fn infer_model_dir_from_package(
         .parent()
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
+    if let Some(tokenizer) = &manifest.tokenizer {
+        let tokenizer_dir = resolve_package_path(&manifest_dir, &tokenizer.path);
+        if !tokenizer_dir.join("tokenizer.json").is_file() {
+            return Err(Box::new(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "compiled package declares tokenizer at {}, but tokenizer.json is missing",
+                    tokenizer_dir.display()
+                ),
+            )));
+        }
+        return Ok(Some(tokenizer_dir));
+    }
+    if manifest_dir.join("tokenizer.json").is_file() {
+        return Ok(Some(manifest_dir));
+    }
     let index_path = manifest_dir.join(manifest.circuit_index_path);
     let index = LoweredPedalboard::from_json_file(index_path)?;
     Ok(Some(PathBuf::from(index.source.source_model_dir)))
+}
+
+fn resolve_package_path(manifest_dir: &Path, raw_path: &str) -> PathBuf {
+    let path = Path::new(raw_path);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        manifest_dir.join(path)
+    }
 }
 
 fn choose_runtime_capacity(

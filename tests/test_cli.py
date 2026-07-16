@@ -65,6 +65,16 @@ class RuntimeCliCommandTest(unittest.TestCase):
         )
 
 
+class CompiledPackageTest(unittest.TestCase):
+    def test_compiled_package_contains_tokenizer_files(self) -> None:
+        fixture = compiled_model_or_skip()
+        manifest = json.loads(fixture.package_manifest.read_text())
+
+        self.assertEqual("tokenizer", manifest["tokenizer"]["path"])
+        self.assertIn("tokenizer.json", manifest["tokenizer"]["files"])
+        self.assertTrue((fixture.lowered_dir / "tokenizer" / "tokenizer.json").is_file())
+
+
 @unittest.skipUnless(CLI_DEPS_AVAILABLE, "CLI generation dependencies are not installed")
 class CliTest(unittest.TestCase):
     @classmethod

@@ -73,8 +73,6 @@ def run_rust_vulkan_runtime(args: argparse.Namespace) -> dict[str, Any]:
         "llmoop",
         "--run",
         str(args.lowered_dir),
-        "--model-dir",
-        str(args.model_dir),
         "--prompt",
         args.prompt_text,
         "--max-new-tokens",

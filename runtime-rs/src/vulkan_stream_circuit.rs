@@ -5768,6 +5768,8 @@ pub struct VulkanResidentGreedyModelPackageManifest {
     pub circuit_index_path: String,
     pub tensor_index_path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokenizer: Option<VulkanResidentTokenizerPackageSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activation_element_bytes: Option<usize>,
     pub dynamic_state_capacity_activations: usize,
     pub input_transducer: VulkanResidentInputEmbeddingTransducerPackageSpec,
@@ -5800,6 +5802,13 @@ impl VulkanResidentGreedyModelPackageManifest {
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         fs::write(path, bytes)
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VulkanResidentTokenizerPackageSpec {
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
