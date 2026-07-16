@@ -4,9 +4,10 @@ use std::path::PathBuf;
 
 use llmoop_runtime::{
     VulkanResidentHfTokenizerTextCodec, VulkanResidentTokenEngine,
-    VulkanResidentTokenEngineRunBudget, VulkanResidentTokenEngineRunStopCondition,
-    VulkanResidentTokenEngineSubmittedTextRun, VulkanResidentTokenRuntimeCycleRun,
-    VulkanResidentTokenRuntimeCycleStopCondition, VulkanResidentTokenTextCodec,
+    VulkanResidentTokenEngineQueuedTextInputEvent, VulkanResidentTokenEngineRunStopCondition,
+    VulkanResidentTokenEngineTextCycleRun, VulkanResidentTokenRuntimeCycleRun,
+    VulkanResidentTokenRuntimeCycleStopCondition, VulkanResidentTokenRuntimeSchedulerStopCondition,
+    VulkanResidentTokenTextCodec,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -36,6 +37,45 @@ impl Default for Args {
             max_scheduler_turns: 1_024,
             add_special_tokens: true,
             skip_special_tokens: true,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LiveTextTurn {
+    queued: VulkanResidentTokenEngineQueuedTextInputEvent,
+    cycles: Vec<VulkanResidentTokenEngineTextCycleRun>,
+}
+
+impl LiveTextTurn {
+    fn generated_token_ids(&self) -> Vec<u32> {
+        self.cycles
+            .iter()
+            .flat_map(|cycle| cycle.generated_token_ids.iter().copied())
+            .collect()
+    }
+
+    fn scheduler_turn_count(&self) -> usize {
+        self.cycles.len()
+    }
+
+    fn runtime_cycle_count(&self) -> usize {
+        self.cycles
+            .iter()
+            .map(|cycle| cycle.scheduler_run.runtime_cycles.len())
+            .sum()
+    }
+
+    fn stop_condition(&self) -> VulkanResidentTokenEngineRunStopCondition {
+        if self
+            .cycles
+            .last()
+            .map(|cycle| cycle.scheduler_run.stop_condition)
+            == Some(VulkanResidentTokenRuntimeSchedulerStopCondition::Idle)
+        {
+            VulkanResidentTokenEngineRunStopCondition::Idle
+        } else {
+            VulkanResidentTokenEngineRunStopCondition::SchedulerTurnBudget
         }
     }
 }
@@ -94,45 +134,37 @@ fn run() -> Result<(), Box<dyn Error>> {
     println!("scheduler.max_runtime_cycles_per_turn=1");
     println!("engine.max_scheduler_turns={}", args.max_scheduler_turns);
 
-    let budget =
-        VulkanResidentTokenEngineRunBudget::new(args.max_scheduler_turns, 1, args.cycle_ticks);
-    let mut submitted_runs = Vec::new();
-    submitted_runs.push(engine.submit_text_until_idle(
+    let mut submitted_turns = Vec::new();
+    submitted_turns.push(run_live_text_turn(
+        &mut engine,
         stream_id,
         "first",
-        args.prompt,
+        args.prompt.clone(),
         args.max_new_tokens,
-        "cli",
-        budget,
         &codec,
+        &args,
     )?);
-    if let Some(then_prompt) = args.then_prompt {
-        submitted_runs.push(engine.submit_text_until_idle(
+    if let Some(then_prompt) = args.then_prompt.clone() {
+        submitted_turns.push(run_live_text_turn(
+            &mut engine,
             stream_id,
             "second",
             then_prompt,
             args.then_max_new_tokens,
-            "cli",
-            budget,
             &codec,
+            &args,
         )?);
     }
 
     let mut cycle_index = 0usize;
-    for (turn_index, submitted) in submitted_runs.iter().enumerate() {
-        print_submitted_text_turn(turn_index, submitted, &codec)?;
-        print_submitted_run_cycles(submitted, &mut cycle_index);
+    for (turn_index, turn) in submitted_turns.iter().enumerate() {
+        print_live_text_turn(turn_index, turn, &codec)?;
+        print_live_turn_cycles(turn, &mut cycle_index);
     }
 
-    let generated = submitted_runs
+    let generated = submitted_turns
         .iter()
-        .flat_map(|submitted| {
-            submitted
-                .submitted_tokens
-                .generated_token_ids
-                .iter()
-                .copied()
-        })
+        .flat_map(LiveTextTurn::generated_token_ids)
         .collect::<Vec<_>>();
     let generated_text = codec.decode_tokens(&generated)?;
     let engine_snapshot = engine.snapshot();
@@ -145,21 +177,21 @@ fn run() -> Result<(), Box<dyn Error>> {
     println!("runtime.cycles={cycle_index}");
     println!(
         "engine.scheduler_turns={}",
-        submitted_runs
+        submitted_turns
             .iter()
-            .map(|submitted| submitted.submitted_tokens.run.scheduler_runs.len())
+            .map(LiveTextTurn::scheduler_turn_count)
             .sum::<usize>()
     );
     println!(
         "engine.runtime_cycles={}",
-        submitted_runs
+        submitted_turns
             .iter()
-            .map(|submitted| submitted.submitted_tokens.run.runtime_cycle_count)
+            .map(LiveTextTurn::runtime_cycle_count)
             .sum::<usize>()
     );
     println!(
         "engine.stop={}",
-        engine_stop_label(aggregate_engine_stop(&submitted_runs))
+        engine_stop_label(aggregate_engine_stop(&submitted_turns))
     );
     println!(
         "runtime.next_stream_tick={}",
@@ -263,32 +295,57 @@ fn next_value(raw: &mut impl Iterator<Item = String>, flag: &str) -> Result<Stri
         .ok_or_else(|| format!("{flag} requires a value\n\n{}", usage()))
 }
 
-fn print_submitted_text_turn(
+fn run_live_text_turn(
+    engine: &mut VulkanResidentTokenEngine,
+    stream_id: &str,
+    input_event_id: &str,
+    input_text: String,
+    max_new_tokens: usize,
+    codec: &impl VulkanResidentTokenTextCodec,
+    args: &Args,
+) -> Result<LiveTextTurn, Box<dyn Error>> {
+    let queued = engine.enqueue_text_input_event(
+        stream_id,
+        input_event_id,
+        input_text,
+        max_new_tokens,
+        "cli",
+        codec,
+    )?;
+    let mut cycles = Vec::new();
+
+    while engine.snapshot().scheduler.running && cycles.len() < args.max_scheduler_turns {
+        let cycle = engine.run_text_cycle(1, args.cycle_ticks, codec)?;
+        let stopped_on_idle = cycle.scheduler_run.stop_condition
+            == VulkanResidentTokenRuntimeSchedulerStopCondition::Idle;
+        cycles.push(cycle);
+        if stopped_on_idle {
+            break;
+        }
+    }
+
+    Ok(LiveTextTurn { queued, cycles })
+}
+
+fn print_live_text_turn(
     index: usize,
-    submitted: &VulkanResidentTokenEngineSubmittedTextRun,
+    turn: &LiveTextTurn,
     codec: &impl VulkanResidentTokenTextCodec,
 ) -> Result<(), Box<dyn Error>> {
-    let mut output_token_ids = submitted.encoded_token_ids.clone();
-    output_token_ids.extend(
-        submitted
-            .submitted_tokens
-            .generated_token_ids
-            .iter()
-            .copied(),
-    );
+    let generated_token_ids = turn.generated_token_ids();
+    let generated_text = codec.decode_tokens(&generated_token_ids)?;
+    let mut output_token_ids = turn.queued.encoded_token_ids.clone();
+    output_token_ids.extend(generated_token_ids.iter().copied());
     let output_text = codec.decode_tokens(&output_token_ids)?;
 
-    println!("turn_{index}.input_text={:?}", submitted.input_text);
-    println!("turn_{index}.encoded={:?}", submitted.encoded_token_ids);
-    println!(
-        "turn_{index}.generated={:?}",
-        submitted.submitted_tokens.generated_token_ids
-    );
-    println!("turn_{index}.generated_text={:?}", submitted.generated_text);
+    println!("turn_{index}.input_text={:?}", turn.queued.input_text);
+    println!("turn_{index}.encoded={:?}", turn.queued.encoded_token_ids);
+    println!("turn_{index}.generated={generated_token_ids:?}");
+    println!("turn_{index}.generated_text={generated_text:?}");
     println!("turn_{index}.output_text={output_text:?}");
     println!(
         "turn_{index}.engine_stop={}",
-        engine_stop_label(submitted.submitted_tokens.run.stop_condition)
+        engine_stop_label(turn.stop_condition())
     );
     Ok(())
 }
@@ -327,13 +384,25 @@ fn print_cycle(index: usize, cycle: &VulkanResidentTokenRuntimeCycleRun) {
     );
 }
 
-fn print_submitted_run_cycles(
-    submitted: &VulkanResidentTokenEngineSubmittedTextRun,
-    cycle_index: &mut usize,
-) {
-    for scheduler_run in &submitted.submitted_tokens.run.scheduler_runs {
-        for cycle in &scheduler_run.runtime_cycles {
-            print_cycle(*cycle_index, cycle);
+fn print_live_turn_cycles(turn: &LiveTextTurn, cycle_index: &mut usize) {
+    for text_cycle in &turn.cycles {
+        for cycle in &text_cycle.scheduler_run.runtime_cycles {
+            let index = *cycle_index;
+            print_cycle(index, cycle);
+            println!(
+                "cycle_{index}.text_outputs={:?} cycle_{index}.text={:?}",
+                text_cycle
+                    .output_events
+                    .iter()
+                    .map(|event| (
+                        event.input_event_id.as_str(),
+                        event.output_index,
+                        event.token_id,
+                        event.text.as_str()
+                    ))
+                    .collect::<Vec<_>>(),
+                text_cycle.generated_text
+            );
             *cycle_index += 1;
         }
     }
@@ -354,11 +423,10 @@ fn engine_stop_label(stop: VulkanResidentTokenEngineRunStopCondition) -> &'stati
 }
 
 fn aggregate_engine_stop(
-    submitted_runs: &[VulkanResidentTokenEngineSubmittedTextRun],
+    submitted_turns: &[LiveTextTurn],
 ) -> VulkanResidentTokenEngineRunStopCondition {
-    if submitted_runs.iter().any(|submitted| {
-        submitted.submitted_tokens.run.stop_condition
-            == VulkanResidentTokenEngineRunStopCondition::SchedulerTurnBudget
+    if submitted_turns.iter().any(|turn| {
+        turn.stop_condition() == VulkanResidentTokenEngineRunStopCondition::SchedulerTurnBudget
     }) {
         VulkanResidentTokenEngineRunStopCondition::SchedulerTurnBudget
     } else {

@@ -5371,6 +5371,79 @@ impl VulkanResidentTokenEngine {
         })
     }
 
+    pub fn enqueue_text_input_event<C>(
+        &mut self,
+        stream_id: &str,
+        input_event_id: impl Into<String>,
+        input_text: impl Into<String>,
+        max_public_tokens: usize,
+        origin: impl Into<String>,
+        codec: &C,
+    ) -> Result<VulkanResidentTokenEngineQueuedTextInputEvent, VulkanResidentTokenEngineError>
+    where
+        C: VulkanResidentTokenTextCodec,
+    {
+        let input_event_id = input_event_id.into();
+        let input_text = input_text.into();
+        let encoded_token_ids = codec.encode_text(&input_text)?;
+        let queued_input_event = self.enqueue_input_event(
+            stream_id,
+            VulkanResidentTokenInputEvent::new(
+                input_event_id.clone(),
+                encoded_token_ids.clone(),
+                max_public_tokens,
+            )
+            .with_origin(origin),
+        )?;
+
+        Ok(VulkanResidentTokenEngineQueuedTextInputEvent {
+            stream_id: stream_id.to_string(),
+            input_event_id,
+            input_text,
+            encoded_token_ids,
+            queued_input_event,
+        })
+    }
+
+    pub fn run_text_cycle<C>(
+        &mut self,
+        max_runtime_cycles: usize,
+        ticks_per_runtime: usize,
+        codec: &C,
+    ) -> Result<VulkanResidentTokenEngineTextCycleRun, VulkanResidentTokenEngineError>
+    where
+        C: VulkanResidentTokenTextCodec,
+    {
+        let scheduler_run = self.run_cycle(max_runtime_cycles, ticks_per_runtime)?;
+        let output_events = scheduler_run
+            .output_events
+            .iter()
+            .map(|event| {
+                let token_id = event.output_event.token_id;
+                Ok(VulkanResidentTokenEngineTextOutputEvent {
+                    stream_id: event.stream_id.clone(),
+                    input_event_id: event.output_event.input_event_id.clone(),
+                    output_index: event.output_event.output_index,
+                    token_id,
+                    text: codec.decode_tokens(&[token_id])?,
+                    source_stream_tick: event.output_event.source_stream_tick,
+                })
+            })
+            .collect::<Result<Vec<_>, VulkanResidentTokenEngineError>>()?;
+        let generated_token_ids = output_events
+            .iter()
+            .map(|event| event.token_id)
+            .collect::<Vec<_>>();
+        let generated_text = codec.decode_tokens(&generated_token_ids)?;
+
+        Ok(VulkanResidentTokenEngineTextCycleRun {
+            scheduler_run,
+            output_events,
+            generated_token_ids,
+            generated_text,
+        })
+    }
+
     pub fn snapshot(&self) -> VulkanResidentTokenEngineSnapshot {
         let mut stream_counts_by_model = BTreeMap::new();
         for stream in self.streams.values() {
@@ -5502,6 +5575,33 @@ pub struct VulkanResidentTokenEngineSubmittedTextRun {
     pub encoded_token_ids: Vec<u32>,
     pub generated_text: String,
     pub submitted_tokens: VulkanResidentTokenEngineSubmittedInputRun,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanResidentTokenEngineQueuedTextInputEvent {
+    pub stream_id: String,
+    pub input_event_id: String,
+    pub input_text: String,
+    pub encoded_token_ids: Vec<u32>,
+    pub queued_input_event: VulkanResidentTokenRuntimeQueuedInputEvent,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanResidentTokenEngineTextCycleRun {
+    pub scheduler_run: VulkanResidentTokenRuntimeSchedulerRun,
+    pub output_events: Vec<VulkanResidentTokenEngineTextOutputEvent>,
+    pub generated_token_ids: Vec<u32>,
+    pub generated_text: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanResidentTokenEngineTextOutputEvent {
+    pub stream_id: String,
+    pub input_event_id: String,
+    pub output_index: usize,
+    pub token_id: u32,
+    pub text: String,
+    pub source_stream_tick: u64,
 }
 
 pub trait VulkanResidentTokenTextCodec {
@@ -13315,6 +13415,75 @@ mod tests {
         assert!(!runtime.running);
         assert_eq!(runtime.stream.total_public_outputs, 2);
         assert_eq!(runtime.pending_input_event_count, 0);
+    }
+
+    #[test]
+    fn resident_token_engine_drains_text_output_cycle_by_cycle() {
+        let device = match VulkanComputeDevice::new() {
+            Ok(device) => device,
+            Err(error) => {
+                eprintln!("skipping resident token text cycle engine: {error}");
+                return;
+            }
+        };
+        let Some(processor) = create_lfm2_resident_greedy_stream_processor_with_capacity(
+            &device,
+            "resident token text cycle engine",
+            8,
+            "gqa_attention_bf16_q16_kv8_d64_cap8.comp",
+        ) else {
+            return;
+        };
+        let mut engine =
+            VulkanResidentTokenEngine::from_processor(device, "engine_text_cycle", processor)
+                .unwrap();
+        let codec = VulkanResidentTokenIdTextCodec;
+
+        let queued = engine
+            .enqueue_text_input_event("engine_text_cycle", "event_0", "1", 2, "test_host", &codec)
+            .unwrap();
+        assert_eq!(queued.stream_id, "engine_text_cycle");
+        assert_eq!(queued.input_event_id, "event_0");
+        assert_eq!(queued.input_text, "1");
+        assert_eq!(queued.encoded_token_ids, vec![1]);
+        assert_eq!(queued.queued_input_event.pending_input_event_count, 1);
+
+        let first = engine.run_text_cycle(1, 2, &codec).unwrap();
+        assert_eq!(
+            first.scheduler_run.stop_condition,
+            VulkanResidentTokenRuntimeSchedulerStopCondition::RuntimeCycleBudget
+        );
+        assert_eq!(first.generated_token_ids, vec![1, 1]);
+        assert_eq!(first.generated_text, "1 1");
+        assert_eq!(
+            first
+                .output_events
+                .iter()
+                .map(|event| {
+                    (
+                        event.stream_id.as_str(),
+                        event.input_event_id.as_str(),
+                        event.output_index,
+                        event.token_id,
+                        event.text.as_str(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            vec![
+                ("engine_text_cycle", "event_0", 0, 1, "1"),
+                ("engine_text_cycle", "event_0", 1, 1, "1")
+            ]
+        );
+
+        let final_cycle = engine.run_text_cycle(1, 2, &codec).unwrap();
+        assert_eq!(
+            final_cycle.scheduler_run.stop_condition,
+            VulkanResidentTokenRuntimeSchedulerStopCondition::Idle
+        );
+        assert!(final_cycle.output_events.is_empty());
+        assert!(final_cycle.generated_token_ids.is_empty());
+        assert_eq!(final_cycle.generated_text, "");
+        assert!(engine.runtime_snapshot("engine_text_cycle").unwrap().idle);
     }
 
     #[cfg(feature = "tokenizers")]
