@@ -6019,6 +6019,7 @@ impl VulkanResidentGreedyModelPackage {
                     "failed to bind Vulkan stream circuit dispatch plan: {error}"
                 ))
             })?;
+        validate_pedal_executions_against_mounted_dispatches(&manifest, &mounted_bound)?;
         let pedal_kernel_shaders =
             resident_greedy_package_pedal_kernel_shader_refs_for_capacity(&manifest, capacity);
         let loaded_manifest = loaded_kernel_pack_from_package_shader_refs(
@@ -6241,6 +6242,110 @@ fn validate_capacity_profiles(
             "resident model package {:?} has overlapping capacity profiles for capacity {capacity}",
             manifest.package_id
         )));
+    }
+
+    Ok(())
+}
+
+fn validate_pedal_executions_against_mounted_dispatches(
+    manifest: &VulkanResidentGreedyModelPackageManifest,
+    mounted_bound: &VulkanMountedPlacedBoundDispatchPlan,
+) -> Result<(), VulkanResidentTokenModelPackageError> {
+    let declared_pedals = manifest
+        .pedal_executions
+        .iter()
+        .map(|pedal| pedal.pedal_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let mounted_pedals = mounted_bound
+        .dispatches
+        .iter()
+        .map(|dispatch| dispatch.pedal_id.as_str())
+        .collect::<BTreeSet<_>>();
+
+    let missing_pedals = mounted_pedals
+        .difference(&declared_pedals)
+        .copied()
+        .collect::<Vec<_>>();
+    if !missing_pedals.is_empty() {
+        return Err(VulkanResidentTokenModelPackageError::new(format!(
+            "resident model package {:?} is missing pedal executions for mounted pedals: {}",
+            manifest.package_id,
+            missing_pedals.join(", ")
+        )));
+    }
+
+    let unknown_pedals = declared_pedals
+        .difference(&mounted_pedals)
+        .copied()
+        .collect::<Vec<_>>();
+    if !unknown_pedals.is_empty() {
+        return Err(VulkanResidentTokenModelPackageError::new(format!(
+            "resident model package {:?} declares pedal executions for unknown mounted pedals: {}",
+            manifest.package_id,
+            unknown_pedals.join(", ")
+        )));
+    }
+
+    for pedal in &manifest.pedal_executions {
+        let mounted_dispatches = mounted_bound
+            .dispatches
+            .iter()
+            .filter(|dispatch| dispatch.pedal_id == pedal.pedal_id)
+            .collect::<Vec<_>>();
+        if pedal.kernels.len() != mounted_dispatches.len() {
+            return Err(VulkanResidentTokenModelPackageError::new(format!(
+                "resident model package {:?} declares {} kernels for pedal {}, but mounted dispatch plan has {}",
+                manifest.package_id,
+                pedal.kernels.len(),
+                pedal.pedal_id,
+                mounted_dispatches.len()
+            )));
+        }
+
+        for (expected_index, (kernel, dispatch)) in
+            pedal.kernels.iter().zip(mounted_dispatches).enumerate()
+        {
+            if kernel.execution_index != expected_index {
+                return Err(VulkanResidentTokenModelPackageError::new(format!(
+                    "resident model package {:?} declares pedal {} kernel {} with execution_index {}, expected {}",
+                    manifest.package_id,
+                    pedal.pedal_id,
+                    kernel.node_id,
+                    kernel.execution_index,
+                    expected_index
+                )));
+            }
+            if kernel.node_id != dispatch.node_id {
+                return Err(VulkanResidentTokenModelPackageError::new(format!(
+                    "resident model package {:?} declares pedal {} execution_index {} as node {}, but mounted dispatch plan has node {}",
+                    manifest.package_id,
+                    pedal.pedal_id,
+                    expected_index,
+                    kernel.node_id,
+                    dispatch.node_id
+                )));
+            }
+            if kernel.op != dispatch.op {
+                return Err(VulkanResidentTokenModelPackageError::new(format!(
+                    "resident model package {:?} declares pedal {} node {} op {}, but mounted dispatch plan has op {}",
+                    manifest.package_id,
+                    pedal.pedal_id,
+                    kernel.node_id,
+                    kernel.op,
+                    dispatch.op
+                )));
+            }
+            if kernel.execution_index != dispatch.node_index {
+                return Err(VulkanResidentTokenModelPackageError::new(format!(
+                    "resident model package {:?} declares pedal {} node {} execution_index {}, but mounted dispatch plan has node_index {}",
+                    manifest.package_id,
+                    pedal.pedal_id,
+                    kernel.node_id,
+                    kernel.execution_index,
+                    dispatch.node_index
+                )));
+            }
+        }
     }
 
     Ok(())
@@ -11365,6 +11470,30 @@ mod tests {
         tensor_index: &TensorIndex,
     ) {
         load_fixture_model_conv_layer_parameters(mounted, tensor_index, 0);
+    }
+
+    #[test]
+    fn package_pedal_executions_must_match_mounted_dispatch_order() {
+        let device = match VulkanComputeDevice::new() {
+            Ok(device) => device,
+            Err(error) => {
+                eprintln!("skipping package pedal execution validation: {error}");
+                return;
+            }
+        };
+        let mut manifest = fixture_model_package_manifest();
+        let (_tensor_index, _mounted, _kernel_manifest, mounted_bound) =
+            mount_fixture_model_single_device_stream_circuit(&device);
+
+        validate_pedal_executions_against_mounted_dispatches(&manifest, &mounted_bound).unwrap();
+
+        manifest.pedal_executions[0].kernels.swap(0, 1);
+        let error =
+            validate_pedal_executions_against_mounted_dispatches(&manifest, &mounted_bound)
+                .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("declares pedal layer_00 kernel conv_in_projection with execution_index 1, expected 0"));
     }
 
     fn fixture_model_embedding_row_bytes(tensor_index: &TensorIndex, token_id: u32) -> Vec<u8> {
