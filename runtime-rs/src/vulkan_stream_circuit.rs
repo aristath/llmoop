@@ -5205,6 +5205,71 @@ impl VulkanResidentTokenEngine {
             .run_cycle(&self.device, max_runtime_cycles, ticks_per_runtime)?)
     }
 
+    pub fn run_until_idle(
+        &mut self,
+        max_scheduler_turns: usize,
+        max_runtime_cycles_per_turn: usize,
+        ticks_per_runtime: usize,
+    ) -> Result<VulkanResidentTokenEngineRun, VulkanResidentTokenEngineError> {
+        let start_snapshot = self.snapshot();
+        let mut scheduler_runs = Vec::new();
+        let mut output_events = Vec::new();
+        let mut runtime_cycle_count = 0usize;
+
+        if max_scheduler_turns == 0 || max_runtime_cycles_per_turn == 0 || ticks_per_runtime == 0 {
+            let end_snapshot = self.snapshot();
+            let stop_condition = if end_snapshot.scheduler.running {
+                VulkanResidentTokenEngineRunStopCondition::SchedulerTurnBudget
+            } else {
+                VulkanResidentTokenEngineRunStopCondition::Idle
+            };
+            return Ok(VulkanResidentTokenEngineRun {
+                max_scheduler_turns,
+                max_runtime_cycles_per_turn,
+                ticks_per_runtime,
+                stop_condition,
+                scheduler_runs,
+                output_events,
+                runtime_cycle_count,
+                start_snapshot,
+                end_snapshot,
+            });
+        }
+
+        while scheduler_runs.len() < max_scheduler_turns && self.snapshot().scheduler.running {
+            let scheduler_run = self.run_cycle(max_runtime_cycles_per_turn, ticks_per_runtime)?;
+            let produced_runtime_cycles = scheduler_run.runtime_cycles.len();
+            runtime_cycle_count = runtime_cycle_count
+                .checked_add(produced_runtime_cycles)
+                .ok_or(VulkanResidentTokenEngineError::RunCycleCountOverflow)?;
+            output_events.extend(scheduler_run.output_events.iter().cloned());
+            let still_running = self.snapshot().scheduler.running;
+            if produced_runtime_cycles == 0 && still_running {
+                return Err(VulkanResidentTokenEngineError::RunStalled);
+            }
+            scheduler_runs.push(scheduler_run);
+        }
+
+        let end_snapshot = self.snapshot();
+        let stop_condition = if end_snapshot.scheduler.running {
+            VulkanResidentTokenEngineRunStopCondition::SchedulerTurnBudget
+        } else {
+            VulkanResidentTokenEngineRunStopCondition::Idle
+        };
+
+        Ok(VulkanResidentTokenEngineRun {
+            max_scheduler_turns,
+            max_runtime_cycles_per_turn,
+            ticks_per_runtime,
+            stop_condition,
+            scheduler_runs,
+            output_events,
+            runtime_cycle_count,
+            start_snapshot,
+            end_snapshot,
+        })
+    }
+
     pub fn snapshot(&self) -> VulkanResidentTokenEngineSnapshot {
         let mut stream_counts_by_model = BTreeMap::new();
         for stream in self.streams.values() {
@@ -5278,6 +5343,25 @@ pub struct VulkanResidentTokenEngineSnapshot {
     pub models: Vec<VulkanResidentTokenEngineModelSnapshot>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VulkanResidentTokenEngineRunStopCondition {
+    Idle,
+    SchedulerTurnBudget,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanResidentTokenEngineRun {
+    pub max_scheduler_turns: usize,
+    pub max_runtime_cycles_per_turn: usize,
+    pub ticks_per_runtime: usize,
+    pub stop_condition: VulkanResidentTokenEngineRunStopCondition,
+    pub scheduler_runs: Vec<VulkanResidentTokenRuntimeSchedulerRun>,
+    pub output_events: Vec<VulkanResidentTokenRuntimeSchedulerOutputEvent>,
+    pub runtime_cycle_count: usize,
+    pub start_snapshot: VulkanResidentTokenEngineSnapshot,
+    pub end_snapshot: VulkanResidentTokenEngineSnapshot,
+}
+
 #[derive(Debug)]
 pub enum VulkanResidentTokenEngineError {
     Device(VulkanError),
@@ -5285,6 +5369,8 @@ pub enum VulkanResidentTokenEngineError {
     Scheduler(VulkanResidentTokenRuntimeSchedulerError),
     DuplicateModel(String),
     UnknownModel(String),
+    RunCycleCountOverflow,
+    RunStalled,
 }
 
 impl Display for VulkanResidentTokenEngineError {
@@ -5302,6 +5388,12 @@ impl Display for VulkanResidentTokenEngineError {
             Self::UnknownModel(model_id) => {
                 write!(f, "resident token engine model {model_id:?} is not loaded")
             }
+            Self::RunCycleCountOverflow => {
+                f.write_str("resident token engine run cycle count overflowed")
+            }
+            Self::RunStalled => f.write_str(
+                "resident token engine run stalled while scheduler still had active runtimes",
+            ),
         }
     }
 }
@@ -12843,29 +12935,21 @@ mod tests {
         assert_eq!(queued.pending_input_event_count, 1);
         assert_eq!(engine.snapshot().scheduler.active_runtime_count, 1);
 
-        let mut generated = Vec::new();
-        let mut cycle_count = 0usize;
-        while engine.snapshot().scheduler.running {
-            let run = engine.run_cycle(1, 2).unwrap();
-            assert!(
-                !run.runtime_cycles.is_empty(),
-                "running engine should produce a bounded runtime cycle"
-            );
-            generated.extend(
-                run.output_events
-                    .iter()
-                    .map(|event| event.output_event.token_id),
-            );
-            cycle_count += run.runtime_cycles.len();
-            assert!(
-                cycle_count < 8,
-                "engine did not drain within the test budget"
-            );
-        }
+        let run = engine.run_until_idle(8, 1, 2).unwrap();
+        let generated = run
+            .output_events
+            .iter()
+            .map(|event| event.output_event.token_id)
+            .collect::<Vec<_>>();
 
         assert_eq!(generated, vec![1, 1]);
-        assert!(cycle_count >= 1);
-        let final_snapshot = engine.snapshot();
+        assert_eq!(
+            run.stop_condition,
+            VulkanResidentTokenEngineRunStopCondition::Idle
+        );
+        assert!(run.runtime_cycle_count >= 1);
+        assert_eq!(run.end_snapshot.scheduler.active_runtime_count, 0);
+        let final_snapshot = run.end_snapshot;
         assert_eq!(final_snapshot.scheduler.registered_runtime_count, 1);
         assert_eq!(final_snapshot.scheduler.active_runtime_count, 0);
         assert!(final_snapshot.scheduler.idle);
@@ -12944,25 +13028,22 @@ mod tests {
             .unwrap();
         assert_eq!(engine.snapshot().scheduler.active_runtime_count, 2);
 
+        let run = engine.run_until_idle(8, 2, 2).unwrap();
+        assert_eq!(
+            run.stop_condition,
+            VulkanResidentTokenEngineRunStopCondition::Idle
+        );
+        assert_eq!(run.start_snapshot.scheduler.active_runtime_count, 2);
+        assert_eq!(run.end_snapshot.scheduler.active_runtime_count, 0);
+        assert_eq!(run.runtime_cycle_count, 4);
+        assert_eq!(run.scheduler_runs.len(), 2);
+
         let mut generated_by_stream = BTreeMap::<String, Vec<u32>>::new();
-        let mut runtime_cycles = 0usize;
-        while engine.snapshot().scheduler.running {
-            let run = engine.run_cycle(2, 2).unwrap();
-            assert!(
-                !run.runtime_cycles.is_empty(),
-                "running shared-model engine should produce bounded runtime cycles"
-            );
-            for event in run.output_events {
-                generated_by_stream
-                    .entry(event.stream_id)
-                    .or_default()
-                    .push(event.output_event.token_id);
-            }
-            runtime_cycles += run.runtime_cycles.len();
-            assert!(
-                runtime_cycles < 16,
-                "shared-model streams did not drain within the test budget"
-            );
+        for event in &run.output_events {
+            generated_by_stream
+                .entry(event.stream_id.clone())
+                .or_default()
+                .push(event.output_event.token_id);
         }
 
         assert_eq!(
@@ -12973,7 +13054,7 @@ mod tests {
             generated_by_stream.get("shared_stream_b"),
             Some(&vec![1, 1])
         );
-        let final_snapshot = engine.snapshot();
+        let final_snapshot = run.end_snapshot;
         assert_eq!(final_snapshot.models[0].registered_stream_count, 2);
         assert_eq!(final_snapshot.scheduler.registered_runtime_count, 2);
         assert_eq!(final_snapshot.scheduler.active_runtime_count, 0);

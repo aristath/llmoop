@@ -2,7 +2,8 @@ use std::error::Error;
 use std::io;
 
 use llmoop_runtime::{
-    VulkanResidentTokenEngine, VulkanResidentTokenInputEvent, VulkanResidentTokenRuntimeCycleRun,
+    VulkanResidentTokenEngine, VulkanResidentTokenEngineRunStopCondition,
+    VulkanResidentTokenInputEvent, VulkanResidentTokenRuntimeCycleRun,
     VulkanResidentTokenRuntimeCycleStopCondition,
 };
 
@@ -14,6 +15,7 @@ struct Args {
     then_prompt: Vec<u32>,
     then_max_new_tokens: usize,
     cycle_ticks: usize,
+    max_scheduler_turns: usize,
 }
 
 impl Default for Args {
@@ -25,6 +27,7 @@ impl Default for Args {
             then_prompt: vec![36_309],
             then_max_new_tokens: 1,
             cycle_ticks: 2,
+            max_scheduler_turns: 1_024,
         }
     }
 }
@@ -81,23 +84,17 @@ fn run() -> Result<(), Box<dyn Error>> {
 
     println!("cycle_ticks={}", args.cycle_ticks);
     println!("scheduler.max_runtime_cycles_per_turn=1");
+    println!("engine.max_scheduler_turns={}", args.max_scheduler_turns);
 
-    let mut generated = Vec::new();
+    let run = engine.run_until_idle(args.max_scheduler_turns, 1, args.cycle_ticks)?;
+    let generated = run
+        .output_events
+        .iter()
+        .map(|event| event.output_event.token_id)
+        .collect::<Vec<_>>();
     let mut cycle_index = 0usize;
-    while engine.snapshot().scheduler.running {
-        let run = engine.run_cycle(1, args.cycle_ticks)?;
-        if run.runtime_cycles.is_empty() && engine.snapshot().scheduler.running {
-            return Err(io::Error::other(
-                "resident token engine is running but produced no runtime cycles",
-            )
-            .into());
-        }
-        generated.extend(
-            run.output_events
-                .iter()
-                .map(|event| event.output_event.token_id),
-        );
-        for cycle in &run.runtime_cycles {
+    for scheduler_run in &run.scheduler_runs {
+        for cycle in &scheduler_run.runtime_cycles {
             print_cycle(cycle_index, cycle);
             cycle_index += 1;
         }
@@ -109,6 +106,9 @@ fn run() -> Result<(), Box<dyn Error>> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "demo stream disappeared"))?;
     println!("runtime.generated={generated:?}");
     println!("runtime.cycles={cycle_index}");
+    println!("engine.scheduler_turns={}", run.scheduler_runs.len());
+    println!("engine.runtime_cycles={}", run.runtime_cycle_count);
+    println!("engine.stop={}", engine_stop_label(run.stop_condition));
     println!(
         "runtime.next_stream_tick={}",
         snapshot.stream.next_stream_tick
@@ -159,6 +159,9 @@ fn parse_args() -> Result<Args, String> {
             "--cycle-ticks" => {
                 parsed.cycle_ticks = parse_next(&mut raw, "--cycle-ticks")?;
             }
+            "--max-scheduler-turns" => {
+                parsed.max_scheduler_turns = parse_next(&mut raw, "--max-scheduler-turns")?;
+            }
             _ => {
                 return Err(format!("unknown argument {arg:?}\n\n{}", usage()));
             }
@@ -173,6 +176,9 @@ fn parse_args() -> Result<Args, String> {
     }
     if parsed.cycle_ticks == 0 {
         return Err("--cycle-ticks must be at least 1".to_string());
+    }
+    if parsed.max_scheduler_turns == 0 {
+        return Err("--max-scheduler-turns must be at least 1".to_string());
     }
 
     Ok(parsed)
@@ -248,6 +254,13 @@ fn cycle_stop_label(stop: VulkanResidentTokenRuntimeCycleStopCondition) -> &'sta
     }
 }
 
+fn engine_stop_label(stop: VulkanResidentTokenEngineRunStopCondition) -> &'static str {
+    match stop {
+        VulkanResidentTokenEngineRunStopCondition::Idle => "idle",
+        VulkanResidentTokenEngineRunStopCondition::SchedulerTurnBudget => "scheduler_turn_budget",
+    }
+}
+
 fn print_usage() {
     println!("{}", usage());
 }
@@ -262,6 +275,7 @@ Options:
   --then-prompt <TOKENS>      Comma-separated later external token event. Default: 36309
   --then-max-new-tokens <N>   Public outputs to emit after later input. Default: 1
   --cycle-ticks <N>           Max runtime ticks per always-on cycle. Default: 2
+  --max-scheduler-turns <N>   Max engine scheduler turns before stopping. Default: 1024
   -h, --help                  Show this help
 
 Example:
