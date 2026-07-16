@@ -57,6 +57,18 @@ def main() -> None:
         help="directory for runtime package artifacts",
     )
     parser.add_argument(
+        "--default-device-id",
+        default="gpu0",
+        help="default logical device for compiled package pedal placement",
+    )
+    parser.add_argument(
+        "--place-pedal",
+        action="append",
+        default=[],
+        metavar="PEDAL=DEVICE",
+        help="assign one compiled package pedal to a logical device; may be repeated",
+    )
+    parser.add_argument(
         "--shader-source-dir",
         type=Path,
         default=Path("runtime-rs/shaders"),
@@ -134,6 +146,11 @@ def main() -> None:
     if not any(selected_actions):
         parser.print_help()
         raise SystemExit(2)
+    if args.compile_model is None:
+        if args.default_device_id != "gpu0":
+            parser.error("--default-device-id is only supported with --compile-model")
+        if args.place_pedal:
+            parser.error("--place-pedal is only supported with --compile-model")
     if args.run is not None:
         if args.prompt is None:
             parser.error("--prompt is required with --run")
@@ -155,6 +172,10 @@ def main() -> None:
         run_model(args)
         return
 
+    try:
+        pedal_devices = parse_pedal_device_overrides(args.place_pedal)
+    except ValueError as error:
+        parser.error(str(error))
     report = compile_model(
         args.compile_model,
         transpiled_dir=args.transpiled_dir,
@@ -163,6 +184,8 @@ def main() -> None:
         clean=not args.no_clean,
         shader_source_dir=args.shader_source_dir,
         default_dynamic_state_capacity_activations=args.capacity or 4,
+        default_device_id=args.default_device_id,
+        pedal_devices=pedal_devices,
     )
     if args.json:
         print(json.dumps(report.to_json(), indent=2))
@@ -194,6 +217,22 @@ def resolve_runtime_package_manifest(path: Path) -> Path:
     if path.is_file():
         return path
     raise SystemExit(f"compiled model package path does not exist: {path}")
+
+
+def parse_pedal_device_overrides(raw_overrides: list[str]) -> dict[str, str]:
+    pedal_devices: dict[str, str] = {}
+    for raw_override in raw_overrides:
+        if "=" not in raw_override:
+            raise ValueError(f"invalid --place-pedal value {raw_override!r}; expected PEDAL=DEVICE")
+        pedal_id, device_id = (part.strip() for part in raw_override.split("=", 1))
+        if not pedal_id:
+            raise ValueError(f"invalid --place-pedal value {raw_override!r}; pedal id is empty")
+        if not device_id:
+            raise ValueError(f"invalid --place-pedal value {raw_override!r}; device id is empty")
+        if pedal_id in pedal_devices:
+            raise ValueError(f"duplicate --place-pedal assignment for {pedal_id!r}")
+        pedal_devices[pedal_id] = device_id
+    return pedal_devices
 
 
 def build_runtime_command(args: argparse.Namespace, package_manifest: Path) -> list[str]:

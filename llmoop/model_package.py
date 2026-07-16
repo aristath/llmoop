@@ -44,6 +44,8 @@ def compile_model_package(
     clean: bool,
     shader_source_dir: Path,
     default_dynamic_state_capacity_activations: int,
+    default_device_id: str,
+    pedal_devices: dict[str, str],
 ) -> CompiledModelReport:
     slug = compiled_model_slug(model_dir)
     transpiled_dir = transpiled_dir or Path("transpiled") / slug
@@ -72,6 +74,8 @@ def compile_model_package(
         package_id=f"{slug}_vulkan_resident_greedy",
         shader_source_dir=shader_source_dir,
         default_dynamic_state_capacity_activations=default_dynamic_state_capacity_activations,
+        default_device_id=default_device_id,
+        pedal_devices=pedal_devices,
         tokenizer_manifest=tokenizer_manifest,
     )
     package_manifest_path = package_dir / "vulkan_resident_greedy_package.json"
@@ -99,6 +103,8 @@ def build_vulkan_resident_greedy_package_manifest(
     package_id: str,
     shader_source_dir: Path,
     default_dynamic_state_capacity_activations: int,
+    default_device_id: str,
+    pedal_devices: dict[str, str],
     tokenizer_manifest: Json,
 ) -> Json:
     dimensions = model_graph["dimensions"]
@@ -127,6 +133,7 @@ def build_vulkan_resident_greedy_package_manifest(
         package_dir / "shaders",
         required_shader_files(dimensions),
     )
+    placement = package_placement(lowered_index, default_device_id, pedal_devices)
 
     pedal_executions, cap8_overrides = pedal_execution_specs(
         lowered_index=lowered_index,
@@ -138,12 +145,8 @@ def build_vulkan_resident_greedy_package_manifest(
     return {
         "schema": PACKAGE_SCHEMA,
         "package_id": package_id,
-        "device_id": "gpu0",
-        "placement": {
-            "schema": "llmoop.stream_circuit_placement.v1",
-            "default_device_id": "gpu0",
-            "pedal_devices": {},
-        },
+        "device_id": default_device_id,
+        "placement": placement,
         "circuit_graph": package_circuit_graph(lowered_index, lowered_dir),
         "tensor_index_path": "tensors.json",
         "config_path": CONFIG_PACKAGE_FILE,
@@ -209,6 +212,34 @@ def build_vulkan_resident_greedy_package_manifest(
                 "pedal_execution_shader_overrides": cap8_overrides,
             }
         ],
+    }
+
+
+def package_placement(
+    lowered_index: Json,
+    default_device_id: str,
+    pedal_devices: dict[str, str],
+) -> Json:
+    if not default_device_id:
+        raise ModelCompileError("placement default_device_id must not be empty")
+
+    known_pedals = {circuit["id"] for circuit in lowered_index["graph"]["circuits"]}
+    normalized_pedal_devices: dict[str, str] = {}
+    for pedal_id, device_id in pedal_devices.items():
+        if not pedal_id:
+            raise ModelCompileError("placement pedal id must not be empty")
+        if not device_id:
+            raise ModelCompileError(
+                f"placement device id for pedal {pedal_id!r} must not be empty"
+            )
+        if pedal_id not in known_pedals:
+            raise ModelCompileError(f"placement references unknown pedal {pedal_id!r}")
+        normalized_pedal_devices[pedal_id] = device_id
+
+    return {
+        "schema": "llmoop.stream_circuit_placement.v1",
+        "default_device_id": default_device_id,
+        "pedal_devices": dict(sorted(normalized_pedal_devices.items())),
     }
 
 

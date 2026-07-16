@@ -9,7 +9,13 @@ import unittest
 from argparse import Namespace
 from pathlib import Path
 
-from llmoop.cli import build_runtime_command, resolve_runtime_package_manifest
+from llmoop.cli import (
+    build_runtime_command,
+    parse_pedal_device_overrides,
+    resolve_runtime_package_manifest,
+)
+from llmoop.model_compiler import ModelCompileError
+from llmoop.model_package import package_placement
 from tests.fixtures import compiled_model_or_skip
 
 
@@ -60,6 +66,45 @@ class RuntimeCliCommandTest(unittest.TestCase):
             ],
             build_runtime_command(args, package),
         )
+
+    def test_parse_pedal_device_overrides_requires_explicit_pedal_device_pairs(self) -> None:
+        self.assertEqual(
+            {"layer_02": "gpu1", "layer_03": "lan:worker-a"},
+            parse_pedal_device_overrides(["layer_02=gpu1", " layer_03 = lan:worker-a "]),
+        )
+
+        with self.assertRaisesRegex(ValueError, "expected PEDAL=DEVICE"):
+            parse_pedal_device_overrides(["layer_02"])
+        with self.assertRaisesRegex(ValueError, "duplicate"):
+            parse_pedal_device_overrides(["layer_02=gpu1", "layer_02=gpu2"])
+
+
+class PackagePlacementTest(unittest.TestCase):
+    def test_package_placement_records_default_device_and_overrides(self) -> None:
+        lowered_index = {"graph": {"circuits": [{"id": "layer_00"}, {"id": "layer_02"}]}}
+
+        self.assertEqual(
+            {
+                "schema": "llmoop.stream_circuit_placement.v1",
+                "default_device_id": "gpu0",
+                "pedal_devices": {"layer_00": "cpu0", "layer_02": "gpu1"},
+            },
+            package_placement(
+                lowered_index,
+                default_device_id="gpu0",
+                pedal_devices={"layer_02": "gpu1", "layer_00": "cpu0"},
+            ),
+        )
+
+    def test_package_placement_rejects_unknown_pedals(self) -> None:
+        lowered_index = {"graph": {"circuits": [{"id": "layer_00"}]}}
+
+        with self.assertRaisesRegex(ModelCompileError, "unknown pedal 'layer_99'"):
+            package_placement(
+                lowered_index,
+                default_device_id="gpu0",
+                pedal_devices={"layer_99": "gpu1"},
+            )
 
 
 class CompiledPackageTest(unittest.TestCase):
