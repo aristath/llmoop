@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::fs;
@@ -3559,6 +3559,11 @@ pub enum VulkanResidentGreedyFeedbackLoopRunnerError {
     MissingPrivateFeedback,
     StreamTickOverflow,
     DynamicStateCapacityOverflow,
+    OutputBudgetOverflow,
+    StreamStateCapacityExceeded {
+        stream_tick: u64,
+        dynamic_state_capacity_activations: usize,
+    },
     FeedbackDepthOverflow,
     DispatchCountOverflow,
     DescriptorCountOverflow,
@@ -3581,6 +3586,16 @@ impl Display for VulkanResidentGreedyFeedbackLoopRunnerError {
             Self::DynamicStateCapacityOverflow => {
                 f.write_str("greedy feedback loop dynamic state capacity overflowed")
             }
+            Self::OutputBudgetOverflow => {
+                f.write_str("greedy running stream output budget overflowed")
+            }
+            Self::StreamStateCapacityExceeded {
+                stream_tick,
+                dynamic_state_capacity_activations,
+            } => write!(
+                f,
+                "greedy feedback loop stream tick {stream_tick} exceeds dynamic state capacity {dynamic_state_capacity_activations}"
+            ),
             Self::FeedbackDepthOverflow => {
                 f.write_str("greedy feedback loop feedback depth overflowed")
             }
@@ -3688,6 +3703,444 @@ impl VulkanResidentGreedyStreamProcessor {
         u32::try_from(self.dynamic_state_capacity_activations)
             .map_err(|_| VulkanResidentGreedyFeedbackLoopRunnerError::DynamicStateCapacityOverflow)
     }
+
+    pub fn into_running_stream(
+        self,
+        stream_id: impl Into<String>,
+    ) -> VulkanResidentGreedyRunningStream {
+        VulkanResidentGreedyRunningStream::new(stream_id, self)
+    }
+}
+
+pub struct VulkanResidentGreedyRunningStream {
+    pub stream_id: String,
+    pub next_stream_tick: u64,
+    pub remaining_public_outputs: usize,
+    pub eos_token_id: Option<u32>,
+    pub loop_open: bool,
+    pub last_stop_reason: Option<String>,
+    processor: VulkanResidentGreedyStreamProcessor,
+    external_input_queue: VecDeque<VulkanResidentGreedyExternalInputSignal>,
+    private_feedback_queue: VecDeque<VulkanResidentGreedyPrivateFeedbackSignal>,
+    public_outputs: Vec<VulkanResidentGreedyPublicOutputSignal>,
+    private_feedback_history: Vec<VulkanResidentGreedyPrivateFeedbackSignal>,
+    ticks: Vec<VulkanResidentGreedyRunningStreamTick>,
+    input_counter: usize,
+    public_counter: usize,
+    feedback_counter: usize,
+}
+
+impl VulkanResidentGreedyRunningStream {
+    pub fn new(
+        stream_id: impl Into<String>,
+        processor: VulkanResidentGreedyStreamProcessor,
+    ) -> Self {
+        Self {
+            stream_id: stream_id.into(),
+            next_stream_tick: 0,
+            remaining_public_outputs: 0,
+            eos_token_id: None,
+            loop_open: false,
+            last_stop_reason: None,
+            processor,
+            external_input_queue: VecDeque::new(),
+            private_feedback_queue: VecDeque::new(),
+            public_outputs: Vec::new(),
+            private_feedback_history: Vec::new(),
+            ticks: Vec::new(),
+            input_counter: 0,
+            public_counter: 0,
+            feedback_counter: 0,
+        }
+    }
+
+    pub fn inject_token(
+        &mut self,
+        token_id: u32,
+        origin: impl Into<String>,
+    ) -> VulkanResidentGreedyExternalInputSignal {
+        let signal = VulkanResidentGreedyExternalInputSignal {
+            id: format!("input_{}", self.input_counter),
+            token_id,
+            origin: origin.into(),
+        };
+        self.input_counter += 1;
+        self.external_input_queue.push_back(signal.clone());
+        signal
+    }
+
+    pub fn inject_prompt(
+        &mut self,
+        prompt_token_ids: &[u32],
+        max_new_tokens: usize,
+        eos_token_id: Option<u32>,
+    ) -> Result<
+        Vec<VulkanResidentGreedyExternalInputSignal>,
+        VulkanResidentGreedyFeedbackLoopRunnerError,
+    > {
+        if prompt_token_ids.is_empty() {
+            return Err(VulkanResidentGreedyFeedbackLoopRunnerError::EmptyPromptEvent);
+        }
+
+        self.remaining_public_outputs =
+            self.remaining_public_outputs
+                .checked_add(max_new_tokens)
+                .ok_or(VulkanResidentGreedyFeedbackLoopRunnerError::OutputBudgetOverflow)?;
+        self.eos_token_id = eos_token_id;
+        self.loop_open = self.remaining_public_outputs > 0;
+        self.last_stop_reason = (max_new_tokens == 0).then(|| "max_new_tokens".to_string());
+
+        Ok(prompt_token_ids
+            .iter()
+            .copied()
+            .map(|token_id| self.inject_token(token_id, "external_input"))
+            .collect())
+    }
+
+    pub fn continue_loop(
+        &mut self,
+        additional_public_outputs: usize,
+    ) -> Result<(), VulkanResidentGreedyFeedbackLoopRunnerError> {
+        self.remaining_public_outputs = self
+            .remaining_public_outputs
+            .checked_add(additional_public_outputs)
+            .ok_or(VulkanResidentGreedyFeedbackLoopRunnerError::OutputBudgetOverflow)?;
+        if self.remaining_public_outputs > 0 {
+            self.loop_open = true;
+            self.last_stop_reason = None;
+        }
+        Ok(())
+    }
+
+    pub fn tick(
+        &mut self,
+        device: &VulkanComputeDevice,
+    ) -> Result<VulkanResidentGreedyRunningStreamTick, VulkanResidentGreedyFeedbackLoopRunnerError>
+    {
+        if self.external_input_queue.is_empty() && self.private_feedback_queue.is_empty() {
+            let tick = VulkanResidentGreedyRunningStreamTick {
+                stream_id: self.stream_id.clone(),
+                stream_tick: None,
+                status: VulkanResidentGreedyRunningStreamTickStatus::Idle,
+                input_signal: None,
+                tick_run: None,
+                public_output: None,
+                private_feedback: None,
+                sampler_run: None,
+                stop_reason: self.last_stop_reason.clone(),
+            };
+            self.ticks.push(tick.clone());
+            return Ok(tick);
+        }
+
+        let stream_tick = self.next_stream_tick;
+        self.ensure_stream_tick_capacity(stream_tick)?;
+        let input_signal = self
+            .next_input_signal()
+            .ok_or(VulkanResidentGreedyFeedbackLoopRunnerError::MissingPrivateFeedback)?;
+        let tick_run = self
+            .processor
+            .loop_runner
+            .tick_runner
+            .run_token_id_with_stream_control(
+                device,
+                input_signal.token_id(),
+                VulkanMountedPlacedStreamControl {
+                    stream_tick,
+                    control_flags: 0,
+                    dynamic_state_capacity_activations: self
+                        .processor
+                        .dynamic_state_capacity_activations_u32()?,
+                },
+            )?;
+        self.next_stream_tick = self
+            .next_stream_tick
+            .checked_add(1)
+            .ok_or(VulkanResidentGreedyFeedbackLoopRunnerError::StreamTickOverflow)?;
+
+        let should_emit_public_output =
+            self.remaining_public_outputs > 0 && self.external_input_queue.is_empty();
+        let mut public_output = None;
+        let mut private_feedback = None;
+        let mut sampler_run = None;
+
+        if should_emit_public_output {
+            let run = self.processor.loop_runner.sampler.run(device)?;
+            let sampled_token_id = run.token_id;
+            self.remaining_public_outputs -= 1;
+
+            let public = VulkanResidentGreedyPublicOutputSignal {
+                id: format!("public_{}", self.public_counter),
+                token_id: sampled_token_id,
+                source_stream_tick: stream_tick,
+                sampler_run: run.clone(),
+            };
+            self.public_counter += 1;
+            self.public_outputs.push(public.clone());
+
+            let close_after_feedback = if self.eos_token_id == Some(sampled_token_id) {
+                self.remaining_public_outputs = 0;
+                self.last_stop_reason = Some("eos".to_string());
+                true
+            } else if self.remaining_public_outputs == 0 {
+                self.last_stop_reason = Some("max_new_tokens".to_string());
+                true
+            } else {
+                false
+            };
+            let feedback_depth = input_signal
+                .feedback_depth()
+                .checked_add(1)
+                .ok_or(VulkanResidentGreedyFeedbackLoopRunnerError::FeedbackDepthOverflow)?;
+            let feedback = VulkanResidentGreedyPrivateFeedbackSignal {
+                id: format!("feedback_{}", self.feedback_counter),
+                token_id: sampled_token_id,
+                source_public_output_id: public.id.clone(),
+                feedback_depth,
+                closes_loop_after_processing: close_after_feedback,
+                stop_reason: self
+                    .last_stop_reason
+                    .clone()
+                    .filter(|_| close_after_feedback),
+            };
+            self.feedback_counter += 1;
+            self.private_feedback_queue.push_back(feedback.clone());
+            self.private_feedback_history.push(feedback.clone());
+
+            sampler_run = Some(run);
+            public_output = Some(public);
+            private_feedback = Some(feedback);
+        }
+
+        if input_signal.closes_loop_after_processing() {
+            self.loop_open = false;
+            self.last_stop_reason = input_signal
+                .stop_reason()
+                .cloned()
+                .or_else(|| self.last_stop_reason.clone())
+                .or_else(|| Some("max_new_tokens".to_string()));
+        }
+
+        let tick = VulkanResidentGreedyRunningStreamTick {
+            stream_id: self.stream_id.clone(),
+            stream_tick: Some(stream_tick),
+            status: VulkanResidentGreedyRunningStreamTickStatus::Processed,
+            input_signal: Some(input_signal),
+            tick_run: Some(tick_run),
+            public_output,
+            private_feedback,
+            sampler_run,
+            stop_reason: self.last_stop_reason.clone(),
+        };
+        self.ticks.push(tick.clone());
+        Ok(tick)
+    }
+
+    pub fn run_until_idle(
+        &mut self,
+        device: &VulkanComputeDevice,
+    ) -> Result<
+        Vec<VulkanResidentGreedyRunningStreamTick>,
+        VulkanResidentGreedyFeedbackLoopRunnerError,
+    > {
+        let start = self.ticks.len();
+        while !self.external_input_queue.is_empty() || !self.private_feedback_queue.is_empty() {
+            self.tick(device)?;
+        }
+        self.tick(device)?;
+        Ok(self.ticks[start..].to_vec())
+    }
+
+    pub fn run_prompt(
+        &mut self,
+        device: &VulkanComputeDevice,
+        prompt_token_ids: &[u32],
+        max_new_tokens: usize,
+        eos_token_id: Option<u32>,
+    ) -> Result<VulkanResidentGreedyRunningStreamRun, VulkanResidentGreedyFeedbackLoopRunnerError>
+    {
+        let start_public = self.public_outputs.len();
+        let start_feedback = self.private_feedback_history.len();
+        let start_stream_tick = self.next_stream_tick;
+        self.inject_prompt(prompt_token_ids, max_new_tokens, eos_token_id)?;
+        let ticks = self.run_until_idle(device)?;
+        let public_outputs = self.public_outputs[start_public..].to_vec();
+        let private_feedback = self.private_feedback_history[start_feedback..].to_vec();
+        let generated_token_ids = public_outputs
+            .iter()
+            .map(|output| output.token_id)
+            .collect::<Vec<_>>();
+        let output_token_ids = prompt_token_ids
+            .iter()
+            .copied()
+            .chain(generated_token_ids.iter().copied())
+            .collect::<Vec<_>>();
+
+        Ok(VulkanResidentGreedyRunningStreamRun {
+            stream_id: self.stream_id.clone(),
+            prompt_token_ids: prompt_token_ids.to_vec(),
+            generated_token_ids,
+            output_token_ids,
+            stop_reason: self
+                .last_stop_reason
+                .clone()
+                .unwrap_or_else(|| "max_new_tokens".to_string()),
+            start_stream_tick,
+            next_stream_tick: self.next_stream_tick,
+            ticks,
+            public_outputs,
+            private_feedback,
+        })
+    }
+
+    pub fn pending_external_input_count(&self) -> usize {
+        self.external_input_queue.len()
+    }
+
+    pub fn pending_private_feedback_count(&self) -> usize {
+        self.private_feedback_queue.len()
+    }
+
+    pub fn public_outputs(&self) -> &[VulkanResidentGreedyPublicOutputSignal] {
+        &self.public_outputs
+    }
+
+    pub fn private_feedback_history(&self) -> &[VulkanResidentGreedyPrivateFeedbackSignal] {
+        &self.private_feedback_history
+    }
+
+    pub fn ticks(&self) -> &[VulkanResidentGreedyRunningStreamTick] {
+        &self.ticks
+    }
+
+    fn next_input_signal(&mut self) -> Option<VulkanResidentGreedyRunningStreamInputSignal> {
+        if let Some(signal) = self.external_input_queue.pop_front() {
+            return Some(VulkanResidentGreedyRunningStreamInputSignal::External(
+                signal,
+            ));
+        }
+        self.private_feedback_queue
+            .pop_front()
+            .map(VulkanResidentGreedyRunningStreamInputSignal::PrivateFeedback)
+    }
+
+    fn ensure_stream_tick_capacity(
+        &self,
+        stream_tick: u64,
+    ) -> Result<(), VulkanResidentGreedyFeedbackLoopRunnerError> {
+        if stream_tick >= self.processor.dynamic_state_capacity_activations as u64 {
+            return Err(
+                VulkanResidentGreedyFeedbackLoopRunnerError::StreamStateCapacityExceeded {
+                    stream_tick,
+                    dynamic_state_capacity_activations: self
+                        .processor
+                        .dynamic_state_capacity_activations,
+                },
+            );
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanResidentGreedyExternalInputSignal {
+    pub id: String,
+    pub token_id: u32,
+    pub origin: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanResidentGreedyPublicOutputSignal {
+    pub id: String,
+    pub token_id: u32,
+    pub source_stream_tick: u64,
+    pub sampler_run: VulkanResidentGreedySamplerRun,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanResidentGreedyPrivateFeedbackSignal {
+    pub id: String,
+    pub token_id: u32,
+    pub source_public_output_id: String,
+    pub feedback_depth: u32,
+    pub closes_loop_after_processing: bool,
+    pub stop_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VulkanResidentGreedyRunningStreamInputSignal {
+    External(VulkanResidentGreedyExternalInputSignal),
+    PrivateFeedback(VulkanResidentGreedyPrivateFeedbackSignal),
+}
+
+impl VulkanResidentGreedyRunningStreamInputSignal {
+    pub fn token_id(&self) -> u32 {
+        match self {
+            Self::External(signal) => signal.token_id,
+            Self::PrivateFeedback(signal) => signal.token_id,
+        }
+    }
+
+    pub fn route(&self) -> VulkanResidentGreedyPromptEventInputRoute {
+        match self {
+            Self::External(_) => VulkanResidentGreedyPromptEventInputRoute::ExternalInput,
+            Self::PrivateFeedback(_) => VulkanResidentGreedyPromptEventInputRoute::PrivateFeedback,
+        }
+    }
+
+    pub fn feedback_depth(&self) -> u32 {
+        match self {
+            Self::External(_) => 0,
+            Self::PrivateFeedback(signal) => signal.feedback_depth,
+        }
+    }
+
+    pub fn closes_loop_after_processing(&self) -> bool {
+        match self {
+            Self::External(_) => false,
+            Self::PrivateFeedback(signal) => signal.closes_loop_after_processing,
+        }
+    }
+
+    pub fn stop_reason(&self) -> Option<&String> {
+        match self {
+            Self::External(_) => None,
+            Self::PrivateFeedback(signal) => signal.stop_reason.as_ref(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VulkanResidentGreedyRunningStreamTickStatus {
+    Processed,
+    Idle,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanResidentGreedyRunningStreamTick {
+    pub stream_id: String,
+    pub stream_tick: Option<u64>,
+    pub status: VulkanResidentGreedyRunningStreamTickStatus,
+    pub input_signal: Option<VulkanResidentGreedyRunningStreamInputSignal>,
+    pub tick_run: Option<VulkanResidentSingleTokenTickRun>,
+    pub public_output: Option<VulkanResidentGreedyPublicOutputSignal>,
+    pub private_feedback: Option<VulkanResidentGreedyPrivateFeedbackSignal>,
+    pub sampler_run: Option<VulkanResidentGreedySamplerRun>,
+    pub stop_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanResidentGreedyRunningStreamRun {
+    pub stream_id: String,
+    pub prompt_token_ids: Vec<u32>,
+    pub generated_token_ids: Vec<u32>,
+    pub output_token_ids: Vec<u32>,
+    pub stop_reason: String,
+    pub start_stream_tick: u64,
+    pub next_stream_tick: u64,
+    pub ticks: Vec<VulkanResidentGreedyRunningStreamTick>,
+    pub public_outputs: Vec<VulkanResidentGreedyPublicOutputSignal>,
+    pub private_feedback: Vec<VulkanResidentGreedyPrivateFeedbackSignal>,
 }
 
 pub struct VulkanMountedPlacedResidentPedalRunner {
@@ -9614,6 +10067,121 @@ mod tests {
         assert_eq!(run.tick_runs[2].public_output_token_id, None);
         assert_eq!(run.tick_runs[2].private_feedback_token_id, None);
         assert!(run.tick_runs[2].sampler_run.is_none());
+    }
+
+    #[test]
+    fn resident_greedy_running_stream_accepts_later_input_without_resetting_state() {
+        let device = match VulkanComputeDevice::new() {
+            Ok(device) => device,
+            Err(error) => {
+                eprintln!("skipping resident greedy running stream: {error}");
+                return;
+            }
+        };
+        let Some(processor) =
+            create_lfm2_resident_greedy_stream_processor(&device, "resident greedy running stream")
+        else {
+            return;
+        };
+        let mut stream = processor.into_running_stream("stream_0");
+        assert_eq!(stream.stream_id, "stream_0");
+        assert_eq!(stream.next_stream_tick, 0);
+        assert_eq!(stream.pending_external_input_count(), 0);
+        assert_eq!(stream.pending_private_feedback_count(), 0);
+
+        let first = stream.run_prompt(&device, &[1], 1, None).unwrap();
+        assert_eq!(first.stream_id, "stream_0");
+        assert_eq!(first.prompt_token_ids, vec![1]);
+        assert_eq!(first.generated_token_ids.len(), 1);
+        assert_eq!(
+            first.output_token_ids,
+            vec![1, first.generated_token_ids[0]]
+        );
+        assert_eq!(first.stop_reason, "max_new_tokens");
+        assert_eq!(first.start_stream_tick, 0);
+        assert_eq!(first.next_stream_tick, 2);
+        assert_eq!(first.ticks.len(), 3);
+        assert_eq!(
+            first.ticks[0].status,
+            VulkanResidentGreedyRunningStreamTickStatus::Processed
+        );
+        assert_eq!(first.ticks[0].stream_tick, Some(0));
+        assert_eq!(
+            first.ticks[0].input_signal.as_ref().unwrap().route(),
+            VulkanResidentGreedyPromptEventInputRoute::ExternalInput
+        );
+        assert_eq!(
+            first.ticks[0].public_output.as_ref().unwrap().token_id,
+            first.generated_token_ids[0]
+        );
+        assert_eq!(first.ticks[1].stream_tick, Some(1));
+        assert_eq!(
+            first.ticks[1].input_signal.as_ref().unwrap().route(),
+            VulkanResidentGreedyPromptEventInputRoute::PrivateFeedback
+        );
+        assert_eq!(
+            first.ticks[1].input_signal.as_ref().unwrap().token_id(),
+            first.generated_token_ids[0]
+        );
+        assert_eq!(
+            first.ticks[2].status,
+            VulkanResidentGreedyRunningStreamTickStatus::Idle
+        );
+        assert_eq!(first.ticks[2].stream_tick, None);
+        assert_eq!(stream.next_stream_tick, 2);
+        assert_eq!(stream.public_outputs().len(), 1);
+        assert_eq!(stream.private_feedback_history().len(), 1);
+        assert_eq!(stream.pending_external_input_count(), 0);
+        assert_eq!(stream.pending_private_feedback_count(), 0);
+
+        let second = stream.run_prompt(&device, &[36_309], 1, None).unwrap();
+        assert_eq!(second.prompt_token_ids, vec![36_309]);
+        assert_eq!(second.generated_token_ids.len(), 1);
+        assert_eq!(
+            second.output_token_ids,
+            vec![36_309, second.generated_token_ids[0]]
+        );
+        assert_eq!(second.stop_reason, "max_new_tokens");
+        assert_eq!(second.start_stream_tick, 2);
+        assert_eq!(second.next_stream_tick, 4);
+        assert_eq!(second.ticks.len(), 3);
+        assert_eq!(second.ticks[0].stream_tick, Some(2));
+        assert_eq!(
+            second.ticks[0].input_signal.as_ref().unwrap().token_id(),
+            36_309
+        );
+        assert_eq!(
+            second.ticks[0].input_signal.as_ref().unwrap().route(),
+            VulkanResidentGreedyPromptEventInputRoute::ExternalInput
+        );
+        assert_eq!(second.ticks[1].stream_tick, Some(3));
+        assert_eq!(
+            second.ticks[1].input_signal.as_ref().unwrap().route(),
+            VulkanResidentGreedyPromptEventInputRoute::PrivateFeedback
+        );
+        assert_eq!(
+            second.ticks[2].status,
+            VulkanResidentGreedyRunningStreamTickStatus::Idle
+        );
+        assert_eq!(second.ticks[2].stream_tick, None);
+        assert_eq!(stream.next_stream_tick, 4);
+        assert_eq!(stream.public_outputs().len(), 2);
+        assert_eq!(stream.private_feedback_history().len(), 2);
+        assert_eq!(stream.ticks().len(), 6);
+        assert!(!stream.loop_open);
+        assert_eq!(stream.last_stop_reason.as_deref(), Some("max_new_tokens"));
+
+        stream.inject_prompt(&[1], 0, None).unwrap();
+        let error = stream.tick(&device).unwrap_err();
+        assert!(matches!(
+            error,
+            VulkanResidentGreedyFeedbackLoopRunnerError::StreamStateCapacityExceeded {
+                stream_tick: 4,
+                dynamic_state_capacity_activations: 4,
+            }
+        ));
+        assert_eq!(stream.pending_external_input_count(), 1);
+        assert_eq!(stream.next_stream_tick, 4);
     }
 
     #[test]
