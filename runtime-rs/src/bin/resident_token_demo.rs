@@ -2,7 +2,7 @@ use std::error::Error;
 use std::io;
 
 use llmoop_runtime::{
-    VulkanComputeDevice, VulkanResidentGreedyRunningStreamRun,
+    VulkanComputeDevice, VulkanResidentTokenInputEvent, VulkanResidentTokenStreamRun,
     create_default_lfm2_5_230m_resident_greedy_stream_processor,
 };
 
@@ -62,19 +62,25 @@ fn run() -> Result<(), Box<dyn Error>> {
         processor.dynamic_state_capacity_activations
     );
 
-    let mut stream = processor.into_running_stream("demo_stream");
-    let first = stream.run_prompt(&device, &args.prompt, args.max_new_tokens, None)?;
+    let mut stream = processor.into_token_stream("demo_stream");
+    let first = stream.submit_external_event(
+        &device,
+        VulkanResidentTokenInputEvent::new("first", args.prompt, args.max_new_tokens)
+            .with_origin("cli"),
+    )?;
     print_run("first", &first);
 
-    let second = stream.run_prompt(&device, &args.then_prompt, args.then_max_new_tokens, None)?;
+    let second = stream.submit_external_event(
+        &device,
+        VulkanResidentTokenInputEvent::new("second", args.then_prompt, args.then_max_new_tokens)
+            .with_origin("cli"),
+    )?;
     print_run("second", &second);
 
-    println!("stream.next_stream_tick={}", stream.next_stream_tick);
-    println!("stream.public_outputs={}", stream.public_outputs().len());
-    println!(
-        "stream.private_feedback_history={}",
-        stream.private_feedback_history().len()
-    );
+    let snapshot = stream.snapshot();
+    println!("stream.next_stream_tick={}", snapshot.next_stream_tick);
+    println!("stream.public_outputs={}", snapshot.total_public_outputs);
+    println!("stream.idle={}", snapshot.idle);
 
     Ok(())
 }
@@ -145,23 +151,19 @@ fn parse_token_list(value: &str) -> Result<Vec<u32>, String> {
         .collect()
 }
 
-fn print_run(label: &str, run: &VulkanResidentGreedyRunningStreamRun) {
-    let processed_ticks = run
-        .ticks
-        .iter()
-        .filter(|tick| tick.stream_tick.is_some())
-        .count();
-    let idle_ticks = run.ticks.len() - processed_ticks;
-
+fn print_run(label: &str, run: &VulkanResidentTokenStreamRun) {
     println!(
-        "{label}.prompt={:?} {label}.generated={:?} {label}.output={:?}",
-        run.prompt_token_ids, run.generated_token_ids, run.output_token_ids
+        "{label}.input_event={} {label}.tokens={:?} {label}.generated={:?}",
+        run.input_event.id, run.input_event.token_ids, run.generated_token_ids
     );
     println!(
         "{label}.start_stream_tick={} {label}.next_stream_tick={} {label}.stop_reason={}",
         run.start_stream_tick, run.next_stream_tick, run.stop_reason
     );
-    println!("{label}.processed_ticks={processed_ticks} {label}.idle_ticks={idle_ticks}");
+    println!(
+        "{label}.processed_ticks={} {label}.idle_ticks={}",
+        run.processed_tick_count, run.idle_tick_count
+    );
 }
 
 fn print_usage() {
