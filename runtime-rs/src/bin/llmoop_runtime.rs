@@ -26,7 +26,8 @@ use llmoop_runtime::{
     VulkanResidentGreedyModelPackageDeviceSlice, VulkanResidentGreedyModelPackageManifest,
     VulkanResidentHfTokenizerTextCodec, VulkanResidentTokenEngine,
     VulkanResidentTokenEngineRunBudget, VulkanResidentTokenEngineRunStopCondition,
-    VulkanResidentTokenTextCodec, VulkanReusableKernelArtifactManifest,
+    VulkanResidentTokenInputEvent, VulkanResidentTokenTextCodec,
+    VulkanReusableKernelArtifactManifest,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -357,14 +358,12 @@ fn execute_placed_prompt_run(
         )?;
     let setup_time_ns = elapsed_nanos_u64(setup_start);
     let run_start = Instant::now();
-    let session_run = stream.run_prompt_event_bounded(
-        prompt_ids,
-        args.max_new_tokens,
-        None,
+    let submitted_run = stream.submit_input_event_bounded(
+        VulkanResidentTokenInputEvent::new("prompt", prompt_ids.to_vec(), args.max_new_tokens),
         args.max_scheduler_turns,
     )?;
     let run_time_ns = elapsed_nanos_u64(run_start);
-    let run = session_run.run;
+    let run = submitted_run.session_run.run;
     let generated_text = codec.decode_tokens(&run.generated_token_ids)?;
     let output_text = codec.decode_tokens(&run.output_token_ids)?;
     let total_scheduler_turns = run
