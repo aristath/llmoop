@@ -231,6 +231,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         print_text(&turn.generated_text);
     } else {
         print_text(&turn.output_text);
+        print_prompt_timing_profile(&timing);
     }
 
     Ok(())
@@ -417,6 +418,8 @@ fn run_placed_prompt(
         print_text(&generated_text);
     } else {
         print_text(&output_text);
+        print_prompt_timing_profile(&timing);
+        print_placed_pedal_timing_profile(&pedal_timing_summaries, 5);
     }
 
     Ok(())
@@ -1965,6 +1968,57 @@ fn print_text(text: &str) {
     if !text.ends_with('\n') {
         println!();
     }
+}
+
+fn print_prompt_timing_profile(timing: &RuntimePromptTimingReport) {
+    println!("profile:");
+    println!("  setup_ms={:.3}", nanos_to_millis(timing.setup_time_ns));
+    println!("  run_ms={:.3}", nanos_to_millis(timing.run_time_ns));
+    println!("  total_ms={:.3}", nanos_to_millis(timing.total_time_ns));
+    println!("  generated_tokens={}", timing.generated_token_count);
+    println!("  ticks={}", timing.tick_count);
+    println!("  scheduler_turns={}", timing.scheduler_turn_count);
+    if let Some(average) = timing.average_generated_token_time_ns {
+        println!("  avg_generated_token_ms={:.3}", nanos_to_millis(average));
+    }
+    if let Some(average) = timing.average_tick_time_ns {
+        println!("  avg_tick_ms={:.3}", nanos_to_millis(average));
+    }
+    if let Some(average) = timing.average_scheduler_turn_time_ns {
+        println!("  avg_scheduler_turn_ms={:.3}", nanos_to_millis(average));
+    }
+}
+
+fn print_placed_pedal_timing_profile(
+    summaries: &[RuntimePlacedPedalTimingSummaryReport],
+    max_rows: usize,
+) {
+    if summaries.is_empty() || max_rows == 0 {
+        return;
+    }
+    println!("top_pedals:");
+    for summary in summaries.iter().take(max_rows) {
+        println!(
+            "  {}:{} total_ms={:.3} ticks={} dispatches={} avg_tick_ms={} avg_dispatch_ms={}",
+            summary.device_id,
+            summary.pedal_id,
+            nanos_to_millis(summary.total_run_time_ns),
+            summary.tick_count,
+            summary.dispatch_count,
+            optional_nanos_to_millis(summary.average_tick_time_ns),
+            optional_nanos_to_millis(summary.average_dispatch_time_ns)
+        );
+    }
+}
+
+fn optional_nanos_to_millis(value: Option<u64>) -> String {
+    value
+        .map(|nanos| format!("{:.3}", nanos_to_millis(nanos)))
+        .unwrap_or_else(|| "n/a".to_string())
+}
+
+fn nanos_to_millis(nanos: u64) -> f64 {
+    nanos as f64 / 1_000_000.0
 }
 
 fn engine_stop_label(stop: VulkanResidentTokenEngineRunStopCondition) -> &'static str {
