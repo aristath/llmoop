@@ -5,15 +5,17 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use llmoop_runtime::{
-    CircuitPort, PedalCablePlacement, PedalPlacement, RuntimeAvailableDevice,
-    RuntimeAvailableMemoryHeap, RuntimeBoundDevice, RuntimeCableRouteTarget, RuntimeCableRoutes,
-    RuntimeCapacityProfileSummary, RuntimeDeviceBindings, RuntimePedalPortSummary,
-    RuntimeSourcePedal, VulkanComputeDevice, VulkanResidentGreedyInProcessPlacedModelPackage,
-    VulkanResidentGreedyModelPackage, VulkanResidentGreedyModelPackageDeviceSlice,
-    VulkanResidentGreedyModelPackageManifest, VulkanResidentHfTokenizerTextCodec,
-    VulkanResidentTokenEngine, VulkanResidentTokenEngineRunBudget,
-    VulkanResidentTokenEngineRunStopCondition, VulkanResidentTokenTextCodec,
-    VulkanReusableKernelArtifactManifest,
+    CircuitPort, PedalCablePlacement, PedalPlacement, RUNTIME_TOPOLOGY_SCHEMA,
+    RuntimeAvailableDevice, RuntimeAvailableMemoryHeap, RuntimeBoundDevice,
+    RuntimeCableRouteTarget, RuntimeCableRoutes, RuntimeCapacityProfileSummary,
+    RuntimeCompiledPedalboardSummary, RuntimeDeviceBindings, RuntimeEffectivePedalboardTopology,
+    RuntimePatchControls, RuntimePatchDuplicateAfterControl, RuntimePatchSourceChainEntry,
+    RuntimePedalPortSummary, RuntimeSourcePedal, RuntimeTopologyReport, VulkanComputeDevice,
+    VulkanResidentGreedyInProcessPlacedModelPackage, VulkanResidentGreedyModelPackage,
+    VulkanResidentGreedyModelPackageDeviceSlice, VulkanResidentGreedyModelPackageManifest,
+    VulkanResidentHfTokenizerTextCodec, VulkanResidentTokenEngine,
+    VulkanResidentTokenEngineRunBudget, VulkanResidentTokenEngineRunStopCondition,
+    VulkanResidentTokenTextCodec, VulkanReusableKernelArtifactManifest,
 };
 use serde_json::{Value, json};
 
@@ -415,66 +417,66 @@ fn inspect_runtime_topology(
     let source_pedals = source_pedals_report(&manifest);
     let capacity_profiles = capacity_profiles_report(&manifest);
 
-    let payload = json!({
-        "ok": true,
-        "schema": "llmoop.runtime_topology.v1",
-        "package_manifest": package_manifest,
-        "package_root": manifest_dir,
-        "package_id": manifest.package_id,
-        "compiled_schema": manifest.schema,
-        "config_path": manifest.config_path,
-        "tokenizer": manifest.tokenizer,
-        "available_devices": available_devices,
-        "compiled": {
-            "wiring": manifest.circuit_graph.wiring,
-            "default_device_id": manifest.placement.default_device_id,
-            "pedal_devices": manifest.placement.pedal_devices,
-            "source_pedal_count": source_pedals.len(),
-            "source_pedals": source_pedals,
-            "dynamic_state_capacity_activations": manifest.dynamic_state_capacity_activations,
-            "capacity_profiles": capacity_profiles,
+    let payload = RuntimeTopologyReport {
+        ok: true,
+        schema: RUNTIME_TOPOLOGY_SCHEMA.to_string(),
+        package_manifest: package_manifest.to_path_buf(),
+        package_root: manifest_dir.to_path_buf(),
+        package_id: manifest.package_id.clone(),
+        compiled_schema: manifest.schema.clone(),
+        config_path: manifest.config_path.clone(),
+        tokenizer: serde_json::to_value(&manifest.tokenizer)?,
+        available_devices,
+        compiled: RuntimeCompiledPedalboardSummary {
+            wiring: manifest.circuit_graph.wiring.clone(),
+            default_device_id: manifest.placement.default_device_id.clone(),
+            pedal_devices: manifest.placement.pedal_devices.clone(),
+            source_pedal_count: source_pedals.len(),
+            source_pedals,
+            dynamic_state_capacity_activations: manifest.dynamic_state_capacity_activations,
+            capacity_profiles,
         },
-        "runtime_patch_controls": runtime_patch_report(args),
-        "runtime_patch": patch,
-        "effective": {
-            "wiring": placement.wiring,
-            "pedal_count": placement.pedals.len(),
-            "cable_count": placement.cables.len(),
-            "local_cable_count": placement.local_cable_count,
-            "cross_device_cable_count": placement.cross_device_cable_count,
-            "device_count": placement_device_ids.len(),
-            "device_ids": placement_device_ids,
-            "device_bindings": device_bindings,
-            "cable_routes": runtime_routes,
-            "pedals": placement.pedals,
-            "cables": placement.cables,
+        runtime_patch_controls: runtime_patch_report(args),
+        runtime_patch: patch,
+        effective: RuntimeEffectivePedalboardTopology {
+            wiring: placement.wiring,
+            pedal_count: placement.pedals.len(),
+            cable_count: placement.cables.len(),
+            local_cable_count: placement.local_cable_count,
+            cross_device_cable_count: placement.cross_device_cable_count,
+            device_count: placement_device_ids.len(),
+            device_ids: placement_device_ids,
+            device_bindings,
+            cable_routes: runtime_routes,
+            pedals: placement.pedals,
+            cables: placement.cables,
         },
-    });
+    };
 
     if args.json {
         println!("{}", serde_json::to_string_pretty(&payload)?);
     } else {
-        println!("package_id={}", payload["package_id"]);
-        println!(
-            "source_pedal_count={}",
-            payload["compiled"]["source_pedal_count"]
-        );
-        println!(
-            "effective_pedal_count={}",
-            payload["effective"]["pedal_count"]
-        );
-        println!("device_count={}", payload["effective"]["device_count"]);
+        println!("package_id={}", payload.package_id);
+        println!("source_pedal_count={}", payload.compiled.source_pedal_count);
+        println!("effective_pedal_count={}", payload.effective.pedal_count);
+        println!("device_count={}", payload.effective.device_count);
         println!(
             "cross_device_cable_count={}",
-            payload["effective"]["cross_device_cable_count"]
+            payload.effective.cross_device_cable_count
         );
         println!(
             "same_physical_target_cable_count={}",
-            payload["effective"]["cable_routes"]["same_physical_target_cable_count"]
+            payload
+                .effective
+                .cable_routes
+                .same_physical_target_cable_count
         );
         println!(
             "cross_physical_target_cable_count={}",
-            payload["effective"]["cable_routes"]["cross_physical_target_cable_count"]
+            payload
+                .effective
+                .cable_routes
+                .cross_physical_target_cable_count
         );
     }
 
@@ -1295,25 +1297,32 @@ fn runtime_report_default_vulkan_physical_device_index(args: &Args) -> Option<us
         .or_else(|| runtime_default_vulkan_physical_device_index().ok())
 }
 
-fn runtime_patch_report(args: &Args) -> Value {
-    json!({
-        "default_device_id": args.default_device_id.clone(),
-        "pedal_devices": args.pedal_devices.clone(),
-        "source_chain": args.source_chain.as_ref().map(|source_chain| {
-            source_chain.iter().map(|(instance_id, source_pedal_id)| {
-                json!({
-                    "instance_id": instance_id,
-                    "source_pedal_id": source_pedal_id,
-                })
-            }).collect::<Vec<_>>()
+fn runtime_patch_report(args: &Args) -> RuntimePatchControls {
+    RuntimePatchControls {
+        default_device_id: args.default_device_id.clone(),
+        pedal_devices: args.pedal_devices.clone(),
+        source_chain: args.source_chain.as_ref().map(|source_chain| {
+            source_chain
+                .iter()
+                .map(
+                    |(instance_id, source_pedal_id)| RuntimePatchSourceChainEntry {
+                        instance_id: instance_id.clone(),
+                        source_pedal_id: source_pedal_id.clone(),
+                    },
+                )
+                .collect::<Vec<_>>()
         }),
-        "duplicate_after": args.duplicate_after.iter().map(|(after_instance_id, new_instance_id)| {
-            json!({
-                "after_instance_id": after_instance_id,
-                "new_instance_id": new_instance_id,
-            })
-        }).collect::<Vec<_>>(),
-    })
+        duplicate_after: args
+            .duplicate_after
+            .iter()
+            .map(
+                |(after_instance_id, new_instance_id)| RuntimePatchDuplicateAfterControl {
+                    after_instance_id: after_instance_id.clone(),
+                    new_instance_id: new_instance_id.clone(),
+                },
+            )
+            .collect::<Vec<_>>(),
+    }
 }
 
 fn runtime_device_bindings_report(

@@ -27,6 +27,7 @@ pub const STREAM_CIRCUIT_PLACEMENT_SCHEMA: &str = "llmoop.stream_circuit_placeme
 pub const STREAM_CIRCUIT_RUNTIME_PATCH_SCHEMA: &str = "llmoop.stream_circuit_runtime_patch.v1";
 pub const RUNTIME_CABLE_ROUTES_SCHEMA: &str = "llmoop.runtime_cable_routes.v1";
 pub const RUNTIME_DEVICE_BINDINGS_SCHEMA: &str = "llmoop.runtime_device_bindings.v1";
+pub const RUNTIME_TOPOLOGY_SCHEMA: &str = "llmoop.runtime_topology.v1";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CircuitArtifactError(pub String);
@@ -1765,6 +1766,69 @@ pub struct RuntimeSourcePedal {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimePatchSourceChainEntry {
+    pub instance_id: String,
+    pub source_pedal_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimePatchDuplicateAfterControl {
+    pub after_instance_id: String,
+    pub new_instance_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimePatchControls {
+    pub default_device_id: Option<String>,
+    pub pedal_devices: BTreeMap<String, String>,
+    pub source_chain: Option<Vec<RuntimePatchSourceChainEntry>>,
+    pub duplicate_after: Vec<RuntimePatchDuplicateAfterControl>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RuntimeCompiledPedalboardSummary {
+    pub wiring: String,
+    pub default_device_id: String,
+    pub pedal_devices: BTreeMap<String, String>,
+    pub source_pedal_count: usize,
+    pub source_pedals: Vec<RuntimeSourcePedal>,
+    pub dynamic_state_capacity_activations: usize,
+    pub capacity_profiles: Vec<RuntimeCapacityProfileSummary>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeEffectivePedalboardTopology {
+    pub wiring: String,
+    pub pedal_count: usize,
+    pub cable_count: usize,
+    pub local_cable_count: usize,
+    pub cross_device_cable_count: usize,
+    pub device_count: usize,
+    pub device_ids: Vec<String>,
+    pub device_bindings: RuntimeDeviceBindings,
+    pub cable_routes: RuntimeCableRoutes,
+    pub pedals: Vec<PedalPlacement>,
+    pub cables: Vec<PedalCablePlacement>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RuntimeTopologyReport {
+    pub ok: bool,
+    pub schema: String,
+    pub package_manifest: PathBuf,
+    pub package_root: PathBuf,
+    pub package_id: String,
+    pub compiled_schema: String,
+    pub config_path: String,
+    pub tokenizer: Value,
+    pub available_devices: Vec<RuntimeAvailableDevice>,
+    pub compiled: RuntimeCompiledPedalboardSummary,
+    pub runtime_patch_controls: RuntimePatchControls,
+    pub runtime_patch: StreamCircuitRuntimePatch,
+    pub effective: RuntimeEffectivePedalboardTopology,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeCapacityProfileSummary {
     pub min_dynamic_state_capacity_activations: usize,
     pub max_dynamic_state_capacity_activations: usize,
@@ -2793,6 +2857,150 @@ mod tests {
         assert_eq!(payload["min_dynamic_state_capacity_activations"], 4);
         assert_eq!(payload["max_dynamic_state_capacity_activations"], 64);
         assert_eq!(payload["shader_override_count"], 14);
+    }
+
+    #[test]
+    fn runtime_topology_report_serializes_ui_facing_contract() {
+        let logical_device_ids = vec!["gpu0".to_string()];
+        let bindings = RuntimeDeviceBindings::from_vulkan_targets(
+            &logical_device_ids,
+            &BTreeMap::new(),
+            Some(0),
+            |target| {
+                if let Some(index) = target.strip_prefix("vulkan:") {
+                    return index.parse::<usize>().map(Some).map_err(|error| {
+                        format!("invalid Vulkan physical device reference {target:?}: {error}")
+                    });
+                }
+                Ok(None)
+            },
+        );
+        let source_pedal = RuntimeSourcePedal {
+            pedal_index: 0,
+            pedal_id: "layer_00".to_string(),
+            operator_type: "layer".to_string(),
+            implementation: "vulkan_resident".to_string(),
+            behavioral_role: "transformer_layer".to_string(),
+            source_layer_index: 0,
+            circuit_id: "layer_00_circuit_v1".to_string(),
+            input_ports: Vec::new(),
+            output_ports: Vec::new(),
+            state_port_count: 0,
+            parameter_ref_count: 0,
+            node_count: 0,
+            kernel_count: 0,
+        };
+        let report = RuntimeTopologyReport {
+            ok: true,
+            schema: RUNTIME_TOPOLOGY_SCHEMA.to_string(),
+            package_manifest: PathBuf::from("package.json"),
+            package_root: PathBuf::from("."),
+            package_id: "model-test".to_string(),
+            compiled_schema: "llmoop.vulkan_resident_greedy_model_package.v1".to_string(),
+            config_path: "config.json".to_string(),
+            tokenizer: serde_json::json!({"path": "tokenizer"}),
+            available_devices: vec![RuntimeAvailableDevice {
+                device_id: "gpu0".to_string(),
+                backend: "vulkan_compute".to_string(),
+                available: true,
+                runtime_device_id: Some("gpu0".to_string()),
+                physical_device_id: Some("vulkan:0".to_string()),
+                physical_device_index: Some(0),
+                device_name: Some("Radeon Test Device".to_string()),
+                device_type: Some("discrete_gpu".to_string()),
+                vendor_id: Some(4098),
+                raw_device_id: Some(29_567),
+                api_version: Some(4_203_000),
+                driver_version: Some(1_024),
+                compute_queue_family_indices: Some(vec![0]),
+                memory_heaps: Some(Vec::new()),
+                selected_by_default: Some(true),
+                selected_by_runtime: Some(true),
+                runtime_binding: Some("default_local_vulkan_target".to_string()),
+                can_host_runtime_pedals_on_physical_device: Some(true),
+                notes: Vec::new(),
+                error: None,
+            }],
+            compiled: RuntimeCompiledPedalboardSummary {
+                wiring: "series".to_string(),
+                default_device_id: "runtime_default".to_string(),
+                pedal_devices: BTreeMap::new(),
+                source_pedal_count: 1,
+                source_pedals: vec![source_pedal],
+                dynamic_state_capacity_activations: 16,
+                capacity_profiles: vec![RuntimeCapacityProfileSummary {
+                    min_dynamic_state_capacity_activations: 1,
+                    max_dynamic_state_capacity_activations: 16,
+                    shader_override_count: 1,
+                }],
+            },
+            runtime_patch_controls: RuntimePatchControls {
+                default_device_id: Some("gpu0".to_string()),
+                pedal_devices: BTreeMap::new(),
+                source_chain: None,
+                duplicate_after: vec![RuntimePatchDuplicateAfterControl {
+                    after_instance_id: "layer_00".to_string(),
+                    new_instance_id: "layer_00_repeat".to_string(),
+                }],
+            },
+            runtime_patch: StreamCircuitRuntimePatch {
+                schema: STREAM_CIRCUIT_RUNTIME_PATCH_SCHEMA.to_string(),
+                wiring: "series".to_string(),
+                default_device_id: "gpu0".to_string(),
+                instances: vec![StreamCircuitPedalInstance {
+                    instance_id: "layer_00".to_string(),
+                    source_pedal_id: "layer_00".to_string(),
+                    device_id: "gpu0".to_string(),
+                    state_policy: StreamCircuitPedalInstanceStatePolicy::Fresh,
+                }],
+            },
+            effective: RuntimeEffectivePedalboardTopology {
+                wiring: "series".to_string(),
+                pedal_count: 1,
+                cable_count: 0,
+                local_cable_count: 0,
+                cross_device_cable_count: 0,
+                device_count: 1,
+                device_ids: vec!["gpu0".to_string()],
+                device_bindings: bindings,
+                cable_routes: RuntimeCableRoutes {
+                    schema: RUNTIME_CABLE_ROUTES_SCHEMA.to_string(),
+                    cable_count: 0,
+                    logical_local_cable_count: 0,
+                    logical_cross_device_cable_count: 0,
+                    same_physical_target_cable_count: 0,
+                    cross_physical_target_cable_count: 0,
+                    unresolved_target_cable_count: 0,
+                    routes: Vec::new(),
+                },
+                pedals: vec![PedalPlacement {
+                    pedal_index: 0,
+                    pedal_id: "layer_00".to_string(),
+                    circuit_id: "layer_00_circuit_v1".to_string(),
+                    operator_type: "layer".to_string(),
+                    device_id: "gpu0".to_string(),
+                }],
+                cables: Vec::new(),
+            },
+        };
+
+        let payload = serde_json::to_value(&report).unwrap();
+
+        assert_eq!(payload["schema"], RUNTIME_TOPOLOGY_SCHEMA);
+        assert_eq!(payload["compiled"]["default_device_id"], "runtime_default");
+        assert_eq!(
+            payload["available_devices"][0]["physical_device_id"],
+            "vulkan:0"
+        );
+        assert_eq!(
+            payload["runtime_patch_controls"]["duplicate_after"][0]["new_instance_id"],
+            "layer_00_repeat"
+        );
+        assert_eq!(
+            payload["effective"]["device_bindings"]["can_mount_in_process"],
+            true
+        );
+        assert_eq!(payload["effective"]["pedals"][0]["pedal_id"], "layer_00");
     }
 
     #[test]
