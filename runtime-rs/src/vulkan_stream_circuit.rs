@@ -8343,6 +8343,36 @@ impl VulkanResidentGreedyInProcessPlacedPromptEngine {
         )
     }
 
+    pub fn submit_input_events_until_idle_bounded<I>(
+        &mut self,
+        requests: I,
+        max_engine_turns: usize,
+        max_scheduler_turns_per_tick: usize,
+    ) -> Result<
+        VulkanResidentGreedyInProcessPlacedPromptEngineBatchRun,
+        VulkanResidentGreedyInProcessPlacedPromptEngineError,
+    >
+    where
+        I: IntoIterator<Item = VulkanResidentGreedyInProcessPlacedPromptEngineInputRequest>,
+    {
+        let mut queued_input_events = Vec::new();
+        for request in requests {
+            queued_input_events
+                .push(self.enqueue_input_event(&request.stream_id, request.input_event)?);
+        }
+        let engine_run =
+            self.run_until_idle_bounded(max_engine_turns, max_scheduler_turns_per_tick)?;
+        let output_events = engine_run.output_events.clone();
+        let generated_token_ids = engine_run.generated_token_ids.clone();
+
+        Ok(VulkanResidentGreedyInProcessPlacedPromptEngineBatchRun {
+            queued_input_events,
+            engine_run,
+            output_events,
+            generated_token_ids,
+        })
+    }
+
     pub fn run_until_idle_bounded(
         &mut self,
         max_engine_turns: usize,
@@ -8461,6 +8491,21 @@ impl VulkanResidentGreedyInProcessPlacedPromptEngine {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanResidentGreedyInProcessPlacedPromptEngineInputRequest {
+    pub stream_id: String,
+    pub input_event: VulkanResidentTokenInputEvent,
+}
+
+impl VulkanResidentGreedyInProcessPlacedPromptEngineInputRequest {
+    pub fn new(stream_id: impl Into<String>, input_event: VulkanResidentTokenInputEvent) -> Self {
+        Self {
+            stream_id: stream_id.into(),
+            input_event,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VulkanResidentGreedyInProcessPlacedPromptEngineQueuedInputEvent {
     pub stream_id: String,
     pub queued_input_event: VulkanResidentGreedyInProcessPlacedQueuedInputEvent,
@@ -8480,6 +8525,14 @@ pub struct VulkanResidentGreedyInProcessPlacedPromptEngineSubmittedInputRun {
     pub input_event_id: String,
     pub queued_input_event: VulkanResidentGreedyInProcessPlacedPromptEngineQueuedInputEvent,
     pub stream_run: VulkanResidentGreedyInProcessPlacedPromptEngineStreamRun,
+    pub output_events: Vec<VulkanResidentTokenRuntimeSchedulerOutputEvent>,
+    pub generated_token_ids: Vec<u32>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanResidentGreedyInProcessPlacedPromptEngineBatchRun {
+    pub queued_input_events: Vec<VulkanResidentGreedyInProcessPlacedPromptEngineQueuedInputEvent>,
+    pub engine_run: VulkanResidentGreedyInProcessPlacedPromptEngineRun,
     pub output_events: Vec<VulkanResidentTokenRuntimeSchedulerOutputEvent>,
     pub generated_token_ids: Vec<u32>,
 }
@@ -23268,6 +23321,89 @@ mod tests {
         assert_eq!(run.end_snapshot.streams[0].next_stream_tick, 2);
         assert_eq!(run.end_snapshot.streams[1].stream_id, "stream_b");
         assert_eq!(run.end_snapshot.streams[1].next_stream_tick, 4);
+    }
+
+    #[test]
+    fn placed_prompt_engine_batches_input_events_across_streams() {
+        let device = match VulkanComputeDevice::new() {
+            Ok(device) => device,
+            Err(error) => {
+                eprintln!("skipping placed prompt engine batch test: {error}");
+                return;
+            }
+        };
+        let mut manifest = fixture_model_package_manifest();
+        manifest.placement =
+            StreamCircuitPlacementSpec::new("gpu0").with_pedal_device("layer_02", "gpu1");
+        let manifest_path = fixture_model_package_manifest_path();
+        let manifest_dir = manifest_path.parent().unwrap();
+        let device = Arc::new(device);
+        let devices = BTreeMap::from([
+            ("gpu0".to_string(), device.clone()),
+            ("gpu1".to_string(), device.clone()),
+        ]);
+
+        let stream_a =
+            VulkanResidentGreedyInProcessPlacedPromptStream::from_manifest_for_bound_devices(
+                devices.clone(),
+                manifest_dir,
+                manifest.clone(),
+                Some(8),
+            )
+            .unwrap();
+        let stream_b =
+            VulkanResidentGreedyInProcessPlacedPromptStream::from_manifest_for_bound_devices(
+                devices,
+                manifest_dir,
+                manifest,
+                Some(8),
+            )
+            .unwrap();
+
+        let mut engine = VulkanResidentGreedyInProcessPlacedPromptEngine::new();
+        engine.add_stream("stream_a", stream_a).unwrap();
+        engine.add_stream("stream_b", stream_b).unwrap();
+
+        let batch = engine
+            .submit_input_events_until_idle_bounded(
+                vec![
+                    VulkanResidentGreedyInProcessPlacedPromptEngineInputRequest::new(
+                        "stream_b",
+                        VulkanResidentTokenInputEvent::new("event_b", vec![36_309], 1),
+                    ),
+                    VulkanResidentGreedyInProcessPlacedPromptEngineInputRequest::new(
+                        "stream_a",
+                        VulkanResidentTokenInputEvent::new("event_a", vec![1], 1),
+                    ),
+                ],
+                4,
+                8,
+            )
+            .unwrap();
+
+        assert_eq!(batch.queued_input_events.len(), 2);
+        assert_eq!(batch.queued_input_events[0].stream_id, "stream_b");
+        assert_eq!(batch.queued_input_events[1].stream_id, "stream_a");
+        assert_eq!(
+            batch.engine_run.stop_condition,
+            VulkanResidentGreedyInProcessPlacedPromptEngineRunStopCondition::Idle
+        );
+        assert_eq!(batch.engine_run.input_runs.len(), 2);
+        assert_eq!(batch.engine_run.input_runs[0].stream_id, "stream_b");
+        assert_eq!(
+            batch.engine_run.input_runs[0].submitted_run.input_event.id,
+            "event_b"
+        );
+        assert_eq!(batch.engine_run.input_runs[1].stream_id, "stream_a");
+        assert_eq!(
+            batch.engine_run.input_runs[1].submitted_run.input_event.id,
+            "event_a"
+        );
+        assert_eq!(batch.output_events.len(), 2);
+        assert_eq!(batch.output_events[0].stream_id, "stream_b");
+        assert_eq!(batch.output_events[1].stream_id, "stream_a");
+        assert_eq!(batch.generated_token_ids.len(), 2);
+        assert!(engine.snapshot().idle);
     }
 
     #[test]
