@@ -2018,6 +2018,17 @@ pub struct RuntimePlacedPedalTimingReport {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimePlacedPedalTimingSummaryReport {
+    pub device_id: String,
+    pub pedal_id: String,
+    pub tick_count: usize,
+    pub dispatch_count: usize,
+    pub total_run_time_ns: u64,
+    pub average_tick_time_ns: Option<u64>,
+    pub average_dispatch_time_ns: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeSingleDevicePromptRunReport {
     pub ok: bool,
     pub execution_mode: String,
@@ -2075,6 +2086,7 @@ pub struct RuntimePlacedPromptRunReport {
     pub transport: RuntimePlacedTransportReport,
     pub timing: RuntimePromptTimingReport,
     pub pedal_timings: Vec<RuntimePlacedPedalTimingReport>,
+    pub pedal_timing_summaries: Vec<RuntimePlacedPedalTimingSummaryReport>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -3699,6 +3711,15 @@ mod tests {
                     run_time_ns: 90,
                 }],
             }],
+            pedal_timing_summaries: vec![RuntimePlacedPedalTimingSummaryReport {
+                device_id: "gpu0".to_string(),
+                pedal_id: "layer_00".to_string(),
+                tick_count: 1,
+                dispatch_count: 1,
+                total_run_time_ns: 90,
+                average_tick_time_ns: Some(90),
+                average_dispatch_time_ns: Some(90),
+            }],
         };
 
         let single_payload = serde_json::to_value(&single).unwrap();
@@ -3719,6 +3740,10 @@ mod tests {
         assert_eq!(
             placed_payload["pedal_timings"][0]["dispatches"][0]["node_id"],
             "layer_00.matmul"
+        );
+        assert_eq!(
+            placed_payload["pedal_timing_summaries"][0]["total_run_time_ns"],
+            90
         );
     }
 

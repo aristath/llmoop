@@ -14,11 +14,12 @@ use llmoop_runtime::{
     RuntimePackageInspectionReport, RuntimePatchControls, RuntimePatchDuplicateAfterControl,
     RuntimePatchInspectionReport, RuntimePatchPlacementReport, RuntimePatchSourceChainEntry,
     RuntimePedalPortSummary, RuntimePlacedPedalDispatchTimingReport,
-    RuntimePlacedPedalTimingReport, RuntimePlacedPromptRunReport, RuntimePlacedTransportReport,
-    RuntimePlacedTransportStatsReport, RuntimePlacementReport, RuntimePromptTimingReport,
-    RuntimeRemoteCableBufferReport, RuntimeSingleDevicePromptRunReport, RuntimeSourcePedal,
-    RuntimeTokenizerOptionsReport, RuntimeTopologyReport, VulkanComputeDevice,
-    VulkanPlacedCableTransportStats, VulkanResidentGreedyInProcessPlacedModelPackage,
+    RuntimePlacedPedalTimingReport, RuntimePlacedPedalTimingSummaryReport,
+    RuntimePlacedPromptRunReport, RuntimePlacedTransportReport, RuntimePlacedTransportStatsReport,
+    RuntimePlacementReport, RuntimePromptTimingReport, RuntimeRemoteCableBufferReport,
+    RuntimeSingleDevicePromptRunReport, RuntimeSourcePedal, RuntimeTokenizerOptionsReport,
+    RuntimeTopologyReport, VulkanComputeDevice, VulkanPlacedCableTransportStats,
+    VulkanResidentGreedyInProcessPlacedModelPackage,
     VulkanResidentGreedyInProcessPlacedPromptEventRun, VulkanResidentGreedyModelPackage,
     VulkanResidentGreedyModelPackageDeviceSlice, VulkanResidentGreedyModelPackageManifest,
     VulkanResidentHfTokenizerTextCodec, VulkanResidentTokenEngine,
@@ -292,6 +293,7 @@ fn run_placed_prompt(
         total_scheduler_turns,
     );
     let pedal_timings = runtime_placed_pedal_timings_report(&run);
+    let pedal_timing_summaries = runtime_placed_pedal_timing_summaries_report(&pedal_timings);
     let transport_stats_by_tick = run
         .tick_runs
         .iter()
@@ -408,6 +410,7 @@ fn run_placed_prompt(
             },
             timing,
             pedal_timings,
+            pedal_timing_summaries,
         };
         println!("{}", serde_json::to_string_pretty(&payload)?);
     } else if args.generated_only {
@@ -1441,6 +1444,43 @@ fn runtime_placed_pedal_timings_report(
         }
     }
     timings
+}
+
+fn runtime_placed_pedal_timing_summaries_report(
+    pedal_timings: &[RuntimePlacedPedalTimingReport],
+) -> Vec<RuntimePlacedPedalTimingSummaryReport> {
+    let mut summaries = BTreeMap::<(String, String), RuntimePlacedPedalTimingSummaryReport>::new();
+    for timing in pedal_timings {
+        let entry = summaries
+            .entry((timing.device_id.clone(), timing.pedal_id.clone()))
+            .or_insert_with(|| RuntimePlacedPedalTimingSummaryReport {
+                device_id: timing.device_id.clone(),
+                pedal_id: timing.pedal_id.clone(),
+                tick_count: 0,
+                dispatch_count: 0,
+                total_run_time_ns: 0,
+                average_tick_time_ns: None,
+                average_dispatch_time_ns: None,
+            });
+        entry.tick_count += 1;
+        entry.dispatch_count += timing.dispatch_count;
+        entry.total_run_time_ns = entry.total_run_time_ns.saturating_add(timing.run_time_ns);
+    }
+
+    let mut summaries = summaries.into_values().collect::<Vec<_>>();
+    for summary in &mut summaries {
+        summary.average_tick_time_ns = average_nanos(summary.total_run_time_ns, summary.tick_count);
+        summary.average_dispatch_time_ns =
+            average_nanos(summary.total_run_time_ns, summary.dispatch_count);
+    }
+    summaries.sort_by(|left, right| {
+        right
+            .total_run_time_ns
+            .cmp(&left.total_run_time_ns)
+            .then_with(|| left.device_id.cmp(&right.device_id))
+            .then_with(|| left.pedal_id.cmp(&right.pedal_id))
+    });
+    summaries
 }
 
 fn tokenizer_options_report(args: &Args) -> RuntimeTokenizerOptionsReport {
