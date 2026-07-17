@@ -355,16 +355,18 @@ fn execute_placed_prompt_run(
         Some(capacity),
     )?;
     let setup_time_ns = elapsed_nanos_u64(setup_start);
+    let mut session = package.prompt_session();
     let run_start = Instant::now();
-    let run = package.run_prompt_event_bounded_on_bound_devices_in_process(
+    let session_run = session.run_prompt_event_bounded_on_bound_devices_in_process(
+        &package,
         &bound_devices.devices,
         prompt_ids,
-        0,
         args.max_new_tokens,
         None,
         args.max_scheduler_turns,
     )?;
     let run_time_ns = elapsed_nanos_u64(run_start);
+    let run = session_run.run;
     let generated_text = codec.decode_tokens(&run.generated_token_ids)?;
     let output_text = codec.decode_tokens(&run.output_token_ids)?;
     let total_scheduler_turns = run

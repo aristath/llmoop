@@ -7406,6 +7406,25 @@ impl VulkanResidentGreedyInProcessPlacedModelPackage {
         })
     }
 
+    pub fn prompt_session(&self) -> VulkanResidentGreedyInProcessPlacedPromptSession {
+        VulkanResidentGreedyInProcessPlacedPromptSession::new(0)
+    }
+
+    pub fn prompt_session_from_stream_tick(
+        &self,
+        start_stream_tick: u64,
+    ) -> Result<
+        VulkanResidentGreedyInProcessPlacedPromptSession,
+        VulkanResidentGreedyInProcessPlacedModelPackageError,
+    > {
+        if start_stream_tick != 0 {
+            self.ensure_stream_tick_capacity(start_stream_tick)?;
+        }
+        Ok(VulkanResidentGreedyInProcessPlacedPromptSession::new(
+            start_stream_tick,
+        ))
+    }
+
     pub fn run_prompt_event_bounded_in_process(
         &self,
         device: &VulkanComputeDevice,
@@ -7741,6 +7760,117 @@ pub struct VulkanResidentGreedyInProcessPlacedPromptEventRun {
     pub output_token_ids: Vec<u32>,
     pub stop_reason: String,
     pub tick_runs: Vec<VulkanResidentGreedyInProcessPlacedPromptEventTickRun>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanResidentGreedyInProcessPlacedPromptSession {
+    pub next_stream_tick: u64,
+    pub completed_prompt_event_count: usize,
+    pub generated_token_count: usize,
+    pub output_token_count: usize,
+}
+
+impl VulkanResidentGreedyInProcessPlacedPromptSession {
+    pub fn new(start_stream_tick: u64) -> Self {
+        Self {
+            next_stream_tick: start_stream_tick,
+            completed_prompt_event_count: 0,
+            generated_token_count: 0,
+            output_token_count: 0,
+        }
+    }
+
+    pub fn run_prompt_event_bounded_in_process(
+        &mut self,
+        package: &VulkanResidentGreedyInProcessPlacedModelPackage,
+        device: &VulkanComputeDevice,
+        prompt_token_ids: &[u32],
+        max_new_tokens: usize,
+        eos_token_id: Option<u32>,
+        max_scheduler_turns_per_tick: usize,
+    ) -> Result<
+        VulkanResidentGreedyInProcessPlacedPromptSessionRun,
+        VulkanResidentGreedyInProcessPlacedModelPackageError,
+    > {
+        let start_stream_tick = self.next_stream_tick;
+        let run = package.run_prompt_event_bounded_in_process(
+            device,
+            prompt_token_ids,
+            start_stream_tick,
+            max_new_tokens,
+            eos_token_id,
+            max_scheduler_turns_per_tick,
+        )?;
+        self.complete_prompt_event(start_stream_tick, run)
+    }
+
+    pub fn run_prompt_event_bounded_on_bound_devices_in_process(
+        &mut self,
+        package: &VulkanResidentGreedyInProcessPlacedModelPackage,
+        devices: &BTreeMap<String, Arc<VulkanComputeDevice>>,
+        prompt_token_ids: &[u32],
+        max_new_tokens: usize,
+        eos_token_id: Option<u32>,
+        max_scheduler_turns_per_tick: usize,
+    ) -> Result<
+        VulkanResidentGreedyInProcessPlacedPromptSessionRun,
+        VulkanResidentGreedyInProcessPlacedModelPackageError,
+    > {
+        let start_stream_tick = self.next_stream_tick;
+        let run = package.run_prompt_event_bounded_on_bound_devices_in_process(
+            devices,
+            prompt_token_ids,
+            start_stream_tick,
+            max_new_tokens,
+            eos_token_id,
+            max_scheduler_turns_per_tick,
+        )?;
+        self.complete_prompt_event(start_stream_tick, run)
+    }
+
+    fn complete_prompt_event(
+        &mut self,
+        start_stream_tick: u64,
+        run: VulkanResidentGreedyInProcessPlacedPromptEventRun,
+    ) -> Result<
+        VulkanResidentGreedyInProcessPlacedPromptSessionRun,
+        VulkanResidentGreedyInProcessPlacedModelPackageError,
+    > {
+        let tick_count = run.tick_runs.len();
+        let tick_delta = u64::try_from(tick_count).map_err(|_| {
+            VulkanResidentGreedyInProcessPlacedModelPackageError::StreamTickOverflow
+        })?;
+        let next_stream_tick = start_stream_tick
+            .checked_add(tick_delta)
+            .ok_or(VulkanResidentGreedyInProcessPlacedModelPackageError::StreamTickOverflow)?;
+        let prompt_event_index = self.completed_prompt_event_count;
+
+        self.next_stream_tick = next_stream_tick;
+        self.completed_prompt_event_count = self.completed_prompt_event_count.saturating_add(1);
+        self.generated_token_count = self
+            .generated_token_count
+            .saturating_add(run.generated_token_ids.len());
+        self.output_token_count = self
+            .output_token_count
+            .saturating_add(run.output_token_ids.len());
+
+        Ok(VulkanResidentGreedyInProcessPlacedPromptSessionRun {
+            prompt_event_index,
+            start_stream_tick,
+            next_stream_tick,
+            tick_count,
+            run,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanResidentGreedyInProcessPlacedPromptSessionRun {
+    pub prompt_event_index: usize,
+    pub start_stream_tick: u64,
+    pub next_stream_tick: u64,
+    pub tick_count: usize,
+    pub run: VulkanResidentGreedyInProcessPlacedPromptEventRun,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -21985,6 +22115,70 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![246, 246, 246]
         );
+    }
+
+    #[test]
+    fn placed_prompt_session_keeps_stream_tick_across_prompt_events() {
+        let device = match VulkanComputeDevice::new() {
+            Ok(device) => device,
+            Err(error) => {
+                eprintln!("skipping placed prompt session stream tick test: {error}");
+                return;
+            }
+        };
+        let manifest = fixture_model_package_manifest();
+        let manifest_path = fixture_model_package_manifest_path();
+        let manifest_dir = manifest_path.parent().unwrap();
+
+        let placed_package =
+            VulkanResidentGreedyInProcessPlacedModelPackage::from_manifest_for_devices(
+                &device,
+                manifest_dir,
+                manifest,
+                Some(8),
+            )
+            .unwrap();
+        let mut session = placed_package.prompt_session();
+
+        let first = session
+            .run_prompt_event_bounded_in_process(&placed_package, &device, &[1], 1, None, 8)
+            .unwrap();
+        assert_eq!(first.prompt_event_index, 0);
+        assert_eq!(first.start_stream_tick, 0);
+        assert_eq!(first.tick_count, 2);
+        assert_eq!(first.next_stream_tick, 2);
+        assert_eq!(
+            first
+                .run
+                .tick_runs
+                .iter()
+                .map(|tick| tick.stream_tick)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert_eq!(session.next_stream_tick, 2);
+        assert_eq!(session.completed_prompt_event_count, 1);
+
+        let second = session
+            .run_prompt_event_bounded_in_process(&placed_package, &device, &[36_309], 1, None, 8)
+            .unwrap();
+        assert_eq!(second.prompt_event_index, 1);
+        assert_eq!(second.start_stream_tick, 2);
+        assert_eq!(second.tick_count, 2);
+        assert_eq!(second.next_stream_tick, 4);
+        assert_eq!(
+            second
+                .run
+                .tick_runs
+                .iter()
+                .map(|tick| tick.stream_tick)
+                .collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+        assert_eq!(session.next_stream_tick, 4);
+        assert_eq!(session.completed_prompt_event_count, 2);
+        assert_eq!(session.generated_token_count, 2);
+        assert_eq!(session.output_token_count, 4);
     }
 
     #[test]
