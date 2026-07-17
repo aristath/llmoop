@@ -6690,7 +6690,7 @@ impl VulkanResidentGreedyInProcessPlacedModelPackage {
     }
 
     pub fn from_manifest_for_bound_devices(
-        devices: &BTreeMap<String, VulkanComputeDevice>,
+        devices: &BTreeMap<String, Arc<VulkanComputeDevice>>,
         manifest_dir: impl AsRef<Path>,
         manifest: VulkanResidentGreedyModelPackageManifest,
         dynamic_state_capacity_activations: Option<usize>,
@@ -6700,11 +6700,14 @@ impl VulkanResidentGreedyInProcessPlacedModelPackage {
             manifest,
             dynamic_state_capacity_activations,
             |device_id| {
-                devices.get(device_id).ok_or_else(|| {
-                    VulkanResidentGreedyInProcessPlacedModelPackageError::MissingBoundDevice {
-                        device_id: device_id.to_string(),
-                    }
-                })
+                devices
+                    .get(device_id)
+                    .map(|device| device.as_ref())
+                    .ok_or_else(|| {
+                        VulkanResidentGreedyInProcessPlacedModelPackageError::MissingBoundDevice {
+                            device_id: device_id.to_string(),
+                        }
+                    })
             },
         )
     }
@@ -6919,7 +6922,7 @@ impl VulkanResidentGreedyInProcessPlacedModelPackage {
 
     pub fn run_stream_tick_on_bound_devices_in_process(
         &self,
-        devices: &BTreeMap<String, VulkanComputeDevice>,
+        devices: &BTreeMap<String, Arc<VulkanComputeDevice>>,
         stream_tick: u64,
         max_scheduler_turns: usize,
     ) -> Result<
@@ -6930,11 +6933,14 @@ impl VulkanResidentGreedyInProcessPlacedModelPackage {
         let mut tick_slices = Vec::with_capacity(self.device_slices.len());
 
         for slice in &self.device_slices {
-            let slice_device = devices.get(&slice.device_id).ok_or_else(|| {
-                VulkanResidentGreedyInProcessPlacedModelPackageError::MissingBoundDevice {
-                    device_id: slice.device_id.clone(),
-                }
-            })?;
+            let slice_device = devices
+                .get(&slice.device_id)
+                .map(|device| device.as_ref())
+                .ok_or_else(|| {
+                    VulkanResidentGreedyInProcessPlacedModelPackageError::MissingBoundDevice {
+                        device_id: slice.device_id.clone(),
+                    }
+                })?;
             let tick_plan = slice
                 .mounted
                 .stream_tick_plan(&slice.reusable_manifest)
@@ -6996,7 +7002,7 @@ impl VulkanResidentGreedyInProcessPlacedModelPackage {
 
     pub fn run_token_id_stream_tick_on_bound_devices_in_process(
         &self,
-        devices: &BTreeMap<String, VulkanComputeDevice>,
+        devices: &BTreeMap<String, Arc<VulkanComputeDevice>>,
         token_id: u32,
         stream_tick: u64,
         max_scheduler_turns: usize,
@@ -7004,11 +7010,14 @@ impl VulkanResidentGreedyInProcessPlacedModelPackage {
         VulkanResidentGreedyInProcessPlacedSingleTokenTickRun,
         VulkanResidentGreedyInProcessPlacedModelPackageError,
     > {
-        let boundary_device = devices.get(&self.boundary_device_id).ok_or_else(|| {
-            VulkanResidentGreedyInProcessPlacedModelPackageError::MissingBoundDevice {
-                device_id: self.boundary_device_id.clone(),
-            }
-        })?;
+        let boundary_device = devices
+            .get(&self.boundary_device_id)
+            .map(|device| device.as_ref())
+            .ok_or_else(|| {
+                VulkanResidentGreedyInProcessPlacedModelPackageError::MissingBoundDevice {
+                    device_id: self.boundary_device_id.clone(),
+                }
+            })?;
         let input_run = self
             .input_transducer
             .run_token_id(boundary_device, token_id)
@@ -7251,7 +7260,7 @@ impl VulkanResidentGreedyInProcessPlacedModelPackage {
 
     pub fn run_prompt_event_bounded_on_bound_devices_in_process(
         &self,
-        devices: &BTreeMap<String, VulkanComputeDevice>,
+        devices: &BTreeMap<String, Arc<VulkanComputeDevice>>,
         prompt_token_ids: &[u32],
         start_stream_tick: u64,
         max_new_tokens: usize,
@@ -7264,11 +7273,14 @@ impl VulkanResidentGreedyInProcessPlacedModelPackage {
         if prompt_token_ids.is_empty() {
             return Err(VulkanResidentGreedyInProcessPlacedModelPackageError::EmptyPromptEvent);
         }
-        let boundary_device = devices.get(&self.boundary_device_id).ok_or_else(|| {
-            VulkanResidentGreedyInProcessPlacedModelPackageError::MissingBoundDevice {
-                device_id: self.boundary_device_id.clone(),
-            }
-        })?;
+        let boundary_device = devices
+            .get(&self.boundary_device_id)
+            .map(|device| device.as_ref())
+            .ok_or_else(|| {
+                VulkanResidentGreedyInProcessPlacedModelPackageError::MissingBoundDevice {
+                    device_id: self.boundary_device_id.clone(),
+                }
+            })?;
 
         let mut external_input_index = 0usize;
         let mut pending_feedback: Option<VulkanResidentPendingPrivateFeedback> = None;

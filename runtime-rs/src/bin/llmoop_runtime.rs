@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use llmoop_runtime::{
     CircuitPort, PedalPlacement, VulkanComputeDevice,
@@ -772,7 +773,7 @@ fn runtime_vulkan_device(args: &Args) -> Result<VulkanComputeDevice, Box<dyn Err
 }
 
 struct RuntimeBoundVulkanDevices {
-    devices: BTreeMap<String, VulkanComputeDevice>,
+    devices: BTreeMap<String, Arc<VulkanComputeDevice>>,
     physical_device_indices: BTreeMap<String, usize>,
 }
 
@@ -789,6 +790,7 @@ fn runtime_bound_vulkan_devices(
     logical_device_ids.sort();
     logical_device_ids.dedup();
     let mut devices = BTreeMap::new();
+    let mut physical_devices: BTreeMap<usize, Arc<VulkanComputeDevice>> = BTreeMap::new();
     let mut physical_device_indices = BTreeMap::new();
 
     for logical_device_id in &logical_device_ids {
@@ -808,7 +810,15 @@ fn runtime_bound_vulkan_devices(
         } else {
             default_physical_device_index
         };
-        let device = VulkanComputeDevice::new_for_physical_device_index(physical_device_index)?;
+        let device = if let Some(device) = physical_devices.get(&physical_device_index) {
+            Arc::clone(device)
+        } else {
+            let device = Arc::new(VulkanComputeDevice::new_for_physical_device_index(
+                physical_device_index,
+            )?);
+            physical_devices.insert(physical_device_index, Arc::clone(&device));
+            device
+        };
         devices.insert(logical_device_id.clone(), device);
         physical_device_indices.insert(logical_device_id.clone(), physical_device_index);
     }
