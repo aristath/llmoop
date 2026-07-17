@@ -1691,6 +1691,54 @@ pub struct RuntimeBoundDevice {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeAvailableMemoryHeap {
+    pub heap_index: u32,
+    pub size_bytes: u64,
+    pub device_local: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeAvailableDevice {
+    pub device_id: String,
+    pub backend: String,
+    pub available: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_device_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub physical_device_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub physical_device_index: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vendor_id: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_device_id: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub driver_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compute_queue_family_indices: Option<Vec<u32>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_heaps: Option<Vec<RuntimeAvailableMemoryHeap>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_by_default: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_by_runtime: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_binding: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub can_host_runtime_pedals_on_physical_device: Option<bool>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimePedalPortSummary {
     pub id: String,
     pub signal: String,
@@ -2618,6 +2666,77 @@ mod tests {
         assert_eq!(payload["target"], "vulkan:5");
         assert_eq!(payload["physical_device_index"], 5);
         assert_eq!(payload["device_name"], "Radeon Test Device");
+    }
+
+    #[test]
+    fn runtime_available_device_serializes_inventory_entries() {
+        let available = RuntimeAvailableDevice {
+            device_id: "vulkan:5".to_string(),
+            backend: "vulkan_compute".to_string(),
+            available: true,
+            runtime_device_id: None,
+            physical_device_id: Some("vulkan:5".to_string()),
+            physical_device_index: Some(5),
+            device_name: Some("Radeon Test Device".to_string()),
+            device_type: Some("discrete_gpu".to_string()),
+            vendor_id: Some(4098),
+            raw_device_id: Some(29_567),
+            api_version: Some(4_203_000),
+            driver_version: Some(1_024),
+            compute_queue_family_indices: Some(vec![0, 2]),
+            memory_heaps: Some(vec![RuntimeAvailableMemoryHeap {
+                heap_index: 0,
+                size_bytes: 8 * 1024 * 1024 * 1024,
+                device_local: true,
+            }]),
+            selected_by_default: Some(false),
+            selected_by_runtime: Some(false),
+            runtime_binding: Some("inventory_only".to_string()),
+            can_host_runtime_pedals_on_physical_device: Some(true),
+            notes: vec![
+                "auto-detected by Vulkan inventory; can be selected with --bind-device LOGICAL=vulkan:N"
+                    .to_string(),
+            ],
+            error: None,
+        };
+        let unavailable = RuntimeAvailableDevice {
+            device_id: "runtime_default".to_string(),
+            backend: "vulkan_compute".to_string(),
+            available: false,
+            runtime_device_id: None,
+            physical_device_id: None,
+            physical_device_index: None,
+            device_name: None,
+            device_type: None,
+            vendor_id: None,
+            raw_device_id: None,
+            api_version: None,
+            driver_version: None,
+            compute_queue_family_indices: None,
+            memory_heaps: None,
+            selected_by_default: None,
+            selected_by_runtime: None,
+            runtime_binding: None,
+            can_host_runtime_pedals_on_physical_device: None,
+            notes: vec!["no compute-capable Vulkan physical devices were found".to_string()],
+            error: None,
+        };
+
+        let available_payload = serde_json::to_value(&available).unwrap();
+        assert_eq!(available_payload["device_id"], "vulkan:5");
+        assert_eq!(available_payload["physical_device_index"], 5);
+        assert_eq!(available_payload["memory_heaps"][0]["device_local"], true);
+        assert_eq!(
+            available_payload["can_host_runtime_pedals_on_physical_device"],
+            true
+        );
+        assert!(available_payload.get("runtime_device_id").is_none());
+
+        let unavailable_payload = serde_json::to_value(&unavailable).unwrap();
+        assert_eq!(unavailable_payload["device_id"], "runtime_default");
+        assert_eq!(unavailable_payload["available"], false);
+        assert!(unavailable_payload.get("physical_device_id").is_none());
+        assert!(unavailable_payload.get("error").is_none());
     }
 
     #[test]
