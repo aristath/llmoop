@@ -421,6 +421,13 @@ pub struct VulkanU32ResidentCopy {
     byte_len: vk::DeviceSize,
 }
 
+pub struct VulkanResidentBufferCopy {
+    device: ash::Device,
+    command_pool: vk::CommandPool,
+    command_buffer: vk::CommandBuffer,
+    byte_len: vk::DeviceSize,
+}
+
 impl VulkanU32ResidentDispatch {
     pub fn len(&self) -> usize {
         self.len
@@ -469,7 +476,21 @@ impl VulkanU32ResidentCopy {
     }
 }
 
+impl VulkanResidentBufferCopy {
+    pub fn byte_len(&self) -> usize {
+        self.byte_len as usize
+    }
+}
+
 impl Drop for VulkanU32ResidentCopy {
+    fn drop(&mut self) {
+        unsafe {
+            self.device.destroy_command_pool(self.command_pool, None);
+        }
+    }
+}
+
+impl Drop for VulkanResidentBufferCopy {
     fn drop(&mut self) {
         unsafe {
             self.device.destroy_command_pool(self.command_pool, None);
@@ -726,6 +747,16 @@ impl VulkanComputeDevice {
         self.run_u32_resident_copy(&binding, len)
     }
 
+    pub fn copy_resident_buffer_bytes(
+        &self,
+        source: &VulkanResidentBuffer,
+        destination: &VulkanResidentBuffer,
+        len: usize,
+    ) -> Result<(), VulkanError> {
+        let binding = self.create_resident_buffer_copy(source, destination, len)?;
+        self.run_resident_buffer_copy(&binding, len)
+    }
+
     pub fn create_u32_resident_copy(
         &self,
         source: &VulkanU32ResidentBuffer,
@@ -806,6 +837,85 @@ impl VulkanComputeDevice {
         }
     }
 
+    pub fn create_resident_buffer_copy(
+        &self,
+        source: &VulkanResidentBuffer,
+        destination: &VulkanResidentBuffer,
+        len: usize,
+    ) -> Result<VulkanResidentBufferCopy, VulkanError> {
+        if len == 0 {
+            return Err(VulkanError(
+                "resident byte copy binding length must not be zero".to_string(),
+            ));
+        }
+        let byte_len = source.byte_len(len)?;
+        destination.byte_len(len)?;
+
+        unsafe {
+            let command_pool_info = vk::CommandPoolCreateInfo::default()
+                .queue_family_index(self.queue_family_index)
+                .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+            let command_pool = self
+                .device
+                .create_command_pool(&command_pool_info, None)
+                .map_err(|error| {
+                    VulkanError(format!(
+                        "failed to create resident byte copy binding command pool: {error:?}"
+                    ))
+                })?;
+            let command_alloc_info = vk::CommandBufferAllocateInfo::default()
+                .command_pool(command_pool)
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .command_buffer_count(1);
+            let command_buffer = self
+                .device
+                .allocate_command_buffers(&command_alloc_info)
+                .map_err(|error| {
+                    self.device.destroy_command_pool(command_pool, None);
+                    VulkanError(format!(
+                        "failed to allocate resident byte copy binding command buffer: {error:?}"
+                    ))
+                })?
+                .remove(0);
+
+            let command_begin = vk::CommandBufferBeginInfo::default();
+            self.device
+                .begin_command_buffer(command_buffer, &command_begin)
+                .map_err(|error| {
+                    self.device.destroy_command_pool(command_pool, None);
+                    VulkanError(format!(
+                        "failed to begin resident byte copy binding command buffer: {error:?}"
+                    ))
+                })?;
+            let copy_regions = [vk::BufferCopy {
+                src_offset: 0,
+                dst_offset: 0,
+                size: byte_len,
+            }];
+            self.device.cmd_copy_buffer(
+                command_buffer,
+                source.buffer,
+                destination.buffer,
+                &copy_regions,
+            );
+            self.device
+                .end_command_buffer(command_buffer)
+                .map_err(|error| {
+                    self.device.destroy_command_pool(command_pool, None);
+                    VulkanError(format!(
+                        "failed to end resident byte copy binding command buffer: {error:?}"
+                    ))
+                })?;
+
+            Ok(VulkanResidentBufferCopy {
+                device: self.device.clone(),
+                command_pool,
+                command_buffer,
+                byte_len,
+            })
+        }
+    }
+
     pub fn run_u32_resident_copy(
         &self,
         binding: &VulkanU32ResidentCopy,
@@ -843,6 +953,39 @@ impl VulkanComputeDevice {
                 })?;
             self.device.queue_wait_idle(self.queue).map_err(|error| {
                 VulkanError(format!("failed waiting for resident copy: {error:?}"))
+            })?;
+            Ok(())
+        }
+    }
+
+    pub fn run_resident_buffer_copy(
+        &self,
+        binding: &VulkanResidentBufferCopy,
+        len: usize,
+    ) -> Result<(), VulkanError> {
+        if len == 0 {
+            return Err(VulkanError(
+                "resident byte copy length must not be zero".to_string(),
+            ));
+        }
+        let byte_len = len as vk::DeviceSize;
+        if byte_len != binding.byte_len {
+            return Err(VulkanError(format!(
+                "resident byte copy binding byte length {} cannot run {} bytes",
+                binding.byte_len, byte_len
+            )));
+        }
+
+        unsafe {
+            let command_buffers = [binding.command_buffer];
+            let submit_info = [vk::SubmitInfo::default().command_buffers(&command_buffers)];
+            self.device
+                .queue_submit(self.queue, &submit_info, vk::Fence::null())
+                .map_err(|error| {
+                    VulkanError(format!("failed to submit resident byte copy: {error:?}"))
+                })?;
+            self.device.queue_wait_idle(self.queue).map_err(|error| {
+                VulkanError(format!("failed waiting for resident byte copy: {error:?}"))
             })?;
             Ok(())
         }
@@ -2193,6 +2336,55 @@ mod tests {
         device.run_u32_resident_copy(&binding, 3).unwrap();
         assert_eq!(destination.read(3).unwrap(), vec![10, 20, 30]);
         assert_eq!(binding.len(), 3);
+    }
+
+    #[test]
+    fn resident_byte_buffers_can_copy_on_device() {
+        let device = match VulkanComputeDevice::new() {
+            Ok(device) => device,
+            Err(error) => {
+                eprintln!("skipping Vulkan smoke: {error}");
+                return;
+            }
+        };
+        let source = device.create_resident_buffer(8).unwrap();
+        let destination = device.create_resident_buffer(8).unwrap();
+        source.write_bytes(&[1, 2, 3, 4, 5, 6]).unwrap();
+        destination.write_bytes(&[0, 0, 0, 0, 0, 0]).unwrap();
+
+        device
+            .copy_resident_buffer_bytes(&source, &destination, 6)
+            .unwrap();
+
+        assert_eq!(destination.read_bytes(6).unwrap(), vec![1, 2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn resident_byte_copy_binding_can_be_reused() {
+        let device = match VulkanComputeDevice::new() {
+            Ok(device) => device,
+            Err(error) => {
+                eprintln!("skipping Vulkan smoke: {error}");
+                return;
+            }
+        };
+        let source = device.create_resident_buffer(8).unwrap();
+        let destination = device.create_resident_buffer(8).unwrap();
+        let binding = device
+            .create_resident_buffer_copy(&source, &destination, 6)
+            .unwrap();
+
+        source.write_bytes(&[1, 2, 3, 4, 5, 6]).unwrap();
+        device.run_resident_buffer_copy(&binding, 6).unwrap();
+        assert_eq!(destination.read_bytes(6).unwrap(), vec![1, 2, 3, 4, 5, 6]);
+
+        source.write_bytes(&[10, 20, 30, 40, 50, 60]).unwrap();
+        device.run_resident_buffer_copy(&binding, 6).unwrap();
+        assert_eq!(
+            destination.read_bytes(6).unwrap(),
+            vec![10, 20, 30, 40, 50, 60]
+        );
+        assert_eq!(binding.byte_len(), 6);
     }
 
     #[test]
