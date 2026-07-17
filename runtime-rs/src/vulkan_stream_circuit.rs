@@ -1685,7 +1685,7 @@ pub struct VulkanPlacedCableTransportReceiveBatch {
     pub missing_packets: Vec<VulkanPlacedCablePacketKey>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VulkanPlacedCableTransportStats {
     pub pending_packet_count: usize,
     pub pending_byte_count: usize,

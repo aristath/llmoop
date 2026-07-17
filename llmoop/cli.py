@@ -37,6 +37,17 @@ def main() -> None:
         help="prompt text for --run/--run-model",
     )
     parser.add_argument(
+        "--inspect-runtime",
+        action="store_true",
+        help="preview UI-ready package, patch, placement, device, and route facts for --run",
+    )
+    parser.add_argument(
+        "--inspect-topology",
+        action="store_true",
+        dest="inspect_runtime",
+        help="alias for --inspect-runtime",
+    )
+    parser.add_argument(
         "--inspect-device-slice",
         metavar="DEVICE_ID",
         help="mount and summarize only the compiled package pedals assigned to DEVICE_ID for --run",
@@ -193,6 +204,8 @@ def main() -> None:
         parser.print_help()
         raise SystemExit(2)
     if args.compile_model is None:
+        if args.inspect_runtime and args.run is None:
+            parser.error("--inspect-runtime is only supported with --run")
         if args.inspect_package and args.run is None:
             parser.error("--inspect-package is only supported with --run")
         if args.inspect_patch and args.run is None:
@@ -201,6 +214,8 @@ def main() -> None:
             parser.error("--inspect-placement is only supported with --run")
     elif args.inspect_device_slice is not None:
         parser.error("--inspect-device-slice is only supported with --run")
+    elif args.inspect_runtime:
+        parser.error("--inspect-runtime is only supported with --run")
     elif args.inspect_package:
         parser.error("--inspect-package is only supported with --run")
     elif args.inspect_patch:
@@ -223,6 +238,7 @@ def main() -> None:
         inspect_mode_count = sum(
             [
                 args.inspect_device_slice is not None,
+                args.inspect_runtime,
                 args.inspect_package,
                 args.inspect_patch,
                 args.inspect_placement,
@@ -230,7 +246,7 @@ def main() -> None:
         )
         if inspect_mode_count > 1:
             parser.error(
-                "--inspect-package, --inspect-patch, --inspect-device-slice, and --inspect-placement are mutually exclusive"
+                "--inspect-runtime, --inspect-package, --inspect-patch, --inspect-device-slice, and --inspect-placement are mutually exclusive"
             )
         if inspect_mode_count == 0 and args.prompt is None:
             parser.error("--prompt is required with --run")
@@ -257,6 +273,8 @@ def main() -> None:
     if args.run_model is not None:
         if args.inspect_device_slice is not None:
             parser.error("--inspect-device-slice is only supported by --run")
+        if args.inspect_runtime:
+            parser.error("--inspect-runtime is only supported by --run")
         if args.inspect_package:
             parser.error("--inspect-package is only supported by --run")
         if args.inspect_patch:
@@ -435,7 +453,9 @@ def build_runtime_command(args: argparse.Namespace, package_manifest: Path) -> l
         "--package",
         str(package_manifest),
     ]
-    if args.inspect_placement:
+    if args.inspect_runtime:
+        runtime_args.append("--inspect-runtime")
+    elif args.inspect_placement:
         runtime_args.append("--inspect-placement")
     elif args.inspect_package:
         runtime_args.append("--inspect-package")

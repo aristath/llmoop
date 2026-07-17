@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use llmoop_runtime::{
-    CircuitPort, PedalCablePlacement, PedalPlacement, VulkanComputeDevice,
-    VulkanPlacedCableTransportStats, VulkanResidentGreedyInProcessPlacedModelPackage,
+    CircuitPort, PedalCablePlacement, PedalPlacement, RuntimeCableRouteTarget, RuntimeCableRoutes,
+    VulkanComputeDevice, VulkanResidentGreedyInProcessPlacedModelPackage,
     VulkanResidentGreedyModelPackage, VulkanResidentGreedyModelPackageDeviceSlice,
     VulkanResidentGreedyModelPackageManifest, VulkanResidentHfTokenizerTextCodec,
     VulkanResidentTokenEngine, VulkanResidentTokenEngineRunBudget,
@@ -19,6 +19,7 @@ use serde_json::{Value, json};
 struct Args {
     package_manifest: Option<PathBuf>,
     prompt: Option<String>,
+    inspect_runtime: bool,
     inspect_package: bool,
     inspect_patch: bool,
     inspect_placement: bool,
@@ -44,6 +45,7 @@ impl Default for Args {
         Self {
             package_manifest: None,
             prompt: None,
+            inspect_runtime: false,
             inspect_package: false,
             inspect_patch: false,
             inspect_placement: false,
@@ -93,6 +95,10 @@ fn run() -> Result<(), Box<dyn Error>> {
         .parent()
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
+    if args.inspect_runtime {
+        let manifest = VulkanResidentGreedyModelPackageManifest::from_json_file(package_manifest)?;
+        return inspect_runtime_topology(&args, package_manifest, &manifest_dir, manifest);
+    }
     if args.inspect_package {
         let manifest = VulkanResidentGreedyModelPackageManifest::from_json_file(package_manifest)?;
         return inspect_package(&args, package_manifest, &manifest_dir, manifest);
@@ -254,7 +260,7 @@ fn run_placed_prompt(
     let transport_stats_by_tick = run
         .tick_runs
         .iter()
-        .map(|tick| transport_stats_report(&tick.tick_run.placed_run.transport_stats))
+        .map(|tick| tick.tick_run.placed_run.transport_stats.clone())
         .collect::<Vec<_>>();
     let transport_published_packet_count = run
         .tick_runs
@@ -381,21 +387,99 @@ fn run_placed_prompt(
     Ok(())
 }
 
-fn transport_stats_report(stats: &VulkanPlacedCableTransportStats) -> Value {
-    json!({
-        "pending_packet_count": stats.pending_packet_count,
-        "pending_byte_count": stats.pending_byte_count,
-        "pending_direct_cable_count": stats.pending_direct_cable_count,
-        "pending_direct_byte_count": stats.pending_direct_byte_count,
-        "published_packet_count": stats.published_packet_count,
-        "published_byte_count": stats.published_byte_count,
-        "received_packet_count": stats.received_packet_count,
-        "received_byte_count": stats.received_byte_count,
-        "direct_copy_count": stats.direct_copy_count,
-        "direct_copy_byte_count": stats.direct_copy_byte_count,
-        "direct_receive_count": stats.direct_receive_count,
-        "direct_receive_byte_count": stats.direct_receive_byte_count,
-    })
+fn inspect_runtime_topology(
+    args: &Args,
+    package_manifest: &Path,
+    manifest_dir: &Path,
+    manifest: VulkanResidentGreedyModelPackageManifest,
+) -> Result<(), Box<dyn Error>> {
+    let default_device_id = args
+        .default_device_id
+        .as_deref()
+        .unwrap_or(&manifest.placement.default_device_id);
+    let available_devices = inspect_available_devices(default_device_id, args.vulkan_device_index);
+    let source_graph = manifest.resolved_source_graph(manifest_dir.to_path_buf())?;
+    let patch = manifest.runtime_patch_from_controls(
+        args.default_device_id.as_deref(),
+        &args.pedal_devices,
+        &args.duplicate_after,
+        args.source_chain.as_deref(),
+    )?;
+    let effective_graph = source_graph.instantiate_runtime_patch(&patch)?;
+    let placement = effective_graph.placement_plan(&patch.placement_spec())?;
+    let placement_device_ids = placement_device_ids(&placement.pedals);
+    let runtime_routes = runtime_cable_routes_report(args, &placement.cables);
+    let device_bindings = runtime_device_bindings_report(args, &placement_device_ids);
+    let source_pedals = source_pedals_report(&manifest);
+
+    let payload = json!({
+        "ok": true,
+        "schema": "llmoop.runtime_topology.v1",
+        "package_manifest": package_manifest,
+        "package_root": manifest_dir,
+        "package_id": manifest.package_id,
+        "compiled_schema": manifest.schema,
+        "config_path": manifest.config_path,
+        "tokenizer": manifest.tokenizer,
+        "available_devices": available_devices,
+        "compiled": {
+            "wiring": manifest.circuit_graph.wiring,
+            "default_device_id": manifest.placement.default_device_id,
+            "pedal_devices": manifest.placement.pedal_devices,
+            "source_pedal_count": source_pedals.len(),
+            "source_pedals": source_pedals,
+            "dynamic_state_capacity_activations": manifest.dynamic_state_capacity_activations,
+            "capacity_profiles": manifest.capacity_profiles.iter().map(|profile| json!({
+                "min_dynamic_state_capacity_activations": profile.min_dynamic_state_capacity_activations,
+                "max_dynamic_state_capacity_activations": profile.max_dynamic_state_capacity_activations,
+                "shader_override_count": profile.pedal_execution_shader_overrides.len(),
+            })).collect::<Vec<_>>(),
+        },
+        "runtime_patch_controls": runtime_patch_report(args),
+        "runtime_patch": patch,
+        "effective": {
+            "wiring": placement.wiring,
+            "pedal_count": placement.pedals.len(),
+            "cable_count": placement.cables.len(),
+            "local_cable_count": placement.local_cable_count,
+            "cross_device_cable_count": placement.cross_device_cable_count,
+            "device_count": placement_device_ids.len(),
+            "device_ids": placement_device_ids,
+            "device_bindings": device_bindings,
+            "cable_routes": runtime_routes,
+            "pedals": placement.pedals,
+            "cables": placement.cables,
+        },
+    });
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+    } else {
+        println!("package_id={}", payload["package_id"]);
+        println!(
+            "source_pedal_count={}",
+            payload["compiled"]["source_pedal_count"]
+        );
+        println!(
+            "effective_pedal_count={}",
+            payload["effective"]["pedal_count"]
+        );
+        println!("device_count={}", payload["effective"]["device_count"]);
+        println!(
+            "cross_device_cable_count={}",
+            payload["effective"]["cross_device_cable_count"]
+        );
+        println!(
+            "same_physical_target_cable_count={}",
+            payload["effective"]["cable_routes"]["same_physical_target_cable_count"]
+        );
+        println!(
+            "cross_physical_target_cable_count={}",
+            payload["effective"]["cable_routes"]["cross_physical_target_cable_count"]
+        );
+    }
+
+    Ok(())
 }
 
 fn inspect_package(
@@ -409,35 +493,13 @@ fn inspect_package(
         .as_deref()
         .unwrap_or(&manifest.placement.default_device_id);
     let available_devices = inspect_available_devices(default_device_id, args.vulkan_device_index);
-    let execution_by_pedal = manifest
-        .pedal_executions
-        .iter()
-        .map(|execution| (execution.pedal_id.as_str(), execution))
-        .collect::<BTreeMap<_, _>>();
-    let source_pedals = manifest
-        .circuit_graph
-        .pedals
-        .iter()
-        .enumerate()
-        .map(|(pedal_index, pedal)| {
-            let execution = execution_by_pedal.get(pedal.pedal_id.as_str());
-            json!({
-                "pedal_index": pedal_index,
-                "pedal_id": pedal.pedal_id,
-                "operator_type": pedal.operator_type,
-                "implementation": pedal.implementation,
-                "behavioral_role": pedal.behavioral_role,
-                "source_layer_index": pedal.circuit.source.source_layer_index,
-                "circuit_id": pedal.circuit.id,
-                "input_ports": pedal.circuit.boundary.inputs.iter().map(package_port_report).collect::<Vec<_>>(),
-                "output_ports": pedal.circuit.boundary.outputs.iter().map(package_port_report).collect::<Vec<_>>(),
-                "state_port_count": pedal.circuit.state_ports.len(),
-                "parameter_ref_count": pedal.params.refs.len(),
-                "node_count": pedal.circuit.nodes.len(),
-                "kernel_count": execution.map(|execution| execution.kernels.len()).unwrap_or(0),
-            })
-        })
-        .collect::<Vec<_>>();
+    let source_pedals = source_pedals_report(&manifest);
+    let source_pedal_count = source_pedals.len();
+    let capacity_profiles = manifest.capacity_profiles.iter().map(|profile| json!({
+        "min_dynamic_state_capacity_activations": profile.min_dynamic_state_capacity_activations,
+        "max_dynamic_state_capacity_activations": profile.max_dynamic_state_capacity_activations,
+        "shader_override_count": profile.pedal_execution_shader_overrides.len(),
+    })).collect::<Vec<_>>();
     let payload = json!({
         "ok": true,
         "package_manifest": package_manifest,
@@ -452,12 +514,8 @@ fn inspect_package(
         "runtime_patch": runtime_patch_report(args),
         "device_bindings": runtime_device_bindings_report(args, &[]),
         "dynamic_state_capacity_activations": manifest.dynamic_state_capacity_activations,
-        "capacity_profiles": manifest.capacity_profiles.iter().map(|profile| json!({
-            "min_dynamic_state_capacity_activations": profile.min_dynamic_state_capacity_activations,
-            "max_dynamic_state_capacity_activations": profile.max_dynamic_state_capacity_activations,
-            "shader_override_count": profile.pedal_execution_shader_overrides.len(),
-        })).collect::<Vec<_>>(),
-        "source_pedal_count": source_pedals.len(),
+        "capacity_profiles": capacity_profiles,
+        "source_pedal_count": source_pedal_count,
         "source_pedals": source_pedals,
         "available_devices": available_devices,
     });
@@ -484,6 +542,39 @@ fn inspect_package(
     }
 
     Ok(())
+}
+
+fn source_pedals_report(manifest: &VulkanResidentGreedyModelPackageManifest) -> Vec<Value> {
+    let execution_by_pedal = manifest
+        .pedal_executions
+        .iter()
+        .map(|execution| (execution.pedal_id.as_str(), execution))
+        .collect::<BTreeMap<_, _>>();
+
+    manifest
+        .circuit_graph
+        .pedals
+        .iter()
+        .enumerate()
+        .map(|(pedal_index, pedal)| {
+            let execution = execution_by_pedal.get(pedal.pedal_id.as_str());
+            json!({
+                "pedal_index": pedal_index,
+                "pedal_id": pedal.pedal_id,
+                "operator_type": pedal.operator_type,
+                "implementation": pedal.implementation,
+                "behavioral_role": pedal.behavioral_role,
+                "source_layer_index": pedal.circuit.source.source_layer_index,
+                "circuit_id": pedal.circuit.id,
+                "input_ports": pedal.circuit.boundary.inputs.iter().map(package_port_report).collect::<Vec<_>>(),
+                "output_ports": pedal.circuit.boundary.outputs.iter().map(package_port_report).collect::<Vec<_>>(),
+                "state_port_count": pedal.circuit.state_ports.len(),
+                "parameter_ref_count": pedal.params.refs.len(),
+                "node_count": pedal.circuit.nodes.len(),
+                "kernel_count": execution.map(|execution| execution.kernels.len()).unwrap_or(0),
+            })
+        })
+        .collect::<Vec<_>>()
 }
 
 fn inspect_available_devices(
@@ -980,8 +1071,8 @@ fn bound_devices_report(bound_devices: &RuntimeBoundVulkanDevices) -> Value {
     )
 }
 
-fn runtime_cable_routes_report(args: &Args, cables: &[PedalCablePlacement]) -> Value {
-    cable_routes_report(cables, |device_id| {
+fn runtime_cable_routes_report(args: &Args, cables: &[PedalCablePlacement]) -> RuntimeCableRoutes {
+    RuntimeCableRoutes::from_cables(cables, |device_id| {
         let explicit_target = args.device_bindings.get(device_id);
         let target = explicit_target.cloned().or_else(|| {
             args.vulkan_device_index
@@ -997,10 +1088,10 @@ fn runtime_cable_routes_report(args: &Args, cables: &[PedalCablePlacement]) -> V
         } else {
             "runtime_default"
         };
-        CableRouteTarget {
+        RuntimeCableRouteTarget {
             target,
             physical_device_index,
-            binding_source: source,
+            binding_source: source.to_string(),
         }
     })
 }
@@ -1008,91 +1099,17 @@ fn runtime_cable_routes_report(args: &Args, cables: &[PedalCablePlacement]) -> V
 fn bound_cable_routes_report(
     bound_devices: &RuntimeBoundVulkanDevices,
     cables: &[PedalCablePlacement],
-) -> Value {
-    cable_routes_report(cables, |device_id| {
+) -> RuntimeCableRoutes {
+    RuntimeCableRoutes::from_cables(cables, |device_id| {
         let physical_device_index = bound_devices
             .physical_device_indices
             .get(device_id)
             .copied();
-        CableRouteTarget {
+        RuntimeCableRouteTarget {
             target: physical_device_index.map(|index| format!("vulkan:{index}")),
             physical_device_index,
-            binding_source: "mounted",
+            binding_source: "mounted".to_string(),
         }
-    })
-}
-
-struct CableRouteTarget {
-    target: Option<String>,
-    physical_device_index: Option<usize>,
-    binding_source: &'static str,
-}
-
-fn cable_routes_report<F>(cables: &[PedalCablePlacement], target_for: F) -> Value
-where
-    F: Fn(&str) -> CableRouteTarget,
-{
-    let mut logical_local_cable_count = 0usize;
-    let mut logical_cross_device_cable_count = 0usize;
-    let mut same_target_cable_count = 0usize;
-    let mut cross_target_cable_count = 0usize;
-    let mut unresolved_target_cable_count = 0usize;
-
-    let routes = cables
-        .iter()
-        .map(|cable| {
-            let source_target = target_for(&cable.source_device_id);
-            let destination_target = target_for(&cable.destination_device_id);
-            let is_logical_local = cable.source_device_id == cable.destination_device_id;
-            let route_kind = if is_logical_local {
-                logical_local_cable_count += 1;
-                "logical_local"
-            } else {
-                logical_cross_device_cable_count += 1;
-                match (&source_target.target, &destination_target.target) {
-                    (Some(source), Some(destination)) if source == destination => {
-                        same_target_cable_count += 1;
-                        "same_physical_target"
-                    }
-                    (Some(_), Some(_)) => {
-                        cross_target_cable_count += 1;
-                        "cross_physical_target"
-                    }
-                    _ => {
-                        unresolved_target_cable_count += 1;
-                        "unresolved_runtime_target"
-                    }
-                }
-            };
-
-            json!({
-                "cable_index": cable.cable_index,
-                "signal": cable.signal,
-                "shape": cable.shape,
-                "source_pedal_id": cable.source_pedal_id,
-                "source_device_id": cable.source_device_id,
-                "source_target": source_target.target,
-                "source_physical_device_index": source_target.physical_device_index,
-                "source_binding": source_target.binding_source,
-                "destination_pedal_id": cable.destination_pedal_id,
-                "destination_device_id": cable.destination_device_id,
-                "destination_target": destination_target.target,
-                "destination_physical_device_index": destination_target.physical_device_index,
-                "destination_binding": destination_target.binding_source,
-                "route_kind": route_kind,
-            })
-        })
-        .collect::<Vec<_>>();
-
-    json!({
-        "schema": "llmoop.runtime_cable_routes.v1",
-        "cable_count": cables.len(),
-        "logical_local_cable_count": logical_local_cable_count,
-        "logical_cross_device_cable_count": logical_cross_device_cable_count,
-        "same_physical_target_cable_count": same_target_cable_count,
-        "cross_physical_target_cable_count": cross_target_cable_count,
-        "unresolved_target_cable_count": unresolved_target_cable_count,
-        "routes": routes,
     })
 }
 
@@ -1313,6 +1330,9 @@ fn parse_args() -> Result<Args, String> {
             "--prompt" => {
                 parsed.prompt = Some(next_value(&mut raw, "--prompt")?);
             }
+            "--inspect-runtime" | "--inspect-topology" => {
+                parsed.inspect_runtime = true;
+            }
             "--inspect-package" | "--inspect-pedals" => {
                 parsed.inspect_package = true;
             }
@@ -1402,13 +1422,14 @@ fn parse_args() -> Result<Args, String> {
     if matches!(parsed.prompt.as_deref(), Some("")) {
         return Err("--prompt must not be empty".to_string());
     }
-    let inspect_mode_count = usize::from(parsed.inspect_package)
+    let inspect_mode_count = usize::from(parsed.inspect_runtime)
+        + usize::from(parsed.inspect_package)
         + usize::from(parsed.inspect_patch)
         + usize::from(parsed.inspect_placement)
         + usize::from(parsed.inspect_device_slice.is_some());
     if inspect_mode_count > 1 {
         return Err(
-            "--inspect-package, --inspect-patch, --inspect-placement, and --inspect-device-slice are mutually exclusive"
+            "--inspect-runtime, --inspect-package, --inspect-patch, --inspect-placement, and --inspect-device-slice are mutually exclusive"
                 .to_string(),
         );
     }
@@ -1605,6 +1626,8 @@ Options:
   --chain <ITEM[,ITEM...]>    Runtime source chain. ITEM is SOURCE or INSTANCE=SOURCE.
   --duplicate-after <AFTER=NEW>
                              Duplicate runtime pedal instance AFTER with id NEW.
+  --inspect-runtime          Preview UI-ready package, patch, placement, device, and route facts.
+  --inspect-topology         Alias for --inspect-runtime.
   --inspect-package          Summarize the compiled source pedal kit and available devices.
   --inspect-pedals           Alias for --inspect-package.
   --inspect-patch            Preview the effective runtime patch without mounting devices.

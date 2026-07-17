@@ -25,6 +25,7 @@ pub const CIRCUIT_STATE_SCHEMA: &str = "llmoop.circuit_state.v1";
 pub const LOWERED_PEDALBOARD_SCHEMA: &str = "llmoop.lowered_pedalboard.v1";
 pub const STREAM_CIRCUIT_PLACEMENT_SCHEMA: &str = "llmoop.stream_circuit_placement.v1";
 pub const STREAM_CIRCUIT_RUNTIME_PATCH_SCHEMA: &str = "llmoop.stream_circuit_runtime_patch.v1";
+pub const RUNTIME_CABLE_ROUTES_SCHEMA: &str = "llmoop.runtime_cable_routes.v1";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CircuitArtifactError(pub String);
@@ -1370,6 +1371,13 @@ impl StreamCircuitPlacementPlan {
             .filter(|cable| cable.transport.is_cross_device())
             .collect()
     }
+
+    pub fn runtime_cable_routes<F>(&self, target_for: F) -> RuntimeCableRoutes
+    where
+        F: FnMut(&str) -> RuntimeCableRouteTarget,
+    {
+        RuntimeCableRoutes::from_cables(&self.cables, target_for)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1412,6 +1420,122 @@ pub enum CableTransport {
 impl CableTransport {
     pub fn is_cross_device(&self) -> bool {
         matches!(self, Self::CrossDevice { .. })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeCableRouteTarget {
+    pub target: Option<String>,
+    pub physical_device_index: Option<usize>,
+    pub binding_source: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeCableRouteKind {
+    LogicalLocal,
+    SamePhysicalTarget,
+    CrossPhysicalTarget,
+    UnresolvedRuntimeTarget,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeCableRoute {
+    pub cable_index: usize,
+    pub signal: String,
+    pub shape: Vec<usize>,
+    pub source_pedal_id: String,
+    pub source_device_id: String,
+    pub source_target: Option<String>,
+    pub source_physical_device_index: Option<usize>,
+    pub source_binding: String,
+    pub destination_pedal_id: String,
+    pub destination_device_id: String,
+    pub destination_target: Option<String>,
+    pub destination_physical_device_index: Option<usize>,
+    pub destination_binding: String,
+    pub route_kind: RuntimeCableRouteKind,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeCableRoutes {
+    pub schema: String,
+    pub cable_count: usize,
+    pub logical_local_cable_count: usize,
+    pub logical_cross_device_cable_count: usize,
+    pub same_physical_target_cable_count: usize,
+    pub cross_physical_target_cable_count: usize,
+    pub unresolved_target_cable_count: usize,
+    pub routes: Vec<RuntimeCableRoute>,
+}
+
+impl RuntimeCableRoutes {
+    pub fn from_cables<F>(cables: &[PedalCablePlacement], mut target_for: F) -> Self
+    where
+        F: FnMut(&str) -> RuntimeCableRouteTarget,
+    {
+        let mut logical_local_cable_count = 0usize;
+        let mut logical_cross_device_cable_count = 0usize;
+        let mut same_physical_target_cable_count = 0usize;
+        let mut cross_physical_target_cable_count = 0usize;
+        let mut unresolved_target_cable_count = 0usize;
+
+        let routes = cables
+            .iter()
+            .map(|cable| {
+                let source_target = target_for(&cable.source_device_id);
+                let destination_target = target_for(&cable.destination_device_id);
+                let is_logical_local = cable.source_device_id == cable.destination_device_id;
+                let route_kind = if is_logical_local {
+                    logical_local_cable_count += 1;
+                    RuntimeCableRouteKind::LogicalLocal
+                } else {
+                    logical_cross_device_cable_count += 1;
+                    match (&source_target.target, &destination_target.target) {
+                        (Some(source), Some(destination)) if source == destination => {
+                            same_physical_target_cable_count += 1;
+                            RuntimeCableRouteKind::SamePhysicalTarget
+                        }
+                        (Some(_), Some(_)) => {
+                            cross_physical_target_cable_count += 1;
+                            RuntimeCableRouteKind::CrossPhysicalTarget
+                        }
+                        _ => {
+                            unresolved_target_cable_count += 1;
+                            RuntimeCableRouteKind::UnresolvedRuntimeTarget
+                        }
+                    }
+                };
+
+                RuntimeCableRoute {
+                    cable_index: cable.cable_index,
+                    signal: cable.signal.clone(),
+                    shape: cable.shape.clone(),
+                    source_pedal_id: cable.source_pedal_id.clone(),
+                    source_device_id: cable.source_device_id.clone(),
+                    source_target: source_target.target,
+                    source_physical_device_index: source_target.physical_device_index,
+                    source_binding: source_target.binding_source,
+                    destination_pedal_id: cable.destination_pedal_id.clone(),
+                    destination_device_id: cable.destination_device_id.clone(),
+                    destination_target: destination_target.target,
+                    destination_physical_device_index: destination_target.physical_device_index,
+                    destination_binding: destination_target.binding_source,
+                    route_kind,
+                }
+            })
+            .collect::<Vec<_>>();
+
+        Self {
+            schema: RUNTIME_CABLE_ROUTES_SCHEMA.to_string(),
+            cable_count: cables.len(),
+            logical_local_cable_count,
+            logical_cross_device_cable_count,
+            same_physical_target_cable_count,
+            cross_physical_target_cable_count,
+            unresolved_target_cable_count,
+            routes,
+        }
     }
 }
 
@@ -2185,6 +2309,54 @@ mod tests {
                 to_device_id: "lan:worker-a".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn runtime_cable_routes_classify_logical_and_physical_routes() {
+        let resolved =
+            ResolvedLoweredPedalboard::from_index_file(fixture_model_index_path()).unwrap();
+        let spec = StreamCircuitPlacementSpec::new("gpu0")
+            .with_pedal_device("layer_01", "gpu1")
+            .with_pedal_device("layer_02", "gpu2");
+        let placement = resolved.placement_plan(&spec).unwrap();
+
+        let routes = placement.runtime_cable_routes(|device_id| {
+            let (target, physical_device_index) = match device_id {
+                "gpu0" | "gpu1" => (Some("vulkan:0".to_string()), Some(0)),
+                "gpu2" => (Some("vulkan:1".to_string()), Some(1)),
+                _ => (None, None),
+            };
+            RuntimeCableRouteTarget {
+                target,
+                physical_device_index,
+                binding_source: "test".to_string(),
+            }
+        });
+
+        assert_eq!(routes.schema, RUNTIME_CABLE_ROUTES_SCHEMA);
+        assert_eq!(routes.cable_count, 13);
+        assert_eq!(routes.logical_local_cable_count, 10);
+        assert_eq!(routes.logical_cross_device_cable_count, 3);
+        assert_eq!(routes.same_physical_target_cable_count, 1);
+        assert_eq!(routes.cross_physical_target_cable_count, 2);
+        assert_eq!(routes.unresolved_target_cable_count, 0);
+        assert_eq!(
+            routes.routes[0].route_kind,
+            RuntimeCableRouteKind::SamePhysicalTarget
+        );
+        assert_eq!(
+            routes.routes[1].route_kind,
+            RuntimeCableRouteKind::CrossPhysicalTarget
+        );
+        assert_eq!(
+            routes.routes[3].route_kind,
+            RuntimeCableRouteKind::LogicalLocal
+        );
+
+        let payload = serde_json::to_value(&routes).unwrap();
+        assert_eq!(payload["routes"][0]["route_kind"], "same_physical_target");
+        assert_eq!(payload["routes"][1]["route_kind"], "cross_physical_target");
+        assert_eq!(payload["routes"][3]["route_kind"], "logical_local");
     }
 
     #[test]
