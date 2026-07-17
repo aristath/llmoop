@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use llmoop_runtime::{
-    CircuitPort, PedalPlacement, VulkanComputeDevice,
+    CircuitPort, PedalPlacement, VulkanComputeDevice, VulkanPlacedCableTransportStats,
     VulkanResidentGreedyInProcessPlacedModelPackage, VulkanResidentGreedyModelPackage,
     VulkanResidentGreedyModelPackageDeviceSlice, VulkanResidentGreedyModelPackageManifest,
     VulkanResidentHfTokenizerTextCodec, VulkanResidentTokenEngine,
@@ -249,6 +249,46 @@ fn run_placed_prompt(
         .iter()
         .map(|tick| tick.tick_run.placed_run.completed_stage_delta)
         .collect::<Vec<_>>();
+    let transport_stats_by_tick = run
+        .tick_runs
+        .iter()
+        .map(|tick| transport_stats_report(&tick.tick_run.placed_run.transport_stats))
+        .collect::<Vec<_>>();
+    let transport_published_packet_count = run
+        .tick_runs
+        .iter()
+        .map(|tick| {
+            tick.tick_run
+                .placed_run
+                .transport_stats
+                .published_packet_count
+        })
+        .sum::<usize>();
+    let transport_published_byte_count = run
+        .tick_runs
+        .iter()
+        .map(|tick| {
+            tick.tick_run
+                .placed_run
+                .transport_stats
+                .published_byte_count
+        })
+        .sum::<usize>();
+    let transport_received_packet_count = run
+        .tick_runs
+        .iter()
+        .map(|tick| {
+            tick.tick_run
+                .placed_run
+                .transport_stats
+                .received_packet_count
+        })
+        .sum::<usize>();
+    let transport_received_byte_count = run
+        .tick_runs
+        .iter()
+        .map(|tick| tick.tick_run.placed_run.transport_stats.received_byte_count)
+        .sum::<usize>();
 
     if args.json {
         println!(
@@ -281,6 +321,13 @@ fn run_placed_prompt(
                 "scheduler_turns": total_scheduler_turns,
                 "max_scheduler_turns_per_tick": args.max_scheduler_turns,
                 "completed_stage_deltas": completed_stage_deltas,
+                "transport": {
+                    "published_packet_count": transport_published_packet_count,
+                    "published_byte_count": transport_published_byte_count,
+                    "received_packet_count": transport_received_packet_count,
+                    "received_byte_count": transport_received_byte_count,
+                    "by_tick": transport_stats_by_tick,
+                },
             }))?
         );
     } else if args.generated_only {
@@ -290,6 +337,17 @@ fn run_placed_prompt(
     }
 
     Ok(())
+}
+
+fn transport_stats_report(stats: &VulkanPlacedCableTransportStats) -> Value {
+    json!({
+        "pending_packet_count": stats.pending_packet_count,
+        "pending_byte_count": stats.pending_byte_count,
+        "published_packet_count": stats.published_packet_count,
+        "published_byte_count": stats.published_byte_count,
+        "received_packet_count": stats.received_packet_count,
+        "received_byte_count": stats.received_byte_count,
+    })
 }
 
 fn inspect_package(

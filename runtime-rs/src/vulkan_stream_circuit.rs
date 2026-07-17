@@ -1686,8 +1686,22 @@ pub struct VulkanPlacedCableTransportReceiveBatch {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct VulkanPlacedCableTransportStats {
+    pub pending_packet_count: usize,
+    pub pending_byte_count: usize,
+    pub published_packet_count: usize,
+    pub published_byte_count: usize,
+    pub received_packet_count: usize,
+    pub received_byte_count: usize,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct VulkanInProcessPlacedCableTransport {
     packets: BTreeMap<VulkanPlacedCablePacketKey, VulkanPlacedCablePacket>,
+    published_packet_count: usize,
+    published_byte_count: usize,
+    received_packet_count: usize,
+    received_byte_count: usize,
 }
 
 impl VulkanInProcessPlacedCableTransport {
@@ -1697,6 +1711,17 @@ impl VulkanInProcessPlacedCableTransport {
 
     pub fn packet_count(&self) -> usize {
         self.packets.len()
+    }
+
+    pub fn stats(&self) -> VulkanPlacedCableTransportStats {
+        VulkanPlacedCableTransportStats {
+            pending_packet_count: self.packets.len(),
+            pending_byte_count: self.packets.values().map(|packet| packet.byte_count).sum(),
+            published_packet_count: self.published_packet_count,
+            published_byte_count: self.published_byte_count,
+            received_packet_count: self.received_packet_count,
+            received_byte_count: self.received_byte_count,
+        }
     }
 
     pub fn contains_packet(&self, key: &VulkanPlacedCablePacketKey) -> bool {
@@ -1736,7 +1761,10 @@ impl VulkanInProcessPlacedCableTransport {
             signal: packet.signal.clone(),
             byte_count: packet.byte_count,
         };
+        let byte_count = packet.byte_count;
         self.packets.insert(key, packet);
+        self.published_packet_count += 1;
+        self.published_byte_count += byte_count;
         Ok(receipt)
     }
 
@@ -1787,6 +1815,8 @@ impl VulkanInProcessPlacedCableTransport {
                 operation: "write incoming cable buffer",
                 error,
             })?;
+        self.received_packet_count += 1;
+        self.received_byte_count += packet.byte_count;
         Ok(VulkanPlacedCableTransportReceipt {
             key: packet.key,
             signal: packet.signal,
@@ -11861,6 +11891,7 @@ pub struct VulkanMountedPlacedResidentInProcessStreamTickRun {
     pub completed_stage_delta: usize,
     pub completed_slice_count: usize,
     pub pending_slice_count: usize,
+    pub transport_stats: VulkanPlacedCableTransportStats,
     pub device_runs: Vec<VulkanMountedPlacedResidentStreamTickRun>,
 }
 
@@ -11933,6 +11964,7 @@ pub fn run_mounted_placed_resident_stream_tick_slices_in_process(
         if slices.iter().all(|slice| slice.cursor.is_completed()) {
             return Ok(in_process_stream_tick_run_snapshot(
                 slices,
+                transport,
                 VulkanMountedPlacedResidentInProcessStreamTickRunStatus::Completed,
                 scheduler_turn_count,
                 completed_stage_delta,
@@ -11943,6 +11975,7 @@ pub fn run_mounted_placed_resident_stream_tick_slices_in_process(
             let pending_device_ids = pending_in_process_stream_tick_device_ids(slices);
             return Ok(in_process_stream_tick_run_snapshot(
                 slices,
+                transport,
                 VulkanMountedPlacedResidentInProcessStreamTickRunStatus::Blocked {
                     pending_device_ids,
                 },
@@ -11962,6 +11995,7 @@ pub fn run_mounted_placed_resident_stream_tick_slices_in_process(
     };
     Ok(in_process_stream_tick_run_snapshot(
         slices,
+        transport,
         status,
         scheduler_turn_count,
         completed_stage_delta,
@@ -11980,6 +12014,7 @@ fn pending_in_process_stream_tick_device_ids(
 
 fn in_process_stream_tick_run_snapshot(
     slices: &[VulkanMountedPlacedResidentInProcessStreamTickSlice<'_>],
+    transport: &VulkanInProcessPlacedCableTransport,
     status: VulkanMountedPlacedResidentInProcessStreamTickRunStatus,
     scheduler_turn_count: usize,
     completed_stage_delta: usize,
@@ -11994,6 +12029,7 @@ fn in_process_stream_tick_run_snapshot(
         completed_stage_delta,
         completed_slice_count,
         pending_slice_count: slices.len() - completed_slice_count,
+        transport_stats: transport.stats(),
         device_runs: slices.iter().map(|slice| slice.cursor.snapshot()).collect(),
     }
 }
@@ -21324,6 +21360,12 @@ mod tests {
         assert_eq!(run.completed_slice_count, 2);
         assert_eq!(run.pending_slice_count, 0);
         assert_eq!(run.completed_stage_delta, 246);
+        assert_eq!(run.transport_stats.pending_packet_count, 0);
+        assert_eq!(run.transport_stats.pending_byte_count, 0);
+        assert_eq!(run.transport_stats.published_packet_count, 2);
+        assert_eq!(run.transport_stats.published_byte_count, 4096);
+        assert_eq!(run.transport_stats.received_packet_count, 2);
+        assert_eq!(run.transport_stats.received_byte_count, 4096);
         assert_eq!(transport.packet_count(), 0);
 
         let gpu0_run = run
