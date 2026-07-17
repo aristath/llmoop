@@ -21,8 +21,8 @@ use llmoop_runtime::{
     RuntimePromptBenchmarkUsizeMetricReport, RuntimePromptTimingReport,
     RuntimeRemoteCableBufferReport, RuntimeSingleDevicePromptRunReport, RuntimeSourcePedal,
     RuntimeTokenizerOptionsReport, RuntimeTopologyReport, VulkanComputeDevice,
-    VulkanPlacedCableTransportStats, VulkanResidentGreedyInProcessPlacedModelPackage,
-    VulkanResidentGreedyInProcessPlacedPromptEventRun, VulkanResidentGreedyModelPackage,
+    VulkanPlacedCableTransportStats, VulkanResidentGreedyInProcessPlacedPromptEventRun,
+    VulkanResidentGreedyInProcessPlacedPromptStream, VulkanResidentGreedyModelPackage,
     VulkanResidentGreedyModelPackageDeviceSlice, VulkanResidentGreedyModelPackageManifest,
     VulkanResidentHfTokenizerTextCodec, VulkanResidentTokenEngine,
     VulkanResidentTokenEngineRunBudget, VulkanResidentTokenEngineRunStopCondition,
@@ -348,18 +348,16 @@ fn execute_placed_prompt_run(
     }
     let placement = runtime_manifest_placement(manifest_dir, &manifest)?;
     let bound_devices = runtime_bound_vulkan_devices(args, &logical_device_ids)?;
-    let package = VulkanResidentGreedyInProcessPlacedModelPackage::from_manifest_for_bound_devices(
-        &bound_devices.devices,
-        manifest_dir,
-        manifest,
-        Some(capacity),
-    )?;
+    let mut stream =
+        VulkanResidentGreedyInProcessPlacedPromptStream::from_manifest_for_bound_devices(
+            bound_devices.devices.clone(),
+            manifest_dir,
+            manifest,
+            Some(capacity),
+        )?;
     let setup_time_ns = elapsed_nanos_u64(setup_start);
-    let mut session = package.prompt_session();
     let run_start = Instant::now();
-    let session_run = session.run_prompt_event_bounded_on_bound_devices_in_process(
-        &package,
-        &bound_devices.devices,
+    let session_run = stream.run_prompt_event_bounded(
         prompt_ids,
         args.max_new_tokens,
         None,
@@ -471,15 +469,15 @@ fn execute_placed_prompt_run(
         execution_mode: "placed_in_process".to_string(),
         package_manifest: package_manifest.to_path_buf(),
         tokenizer_dir: tokenizer_dir.to_path_buf(),
-        boundary_device_id: package.boundary_device_id.clone(),
-        device_count: package.device_count,
-        device_ids: package.device_ids.clone(),
+        boundary_device_id: stream.package().boundary_device_id.clone(),
+        device_count: stream.package().device_count,
+        device_ids: stream.package().device_ids.clone(),
         bound_devices: bound_devices_report(&bound_devices),
         cable_routes: bound_cable_routes_report(&bound_devices, &placement.cables),
         runtime_patch: runtime_patch_report(args),
-        device_bindings: runtime_device_bindings_report(args, &package.device_ids),
-        hosted_pedal_count: package.hosted_pedal_count,
-        resident_capacity_activations: package.dynamic_state_capacity_activations,
+        device_bindings: runtime_device_bindings_report(args, &stream.package().device_ids),
+        hosted_pedal_count: stream.package().hosted_pedal_count,
+        resident_capacity_activations: stream.package().dynamic_state_capacity_activations,
         needed_capacity_activations: prompt_ids.len() + args.max_new_tokens,
         tokenizer: tokenizer_options_report(args),
         prompt_text: prompt.to_string(),

@@ -7932,6 +7932,100 @@ pub struct VulkanResidentGreedyInProcessPlacedPromptSessionRun {
     pub run: VulkanResidentGreedyInProcessPlacedPromptEventRun,
 }
 
+pub struct VulkanResidentGreedyInProcessPlacedPromptStream {
+    package: VulkanResidentGreedyInProcessPlacedModelPackage,
+    devices: BTreeMap<String, Arc<VulkanComputeDevice>>,
+    session: VulkanResidentGreedyInProcessPlacedPromptSession,
+}
+
+impl VulkanResidentGreedyInProcessPlacedPromptStream {
+    pub fn new(
+        package: VulkanResidentGreedyInProcessPlacedModelPackage,
+        devices: BTreeMap<String, Arc<VulkanComputeDevice>>,
+    ) -> Result<Self, VulkanResidentGreedyInProcessPlacedModelPackageError> {
+        Self::from_package_devices_and_session(package, devices, 0)
+    }
+
+    pub fn from_manifest_for_bound_devices(
+        devices: BTreeMap<String, Arc<VulkanComputeDevice>>,
+        manifest_dir: impl AsRef<Path>,
+        manifest: VulkanResidentGreedyModelPackageManifest,
+        dynamic_state_capacity_activations: Option<usize>,
+    ) -> Result<Self, VulkanResidentGreedyInProcessPlacedModelPackageError> {
+        let package =
+            VulkanResidentGreedyInProcessPlacedModelPackage::from_manifest_for_bound_devices(
+                &devices,
+                manifest_dir,
+                manifest,
+                dynamic_state_capacity_activations,
+            )?;
+        Self::new(package, devices)
+    }
+
+    pub fn from_package_devices_and_session(
+        package: VulkanResidentGreedyInProcessPlacedModelPackage,
+        devices: BTreeMap<String, Arc<VulkanComputeDevice>>,
+        start_stream_tick: u64,
+    ) -> Result<Self, VulkanResidentGreedyInProcessPlacedModelPackageError> {
+        for device_id in &package.device_ids {
+            if !devices.contains_key(device_id) {
+                return Err(
+                    VulkanResidentGreedyInProcessPlacedModelPackageError::MissingBoundDevice {
+                        device_id: device_id.clone(),
+                    },
+                );
+            }
+        }
+        let session = package.prompt_session_from_stream_tick(start_stream_tick)?;
+        Ok(Self {
+            package,
+            devices,
+            session,
+        })
+    }
+
+    pub fn package(&self) -> &VulkanResidentGreedyInProcessPlacedModelPackage {
+        &self.package
+    }
+
+    pub fn session(&self) -> &VulkanResidentGreedyInProcessPlacedPromptSession {
+        &self.session
+    }
+
+    pub fn devices(&self) -> &BTreeMap<String, Arc<VulkanComputeDevice>> {
+        &self.devices
+    }
+
+    pub fn next_stream_tick(&self) -> u64 {
+        self.session.next_stream_tick
+    }
+
+    pub fn completed_prompt_event_count(&self) -> usize {
+        self.session.completed_prompt_event_count
+    }
+
+    pub fn run_prompt_event_bounded(
+        &mut self,
+        prompt_token_ids: &[u32],
+        max_new_tokens: usize,
+        eos_token_id: Option<u32>,
+        max_scheduler_turns_per_tick: usize,
+    ) -> Result<
+        VulkanResidentGreedyInProcessPlacedPromptSessionRun,
+        VulkanResidentGreedyInProcessPlacedModelPackageError,
+    > {
+        self.session
+            .run_prompt_event_bounded_on_bound_devices_in_process(
+                &self.package,
+                &self.devices,
+                prompt_token_ids,
+                max_new_tokens,
+                eos_token_id,
+                max_scheduler_turns_per_tick,
+            )
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VulkanResidentGreedyInProcessPlacedPromptEventTickRun {
     pub stream_tick: u64,
@@ -22240,6 +22334,65 @@ mod tests {
         assert_eq!(session.generated_token_count, 2);
         assert_eq!(session.output_token_count, 4);
         assert_eq!(session.transport_stats().pending_packet_count, 0);
+    }
+
+    #[test]
+    fn placed_prompt_stream_owns_package_devices_and_session() {
+        let device = match VulkanComputeDevice::new() {
+            Ok(device) => device,
+            Err(error) => {
+                eprintln!("skipping placed prompt stream test: {error}");
+                return;
+            }
+        };
+        let mut manifest = fixture_model_package_manifest();
+        manifest.placement =
+            StreamCircuitPlacementSpec::new("gpu0").with_pedal_device("layer_02", "gpu1");
+        let manifest_path = fixture_model_package_manifest_path();
+        let manifest_dir = manifest_path.parent().unwrap();
+        let device = Arc::new(device);
+        let devices = BTreeMap::from([
+            ("gpu0".to_string(), device.clone()),
+            ("gpu1".to_string(), device.clone()),
+        ]);
+
+        let mut stream =
+            VulkanResidentGreedyInProcessPlacedPromptStream::from_manifest_for_bound_devices(
+                devices,
+                manifest_dir,
+                manifest,
+                Some(8),
+            )
+            .unwrap();
+
+        assert_eq!(stream.package().boundary_device_id, "gpu0");
+        assert_eq!(stream.devices().len(), 2);
+        assert_eq!(stream.next_stream_tick(), 0);
+
+        let first = stream.run_prompt_event_bounded(&[1], 1, None, 8).unwrap();
+        assert_eq!(first.prompt_event_index, 0);
+        assert_eq!(first.start_stream_tick, 0);
+        assert_eq!(first.next_stream_tick, 2);
+        assert_eq!(stream.next_stream_tick(), 2);
+        assert_eq!(stream.completed_prompt_event_count(), 1);
+
+        let second = stream
+            .run_prompt_event_bounded(&[36_309], 1, None, 8)
+            .unwrap();
+        assert_eq!(second.prompt_event_index, 1);
+        assert_eq!(second.start_stream_tick, 2);
+        assert_eq!(second.next_stream_tick, 4);
+        assert_eq!(stream.next_stream_tick(), 4);
+        assert_eq!(stream.completed_prompt_event_count(), 2);
+        assert_eq!(
+            second
+                .run
+                .tick_runs
+                .iter()
+                .map(|tick| tick.stream_tick)
+                .collect::<Vec<_>>(),
+            vec![2, 3]
+        );
     }
 
     #[test]
