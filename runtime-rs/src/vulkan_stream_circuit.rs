@@ -7437,6 +7437,31 @@ impl VulkanResidentGreedyInProcessPlacedModelPackage {
         VulkanResidentGreedyInProcessPlacedPromptEventRun,
         VulkanResidentGreedyInProcessPlacedModelPackageError,
     > {
+        let mut transport = VulkanInProcessPlacedCableTransport::new();
+        self.run_prompt_event_bounded_in_process_with_transport(
+            device,
+            &mut transport,
+            prompt_token_ids,
+            start_stream_tick,
+            max_new_tokens,
+            eos_token_id,
+            max_scheduler_turns_per_tick,
+        )
+    }
+
+    pub fn run_prompt_event_bounded_in_process_with_transport(
+        &self,
+        device: &VulkanComputeDevice,
+        transport: &mut VulkanInProcessPlacedCableTransport,
+        prompt_token_ids: &[u32],
+        start_stream_tick: u64,
+        max_new_tokens: usize,
+        eos_token_id: Option<u32>,
+        max_scheduler_turns_per_tick: usize,
+    ) -> Result<
+        VulkanResidentGreedyInProcessPlacedPromptEventRun,
+        VulkanResidentGreedyInProcessPlacedModelPackageError,
+    > {
         if prompt_token_ids.is_empty() {
             return Err(VulkanResidentGreedyInProcessPlacedModelPackageError::EmptyPromptEvent);
         }
@@ -7447,7 +7472,6 @@ impl VulkanResidentGreedyInProcessPlacedModelPackage {
         let mut generated_token_ids = Vec::with_capacity(max_new_tokens);
         let mut remaining_public_outputs = max_new_tokens;
         let mut stop_reason = (max_new_tokens == 0).then(|| "max_new_tokens".to_string());
-        let mut transport = VulkanInProcessPlacedCableTransport::new();
 
         while external_input_index < prompt_token_ids.len() || pending_feedback.is_some() {
             let (input_token_id, input_route, input_feedback_depth, input_closes_loop) =
@@ -7480,7 +7504,7 @@ impl VulkanResidentGreedyInProcessPlacedModelPackage {
             self.ensure_stream_tick_capacity(stream_tick)?;
             let tick_run = self.run_token_id_stream_tick_in_process_with_transport(
                 device,
-                &mut transport,
+                transport,
                 input_token_id,
                 stream_tick,
                 max_scheduler_turns_per_tick,
@@ -7572,6 +7596,31 @@ impl VulkanResidentGreedyInProcessPlacedModelPackage {
         VulkanResidentGreedyInProcessPlacedPromptEventRun,
         VulkanResidentGreedyInProcessPlacedModelPackageError,
     > {
+        let mut transport = VulkanInProcessPlacedCableTransport::new();
+        self.run_prompt_event_bounded_on_bound_devices_in_process_with_transport(
+            devices,
+            &mut transport,
+            prompt_token_ids,
+            start_stream_tick,
+            max_new_tokens,
+            eos_token_id,
+            max_scheduler_turns_per_tick,
+        )
+    }
+
+    pub fn run_prompt_event_bounded_on_bound_devices_in_process_with_transport(
+        &self,
+        devices: &BTreeMap<String, Arc<VulkanComputeDevice>>,
+        transport: &mut VulkanInProcessPlacedCableTransport,
+        prompt_token_ids: &[u32],
+        start_stream_tick: u64,
+        max_new_tokens: usize,
+        eos_token_id: Option<u32>,
+        max_scheduler_turns_per_tick: usize,
+    ) -> Result<
+        VulkanResidentGreedyInProcessPlacedPromptEventRun,
+        VulkanResidentGreedyInProcessPlacedModelPackageError,
+    > {
         if prompt_token_ids.is_empty() {
             return Err(VulkanResidentGreedyInProcessPlacedModelPackageError::EmptyPromptEvent);
         }
@@ -7590,7 +7639,6 @@ impl VulkanResidentGreedyInProcessPlacedModelPackage {
         let mut generated_token_ids = Vec::with_capacity(max_new_tokens);
         let mut remaining_public_outputs = max_new_tokens;
         let mut stop_reason = (max_new_tokens == 0).then(|| "max_new_tokens".to_string());
-        let mut transport = VulkanInProcessPlacedCableTransport::new();
 
         while external_input_index < prompt_token_ids.len() || pending_feedback.is_some() {
             let (input_token_id, input_route, input_feedback_depth, input_closes_loop) =
@@ -7624,7 +7672,7 @@ impl VulkanResidentGreedyInProcessPlacedModelPackage {
             let tick_run = self
                 .run_token_id_stream_tick_on_bound_devices_in_process_with_transport(
                     devices,
-                    &mut transport,
+                    transport,
                     input_token_id,
                     stream_tick,
                     max_scheduler_turns_per_tick,
@@ -7762,12 +7810,12 @@ pub struct VulkanResidentGreedyInProcessPlacedPromptEventRun {
     pub tick_runs: Vec<VulkanResidentGreedyInProcessPlacedPromptEventTickRun>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VulkanResidentGreedyInProcessPlacedPromptSession {
     pub next_stream_tick: u64,
     pub completed_prompt_event_count: usize,
     pub generated_token_count: usize,
     pub output_token_count: usize,
+    transport: VulkanInProcessPlacedCableTransport,
 }
 
 impl VulkanResidentGreedyInProcessPlacedPromptSession {
@@ -7777,7 +7825,16 @@ impl VulkanResidentGreedyInProcessPlacedPromptSession {
             completed_prompt_event_count: 0,
             generated_token_count: 0,
             output_token_count: 0,
+            transport: VulkanInProcessPlacedCableTransport::new(),
         }
+    }
+
+    pub fn transport_direct_cable_binding_count(&self) -> usize {
+        self.transport.direct_cable_binding_count()
+    }
+
+    pub fn transport_stats(&self) -> VulkanPlacedCableTransportStats {
+        self.transport.stats()
     }
 
     pub fn run_prompt_event_bounded_in_process(
@@ -7793,8 +7850,9 @@ impl VulkanResidentGreedyInProcessPlacedPromptSession {
         VulkanResidentGreedyInProcessPlacedModelPackageError,
     > {
         let start_stream_tick = self.next_stream_tick;
-        let run = package.run_prompt_event_bounded_in_process(
+        let run = package.run_prompt_event_bounded_in_process_with_transport(
             device,
+            &mut self.transport,
             prompt_token_ids,
             start_stream_tick,
             max_new_tokens,
@@ -7817,8 +7875,9 @@ impl VulkanResidentGreedyInProcessPlacedPromptSession {
         VulkanResidentGreedyInProcessPlacedModelPackageError,
     > {
         let start_stream_tick = self.next_stream_tick;
-        let run = package.run_prompt_event_bounded_on_bound_devices_in_process(
+        let run = package.run_prompt_event_bounded_on_bound_devices_in_process_with_transport(
             devices,
+            &mut self.transport,
             prompt_token_ids,
             start_stream_tick,
             max_new_tokens,
@@ -22158,6 +22217,7 @@ mod tests {
         );
         assert_eq!(session.next_stream_tick, 2);
         assert_eq!(session.completed_prompt_event_count, 1);
+        assert_eq!(session.transport_stats().pending_packet_count, 0);
 
         let second = session
             .run_prompt_event_bounded_in_process(&placed_package, &device, &[36_309], 1, None, 8)
@@ -22179,6 +22239,7 @@ mod tests {
         assert_eq!(session.completed_prompt_event_count, 2);
         assert_eq!(session.generated_token_count, 2);
         assert_eq!(session.output_token_count, 4);
+        assert_eq!(session.transport_stats().pending_packet_count, 0);
     }
 
     #[test]
