@@ -370,14 +370,56 @@ fn inspect_package(
 }
 
 fn inspect_available_devices(default_device_id: &str) -> Vec<Value> {
-    match VulkanComputeDevice::new() {
-        Ok(device) => vec![json!({
+    match VulkanComputeDevice::available_compute_devices() {
+        Ok(devices) if devices.is_empty() => vec![json!({
             "device_id": default_device_id,
             "backend": "vulkan_compute",
-            "device_name": device.device_name(),
-            "available": true,
-            "notes": ["selected local Vulkan compute device"],
+            "available": false,
+            "notes": ["no compute-capable Vulkan physical devices were found"],
         })],
+        Ok(devices) => devices
+            .iter()
+            .map(|device| {
+                let runtime_device_id = device
+                    .selected_by_default
+                    .then(|| default_device_id.to_string());
+                let device_id = runtime_device_id
+                    .clone()
+                    .unwrap_or_else(|| device.physical_device_id.clone());
+                json!({
+                    "device_id": device_id,
+                    "runtime_device_id": runtime_device_id,
+                    "physical_device_id": device.physical_device_id.clone(),
+                    "physical_device_index": device.physical_device_index,
+                    "backend": "vulkan_compute",
+                    "device_name": device.device_name.clone(),
+                    "device_type": device.device_type.clone(),
+                    "vendor_id": device.vendor_id,
+                    "raw_device_id": device.device_id,
+                    "api_version": device.api_version,
+                    "driver_version": device.driver_version,
+                    "compute_queue_family_indices": device.compute_queue_family_indices.clone(),
+                    "memory_heaps": device.memory_heaps.iter().map(|heap| json!({
+                        "heap_index": heap.heap_index,
+                        "size_bytes": heap.size_bytes,
+                        "device_local": heap.device_local,
+                    })).collect::<Vec<_>>(),
+                    "available": true,
+                    "selected_by_default": device.selected_by_default,
+                    "runtime_binding": if device.selected_by_default {
+                        "selected_local_vulkan_device"
+                    } else {
+                        "inventory_only"
+                    },
+                    "can_host_runtime_pedals_on_physical_device": device.selected_by_default,
+                    "notes": if device.selected_by_default {
+                        vec!["currently selected by VulkanComputeDevice::new()"]
+                    } else {
+                        vec!["detected by Vulkan inventory; explicit physical-device binding is not implemented yet"]
+                    },
+                })
+            })
+            .collect(),
         Err(error) => vec![json!({
             "device_id": default_device_id,
             "backend": "vulkan_compute",

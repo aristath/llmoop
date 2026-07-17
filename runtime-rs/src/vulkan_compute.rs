@@ -190,6 +190,28 @@ pub struct VulkanComputeDevice {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanComputeDeviceInfo {
+    pub physical_device_index: usize,
+    pub physical_device_id: String,
+    pub device_name: String,
+    pub device_type: String,
+    pub vendor_id: u32,
+    pub device_id: u32,
+    pub api_version: u32,
+    pub driver_version: u32,
+    pub compute_queue_family_indices: Vec<u32>,
+    pub memory_heaps: Vec<VulkanMemoryHeapInfo>,
+    pub selected_by_default: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanMemoryHeapInfo {
+    pub heap_index: u32,
+    pub size_bytes: u64,
+    pub device_local: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VulkanPipelineCacheStats {
     pub u32_storage_pipelines: usize,
     pub hits: u64,
@@ -490,24 +512,43 @@ impl Drop for VulkanResidentKernelDispatch {
 }
 
 impl VulkanComputeDevice {
+    pub fn available_compute_devices() -> Result<Vec<VulkanComputeDeviceInfo>, VulkanError> {
+        unsafe {
+            let entry = Entry::load()
+                .map_err(|error| VulkanError(format!("failed to load Vulkan: {error}")))?;
+            let instance = create_llmoop_vulkan_instance(&entry)?;
+            let physical_devices = match instance.enumerate_physical_devices() {
+                Ok(physical_devices) => physical_devices,
+                Err(error) => {
+                    instance.destroy_instance(None);
+                    return Err(VulkanError(format!(
+                        "failed to enumerate Vulkan devices: {error:?}"
+                    )));
+                }
+            };
+            let selected_index = select_compute_device_index(&instance, &physical_devices);
+            let devices = physical_devices
+                .iter()
+                .enumerate()
+                .filter_map(|(physical_device_index, physical_device)| {
+                    inspect_compute_device(
+                        &instance,
+                        physical_device_index,
+                        *physical_device,
+                        Some(physical_device_index) == selected_index,
+                    )
+                })
+                .collect::<Vec<_>>();
+            instance.destroy_instance(None);
+            Ok(devices)
+        }
+    }
+
     pub fn new() -> Result<Self, VulkanError> {
         unsafe {
             let entry = Entry::load()
                 .map_err(|error| VulkanError(format!("failed to load Vulkan: {error}")))?;
-            let app_name = CString::new("llmoop-runtime").expect("static string has no nul");
-            let engine_name = CString::new("llmoop-dsp").expect("static string has no nul");
-            let app_info = vk::ApplicationInfo::default()
-                .application_name(&app_name)
-                .application_version(1)
-                .engine_name(&engine_name)
-                .engine_version(1)
-                .api_version(vk::API_VERSION_1_1);
-            let instance_info = vk::InstanceCreateInfo::default().application_info(&app_info);
-            let instance = entry
-                .create_instance(&instance_info, None)
-                .map_err(|error| {
-                    VulkanError(format!("failed to create Vulkan instance: {error:?}"))
-                })?;
+            let instance = create_llmoop_vulkan_instance(&entry)?;
 
             let physical_devices = instance.enumerate_physical_devices().map_err(|error| {
                 VulkanError(format!("failed to enumerate Vulkan devices: {error:?}"))
@@ -1540,27 +1581,123 @@ unsafe fn select_compute_device(
     instance: &ash::Instance,
     physical_devices: &[vk::PhysicalDevice],
 ) -> Option<(vk::PhysicalDevice, u32, String)> {
+    let selected_index = unsafe { select_compute_device_index(instance, physical_devices)? };
+    let physical_device = physical_devices[selected_index];
+    let properties = unsafe { instance.get_physical_device_properties(physical_device) };
+    let device_name = unsafe { std::ffi::CStr::from_ptr(properties.device_name.as_ptr()) }
+        .to_string_lossy()
+        .into_owned();
+    let queue_family_index = unsafe { compute_queue_family_indices(instance, physical_device) }
+        .into_iter()
+        .next()?;
+    Some((physical_device, queue_family_index, device_name))
+}
+
+unsafe fn select_compute_device_index(
+    instance: &ash::Instance,
+    physical_devices: &[vk::PhysicalDevice],
+) -> Option<usize> {
     let mut fallback = None;
-    for physical_device in physical_devices {
+    for (physical_device_index, physical_device) in physical_devices.iter().enumerate() {
         let properties = unsafe { instance.get_physical_device_properties(*physical_device) };
-        let device_name = unsafe { std::ffi::CStr::from_ptr(properties.device_name.as_ptr()) }
-            .to_string_lossy()
-            .into_owned();
         let queue_families =
             unsafe { instance.get_physical_device_queue_family_properties(*physical_device) };
-        for (index, family) in queue_families.iter().enumerate() {
+        for family in queue_families {
             if family.queue_flags.contains(vk::QueueFlags::COMPUTE) {
-                let candidate = (*physical_device, index as u32, device_name.clone());
                 if properties.device_type == vk::PhysicalDeviceType::DISCRETE_GPU
                     || properties.device_type == vk::PhysicalDeviceType::INTEGRATED_GPU
                 {
-                    return Some(candidate);
+                    return Some(physical_device_index);
                 }
-                fallback.get_or_insert(candidate);
+                fallback.get_or_insert(physical_device_index);
             }
         }
     }
     fallback
+}
+
+unsafe fn inspect_compute_device(
+    instance: &ash::Instance,
+    physical_device_index: usize,
+    physical_device: vk::PhysicalDevice,
+    selected_by_default: bool,
+) -> Option<VulkanComputeDeviceInfo> {
+    let compute_queue_family_indices =
+        unsafe { compute_queue_family_indices(instance, physical_device) };
+    if compute_queue_family_indices.is_empty() {
+        return None;
+    }
+    let properties = unsafe { instance.get_physical_device_properties(physical_device) };
+    let memory_properties =
+        unsafe { instance.get_physical_device_memory_properties(physical_device) };
+    let device_name = unsafe { std::ffi::CStr::from_ptr(properties.device_name.as_ptr()) }
+        .to_string_lossy()
+        .into_owned();
+    let memory_heaps = (0..memory_properties.memory_heap_count)
+        .map(|heap_index| {
+            let heap = memory_properties.memory_heaps[heap_index as usize];
+            VulkanMemoryHeapInfo {
+                heap_index,
+                size_bytes: heap.size,
+                device_local: heap.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL),
+            }
+        })
+        .collect();
+
+    Some(VulkanComputeDeviceInfo {
+        physical_device_index,
+        physical_device_id: format!("vulkan:{physical_device_index}"),
+        device_name,
+        device_type: vulkan_device_type_label(properties.device_type).to_string(),
+        vendor_id: properties.vendor_id,
+        device_id: properties.device_id,
+        api_version: properties.api_version,
+        driver_version: properties.driver_version,
+        compute_queue_family_indices,
+        memory_heaps,
+        selected_by_default,
+    })
+}
+
+unsafe fn compute_queue_family_indices(
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+) -> Vec<u32> {
+    unsafe { instance.get_physical_device_queue_family_properties(physical_device) }
+        .iter()
+        .enumerate()
+        .filter_map(|(index, family)| {
+            family
+                .queue_flags
+                .contains(vk::QueueFlags::COMPUTE)
+                .then_some(index as u32)
+        })
+        .collect()
+}
+
+fn vulkan_device_type_label(device_type: vk::PhysicalDeviceType) -> &'static str {
+    match device_type {
+        vk::PhysicalDeviceType::OTHER => "other",
+        vk::PhysicalDeviceType::INTEGRATED_GPU => "integrated_gpu",
+        vk::PhysicalDeviceType::DISCRETE_GPU => "discrete_gpu",
+        vk::PhysicalDeviceType::VIRTUAL_GPU => "virtual_gpu",
+        vk::PhysicalDeviceType::CPU => "cpu",
+        _ => "unknown",
+    }
+}
+
+unsafe fn create_llmoop_vulkan_instance(entry: &Entry) -> Result<ash::Instance, VulkanError> {
+    let app_name = CString::new("llmoop-runtime").expect("static string has no nul");
+    let engine_name = CString::new("llmoop-dsp").expect("static string has no nul");
+    let app_info = vk::ApplicationInfo::default()
+        .application_name(&app_name)
+        .application_version(1)
+        .engine_name(&engine_name)
+        .engine_version(1)
+        .api_version(vk::API_VERSION_1_1);
+    let instance_info = vk::InstanceCreateInfo::default().application_info(&app_info);
+    unsafe { entry.create_instance(&instance_info, None) }
+        .map_err(|error| VulkanError(format!("failed to create Vulkan instance: {error:?}")))
 }
 
 unsafe fn find_memory_type(
