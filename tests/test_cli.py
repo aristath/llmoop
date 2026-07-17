@@ -398,7 +398,7 @@ class PackagePlacementTest(unittest.TestCase):
         self.assertEqual(
             {
                 "schema": "llmoop.stream_circuit_placement.v1",
-                "default_device_id": "gpu0",
+                "default_device_id": "runtime_default",
                 "pedal_devices": {},
             },
             package_placement(),
@@ -479,11 +479,12 @@ class CompiledPackageTest(unittest.TestCase):
         self.assertEqual(
             {
                 "schema": "llmoop.stream_circuit_placement.v1",
-                "default_device_id": "gpu0",
+                "default_device_id": "runtime_default",
                 "pedal_devices": {},
             },
             manifest["placement"],
         )
+        self.assertEqual("runtime_default", manifest["device_id"])
         circuit_graph = manifest["circuit_graph"]
         self.assertEqual("series", circuit_graph["wiring"])
         self.assertEqual(14, len(circuit_graph["pedals"]))

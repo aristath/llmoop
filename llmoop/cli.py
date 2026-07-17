@@ -89,6 +89,8 @@ def main() -> None:
     )
     parser.add_argument(
         "--default-device-id",
+        "--device",
+        dest="default_device_id",
         default=None,
         help="default logical device for the runtime pedalboard patch",
     )

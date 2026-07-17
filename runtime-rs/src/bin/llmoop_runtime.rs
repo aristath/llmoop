@@ -630,19 +630,19 @@ fn inspect_available_devices(
                     "selected_by_default": device.selected_by_default,
                     "selected_by_runtime": selected_by_runtime,
                     "runtime_binding": if selected_by_runtime {
-                        "selected_local_vulkan_device"
+                        "default_local_vulkan_target"
                     } else {
                         "inventory_only"
                     },
-                    "can_host_runtime_pedals_on_physical_device": selected_by_runtime,
+                    "can_host_runtime_pedals_on_physical_device": true,
                     "notes": if selected_by_runtime {
                         if selected_vulkan_device_index.is_some() {
-                            vec!["selected by --vulkan-device-index for this runtime process"]
+                            vec!["selected by --vulkan-device-index as the default target for unbound logical devices"]
                         } else {
-                            vec!["currently selected by VulkanComputeDevice::new()"]
+                            vec!["auto-detected as the default target for unbound logical devices"]
                         }
                     } else {
-                        vec!["detected by Vulkan inventory; explicit physical-device binding is not implemented yet"]
+                        vec!["auto-detected by Vulkan inventory; can be selected with --bind-device LOGICAL=vulkan:N"]
                     },
                 })
             })
@@ -1028,22 +1028,11 @@ fn runtime_bound_vulkan_devices(
     let mut physical_device_indices = BTreeMap::new();
 
     for logical_device_id in &logical_device_ids {
-        let physical_device_index = if let Some(target) =
-            args.device_bindings.get(logical_device_id)
-        {
-            parse_vulkan_physical_device_ref(target)
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?
-                .ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!(
-                            "logical device {logical_device_id:?} is bound to unsupported target {target:?}; local mounted execution supports vulkan:N targets"
-                        ),
-                    )
-                })?
-        } else {
-            default_physical_device_index
-        };
+        let physical_device_index = runtime_mount_physical_device_index(
+            args,
+            logical_device_id,
+            default_physical_device_index,
+        )?;
         let device = if let Some(device) = physical_devices.get(&physical_device_index) {
             Arc::clone(device)
         } else {
@@ -1099,26 +1088,7 @@ fn bound_devices_report(bound_devices: &RuntimeBoundVulkanDevices) -> Vec<Runtim
 
 fn runtime_cable_routes_report(args: &Args, cables: &[PedalCablePlacement]) -> RuntimeCableRoutes {
     RuntimeCableRoutes::from_cables(cables, |device_id| {
-        let explicit_target = args.device_bindings.get(device_id);
-        let target = explicit_target.cloned().or_else(|| {
-            args.vulkan_device_index
-                .map(|index| format!("vulkan:{index}"))
-        });
-        let physical_device_index = target
-            .as_deref()
-            .and_then(|target| parse_vulkan_physical_device_ref(target).ok().flatten());
-        let source = if explicit_target.is_some() {
-            "explicit"
-        } else if args.vulkan_device_index.is_some() {
-            "process_default"
-        } else {
-            "runtime_default"
-        };
-        RuntimeCableRouteTarget {
-            target,
-            physical_device_index,
-            binding_source: source.to_string(),
-        }
+        runtime_target_for_logical_device(args, device_id)
     })
 }
 
@@ -1142,6 +1112,31 @@ fn bound_cable_routes_report(
 fn runtime_physical_device_index(args: &Args) -> Result<Option<usize>, Box<dyn Error>> {
     let mut selected = args.vulkan_device_index;
     let mut unsupported_bindings = Vec::new();
+    if let Some(default_device_id) = args.default_device_id.as_deref() {
+        match parse_vulkan_physical_device_ref(default_device_id) {
+            Ok(Some(index)) => {
+                if let Some(existing) = selected {
+                    if existing != index {
+                        return Err(Box::new(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!(
+                                "runtime default device requests Vulkan physical device {index}, but --vulkan-device-index selected {existing}"
+                            ),
+                        )));
+                    }
+                } else {
+                    selected = Some(index);
+                }
+            }
+            Ok(None) if default_device_id.contains(':') => {
+                unsupported_bindings.push(default_device_id.to_string())
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return Err(Box::new(io::Error::new(io::ErrorKind::InvalidInput, error)));
+            }
+        }
+    }
     for (logical_device_id, target) in &args.device_bindings {
         match parse_vulkan_physical_device_ref(target) {
             Ok(Some(index)) => {
@@ -1176,6 +1171,81 @@ fn runtime_physical_device_index(args: &Args) -> Result<Option<usize>, Box<dyn E
     Ok(selected)
 }
 
+fn runtime_mount_physical_device_index(
+    args: &Args,
+    logical_device_id: &str,
+    default_physical_device_index: usize,
+) -> Result<usize, io::Error> {
+    if let Some(target) = args.device_bindings.get(logical_device_id) {
+        return parse_vulkan_physical_device_ref(target)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "logical device {logical_device_id:?} is bound to unsupported target {target:?}; local mounted execution supports vulkan:N targets"
+                    ),
+                )
+            });
+    }
+    match parse_vulkan_physical_device_ref(logical_device_id)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?
+    {
+        Some(index) => Ok(index),
+        None if logical_device_id.contains(':') => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "logical device id {logical_device_id:?} looks like an unsupported direct runtime target; local mounted execution supports vulkan:N targets"
+            ),
+        )),
+        None => Ok(default_physical_device_index),
+    }
+}
+
+fn runtime_target_for_logical_device(
+    args: &Args,
+    logical_device_id: &str,
+) -> RuntimeCableRouteTarget {
+    if let Some(target) = args.device_bindings.get(logical_device_id) {
+        return RuntimeCableRouteTarget {
+            target: Some(target.clone()),
+            physical_device_index: parse_vulkan_physical_device_ref(target).ok().flatten(),
+            binding_source: "explicit".to_string(),
+        };
+    }
+    match parse_vulkan_physical_device_ref(logical_device_id) {
+        Ok(Some(index)) => RuntimeCableRouteTarget {
+            target: Some(logical_device_id.to_string()),
+            physical_device_index: Some(index),
+            binding_source: "device_id".to_string(),
+        },
+        Ok(None) | Err(_) if logical_device_id.contains(':') => RuntimeCableRouteTarget {
+            target: Some(logical_device_id.to_string()),
+            physical_device_index: None,
+            binding_source: "device_id".to_string(),
+        },
+        Ok(None) | Err(_) => {
+            let default_physical_device_index =
+                runtime_report_default_vulkan_physical_device_index(args);
+            let target = default_physical_device_index.map(|index| format!("vulkan:{index}"));
+            RuntimeCableRouteTarget {
+                physical_device_index: default_physical_device_index,
+                target,
+                binding_source: if args.vulkan_device_index.is_some() {
+                    "process_default".to_string()
+                } else {
+                    "runtime_default".to_string()
+                },
+            }
+        }
+    }
+}
+
+fn runtime_report_default_vulkan_physical_device_index(args: &Args) -> Option<usize> {
+    args.vulkan_device_index
+        .or_else(|| runtime_default_vulkan_physical_device_index().ok())
+}
+
 fn runtime_patch_report(args: &Args) -> Value {
     json!({
         "default_device_id": args.default_device_id.clone(),
@@ -1204,7 +1274,7 @@ fn runtime_device_bindings_report(
     RuntimeDeviceBindings::from_vulkan_targets(
         logical_device_ids,
         &args.device_bindings,
-        args.vulkan_device_index,
+        runtime_report_default_vulkan_physical_device_index(args),
         parse_vulkan_physical_device_ref,
     )
 }

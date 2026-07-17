@@ -21,7 +21,7 @@ from llmoop.model_transpiler import transpile_model
 TOKENIZER_PACKAGE_DIR = "tokenizer"
 WEIGHTS_PACKAGE_DIR = "weights"
 CONFIG_PACKAGE_FILE = "config.json"
-DEFAULT_PACKAGE_DEVICE_ID = "gpu0"
+RUNTIME_DEFAULT_LOGICAL_DEVICE_ID = "runtime_default"
 TOKENIZER_PACKAGE_FILES = (
     "tokenizer.json",
     "tokenizer_config.json",
@@ -140,7 +140,7 @@ def build_vulkan_resident_greedy_package_manifest(
     return {
         "schema": PACKAGE_SCHEMA,
         "package_id": package_id,
-        "device_id": DEFAULT_PACKAGE_DEVICE_ID,
+        "device_id": RUNTIME_DEFAULT_LOGICAL_DEVICE_ID,
         "placement": placement,
         "circuit_graph": package_circuit_graph(lowered_index, lowered_dir),
         "tensor_index_path": "tensors.json",
@@ -213,7 +213,7 @@ def build_vulkan_resident_greedy_package_manifest(
 def package_placement() -> Json:
     return {
         "schema": "llmoop.stream_circuit_placement.v1",
-        "default_device_id": DEFAULT_PACKAGE_DEVICE_ID,
+        "default_device_id": RUNTIME_DEFAULT_LOGICAL_DEVICE_ID,
         "pedal_devices": {},
     }
 
