@@ -114,6 +114,12 @@ def main() -> None:
         help="resident dynamic-state activation capacity; compile default is 4, runtime default is auto",
     )
     parser.add_argument(
+        "--vulkan-device-index",
+        type=int,
+        default=None,
+        help="Vulkan physical device index to use for this --run process",
+    )
+    parser.add_argument(
         "--max-new-tokens",
         type=int,
         default=32,
@@ -202,6 +208,8 @@ def main() -> None:
         parser.error("--duplicate-after is only supported with --run")
     elif args.chain is not None:
         parser.error("--chain is only supported with --run")
+    elif args.vulkan_device_index is not None:
+        parser.error("--vulkan-device-index is only supported with --run")
     if args.run is not None:
         inspect_mode_count = sum(
             [
@@ -225,6 +233,8 @@ def main() -> None:
             parser.error("--seed is only supported by --run-model")
         if args.ignore_eos:
             parser.error("--ignore-eos is only supported by --run-model")
+        if args.vulkan_device_index is not None and args.vulkan_device_index < 0:
+            parser.error("--vulkan-device-index must be non-negative")
         try:
             parse_pedal_device_overrides(args.place_pedal)
             parse_duplicate_after_overrides(args.duplicate_after)
@@ -251,6 +261,8 @@ def main() -> None:
             parser.error("--duplicate-after is only supported by --run")
         if args.chain is not None:
             parser.error("--chain is only supported by --run")
+        if args.vulkan_device_index is not None:
+            parser.error("--vulkan-device-index is only supported by --run")
         if args.prompt is None:
             parser.error("--prompt is required with --run-model")
         if args.package_dir is None:
@@ -405,6 +417,8 @@ def build_runtime_command(args: argparse.Namespace, package_manifest: Path) -> l
         runtime_args.extend(["--chain", args.chain])
     if args.capacity is not None:
         runtime_args.extend(["--capacity", str(args.capacity)])
+    if args.vulkan_device_index is not None:
+        runtime_args.extend(["--vulkan-device-index", str(args.vulkan_device_index)])
     if args.no_special_tokens:
         runtime_args.append("--no-special-tokens")
     if args.keep_special_tokens:

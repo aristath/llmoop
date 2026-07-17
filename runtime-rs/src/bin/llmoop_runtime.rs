@@ -27,6 +27,7 @@ struct Args {
     source_chain: Option<Vec<(String, String)>>,
     max_new_tokens: usize,
     capacity: Option<usize>,
+    vulkan_device_index: Option<usize>,
     cycle_ticks: usize,
     max_scheduler_turns: usize,
     add_special_tokens: bool,
@@ -50,6 +51,7 @@ impl Default for Args {
             source_chain: None,
             max_new_tokens: 4,
             capacity: None,
+            vulkan_device_index: None,
             cycle_ticks: 4,
             max_scheduler_turns: 1_024,
             add_special_tokens: true,
@@ -122,7 +124,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         })?;
     let capacity = choose_runtime_capacity(package_manifest, args.capacity, needed_capacity)?;
 
-    let device = VulkanComputeDevice::new()?;
+    let device = runtime_vulkan_device(&args)?;
     if manifest.placement_device_ids().len() > 1 {
         return run_placed_prompt(
             &args,
@@ -292,7 +294,7 @@ fn inspect_package(
         .default_device_id
         .as_deref()
         .unwrap_or(&manifest.placement.default_device_id);
-    let available_devices = inspect_available_devices(default_device_id);
+    let available_devices = inspect_available_devices(default_device_id, args.vulkan_device_index);
     let execution_by_pedal = manifest
         .pedal_executions
         .iter()
@@ -369,7 +371,10 @@ fn inspect_package(
     Ok(())
 }
 
-fn inspect_available_devices(default_device_id: &str) -> Vec<Value> {
+fn inspect_available_devices(
+    default_device_id: &str,
+    selected_vulkan_device_index: Option<usize>,
+) -> Vec<Value> {
     match VulkanComputeDevice::available_compute_devices() {
         Ok(devices) if devices.is_empty() => vec![json!({
             "device_id": default_device_id,
@@ -380,9 +385,10 @@ fn inspect_available_devices(default_device_id: &str) -> Vec<Value> {
         Ok(devices) => devices
             .iter()
             .map(|device| {
-                let runtime_device_id = device
-                    .selected_by_default
-                    .then(|| default_device_id.to_string());
+                let selected_by_runtime = selected_vulkan_device_index
+                    .map(|index| index == device.physical_device_index)
+                    .unwrap_or(device.selected_by_default);
+                let runtime_device_id = selected_by_runtime.then(|| default_device_id.to_string());
                 let device_id = runtime_device_id
                     .clone()
                     .unwrap_or_else(|| device.physical_device_id.clone());
@@ -406,14 +412,19 @@ fn inspect_available_devices(default_device_id: &str) -> Vec<Value> {
                     })).collect::<Vec<_>>(),
                     "available": true,
                     "selected_by_default": device.selected_by_default,
-                    "runtime_binding": if device.selected_by_default {
+                    "selected_by_runtime": selected_by_runtime,
+                    "runtime_binding": if selected_by_runtime {
                         "selected_local_vulkan_device"
                     } else {
                         "inventory_only"
                     },
-                    "can_host_runtime_pedals_on_physical_device": device.selected_by_default,
-                    "notes": if device.selected_by_default {
-                        vec!["currently selected by VulkanComputeDevice::new()"]
+                    "can_host_runtime_pedals_on_physical_device": selected_by_runtime,
+                    "notes": if selected_by_runtime {
+                        if selected_vulkan_device_index.is_some() {
+                            vec!["selected by --vulkan-device-index for this runtime process"]
+                        } else {
+                            vec!["currently selected by VulkanComputeDevice::new()"]
+                        }
                     } else {
                         vec!["detected by Vulkan inventory; explicit physical-device binding is not implemented yet"]
                     },
@@ -509,7 +520,7 @@ fn inspect_device_slice(
     device_id: &str,
 ) -> Result<(), Box<dyn Error>> {
     let capacity = choose_runtime_capacity(package_manifest, args.capacity, 1)?;
-    let device = VulkanComputeDevice::new()?;
+    let device = runtime_vulkan_device(args)?;
     let payload = inspect_device_slice_payload(
         &device,
         package_manifest,
@@ -542,7 +553,7 @@ fn inspect_placement(
 ) -> Result<(), Box<dyn Error>> {
     let capacity = choose_runtime_capacity(package_manifest, args.capacity, 1)?;
     let device_ids = manifest.placement_device_ids();
-    let device = VulkanComputeDevice::new()?;
+    let device = runtime_vulkan_device(args)?;
     let slices = device_ids
         .iter()
         .map(|device_id| {
@@ -716,6 +727,16 @@ fn runtime_manifest(
     )?)
 }
 
+fn runtime_vulkan_device(args: &Args) -> Result<VulkanComputeDevice, Box<dyn Error>> {
+    if let Some(physical_device_index) = args.vulkan_device_index {
+        Ok(VulkanComputeDevice::new_for_physical_device_index(
+            physical_device_index,
+        )?)
+    } else {
+        Ok(VulkanComputeDevice::new()?)
+    }
+}
+
 fn runtime_patch_report(args: &Args) -> Value {
     json!({
         "default_device_id": args.default_device_id.clone(),
@@ -873,6 +894,9 @@ fn parse_args() -> Result<Args, String> {
             }
             "--capacity" => {
                 parsed.capacity = Some(parse_next(&mut raw, "--capacity")?);
+            }
+            "--vulkan-device-index" => {
+                parsed.vulkan_device_index = Some(parse_next(&mut raw, "--vulkan-device-index")?);
             }
             "--cycle-ticks" => {
                 parsed.cycle_ticks = parse_next(&mut raw, "--cycle-ticks")?;
@@ -1072,6 +1096,7 @@ Options:
                              Mount and summarize only the runtime patch pedals assigned to DEVICE_ID.
   --max-new-tokens <N>       Public output tokens to emit after the prompt. Default: 4
   --capacity <N>             Override resident activation capacity selected from the package.
+  --vulkan-device-index <N>  Use Vulkan physical device index N for this runtime process.
   --cycle-ticks <N>          Max runtime ticks per always-on cycle. Default: 4
   --max-scheduler-turns <N>  Max engine scheduler turns before stopping. Default: 1024
   --no-special-tokens        Do not add tokenizer special tokens to input text.

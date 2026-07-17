@@ -545,6 +545,18 @@ impl VulkanComputeDevice {
     }
 
     pub fn new() -> Result<Self, VulkanError> {
+        Self::new_with_physical_device_index(None)
+    }
+
+    pub fn new_for_physical_device_index(
+        physical_device_index: usize,
+    ) -> Result<Self, VulkanError> {
+        Self::new_with_physical_device_index(Some(physical_device_index))
+    }
+
+    fn new_with_physical_device_index(
+        requested_physical_device_index: Option<usize>,
+    ) -> Result<Self, VulkanError> {
         unsafe {
             let entry = Entry::load()
                 .map_err(|error| VulkanError(format!("failed to load Vulkan: {error}")))?;
@@ -554,9 +566,17 @@ impl VulkanComputeDevice {
                 VulkanError(format!("failed to enumerate Vulkan devices: {error:?}"))
             })?;
             let (physical_device, queue_family_index, device_name) =
-                select_compute_device(&instance, &physical_devices).ok_or_else(|| {
-                    VulkanError("no Vulkan device with a compute queue was found".to_string())
-                })?;
+                if let Some(physical_device_index) = requested_physical_device_index {
+                    select_compute_device_by_index(
+                        &instance,
+                        &physical_devices,
+                        physical_device_index,
+                    )?
+                } else {
+                    select_compute_device(&instance, &physical_devices).ok_or_else(|| {
+                        VulkanError("no Vulkan device with a compute queue was found".to_string())
+                    })?
+                };
 
             let queue_priorities = [1.0_f32];
             let queue_info = [vk::DeviceQueueCreateInfo::default()
@@ -1591,6 +1611,31 @@ unsafe fn select_compute_device(
         .into_iter()
         .next()?;
     Some((physical_device, queue_family_index, device_name))
+}
+
+unsafe fn select_compute_device_by_index(
+    instance: &ash::Instance,
+    physical_devices: &[vk::PhysicalDevice],
+    physical_device_index: usize,
+) -> Result<(vk::PhysicalDevice, u32, String), VulkanError> {
+    let physical_device = *physical_devices.get(physical_device_index).ok_or_else(|| {
+        VulkanError(format!(
+            "Vulkan physical device index {physical_device_index} was not found"
+        ))
+    })?;
+    let properties = unsafe { instance.get_physical_device_properties(physical_device) };
+    let device_name = unsafe { std::ffi::CStr::from_ptr(properties.device_name.as_ptr()) }
+        .to_string_lossy()
+        .into_owned();
+    let queue_family_index = unsafe { compute_queue_family_indices(instance, physical_device) }
+        .into_iter()
+        .next()
+        .ok_or_else(|| {
+            VulkanError(format!(
+                "Vulkan physical device index {physical_device_index} ({device_name}) has no compute queue"
+            ))
+        })?;
+    Ok((physical_device, queue_family_index, device_name))
 }
 
 unsafe fn select_compute_device_index(
