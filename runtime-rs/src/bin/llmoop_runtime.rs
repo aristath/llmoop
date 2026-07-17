@@ -5,12 +5,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use llmoop_runtime::{
-    CircuitPort, PedalPlacement, VulkanComputeDevice, VulkanPlacedCableTransportStats,
-    VulkanResidentGreedyInProcessPlacedModelPackage, VulkanResidentGreedyModelPackage,
-    VulkanResidentGreedyModelPackageDeviceSlice, VulkanResidentGreedyModelPackageManifest,
-    VulkanResidentHfTokenizerTextCodec, VulkanResidentTokenEngine,
-    VulkanResidentTokenEngineRunBudget, VulkanResidentTokenEngineRunStopCondition,
-    VulkanResidentTokenTextCodec, VulkanReusableKernelArtifactManifest,
+    CircuitPort, PedalCablePlacement, PedalPlacement, VulkanComputeDevice,
+    VulkanPlacedCableTransportStats, VulkanResidentGreedyInProcessPlacedModelPackage,
+    VulkanResidentGreedyModelPackage, VulkanResidentGreedyModelPackageDeviceSlice,
+    VulkanResidentGreedyModelPackageManifest, VulkanResidentHfTokenizerTextCodec,
+    VulkanResidentTokenEngine, VulkanResidentTokenEngineRunBudget,
+    VulkanResidentTokenEngineRunStopCondition, VulkanResidentTokenTextCodec,
+    VulkanReusableKernelArtifactManifest,
 };
 use serde_json::{Value, json};
 
@@ -222,6 +223,7 @@ fn run_placed_prompt(
     if !logical_device_ids.contains(&manifest.device_id) {
         logical_device_ids.push(manifest.device_id.clone());
     }
+    let placement = runtime_manifest_placement(manifest_dir, &manifest)?;
     let bound_devices = runtime_bound_vulkan_devices(args, &logical_device_ids)?;
     let package = VulkanResidentGreedyInProcessPlacedModelPackage::from_manifest_for_bound_devices(
         &bound_devices.devices,
@@ -302,6 +304,7 @@ fn run_placed_prompt(
                 "device_count": package.device_count,
                 "device_ids": package.device_ids.clone(),
                 "bound_devices": bound_devices_report(&bound_devices),
+                "cable_routes": bound_cable_routes_report(&bound_devices, &placement.cables),
                 "runtime_patch": runtime_patch_report(args),
                 "device_bindings": runtime_device_bindings_report(args, &package.device_ids),
                 "hosted_pedal_count": package.hosted_pedal_count,
@@ -541,6 +544,7 @@ fn inspect_patch(
             "wiring": placement.wiring,
             "local_cable_count": placement.local_cable_count,
             "cross_device_cable_count": placement.cross_device_cable_count,
+            "runtime_routes": runtime_cable_routes_report(args, &placement.cables),
             "pedals": placement.pedals,
             "cables": placement.cables,
         },
@@ -629,6 +633,7 @@ fn inspect_placement(
 ) -> Result<(), Box<dyn Error>> {
     let capacity = choose_runtime_capacity(package_manifest, args.capacity, 1)?;
     let device_ids = manifest.placement_device_ids();
+    let placement = runtime_manifest_placement(manifest_dir, &manifest)?;
     let bound_devices = runtime_bound_vulkan_devices(args, &device_ids)?;
     let slices = device_ids
         .iter()
@@ -656,6 +661,7 @@ fn inspect_placement(
         "runtime_patch": runtime_patch_report(args),
         "device_bindings": runtime_device_bindings_report(args, &device_ids),
         "bound_devices": bound_devices_report(&bound_devices),
+        "cable_routes": bound_cable_routes_report(&bound_devices, &placement.cables),
         "device_count": device_ids.len(),
         "device_ids": device_ids,
         "devices": slices,
@@ -777,6 +783,16 @@ fn placement_device_ids(pedals: &[PedalPlacement]) -> Vec<String> {
     device_ids.sort();
     device_ids.dedup();
     device_ids
+}
+
+fn runtime_manifest_placement(
+    manifest_dir: &Path,
+    manifest: &VulkanResidentGreedyModelPackageManifest,
+) -> Result<llmoop_runtime::StreamCircuitPlacementPlan, Box<dyn Error>> {
+    let graph = manifest.resolved_source_graph(manifest_dir.to_path_buf())?;
+    graph
+        .placement_plan(&manifest.placement)
+        .map_err(|error| Box::new(error) as Box<dyn Error>)
 }
 
 fn tokenizer_dir_from_package(package_manifest: &Path) -> Result<PathBuf, Box<dyn Error>> {
@@ -917,6 +933,122 @@ fn bound_devices_report(bound_devices: &RuntimeBoundVulkanDevices) -> Value {
             })
             .collect::<Vec<_>>()
     )
+}
+
+fn runtime_cable_routes_report(args: &Args, cables: &[PedalCablePlacement]) -> Value {
+    cable_routes_report(cables, |device_id| {
+        let explicit_target = args.device_bindings.get(device_id);
+        let target = explicit_target.cloned().or_else(|| {
+            args.vulkan_device_index
+                .map(|index| format!("vulkan:{index}"))
+        });
+        let physical_device_index = target
+            .as_deref()
+            .and_then(|target| parse_vulkan_physical_device_ref(target).ok().flatten());
+        let source = if explicit_target.is_some() {
+            "explicit"
+        } else if args.vulkan_device_index.is_some() {
+            "process_default"
+        } else {
+            "runtime_default"
+        };
+        CableRouteTarget {
+            target,
+            physical_device_index,
+            binding_source: source,
+        }
+    })
+}
+
+fn bound_cable_routes_report(
+    bound_devices: &RuntimeBoundVulkanDevices,
+    cables: &[PedalCablePlacement],
+) -> Value {
+    cable_routes_report(cables, |device_id| {
+        let physical_device_index = bound_devices
+            .physical_device_indices
+            .get(device_id)
+            .copied();
+        CableRouteTarget {
+            target: physical_device_index.map(|index| format!("vulkan:{index}")),
+            physical_device_index,
+            binding_source: "mounted",
+        }
+    })
+}
+
+struct CableRouteTarget {
+    target: Option<String>,
+    physical_device_index: Option<usize>,
+    binding_source: &'static str,
+}
+
+fn cable_routes_report<F>(cables: &[PedalCablePlacement], target_for: F) -> Value
+where
+    F: Fn(&str) -> CableRouteTarget,
+{
+    let mut logical_local_cable_count = 0usize;
+    let mut logical_cross_device_cable_count = 0usize;
+    let mut same_target_cable_count = 0usize;
+    let mut cross_target_cable_count = 0usize;
+    let mut unresolved_target_cable_count = 0usize;
+
+    let routes = cables
+        .iter()
+        .map(|cable| {
+            let source_target = target_for(&cable.source_device_id);
+            let destination_target = target_for(&cable.destination_device_id);
+            let is_logical_local = cable.source_device_id == cable.destination_device_id;
+            let route_kind = if is_logical_local {
+                logical_local_cable_count += 1;
+                "logical_local"
+            } else {
+                logical_cross_device_cable_count += 1;
+                match (&source_target.target, &destination_target.target) {
+                    (Some(source), Some(destination)) if source == destination => {
+                        same_target_cable_count += 1;
+                        "same_physical_target"
+                    }
+                    (Some(_), Some(_)) => {
+                        cross_target_cable_count += 1;
+                        "cross_physical_target"
+                    }
+                    _ => {
+                        unresolved_target_cable_count += 1;
+                        "unresolved_runtime_target"
+                    }
+                }
+            };
+
+            json!({
+                "cable_index": cable.cable_index,
+                "signal": cable.signal,
+                "shape": cable.shape,
+                "source_pedal_id": cable.source_pedal_id,
+                "source_device_id": cable.source_device_id,
+                "source_target": source_target.target,
+                "source_physical_device_index": source_target.physical_device_index,
+                "source_binding": source_target.binding_source,
+                "destination_pedal_id": cable.destination_pedal_id,
+                "destination_device_id": cable.destination_device_id,
+                "destination_target": destination_target.target,
+                "destination_physical_device_index": destination_target.physical_device_index,
+                "destination_binding": destination_target.binding_source,
+                "route_kind": route_kind,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    json!({
+        "schema": "llmoop.runtime_cable_routes.v1",
+        "cable_count": cables.len(),
+        "logical_local_cable_count": logical_local_cable_count,
+        "logical_cross_device_cable_count": logical_cross_device_cable_count,
+        "same_physical_target_cable_count": same_target_cable_count,
+        "cross_physical_target_cable_count": cross_target_cable_count,
+        "unresolved_target_cable_count": unresolved_target_cable_count,
+        "routes": routes,
+    })
 }
 
 fn runtime_physical_device_index(args: &Args) -> Result<Option<usize>, Box<dyn Error>> {
