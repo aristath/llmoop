@@ -1,22 +1,30 @@
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::io;
 use std::path::{Path, PathBuf};
 
 use llmoop_runtime::{
-    VulkanComputeDevice, VulkanResidentGreedyModelPackage,
-    VulkanResidentGreedyModelPackageDeviceSlice, VulkanResidentGreedyModelPackageManifest,
-    VulkanResidentHfTokenizerTextCodec, VulkanResidentTokenEngine,
-    VulkanResidentTokenEngineRunBudget, VulkanResidentTokenEngineRunStopCondition,
-    VulkanResidentTokenTextCodec, VulkanReusableKernelArtifactManifest,
+    CircuitPort, VulkanComputeDevice, VulkanResidentGreedyInProcessPlacedModelPackage,
+    VulkanResidentGreedyModelPackage, VulkanResidentGreedyModelPackageDeviceSlice,
+    VulkanResidentGreedyModelPackageManifest, VulkanResidentHfTokenizerTextCodec,
+    VulkanResidentTokenEngine, VulkanResidentTokenEngineRunBudget,
+    VulkanResidentTokenEngineRunStopCondition, VulkanResidentTokenTextCodec,
+    VulkanReusableKernelArtifactManifest,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Args {
     package_manifest: Option<PathBuf>,
     prompt: Option<String>,
+    inspect_package: bool,
+    inspect_patch: bool,
     inspect_placement: bool,
     inspect_device_slice: Option<String>,
+    default_device_id: Option<String>,
+    pedal_devices: BTreeMap<String, String>,
+    duplicate_after: Vec<(String, String)>,
+    source_chain: Option<Vec<(String, String)>>,
     max_new_tokens: usize,
     capacity: Option<usize>,
     cycle_ticks: usize,
@@ -32,8 +40,14 @@ impl Default for Args {
         Self {
             package_manifest: None,
             prompt: None,
+            inspect_package: false,
+            inspect_patch: false,
             inspect_placement: false,
             inspect_device_slice: None,
+            default_device_id: None,
+            pedal_devices: BTreeMap::new(),
+            duplicate_after: Vec::new(),
+            source_chain: None,
             max_new_tokens: 4,
             capacity: None,
             cycle_ticks: 4,
@@ -69,11 +83,24 @@ fn run() -> Result<(), Box<dyn Error>> {
             "--package is required; run `python -m llmoop --compile-model <MODEL_DIR>` first",
         )
     })?;
+    let manifest_dir = package_manifest
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    if args.inspect_package {
+        let manifest = VulkanResidentGreedyModelPackageManifest::from_json_file(package_manifest)?;
+        return inspect_package(&args, package_manifest, &manifest_dir, manifest);
+    }
+    if args.inspect_patch {
+        let manifest = VulkanResidentGreedyModelPackageManifest::from_json_file(package_manifest)?;
+        return inspect_patch(&args, package_manifest, &manifest_dir, manifest);
+    }
+    let manifest = runtime_manifest(&args, package_manifest)?;
     if args.inspect_placement {
-        return inspect_placement(&args, package_manifest);
+        return inspect_placement(&args, package_manifest, &manifest_dir, manifest);
     }
     if let Some(device_id) = args.inspect_device_slice.as_deref() {
-        return inspect_device_slice(&args, package_manifest, device_id);
+        return inspect_device_slice(&args, package_manifest, &manifest_dir, manifest, device_id);
     }
     let prompt = args
         .prompt
@@ -96,9 +123,25 @@ fn run() -> Result<(), Box<dyn Error>> {
     let capacity = choose_runtime_capacity(package_manifest, args.capacity, needed_capacity)?;
 
     let device = VulkanComputeDevice::new()?;
-    let model = VulkanResidentGreedyModelPackage::from_manifest_file_with_capacity(
+    if manifest.placement_device_ids().len() > 1 {
+        return run_placed_prompt(
+            &args,
+            package_manifest,
+            &manifest_dir,
+            &tokenizer_dir,
+            prompt,
+            prompt_ids,
+            capacity,
+            device,
+            manifest,
+            &codec,
+        );
+    }
+
+    let model = VulkanResidentGreedyModelPackage::from_manifest(
         &device,
-        package_manifest,
+        &manifest_dir,
+        manifest,
         Some(capacity),
     )?;
     let mut engine = VulkanResidentTokenEngine::new(device);
@@ -124,10 +167,12 @@ fn run() -> Result<(), Box<dyn Error>> {
             "{}",
             serde_json::to_string_pretty(&json!({
                 "ok": true,
+                "execution_mode": "single_device_resident",
                 "package_manifest": package_manifest,
                 "tokenizer_dir": tokenizer_dir,
                 "device_name": snapshot.device_name,
                 "device_id": stream.device_id,
+                "runtime_patch": runtime_patch_report(&args),
                 "pedal_count": stream.pedal_count,
                 "dispatches_per_tick": stream.per_tick_dispatch_count,
                 "descriptors_per_tick": stream.per_tick_descriptor_count,
@@ -157,14 +202,280 @@ fn run() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn run_placed_prompt(
+    args: &Args,
+    package_manifest: &Path,
+    manifest_dir: &Path,
+    tokenizer_dir: &Path,
+    prompt: &str,
+    prompt_ids: Vec<u32>,
+    capacity: usize,
+    device: VulkanComputeDevice,
+    manifest: VulkanResidentGreedyModelPackageManifest,
+    codec: &VulkanResidentHfTokenizerTextCodec,
+) -> Result<(), Box<dyn Error>> {
+    let package = VulkanResidentGreedyInProcessPlacedModelPackage::from_manifest_for_devices(
+        &device,
+        manifest_dir,
+        manifest,
+        Some(capacity),
+    )?;
+    let run = package.run_prompt_event_bounded_in_process(
+        &device,
+        &prompt_ids,
+        0,
+        args.max_new_tokens,
+        None,
+        args.max_scheduler_turns,
+    )?;
+    let generated_text = codec.decode_tokens(&run.generated_token_ids)?;
+    let output_text = codec.decode_tokens(&run.output_token_ids)?;
+    let total_scheduler_turns = run
+        .tick_runs
+        .iter()
+        .map(|tick| tick.tick_run.placed_run.scheduler_turn_count)
+        .sum::<usize>();
+    let completed_stage_deltas = run
+        .tick_runs
+        .iter()
+        .map(|tick| tick.tick_run.placed_run.completed_stage_delta)
+        .collect::<Vec<_>>();
+
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "ok": true,
+                "execution_mode": "placed_in_process",
+                "package_manifest": package_manifest,
+                "tokenizer_dir": tokenizer_dir,
+                "device_name": device.device_name(),
+                "boundary_device_id": package.boundary_device_id,
+                "device_count": package.device_count,
+                "device_ids": package.device_ids,
+                "runtime_patch": runtime_patch_report(args),
+                "hosted_pedal_count": package.hosted_pedal_count,
+                "resident_capacity_activations": package.dynamic_state_capacity_activations,
+                "needed_capacity_activations": prompt_ids.len() + args.max_new_tokens,
+                "tokenizer": {
+                    "add_special_tokens": args.add_special_tokens,
+                    "skip_special_tokens": args.skip_special_tokens,
+                },
+                "prompt_text": prompt,
+                "prompt_ids": run.prompt_token_ids,
+                "generated_ids": run.generated_token_ids,
+                "generated_text": generated_text,
+                "output_text": output_text,
+                "stop_reason": run.stop_reason,
+                "tick_count": run.tick_runs.len(),
+                "scheduler_turns": total_scheduler_turns,
+                "max_scheduler_turns_per_tick": args.max_scheduler_turns,
+                "completed_stage_deltas": completed_stage_deltas,
+            }))?
+        );
+    } else if args.generated_only {
+        print_text(&generated_text);
+    } else {
+        print_text(&output_text);
+    }
+
+    Ok(())
+}
+
+fn inspect_package(
+    args: &Args,
+    package_manifest: &Path,
+    manifest_dir: &Path,
+    manifest: VulkanResidentGreedyModelPackageManifest,
+) -> Result<(), Box<dyn Error>> {
+    let default_device_id = args
+        .default_device_id
+        .as_deref()
+        .unwrap_or(&manifest.placement.default_device_id);
+    let available_devices = inspect_available_devices(default_device_id);
+    let execution_by_pedal = manifest
+        .pedal_executions
+        .iter()
+        .map(|execution| (execution.pedal_id.as_str(), execution))
+        .collect::<BTreeMap<_, _>>();
+    let source_pedals = manifest
+        .circuit_graph
+        .pedals
+        .iter()
+        .enumerate()
+        .map(|(pedal_index, pedal)| {
+            let execution = execution_by_pedal.get(pedal.pedal_id.as_str());
+            json!({
+                "pedal_index": pedal_index,
+                "pedal_id": pedal.pedal_id,
+                "operator_type": pedal.operator_type,
+                "implementation": pedal.implementation,
+                "behavioral_role": pedal.behavioral_role,
+                "source_layer_index": pedal.circuit.source.source_layer_index,
+                "circuit_id": pedal.circuit.id,
+                "input_ports": pedal.circuit.boundary.inputs.iter().map(package_port_report).collect::<Vec<_>>(),
+                "output_ports": pedal.circuit.boundary.outputs.iter().map(package_port_report).collect::<Vec<_>>(),
+                "state_port_count": pedal.circuit.state_ports.len(),
+                "parameter_ref_count": pedal.params.refs.len(),
+                "node_count": pedal.circuit.nodes.len(),
+                "kernel_count": execution.map(|execution| execution.kernels.len()).unwrap_or(0),
+            })
+        })
+        .collect::<Vec<_>>();
+    let payload = json!({
+        "ok": true,
+        "package_manifest": package_manifest,
+        "package_root": manifest_dir,
+        "schema": manifest.schema,
+        "package_id": manifest.package_id,
+        "config_path": manifest.config_path,
+        "tokenizer": manifest.tokenizer,
+        "compiled_wiring": manifest.circuit_graph.wiring,
+        "compiled_default_device_id": manifest.placement.default_device_id,
+        "compiled_pedal_devices": manifest.placement.pedal_devices,
+        "runtime_patch": runtime_patch_report(args),
+        "dynamic_state_capacity_activations": manifest.dynamic_state_capacity_activations,
+        "capacity_profiles": manifest.capacity_profiles.iter().map(|profile| json!({
+            "min_dynamic_state_capacity_activations": profile.min_dynamic_state_capacity_activations,
+            "max_dynamic_state_capacity_activations": profile.max_dynamic_state_capacity_activations,
+            "shader_override_count": profile.pedal_execution_shader_overrides.len(),
+        })).collect::<Vec<_>>(),
+        "source_pedal_count": source_pedals.len(),
+        "source_pedals": source_pedals,
+        "available_devices": available_devices,
+    });
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+    } else {
+        println!("package_id={}", payload["package_id"]);
+        println!("source_pedal_count={}", payload["source_pedal_count"]);
+        println!("compiled_wiring={}", payload["compiled_wiring"]);
+        println!(
+            "default_device_id={}",
+            payload["compiled_default_device_id"]
+        );
+        for pedal in payload["source_pedals"].as_array().into_iter().flatten() {
+            println!(
+                "{} {} kernels={} state_ports={}",
+                pedal["pedal_id"],
+                pedal["operator_type"],
+                pedal["kernel_count"],
+                pedal["state_port_count"]
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn inspect_available_devices(default_device_id: &str) -> Vec<Value> {
+    match VulkanComputeDevice::new() {
+        Ok(device) => vec![json!({
+            "device_id": default_device_id,
+            "backend": "vulkan_compute",
+            "device_name": device.device_name(),
+            "available": true,
+            "notes": ["selected local Vulkan compute device"],
+        })],
+        Err(error) => vec![json!({
+            "device_id": default_device_id,
+            "backend": "vulkan_compute",
+            "available": false,
+            "error": error.to_string(),
+        })],
+    }
+}
+
+fn inspect_patch(
+    args: &Args,
+    package_manifest: &Path,
+    manifest_dir: &Path,
+    manifest: VulkanResidentGreedyModelPackageManifest,
+) -> Result<(), Box<dyn Error>> {
+    let source_graph = manifest.resolved_source_graph(manifest_dir.to_path_buf())?;
+    let patch = manifest.runtime_patch_from_controls(
+        args.default_device_id.as_deref(),
+        &args.pedal_devices,
+        &args.duplicate_after,
+        args.source_chain.as_deref(),
+    )?;
+    let effective_graph = source_graph.instantiate_runtime_patch(&patch)?;
+    let placement = effective_graph.placement_plan(&patch.placement_spec())?;
+    let instance_count = patch.instances.len();
+    let cable_count = placement.cables.len();
+    let payload = json!({
+        "ok": true,
+        "package_manifest": package_manifest,
+        "package_root": manifest_dir,
+        "package_id": manifest.package_id,
+        "compiled_source_pedal_count": source_graph.circuits.len(),
+        "runtime_patch_controls": runtime_patch_report(args),
+        "runtime_patch": patch,
+        "effective_pedal_count": instance_count,
+        "effective_cable_count": cable_count,
+        "placement": {
+            "schema": placement.schema,
+            "wiring": placement.wiring,
+            "local_cable_count": placement.local_cable_count,
+            "cross_device_cable_count": placement.cross_device_cable_count,
+            "pedals": placement.pedals,
+            "cables": placement.cables,
+        },
+    });
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+    } else {
+        println!("package_id={}", payload["package_id"]);
+        println!("effective_pedal_count={}", payload["effective_pedal_count"]);
+        println!("effective_cable_count={}", payload["effective_cable_count"]);
+        println!(
+            "cross_device_cable_count={}",
+            payload["placement"]["cross_device_cable_count"]
+        );
+        for pedal in payload["placement"]["pedals"]
+            .as_array()
+            .into_iter()
+            .flatten()
+        {
+            println!(
+                "{} circuit={} device={}",
+                pedal["pedal_id"], pedal["circuit_id"], pedal["device_id"]
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn package_port_report(port: &CircuitPort) -> Value {
+    json!({
+        "id": port.id,
+        "signal": port.signal,
+        "shape": port.shape,
+        "source": port.source,
+        "pedal_port": port.pedal_port,
+    })
+}
+
 fn inspect_device_slice(
     args: &Args,
     package_manifest: &Path,
+    manifest_dir: &Path,
+    manifest: VulkanResidentGreedyModelPackageManifest,
     device_id: &str,
 ) -> Result<(), Box<dyn Error>> {
     let capacity = choose_runtime_capacity(package_manifest, args.capacity, 1)?;
     let device = VulkanComputeDevice::new()?;
-    let payload = inspect_device_slice_payload(&device, package_manifest, device_id, capacity)?;
+    let payload = inspect_device_slice_payload(
+        &device,
+        package_manifest,
+        manifest_dir,
+        manifest,
+        device_id,
+        capacity,
+    )?;
 
     if args.json {
         println!("{}", serde_json::to_string_pretty(&payload)?);
@@ -181,15 +492,26 @@ fn inspect_device_slice(
     Ok(())
 }
 
-fn inspect_placement(args: &Args, package_manifest: &Path) -> Result<(), Box<dyn Error>> {
+fn inspect_placement(
+    args: &Args,
+    package_manifest: &Path,
+    manifest_dir: &Path,
+    manifest: VulkanResidentGreedyModelPackageManifest,
+) -> Result<(), Box<dyn Error>> {
     let capacity = choose_runtime_capacity(package_manifest, args.capacity, 1)?;
-    let manifest = VulkanResidentGreedyModelPackageManifest::from_json_file(package_manifest)?;
     let device_ids = manifest.placement_device_ids();
     let device = VulkanComputeDevice::new()?;
     let slices = device_ids
         .iter()
         .map(|device_id| {
-            inspect_device_slice_payload(&device, package_manifest, device_id, capacity)
+            inspect_device_slice_payload(
+                &device,
+                package_manifest,
+                manifest_dir,
+                manifest.clone(),
+                device_id,
+                capacity,
+            )
         })
         .collect::<Result<Vec<_>, _>>()?;
     let payload = json!({
@@ -197,6 +519,7 @@ fn inspect_placement(args: &Args, package_manifest: &Path) -> Result<(), Box<dyn
         "package_manifest": package_manifest,
         "device_name": device.device_name(),
         "resident_capacity_activations": capacity,
+        "runtime_patch": runtime_patch_report(args),
         "device_count": device_ids.len(),
         "device_ids": device_ids,
         "devices": slices,
@@ -224,12 +547,15 @@ fn inspect_placement(args: &Args, package_manifest: &Path) -> Result<(), Box<dyn
 fn inspect_device_slice_payload(
     device: &VulkanComputeDevice,
     package_manifest: &Path,
+    manifest_dir: &Path,
+    manifest: VulkanResidentGreedyModelPackageManifest,
     device_id: &str,
     capacity: usize,
 ) -> Result<Value, Box<dyn Error>> {
-    let slice = VulkanResidentGreedyModelPackageDeviceSlice::from_manifest_file_for_device(
+    let slice = VulkanResidentGreedyModelPackageDeviceSlice::from_manifest_for_device(
         device,
-        package_manifest,
+        manifest_dir,
+        manifest,
         device_id,
         Some(capacity),
     )?;
@@ -335,6 +661,40 @@ fn resolve_package_path(manifest_dir: &Path, raw_path: &str) -> PathBuf {
     }
 }
 
+fn runtime_manifest(
+    args: &Args,
+    package_manifest: &Path,
+) -> Result<VulkanResidentGreedyModelPackageManifest, Box<dyn Error>> {
+    let manifest = VulkanResidentGreedyModelPackageManifest::from_json_file(package_manifest)?;
+    Ok(manifest.with_runtime_patch_controls(
+        args.default_device_id.as_deref(),
+        &args.pedal_devices,
+        &args.duplicate_after,
+        args.source_chain.as_deref(),
+    )?)
+}
+
+fn runtime_patch_report(args: &Args) -> Value {
+    json!({
+        "default_device_id": args.default_device_id.clone(),
+        "pedal_devices": args.pedal_devices.clone(),
+        "source_chain": args.source_chain.as_ref().map(|source_chain| {
+            source_chain.iter().map(|(instance_id, source_pedal_id)| {
+                json!({
+                    "instance_id": instance_id,
+                    "source_pedal_id": source_pedal_id,
+                })
+            }).collect::<Vec<_>>()
+        }),
+        "duplicate_after": args.duplicate_after.iter().map(|(after_instance_id, new_instance_id)| {
+            json!({
+                "after_instance_id": after_instance_id,
+                "new_instance_id": new_instance_id,
+            })
+        }).collect::<Vec<_>>(),
+    })
+}
+
 fn choose_runtime_capacity(
     package_manifest: &Path,
     requested_capacity: Option<usize>,
@@ -426,11 +786,45 @@ fn parse_args() -> Result<Args, String> {
             "--prompt" => {
                 parsed.prompt = Some(next_value(&mut raw, "--prompt")?);
             }
+            "--inspect-package" | "--inspect-pedals" => {
+                parsed.inspect_package = true;
+            }
+            "--inspect-patch" => {
+                parsed.inspect_patch = true;
+            }
             "--inspect-placement" => {
                 parsed.inspect_placement = true;
             }
             "--inspect-device-slice" => {
                 parsed.inspect_device_slice = Some(next_value(&mut raw, "--inspect-device-slice")?);
+            }
+            "--device" | "--default-device-id" => {
+                parsed.default_device_id = Some(next_value(&mut raw, &arg)?);
+            }
+            "--place-pedal" | "--place" => {
+                let assignment = next_value(&mut raw, &arg)?;
+                let (pedal_id, device_id) = parse_pedal_device_assignment(&assignment)?;
+                if parsed
+                    .pedal_devices
+                    .insert(pedal_id.clone(), device_id)
+                    .is_some()
+                {
+                    return Err(format!(
+                        "duplicate runtime placement for pedal {pedal_id:?}"
+                    ));
+                }
+            }
+            "--duplicate-after" => {
+                let assignment = next_value(&mut raw, "--duplicate-after")?;
+                parsed
+                    .duplicate_after
+                    .push(parse_duplicate_after_assignment(&assignment)?);
+            }
+            "--chain" | "--source-chain" => {
+                let chain = parse_source_chain(&next_value(&mut raw, &arg)?)?;
+                if parsed.source_chain.replace(chain).is_some() {
+                    return Err("--chain may only be supplied once".to_string());
+                }
             }
             "--max-new-tokens" => {
                 parsed.max_new_tokens = parse_next(&mut raw, "--max-new-tokens")?;
@@ -465,13 +859,21 @@ fn parse_args() -> Result<Args, String> {
     if matches!(parsed.prompt.as_deref(), Some("")) {
         return Err("--prompt must not be empty".to_string());
     }
-    if parsed.inspect_placement && parsed.inspect_device_slice.is_some() {
+    let inspect_mode_count = usize::from(parsed.inspect_package)
+        + usize::from(parsed.inspect_patch)
+        + usize::from(parsed.inspect_placement)
+        + usize::from(parsed.inspect_device_slice.is_some());
+    if inspect_mode_count > 1 {
         return Err(
-            "--inspect-placement and --inspect-device-slice are mutually exclusive".to_string(),
+            "--inspect-package, --inspect-patch, --inspect-placement, and --inspect-device-slice are mutually exclusive"
+                .to_string(),
         );
     }
     if matches!(parsed.inspect_device_slice.as_deref(), Some("")) {
         return Err("--inspect-device-slice must not be empty".to_string());
+    }
+    if matches!(parsed.default_device_id.as_deref(), Some("")) {
+        return Err("--device must not be empty".to_string());
     }
     if parsed.max_new_tokens == 0 {
         return Err("--max-new-tokens must be at least 1".to_string());
@@ -487,6 +889,87 @@ fn parse_args() -> Result<Args, String> {
     }
 
     Ok(parsed)
+}
+
+fn parse_pedal_device_assignment(raw: &str) -> Result<(String, String), String> {
+    let (pedal_id, device_id) = raw
+        .split_once('=')
+        .ok_or_else(|| format!("invalid runtime placement {raw:?}; expected PEDAL_ID=DEVICE_ID"))?;
+    let pedal_id = pedal_id.trim();
+    let device_id = device_id.trim();
+    if pedal_id.is_empty() {
+        return Err(format!(
+            "invalid runtime placement {raw:?}; pedal id must not be empty"
+        ));
+    }
+    if device_id.is_empty() {
+        return Err(format!(
+            "invalid runtime placement {raw:?}; device id must not be empty"
+        ));
+    }
+    Ok((pedal_id.to_string(), device_id.to_string()))
+}
+
+fn parse_duplicate_after_assignment(raw: &str) -> Result<(String, String), String> {
+    let (after_instance_id, new_instance_id) = raw.split_once('=').ok_or_else(|| {
+        format!("invalid runtime duplicate {raw:?}; expected AFTER_INSTANCE_ID=NEW_INSTANCE_ID")
+    })?;
+    let after_instance_id = after_instance_id.trim();
+    let new_instance_id = new_instance_id.trim();
+    if after_instance_id.is_empty() {
+        return Err(format!(
+            "invalid runtime duplicate {raw:?}; source instance id must not be empty"
+        ));
+    }
+    if new_instance_id.is_empty() {
+        return Err(format!(
+            "invalid runtime duplicate {raw:?}; new instance id must not be empty"
+        ));
+    }
+    Ok((after_instance_id.to_string(), new_instance_id.to_string()))
+}
+
+fn parse_source_chain(raw: &str) -> Result<Vec<(String, String)>, String> {
+    let separator = if raw.contains("->") { "->" } else { "," };
+    let mut chain = Vec::new();
+    let mut instance_ids = std::collections::BTreeSet::new();
+
+    for raw_item in raw.split(separator) {
+        let raw_item = raw_item.trim();
+        if raw_item.is_empty() {
+            return Err(format!(
+                "invalid runtime chain {raw:?}; chain items must not be empty"
+            ));
+        }
+        let (instance_id, source_pedal_id) =
+            if let Some((instance_id, source_pedal_id)) = raw_item.split_once('=') {
+                (instance_id.trim(), source_pedal_id.trim())
+            } else {
+                (raw_item, raw_item)
+            };
+        if instance_id.is_empty() {
+            return Err(format!(
+                "invalid runtime chain item {raw_item:?}; instance id must not be empty"
+            ));
+        }
+        if source_pedal_id.is_empty() {
+            return Err(format!(
+                "invalid runtime chain item {raw_item:?}; source pedal id must not be empty"
+            ));
+        }
+        if !instance_ids.insert(instance_id.to_string()) {
+            return Err(format!(
+                "invalid runtime chain {raw:?}; duplicate instance id {instance_id:?}"
+            ));
+        }
+        chain.push((instance_id.to_string(), source_pedal_id.to_string()));
+    }
+
+    if chain.is_empty() {
+        return Err("runtime chain must contain at least one pedal".to_string());
+    }
+
+    Ok(chain)
 }
 
 fn parse_next<T: std::str::FromStr>(
@@ -532,9 +1015,19 @@ Options:
   --package <PATH>           Compiled resident model package manifest. Required.
   --package-manifest <PATH>  Alias for --package.
   --prompt <TEXT>            External text event to inject into the resident stream. Required.
-  --inspect-placement        Mount and summarize every logical device slice in the package.
+  --device <DEVICE_ID>       Default logical device for this runtime patch.
+  --default-device-id <ID>   Alias for --device.
+  --place-pedal <PEDAL=DEV>  Assign one runtime pedal instance to a logical device.
+  --place <PEDAL=DEV>        Alias for --place-pedal.
+  --chain <ITEM[,ITEM...]>    Runtime source chain. ITEM is SOURCE or INSTANCE=SOURCE.
+  --duplicate-after <AFTER=NEW>
+                             Duplicate runtime pedal instance AFTER with id NEW.
+  --inspect-package          Summarize the compiled source pedal kit and available devices.
+  --inspect-pedals           Alias for --inspect-package.
+  --inspect-patch            Preview the effective runtime patch without mounting devices.
+  --inspect-placement        Mount and summarize every logical device slice in the runtime patch.
   --inspect-device-slice <DEVICE_ID>
-                             Mount and summarize only the package pedals assigned to DEVICE_ID.
+                             Mount and summarize only the runtime patch pedals assigned to DEVICE_ID.
   --max-new-tokens <N>       Public output tokens to emit after the prompt. Default: 4
   --capacity <N>             Override resident activation capacity selected from the package.
   --cycle-ticks <N>          Max runtime ticks per always-on cycle. Default: 4

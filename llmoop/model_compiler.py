@@ -51,8 +51,6 @@ def compile_model(
     clean: bool = True,
     shader_source_dir: Path = Path("runtime-rs/shaders"),
     default_dynamic_state_capacity_activations: int = 4,
-    default_device_id: str = "gpu0",
-    pedal_devices: dict[str, str] | None = None,
 ) -> CompiledModelReport:
     model_dir = model_dir.expanduser()
     from llmoop.model_package import compile_model_package
@@ -65,8 +63,6 @@ def compile_model(
         clean=clean,
         shader_source_dir=shader_source_dir,
         default_dynamic_state_capacity_activations=default_dynamic_state_capacity_activations,
-        default_device_id=default_device_id,
-        pedal_devices=pedal_devices or {},
     )
 
 

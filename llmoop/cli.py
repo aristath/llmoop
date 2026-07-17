@@ -42,6 +42,16 @@ def main() -> None:
         help="mount and summarize only the compiled package pedals assigned to DEVICE_ID for --run",
     )
     parser.add_argument(
+        "--inspect-package",
+        action="store_true",
+        help="summarize the compiled source pedal kit and available runtime devices for --run",
+    )
+    parser.add_argument(
+        "--inspect-patch",
+        action="store_true",
+        help="preview the effective runtime patch for --run without mounting devices",
+    )
+    parser.add_argument(
         "--inspect-placement",
         action="store_true",
         help="mount and summarize every logical device slice in a compiled package for --run",
@@ -68,15 +78,28 @@ def main() -> None:
     )
     parser.add_argument(
         "--default-device-id",
-        default="gpu0",
-        help="default logical device for compiled package pedal placement",
+        default=None,
+        help="default logical device for the runtime pedalboard patch",
     )
     parser.add_argument(
         "--place-pedal",
         action="append",
         default=[],
         metavar="PEDAL=DEVICE",
-        help="assign one compiled package pedal to a logical device; may be repeated",
+        help="assign one runtime pedal instance to a logical device in the runtime patch; may be repeated",
+    )
+    parser.add_argument(
+        "--duplicate-after",
+        action="append",
+        default=[],
+        metavar="AFTER=NEW",
+        help="duplicate runtime pedal instance AFTER with id NEW; may be repeated",
+    )
+    parser.add_argument(
+        "--chain",
+        default=None,
+        metavar="ITEM[,ITEM...]",
+        help="runtime source chain for --run; ITEM is SOURCE or INSTANCE=SOURCE",
     )
     parser.add_argument(
         "--shader-source-dir",
@@ -157,20 +180,42 @@ def main() -> None:
         parser.print_help()
         raise SystemExit(2)
     if args.compile_model is None:
-        if args.default_device_id != "gpu0":
-            parser.error("--default-device-id is only supported with --compile-model")
-        if args.place_pedal:
-            parser.error("--place-pedal is only supported with --compile-model")
+        if args.inspect_package and args.run is None:
+            parser.error("--inspect-package is only supported with --run")
+        if args.inspect_patch and args.run is None:
+            parser.error("--inspect-patch is only supported with --run")
         if args.inspect_placement and args.run is None:
             parser.error("--inspect-placement is only supported with --run")
     elif args.inspect_device_slice is not None:
         parser.error("--inspect-device-slice is only supported with --run")
+    elif args.inspect_package:
+        parser.error("--inspect-package is only supported with --run")
+    elif args.inspect_patch:
+        parser.error("--inspect-patch is only supported with --run")
     elif args.inspect_placement:
         parser.error("--inspect-placement is only supported with --run")
+    elif args.default_device_id is not None:
+        parser.error("--default-device-id is only supported with --run")
+    elif args.place_pedal:
+        parser.error("--place-pedal is only supported with --run")
+    elif args.duplicate_after:
+        parser.error("--duplicate-after is only supported with --run")
+    elif args.chain is not None:
+        parser.error("--chain is only supported with --run")
     if args.run is not None:
-        if args.inspect_device_slice is not None and args.inspect_placement:
-            parser.error("--inspect-device-slice and --inspect-placement are mutually exclusive")
-        if args.inspect_device_slice is None and not args.inspect_placement and args.prompt is None:
+        inspect_mode_count = sum(
+            [
+                args.inspect_device_slice is not None,
+                args.inspect_package,
+                args.inspect_patch,
+                args.inspect_placement,
+            ]
+        )
+        if inspect_mode_count > 1:
+            parser.error(
+                "--inspect-package, --inspect-patch, --inspect-device-slice, and --inspect-placement are mutually exclusive"
+            )
+        if inspect_mode_count == 0 and args.prompt is None:
             parser.error("--prompt is required with --run")
         if args.temperature is not None:
             parser.error("--temperature is only supported by --run-model")
@@ -180,13 +225,32 @@ def main() -> None:
             parser.error("--seed is only supported by --run-model")
         if args.ignore_eos:
             parser.error("--ignore-eos is only supported by --run-model")
+        try:
+            parse_pedal_device_overrides(args.place_pedal)
+            parse_duplicate_after_overrides(args.duplicate_after)
+            if args.chain is not None:
+                parse_source_chain(args.chain)
+        except ValueError as error:
+            parser.error(str(error))
         run_engine(args)
         return
     if args.run_model is not None:
         if args.inspect_device_slice is not None:
             parser.error("--inspect-device-slice is only supported by --run")
+        if args.inspect_package:
+            parser.error("--inspect-package is only supported by --run")
+        if args.inspect_patch:
+            parser.error("--inspect-patch is only supported by --run")
         if args.inspect_placement:
             parser.error("--inspect-placement is only supported by --run")
+        if args.default_device_id is not None:
+            parser.error("--default-device-id is only supported by --run")
+        if args.place_pedal:
+            parser.error("--place-pedal is only supported by --run")
+        if args.duplicate_after:
+            parser.error("--duplicate-after is only supported by --run")
+        if args.chain is not None:
+            parser.error("--chain is only supported by --run")
         if args.prompt is None:
             parser.error("--prompt is required with --run-model")
         if args.package_dir is None:
@@ -194,10 +258,6 @@ def main() -> None:
         run_model(args)
         return
 
-    try:
-        pedal_devices = parse_pedal_device_overrides(args.place_pedal)
-    except ValueError as error:
-        parser.error(str(error))
     report = compile_model(
         args.compile_model,
         transpiled_dir=args.transpiled_dir,
@@ -206,8 +266,6 @@ def main() -> None:
         clean=not args.no_clean,
         shader_source_dir=args.shader_source_dir,
         default_dynamic_state_capacity_activations=args.capacity or 4,
-        default_device_id=args.default_device_id,
-        pedal_devices=pedal_devices,
     )
     if args.json:
         print(json.dumps(report.to_json(), indent=2))
@@ -257,6 +315,64 @@ def parse_pedal_device_overrides(raw_overrides: list[str]) -> dict[str, str]:
     return pedal_devices
 
 
+def parse_duplicate_after_overrides(raw_overrides: list[str]) -> dict[str, str]:
+    duplicates: dict[str, str] = {}
+    new_instance_ids: set[str] = set()
+    for raw_override in raw_overrides:
+        if "=" not in raw_override:
+            raise ValueError(
+                f"invalid --duplicate-after value {raw_override!r}; expected AFTER=NEW"
+            )
+        after_instance_id, new_instance_id = (
+            part.strip() for part in raw_override.split("=", 1)
+        )
+        if not after_instance_id:
+            raise ValueError(
+                f"invalid --duplicate-after value {raw_override!r}; source instance id is empty"
+            )
+        if not new_instance_id:
+            raise ValueError(
+                f"invalid --duplicate-after value {raw_override!r}; new instance id is empty"
+            )
+        if new_instance_id in new_instance_ids:
+            raise ValueError(f"duplicate --duplicate-after new instance {new_instance_id!r}")
+        duplicates[after_instance_id] = new_instance_id
+        new_instance_ids.add(new_instance_id)
+    return duplicates
+
+
+def parse_source_chain(raw_chain: str) -> list[tuple[str, str]]:
+    separator = "->" if "->" in raw_chain else ","
+    chain: list[tuple[str, str]] = []
+    instance_ids: set[str] = set()
+    for raw_item in raw_chain.split(separator):
+        raw_item = raw_item.strip()
+        if not raw_item:
+            raise ValueError(
+                f"invalid --chain value {raw_chain!r}; chain items must not be empty"
+            )
+        if "=" in raw_item:
+            instance_id, source_pedal_id = (part.strip() for part in raw_item.split("=", 1))
+        else:
+            instance_id = raw_item
+            source_pedal_id = raw_item
+        if not instance_id:
+            raise ValueError(
+                f"invalid --chain item {raw_item!r}; instance id is empty"
+            )
+        if not source_pedal_id:
+            raise ValueError(
+                f"invalid --chain item {raw_item!r}; source pedal id is empty"
+            )
+        if instance_id in instance_ids:
+            raise ValueError(f"duplicate --chain instance id {instance_id!r}")
+        instance_ids.add(instance_id)
+        chain.append((instance_id, source_pedal_id))
+    if not chain:
+        raise ValueError("--chain must contain at least one pedal")
+    return chain
+
+
 def build_runtime_command(args: argparse.Namespace, package_manifest: Path) -> list[str]:
     runtime_args = [
         "--package",
@@ -264,6 +380,10 @@ def build_runtime_command(args: argparse.Namespace, package_manifest: Path) -> l
     ]
     if args.inspect_placement:
         runtime_args.append("--inspect-placement")
+    elif args.inspect_package:
+        runtime_args.append("--inspect-package")
+    elif args.inspect_patch:
+        runtime_args.append("--inspect-patch")
     elif args.inspect_device_slice is not None:
         runtime_args.extend(["--inspect-device-slice", args.inspect_device_slice])
     else:
@@ -275,6 +395,14 @@ def build_runtime_command(args: argparse.Namespace, package_manifest: Path) -> l
                 str(args.max_new_tokens),
             ]
         )
+    if args.default_device_id is not None:
+        runtime_args.extend(["--device", args.default_device_id])
+    for raw_placement in args.place_pedal:
+        runtime_args.extend(["--place-pedal", raw_placement])
+    for raw_duplicate in args.duplicate_after:
+        runtime_args.extend(["--duplicate-after", raw_duplicate])
+    if args.chain is not None:
+        runtime_args.extend(["--chain", args.chain])
     if args.capacity is not None:
         runtime_args.extend(["--capacity", str(args.capacity)])
     if args.no_special_tokens:

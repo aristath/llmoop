@@ -10,10 +10,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::stream_circuit::{
-    CableTransport, CircuitParamsArtifact, CircuitStateArtifact, LoweredCircuitRef,
-    LoweredPedalboard, LoweredPedalboardGraph, LoweredPedalboardSource, LoweredPedalboardSummary,
-    PedalCablePlacement, ResolvedCircuitArtifact, ResolvedLoweredPedalboard, StreamCircuit,
-    StreamCircuitPlacementPlan, StreamCircuitPlacementSpec, LOWERED_PEDALBOARD_SCHEMA,
+    CableTransport, CircuitParamsArtifact, CircuitStateArtifact, LOWERED_PEDALBOARD_SCHEMA,
+    LoweredCircuitRef, LoweredPedalboard, LoweredPedalboardGraph, LoweredPedalboardSource,
+    LoweredPedalboardSummary, PedalCablePlacement, ResolvedCircuitArtifact,
+    ResolvedLoweredPedalboard, StreamCircuit, StreamCircuitPlacementPlan,
+    StreamCircuitPlacementSpec, StreamCircuitRuntimePatch,
 };
 use crate::stream_plan::{
     CircuitActivationPlan, PlannedNode, PlannedPort, SignalProducer, SignalStorage,
@@ -1715,14 +1716,13 @@ impl VulkanInProcessPlacedCableTransport {
                 cable_index,
             })?;
         let key = VulkanPlacedCablePacketKey::from_outgoing_endpoint(&outgoing.endpoint);
-        let bytes =
-            outgoing
-                .buffer
-                .read_bytes(outgoing.byte_capacity)
-                .map_err(|error| VulkanPlacedCableTransportError::Vulkan {
-                    operation: "read outgoing cable buffer",
-                    error,
-                })?;
+        let bytes = outgoing
+            .buffer
+            .read_bytes(outgoing.byte_capacity)
+            .map_err(|error| VulkanPlacedCableTransportError::Vulkan {
+                operation: "read outgoing cable buffer",
+                error,
+            })?;
         let packet = VulkanPlacedCablePacket {
             key: key.clone(),
             signal: outgoing.endpoint.signal.clone(),
@@ -1769,12 +1769,10 @@ impl VulkanInProcessPlacedCableTransport {
                 cable_index,
             })?;
         let key = VulkanPlacedCablePacketKey::from_incoming_endpoint(&incoming.endpoint);
-        let packet =
-            self.packets
-                .remove(&key)
-                .ok_or_else(|| VulkanPlacedCableTransportError::MissingPacket {
-                    key: key.clone(),
-                })?;
+        let packet = self
+            .packets
+            .remove(&key)
+            .ok_or_else(|| VulkanPlacedCableTransportError::MissingPacket { key: key.clone() })?;
         if packet.byte_count != incoming.byte_capacity {
             return Err(VulkanPlacedCableTransportError::ByteCapacityMismatch {
                 key,
@@ -1782,12 +1780,13 @@ impl VulkanInProcessPlacedCableTransport {
                 incoming_byte_capacity: incoming.byte_capacity,
             });
         }
-        incoming.buffer.write_bytes(&packet.bytes).map_err(|error| {
-            VulkanPlacedCableTransportError::Vulkan {
+        incoming
+            .buffer
+            .write_bytes(&packet.bytes)
+            .map_err(|error| VulkanPlacedCableTransportError::Vulkan {
                 operation: "write incoming cable buffer",
                 error,
-            }
-        })?;
+            })?;
         Ok(VulkanPlacedCableTransportReceipt {
             key: packet.key,
             signal: packet.signal,
@@ -6065,6 +6064,190 @@ impl VulkanResidentGreedyModelPackageManifest {
             .into_iter()
             .collect()
     }
+
+    pub fn with_runtime_placement(
+        mut self,
+        default_device_id: Option<&str>,
+        pedal_devices: &BTreeMap<String, String>,
+    ) -> Self {
+        if let Some(default_device_id) = default_device_id {
+            self.placement.default_device_id = default_device_id.to_string();
+            self.device_id = default_device_id.to_string();
+        }
+        for (pedal_id, device_id) in pedal_devices {
+            self.placement
+                .pedal_devices
+                .insert(pedal_id.clone(), device_id.clone());
+        }
+        self
+    }
+
+    pub fn with_runtime_patch_controls(
+        self,
+        default_device_id: Option<&str>,
+        pedal_devices: &BTreeMap<String, String>,
+        duplicate_after: &[(String, String)],
+        source_chain: Option<&[(String, String)]>,
+    ) -> Result<Self, VulkanResidentTokenModelPackageError> {
+        if default_device_id.is_none()
+            && pedal_devices.is_empty()
+            && duplicate_after.is_empty()
+            && source_chain.is_none()
+        {
+            return Ok(self);
+        }
+
+        let patch = self.runtime_patch_from_controls(
+            default_device_id,
+            pedal_devices,
+            duplicate_after,
+            source_chain,
+        )?;
+
+        self.with_runtime_patch(&patch)
+    }
+
+    pub fn runtime_patch_from_controls(
+        &self,
+        default_device_id: Option<&str>,
+        pedal_devices: &BTreeMap<String, String>,
+        duplicate_after: &[(String, String)],
+        source_chain: Option<&[(String, String)]>,
+    ) -> Result<StreamCircuitRuntimePatch, VulkanResidentTokenModelPackageError> {
+        let source_graph = self
+            .circuit_graph
+            .to_resolved_lowered_pedalboard(PathBuf::from("."))?;
+        let default_device_id = default_device_id
+            .unwrap_or(&self.placement.default_device_id)
+            .to_string();
+        let mut patch = if let Some(source_chain) = source_chain {
+            StreamCircuitRuntimePatch::from_source_chain(
+                &source_graph,
+                default_device_id,
+                source_chain,
+            )
+        } else {
+            StreamCircuitRuntimePatch::from_source_series(&source_graph, default_device_id)
+        }
+        .map_err(|error| VulkanResidentTokenModelPackageError::new(error.to_string()))?;
+
+        for (pedal_id, device_id) in &self.placement.pedal_devices {
+            if patch
+                .instances
+                .iter()
+                .any(|instance| instance.instance_id == *pedal_id)
+            {
+                patch = patch
+                    .with_instance_device(pedal_id, device_id)
+                    .map_err(|error| {
+                        VulkanResidentTokenModelPackageError::new(error.to_string())
+                    })?;
+            }
+        }
+        for (after_instance_id, new_instance_id) in duplicate_after {
+            patch = patch
+                .duplicate_after_instance(after_instance_id, new_instance_id)
+                .map_err(|error| VulkanResidentTokenModelPackageError::new(error.to_string()))?;
+        }
+        for (instance_id, device_id) in pedal_devices {
+            patch = patch
+                .with_instance_device(instance_id, device_id)
+                .map_err(|error| VulkanResidentTokenModelPackageError::new(error.to_string()))?;
+        }
+
+        Ok(patch)
+    }
+
+    pub fn resolved_source_graph(
+        &self,
+        package_root: impl Into<PathBuf>,
+    ) -> Result<ResolvedLoweredPedalboard, VulkanResidentTokenModelPackageError> {
+        self.circuit_graph
+            .to_resolved_lowered_pedalboard(package_root)
+    }
+
+    pub fn with_runtime_patch(
+        mut self,
+        patch: &StreamCircuitRuntimePatch,
+    ) -> Result<Self, VulkanResidentTokenModelPackageError> {
+        let source_graph = self
+            .circuit_graph
+            .to_resolved_lowered_pedalboard(PathBuf::from("."))?;
+        patch
+            .validate_against_graph(&source_graph)
+            .map_err(|error| VulkanResidentTokenModelPackageError::new(error.to_string()))?;
+
+        let source_pedals = self
+            .circuit_graph
+            .pedals
+            .iter()
+            .map(|pedal| (pedal.pedal_id.as_str(), pedal))
+            .collect::<BTreeMap<_, _>>();
+        let source_executions = self
+            .pedal_executions
+            .iter()
+            .map(|execution| (execution.pedal_id.as_str(), execution))
+            .collect::<BTreeMap<_, _>>();
+
+        let mut pedals = Vec::with_capacity(patch.instances.len());
+        let mut pedal_executions = Vec::with_capacity(patch.instances.len());
+        let mut placement = StreamCircuitPlacementSpec::new(patch.default_device_id.clone());
+
+        for instance in &patch.instances {
+            let source_pedal = source_pedals
+                .get(instance.source_pedal_id.as_str())
+                .ok_or_else(|| {
+                    VulkanResidentTokenModelPackageError::new(format!(
+                        "runtime patch instance {} references unknown source pedal {}",
+                        instance.instance_id, instance.source_pedal_id
+                    ))
+                })?;
+            let mut pedal = (*source_pedal).clone();
+            pedal.pedal_id = instance.instance_id.clone();
+            pedal.circuit.source.pedal_id = instance.instance_id.clone();
+            pedals.push(pedal);
+
+            let source_execution = source_executions
+                .get(instance.source_pedal_id.as_str())
+                .ok_or_else(|| {
+                    VulkanResidentTokenModelPackageError::new(format!(
+                        "runtime patch source pedal {} has no execution spec",
+                        instance.source_pedal_id
+                    ))
+                })?;
+            let mut execution = (*source_execution).clone();
+            execution.pedal_id = instance.instance_id.clone();
+            pedal_executions.push(execution);
+
+            if instance.device_id != patch.default_device_id {
+                placement = placement.with_pedal_device(&instance.instance_id, &instance.device_id);
+            }
+        }
+
+        for profile in &mut self.capacity_profiles {
+            let source_overrides = profile.pedal_execution_shader_overrides.clone();
+            profile.pedal_execution_shader_overrides.clear();
+            for instance in &patch.instances {
+                profile.pedal_execution_shader_overrides.extend(
+                    source_overrides
+                        .iter()
+                        .filter(|shader| shader.pedal_id == instance.source_pedal_id)
+                        .cloned()
+                        .map(|mut shader| {
+                            shader.pedal_id = instance.instance_id.clone();
+                            shader
+                        }),
+                );
+            }
+        }
+
+        self.device_id = patch.default_device_id.clone();
+        self.placement = placement;
+        self.circuit_graph.wiring = patch.wiring.clone();
+        self.circuit_graph.pedals = pedals;
+        self.pedal_executions = pedal_executions;
+        Ok(self)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -6426,6 +6609,697 @@ impl VulkanResidentGreedyModelPackageDeviceSlice {
 
     pub fn loaded_manifest(&self) -> &VulkanLoadedReusableKernelArtifactManifest {
         &self.loaded_manifest
+    }
+}
+
+pub struct VulkanResidentGreedyInProcessPlacedModelPackage {
+    pub package_id: String,
+    pub boundary_device_id: String,
+    pub dynamic_state_capacity_activations: usize,
+    pub device_ids: Vec<String>,
+    pub device_count: usize,
+    pub hosted_pedal_count: usize,
+    pub transducer_parameter_count: usize,
+    pub transducer_parameter_bytes: usize,
+    _transducer_parameter_buffers: Arc<VulkanPermanentParameterBuffers>,
+    input_transducer: VulkanResidentInputEmbeddingTransducerRunner,
+    output_transducer: VulkanResidentOutputTransducerRunner,
+    sampler: VulkanResidentGreedySamplerRunner,
+    device_slices: Vec<VulkanResidentGreedyInProcessPlacedModelPackageDevice>,
+}
+
+pub struct VulkanResidentGreedyInProcessPlacedModelPackageDevice {
+    pub device_id: String,
+    pub hosted_pedal_count: usize,
+    pub incoming_cable_count: usize,
+    pub outgoing_cable_count: usize,
+    pub dispatch_count: usize,
+    package_slice: VulkanResidentGreedyModelPackageDeviceSlice,
+    mounted: VulkanMountedPlacedStreamCircuit,
+    reusable_manifest: VulkanReusableKernelArtifactManifest,
+    mounted_bound: VulkanMountedPlacedBoundDispatchPlan,
+}
+
+impl VulkanResidentGreedyInProcessPlacedModelPackage {
+    pub fn from_manifest_file(
+        device: &VulkanComputeDevice,
+        manifest_path: impl AsRef<Path>,
+    ) -> Result<Self, VulkanResidentGreedyInProcessPlacedModelPackageError> {
+        Self::from_manifest_file_with_capacity(device, manifest_path, None)
+    }
+
+    pub fn from_manifest_file_with_capacity(
+        device: &VulkanComputeDevice,
+        manifest_path: impl AsRef<Path>,
+        dynamic_state_capacity_activations: Option<usize>,
+    ) -> Result<Self, VulkanResidentGreedyInProcessPlacedModelPackageError> {
+        let manifest_path = manifest_path.as_ref();
+        let manifest = VulkanResidentGreedyModelPackageManifest::from_json_file(manifest_path)
+            .map_err(|error| {
+                VulkanResidentGreedyInProcessPlacedModelPackageError::Package(
+                    VulkanResidentTokenModelPackageError::new(format!(
+                        "failed to load resident placed model package manifest {:?}: {error}",
+                        manifest_path
+                    )),
+                )
+            })?;
+        let manifest_dir = manifest_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        Self::from_manifest_for_devices(
+            device,
+            &manifest_dir,
+            manifest,
+            dynamic_state_capacity_activations,
+        )
+    }
+
+    pub fn from_manifest_for_devices(
+        device: &VulkanComputeDevice,
+        manifest_dir: impl AsRef<Path>,
+        manifest: VulkanResidentGreedyModelPackageManifest,
+        dynamic_state_capacity_activations: Option<usize>,
+    ) -> Result<Self, VulkanResidentGreedyInProcessPlacedModelPackageError> {
+        let manifest_dir = manifest_dir.as_ref();
+        let package_id = manifest.package_id.clone();
+        let boundary_device_id = manifest.device_id.clone();
+        let capacity = dynamic_state_capacity_activations
+            .unwrap_or(manifest.dynamic_state_capacity_activations);
+        let tensor_index_path =
+            resolve_resident_model_package_path(manifest_dir, &manifest.tensor_index_path);
+        let (tensor_index, resource_plan, _placement_plan, _boundary_placed_plan) =
+            plan_resident_greedy_package_placed_stream_circuit(
+                &boundary_device_id,
+                &manifest.placement,
+                &manifest.circuit_graph,
+                manifest_dir,
+                &tensor_index_path,
+                manifest.activation_element_bytes,
+            )?;
+        let transducer_parameter_buffers =
+            Arc::new(load_resident_greedy_package_transducer_parameter_buffers(
+                device,
+                &boundary_device_id,
+                &resource_plan,
+                &tensor_index,
+            )?);
+        let input_transducer_spirv_words = compile_required_resident_model_package_shader(
+            manifest_dir,
+            &manifest.input_transducer.shader_path,
+        )?;
+        let embedding_norm_spirv_words = compile_required_resident_model_package_shader(
+            manifest_dir,
+            &manifest.output_transducer.embedding_norm_shader_path,
+        )?;
+        let tied_projection_spirv_words = compile_required_resident_model_package_shader(
+            manifest_dir,
+            &manifest.output_transducer.projection_shader_path,
+        )?;
+        let sampler_spirv_words = compile_required_resident_model_package_shader(
+            manifest_dir,
+            &manifest.sampler.shader_path,
+        )?;
+        let device_ids = manifest.placement_device_ids();
+        let mut device_slices = Vec::with_capacity(device_ids.len());
+        let mut hosted_pedal_count = 0usize;
+
+        for device_id in &device_ids {
+            let package_slice =
+                VulkanResidentGreedyModelPackageDeviceSlice::from_manifest_for_device(
+                    device,
+                    manifest_dir,
+                    manifest.clone(),
+                    device_id,
+                    Some(capacity),
+                )
+                .map_err(VulkanResidentGreedyInProcessPlacedModelPackageError::Package)?;
+            let mounted = package_slice
+                .create_mounted_stream_circuit(device)
+                .map_err(VulkanResidentGreedyInProcessPlacedModelPackageError::Package)?;
+            mounted.buffers.zero_state_buffers().map_err(|error| {
+                VulkanResidentGreedyInProcessPlacedModelPackageError::Package(
+                    VulkanResidentTokenModelPackageError::new(format!(
+                        "failed to zero stream state buffers for placed device {device_id:?}: {error}"
+                    )),
+                )
+            })?;
+            let reusable_manifest =
+                resident_greedy_package_reusable_kernel_manifest(&mounted.placed_plan);
+            let mounted_bound = mounted
+                .mounted_placed_bound_dispatch_plan(&reusable_manifest)
+                .map_err(VulkanResidentGreedyInProcessPlacedModelPackageError::BoundDispatchPlan)?;
+            let dispatch_count = mounted_bound.dispatches.len();
+            hosted_pedal_count = hosted_pedal_count
+                .checked_add(package_slice.hosted_pedal_count)
+                .ok_or_else(|| {
+                    VulkanResidentGreedyInProcessPlacedModelPackageError::Package(
+                        VulkanResidentTokenModelPackageError::new(
+                            "placed package hosted pedal count overflowed",
+                        ),
+                    )
+                })?;
+            device_slices.push(VulkanResidentGreedyInProcessPlacedModelPackageDevice {
+                device_id: package_slice.device_id.clone(),
+                hosted_pedal_count: package_slice.hosted_pedal_count,
+                incoming_cable_count: package_slice.incoming_cable_count,
+                outgoing_cable_count: package_slice.outgoing_cable_count,
+                dispatch_count,
+                package_slice,
+                mounted,
+                reusable_manifest,
+                mounted_bound,
+            });
+        }
+        let boundary_slice = device_slices
+            .iter()
+            .find(|slice| slice.device_id == boundary_device_id)
+            .ok_or_else(|| {
+                VulkanResidentGreedyInProcessPlacedModelPackageError::Package(
+                    VulkanResidentTokenModelPackageError::new(format!(
+                        "placed package {package_id:?} has no mounted boundary device slice {boundary_device_id:?}"
+                    )),
+                )
+            })?;
+        let input_transducer =
+            VulkanResidentInputEmbeddingTransducerRunner::from_mounted_token_embedding(
+                device,
+                &boundary_slice.mounted,
+                &transducer_parameter_buffers,
+                &input_transducer_spirv_words,
+                &manifest.input_transducer.spec,
+            )
+            .map_err(VulkanResidentGreedyInProcessPlacedModelPackageError::InputTransducer)?;
+        let output_transducer =
+            VulkanResidentOutputTransducerRunner::from_mounted_output_transducer(
+                device,
+                &boundary_slice.mounted,
+                &transducer_parameter_buffers,
+                &embedding_norm_spirv_words,
+                &tied_projection_spirv_words,
+                &manifest.output_transducer.spec,
+            )
+            .map_err(VulkanResidentGreedyInProcessPlacedModelPackageError::OutputTransducer)?;
+        let sampler = VulkanResidentGreedySamplerRunner::from_output_transducer_with_spec(
+            device,
+            &output_transducer,
+            &sampler_spirv_words,
+            &manifest.sampler.spec,
+        )
+        .map_err(VulkanResidentGreedyInProcessPlacedModelPackageError::Sampler)?;
+
+        Ok(Self {
+            package_id,
+            boundary_device_id,
+            dynamic_state_capacity_activations: capacity,
+            device_count: device_ids.len(),
+            device_ids,
+            hosted_pedal_count,
+            transducer_parameter_count: transducer_parameter_buffers.plan.parameter_count,
+            transducer_parameter_bytes: transducer_parameter_buffers.total_byte_capacity,
+            _transducer_parameter_buffers: transducer_parameter_buffers,
+            input_transducer,
+            output_transducer,
+            sampler,
+            device_slices,
+        })
+    }
+
+    pub fn device(
+        &self,
+        device_id: &str,
+    ) -> Option<&VulkanResidentGreedyInProcessPlacedModelPackageDevice> {
+        self.device_slices
+            .iter()
+            .find(|slice| slice.device_id == device_id)
+    }
+
+    pub fn mounted_device(&self, device_id: &str) -> Option<&VulkanMountedPlacedStreamCircuit> {
+        self.device(device_id).map(|slice| &slice.mounted)
+    }
+
+    pub fn run_stream_tick_in_process(
+        &self,
+        device: &VulkanComputeDevice,
+        stream_tick: u64,
+        max_scheduler_turns: usize,
+    ) -> Result<
+        VulkanMountedPlacedResidentInProcessStreamTickRun,
+        VulkanResidentGreedyInProcessPlacedModelPackageError,
+    > {
+        let mut transport = VulkanInProcessPlacedCableTransport::new();
+        let mut tick_slices = Vec::with_capacity(self.device_slices.len());
+
+        for slice in &self.device_slices {
+            let tick_plan = slice
+                .mounted
+                .stream_tick_plan(&slice.reusable_manifest)
+                .map_err(VulkanResidentGreedyInProcessPlacedModelPackageError::BoundDispatchPlan)?;
+            tick_slices.push(VulkanMountedPlacedResidentInProcessStreamTickSlice::new(
+                &slice.mounted,
+                &slice.mounted_bound,
+                slice.package_slice.loaded_manifest(),
+                tick_plan,
+                stream_tick,
+            ));
+        }
+
+        run_mounted_placed_resident_stream_tick_slices_in_process(
+            device,
+            &mut tick_slices,
+            &mut transport,
+            max_scheduler_turns,
+        )
+        .map_err(VulkanResidentGreedyInProcessPlacedModelPackageError::Tick)
+    }
+
+    pub fn run_token_id_stream_tick_in_process(
+        &self,
+        device: &VulkanComputeDevice,
+        token_id: u32,
+        stream_tick: u64,
+        max_scheduler_turns: usize,
+    ) -> Result<
+        VulkanResidentGreedyInProcessPlacedSingleTokenTickRun,
+        VulkanResidentGreedyInProcessPlacedModelPackageError,
+    > {
+        let input_run = self
+            .input_transducer
+            .run_token_id(device, token_id)
+            .map_err(VulkanResidentGreedyInProcessPlacedModelPackageError::InputTransducer)?;
+        let placed_run =
+            self.run_stream_tick_in_process(device, stream_tick, max_scheduler_turns)?;
+        if placed_run.status != VulkanMountedPlacedResidentInProcessStreamTickRunStatus::Completed {
+            return Err(
+                VulkanResidentGreedyInProcessPlacedModelPackageError::IncompleteTick(
+                    placed_run.status,
+                ),
+            );
+        }
+        let output_run = self
+            .output_transducer
+            .run(device)
+            .map_err(VulkanResidentGreedyInProcessPlacedModelPackageError::OutputTransducer)?;
+        Ok(VulkanResidentGreedyInProcessPlacedSingleTokenTickRun {
+            boundary_device_id: self.boundary_device_id.clone(),
+            token_id,
+            stream_tick,
+            input_run,
+            placed_run,
+            output_run,
+        })
+    }
+
+    pub fn sample_token_id_stream_tick_in_process(
+        &self,
+        device: &VulkanComputeDevice,
+        token_id: u32,
+        stream_tick: u64,
+        max_scheduler_turns: usize,
+    ) -> Result<
+        VulkanResidentGreedyInProcessPlacedSingleTokenSampleRun,
+        VulkanResidentGreedyInProcessPlacedModelPackageError,
+    > {
+        let tick_run = self.run_token_id_stream_tick_in_process(
+            device,
+            token_id,
+            stream_tick,
+            max_scheduler_turns,
+        )?;
+        let sampler_run = self
+            .sampler
+            .run(device)
+            .map_err(VulkanResidentGreedyInProcessPlacedModelPackageError::Sampler)?;
+        Ok(VulkanResidentGreedyInProcessPlacedSingleTokenSampleRun {
+            tick_run,
+            sampler_run,
+        })
+    }
+
+    pub fn run_greedy_feedback_bounded_in_process(
+        &self,
+        device: &VulkanComputeDevice,
+        initial_token_id: u32,
+        start_stream_tick: u64,
+        max_ticks: usize,
+        max_scheduler_turns_per_tick: usize,
+    ) -> Result<
+        VulkanResidentGreedyInProcessPlacedFeedbackLoopRun,
+        VulkanResidentGreedyInProcessPlacedModelPackageError,
+    > {
+        if max_ticks == 0 {
+            return Err(VulkanResidentGreedyInProcessPlacedModelPackageError::ZeroTickBudget);
+        }
+
+        let mut input_token_id = initial_token_id;
+        let mut tick_runs = Vec::with_capacity(max_ticks);
+        let mut sampled_token_ids = Vec::with_capacity(max_ticks);
+
+        for tick_index in 0..max_ticks {
+            let stream_tick = start_stream_tick
+                .checked_add(u64::try_from(tick_index).map_err(|_| {
+                    VulkanResidentGreedyInProcessPlacedModelPackageError::StreamTickOverflow
+                })?)
+                .ok_or(VulkanResidentGreedyInProcessPlacedModelPackageError::StreamTickOverflow)?;
+            self.ensure_stream_tick_capacity(stream_tick)?;
+            let tick_run = self.sample_token_id_stream_tick_in_process(
+                device,
+                input_token_id,
+                stream_tick,
+                max_scheduler_turns_per_tick,
+            )?;
+            let sampled_token_id = tick_run.sampler_run.token_id;
+            sampled_token_ids.push(sampled_token_id);
+            tick_runs.push(VulkanResidentGreedyInProcessPlacedFeedbackTickRun {
+                stream_tick,
+                input_token_id,
+                sampled_token_id,
+                tick_run,
+            });
+            input_token_id = sampled_token_id;
+        }
+
+        Ok(VulkanResidentGreedyInProcessPlacedFeedbackLoopRun {
+            boundary_device_id: self.boundary_device_id.clone(),
+            initial_token_id,
+            sampled_token_ids,
+            tick_runs,
+        })
+    }
+
+    pub fn run_prompt_event_bounded_in_process(
+        &self,
+        device: &VulkanComputeDevice,
+        prompt_token_ids: &[u32],
+        start_stream_tick: u64,
+        max_new_tokens: usize,
+        eos_token_id: Option<u32>,
+        max_scheduler_turns_per_tick: usize,
+    ) -> Result<
+        VulkanResidentGreedyInProcessPlacedPromptEventRun,
+        VulkanResidentGreedyInProcessPlacedModelPackageError,
+    > {
+        if prompt_token_ids.is_empty() {
+            return Err(VulkanResidentGreedyInProcessPlacedModelPackageError::EmptyPromptEvent);
+        }
+
+        let mut external_input_index = 0usize;
+        let mut pending_feedback: Option<VulkanResidentPendingPrivateFeedback> = None;
+        let mut tick_runs = Vec::new();
+        let mut generated_token_ids = Vec::with_capacity(max_new_tokens);
+        let mut remaining_public_outputs = max_new_tokens;
+        let mut stop_reason = (max_new_tokens == 0).then(|| "max_new_tokens".to_string());
+
+        while external_input_index < prompt_token_ids.len() || pending_feedback.is_some() {
+            let (input_token_id, input_route, input_feedback_depth, input_closes_loop) =
+                if external_input_index < prompt_token_ids.len() {
+                    let token_id = prompt_token_ids[external_input_index];
+                    external_input_index += 1;
+                    (
+                        token_id,
+                        VulkanResidentGreedyPromptEventInputRoute::ExternalInput,
+                        0,
+                        false,
+                    )
+                } else {
+                    let feedback = pending_feedback.take().ok_or(
+                        VulkanResidentGreedyInProcessPlacedModelPackageError::MissingPrivateFeedback,
+                    )?;
+                    (
+                        feedback.token_id,
+                        VulkanResidentGreedyPromptEventInputRoute::PrivateFeedback,
+                        feedback.feedback_depth,
+                        feedback.closes_loop_after_processing,
+                    )
+                };
+
+            let stream_tick = start_stream_tick
+                .checked_add(u64::try_from(tick_runs.len()).map_err(|_| {
+                    VulkanResidentGreedyInProcessPlacedModelPackageError::StreamTickOverflow
+                })?)
+                .ok_or(VulkanResidentGreedyInProcessPlacedModelPackageError::StreamTickOverflow)?;
+            self.ensure_stream_tick_capacity(stream_tick)?;
+            let tick_run = self.run_token_id_stream_tick_in_process(
+                device,
+                input_token_id,
+                stream_tick,
+                max_scheduler_turns_per_tick,
+            )?;
+
+            let external_inputs_remaining = prompt_token_ids.len() - external_input_index;
+            let should_emit_public_output =
+                remaining_public_outputs > 0 && external_inputs_remaining == 0;
+            let mut public_output_token_id = None;
+            let mut private_feedback_token_id = None;
+            let mut private_feedback_closes_loop_after_processing = None;
+            let mut sampler_run = None;
+
+            if should_emit_public_output {
+                let run = self
+                    .sampler
+                    .run(device)
+                    .map_err(VulkanResidentGreedyInProcessPlacedModelPackageError::Sampler)?;
+                let sampled_token_id = run.token_id;
+                generated_token_ids.push(sampled_token_id);
+                public_output_token_id = Some(sampled_token_id);
+                remaining_public_outputs -= 1;
+
+                let close_after_feedback = if eos_token_id == Some(sampled_token_id) {
+                    remaining_public_outputs = 0;
+                    stop_reason = Some("eos".to_string());
+                    true
+                } else if remaining_public_outputs == 0 {
+                    stop_reason = Some("max_new_tokens".to_string());
+                    true
+                } else {
+                    false
+                };
+                private_feedback_token_id = Some(sampled_token_id);
+                private_feedback_closes_loop_after_processing = Some(close_after_feedback);
+                pending_feedback = Some(VulkanResidentPendingPrivateFeedback {
+                    token_id: sampled_token_id,
+                    feedback_depth: input_feedback_depth.checked_add(1).ok_or(
+                        VulkanResidentGreedyInProcessPlacedModelPackageError::FeedbackDepthOverflow,
+                    )?,
+                    closes_loop_after_processing: close_after_feedback,
+                });
+                sampler_run = Some(run);
+            }
+
+            tick_runs.push(VulkanResidentGreedyInProcessPlacedPromptEventTickRun {
+                stream_tick,
+                input_token_id,
+                input_route,
+                input_feedback_depth,
+                input_closes_loop_after_processing: input_closes_loop,
+                public_output_token_id,
+                private_feedback_token_id,
+                private_feedback_closes_loop_after_processing,
+                tick_run,
+                sampler_run,
+            });
+
+            if input_closes_loop {
+                pending_feedback = None;
+            }
+        }
+
+        let output_token_ids = prompt_token_ids
+            .iter()
+            .copied()
+            .chain(generated_token_ids.iter().copied())
+            .collect();
+
+        Ok(VulkanResidentGreedyInProcessPlacedPromptEventRun {
+            boundary_device_id: self.boundary_device_id.clone(),
+            prompt_token_ids: prompt_token_ids.to_vec(),
+            generated_token_ids,
+            output_token_ids,
+            stop_reason: stop_reason.unwrap_or_else(|| "max_new_tokens".to_string()),
+            tick_runs,
+        })
+    }
+
+    fn ensure_stream_tick_capacity(
+        &self,
+        stream_tick: u64,
+    ) -> Result<(), VulkanResidentGreedyInProcessPlacedModelPackageError> {
+        if stream_tick >= self.dynamic_state_capacity_activations as u64 {
+            return Err(
+                VulkanResidentGreedyInProcessPlacedModelPackageError::StreamStateCapacityExceeded {
+                    stream_tick,
+                    dynamic_state_capacity_activations: self.dynamic_state_capacity_activations,
+                },
+            );
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanResidentGreedyInProcessPlacedSingleTokenTickRun {
+    pub boundary_device_id: String,
+    pub token_id: u32,
+    pub stream_tick: u64,
+    pub input_run: VulkanResidentInputEmbeddingTransducerRun,
+    pub placed_run: VulkanMountedPlacedResidentInProcessStreamTickRun,
+    pub output_run: VulkanResidentOutputTransducerRun,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanResidentGreedyInProcessPlacedSingleTokenSampleRun {
+    pub tick_run: VulkanResidentGreedyInProcessPlacedSingleTokenTickRun,
+    pub sampler_run: VulkanResidentGreedySamplerRun,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanResidentGreedyInProcessPlacedFeedbackLoopRun {
+    pub boundary_device_id: String,
+    pub initial_token_id: u32,
+    pub sampled_token_ids: Vec<u32>,
+    pub tick_runs: Vec<VulkanResidentGreedyInProcessPlacedFeedbackTickRun>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanResidentGreedyInProcessPlacedFeedbackTickRun {
+    pub stream_tick: u64,
+    pub input_token_id: u32,
+    pub sampled_token_id: u32,
+    pub tick_run: VulkanResidentGreedyInProcessPlacedSingleTokenSampleRun,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanResidentGreedyInProcessPlacedPromptEventRun {
+    pub boundary_device_id: String,
+    pub prompt_token_ids: Vec<u32>,
+    pub generated_token_ids: Vec<u32>,
+    pub output_token_ids: Vec<u32>,
+    pub stop_reason: String,
+    pub tick_runs: Vec<VulkanResidentGreedyInProcessPlacedPromptEventTickRun>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanResidentGreedyInProcessPlacedPromptEventTickRun {
+    pub stream_tick: u64,
+    pub input_token_id: u32,
+    pub input_route: VulkanResidentGreedyPromptEventInputRoute,
+    pub input_feedback_depth: u32,
+    pub input_closes_loop_after_processing: bool,
+    pub public_output_token_id: Option<u32>,
+    pub private_feedback_token_id: Option<u32>,
+    pub private_feedback_closes_loop_after_processing: Option<bool>,
+    pub tick_run: VulkanResidentGreedyInProcessPlacedSingleTokenTickRun,
+    pub sampler_run: Option<VulkanResidentGreedySamplerRun>,
+}
+
+impl VulkanResidentGreedyInProcessPlacedModelPackageDevice {
+    pub fn mounted(&self) -> &VulkanMountedPlacedStreamCircuit {
+        &self.mounted
+    }
+
+    pub fn loaded_manifest(&self) -> &VulkanLoadedReusableKernelArtifactManifest {
+        self.package_slice.loaded_manifest()
+    }
+}
+
+#[derive(Debug)]
+pub enum VulkanResidentGreedyInProcessPlacedModelPackageError {
+    ZeroTickBudget,
+    EmptyPromptEvent,
+    MissingPrivateFeedback,
+    StreamTickOverflow,
+    StreamStateCapacityExceeded {
+        stream_tick: u64,
+        dynamic_state_capacity_activations: usize,
+    },
+    FeedbackDepthOverflow,
+    IncompleteTick(VulkanMountedPlacedResidentInProcessStreamTickRunStatus),
+    Package(VulkanResidentTokenModelPackageError),
+    BoundDispatchPlan(VulkanBoundDispatchPlanError),
+    Tick(VulkanMountedPlacedResidentInProcessStreamTickError),
+    InputTransducer(VulkanResidentInputEmbeddingTransducerRunnerError),
+    OutputTransducer(VulkanResidentOutputTransducerRunnerError),
+    Sampler(VulkanResidentGreedySamplerRunnerError),
+}
+
+impl Display for VulkanResidentGreedyInProcessPlacedModelPackageError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ZeroTickBudget => {
+                f.write_str("placed greedy feedback loop tick budget must not be zero")
+            }
+            Self::EmptyPromptEvent => f.write_str("placed greedy prompt event must not be empty"),
+            Self::MissingPrivateFeedback => {
+                f.write_str("placed greedy feedback loop is missing private feedback")
+            }
+            Self::StreamTickOverflow => f.write_str("placed greedy feedback loop tick overflowed"),
+            Self::StreamStateCapacityExceeded {
+                stream_tick,
+                dynamic_state_capacity_activations,
+            } => write!(
+                f,
+                "placed stream tick {stream_tick} exceeds dynamic-state capacity {dynamic_state_capacity_activations}"
+            ),
+            Self::FeedbackDepthOverflow => f.write_str("placed greedy feedback depth overflowed"),
+            Self::IncompleteTick(status) => write!(
+                f,
+                "placed stream tick did not complete before output sampling: {status:?}"
+            ),
+            Self::Package(error) => Display::fmt(error, f),
+            Self::BoundDispatchPlan(error) => Display::fmt(error, f),
+            Self::Tick(error) => Display::fmt(error, f),
+            Self::InputTransducer(error) => Display::fmt(error, f),
+            Self::OutputTransducer(error) => Display::fmt(error, f),
+            Self::Sampler(error) => Display::fmt(error, f),
+        }
+    }
+}
+
+impl Error for VulkanResidentGreedyInProcessPlacedModelPackageError {}
+
+impl From<VulkanResidentTokenModelPackageError>
+    for VulkanResidentGreedyInProcessPlacedModelPackageError
+{
+    fn from(error: VulkanResidentTokenModelPackageError) -> Self {
+        Self::Package(error)
+    }
+}
+
+impl From<VulkanBoundDispatchPlanError> for VulkanResidentGreedyInProcessPlacedModelPackageError {
+    fn from(error: VulkanBoundDispatchPlanError) -> Self {
+        Self::BoundDispatchPlan(error)
+    }
+}
+
+impl From<VulkanMountedPlacedResidentInProcessStreamTickError>
+    for VulkanResidentGreedyInProcessPlacedModelPackageError
+{
+    fn from(error: VulkanMountedPlacedResidentInProcessStreamTickError) -> Self {
+        Self::Tick(error)
+    }
+}
+
+impl From<VulkanResidentInputEmbeddingTransducerRunnerError>
+    for VulkanResidentGreedyInProcessPlacedModelPackageError
+{
+    fn from(error: VulkanResidentInputEmbeddingTransducerRunnerError) -> Self {
+        Self::InputTransducer(error)
+    }
+}
+
+impl From<VulkanResidentOutputTransducerRunnerError>
+    for VulkanResidentGreedyInProcessPlacedModelPackageError
+{
+    fn from(error: VulkanResidentOutputTransducerRunnerError) -> Self {
+        Self::OutputTransducer(error)
+    }
+}
+
+impl From<VulkanResidentGreedySamplerRunnerError>
+    for VulkanResidentGreedyInProcessPlacedModelPackageError
+{
+    fn from(error: VulkanResidentGreedySamplerRunnerError) -> Self {
+        Self::Sampler(error)
     }
 }
 
@@ -6866,11 +7740,7 @@ fn validate_pedal_executions_against_mounted_dispatches(
             if kernel.op != dispatch.op {
                 return Err(VulkanResidentTokenModelPackageError::new(format!(
                     "resident model package {:?} declares pedal {} node {} op {}, but mounted dispatch plan has op {}",
-                    manifest.package_id,
-                    pedal.pedal_id,
-                    kernel.node_id,
-                    kernel.op,
-                    dispatch.op
+                    manifest.package_id, pedal.pedal_id, kernel.node_id, kernel.op, dispatch.op
                 )));
             }
             if kernel.execution_index != dispatch.node_index {
@@ -10130,10 +11000,8 @@ impl VulkanMountedPlacedStreamTickPlan {
         mounted_bound_plan: &VulkanMountedPlacedBoundDispatchPlan,
     ) -> Self {
         let mut stages = Vec::new();
-        let mut incoming_endpoints =
-            BTreeMap::<(usize, usize), VulkanPlacedCableEndpointBufferBinding>::new();
-        let mut outgoing_endpoints =
-            BTreeMap::<(usize, usize), VulkanPlacedCableEndpointBufferBinding>::new();
+        let mut received_endpoints = BTreeSet::<(usize, usize)>::new();
+        let mut published_endpoints = BTreeSet::<(usize, usize)>::new();
 
         let mut local_cable_read_count = 0usize;
         let mut local_cable_write_count = 0usize;
@@ -10142,114 +11010,98 @@ impl VulkanMountedPlacedStreamTickPlan {
         let mut model_input_read_count = 0usize;
         let mut model_output_write_count = 0usize;
 
-        let dispatch_stages = mounted_bound_plan
-            .dispatches
-            .iter()
-            .map(|dispatch| {
-                let dispatch_stage =
-                    VulkanMountedPlacedStreamTickDispatch::from_bound_dispatch(dispatch);
-                local_cable_read_count += dispatch_stage
-                    .reads
-                    .iter()
-                    .filter(|io| {
-                        matches!(io, VulkanMountedPlacedStreamTickIo::LocalCableBuffer { .. })
-                    })
-                    .count();
-                local_cable_write_count += dispatch_stage
-                    .writes
-                    .iter()
-                    .filter(|io| {
-                        matches!(io, VulkanMountedPlacedStreamTickIo::LocalCableBuffer { .. })
-                    })
-                    .count();
-                incoming_cable_read_count += dispatch_stage
-                    .reads
-                    .iter()
-                    .filter(|io| {
-                        matches!(
-                            io,
-                            VulkanMountedPlacedStreamTickIo::IncomingCableBuffer { .. }
-                        )
-                    })
-                    .count();
-                outgoing_cable_write_count += dispatch_stage
-                    .writes
-                    .iter()
-                    .filter(|io| {
-                        matches!(
-                            io,
-                            VulkanMountedPlacedStreamTickIo::OutgoingCableBuffer { .. }
-                        )
-                    })
-                    .count();
-                model_input_read_count += dispatch_stage
-                    .reads
-                    .iter()
-                    .filter(|io| matches!(io, VulkanMountedPlacedStreamTickIo::ModelSignal { .. }))
-                    .count();
-                model_output_write_count += dispatch_stage
-                    .writes
-                    .iter()
-                    .filter(|io| matches!(io, VulkanMountedPlacedStreamTickIo::ModelSignal { .. }))
-                    .count();
+        for dispatch in &mounted_bound_plan.dispatches {
+            let dispatch_stage =
+                VulkanMountedPlacedStreamTickDispatch::from_bound_dispatch(dispatch);
+            local_cable_read_count += dispatch_stage
+                .reads
+                .iter()
+                .filter(|io| matches!(io, VulkanMountedPlacedStreamTickIo::LocalCableBuffer { .. }))
+                .count();
+            local_cable_write_count += dispatch_stage
+                .writes
+                .iter()
+                .filter(|io| matches!(io, VulkanMountedPlacedStreamTickIo::LocalCableBuffer { .. }))
+                .count();
+            incoming_cable_read_count += dispatch_stage
+                .reads
+                .iter()
+                .filter(|io| {
+                    matches!(
+                        io,
+                        VulkanMountedPlacedStreamTickIo::IncomingCableBuffer { .. }
+                    )
+                })
+                .count();
+            outgoing_cable_write_count += dispatch_stage
+                .writes
+                .iter()
+                .filter(|io| {
+                    matches!(
+                        io,
+                        VulkanMountedPlacedStreamTickIo::OutgoingCableBuffer { .. }
+                    )
+                })
+                .count();
+            model_input_read_count += dispatch_stage
+                .reads
+                .iter()
+                .filter(|io| matches!(io, VulkanMountedPlacedStreamTickIo::ModelSignal { .. }))
+                .count();
+            model_output_write_count += dispatch_stage
+                .writes
+                .iter()
+                .filter(|io| matches!(io, VulkanMountedPlacedStreamTickIo::ModelSignal { .. }))
+                .count();
 
-                for descriptor in &dispatch.descriptors {
-                    match &descriptor.target {
-                        VulkanMountedPlacedBoundDescriptorTarget::IncomingCableBuffer {
-                            endpoint,
-                        } => {
-                            incoming_endpoints
-                                .entry((endpoint.endpoint.cable_index, endpoint.buffer_index))
-                                .or_insert_with(|| endpoint.clone());
-                        }
-                        VulkanMountedPlacedBoundDescriptorTarget::OutgoingCableBuffer {
-                            endpoint,
-                        } => {
-                            outgoing_endpoints
-                                .entry((endpoint.endpoint.cable_index, endpoint.buffer_index))
-                                .or_insert_with(|| endpoint.clone());
-                        }
-                        _ => {}
+            for descriptor in &dispatch.descriptors {
+                if let VulkanMountedPlacedBoundDescriptorTarget::IncomingCableBuffer { endpoint } =
+                    &descriptor.target
+                {
+                    if received_endpoints
+                        .insert((endpoint.endpoint.cable_index, endpoint.buffer_index))
+                    {
+                        stages.push(VulkanMountedPlacedStreamTickStage::ReceiveCable {
+                            stage_index: stages.len(),
+                            cable_index: endpoint.endpoint.cable_index,
+                            endpoint_id: endpoint.endpoint.endpoint_id.clone(),
+                            buffer_index: endpoint.buffer_index,
+                            byte_capacity: endpoint.byte_capacity,
+                            remote_device_id: endpoint.endpoint.remote_device_id.clone(),
+                            remote_pedal_id: endpoint.endpoint.remote_pedal_id.clone(),
+                        });
                     }
                 }
+            }
 
-                dispatch_stage
-            })
-            .collect::<Vec<_>>();
-
-        for endpoint in incoming_endpoints.values() {
-            stages.push(VulkanMountedPlacedStreamTickStage::ReceiveCable {
-                stage_index: stages.len(),
-                cable_index: endpoint.endpoint.cable_index,
-                endpoint_id: endpoint.endpoint.endpoint_id.clone(),
-                buffer_index: endpoint.buffer_index,
-                byte_capacity: endpoint.byte_capacity,
-                remote_device_id: endpoint.endpoint.remote_device_id.clone(),
-                remote_pedal_id: endpoint.endpoint.remote_pedal_id.clone(),
-            });
-        }
-
-        for dispatch in dispatch_stages {
             stages.push(VulkanMountedPlacedStreamTickStage::Dispatch {
                 stage_index: stages.len(),
-                dispatch,
+                dispatch: dispatch_stage,
             });
+
+            for descriptor in &dispatch.descriptors {
+                if let VulkanMountedPlacedBoundDescriptorTarget::OutgoingCableBuffer { endpoint } =
+                    &descriptor.target
+                {
+                    if published_endpoints
+                        .insert((endpoint.endpoint.cable_index, endpoint.buffer_index))
+                    {
+                        stages.push(VulkanMountedPlacedStreamTickStage::PublishCable {
+                            stage_index: stages.len(),
+                            cable_index: endpoint.endpoint.cable_index,
+                            endpoint_id: endpoint.endpoint.endpoint_id.clone(),
+                            buffer_index: endpoint.buffer_index,
+                            byte_capacity: endpoint.byte_capacity,
+                            remote_device_id: endpoint.endpoint.remote_device_id.clone(),
+                            remote_pedal_id: endpoint.endpoint.remote_pedal_id.clone(),
+                        });
+                    }
+                }
+            }
         }
 
-        for endpoint in outgoing_endpoints.values() {
-            stages.push(VulkanMountedPlacedStreamTickStage::PublishCable {
-                stage_index: stages.len(),
-                cable_index: endpoint.endpoint.cable_index,
-                endpoint_id: endpoint.endpoint.endpoint_id.clone(),
-                buffer_index: endpoint.buffer_index,
-                byte_capacity: endpoint.byte_capacity,
-                remote_device_id: endpoint.endpoint.remote_device_id.clone(),
-                remote_pedal_id: endpoint.endpoint.remote_pedal_id.clone(),
-            });
-        }
-
-        let receive_stage_count = incoming_endpoints.len();
-        let publish_stage_count = outgoing_endpoints.len();
+        let receive_stage_count = received_endpoints.len();
+        let publish_stage_count = published_endpoints.len();
         let dispatch_stage_count = mounted_bound_plan.dispatches.len();
         let stage_count = stages.len();
 
@@ -10345,10 +11197,12 @@ impl VulkanMountedPlacedStreamTickPlan {
         stream_tick: u64,
     ) -> Result<VulkanMountedPlacedStreamTickRun, VulkanMountedPlacedStreamTickTransportError> {
         if self.device_id != mounted.device_id() {
-            return Err(VulkanMountedPlacedStreamTickTransportError::DeviceMismatch {
-                plan_device_id: self.device_id.clone(),
-                mounted_device_id: mounted.device_id().to_string(),
-            });
+            return Err(
+                VulkanMountedPlacedStreamTickTransportError::DeviceMismatch {
+                    plan_device_id: self.device_id.clone(),
+                    mounted_device_id: mounted.device_id().to_string(),
+                },
+            );
         }
 
         let mut stages = Vec::with_capacity(self.stages.len());
@@ -10433,6 +11287,441 @@ impl VulkanMountedPlacedStreamTickPlan {
             status,
             can_execute: self.can_execute,
         })
+    }
+
+    pub fn advance_with_resident_pedalboard_and_in_process_transport(
+        &self,
+        device: &VulkanComputeDevice,
+        mounted: &VulkanMountedPlacedStreamCircuit,
+        mounted_bound_plan: &VulkanMountedPlacedBoundDispatchPlan,
+        loaded_manifest: &VulkanLoadedReusableKernelArtifactManifest,
+        transport: &mut VulkanInProcessPlacedCableTransport,
+        stream_tick: u64,
+    ) -> Result<VulkanMountedPlacedResidentStreamTickRun, VulkanMountedPlacedResidentStreamTickError>
+    {
+        let mut cursor = self.resident_stream_tick_cursor(stream_tick);
+        let advance = cursor.advance_with_resident_pedals_and_in_process_transport(
+            device,
+            mounted,
+            mounted_bound_plan,
+            loaded_manifest,
+            transport,
+        )?;
+        Ok(advance.run)
+    }
+
+    pub fn resident_stream_tick_cursor(
+        &self,
+        stream_tick: u64,
+    ) -> VulkanMountedPlacedResidentStreamTickCursor {
+        VulkanMountedPlacedResidentStreamTickCursor::new(self.clone(), stream_tick)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanMountedPlacedResidentStreamTickCursor {
+    pub tick_plan: VulkanMountedPlacedStreamTickPlan,
+    pub stream_tick: u64,
+    pub next_stage_index: usize,
+    pub completed_stage_count: usize,
+    pub pedal_runs: Vec<VulkanMountedPlacedResidentPedalRun>,
+    pedals_run: BTreeSet<String>,
+    last_blocked: Option<(usize, VulkanMountedPlacedStreamTickBlockReason)>,
+}
+
+impl VulkanMountedPlacedResidentStreamTickCursor {
+    pub fn new(tick_plan: VulkanMountedPlacedStreamTickPlan, stream_tick: u64) -> Self {
+        Self {
+            tick_plan,
+            stream_tick,
+            next_stage_index: 0,
+            completed_stage_count: 0,
+            pedal_runs: Vec::new(),
+            pedals_run: BTreeSet::new(),
+            last_blocked: None,
+        }
+    }
+
+    pub fn is_completed(&self) -> bool {
+        self.next_stage_index == self.tick_plan.stages.len()
+    }
+
+    pub fn advance_with_resident_pedals_and_in_process_transport(
+        &mut self,
+        device: &VulkanComputeDevice,
+        mounted: &VulkanMountedPlacedStreamCircuit,
+        mounted_bound_plan: &VulkanMountedPlacedBoundDispatchPlan,
+        loaded_manifest: &VulkanLoadedReusableKernelArtifactManifest,
+        transport: &mut VulkanInProcessPlacedCableTransport,
+    ) -> Result<
+        VulkanMountedPlacedResidentStreamTickCursorAdvance,
+        VulkanMountedPlacedResidentStreamTickError,
+    > {
+        if self.tick_plan.device_id != mounted.device_id() {
+            return Err(VulkanMountedPlacedResidentStreamTickError::DeviceMismatch {
+                plan_device_id: self.tick_plan.device_id.clone(),
+                mounted_device_id: mounted.device_id().to_string(),
+            });
+        }
+        if self.tick_plan.device_id != mounted_bound_plan.device_id {
+            return Err(
+                VulkanMountedPlacedResidentStreamTickError::BoundPlanDeviceMismatch {
+                    plan_device_id: self.tick_plan.device_id.clone(),
+                    bound_plan_device_id: mounted_bound_plan.device_id.clone(),
+                },
+            );
+        }
+
+        let dynamic_state_capacity_activations =
+            u32::try_from(mounted.buffers.dynamic_state_capacity_activations).map_err(|_| {
+                VulkanMountedPlacedResidentStreamTickError::DynamicStateCapacityOverflow {
+                    capacity: mounted.buffers.dynamic_state_capacity_activations,
+                }
+            })?;
+        let control = VulkanMountedPlacedStreamControl {
+            stream_tick: self.stream_tick,
+            control_flags: 0,
+            dynamic_state_capacity_activations,
+        };
+
+        self.last_blocked = None;
+        let completed_before = self.completed_stage_count;
+
+        while self.next_stage_index < self.tick_plan.stages.len() {
+            let stage = self.tick_plan.stages[self.next_stage_index].clone();
+            match &stage {
+                VulkanMountedPlacedStreamTickStage::ReceiveCable { cable_index, .. } => {
+                    match transport.receive_incoming_cable(mounted, *cable_index) {
+                        Ok(_) => self.complete_current_stage(),
+                        Err(VulkanPlacedCableTransportError::MissingPacket { .. }) => {
+                            let reason =
+                                VulkanMountedPlacedStreamTickBlockReason::CableReceiveTransportUnavailable;
+                            self.last_blocked = Some((stage.stage_index(), reason));
+                            return Ok(self.advance_report(completed_before));
+                        }
+                        Err(error) => {
+                            return Err(VulkanMountedPlacedResidentStreamTickError::Transport(
+                                error,
+                            ));
+                        }
+                    }
+                }
+                VulkanMountedPlacedStreamTickStage::Dispatch { dispatch, .. } => {
+                    if self.pedals_run.insert(dispatch.pedal_id.clone()) {
+                        let runner = mounted
+                            .create_resident_pedal_runner(
+                                device,
+                                mounted_bound_plan,
+                                &dispatch.pedal_id,
+                                loaded_manifest,
+                            )
+                            .map_err(VulkanMountedPlacedResidentStreamTickError::Dispatch)?;
+                        let pedal_run = runner
+                            .run_with_stream_control(device, control)
+                            .map_err(VulkanMountedPlacedResidentStreamTickError::Dispatch)?;
+                        self.pedal_runs.push(pedal_run);
+                    }
+                    self.complete_current_stage();
+                }
+                VulkanMountedPlacedStreamTickStage::PublishCable { cable_index, .. } => {
+                    transport
+                        .publish_outgoing_cable(mounted, *cable_index)
+                        .map_err(VulkanMountedPlacedResidentStreamTickError::Transport)?;
+                    self.complete_current_stage();
+                }
+            }
+        }
+
+        Ok(self.advance_report(completed_before))
+    }
+
+    fn complete_current_stage(&mut self) {
+        self.completed_stage_count += 1;
+        self.next_stage_index += 1;
+    }
+
+    fn advance_report(
+        &self,
+        completed_before: usize,
+    ) -> VulkanMountedPlacedResidentStreamTickCursorAdvance {
+        VulkanMountedPlacedResidentStreamTickCursorAdvance {
+            completed_stage_delta: self.completed_stage_count - completed_before,
+            completed: self.is_completed(),
+            run: self.snapshot(),
+        }
+    }
+
+    pub fn snapshot(&self) -> VulkanMountedPlacedResidentStreamTickRun {
+        let mut stages = Vec::with_capacity(self.tick_plan.stages.len());
+        for (index, stage) in self.tick_plan.stages.iter().enumerate() {
+            let status = if index < self.next_stage_index {
+                VulkanMountedPlacedStreamTickStageStatus::Completed
+            } else if self
+                .last_blocked
+                .as_ref()
+                .is_some_and(|(stage_index, _)| *stage_index == index)
+            {
+                VulkanMountedPlacedStreamTickStageStatus::Blocked {
+                    reason: self.last_blocked.as_ref().unwrap().1.clone(),
+                }
+            } else {
+                VulkanMountedPlacedStreamTickStageStatus::Pending
+            };
+            stages.push(VulkanMountedPlacedStreamTickStageRun {
+                stage_index: stage.stage_index(),
+                stage: stage.clone(),
+                status,
+            });
+        }
+
+        let pending_stage_count = stages
+            .iter()
+            .filter(|stage| {
+                matches!(
+                    stage.status,
+                    VulkanMountedPlacedStreamTickStageStatus::Pending
+                )
+            })
+            .count();
+        let status = self
+            .last_blocked
+            .clone()
+            .map(
+                |(stage_index, reason)| VulkanMountedPlacedStreamTickRunStatus::Blocked {
+                    stage_index,
+                    reason,
+                },
+            )
+            .unwrap_or_else(|| {
+                if self.is_completed() {
+                    VulkanMountedPlacedStreamTickRunStatus::Completed
+                } else {
+                    VulkanMountedPlacedStreamTickRunStatus::Blocked {
+                        stage_index: self.next_stage_index,
+                        reason: VulkanMountedPlacedStreamTickBlockReason::KernelDispatchUnavailable,
+                    }
+                }
+            });
+        let attempted_stage_count =
+            self.completed_stage_count + usize::from(self.last_blocked.is_some());
+
+        VulkanMountedPlacedResidentStreamTickRun {
+            tick_run: VulkanMountedPlacedStreamTickRun {
+                backend_id: self.tick_plan.backend_id.clone(),
+                device_id: self.tick_plan.device_id.clone(),
+                stream_tick: self.stream_tick,
+                stages,
+                planned_stage_count: self.tick_plan.stage_count,
+                attempted_stage_count,
+                completed_stage_count: self.completed_stage_count,
+                pending_stage_count,
+                status,
+                can_execute: true,
+            },
+            pedalboard_run: if self.pedal_runs.is_empty() {
+                None
+            } else {
+                Some(VulkanMountedPlacedResidentPedalboardRun {
+                    device_id: self.tick_plan.device_id.clone(),
+                    pedal_runs: self.pedal_runs.clone(),
+                })
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanMountedPlacedResidentStreamTickCursorAdvance {
+    pub completed_stage_delta: usize,
+    pub completed: bool,
+    pub run: VulkanMountedPlacedResidentStreamTickRun,
+}
+
+pub struct VulkanMountedPlacedResidentInProcessStreamTickSlice<'a> {
+    pub mounted: &'a VulkanMountedPlacedStreamCircuit,
+    pub mounted_bound_plan: &'a VulkanMountedPlacedBoundDispatchPlan,
+    pub loaded_manifest: &'a VulkanLoadedReusableKernelArtifactManifest,
+    pub cursor: VulkanMountedPlacedResidentStreamTickCursor,
+}
+
+impl<'a> VulkanMountedPlacedResidentInProcessStreamTickSlice<'a> {
+    pub fn new(
+        mounted: &'a VulkanMountedPlacedStreamCircuit,
+        mounted_bound_plan: &'a VulkanMountedPlacedBoundDispatchPlan,
+        loaded_manifest: &'a VulkanLoadedReusableKernelArtifactManifest,
+        tick_plan: VulkanMountedPlacedStreamTickPlan,
+        stream_tick: u64,
+    ) -> Self {
+        Self {
+            mounted,
+            mounted_bound_plan,
+            loaded_manifest,
+            cursor: tick_plan.resident_stream_tick_cursor(stream_tick),
+        }
+    }
+
+    pub fn device_id(&self) -> &str {
+        self.mounted.device_id()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanMountedPlacedResidentInProcessStreamTickRun {
+    pub status: VulkanMountedPlacedResidentInProcessStreamTickRunStatus,
+    pub scheduler_turn_count: usize,
+    pub completed_stage_delta: usize,
+    pub completed_slice_count: usize,
+    pub pending_slice_count: usize,
+    pub device_runs: Vec<VulkanMountedPlacedResidentStreamTickRun>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VulkanMountedPlacedResidentInProcessStreamTickRunStatus {
+    Completed,
+    Blocked {
+        pending_device_ids: Vec<String>,
+    },
+    SchedulerBudgetExhausted {
+        max_scheduler_turns: usize,
+        pending_device_ids: Vec<String>,
+    },
+}
+
+#[derive(Debug)]
+pub enum VulkanMountedPlacedResidentInProcessStreamTickError {
+    StreamTick(VulkanMountedPlacedResidentStreamTickError),
+}
+
+impl Display for VulkanMountedPlacedResidentInProcessStreamTickError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::StreamTick(error) => Display::fmt(error, f),
+        }
+    }
+}
+
+impl Error for VulkanMountedPlacedResidentInProcessStreamTickError {}
+
+impl From<VulkanMountedPlacedResidentStreamTickError>
+    for VulkanMountedPlacedResidentInProcessStreamTickError
+{
+    fn from(error: VulkanMountedPlacedResidentStreamTickError) -> Self {
+        Self::StreamTick(error)
+    }
+}
+
+pub fn run_mounted_placed_resident_stream_tick_slices_in_process(
+    device: &VulkanComputeDevice,
+    slices: &mut [VulkanMountedPlacedResidentInProcessStreamTickSlice<'_>],
+    transport: &mut VulkanInProcessPlacedCableTransport,
+    max_scheduler_turns: usize,
+) -> Result<
+    VulkanMountedPlacedResidentInProcessStreamTickRun,
+    VulkanMountedPlacedResidentInProcessStreamTickError,
+> {
+    let mut scheduler_turn_count = 0usize;
+    let mut completed_stage_delta = 0usize;
+
+    while scheduler_turn_count < max_scheduler_turns {
+        scheduler_turn_count += 1;
+        let completed_before_turn = completed_stage_delta;
+
+        for slice in slices.iter_mut() {
+            if slice.cursor.is_completed() {
+                continue;
+            }
+            let advance = slice
+                .cursor
+                .advance_with_resident_pedals_and_in_process_transport(
+                    device,
+                    slice.mounted,
+                    slice.mounted_bound_plan,
+                    slice.loaded_manifest,
+                    transport,
+                )?;
+            completed_stage_delta += advance.completed_stage_delta;
+        }
+
+        if slices.iter().all(|slice| slice.cursor.is_completed()) {
+            return Ok(in_process_stream_tick_run_snapshot(
+                slices,
+                VulkanMountedPlacedResidentInProcessStreamTickRunStatus::Completed,
+                scheduler_turn_count,
+                completed_stage_delta,
+            ));
+        }
+
+        if completed_stage_delta == completed_before_turn {
+            let pending_device_ids = pending_in_process_stream_tick_device_ids(slices);
+            return Ok(in_process_stream_tick_run_snapshot(
+                slices,
+                VulkanMountedPlacedResidentInProcessStreamTickRunStatus::Blocked {
+                    pending_device_ids,
+                },
+                scheduler_turn_count,
+                completed_stage_delta,
+            ));
+        }
+    }
+
+    let status = if slices.iter().all(|slice| slice.cursor.is_completed()) {
+        VulkanMountedPlacedResidentInProcessStreamTickRunStatus::Completed
+    } else {
+        VulkanMountedPlacedResidentInProcessStreamTickRunStatus::SchedulerBudgetExhausted {
+            max_scheduler_turns,
+            pending_device_ids: pending_in_process_stream_tick_device_ids(slices),
+        }
+    };
+    Ok(in_process_stream_tick_run_snapshot(
+        slices,
+        status,
+        scheduler_turn_count,
+        completed_stage_delta,
+    ))
+}
+
+fn pending_in_process_stream_tick_device_ids(
+    slices: &[VulkanMountedPlacedResidentInProcessStreamTickSlice<'_>],
+) -> Vec<String> {
+    slices
+        .iter()
+        .filter(|slice| !slice.cursor.is_completed())
+        .map(|slice| slice.device_id().to_string())
+        .collect()
+}
+
+fn in_process_stream_tick_run_snapshot(
+    slices: &[VulkanMountedPlacedResidentInProcessStreamTickSlice<'_>],
+    status: VulkanMountedPlacedResidentInProcessStreamTickRunStatus,
+    scheduler_turn_count: usize,
+    completed_stage_delta: usize,
+) -> VulkanMountedPlacedResidentInProcessStreamTickRun {
+    let completed_slice_count = slices
+        .iter()
+        .filter(|slice| slice.cursor.is_completed())
+        .count();
+    VulkanMountedPlacedResidentInProcessStreamTickRun {
+        status,
+        scheduler_turn_count,
+        completed_stage_delta,
+        completed_slice_count,
+        pending_slice_count: slices.len() - completed_slice_count,
+        device_runs: slices.iter().map(|slice| slice.cursor.snapshot()).collect(),
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanMountedPlacedResidentStreamTickRun {
+    pub tick_run: VulkanMountedPlacedStreamTickRun,
+    pub pedalboard_run: Option<VulkanMountedPlacedResidentPedalboardRun>,
+}
+
+impl VulkanMountedPlacedResidentStreamTickRun {
+    pub fn pedalboard_dispatch_count(&self) -> usize {
+        self.pedalboard_run
+            .as_ref()
+            .map(VulkanMountedPlacedResidentPedalboardRun::dispatch_count)
+            .unwrap_or(0)
     }
 }
 
@@ -10665,6 +11954,52 @@ impl Display for VulkanMountedPlacedStreamTickTransportError {
 }
 
 impl Error for VulkanMountedPlacedStreamTickTransportError {}
+
+#[derive(Debug)]
+pub enum VulkanMountedPlacedResidentStreamTickError {
+    DeviceMismatch {
+        plan_device_id: String,
+        mounted_device_id: String,
+    },
+    BoundPlanDeviceMismatch {
+        plan_device_id: String,
+        bound_plan_device_id: String,
+    },
+    DynamicStateCapacityOverflow {
+        capacity: usize,
+    },
+    Transport(VulkanPlacedCableTransportError),
+    Dispatch(VulkanMountedPlacedResidentKernelDispatchError),
+}
+
+impl Display for VulkanMountedPlacedResidentStreamTickError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DeviceMismatch {
+                plan_device_id,
+                mounted_device_id,
+            } => write!(
+                f,
+                "resident stream tick plan for device {plan_device_id:?} cannot advance mounted device {mounted_device_id:?}"
+            ),
+            Self::BoundPlanDeviceMismatch {
+                plan_device_id,
+                bound_plan_device_id,
+            } => write!(
+                f,
+                "resident stream tick plan for device {plan_device_id:?} cannot use mounted bound plan for device {bound_plan_device_id:?}"
+            ),
+            Self::DynamicStateCapacityOverflow { capacity } => write!(
+                f,
+                "resident stream tick dynamic-state capacity {capacity} cannot fit in u32 push constants"
+            ),
+            Self::Transport(error) => Display::fmt(error, f),
+            Self::Dispatch(error) => Display::fmt(error, f),
+        }
+    }
+}
+
+impl Error for VulkanMountedPlacedResidentStreamTickError {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum VulkanMountedPlacedResidentKernelDispatchError {
@@ -12108,11 +13443,14 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::*;
-    use crate::stream_circuit::{ResolvedLoweredPedalboard, StreamCircuitPlacementSpec};
+    use crate::stream_circuit::{
+        ResolvedLoweredPedalboard, StreamCircuitPlacementSpec, StreamCircuitRuntimePatch,
+    };
     use crate::stream_plan::{StreamCircuitExecutionPlan, StreamCircuitResourcePlan};
 
     const FIXTURE_MODEL_TOKEN_EMBEDDING_TRANSDUCER_ID: &str = "input_transducer.token_embedding";
-    const FIXTURE_MODEL_OUTPUT_EMBEDDING_NORM_TRANSDUCER_ID: &str = "output_transducer.embedding_norm";
+    const FIXTURE_MODEL_OUTPUT_EMBEDDING_NORM_TRANSDUCER_ID: &str =
+        "output_transducer.embedding_norm";
     const FIXTURE_MODEL_TIED_OUTPUT_PROJECTION_TRANSDUCER_ID: &str =
         "output_transducer.tied_output_projection";
     const FIXTURE_MODEL_GREEDY_SAMPLER_PEDAL_ID: &str = "greedy_sampler";
@@ -12168,11 +13506,116 @@ mod tests {
     }
 
     fn fixture_model_package_manifest() -> VulkanResidentGreedyModelPackageManifest {
-        VulkanResidentGreedyModelPackageManifest::from_json_file(fixture_model_package_manifest_path())
-            .unwrap()
+        VulkanResidentGreedyModelPackageManifest::from_json_file(
+            fixture_model_package_manifest_path(),
+        )
+        .unwrap()
     }
 
-    fn fixture_model_input_embedding_transducer_spec() -> VulkanResidentInputEmbeddingTransducerSpec {
+    #[test]
+    fn runtime_placement_overrides_package_manifest_in_memory() {
+        let manifest = fixture_model_package_manifest();
+        assert_eq!(manifest.placement.default_device_id, "gpu0");
+        assert!(manifest.placement.pedal_devices.is_empty());
+
+        let mut pedal_devices = BTreeMap::new();
+        pedal_devices.insert("layer_02".to_string(), "gpu1".to_string());
+        let split = manifest
+            .clone()
+            .with_runtime_placement(None, &pedal_devices);
+
+        assert!(manifest.placement.pedal_devices.is_empty());
+        assert_eq!(split.device_id, "gpu0");
+        assert_eq!(split.placement.device_for_pedal("layer_00"), "gpu0");
+        assert_eq!(split.placement.device_for_pedal("layer_02"), "gpu1");
+        assert_eq!(split.placement_device_ids(), vec!["gpu0", "gpu1"]);
+
+        let moved = manifest.with_runtime_placement(Some("gpu1"), &BTreeMap::new());
+        assert_eq!(moved.device_id, "gpu1");
+        assert_eq!(moved.placement.default_device_id, "gpu1");
+        assert_eq!(moved.placement_device_ids(), vec!["gpu1"]);
+    }
+
+    #[test]
+    fn runtime_patch_duplicates_package_pedals_in_memory() {
+        let manifest = fixture_model_package_manifest();
+        let source_graph = manifest
+            .circuit_graph
+            .to_resolved_lowered_pedalboard(PathBuf::from("."))
+            .unwrap();
+        let patch = StreamCircuitRuntimePatch::from_source_series(&source_graph, "gpu0")
+            .unwrap()
+            .duplicate_after_instance("layer_05", "layer_05_repeat")
+            .unwrap()
+            .with_instance_device("layer_05_repeat", "gpu1")
+            .unwrap();
+
+        let patched = manifest.clone().with_runtime_patch(&patch).unwrap();
+
+        assert_eq!(manifest.circuit_graph.pedals.len(), 14);
+        assert_eq!(manifest.pedal_executions.len(), 14);
+        assert!(
+            manifest
+                .circuit_graph
+                .pedals
+                .iter()
+                .all(|pedal| pedal.pedal_id != "layer_05_repeat")
+        );
+
+        assert_eq!(patched.circuit_graph.pedals.len(), 15);
+        assert_eq!(patched.pedal_executions.len(), 15);
+        assert_eq!(
+            patched.placement.device_for_pedal("layer_05_repeat"),
+            "gpu1"
+        );
+        let repeated_pedal = patched
+            .circuit_graph
+            .pedals
+            .iter()
+            .find(|pedal| pedal.pedal_id == "layer_05_repeat")
+            .unwrap();
+        let source_pedal = manifest
+            .circuit_graph
+            .pedals
+            .iter()
+            .find(|pedal| pedal.pedal_id == "layer_05")
+            .unwrap();
+        assert_eq!(repeated_pedal.operator_type, source_pedal.operator_type);
+        assert_eq!(repeated_pedal.circuit.id, source_pedal.circuit.id);
+        assert_eq!(repeated_pedal.circuit.source.pedal_id, "layer_05_repeat");
+        assert_eq!(
+            repeated_pedal.params.refs.keys().collect::<Vec<_>>(),
+            source_pedal.params.refs.keys().collect::<Vec<_>>()
+        );
+
+        let repeated_execution = patched
+            .pedal_executions
+            .iter()
+            .find(|execution| execution.pedal_id == "layer_05_repeat")
+            .unwrap();
+        let source_execution = manifest
+            .pedal_executions
+            .iter()
+            .find(|execution| execution.pedal_id == "layer_05")
+            .unwrap();
+        assert_eq!(repeated_execution.kernels, source_execution.kernels);
+        let source_override_count = manifest
+            .capacity_profiles
+            .iter()
+            .flat_map(|profile| &profile.pedal_execution_shader_overrides)
+            .filter(|shader| shader.pedal_id == "layer_05")
+            .count();
+        let repeated_override_count = patched
+            .capacity_profiles
+            .iter()
+            .flat_map(|profile| &profile.pedal_execution_shader_overrides)
+            .filter(|shader| shader.pedal_id == "layer_05_repeat")
+            .count();
+        assert_eq!(repeated_override_count, source_override_count);
+    }
+
+    fn fixture_model_input_embedding_transducer_spec() -> VulkanResidentInputEmbeddingTransducerSpec
+    {
         fixture_model_package_manifest().input_transducer.spec
     }
 
@@ -12197,11 +13640,15 @@ mod tests {
 
     #[cfg(feature = "tokenizers")]
     fn fixture_model_model_dir_path() -> Option<PathBuf> {
-        std::env::var("LLMOOP_TEST_MODEL_DIR").ok().map(PathBuf::from)
+        std::env::var("LLMOOP_TEST_MODEL_DIR")
+            .ok()
+            .map(PathBuf::from)
     }
 
     #[cfg(feature = "tokenizers")]
-    fn fixture_model_tokenizer_codec_or_skip(test_name: &str) -> Option<VulkanResidentHfTokenizerTextCodec> {
+    fn fixture_model_tokenizer_codec_or_skip(
+        test_name: &str,
+    ) -> Option<VulkanResidentHfTokenizerTextCodec> {
         let Some(model_dir) = fixture_model_model_dir_path() else {
             eprintln!("skipping {test_name}: set LLMOOP_TEST_MODEL_DIR for tokenizer tests");
             return None;
@@ -12305,12 +13752,11 @@ mod tests {
         validate_pedal_executions_against_mounted_dispatches(&manifest, &mounted_bound).unwrap();
 
         manifest.pedal_executions[0].kernels.swap(0, 1);
-        let error =
-            validate_pedal_executions_against_mounted_dispatches(&manifest, &mounted_bound)
-                .unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("declares pedal layer_00 kernel conv_in_projection with execution_index 1, expected 0"));
+        let error = validate_pedal_executions_against_mounted_dispatches(&manifest, &mounted_bound)
+            .unwrap_err();
+        assert!(error.to_string().contains(
+            "declares pedal layer_00 kernel conv_in_projection with execution_index 1, expected 0"
+        ));
     }
 
     #[test]
@@ -12334,9 +13780,9 @@ mod tests {
             manifest.activation_element_bytes,
         )
         .unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("single-device resident package for \"gpu0\" cannot host remote pedals: layer_00@gpu1"));
+        assert!(error.to_string().contains(
+            "single-device resident package for \"gpu0\" cannot host remote pedals: layer_00@gpu1"
+        ));
     }
 
     #[test]
@@ -12415,7 +13861,10 @@ mod tests {
     }
 
     fn fixture_model_embedding_row_bytes(tensor_index: &TensorIndex, token_id: u32) -> Vec<u8> {
-        let metadata = tensor_index.tensors.get(FIXTURE_MODEL_EMBED_TOKENS_TENSOR).unwrap();
+        let metadata = tensor_index
+            .tensors
+            .get(FIXTURE_MODEL_EMBED_TOKENS_TENSOR)
+            .unwrap();
         let offsets = metadata.data_offsets.as_ref().unwrap();
         let data_start = offsets[0];
         let row_offset = usize::try_from(token_id).unwrap() * FIXTURE_MODEL_FRAME_BYTES;
@@ -12553,7 +14002,10 @@ mod tests {
             .unwrap();
     }
 
-    fn zero_fixture_model_temporal_memory(mounted: &VulkanMountedPlacedStreamCircuit, pedal_id: &str) {
+    fn zero_fixture_model_temporal_memory(
+        mounted: &VulkanMountedPlacedStreamCircuit,
+        pedal_id: &str,
+    ) {
         let temporal_memory = mounted
             .buffers
             .state_buffer(pedal_id, "temporal_memory")
@@ -12609,7 +14061,10 @@ mod tests {
         }
     }
 
-    fn zero_fixture_model_layer_state(mounted: &VulkanMountedPlacedStreamCircuit, layer_index: usize) {
+    fn zero_fixture_model_layer_state(
+        mounted: &VulkanMountedPlacedStreamCircuit,
+        layer_index: usize,
+    ) {
         let pedal_id = fixture_model_layer_id(layer_index);
         match fixture_model_layer_kind(layer_index) {
             FixtureModelLayerKind::ShortConv => {
@@ -13368,7 +14823,10 @@ mod tests {
             .find(|parameter| parameter.tensor == FIXTURE_MODEL_EMBED_TOKENS_TENSOR)
             .unwrap();
         assert_eq!(embed_tokens.use_count, 2);
-        assert_eq!(embed_tokens.byte_capacity, Some(FIXTURE_MODEL_EMBED_TOKENS_BYTES));
+        assert_eq!(
+            embed_tokens.byte_capacity,
+            Some(FIXTURE_MODEL_EMBED_TOKENS_BYTES)
+        );
         let transducer_parameter_buffers =
             transducer_parameter_plan.allocate_buffers(&device).unwrap();
         assert_eq!(
@@ -13383,7 +14841,10 @@ mod tests {
         let loaded_embedding = transducer_parameter_buffers
             .load_parameter_from_tensor_index(&tensor_index, FIXTURE_MODEL_EMBED_TOKENS_TENSOR)
             .unwrap();
-        assert_eq!(loaded_embedding.byte_count, FIXTURE_MODEL_EMBED_TOKENS_BYTES);
+        assert_eq!(
+            loaded_embedding.byte_count,
+            FIXTURE_MODEL_EMBED_TOKENS_BYTES
+        );
         let token_id = 1u32;
 
         let input_transducer_runner =
@@ -13419,7 +14880,10 @@ mod tests {
             FIXTURE_MODEL_TOKEN_EMBEDDING_TRANSDUCER_ID
         );
         assert_eq!(transducer_run.token_id, token_id);
-        assert_eq!(transducer_run.output_signal_id, FIXTURE_MODEL_INPUT_FRAME_SIGNAL);
+        assert_eq!(
+            transducer_run.output_signal_id,
+            FIXTURE_MODEL_INPUT_FRAME_SIGNAL
+        );
         assert_eq!(transducer_run.dispatch_count, 1);
         assert_eq!(transducer_run.descriptor_count, 2);
         assert_eq!(transducer_run.workgroup_count_x, 2);
@@ -13429,7 +14893,10 @@ mod tests {
             .input_buffer(FIXTURE_MODEL_INPUT_FRAME_SIGNAL)
             .unwrap();
         assert_eq!(
-            input_frame.buffer.read_bytes(FIXTURE_MODEL_FRAME_BYTES).unwrap(),
+            input_frame
+                .buffer
+                .read_bytes(FIXTURE_MODEL_FRAME_BYTES)
+                .unwrap(),
             fixture_model_embedding_row_bytes(&tensor_index, token_id)
         );
 
@@ -13573,7 +15040,9 @@ mod tests {
             return;
         };
 
-        let logits_buffer = device.create_resident_buffer(FIXTURE_MODEL_LOGITS_BYTES).unwrap();
+        let logits_buffer = device
+            .create_resident_buffer(FIXTURE_MODEL_LOGITS_BYTES)
+            .unwrap();
         let mut logits = vec![0u8; FIXTURE_MODEL_LOGITS_BYTES];
         let token_7 = 7usize;
         let token_1024 = 1_024usize;
@@ -13591,7 +15060,10 @@ mod tests {
         .unwrap();
         assert_eq!(runner.sampler_id, FIXTURE_MODEL_GREEDY_SAMPLER_PEDAL_ID);
         assert_eq!(runner.logits_byte_capacity, FIXTURE_MODEL_LOGITS_BYTES);
-        assert_eq!(runner.output_byte_capacity, FIXTURE_MODEL_SAMPLER_OUTPUT_BYTES);
+        assert_eq!(
+            runner.output_byte_capacity,
+            FIXTURE_MODEL_SAMPLER_OUTPUT_BYTES
+        );
         assert_eq!(runner.descriptor_count, 2);
         assert_eq!(runner.workgroup_count_x, 1);
         assert_eq!(runner.push_constant_byte_count, 0);
@@ -13623,10 +15095,12 @@ mod tests {
         };
         let (tensor_index, mounted, _manifest, mounted_bound) =
             mount_fixture_model_single_device_stream_circuit(&device);
-        let Some(loaded_manifest) = fixture_model_level_1_loaded_kernel_pack_for_conv_and_attention_families(
-            &mounted,
-            &mounted_bound,
-        ) else {
+        let Some(loaded_manifest) =
+            fixture_model_level_1_loaded_kernel_pack_for_conv_and_attention_families(
+                &mounted,
+                &mounted_bound,
+            )
+        else {
             eprintln!(
                 "skipping resident single-token tick runner: no GLSL to SPIR-V compiler found"
             );
@@ -13706,7 +15180,11 @@ mod tests {
 
         let token_id = 1u32;
         let run = runner
-            .run_token_id_with_stream_control(&device, token_id, fixture_model_stream_control(&mounted, 0))
+            .run_token_id_with_stream_control(
+                &device,
+                token_id,
+                fixture_model_stream_control(&mounted, 0),
+            )
             .unwrap();
         assert_eq!(run.device_id, "gpu0");
         assert_eq!(run.token_id, token_id);
@@ -13714,17 +15192,26 @@ mod tests {
         assert_eq!(run.total_descriptor_count, 802);
         assert_eq!(run.total_push_constant_byte_count, 3_876);
         assert_eq!(run.input_run.dispatch_count, 1);
-        assert_eq!(run.input_run.output_signal_id, FIXTURE_MODEL_INPUT_FRAME_SIGNAL);
+        assert_eq!(
+            run.input_run.output_signal_id,
+            FIXTURE_MODEL_INPUT_FRAME_SIGNAL
+        );
         assert_fixture_model_resident_prefix_run(&run.pedalboard_run, &pedal_ids, 242);
         assert_eq!(run.output_run.dispatch_count, 2);
-        assert_eq!(run.output_run.logits_byte_capacity, FIXTURE_MODEL_LOGITS_BYTES);
+        assert_eq!(
+            run.output_run.logits_byte_capacity,
+            FIXTURE_MODEL_LOGITS_BYTES
+        );
 
         let input_frame = mounted
             .boundary_io
             .input_buffer(FIXTURE_MODEL_INPUT_FRAME_SIGNAL)
             .unwrap();
         assert_eq!(
-            input_frame.buffer.read_bytes(FIXTURE_MODEL_FRAME_BYTES).unwrap(),
+            input_frame
+                .buffer
+                .read_bytes(FIXTURE_MODEL_FRAME_BYTES)
+                .unwrap(),
             fixture_model_embedding_row_bytes(&tensor_index, token_id)
         );
         assert_eq!(
@@ -13809,10 +15296,9 @@ mod tests {
             return None;
         };
 
-        let transducer_parameter_buffers = Arc::new(load_fixture_model_transducer_parameter_buffers(
-            device,
-            &tensor_index,
-        ));
+        let transducer_parameter_buffers = Arc::new(
+            load_fixture_model_transducer_parameter_buffers(device, &tensor_index),
+        );
         let pedal_ids = prepare_fixture_model_resident_prefix(&mounted, &tensor_index, 13);
         let input_transducer =
             VulkanResidentInputEmbeddingTransducerRunner::from_mounted_token_embedding(
@@ -13871,9 +15357,10 @@ mod tests {
                 return;
             }
         };
-        let Some(processor) =
-            create_fixture_model_resident_greedy_stream_processor(&device, "resident greedy feedback loop")
-        else {
+        let Some(processor) = create_fixture_model_resident_greedy_stream_processor(
+            &device,
+            "resident greedy feedback loop",
+        ) else {
             return;
         };
         assert_eq!(processor.device_id, "gpu0");
@@ -13922,9 +15409,10 @@ mod tests {
                 return;
             }
         };
-        let Some(processor) =
-            create_fixture_model_resident_greedy_stream_processor(&device, "resident greedy prompt event")
-        else {
+        let Some(processor) = create_fixture_model_resident_greedy_stream_processor(
+            &device,
+            "resident greedy prompt event",
+        ) else {
             return;
         };
 
@@ -14000,9 +15488,10 @@ mod tests {
                 return;
             }
         };
-        let Some(processor) =
-            create_fixture_model_resident_greedy_stream_processor(&device, "resident greedy running stream")
-        else {
+        let Some(processor) = create_fixture_model_resident_greedy_stream_processor(
+            &device,
+            "resident greedy running stream",
+        ) else {
             return;
         };
         let mut stream = processor.into_running_stream("stream_0");
@@ -14747,7 +16236,8 @@ mod tests {
     #[cfg(feature = "tokenizers")]
     #[test]
     fn resident_hf_tokenizer_text_codec_loads_fixture_model_tokenizer_json() {
-        let Some(codec) = fixture_model_tokenizer_codec_or_skip("resident hf tokenizer text codec") else {
+        let Some(codec) = fixture_model_tokenizer_codec_or_skip("resident hf tokenizer text codec")
+        else {
             return;
         };
 
@@ -14987,7 +16477,9 @@ mod tests {
         };
         let model = fixture_model_resident_greedy_model(&device, 8).unwrap();
         let mut engine = VulkanResidentTokenEngine::new(device);
-        engine.add_model_package("shared_compiled_model", model).unwrap();
+        engine
+            .add_model_package("shared_compiled_model", model)
+            .unwrap();
         engine
             .create_stream_from_model("shared_compiled_model", "text_batch_stream_a")
             .unwrap();
@@ -15058,7 +16550,8 @@ mod tests {
     #[cfg(feature = "tokenizers")]
     #[test]
     fn resident_token_engine_accepts_hf_tokenizer_text_input() {
-        let Some(codec) = fixture_model_tokenizer_codec_or_skip("resident token engine hf tokenizer input")
+        let Some(codec) =
+            fixture_model_tokenizer_codec_or_skip("resident token engine hf tokenizer input")
         else {
             return;
         };
@@ -15122,7 +16615,9 @@ mod tests {
         };
         let model = fixture_model_resident_greedy_model(&device, 8).unwrap();
         let mut engine = VulkanResidentTokenEngine::new(device);
-        let loaded_model = engine.add_model_package("shared_compiled_model", model).unwrap();
+        let loaded_model = engine
+            .add_model_package("shared_compiled_model", model)
+            .unwrap();
         assert_eq!(loaded_model.model_id, "shared_compiled_model");
         assert_eq!(loaded_model.device_id, "gpu0");
         assert_eq!(loaded_model.registered_stream_count, 0);
@@ -15435,10 +16930,12 @@ mod tests {
         };
         let (tensor_index, mounted, _manifest, mounted_bound) =
             mount_fixture_model_single_device_stream_circuit(&device);
-        let Some(loaded_manifest) = fixture_model_level_1_loaded_kernel_pack_for_conv_and_attention_families(
-            &mounted,
-            &mounted_bound,
-        ) else {
+        let Some(loaded_manifest) =
+            fixture_model_level_1_loaded_kernel_pack_for_conv_and_attention_families(
+                &mounted,
+                &mounted_bound,
+            )
+        else {
             eprintln!(
                 "skipping resident attention pedalboard runner: no GLSL to SPIR-V compiler found"
             );
@@ -15490,10 +16987,12 @@ mod tests {
         };
         let (tensor_index, mounted, _manifest, mounted_bound) =
             mount_fixture_model_single_device_stream_circuit(&device);
-        let Some(loaded_manifest) = fixture_model_level_1_loaded_kernel_pack_for_conv_and_attention_families(
-            &mounted,
-            &mounted_bound,
-        ) else {
+        let Some(loaded_manifest) =
+            fixture_model_level_1_loaded_kernel_pack_for_conv_and_attention_families(
+                &mounted,
+                &mounted_bound,
+            )
+        else {
             eprintln!(
                 "skipping resident multi-tick attention runner: no GLSL to SPIR-V compiler found"
             );
@@ -15590,10 +17089,12 @@ mod tests {
         };
         let (tensor_index, mounted, _manifest, mounted_bound) =
             mount_fixture_model_single_device_stream_circuit(&device);
-        let Some(loaded_manifest) = fixture_model_level_1_loaded_kernel_pack_for_conv_and_attention_families(
-            &mounted,
-            &mounted_bound,
-        ) else {
+        let Some(loaded_manifest) =
+            fixture_model_level_1_loaded_kernel_pack_for_conv_and_attention_families(
+                &mounted,
+                &mounted_bound,
+            )
+        else {
             eprintln!("skipping resident layer_03 prefix runner: no GLSL to SPIR-V compiler found");
             return;
         };
@@ -15637,10 +17138,12 @@ mod tests {
         };
         let (tensor_index, mounted, _manifest, mounted_bound) =
             mount_fixture_model_single_device_stream_circuit(&device);
-        let Some(loaded_manifest) = fixture_model_level_1_loaded_kernel_pack_for_conv_and_attention_families(
-            &mounted,
-            &mounted_bound,
-        ) else {
+        let Some(loaded_manifest) =
+            fixture_model_level_1_loaded_kernel_pack_for_conv_and_attention_families(
+                &mounted,
+                &mounted_bound,
+            )
+        else {
             eprintln!("skipping resident layer_04 prefix runner: no GLSL to SPIR-V compiler found");
             return;
         };
@@ -15702,10 +17205,12 @@ mod tests {
         };
         let (tensor_index, mounted, _manifest, mounted_bound) =
             mount_fixture_model_single_device_stream_circuit(&device);
-        let Some(loaded_manifest) = fixture_model_level_1_loaded_kernel_pack_for_conv_and_attention_families(
-            &mounted,
-            &mounted_bound,
-        ) else {
+        let Some(loaded_manifest) =
+            fixture_model_level_1_loaded_kernel_pack_for_conv_and_attention_families(
+                &mounted,
+                &mounted_bound,
+            )
+        else {
             eprintln!("skipping resident layer_05 prefix runner: no GLSL to SPIR-V compiler found");
             return;
         };
@@ -15767,10 +17272,12 @@ mod tests {
         };
         let (tensor_index, mounted, _manifest, mounted_bound) =
             mount_fixture_model_single_device_stream_circuit(&device);
-        let Some(loaded_manifest) = fixture_model_level_1_loaded_kernel_pack_for_conv_and_attention_families(
-            &mounted,
-            &mounted_bound,
-        ) else {
+        let Some(loaded_manifest) =
+            fixture_model_level_1_loaded_kernel_pack_for_conv_and_attention_families(
+                &mounted,
+                &mounted_bound,
+            )
+        else {
             eprintln!("skipping resident layer_06 prefix runner: no GLSL to SPIR-V compiler found");
             return;
         };
@@ -15842,10 +17349,12 @@ mod tests {
         };
         let (tensor_index, mounted, _manifest, mounted_bound) =
             mount_fixture_model_single_device_stream_circuit(&device);
-        let Some(loaded_manifest) = fixture_model_level_1_loaded_kernel_pack_for_conv_and_attention_families(
-            &mounted,
-            &mounted_bound,
-        ) else {
+        let Some(loaded_manifest) =
+            fixture_model_level_1_loaded_kernel_pack_for_conv_and_attention_families(
+                &mounted,
+                &mounted_bound,
+            )
+        else {
             eprintln!("skipping resident layer_07 prefix runner: no GLSL to SPIR-V compiler found");
             return;
         };
@@ -15917,10 +17426,12 @@ mod tests {
         };
         let (tensor_index, mounted, _manifest, mounted_bound) =
             mount_fixture_model_single_device_stream_circuit(&device);
-        let Some(loaded_manifest) = fixture_model_level_1_loaded_kernel_pack_for_conv_and_attention_families(
-            &mounted,
-            &mounted_bound,
-        ) else {
+        let Some(loaded_manifest) =
+            fixture_model_level_1_loaded_kernel_pack_for_conv_and_attention_families(
+                &mounted,
+                &mounted_bound,
+            )
+        else {
             eprintln!("skipping resident layer_08 prefix runner: no GLSL to SPIR-V compiler found");
             return;
         };
@@ -16003,10 +17514,12 @@ mod tests {
         };
         let (tensor_index, mounted, _manifest, mounted_bound) =
             mount_fixture_model_single_device_stream_circuit(&device);
-        let Some(loaded_manifest) = fixture_model_level_1_loaded_kernel_pack_for_conv_and_attention_families(
-            &mounted,
-            &mounted_bound,
-        ) else {
+        let Some(loaded_manifest) =
+            fixture_model_level_1_loaded_kernel_pack_for_conv_and_attention_families(
+                &mounted,
+                &mounted_bound,
+            )
+        else {
             eprintln!("skipping resident layer_09 prefix runner: no GLSL to SPIR-V compiler found");
             return;
         };
@@ -16089,10 +17602,12 @@ mod tests {
         };
         let (tensor_index, mounted, _manifest, mounted_bound) =
             mount_fixture_model_single_device_stream_circuit(&device);
-        let Some(loaded_manifest) = fixture_model_level_1_loaded_kernel_pack_for_conv_and_attention_families(
-            &mounted,
-            &mounted_bound,
-        ) else {
+        let Some(loaded_manifest) =
+            fixture_model_level_1_loaded_kernel_pack_for_conv_and_attention_families(
+                &mounted,
+                &mounted_bound,
+            )
+        else {
             eprintln!("skipping resident layer_10 prefix runner: no GLSL to SPIR-V compiler found");
             return;
         };
@@ -16187,10 +17702,12 @@ mod tests {
         };
         let (tensor_index, mounted, _manifest, mounted_bound) =
             mount_fixture_model_single_device_stream_circuit(&device);
-        let Some(loaded_manifest) = fixture_model_level_1_loaded_kernel_pack_for_conv_and_attention_families(
-            &mounted,
-            &mounted_bound,
-        ) else {
+        let Some(loaded_manifest) =
+            fixture_model_level_1_loaded_kernel_pack_for_conv_and_attention_families(
+                &mounted,
+                &mounted_bound,
+            )
+        else {
             eprintln!("skipping resident layer_11 prefix runner: no GLSL to SPIR-V compiler found");
             return;
         };
@@ -16285,10 +17802,12 @@ mod tests {
         };
         let (tensor_index, mounted, _manifest, mounted_bound) =
             mount_fixture_model_single_device_stream_circuit(&device);
-        let Some(loaded_manifest) = fixture_model_level_1_loaded_kernel_pack_for_conv_and_attention_families(
-            &mounted,
-            &mounted_bound,
-        ) else {
+        let Some(loaded_manifest) =
+            fixture_model_level_1_loaded_kernel_pack_for_conv_and_attention_families(
+                &mounted,
+                &mounted_bound,
+            )
+        else {
             eprintln!("skipping resident layer_12 prefix runner: no GLSL to SPIR-V compiler found");
             return;
         };
@@ -16396,10 +17915,12 @@ mod tests {
         };
         let (tensor_index, mounted, _manifest, mounted_bound) =
             mount_fixture_model_single_device_stream_circuit(&device);
-        let Some(loaded_manifest) = fixture_model_level_1_loaded_kernel_pack_for_conv_and_attention_families(
-            &mounted,
-            &mounted_bound,
-        ) else {
+        let Some(loaded_manifest) =
+            fixture_model_level_1_loaded_kernel_pack_for_conv_and_attention_families(
+                &mounted,
+                &mounted_bound,
+            )
+        else {
             eprintln!(
                 "skipping resident full FIXTURE_MODEL layer-stack runner: no GLSL to SPIR-V compiler found"
             );
@@ -18924,10 +20445,22 @@ mod tests {
         let gpu1 =
             VulkanMountedPlacedStreamCircuit::from_placed_plan(&device, gpu1_plan, 4).unwrap();
 
-        assert_eq!(gpu0.cable_io.outgoing_buffer(1).unwrap().byte_capacity, 2_048);
-        assert_eq!(gpu1.cable_io.incoming_buffer(1).unwrap().byte_capacity, 2_048);
-        assert_eq!(gpu1.cable_io.outgoing_buffer(2).unwrap().byte_capacity, 2_048);
-        assert_eq!(gpu0.cable_io.incoming_buffer(2).unwrap().byte_capacity, 2_048);
+        assert_eq!(
+            gpu0.cable_io.outgoing_buffer(1).unwrap().byte_capacity,
+            2_048
+        );
+        assert_eq!(
+            gpu1.cable_io.incoming_buffer(1).unwrap().byte_capacity,
+            2_048
+        );
+        assert_eq!(
+            gpu1.cable_io.outgoing_buffer(2).unwrap().byte_capacity,
+            2_048
+        );
+        assert_eq!(
+            gpu0.cable_io.incoming_buffer(2).unwrap().byte_capacity,
+            2_048
+        );
 
         let mut layer_01_to_02 = vec![0u8; 2_048];
         layer_01_to_02[..8].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
@@ -19043,6 +20576,811 @@ mod tests {
                 .unwrap(),
             vec![21, 22, 23, 24, 25, 26, 27, 28]
         );
+    }
+
+    #[test]
+    fn placed_tick_plan_interleaves_cross_device_cables_with_hosted_pedals() {
+        let device = match VulkanComputeDevice::new() {
+            Ok(device) => device,
+            Err(error) => {
+                eprintln!("skipping interleaved placed tick plan: {error}");
+                return;
+            }
+        };
+        let graph = ResolvedLoweredPedalboard::from_index_file(fixture_model_index_path()).unwrap();
+        let tensor_index = TensorIndex::from_json_file(fixture_model_tensor_index_path()).unwrap();
+        let execution_plan =
+            StreamCircuitExecutionPlan::from_graph_with_tensor_index(&graph, &tensor_index)
+                .unwrap();
+        let resource_plan =
+            StreamCircuitResourcePlan::from_graph_and_plan(&graph, &execution_plan).unwrap();
+        let placement_spec =
+            StreamCircuitPlacementSpec::new("gpu0").with_pedal_device("layer_02", "gpu1");
+        let placement_plan = graph.placement_plan(&placement_spec).unwrap();
+
+        let gpu0_resident = VulkanPlacedStreamCircuitResidentPlan::from_resource_plan_for_device(
+            &resource_plan,
+            &placement_plan,
+            "gpu0",
+            Some(&tensor_index),
+            Some(2),
+        )
+        .unwrap();
+        let gpu0_plan = VulkanPlacedStreamCircuitPlan::from_plans(
+            &execution_plan,
+            &resource_plan,
+            gpu0_resident,
+        )
+        .unwrap();
+        let gpu0 =
+            VulkanMountedPlacedStreamCircuit::from_placed_plan(&device, gpu0_plan, 4).unwrap();
+        let manifest = VulkanReusableKernelArtifactManifest::new(
+            gpu0.placed_plan
+                .reusable_kernel_plan
+                .families
+                .iter()
+                .map(|family| {
+                    VulkanReusableKernelArtifact::from_family(
+                        family,
+                        format!("kernels/{}.spv", family.family_id),
+                    )
+                })
+                .collect(),
+        );
+        let tick_plan = gpu0.stream_tick_plan(&manifest).unwrap();
+
+        let publish_to_gpu1_index = tick_plan
+            .stages
+            .iter()
+            .position(|stage| {
+                matches!(
+                    stage,
+                    VulkanMountedPlacedStreamTickStage::PublishCable {
+                        cable_index: 1,
+                        remote_device_id,
+                        remote_pedal_id,
+                        ..
+                    } if remote_device_id == "gpu1" && remote_pedal_id == "layer_02"
+                )
+            })
+            .unwrap();
+        let receive_from_gpu1_index = tick_plan
+            .stages
+            .iter()
+            .position(|stage| {
+                matches!(
+                    stage,
+                    VulkanMountedPlacedStreamTickStage::ReceiveCable {
+                        cable_index: 2,
+                        remote_device_id,
+                        remote_pedal_id,
+                        ..
+                    } if remote_device_id == "gpu1" && remote_pedal_id == "layer_02"
+                )
+            })
+            .unwrap();
+        let first_layer_03_dispatch_index = tick_plan
+            .stages
+            .iter()
+            .position(|stage| {
+                matches!(
+                    stage,
+                    VulkanMountedPlacedStreamTickStage::Dispatch {
+                        dispatch,
+                        ..
+                    } if dispatch.pedal_id == "layer_03" && dispatch.node_id == "operator_norm"
+                )
+            })
+            .unwrap();
+
+        assert_eq!(tick_plan.receive_stage_count, 1);
+        assert_eq!(tick_plan.publish_stage_count, 1);
+        assert!(
+            publish_to_gpu1_index < receive_from_gpu1_index,
+            "gpu0 must publish its prefix output before waiting for the remote layer output"
+        );
+        assert!(
+            receive_from_gpu1_index < first_layer_03_dispatch_index,
+            "gpu0 must receive the remote layer output before running the downstream suffix"
+        );
+    }
+
+    #[test]
+    fn resident_stream_tick_executes_split_device_slice_and_publishes_output_cable() {
+        let device = match VulkanComputeDevice::new() {
+            Ok(device) => device,
+            Err(error) => {
+                eprintln!("skipping resident split-device stream tick: {error}");
+                return;
+            }
+        };
+        let mut manifest = fixture_model_package_manifest();
+        manifest.placement =
+            StreamCircuitPlacementSpec::new("gpu0").with_pedal_device("layer_02", "gpu1");
+        let manifest_path = fixture_model_package_manifest_path();
+        let manifest_dir = manifest_path.parent().unwrap();
+
+        let gpu0_slice = VulkanResidentGreedyModelPackageDeviceSlice::from_manifest_for_device(
+            &device,
+            manifest_dir,
+            manifest.clone(),
+            "gpu0",
+            Some(4),
+        )
+        .unwrap();
+        let gpu1_slice = VulkanResidentGreedyModelPackageDeviceSlice::from_manifest_for_device(
+            &device,
+            manifest_dir,
+            manifest,
+            "gpu1",
+            Some(4),
+        )
+        .unwrap();
+        let gpu0 = gpu0_slice.create_mounted_stream_circuit(&device).unwrap();
+        let gpu1 = gpu1_slice.create_mounted_stream_circuit(&device).unwrap();
+        gpu0.buffers.zero_state_buffers().unwrap();
+        gpu1.buffers.zero_state_buffers().unwrap();
+
+        let mut layer_01_to_02 = Vec::with_capacity(2_048);
+        for _ in 0..1_024 {
+            layer_01_to_02.extend_from_slice(&[0x80, 0x3f]);
+        }
+        gpu0.cable_io
+            .outgoing_buffer(1)
+            .unwrap()
+            .buffer
+            .write_bytes(&layer_01_to_02)
+            .unwrap();
+
+        let mut transport = VulkanInProcessPlacedCableTransport::new();
+        transport.publish_outgoing_cable(&gpu0, 1).unwrap();
+
+        let reusable_manifest = resident_greedy_package_reusable_kernel_manifest(&gpu1.placed_plan);
+        let gpu1_bound = gpu1
+            .mounted_placed_bound_dispatch_plan(&reusable_manifest)
+            .unwrap();
+        let gpu1_tick_plan = gpu1.stream_tick_plan(&reusable_manifest).unwrap();
+        let run = gpu1_tick_plan
+            .advance_with_resident_pedalboard_and_in_process_transport(
+                &device,
+                &gpu1,
+                &gpu1_bound,
+                gpu1_slice.loaded_manifest(),
+                &mut transport,
+                0,
+            )
+            .unwrap();
+
+        assert_eq!(
+            run.tick_run.status,
+            VulkanMountedPlacedStreamTickRunStatus::Completed
+        );
+        assert_eq!(run.tick_run.attempted_stage_count, 21);
+        assert_eq!(run.tick_run.completed_stage_count, 21);
+        assert_eq!(run.tick_run.pending_stage_count, 0);
+        assert!(run.tick_run.can_execute);
+        assert_eq!(run.pedalboard_dispatch_count(), 19);
+        assert_eq!(
+            run.pedalboard_run.as_ref().unwrap().pedal_ids(),
+            vec!["layer_02"]
+        );
+
+        let kv_memory = gpu1.buffers.state_buffer("layer_02", "kv_memory").unwrap();
+        assert_ne!(kv_memory.buffer.read_bytes(16).unwrap(), vec![0; 16]);
+
+        let output_packet_key = VulkanPlacedCablePacketKey {
+            cable_index: 2,
+            from_device_id: "gpu1".to_string(),
+            to_device_id: "gpu0".to_string(),
+        };
+        assert_eq!(transport.packet_count(), 1);
+        assert!(transport.contains_packet(&output_packet_key));
+
+        let received_back = transport.receive_available_incoming_cables(&gpu0).unwrap();
+        assert_eq!(received_back.received.len(), 1);
+        assert_eq!(received_back.received[0].key, output_packet_key);
+        assert_eq!(received_back.received[0].byte_count, 2_048);
+        assert_eq!(received_back.missing_packets.len(), 0);
+    }
+
+    #[test]
+    fn resident_stream_tick_cursor_resumes_split_prefix_and_suffix_without_rerunning_prefix() {
+        let device = match VulkanComputeDevice::new() {
+            Ok(device) => device,
+            Err(error) => {
+                eprintln!("skipping resident split cursor stream tick: {error}");
+                return;
+            }
+        };
+        let mut manifest = fixture_model_package_manifest();
+        manifest.placement =
+            StreamCircuitPlacementSpec::new("gpu0").with_pedal_device("layer_02", "gpu1");
+        let manifest_path = fixture_model_package_manifest_path();
+        let manifest_dir = manifest_path.parent().unwrap();
+
+        let gpu0_slice = VulkanResidentGreedyModelPackageDeviceSlice::from_manifest_for_device(
+            &device,
+            manifest_dir,
+            manifest.clone(),
+            "gpu0",
+            Some(4),
+        )
+        .unwrap();
+        let gpu1_slice = VulkanResidentGreedyModelPackageDeviceSlice::from_manifest_for_device(
+            &device,
+            manifest_dir,
+            manifest,
+            "gpu1",
+            Some(4),
+        )
+        .unwrap();
+        let gpu0 = gpu0_slice.create_mounted_stream_circuit(&device).unwrap();
+        let gpu1 = gpu1_slice.create_mounted_stream_circuit(&device).unwrap();
+        gpu0.buffers.zero_state_buffers().unwrap();
+        gpu1.buffers.zero_state_buffers().unwrap();
+
+        let mut input_frame = Vec::with_capacity(2_048);
+        for _ in 0..1_024 {
+            input_frame.extend_from_slice(&[0x80, 0x3f]);
+        }
+        gpu0.boundary_io
+            .input_buffer("input_frame")
+            .unwrap()
+            .buffer
+            .write_bytes(&input_frame)
+            .unwrap();
+
+        let gpu0_reusable_manifest =
+            resident_greedy_package_reusable_kernel_manifest(&gpu0.placed_plan);
+        let gpu0_bound = gpu0
+            .mounted_placed_bound_dispatch_plan(&gpu0_reusable_manifest)
+            .unwrap();
+        let gpu0_tick_plan = gpu0.stream_tick_plan(&gpu0_reusable_manifest).unwrap();
+        let mut gpu0_cursor = gpu0_tick_plan.resident_stream_tick_cursor(0);
+
+        let gpu1_reusable_manifest =
+            resident_greedy_package_reusable_kernel_manifest(&gpu1.placed_plan);
+        let gpu1_bound = gpu1
+            .mounted_placed_bound_dispatch_plan(&gpu1_reusable_manifest)
+            .unwrap();
+        let gpu1_tick_plan = gpu1.stream_tick_plan(&gpu1_reusable_manifest).unwrap();
+        let mut gpu1_cursor = gpu1_tick_plan.resident_stream_tick_cursor(0);
+
+        let mut transport = VulkanInProcessPlacedCableTransport::new();
+        let gpu0_prefix = gpu0_cursor
+            .advance_with_resident_pedals_and_in_process_transport(
+                &device,
+                &gpu0,
+                &gpu0_bound,
+                gpu0_slice.loaded_manifest(),
+                &mut transport,
+            )
+            .unwrap();
+        let blocked_stage_index = match &gpu0_prefix.run.tick_run.status {
+            VulkanMountedPlacedStreamTickRunStatus::Blocked {
+                stage_index,
+                reason,
+            } => {
+                assert_eq!(
+                    *reason,
+                    VulkanMountedPlacedStreamTickBlockReason::CableReceiveTransportUnavailable
+                );
+                *stage_index
+            }
+            ref status => panic!("expected gpu0 prefix to block on remote return, got {status:?}"),
+        };
+        assert_eq!(gpu0_prefix.completed_stage_delta, 33);
+        assert_eq!(gpu0_prefix.run.pedalboard_dispatch_count(), 32);
+        assert!(matches!(
+            gpu0_prefix.run.tick_run.stages[blocked_stage_index].stage,
+            VulkanMountedPlacedStreamTickStage::ReceiveCable {
+                cable_index: 2,
+                ref remote_device_id,
+                ref remote_pedal_id,
+                ..
+            } if remote_device_id == "gpu1" && remote_pedal_id == "layer_02"
+        ));
+        assert_eq!(transport.packet_count(), 1);
+        assert!(transport.contains_packet(&VulkanPlacedCablePacketKey {
+            cable_index: 1,
+            from_device_id: "gpu0".to_string(),
+            to_device_id: "gpu1".to_string(),
+        }));
+
+        let gpu1_remote = gpu1_cursor
+            .advance_with_resident_pedals_and_in_process_transport(
+                &device,
+                &gpu1,
+                &gpu1_bound,
+                gpu1_slice.loaded_manifest(),
+                &mut transport,
+            )
+            .unwrap();
+        assert!(gpu1_remote.completed);
+        assert_eq!(gpu1_remote.run.pedalboard_dispatch_count(), 19);
+        assert_eq!(transport.packet_count(), 1);
+        assert!(transport.contains_packet(&VulkanPlacedCablePacketKey {
+            cable_index: 2,
+            from_device_id: "gpu1".to_string(),
+            to_device_id: "gpu0".to_string(),
+        }));
+
+        let gpu0_suffix = gpu0_cursor
+            .advance_with_resident_pedals_and_in_process_transport(
+                &device,
+                &gpu0,
+                &gpu0_bound,
+                gpu0_slice.loaded_manifest(),
+                &mut transport,
+            )
+            .unwrap();
+        assert!(gpu0_suffix.completed);
+        assert_eq!(
+            gpu0_suffix.run.tick_run.status,
+            VulkanMountedPlacedStreamTickRunStatus::Completed
+        );
+        assert_eq!(gpu0_suffix.run.tick_run.completed_stage_count, 225);
+        assert_eq!(gpu0_suffix.run.pedalboard_dispatch_count(), 223);
+        assert_eq!(transport.packet_count(), 0);
+        assert_eq!(
+            gpu0_cursor
+                .pedal_runs
+                .iter()
+                .map(|run| run.pedal_id.as_str())
+                .collect::<Vec<_>>()[..3],
+            ["layer_00", "layer_01", "layer_03"]
+        );
+
+        let output = gpu0
+            .boundary_io
+            .output_buffer("output_frame")
+            .unwrap()
+            .buffer
+            .read_bytes(16)
+            .unwrap();
+        assert_ne!(output, vec![0; 16]);
+    }
+
+    #[test]
+    fn in_process_resident_stream_tick_runner_completes_split_package_slices() {
+        let device = match VulkanComputeDevice::new() {
+            Ok(device) => device,
+            Err(error) => {
+                eprintln!("skipping in-process resident split runner: {error}");
+                return;
+            }
+        };
+        let mut manifest = fixture_model_package_manifest();
+        manifest.placement =
+            StreamCircuitPlacementSpec::new("gpu0").with_pedal_device("layer_02", "gpu1");
+        let manifest_path = fixture_model_package_manifest_path();
+        let manifest_dir = manifest_path.parent().unwrap();
+
+        let gpu0_slice = VulkanResidentGreedyModelPackageDeviceSlice::from_manifest_for_device(
+            &device,
+            manifest_dir,
+            manifest.clone(),
+            "gpu0",
+            Some(4),
+        )
+        .unwrap();
+        let gpu1_slice = VulkanResidentGreedyModelPackageDeviceSlice::from_manifest_for_device(
+            &device,
+            manifest_dir,
+            manifest,
+            "gpu1",
+            Some(4),
+        )
+        .unwrap();
+        let gpu0 = gpu0_slice.create_mounted_stream_circuit(&device).unwrap();
+        let gpu1 = gpu1_slice.create_mounted_stream_circuit(&device).unwrap();
+        gpu0.buffers.zero_state_buffers().unwrap();
+        gpu1.buffers.zero_state_buffers().unwrap();
+
+        let mut input_frame = Vec::with_capacity(2_048);
+        for _ in 0..1_024 {
+            input_frame.extend_from_slice(&[0x80, 0x3f]);
+        }
+        gpu0.boundary_io
+            .input_buffer("input_frame")
+            .unwrap()
+            .buffer
+            .write_bytes(&input_frame)
+            .unwrap();
+
+        let gpu0_reusable_manifest =
+            resident_greedy_package_reusable_kernel_manifest(&gpu0.placed_plan);
+        let gpu0_bound = gpu0
+            .mounted_placed_bound_dispatch_plan(&gpu0_reusable_manifest)
+            .unwrap();
+        let gpu0_tick_plan = gpu0.stream_tick_plan(&gpu0_reusable_manifest).unwrap();
+
+        let gpu1_reusable_manifest =
+            resident_greedy_package_reusable_kernel_manifest(&gpu1.placed_plan);
+        let gpu1_bound = gpu1
+            .mounted_placed_bound_dispatch_plan(&gpu1_reusable_manifest)
+            .unwrap();
+        let gpu1_tick_plan = gpu1.stream_tick_plan(&gpu1_reusable_manifest).unwrap();
+
+        let mut transport = VulkanInProcessPlacedCableTransport::new();
+        let mut slices = vec![
+            VulkanMountedPlacedResidentInProcessStreamTickSlice::new(
+                &gpu0,
+                &gpu0_bound,
+                gpu0_slice.loaded_manifest(),
+                gpu0_tick_plan,
+                0,
+            ),
+            VulkanMountedPlacedResidentInProcessStreamTickSlice::new(
+                &gpu1,
+                &gpu1_bound,
+                gpu1_slice.loaded_manifest(),
+                gpu1_tick_plan,
+                0,
+            ),
+        ];
+        let run = run_mounted_placed_resident_stream_tick_slices_in_process(
+            &device,
+            &mut slices,
+            &mut transport,
+            8,
+        )
+        .unwrap();
+
+        assert_eq!(
+            run.status,
+            VulkanMountedPlacedResidentInProcessStreamTickRunStatus::Completed
+        );
+        assert_eq!(run.scheduler_turn_count, 2);
+        assert_eq!(run.completed_slice_count, 2);
+        assert_eq!(run.pending_slice_count, 0);
+        assert_eq!(run.completed_stage_delta, 246);
+        assert_eq!(transport.packet_count(), 0);
+
+        let gpu0_run = run
+            .device_runs
+            .iter()
+            .find(|run| run.tick_run.device_id == "gpu0")
+            .unwrap();
+        let gpu1_run = run
+            .device_runs
+            .iter()
+            .find(|run| run.tick_run.device_id == "gpu1")
+            .unwrap();
+        assert_eq!(gpu0_run.tick_run.completed_stage_count, 225);
+        assert_eq!(gpu0_run.pedalboard_dispatch_count(), 223);
+        assert_eq!(gpu1_run.tick_run.completed_stage_count, 21);
+        assert_eq!(gpu1_run.pedalboard_dispatch_count(), 19);
+
+        let output = gpu0
+            .boundary_io
+            .output_buffer("output_frame")
+            .unwrap()
+            .buffer
+            .read_bytes(16)
+            .unwrap();
+        assert_ne!(output, vec![0; 16]);
+    }
+
+    #[test]
+    fn placed_model_package_runs_split_stream_tick_in_process() {
+        let device = match VulkanComputeDevice::new() {
+            Ok(device) => device,
+            Err(error) => {
+                eprintln!("skipping placed model package split stream tick: {error}");
+                return;
+            }
+        };
+        let mut manifest = fixture_model_package_manifest();
+        manifest.placement =
+            StreamCircuitPlacementSpec::new("gpu0").with_pedal_device("layer_02", "gpu1");
+        let manifest_path = fixture_model_package_manifest_path();
+        let manifest_dir = manifest_path.parent().unwrap();
+
+        let placed_package =
+            VulkanResidentGreedyInProcessPlacedModelPackage::from_manifest_for_devices(
+                &device,
+                manifest_dir,
+                manifest,
+                Some(4),
+            )
+            .unwrap();
+        assert_eq!(placed_package.device_ids, vec!["gpu0", "gpu1"]);
+        assert_eq!(placed_package.device_count, 2);
+        assert_eq!(placed_package.hosted_pedal_count, 14);
+        assert_eq!(
+            placed_package.device("gpu0").unwrap().hosted_pedal_count,
+            13
+        );
+        assert_eq!(placed_package.device("gpu1").unwrap().hosted_pedal_count, 1);
+
+        let mut input_frame = Vec::with_capacity(2_048);
+        for _ in 0..1_024 {
+            input_frame.extend_from_slice(&[0x80, 0x3f]);
+        }
+        placed_package
+            .mounted_device("gpu0")
+            .unwrap()
+            .boundary_io
+            .input_buffer("input_frame")
+            .unwrap()
+            .buffer
+            .write_bytes(&input_frame)
+            .unwrap();
+
+        let run = placed_package
+            .run_stream_tick_in_process(&device, 0, 8)
+            .unwrap();
+        assert_eq!(
+            run.status,
+            VulkanMountedPlacedResidentInProcessStreamTickRunStatus::Completed
+        );
+        assert_eq!(run.scheduler_turn_count, 2);
+        assert_eq!(run.completed_stage_delta, 246);
+
+        let output = placed_package
+            .mounted_device("gpu0")
+            .unwrap()
+            .boundary_io
+            .output_buffer("output_frame")
+            .unwrap()
+            .buffer
+            .read_bytes(16)
+            .unwrap();
+        assert_ne!(output, vec![0; 16]);
+    }
+
+    #[test]
+    fn placed_model_package_runs_split_single_token_tick_and_sampler() {
+        let device = match VulkanComputeDevice::new() {
+            Ok(device) => device,
+            Err(error) => {
+                eprintln!("skipping placed model package split token tick: {error}");
+                return;
+            }
+        };
+        let mut manifest = fixture_model_package_manifest();
+        manifest.placement =
+            StreamCircuitPlacementSpec::new("gpu0").with_pedal_device("layer_02", "gpu1");
+        let manifest_path = fixture_model_package_manifest_path();
+        let manifest_dir = manifest_path.parent().unwrap();
+        let tensor_index = TensorIndex::from_json_file(fixture_model_tensor_index_path()).unwrap();
+
+        let placed_package =
+            VulkanResidentGreedyInProcessPlacedModelPackage::from_manifest_for_devices(
+                &device,
+                manifest_dir,
+                manifest,
+                Some(4),
+            )
+            .unwrap();
+        assert_eq!(placed_package.boundary_device_id, "gpu0");
+        assert_eq!(placed_package.transducer_parameter_count, 2);
+        assert_eq!(
+            placed_package.transducer_parameter_bytes,
+            FIXTURE_MODEL_EMBED_TOKENS_BYTES + 2_048
+        );
+
+        let run = placed_package
+            .sample_token_id_stream_tick_in_process(&device, 1, 0, 8)
+            .unwrap();
+        assert_eq!(run.tick_run.boundary_device_id, "gpu0");
+        assert_eq!(run.tick_run.token_id, 1);
+        assert_eq!(run.tick_run.stream_tick, 0);
+        assert_eq!(run.tick_run.input_run.dispatch_count, 1);
+        assert_eq!(
+            run.tick_run.placed_run.status,
+            VulkanMountedPlacedResidentInProcessStreamTickRunStatus::Completed
+        );
+        assert_eq!(run.tick_run.placed_run.completed_stage_delta, 246);
+        assert_eq!(run.tick_run.output_run.dispatch_count, 2);
+        assert_eq!(run.sampler_run.descriptor_count, 2);
+        assert_eq!(run.sampler_run.token_id, 1);
+        assert_eq!(run.sampler_run.selected_logit_bits, 1_100_857_847);
+
+        let input_frame = placed_package
+            .mounted_device("gpu0")
+            .unwrap()
+            .boundary_io
+            .input_buffer(FIXTURE_MODEL_INPUT_FRAME_SIGNAL)
+            .unwrap();
+        assert_eq!(
+            input_frame
+                .buffer
+                .read_bytes(FIXTURE_MODEL_FRAME_BYTES)
+                .unwrap(),
+            fixture_model_embedding_row_bytes(&tensor_index, 1)
+        );
+    }
+
+    #[test]
+    fn placed_model_package_runs_split_greedy_feedback_loop() {
+        let device = match VulkanComputeDevice::new() {
+            Ok(device) => device,
+            Err(error) => {
+                eprintln!("skipping placed model package split feedback loop: {error}");
+                return;
+            }
+        };
+        let mut manifest = fixture_model_package_manifest();
+        manifest.placement =
+            StreamCircuitPlacementSpec::new("gpu0").with_pedal_device("layer_02", "gpu1");
+        let manifest_path = fixture_model_package_manifest_path();
+        let manifest_dir = manifest_path.parent().unwrap();
+
+        let placed_package =
+            VulkanResidentGreedyInProcessPlacedModelPackage::from_manifest_for_devices(
+                &device,
+                manifest_dir,
+                manifest,
+                Some(4),
+            )
+            .unwrap();
+        let run = placed_package
+            .run_greedy_feedback_bounded_in_process(&device, 1, 0, 2, 8)
+            .unwrap();
+
+        assert_eq!(run.boundary_device_id, "gpu0");
+        assert_eq!(run.initial_token_id, 1);
+        assert_eq!(run.sampled_token_ids, vec![1, 1]);
+        assert_eq!(run.tick_runs.len(), 2);
+        assert_eq!(run.tick_runs[0].stream_tick, 0);
+        assert_eq!(run.tick_runs[0].input_token_id, 1);
+        assert_eq!(run.tick_runs[0].sampled_token_id, 1);
+        assert_eq!(run.tick_runs[1].stream_tick, 1);
+        assert_eq!(run.tick_runs[1].input_token_id, 1);
+        assert_eq!(run.tick_runs[1].sampled_token_id, 1);
+        assert_eq!(
+            run.tick_runs
+                .iter()
+                .map(|tick| tick.tick_run.sampler_run.selected_logit_bits)
+                .collect::<Vec<_>>(),
+            vec![1_100_857_847, 1_101_580_110]
+        );
+        assert_eq!(
+            run.tick_runs
+                .iter()
+                .map(|tick| tick.tick_run.tick_run.placed_run.completed_stage_delta)
+                .collect::<Vec<_>>(),
+            vec![246, 246]
+        );
+    }
+
+    #[test]
+    fn placed_model_package_drains_split_prompt_event_before_feedback() {
+        let device = match VulkanComputeDevice::new() {
+            Ok(device) => device,
+            Err(error) => {
+                eprintln!("skipping placed model package split prompt event: {error}");
+                return;
+            }
+        };
+        let mut manifest = fixture_model_package_manifest();
+        manifest.placement =
+            StreamCircuitPlacementSpec::new("gpu0").with_pedal_device("layer_02", "gpu1");
+        let manifest_path = fixture_model_package_manifest_path();
+        let manifest_dir = manifest_path.parent().unwrap();
+
+        let placed_package =
+            VulkanResidentGreedyInProcessPlacedModelPackage::from_manifest_for_devices(
+                &device,
+                manifest_dir,
+                manifest,
+                Some(4),
+            )
+            .unwrap();
+        let run = placed_package
+            .run_prompt_event_bounded_in_process(&device, &[1, 36_309], 0, 1, None, 8)
+            .unwrap();
+
+        assert_eq!(run.boundary_device_id, "gpu0");
+        assert_eq!(run.prompt_token_ids, vec![1, 36_309]);
+        assert_eq!(run.generated_token_ids.len(), 1);
+        assert_eq!(
+            run.output_token_ids,
+            vec![1, 36_309, run.generated_token_ids[0]]
+        );
+        assert_eq!(run.stop_reason, "max_new_tokens");
+        assert_eq!(run.tick_runs.len(), 3);
+
+        assert_eq!(run.tick_runs[0].stream_tick, 0);
+        assert_eq!(run.tick_runs[0].input_token_id, 1);
+        assert_eq!(
+            run.tick_runs[0].input_route,
+            VulkanResidentGreedyPromptEventInputRoute::ExternalInput
+        );
+        assert_eq!(run.tick_runs[0].public_output_token_id, None);
+        assert!(run.tick_runs[0].sampler_run.is_none());
+
+        assert_eq!(run.tick_runs[1].stream_tick, 1);
+        assert_eq!(run.tick_runs[1].input_token_id, 36_309);
+        assert_eq!(
+            run.tick_runs[1].input_route,
+            VulkanResidentGreedyPromptEventInputRoute::ExternalInput
+        );
+        assert_eq!(
+            run.tick_runs[1].public_output_token_id,
+            Some(run.generated_token_ids[0])
+        );
+        assert_eq!(
+            run.tick_runs[1].private_feedback_token_id,
+            Some(run.generated_token_ids[0])
+        );
+        assert_eq!(
+            run.tick_runs[1].private_feedback_closes_loop_after_processing,
+            Some(true)
+        );
+        assert_eq!(
+            run.tick_runs[1].sampler_run.as_ref().unwrap().token_id,
+            run.generated_token_ids[0]
+        );
+
+        assert_eq!(run.tick_runs[2].stream_tick, 2);
+        assert_eq!(run.tick_runs[2].input_token_id, run.generated_token_ids[0]);
+        assert_eq!(
+            run.tick_runs[2].input_route,
+            VulkanResidentGreedyPromptEventInputRoute::PrivateFeedback
+        );
+        assert_eq!(run.tick_runs[2].input_feedback_depth, 1);
+        assert!(run.tick_runs[2].input_closes_loop_after_processing);
+        assert_eq!(run.tick_runs[2].public_output_token_id, None);
+        assert!(run.tick_runs[2].sampler_run.is_none());
+        assert_eq!(
+            run.tick_runs
+                .iter()
+                .map(|tick| tick.tick_run.placed_run.completed_stage_delta)
+                .collect::<Vec<_>>(),
+            vec![246, 246, 246]
+        );
+    }
+
+    #[test]
+    fn placed_model_package_runs_runtime_patched_duplicate_layer() {
+        let device = match VulkanComputeDevice::new() {
+            Ok(device) => device,
+            Err(error) => {
+                eprintln!("skipping placed model package duplicate layer patch: {error}");
+                return;
+            }
+        };
+        let manifest = fixture_model_package_manifest();
+        let manifest_path = fixture_model_package_manifest_path();
+        let manifest_dir = manifest_path.parent().unwrap();
+        let source_graph = manifest
+            .circuit_graph
+            .to_resolved_lowered_pedalboard(manifest_dir)
+            .unwrap();
+        let patch = StreamCircuitRuntimePatch::from_source_series(&source_graph, "gpu0")
+            .unwrap()
+            .duplicate_after_instance("layer_05", "layer_05_repeat")
+            .unwrap()
+            .with_instance_device("layer_05_repeat", "gpu1")
+            .unwrap();
+        let manifest = manifest.with_runtime_patch(&patch).unwrap();
+
+        let placed_package =
+            VulkanResidentGreedyInProcessPlacedModelPackage::from_manifest_for_devices(
+                &device,
+                manifest_dir,
+                manifest,
+                Some(4),
+            )
+            .unwrap();
+        assert_eq!(placed_package.device_ids, vec!["gpu0", "gpu1"]);
+        assert_eq!(placed_package.device_count, 2);
+        assert_eq!(placed_package.hosted_pedal_count, 15);
+        assert_eq!(placed_package.device("gpu1").unwrap().hosted_pedal_count, 1);
+
+        let run = placed_package
+            .sample_token_id_stream_tick_in_process(&device, 1, 0, 8)
+            .unwrap();
+
+        assert_eq!(
+            run.tick_run.placed_run.status,
+            VulkanMountedPlacedResidentInProcessStreamTickRunStatus::Completed
+        );
+        assert!(run.tick_run.placed_run.completed_stage_delta > 246);
+        assert_eq!(run.sampler_run.descriptor_count, 2);
     }
 
     #[test]

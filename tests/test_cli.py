@@ -11,10 +11,11 @@ from pathlib import Path
 
 from llmoop.cli import (
     build_runtime_command,
+    parse_duplicate_after_overrides,
     parse_pedal_device_overrides,
+    parse_source_chain,
     resolve_runtime_package_manifest,
 )
-from llmoop.model_compiler import ModelCompileError
 from llmoop.model_package import package_placement
 from tests.fixtures import compiled_model_or_skip
 
@@ -39,8 +40,14 @@ class RuntimeCliCommandTest(unittest.TestCase):
         package = Path("packages/model_x/vulkan_resident_greedy_package.json")
         args = Namespace(
             prompt="Hello",
+            inspect_package=False,
+            inspect_patch=False,
             inspect_placement=False,
             inspect_device_slice=None,
+            default_device_id=None,
+            place_pedal=[],
+            duplicate_after=[],
+            chain=None,
             max_new_tokens=4,
             capacity=8,
             no_special_tokens=True,
@@ -73,8 +80,14 @@ class RuntimeCliCommandTest(unittest.TestCase):
         package = Path("packages/model_x/vulkan_resident_greedy_package.json")
         args = Namespace(
             prompt=None,
+            inspect_package=False,
+            inspect_patch=False,
             inspect_placement=False,
             inspect_device_slice="gpu1",
+            default_device_id=None,
+            place_pedal=[],
+            duplicate_after=[],
+            chain=None,
             max_new_tokens=4,
             capacity=4,
             no_special_tokens=False,
@@ -102,8 +115,14 @@ class RuntimeCliCommandTest(unittest.TestCase):
         package = Path("packages/model_x/vulkan_resident_greedy_package.json")
         args = Namespace(
             prompt=None,
+            inspect_package=False,
+            inspect_patch=False,
             inspect_placement=True,
             inspect_device_slice=None,
+            default_device_id=None,
+            place_pedal=[],
+            duplicate_after=[],
+            chain=None,
             max_new_tokens=4,
             capacity=4,
             no_special_tokens=False,
@@ -126,6 +145,119 @@ class RuntimeCliCommandTest(unittest.TestCase):
             build_runtime_command(args, package),
         )
 
+    def test_build_runtime_command_can_inspect_package_without_prompt(self) -> None:
+        package = Path("packages/model_x/vulkan_resident_greedy_package.json")
+        args = Namespace(
+            prompt=None,
+            inspect_package=True,
+            inspect_patch=False,
+            inspect_placement=False,
+            inspect_device_slice=None,
+            default_device_id=None,
+            place_pedal=[],
+            duplicate_after=[],
+            chain=None,
+            max_new_tokens=4,
+            capacity=None,
+            no_special_tokens=False,
+            keep_special_tokens=False,
+            generated_only=False,
+            json=True,
+            runtime_bin=Path("/tmp/llmoop-runtime"),
+        )
+
+        self.assertEqual(
+            [
+                "/tmp/llmoop-runtime",
+                "--package",
+                str(package),
+                "--inspect-package",
+                "--json",
+            ],
+            build_runtime_command(args, package),
+        )
+
+    def test_build_runtime_command_can_inspect_patch_without_prompt(self) -> None:
+        package = Path("packages/model_x/vulkan_resident_greedy_package.json")
+        args = Namespace(
+            prompt=None,
+            inspect_package=False,
+            inspect_patch=True,
+            inspect_placement=False,
+            inspect_device_slice=None,
+            default_device_id=None,
+            place_pedal=["layer_05_repeat=gpu1"],
+            duplicate_after=[],
+            chain="layer_00,layer_05_repeat=layer_05,layer_13",
+            max_new_tokens=4,
+            capacity=None,
+            no_special_tokens=False,
+            keep_special_tokens=False,
+            generated_only=False,
+            json=True,
+            runtime_bin=Path("/tmp/llmoop-runtime"),
+        )
+
+        self.assertEqual(
+            [
+                "/tmp/llmoop-runtime",
+                "--package",
+                str(package),
+                "--inspect-patch",
+                "--place-pedal",
+                "layer_05_repeat=gpu1",
+                "--chain",
+                "layer_00,layer_05_repeat=layer_05,layer_13",
+                "--json",
+            ],
+            build_runtime_command(args, package),
+        )
+
+    def test_build_runtime_command_forwards_runtime_patch_overrides(self) -> None:
+        package = Path("packages/model_x/vulkan_resident_greedy_package.json")
+        args = Namespace(
+            prompt="Hello",
+            inspect_package=False,
+            inspect_patch=False,
+            inspect_placement=False,
+            inspect_device_slice=None,
+            default_device_id="gpu0",
+            place_pedal=["layer_02=gpu1", "layer_07=lan:worker-a"],
+            duplicate_after=["layer_05=layer_05_repeat"],
+            chain="layer_00,layer_01,layer_05,layer_05_repeat=layer_05,layer_06",
+            max_new_tokens=4,
+            capacity=None,
+            no_special_tokens=False,
+            keep_special_tokens=False,
+            generated_only=False,
+            json=True,
+            runtime_bin=Path("/tmp/llmoop-runtime"),
+        )
+
+        self.assertEqual(
+            [
+                "/tmp/llmoop-runtime",
+                "--package",
+                str(package),
+                "--prompt",
+                "Hello",
+                "--max-new-tokens",
+                "4",
+                "--device",
+                "gpu0",
+                "--place-pedal",
+                "layer_02=gpu1",
+                "--place-pedal",
+                "layer_07=lan:worker-a",
+                "--duplicate-after",
+                "layer_05=layer_05_repeat",
+                "--chain",
+                "layer_00,layer_01,layer_05,layer_05_repeat=layer_05,layer_06",
+                "--json",
+            ],
+            build_runtime_command(args, package),
+        )
+
     def test_parse_pedal_device_overrides_requires_explicit_pedal_device_pairs(self) -> None:
         self.assertEqual(
             {"layer_02": "gpu1", "layer_03": "lan:worker-a"},
@@ -137,33 +269,55 @@ class RuntimeCliCommandTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "duplicate"):
             parse_pedal_device_overrides(["layer_02=gpu1", "layer_02=gpu2"])
 
+    def test_parse_duplicate_after_overrides_requires_explicit_instance_pairs(self) -> None:
+        self.assertEqual(
+            {"layer_05": "layer_05_repeat", "layer_07": "layer_07_repeat"},
+            parse_duplicate_after_overrides(
+                ["layer_05=layer_05_repeat", " layer_07 = layer_07_repeat "]
+            ),
+        )
+
+        with self.assertRaisesRegex(ValueError, "expected AFTER=NEW"):
+            parse_duplicate_after_overrides(["layer_05"])
+        with self.assertRaisesRegex(ValueError, "duplicate"):
+            parse_duplicate_after_overrides(
+                ["layer_05=layer_repeat", "layer_07=layer_repeat"]
+            )
+
+    def test_parse_source_chain_accepts_sources_and_explicit_instances(self) -> None:
+        self.assertEqual(
+            [
+                ("layer_00", "layer_00"),
+                ("layer_05_repeat", "layer_05"),
+                ("layer_06", "layer_06"),
+            ],
+            parse_source_chain("layer_00, layer_05_repeat = layer_05, layer_06"),
+        )
+        self.assertEqual(
+            [
+                ("layer_00", "layer_00"),
+                ("layer_05_repeat", "layer_05"),
+                ("layer_06", "layer_06"),
+            ],
+            parse_source_chain("layer_00 -> layer_05_repeat=layer_05 -> layer_06"),
+        )
+
+        with self.assertRaisesRegex(ValueError, "items must not be empty"):
+            parse_source_chain("layer_00,,layer_01")
+        with self.assertRaisesRegex(ValueError, "duplicate"):
+            parse_source_chain("layer_05,layer_05")
+
 
 class PackagePlacementTest(unittest.TestCase):
-    def test_package_placement_records_default_device_and_overrides(self) -> None:
-        lowered_index = {"graph": {"circuits": [{"id": "layer_00"}, {"id": "layer_02"}]}}
-
+    def test_package_placement_is_neutral_default_patch(self) -> None:
         self.assertEqual(
             {
                 "schema": "llmoop.stream_circuit_placement.v1",
                 "default_device_id": "gpu0",
-                "pedal_devices": {"layer_00": "cpu0", "layer_02": "gpu1"},
+                "pedal_devices": {},
             },
-            package_placement(
-                lowered_index,
-                default_device_id="gpu0",
-                pedal_devices={"layer_02": "gpu1", "layer_00": "cpu0"},
-            ),
+            package_placement(),
         )
-
-    def test_package_placement_rejects_unknown_pedals(self) -> None:
-        lowered_index = {"graph": {"circuits": [{"id": "layer_00"}]}}
-
-        with self.assertRaisesRegex(ModelCompileError, "unknown pedal 'layer_99'"):
-            package_placement(
-                lowered_index,
-                default_device_id="gpu0",
-                pedal_devices={"layer_99": "gpu1"},
-            )
 
 
 class CompiledPackageTest(unittest.TestCase):
