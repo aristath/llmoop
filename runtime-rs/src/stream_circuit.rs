@@ -1828,6 +1828,27 @@ pub struct RuntimeTopologyReport {
     pub effective: RuntimeEffectivePedalboardTopology,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RuntimePackageInspectionReport {
+    pub ok: bool,
+    pub package_manifest: PathBuf,
+    pub package_root: PathBuf,
+    pub schema: String,
+    pub package_id: String,
+    pub config_path: String,
+    pub tokenizer: Value,
+    pub compiled_wiring: String,
+    pub compiled_default_device_id: String,
+    pub compiled_pedal_devices: BTreeMap<String, String>,
+    pub runtime_patch: RuntimePatchControls,
+    pub device_bindings: RuntimeDeviceBindings,
+    pub dynamic_state_capacity_activations: usize,
+    pub capacity_profiles: Vec<RuntimeCapacityProfileSummary>,
+    pub source_pedal_count: usize,
+    pub source_pedals: Vec<RuntimeSourcePedal>,
+    pub available_devices: Vec<RuntimeAvailableDevice>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeLocalCableBufferReport {
     pub cable_index: usize,
@@ -3077,6 +3098,56 @@ mod tests {
             true
         );
         assert_eq!(payload["effective"]["pedals"][0]["pedal_id"], "layer_00");
+    }
+
+    #[test]
+    fn runtime_package_inspection_report_serializes_box_of_parts_contract() {
+        let report = RuntimePackageInspectionReport {
+            ok: true,
+            package_manifest: PathBuf::from("package.json"),
+            package_root: PathBuf::from("."),
+            schema: "llmoop.vulkan_resident_greedy_model_package.v1".to_string(),
+            package_id: "model-test".to_string(),
+            config_path: "config.json".to_string(),
+            tokenizer: serde_json::json!({"path": "tokenizer"}),
+            compiled_wiring: "series".to_string(),
+            compiled_default_device_id: "runtime_default".to_string(),
+            compiled_pedal_devices: BTreeMap::new(),
+            runtime_patch: RuntimePatchControls {
+                default_device_id: None,
+                pedal_devices: BTreeMap::new(),
+                source_chain: None,
+                duplicate_after: Vec::new(),
+            },
+            device_bindings: RuntimeDeviceBindings::from_vulkan_targets(
+                &Vec::<String>::new(),
+                &BTreeMap::new(),
+                Some(0),
+                |target| {
+                    if let Some(index) = target.strip_prefix("vulkan:") {
+                        return index.parse::<usize>().map(Some).map_err(|error| {
+                            format!("invalid Vulkan physical device reference {target:?}: {error}")
+                        });
+                    }
+                    Ok(None)
+                },
+            ),
+            dynamic_state_capacity_activations: 16,
+            capacity_profiles: Vec::new(),
+            source_pedal_count: 0,
+            source_pedals: Vec::new(),
+            available_devices: Vec::new(),
+        };
+
+        let payload = serde_json::to_value(&report).unwrap();
+
+        assert_eq!(payload["package_id"], "model-test");
+        assert_eq!(payload["compiled_default_device_id"], "runtime_default");
+        assert_eq!(
+            payload["runtime_patch"]["default_device_id"],
+            serde_json::Value::Null
+        );
+        assert_eq!(payload["source_pedal_count"], 0);
     }
 
     #[test]

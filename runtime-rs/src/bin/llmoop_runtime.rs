@@ -10,9 +10,9 @@ use llmoop_runtime::{
     RuntimeCableRouteTarget, RuntimeCableRoutes, RuntimeCapacityProfileSummary,
     RuntimeCompiledPedalboardSummary, RuntimeDeviceBindings, RuntimeDeviceSliceReport,
     RuntimeDeviceTickPlanReport, RuntimeEffectivePedalboardTopology, RuntimeLocalCableBufferReport,
-    RuntimePatchControls, RuntimePatchDuplicateAfterControl, RuntimePatchSourceChainEntry,
-    RuntimePedalPortSummary, RuntimePlacementReport, RuntimeRemoteCableBufferReport,
-    RuntimeSourcePedal, RuntimeTopologyReport, VulkanComputeDevice,
+    RuntimePackageInspectionReport, RuntimePatchControls, RuntimePatchDuplicateAfterControl,
+    RuntimePatchSourceChainEntry, RuntimePedalPortSummary, RuntimePlacementReport,
+    RuntimeRemoteCableBufferReport, RuntimeSourcePedal, RuntimeTopologyReport, VulkanComputeDevice,
     VulkanResidentGreedyInProcessPlacedModelPackage, VulkanResidentGreedyModelPackage,
     VulkanResidentGreedyModelPackageDeviceSlice, VulkanResidentGreedyModelPackageManifest,
     VulkanResidentHfTokenizerTextCodec, VulkanResidentTokenEngine,
@@ -499,43 +499,37 @@ fn inspect_package(
     let source_pedals = source_pedals_report(&manifest);
     let source_pedal_count = source_pedals.len();
     let capacity_profiles = capacity_profiles_report(&manifest);
-    let payload = json!({
-        "ok": true,
-        "package_manifest": package_manifest,
-        "package_root": manifest_dir,
-        "schema": manifest.schema,
-        "package_id": manifest.package_id,
-        "config_path": manifest.config_path,
-        "tokenizer": manifest.tokenizer,
-        "compiled_wiring": manifest.circuit_graph.wiring,
-        "compiled_default_device_id": manifest.placement.default_device_id,
-        "compiled_pedal_devices": manifest.placement.pedal_devices,
-        "runtime_patch": runtime_patch_report(args),
-        "device_bindings": runtime_device_bindings_report(args, &[]),
-        "dynamic_state_capacity_activations": manifest.dynamic_state_capacity_activations,
-        "capacity_profiles": capacity_profiles,
-        "source_pedal_count": source_pedal_count,
-        "source_pedals": source_pedals,
-        "available_devices": available_devices,
-    });
+    let payload = RuntimePackageInspectionReport {
+        ok: true,
+        package_manifest: package_manifest.to_path_buf(),
+        package_root: manifest_dir.to_path_buf(),
+        schema: manifest.schema.clone(),
+        package_id: manifest.package_id.clone(),
+        config_path: manifest.config_path.clone(),
+        tokenizer: serde_json::to_value(&manifest.tokenizer)?,
+        compiled_wiring: manifest.circuit_graph.wiring.clone(),
+        compiled_default_device_id: manifest.placement.default_device_id.clone(),
+        compiled_pedal_devices: manifest.placement.pedal_devices.clone(),
+        runtime_patch: runtime_patch_report(args),
+        device_bindings: runtime_device_bindings_report(args, &[]),
+        dynamic_state_capacity_activations: manifest.dynamic_state_capacity_activations,
+        capacity_profiles,
+        source_pedal_count,
+        source_pedals,
+        available_devices,
+    };
 
     if args.json {
         println!("{}", serde_json::to_string_pretty(&payload)?);
     } else {
-        println!("package_id={}", payload["package_id"]);
-        println!("source_pedal_count={}", payload["source_pedal_count"]);
-        println!("compiled_wiring={}", payload["compiled_wiring"]);
-        println!(
-            "default_device_id={}",
-            payload["compiled_default_device_id"]
-        );
-        for pedal in payload["source_pedals"].as_array().into_iter().flatten() {
+        println!("package_id={}", payload.package_id);
+        println!("source_pedal_count={}", payload.source_pedal_count);
+        println!("compiled_wiring={}", payload.compiled_wiring);
+        println!("default_device_id={}", payload.compiled_default_device_id);
+        for pedal in &payload.source_pedals {
             println!(
                 "{} {} kernels={} state_ports={}",
-                pedal["pedal_id"],
-                pedal["operator_type"],
-                pedal["kernel_count"],
-                pedal["state_port_count"]
+                pedal.pedal_id, pedal.operator_type, pedal.kernel_count, pedal.state_port_count
             );
         }
     }
