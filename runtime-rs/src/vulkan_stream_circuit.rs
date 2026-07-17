@@ -1764,6 +1764,19 @@ impl VulkanInProcessPlacedCableTransport {
         self.ready_direct_cables.contains(key)
     }
 
+    pub fn reset_tick_state(&mut self) {
+        self.packets.clear();
+        self.ready_direct_cables.clear();
+        self.published_packet_count = 0;
+        self.published_byte_count = 0;
+        self.received_packet_count = 0;
+        self.received_byte_count = 0;
+        self.direct_copy_count = 0;
+        self.direct_copy_byte_count = 0;
+        self.direct_receive_count = 0;
+        self.direct_receive_byte_count = 0;
+    }
+
     pub fn register_direct_cable_copy(
         &mut self,
         device: &VulkanComputeDevice,
@@ -1777,6 +1790,9 @@ impl VulkanInProcessPlacedCableTransport {
                 outgoing_key,
                 incoming_key,
             });
+        }
+        if self.direct_copies.contains_key(&outgoing_key) {
+            return Ok(());
         }
         if outgoing.byte_capacity != incoming.byte_capacity {
             return Err(VulkanPlacedCableTransportError::ByteCapacityMismatch {
@@ -7048,6 +7064,24 @@ impl VulkanResidentGreedyInProcessPlacedModelPackage {
         VulkanResidentGreedyInProcessPlacedModelPackageError,
     > {
         let mut transport = VulkanInProcessPlacedCableTransport::new();
+        self.run_stream_tick_in_process_with_transport(
+            device,
+            &mut transport,
+            stream_tick,
+            max_scheduler_turns,
+        )
+    }
+
+    pub fn run_stream_tick_in_process_with_transport(
+        &self,
+        device: &VulkanComputeDevice,
+        transport: &mut VulkanInProcessPlacedCableTransport,
+        stream_tick: u64,
+        max_scheduler_turns: usize,
+    ) -> Result<
+        VulkanMountedPlacedResidentInProcessStreamTickRun,
+        VulkanResidentGreedyInProcessPlacedModelPackageError,
+    > {
         let mut tick_slices = Vec::with_capacity(self.device_slices.len());
 
         for slice in &self.device_slices {
@@ -7067,7 +7101,7 @@ impl VulkanResidentGreedyInProcessPlacedModelPackage {
 
         run_mounted_placed_resident_stream_tick_slices_in_process(
             &mut tick_slices,
-            &mut transport,
+            transport,
             max_scheduler_turns,
         )
         .map_err(VulkanResidentGreedyInProcessPlacedModelPackageError::Tick)
@@ -7083,6 +7117,24 @@ impl VulkanResidentGreedyInProcessPlacedModelPackage {
         VulkanResidentGreedyInProcessPlacedModelPackageError,
     > {
         let mut transport = VulkanInProcessPlacedCableTransport::new();
+        self.run_stream_tick_on_bound_devices_in_process_with_transport(
+            devices,
+            &mut transport,
+            stream_tick,
+            max_scheduler_turns,
+        )
+    }
+
+    pub fn run_stream_tick_on_bound_devices_in_process_with_transport(
+        &self,
+        devices: &BTreeMap<String, Arc<VulkanComputeDevice>>,
+        transport: &mut VulkanInProcessPlacedCableTransport,
+        stream_tick: u64,
+        max_scheduler_turns: usize,
+    ) -> Result<
+        VulkanMountedPlacedResidentInProcessStreamTickRun,
+        VulkanResidentGreedyInProcessPlacedModelPackageError,
+    > {
         let mut tick_slices = Vec::with_capacity(self.device_slices.len());
 
         for slice in &self.device_slices {
@@ -7110,7 +7162,7 @@ impl VulkanResidentGreedyInProcessPlacedModelPackage {
 
         run_mounted_placed_resident_stream_tick_slices_in_process(
             &mut tick_slices,
-            &mut transport,
+            transport,
             max_scheduler_turns,
         )
         .map_err(VulkanResidentGreedyInProcessPlacedModelPackageError::Tick)
@@ -7126,12 +7178,37 @@ impl VulkanResidentGreedyInProcessPlacedModelPackage {
         VulkanResidentGreedyInProcessPlacedSingleTokenTickRun,
         VulkanResidentGreedyInProcessPlacedModelPackageError,
     > {
+        let mut transport = VulkanInProcessPlacedCableTransport::new();
+        self.run_token_id_stream_tick_in_process_with_transport(
+            device,
+            &mut transport,
+            token_id,
+            stream_tick,
+            max_scheduler_turns,
+        )
+    }
+
+    pub fn run_token_id_stream_tick_in_process_with_transport(
+        &self,
+        device: &VulkanComputeDevice,
+        transport: &mut VulkanInProcessPlacedCableTransport,
+        token_id: u32,
+        stream_tick: u64,
+        max_scheduler_turns: usize,
+    ) -> Result<
+        VulkanResidentGreedyInProcessPlacedSingleTokenTickRun,
+        VulkanResidentGreedyInProcessPlacedModelPackageError,
+    > {
         let input_run = self
             .input_transducer
             .run_token_id(device, token_id)
             .map_err(VulkanResidentGreedyInProcessPlacedModelPackageError::InputTransducer)?;
-        let placed_run =
-            self.run_stream_tick_in_process(device, stream_tick, max_scheduler_turns)?;
+        let placed_run = self.run_stream_tick_in_process_with_transport(
+            device,
+            transport,
+            stream_tick,
+            max_scheduler_turns,
+        )?;
         if placed_run.status != VulkanMountedPlacedResidentInProcessStreamTickRunStatus::Completed {
             return Err(
                 VulkanResidentGreedyInProcessPlacedModelPackageError::IncompleteTick(
@@ -7163,6 +7240,27 @@ impl VulkanResidentGreedyInProcessPlacedModelPackage {
         VulkanResidentGreedyInProcessPlacedSingleTokenTickRun,
         VulkanResidentGreedyInProcessPlacedModelPackageError,
     > {
+        let mut transport = VulkanInProcessPlacedCableTransport::new();
+        self.run_token_id_stream_tick_on_bound_devices_in_process_with_transport(
+            devices,
+            &mut transport,
+            token_id,
+            stream_tick,
+            max_scheduler_turns,
+        )
+    }
+
+    pub fn run_token_id_stream_tick_on_bound_devices_in_process_with_transport(
+        &self,
+        devices: &BTreeMap<String, Arc<VulkanComputeDevice>>,
+        transport: &mut VulkanInProcessPlacedCableTransport,
+        token_id: u32,
+        stream_tick: u64,
+        max_scheduler_turns: usize,
+    ) -> Result<
+        VulkanResidentGreedyInProcessPlacedSingleTokenTickRun,
+        VulkanResidentGreedyInProcessPlacedModelPackageError,
+    > {
         let boundary_device = devices
             .get(&self.boundary_device_id)
             .map(|device| device.as_ref())
@@ -7175,8 +7273,9 @@ impl VulkanResidentGreedyInProcessPlacedModelPackage {
             .input_transducer
             .run_token_id(boundary_device, token_id)
             .map_err(VulkanResidentGreedyInProcessPlacedModelPackageError::InputTransducer)?;
-        let placed_run = self.run_stream_tick_on_bound_devices_in_process(
+        let placed_run = self.run_stream_tick_on_bound_devices_in_process_with_transport(
             devices,
+            transport,
             stream_tick,
             max_scheduler_turns,
         )?;
@@ -7211,8 +7310,30 @@ impl VulkanResidentGreedyInProcessPlacedModelPackage {
         VulkanResidentGreedyInProcessPlacedSingleTokenSampleRun,
         VulkanResidentGreedyInProcessPlacedModelPackageError,
     > {
-        let tick_run = self.run_token_id_stream_tick_in_process(
+        let mut transport = VulkanInProcessPlacedCableTransport::new();
+        self.sample_token_id_stream_tick_in_process_with_transport(
             device,
+            &mut transport,
+            token_id,
+            stream_tick,
+            max_scheduler_turns,
+        )
+    }
+
+    pub fn sample_token_id_stream_tick_in_process_with_transport(
+        &self,
+        device: &VulkanComputeDevice,
+        transport: &mut VulkanInProcessPlacedCableTransport,
+        token_id: u32,
+        stream_tick: u64,
+        max_scheduler_turns: usize,
+    ) -> Result<
+        VulkanResidentGreedyInProcessPlacedSingleTokenSampleRun,
+        VulkanResidentGreedyInProcessPlacedModelPackageError,
+    > {
+        let tick_run = self.run_token_id_stream_tick_in_process_with_transport(
+            device,
+            transport,
             token_id,
             stream_tick,
             max_scheduler_turns,
@@ -7245,6 +7366,7 @@ impl VulkanResidentGreedyInProcessPlacedModelPackage {
         let mut input_token_id = initial_token_id;
         let mut tick_runs = Vec::with_capacity(max_ticks);
         let mut sampled_token_ids = Vec::with_capacity(max_ticks);
+        let mut transport = VulkanInProcessPlacedCableTransport::new();
 
         for tick_index in 0..max_ticks {
             let stream_tick = start_stream_tick
@@ -7253,8 +7375,9 @@ impl VulkanResidentGreedyInProcessPlacedModelPackage {
                 })?)
                 .ok_or(VulkanResidentGreedyInProcessPlacedModelPackageError::StreamTickOverflow)?;
             self.ensure_stream_tick_capacity(stream_tick)?;
-            let tick_run = self.sample_token_id_stream_tick_in_process(
+            let tick_run = self.sample_token_id_stream_tick_in_process_with_transport(
                 device,
+                &mut transport,
                 input_token_id,
                 stream_tick,
                 max_scheduler_turns_per_tick,
@@ -7300,6 +7423,7 @@ impl VulkanResidentGreedyInProcessPlacedModelPackage {
         let mut generated_token_ids = Vec::with_capacity(max_new_tokens);
         let mut remaining_public_outputs = max_new_tokens;
         let mut stop_reason = (max_new_tokens == 0).then(|| "max_new_tokens".to_string());
+        let mut transport = VulkanInProcessPlacedCableTransport::new();
 
         while external_input_index < prompt_token_ids.len() || pending_feedback.is_some() {
             let (input_token_id, input_route, input_feedback_depth, input_closes_loop) =
@@ -7330,8 +7454,9 @@ impl VulkanResidentGreedyInProcessPlacedModelPackage {
                 })?)
                 .ok_or(VulkanResidentGreedyInProcessPlacedModelPackageError::StreamTickOverflow)?;
             self.ensure_stream_tick_capacity(stream_tick)?;
-            let tick_run = self.run_token_id_stream_tick_in_process(
+            let tick_run = self.run_token_id_stream_tick_in_process_with_transport(
                 device,
+                &mut transport,
                 input_token_id,
                 stream_tick,
                 max_scheduler_turns_per_tick,
@@ -7441,6 +7566,7 @@ impl VulkanResidentGreedyInProcessPlacedModelPackage {
         let mut generated_token_ids = Vec::with_capacity(max_new_tokens);
         let mut remaining_public_outputs = max_new_tokens;
         let mut stop_reason = (max_new_tokens == 0).then(|| "max_new_tokens".to_string());
+        let mut transport = VulkanInProcessPlacedCableTransport::new();
 
         while external_input_index < prompt_token_ids.len() || pending_feedback.is_some() {
             let (input_token_id, input_route, input_feedback_depth, input_closes_loop) =
@@ -7471,12 +7597,14 @@ impl VulkanResidentGreedyInProcessPlacedModelPackage {
                 })?)
                 .ok_or(VulkanResidentGreedyInProcessPlacedModelPackageError::StreamTickOverflow)?;
             self.ensure_stream_tick_capacity(stream_tick)?;
-            let tick_run = self.run_token_id_stream_tick_on_bound_devices_in_process(
-                devices,
-                input_token_id,
-                stream_tick,
-                max_scheduler_turns_per_tick,
-            )?;
+            let tick_run = self
+                .run_token_id_stream_tick_on_bound_devices_in_process_with_transport(
+                    devices,
+                    &mut transport,
+                    input_token_id,
+                    stream_tick,
+                    max_scheduler_turns_per_tick,
+                )?;
 
             let external_inputs_remaining = prompt_token_ids.len() - external_input_index;
             let should_emit_public_output =
@@ -12089,6 +12217,7 @@ pub fn run_mounted_placed_resident_stream_tick_slices_in_process(
     VulkanMountedPlacedResidentInProcessStreamTickRun,
     VulkanMountedPlacedResidentInProcessStreamTickError,
 > {
+    transport.reset_tick_state();
     register_same_device_direct_cable_copies(slices, transport)?;
 
     let mut scheduler_turn_count = 0usize;
