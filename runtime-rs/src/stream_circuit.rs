@@ -1829,6 +1829,68 @@ pub struct RuntimeTopologyReport {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeLocalCableBufferReport {
+    pub cable_index: usize,
+    pub signal: String,
+    pub source_pedal_id: String,
+    pub destination_pedal_id: String,
+    pub device_id: String,
+    pub byte_capacity: Option<usize>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeRemoteCableBufferReport {
+    pub cable_index: usize,
+    pub signal: String,
+    pub source_device_id: String,
+    pub source_pedal_id: String,
+    pub destination_device_id: String,
+    pub destination_pedal_id: String,
+    pub byte_capacity: Option<usize>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeDeviceTickPlanReport {
+    pub stage_count: usize,
+    pub receive_stage_count: usize,
+    pub dispatch_stage_count: usize,
+    pub publish_stage_count: usize,
+    pub local_cable_read_count: usize,
+    pub local_cable_write_count: usize,
+    pub incoming_cable_read_count: usize,
+    pub outgoing_cable_write_count: usize,
+    pub model_input_read_count: usize,
+    pub model_output_write_count: usize,
+    pub can_execute: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeDeviceSliceReport {
+    pub ok: bool,
+    pub package_manifest: PathBuf,
+    pub device_name: String,
+    pub device_id: String,
+    pub resident_capacity_activations: usize,
+    pub hosted_pedals: Vec<String>,
+    pub local_cables: Vec<RuntimeLocalCableBufferReport>,
+    pub incoming_cables: Vec<RuntimeRemoteCableBufferReport>,
+    pub outgoing_cables: Vec<RuntimeRemoteCableBufferReport>,
+    pub hosted_pedal_count: usize,
+    pub incoming_cable_count: usize,
+    pub outgoing_cable_count: usize,
+    pub permanent_parameter_count: usize,
+    pub permanent_parameter_bytes: usize,
+    pub reusable_kernel_word_count: usize,
+    pub loaded_kernel_artifact_count: usize,
+    pub dispatch_count: usize,
+    pub descriptor_count: usize,
+    pub model_boundary_descriptor_count: usize,
+    pub incoming_cable_descriptor_count: usize,
+    pub outgoing_cable_descriptor_count: usize,
+    pub tick_plan: RuntimeDeviceTickPlanReport,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeCapacityProfileSummary {
     pub min_dynamic_state_capacity_activations: usize,
     pub max_dynamic_state_capacity_activations: usize,
@@ -3001,6 +3063,81 @@ mod tests {
             true
         );
         assert_eq!(payload["effective"]["pedals"][0]["pedal_id"], "layer_00");
+    }
+
+    #[test]
+    fn runtime_device_slice_report_serializes_mounted_device_contract() {
+        let report = RuntimeDeviceSliceReport {
+            ok: true,
+            package_manifest: PathBuf::from("package.json"),
+            device_name: "Radeon Test Device".to_string(),
+            device_id: "gpu1".to_string(),
+            resident_capacity_activations: 16,
+            hosted_pedals: vec!["layer_05".to_string(), "layer_06".to_string()],
+            local_cables: vec![RuntimeLocalCableBufferReport {
+                cable_index: 5,
+                signal: "hidden_state".to_string(),
+                source_pedal_id: "layer_05".to_string(),
+                destination_pedal_id: "layer_06".to_string(),
+                device_id: "gpu1".to_string(),
+                byte_capacity: Some(4096),
+            }],
+            incoming_cables: vec![RuntimeRemoteCableBufferReport {
+                cable_index: 4,
+                signal: "hidden_state".to_string(),
+                source_device_id: "gpu0".to_string(),
+                source_pedal_id: "layer_04".to_string(),
+                destination_device_id: "gpu1".to_string(),
+                destination_pedal_id: "layer_05".to_string(),
+                byte_capacity: Some(4096),
+            }],
+            outgoing_cables: vec![RuntimeRemoteCableBufferReport {
+                cable_index: 6,
+                signal: "hidden_state".to_string(),
+                source_device_id: "gpu1".to_string(),
+                source_pedal_id: "layer_06".to_string(),
+                destination_device_id: "gpu2".to_string(),
+                destination_pedal_id: "layer_07".to_string(),
+                byte_capacity: Some(4096),
+            }],
+            hosted_pedal_count: 2,
+            incoming_cable_count: 1,
+            outgoing_cable_count: 1,
+            permanent_parameter_count: 12,
+            permanent_parameter_bytes: 2048,
+            reusable_kernel_word_count: 128,
+            loaded_kernel_artifact_count: 4,
+            dispatch_count: 8,
+            descriptor_count: 24,
+            model_boundary_descriptor_count: 2,
+            incoming_cable_descriptor_count: 1,
+            outgoing_cable_descriptor_count: 1,
+            tick_plan: RuntimeDeviceTickPlanReport {
+                stage_count: 4,
+                receive_stage_count: 1,
+                dispatch_stage_count: 2,
+                publish_stage_count: 1,
+                local_cable_read_count: 1,
+                local_cable_write_count: 1,
+                incoming_cable_read_count: 1,
+                outgoing_cable_write_count: 1,
+                model_input_read_count: 0,
+                model_output_write_count: 0,
+                can_execute: true,
+            },
+        };
+
+        let payload = serde_json::to_value(&report).unwrap();
+
+        assert_eq!(payload["device_id"], "gpu1");
+        assert_eq!(payload["hosted_pedals"][0], "layer_05");
+        assert_eq!(payload["local_cables"][0]["byte_capacity"], 4096);
+        assert_eq!(payload["incoming_cables"][0]["source_device_id"], "gpu0");
+        assert_eq!(
+            payload["outgoing_cables"][0]["destination_device_id"],
+            "gpu2"
+        );
+        assert_eq!(payload["tick_plan"]["can_execute"], true);
     }
 
     #[test]

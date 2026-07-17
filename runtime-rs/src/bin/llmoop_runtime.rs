@@ -8,16 +8,18 @@ use llmoop_runtime::{
     CircuitPort, PedalCablePlacement, PedalPlacement, RUNTIME_TOPOLOGY_SCHEMA,
     RuntimeAvailableDevice, RuntimeAvailableMemoryHeap, RuntimeBoundDevice,
     RuntimeCableRouteTarget, RuntimeCableRoutes, RuntimeCapacityProfileSummary,
-    RuntimeCompiledPedalboardSummary, RuntimeDeviceBindings, RuntimeEffectivePedalboardTopology,
+    RuntimeCompiledPedalboardSummary, RuntimeDeviceBindings, RuntimeDeviceSliceReport,
+    RuntimeDeviceTickPlanReport, RuntimeEffectivePedalboardTopology, RuntimeLocalCableBufferReport,
     RuntimePatchControls, RuntimePatchDuplicateAfterControl, RuntimePatchSourceChainEntry,
-    RuntimePedalPortSummary, RuntimeSourcePedal, RuntimeTopologyReport, VulkanComputeDevice,
-    VulkanResidentGreedyInProcessPlacedModelPackage, VulkanResidentGreedyModelPackage,
-    VulkanResidentGreedyModelPackageDeviceSlice, VulkanResidentGreedyModelPackageManifest,
-    VulkanResidentHfTokenizerTextCodec, VulkanResidentTokenEngine,
-    VulkanResidentTokenEngineRunBudget, VulkanResidentTokenEngineRunStopCondition,
-    VulkanResidentTokenTextCodec, VulkanReusableKernelArtifactManifest,
+    RuntimePedalPortSummary, RuntimeRemoteCableBufferReport, RuntimeSourcePedal,
+    RuntimeTopologyReport, VulkanComputeDevice, VulkanResidentGreedyInProcessPlacedModelPackage,
+    VulkanResidentGreedyModelPackage, VulkanResidentGreedyModelPackageDeviceSlice,
+    VulkanResidentGreedyModelPackageManifest, VulkanResidentHfTokenizerTextCodec,
+    VulkanResidentTokenEngine, VulkanResidentTokenEngineRunBudget,
+    VulkanResidentTokenEngineRunStopCondition, VulkanResidentTokenTextCodec,
+    VulkanReusableKernelArtifactManifest,
 };
-use serde_json::{Value, json};
+use serde_json::json;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Args {
@@ -824,13 +826,13 @@ fn inspect_device_slice(
     if args.json {
         println!("{}", serde_json::to_string_pretty(&payload)?);
     } else {
-        println!("device_id={}", payload["device_id"]);
-        println!("hosted_pedal_count={}", payload["hosted_pedal_count"]);
-        println!("incoming_cable_count={}", payload["incoming_cable_count"]);
-        println!("outgoing_cable_count={}", payload["outgoing_cable_count"]);
-        println!("dispatch_count={}", payload["dispatch_count"]);
-        println!("descriptor_count={}", payload["descriptor_count"]);
-        println!("tick_stage_count={}", payload["tick_plan"]["stage_count"]);
+        println!("device_id={}", payload.device_id);
+        println!("hosted_pedal_count={}", payload.hosted_pedal_count);
+        println!("incoming_cable_count={}", payload.incoming_cable_count);
+        println!("outgoing_cable_count={}", payload.outgoing_cable_count);
+        println!("dispatch_count={}", payload.dispatch_count);
+        println!("descriptor_count={}", payload.descriptor_count);
+        println!("tick_stage_count={}", payload.tick_plan.stage_count);
     }
 
     Ok(())
@@ -874,22 +876,22 @@ fn inspect_placement(
         "bound_devices": bound_devices_report(&bound_devices),
         "cable_routes": bound_cable_routes_report(&bound_devices, &placement.cables),
         "device_count": device_ids.len(),
-        "device_ids": device_ids,
-        "devices": slices,
+        "device_ids": &device_ids,
+        "devices": &slices,
     });
 
     if args.json {
         println!("{}", serde_json::to_string_pretty(&payload)?);
     } else {
-        println!("device_count={}", payload["device_count"]);
-        for device in payload["devices"].as_array().into_iter().flatten() {
+        println!("device_count={}", device_ids.len());
+        for device in &slices {
             println!(
                 "{} pedals={} incoming={} outgoing={} dispatches={}",
-                device["device_id"],
-                device["hosted_pedal_count"],
-                device["incoming_cable_count"],
-                device["outgoing_cable_count"],
-                device["dispatch_count"]
+                device.device_id,
+                device.hosted_pedal_count,
+                device.incoming_cable_count,
+                device.outgoing_cable_count,
+                device.dispatch_count
             );
         }
     }
@@ -904,7 +906,7 @@ fn inspect_device_slice_payload(
     manifest: VulkanResidentGreedyModelPackageManifest,
     device_id: &str,
     capacity: usize,
-) -> Result<Value, Box<dyn Error>> {
+) -> Result<RuntimeDeviceSliceReport, Box<dyn Error>> {
     let slice = VulkanResidentGreedyModelPackageDeviceSlice::from_manifest_for_device(
         device,
         manifest_dir,
@@ -924,66 +926,88 @@ fn inspect_device_slice_payload(
     let mounted_bound = mounted.mounted_placed_bound_dispatch_plan(&reusable_manifest)?;
     let tick_plan = mounted.stream_tick_plan(&reusable_manifest)?;
     let resident_plan = &mounted.placed_plan.placed_resident_plan;
+    let loaded_kernel_artifact_count = slice.loaded_manifest().artifacts.len();
 
-    Ok(json!({
-        "ok": true,
-        "package_manifest": package_manifest,
-        "device_name": device.device_name(),
-        "device_id": slice.device_id,
-        "resident_capacity_activations": capacity,
-        "hosted_pedals": resident_plan.hosted_pedal_ids,
-        "local_cables": resident_plan.local_cables.iter().map(|cable| json!({
-            "cable_index": cable.cable_index,
-            "signal": cable.signal,
-            "source_pedal_id": cable.source_pedal_id,
-            "destination_pedal_id": cable.destination_pedal_id,
-            "device_id": cable.source_device_id,
-            "byte_capacity": mounted.cable_io.local_cable_buffer(cable.cable_index).map(|buffer| buffer.byte_capacity),
-        })).collect::<Vec<_>>(),
-        "incoming_cables": resident_plan.incoming_cables.iter().map(|cable| json!({
-            "cable_index": cable.cable_index,
-            "signal": cable.signal,
-            "source_device_id": cable.source_device_id,
-            "source_pedal_id": cable.source_pedal_id,
-            "destination_device_id": cable.destination_device_id,
-            "destination_pedal_id": cable.destination_pedal_id,
-            "byte_capacity": mounted.cable_io.incoming_buffer(cable.cable_index).map(|buffer| buffer.byte_capacity),
-        })).collect::<Vec<_>>(),
-        "outgoing_cables": resident_plan.outgoing_cables.iter().map(|cable| json!({
-            "cable_index": cable.cable_index,
-            "signal": cable.signal,
-            "source_device_id": cable.source_device_id,
-            "source_pedal_id": cable.source_pedal_id,
-            "destination_device_id": cable.destination_device_id,
-            "destination_pedal_id": cable.destination_pedal_id,
-            "byte_capacity": mounted.cable_io.outgoing_buffer(cable.cable_index).map(|buffer| buffer.byte_capacity),
-        })).collect::<Vec<_>>(),
-        "hosted_pedal_count": slice.hosted_pedal_count,
-        "incoming_cable_count": slice.incoming_cable_count,
-        "outgoing_cable_count": slice.outgoing_cable_count,
-        "permanent_parameter_count": slice.permanent_parameter_count,
-        "permanent_parameter_bytes": slice.permanent_parameter_bytes,
-        "reusable_kernel_word_count": slice.reusable_kernel_word_count,
-        "loaded_kernel_artifact_count": slice.loaded_manifest().artifacts.len(),
-        "dispatch_count": mounted_bound.dispatches.len(),
-        "descriptor_count": mounted_bound.total_descriptor_count,
-        "model_boundary_descriptor_count": mounted_bound.model_boundary_descriptor_count,
-        "incoming_cable_descriptor_count": mounted_bound.incoming_cable_descriptor_count,
-        "outgoing_cable_descriptor_count": mounted_bound.outgoing_cable_descriptor_count,
-        "tick_plan": {
-            "stage_count": tick_plan.stage_count,
-            "receive_stage_count": tick_plan.receive_stage_count,
-            "dispatch_stage_count": tick_plan.dispatch_stage_count,
-            "publish_stage_count": tick_plan.publish_stage_count,
-            "local_cable_read_count": tick_plan.local_cable_read_count,
-            "local_cable_write_count": tick_plan.local_cable_write_count,
-            "incoming_cable_read_count": tick_plan.incoming_cable_read_count,
-            "outgoing_cable_write_count": tick_plan.outgoing_cable_write_count,
-            "model_input_read_count": tick_plan.model_input_read_count,
-            "model_output_write_count": tick_plan.model_output_write_count,
-            "can_execute": tick_plan.can_execute,
+    Ok(RuntimeDeviceSliceReport {
+        ok: true,
+        package_manifest: package_manifest.to_path_buf(),
+        device_name: device.device_name().to_string(),
+        device_id: slice.device_id,
+        resident_capacity_activations: capacity,
+        hosted_pedals: resident_plan.hosted_pedal_ids.clone(),
+        local_cables: resident_plan
+            .local_cables
+            .iter()
+            .map(|cable| RuntimeLocalCableBufferReport {
+                cable_index: cable.cable_index,
+                signal: cable.signal.clone(),
+                source_pedal_id: cable.source_pedal_id.clone(),
+                destination_pedal_id: cable.destination_pedal_id.clone(),
+                device_id: cable.source_device_id.clone(),
+                byte_capacity: mounted
+                    .cable_io
+                    .local_cable_buffer(cable.cable_index)
+                    .map(|buffer| buffer.byte_capacity),
+            })
+            .collect::<Vec<_>>(),
+        incoming_cables: resident_plan
+            .incoming_cables
+            .iter()
+            .map(|cable| RuntimeRemoteCableBufferReport {
+                cable_index: cable.cable_index,
+                signal: cable.signal.clone(),
+                source_device_id: cable.source_device_id.clone(),
+                source_pedal_id: cable.source_pedal_id.clone(),
+                destination_device_id: cable.destination_device_id.clone(),
+                destination_pedal_id: cable.destination_pedal_id.clone(),
+                byte_capacity: mounted
+                    .cable_io
+                    .incoming_buffer(cable.cable_index)
+                    .map(|buffer| buffer.byte_capacity),
+            })
+            .collect::<Vec<_>>(),
+        outgoing_cables: resident_plan
+            .outgoing_cables
+            .iter()
+            .map(|cable| RuntimeRemoteCableBufferReport {
+                cable_index: cable.cable_index,
+                signal: cable.signal.clone(),
+                source_device_id: cable.source_device_id.clone(),
+                source_pedal_id: cable.source_pedal_id.clone(),
+                destination_device_id: cable.destination_device_id.clone(),
+                destination_pedal_id: cable.destination_pedal_id.clone(),
+                byte_capacity: mounted
+                    .cable_io
+                    .outgoing_buffer(cable.cable_index)
+                    .map(|buffer| buffer.byte_capacity),
+            })
+            .collect::<Vec<_>>(),
+        hosted_pedal_count: slice.hosted_pedal_count,
+        incoming_cable_count: slice.incoming_cable_count,
+        outgoing_cable_count: slice.outgoing_cable_count,
+        permanent_parameter_count: slice.permanent_parameter_count,
+        permanent_parameter_bytes: slice.permanent_parameter_bytes,
+        reusable_kernel_word_count: slice.reusable_kernel_word_count,
+        loaded_kernel_artifact_count,
+        dispatch_count: mounted_bound.dispatches.len(),
+        descriptor_count: mounted_bound.total_descriptor_count,
+        model_boundary_descriptor_count: mounted_bound.model_boundary_descriptor_count,
+        incoming_cable_descriptor_count: mounted_bound.incoming_cable_descriptor_count,
+        outgoing_cable_descriptor_count: mounted_bound.outgoing_cable_descriptor_count,
+        tick_plan: RuntimeDeviceTickPlanReport {
+            stage_count: tick_plan.stage_count,
+            receive_stage_count: tick_plan.receive_stage_count,
+            dispatch_stage_count: tick_plan.dispatch_stage_count,
+            publish_stage_count: tick_plan.publish_stage_count,
+            local_cable_read_count: tick_plan.local_cable_read_count,
+            local_cable_write_count: tick_plan.local_cable_write_count,
+            incoming_cable_read_count: tick_plan.incoming_cable_read_count,
+            outgoing_cable_write_count: tick_plan.outgoing_cable_write_count,
+            model_input_read_count: tick_plan.model_input_read_count,
+            model_output_write_count: tick_plan.model_output_write_count,
+            can_execute: tick_plan.can_execute,
         },
-    }))
+    })
 }
 
 fn placement_device_ids(pedals: &[PedalPlacement]) -> Vec<String> {
