@@ -1649,6 +1649,14 @@ impl RuntimeDeviceBindings {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeBoundDevice {
+    pub device_id: String,
+    pub target: Option<String>,
+    pub physical_device_index: Option<usize>,
+    pub device_name: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CircuitGraphSummary {
     pub circuit_count: usize,
@@ -2522,6 +2530,23 @@ mod tests {
             "process_default"
         );
         assert_eq!(payload["unsupported_targets"][0], "remote0=lan:worker-a");
+    }
+
+    #[test]
+    fn runtime_bound_device_serializes_logical_target_report() {
+        let bound = RuntimeBoundDevice {
+            device_id: "gpu1".to_string(),
+            target: Some("vulkan:5".to_string()),
+            physical_device_index: Some(5),
+            device_name: "Radeon Test Device".to_string(),
+        };
+
+        let payload = serde_json::to_value(&bound).unwrap();
+
+        assert_eq!(payload["device_id"], "gpu1");
+        assert_eq!(payload["target"], "vulkan:5");
+        assert_eq!(payload["physical_device_index"], 5);
+        assert_eq!(payload["device_name"], "Radeon Test Device");
     }
 
     #[test]

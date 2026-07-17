@@ -5,13 +5,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use llmoop_runtime::{
-    CircuitPort, PedalCablePlacement, PedalPlacement, RuntimeCableRouteTarget, RuntimeCableRoutes,
-    RuntimeDeviceBindings, VulkanComputeDevice, VulkanResidentGreedyInProcessPlacedModelPackage,
-    VulkanResidentGreedyModelPackage, VulkanResidentGreedyModelPackageDeviceSlice,
-    VulkanResidentGreedyModelPackageManifest, VulkanResidentHfTokenizerTextCodec,
-    VulkanResidentTokenEngine, VulkanResidentTokenEngineRunBudget,
-    VulkanResidentTokenEngineRunStopCondition, VulkanResidentTokenTextCodec,
-    VulkanReusableKernelArtifactManifest,
+    CircuitPort, PedalCablePlacement, PedalPlacement, RuntimeBoundDevice, RuntimeCableRouteTarget,
+    RuntimeCableRoutes, RuntimeDeviceBindings, VulkanComputeDevice,
+    VulkanResidentGreedyInProcessPlacedModelPackage, VulkanResidentGreedyModelPackage,
+    VulkanResidentGreedyModelPackageDeviceSlice, VulkanResidentGreedyModelPackageManifest,
+    VulkanResidentHfTokenizerTextCodec, VulkanResidentTokenEngine,
+    VulkanResidentTokenEngineRunBudget, VulkanResidentTokenEngineRunStopCondition,
+    VulkanResidentTokenTextCodec, VulkanReusableKernelArtifactManifest,
 };
 use serde_json::{Value, json};
 
@@ -1054,21 +1054,23 @@ fn runtime_default_vulkan_physical_device_index() -> Result<usize, Box<dyn Error
         })
 }
 
-fn bound_devices_report(bound_devices: &RuntimeBoundVulkanDevices) -> Value {
-    json!(
-        bound_devices
-            .devices
-            .iter()
-            .map(|(logical_device_id, device)| {
-                json!({
-                    "device_id": logical_device_id,
-                    "target": bound_devices.physical_device_indices.get(logical_device_id).map(|index| format!("vulkan:{index}")),
-                    "physical_device_index": bound_devices.physical_device_indices.get(logical_device_id),
-                    "device_name": device.device_name(),
-                })
-            })
-            .collect::<Vec<_>>()
-    )
+fn bound_devices_report(bound_devices: &RuntimeBoundVulkanDevices) -> Vec<RuntimeBoundDevice> {
+    bound_devices
+        .devices
+        .iter()
+        .map(|(logical_device_id, device)| {
+            let physical_device_index = bound_devices
+                .physical_device_indices
+                .get(logical_device_id)
+                .copied();
+            RuntimeBoundDevice {
+                device_id: logical_device_id.clone(),
+                target: physical_device_index.map(|index| format!("vulkan:{index}")),
+                physical_device_index,
+                device_name: device.device_name().to_string(),
+            }
+        })
+        .collect::<Vec<_>>()
 }
 
 fn runtime_cable_routes_report(args: &Args, cables: &[PedalCablePlacement]) -> RuntimeCableRoutes {
