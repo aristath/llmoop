@@ -22,6 +22,7 @@ use llmoop_runtime::{
     RuntimeRemoteCableBufferReport, RuntimeSingleDevicePromptRunReport, RuntimeSourcePedal,
     RuntimeTokenizerOptionsReport, RuntimeTopologyReport, VulkanComputeDevice,
     VulkanPlacedCableTransportStats, VulkanResidentGreedyInProcessPlacedPromptEngine,
+    VulkanResidentGreedyInProcessPlacedPromptEngineInputRequest,
     VulkanResidentGreedyInProcessPlacedPromptEventRun,
     VulkanResidentGreedyInProcessPlacedPromptStream, VulkanResidentGreedyModelPackage,
     VulkanResidentGreedyModelPackageDeviceSlice, VulkanResidentGreedyModelPackageManifest,
@@ -363,10 +364,14 @@ fn execute_placed_prompt_run(
     let input_event =
         VulkanResidentTokenInputEvent::new("prompt", prompt_ids.to_vec(), args.max_new_tokens);
     let input_event_id = input_event.id.clone();
-    engine.enqueue_input_event("main", input_event)?;
-    let engine_run = engine.run_until_idle_bounded(1, args.max_scheduler_turns)?;
+    let batch_run = engine.submit_input_events_until_idle_bounded(
+        vec![VulkanResidentGreedyInProcessPlacedPromptEngineInputRequest::new("main", input_event)],
+        1,
+        args.max_scheduler_turns,
+    )?;
     let run_time_ns = elapsed_nanos_u64(run_start);
-    let run = engine_run
+    let run = batch_run
+        .engine_run
         .input_runs
         .into_iter()
         .find(|run| run.stream_id == "main" && run.submitted_run.input_event.id == input_event_id)
