@@ -8200,12 +8200,14 @@ fn placed_prompt_stream_output_events_for(
 #[derive(Default)]
 pub struct VulkanResidentGreedyInProcessPlacedPromptEngine {
     streams: BTreeMap<String, VulkanResidentGreedyInProcessPlacedPromptStream>,
+    active_queue: VecDeque<String>,
 }
 
 impl VulkanResidentGreedyInProcessPlacedPromptEngine {
     pub fn new() -> Self {
         Self {
             streams: BTreeMap::new(),
+            active_queue: VecDeque::new(),
         }
     }
 
@@ -8224,6 +8226,9 @@ impl VulkanResidentGreedyInProcessPlacedPromptEngine {
             );
         }
         let snapshot = placed_prompt_engine_stream_snapshot(&stream_id, &stream);
+        if !stream.is_idle() {
+            self.activate_stream_id(&stream_id);
+        }
         self.streams.insert(stream_id, stream);
         Ok(snapshot)
     }
@@ -8250,12 +8255,15 @@ impl VulkanResidentGreedyInProcessPlacedPromptEngine {
         VulkanResidentGreedyInProcessPlacedPromptEngineQueuedInputEvent,
         VulkanResidentGreedyInProcessPlacedPromptEngineError,
     > {
-        let stream = self.streams.get_mut(stream_id).ok_or_else(|| {
-            VulkanResidentGreedyInProcessPlacedPromptEngineError::UnknownStream {
-                stream_id: stream_id.to_string(),
-            }
-        })?;
-        let queued_input_event = stream.enqueue_input_event(event);
+        let queued_input_event = {
+            let stream = self.streams.get_mut(stream_id).ok_or_else(|| {
+                VulkanResidentGreedyInProcessPlacedPromptEngineError::UnknownStream {
+                    stream_id: stream_id.to_string(),
+                }
+            })?;
+            stream.enqueue_input_event(event)
+        };
+        self.activate_stream_id(stream_id);
         Ok(
             VulkanResidentGreedyInProcessPlacedPromptEngineQueuedInputEvent {
                 stream_id: stream_id.to_string(),
@@ -8279,6 +8287,11 @@ impl VulkanResidentGreedyInProcessPlacedPromptEngine {
         })?;
         let queue_run =
             stream.run_queued_input_events_until_idle_bounded(max_scheduler_turns_per_tick)?;
+        if queue_run.pending_input_event_count == 0 {
+            self.deactivate_stream_id(stream_id);
+        } else {
+            self.activate_stream_id(stream_id);
+        }
         let output_events =
             placed_prompt_engine_output_events_for(stream_id, &queue_run.output_events);
         let generated_token_ids = output_events
@@ -8341,14 +8354,10 @@ impl VulkanResidentGreedyInProcessPlacedPromptEngine {
         let start_snapshot = self.snapshot();
         let mut input_runs = Vec::new();
         let mut output_events = Vec::new();
+        self.refresh_active_queue();
 
         while input_runs.len() < max_engine_turns {
-            let Some(stream_id) = self
-                .streams
-                .iter()
-                .find(|(_, stream)| !stream.is_idle())
-                .map(|(stream_id, _)| stream_id.clone())
-            else {
+            let Some(stream_id) = self.active_queue.pop_front() else {
                 break;
             };
             let stream = self.streams.get_mut(&stream_id).ok_or_else(|| {
@@ -8356,11 +8365,15 @@ impl VulkanResidentGreedyInProcessPlacedPromptEngine {
                     stream_id: stream_id.clone(),
                 }
             })?;
+            if stream.is_idle() {
+                continue;
+            }
             let Some(submitted_run) =
                 stream.run_next_queued_input_event_bounded(max_scheduler_turns_per_tick)?
             else {
                 continue;
             };
+            let stream_still_active = !stream.is_idle();
             let stream_output_events =
                 placed_prompt_engine_output_events_for(&stream_id, &submitted_run.output_events);
             let stream_generated_token_ids = stream_output_events
@@ -8369,11 +8382,14 @@ impl VulkanResidentGreedyInProcessPlacedPromptEngine {
                 .collect::<Vec<_>>();
             output_events.extend(stream_output_events.iter().cloned());
             input_runs.push(VulkanResidentGreedyInProcessPlacedPromptEngineInputRun {
-                stream_id,
+                stream_id: stream_id.clone(),
                 submitted_run,
                 output_events: stream_output_events,
                 generated_token_ids: stream_generated_token_ids,
             });
+            if stream_still_active {
+                self.active_queue.push_back(stream_id);
+            }
         }
 
         let end_snapshot = self.snapshot();
@@ -8407,10 +8423,39 @@ impl VulkanResidentGreedyInProcessPlacedPromptEngine {
             .map(|(stream_id, stream)| placed_prompt_engine_stream_snapshot(stream_id, stream))
             .collect::<Vec<_>>();
         let idle = streams.iter().all(|stream| stream.idle);
+        let active_stream_ids = streams
+            .iter()
+            .filter(|stream| !stream.idle)
+            .map(|stream| stream.stream_id.clone())
+            .collect::<Vec<_>>();
         VulkanResidentGreedyInProcessPlacedPromptEngineSnapshot {
             stream_count: streams.len(),
+            active_stream_count: active_stream_ids.len(),
+            active_stream_ids,
             idle,
             streams,
+        }
+    }
+
+    fn activate_stream_id(&mut self, stream_id: &str) {
+        if !self.active_queue.iter().any(|active| active == stream_id) {
+            self.active_queue.push_back(stream_id.to_string());
+        }
+    }
+
+    fn deactivate_stream_id(&mut self, stream_id: &str) {
+        self.active_queue.retain(|active| active != stream_id);
+    }
+
+    fn refresh_active_queue(&mut self) {
+        let active_stream_ids = self
+            .streams
+            .iter()
+            .filter(|(_, stream)| !stream.is_idle())
+            .map(|(stream_id, _)| stream_id.clone())
+            .collect::<Vec<_>>();
+        for stream_id in active_stream_ids {
+            self.activate_stream_id(&stream_id);
         }
     }
 }
@@ -8469,6 +8514,8 @@ pub struct VulkanResidentGreedyInProcessPlacedPromptEngineRun {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VulkanResidentGreedyInProcessPlacedPromptEngineSnapshot {
     pub stream_count: usize,
+    pub active_stream_count: usize,
+    pub active_stream_ids: Vec<String>,
     pub idle: bool,
     pub streams: Vec<VulkanResidentGreedyInProcessPlacedPromptEngineStreamSnapshot>,
 }
@@ -23175,7 +23222,19 @@ mod tests {
                 VulkanResidentTokenInputEvent::new("event_a", vec![1], 1),
             )
             .unwrap();
-        assert!(!engine.snapshot().idle);
+        engine
+            .enqueue_input_event(
+                "stream_b",
+                VulkanResidentTokenInputEvent::new("event_b_repeat", vec![36_309], 1),
+            )
+            .unwrap();
+        let queued_snapshot = engine.snapshot();
+        assert!(!queued_snapshot.idle);
+        assert_eq!(queued_snapshot.active_stream_count, 2);
+        assert_eq!(
+            queued_snapshot.active_stream_ids,
+            vec!["stream_a".to_string(), "stream_b".to_string()]
+        );
 
         let run = engine.run_until_idle_bounded(4, 8).unwrap();
 
@@ -23183,26 +23242,32 @@ mod tests {
             run.stop_condition,
             VulkanResidentGreedyInProcessPlacedPromptEngineRunStopCondition::Idle
         );
-        assert_eq!(run.processed_input_event_count, 2);
-        assert_eq!(run.input_runs.len(), 2);
-        assert_eq!(run.input_runs[0].stream_id, "stream_a");
-        assert_eq!(run.input_runs[0].submitted_run.input_event.id, "event_a");
-        assert_eq!(run.input_runs[1].stream_id, "stream_b");
-        assert_eq!(run.input_runs[1].submitted_run.input_event.id, "event_b");
-        assert_eq!(run.output_events.len(), 2);
-        assert_eq!(run.output_events[0].stream_id, "stream_a");
+        assert_eq!(run.processed_input_event_count, 3);
+        assert_eq!(run.input_runs.len(), 3);
+        assert_eq!(run.input_runs[0].stream_id, "stream_b");
+        assert_eq!(run.input_runs[0].submitted_run.input_event.id, "event_b");
+        assert_eq!(run.input_runs[1].stream_id, "stream_a");
+        assert_eq!(run.input_runs[1].submitted_run.input_event.id, "event_a");
+        assert_eq!(run.input_runs[2].stream_id, "stream_b");
+        assert_eq!(
+            run.input_runs[2].submitted_run.input_event.id,
+            "event_b_repeat"
+        );
+        assert_eq!(run.output_events.len(), 3);
+        assert_eq!(run.output_events[0].stream_id, "stream_b");
         assert_eq!(run.output_events[0].output_event.source_stream_tick, 0);
-        assert_eq!(run.output_events[1].stream_id, "stream_b");
+        assert_eq!(run.output_events[1].stream_id, "stream_a");
         assert_eq!(run.output_events[1].output_event.source_stream_tick, 0);
-        assert_eq!(run.generated_token_ids.len(), 2);
+        assert_eq!(run.output_events[2].stream_id, "stream_b");
+        assert_eq!(run.output_events[2].output_event.source_stream_tick, 2);
+        assert_eq!(run.generated_token_ids.len(), 3);
         assert!(!run.start_snapshot.idle);
         assert!(run.end_snapshot.idle);
-        assert!(
-            run.end_snapshot
-                .streams
-                .iter()
-                .all(|stream| stream.next_stream_tick == 2)
-        );
+        assert_eq!(run.end_snapshot.active_stream_count, 0);
+        assert_eq!(run.end_snapshot.streams[0].stream_id, "stream_a");
+        assert_eq!(run.end_snapshot.streams[0].next_stream_tick, 2);
+        assert_eq!(run.end_snapshot.streams[1].stream_id, "stream_b");
+        assert_eq!(run.end_snapshot.streams[1].next_stream_tick, 4);
     }
 
     #[test]
