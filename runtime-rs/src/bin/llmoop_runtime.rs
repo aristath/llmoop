@@ -360,25 +360,23 @@ fn execute_placed_prompt_run(
     let stream_snapshot = engine.add_stream("main", stream)?;
     let setup_time_ns = elapsed_nanos_u64(setup_start);
     let run_start = Instant::now();
-    let submitted_run = engine.submit_input_event_until_idle_bounded(
-        "main",
-        VulkanResidentTokenInputEvent::new("prompt", prompt_ids.to_vec(), args.max_new_tokens),
-        args.max_scheduler_turns,
-    )?;
+    let input_event =
+        VulkanResidentTokenInputEvent::new("prompt", prompt_ids.to_vec(), args.max_new_tokens);
+    let input_event_id = input_event.id.clone();
+    engine.enqueue_input_event("main", input_event)?;
+    let engine_run = engine.run_until_idle_bounded(1, args.max_scheduler_turns)?;
     let run_time_ns = elapsed_nanos_u64(run_start);
-    let input_event_id = submitted_run.input_event_id.clone();
-    let run = submitted_run
-        .stream_run
-        .queue_run
-        .submitted_runs
+    let run = engine_run
+        .input_runs
         .into_iter()
-        .find(|run| run.input_event.id == input_event_id)
+        .find(|run| run.stream_id == "main" && run.submitted_run.input_event.id == input_event_id)
         .ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
-                "placed prompt engine did not return the submitted prompt event run",
+                "placed prompt engine run loop did not return the submitted prompt event run",
             )
         })?
+        .submitted_run
         .session_run
         .run;
     let generated_text = codec.decode_tokens(&run.generated_token_ids)?;
