@@ -1764,6 +1764,10 @@ impl VulkanInProcessPlacedCableTransport {
         self.ready_direct_cables.contains(key)
     }
 
+    pub fn direct_cable_binding_count(&self) -> usize {
+        self.direct_copies.len()
+    }
+
     pub fn reset_tick_state(&mut self) {
         self.packets.clear();
         self.ready_direct_cables.clear();
@@ -21627,6 +21631,10 @@ mod tests {
                 0,
             ),
         ];
+        register_same_device_direct_cable_copies(&slices, &mut transport).unwrap();
+        assert_eq!(transport.direct_cable_binding_count(), 2);
+        register_same_device_direct_cable_copies(&slices, &mut transport).unwrap();
+        assert_eq!(transport.direct_cable_binding_count(), 2);
         let run = run_mounted_placed_resident_stream_tick_slices_in_process(
             &mut slices,
             &mut transport,
@@ -21654,6 +21662,7 @@ mod tests {
         assert_eq!(run.transport_stats.direct_copy_byte_count, 4096);
         assert_eq!(run.transport_stats.direct_receive_count, 2);
         assert_eq!(run.transport_stats.direct_receive_byte_count, 4096);
+        assert_eq!(transport.direct_cable_binding_count(), 2);
         assert_eq!(transport.packet_count(), 0);
 
         let gpu0_run = run
