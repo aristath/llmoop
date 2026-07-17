@@ -11,6 +11,7 @@ from pathlib import Path
 
 from llmoop.cli import (
     build_runtime_command,
+    parse_device_bindings,
     parse_duplicate_after_overrides,
     parse_pedal_device_overrides,
     parse_source_chain,
@@ -46,6 +47,7 @@ class RuntimeCliCommandTest(unittest.TestCase):
             inspect_device_slice=None,
             default_device_id=None,
             place_pedal=[],
+            bind_device=[],
             duplicate_after=[],
             chain=None,
             max_new_tokens=4,
@@ -87,6 +89,7 @@ class RuntimeCliCommandTest(unittest.TestCase):
             inspect_device_slice="gpu1",
             default_device_id=None,
             place_pedal=[],
+            bind_device=[],
             duplicate_after=[],
             chain=None,
             max_new_tokens=4,
@@ -123,6 +126,7 @@ class RuntimeCliCommandTest(unittest.TestCase):
             inspect_device_slice=None,
             default_device_id=None,
             place_pedal=[],
+            bind_device=[],
             duplicate_after=[],
             chain=None,
             max_new_tokens=4,
@@ -158,6 +162,7 @@ class RuntimeCliCommandTest(unittest.TestCase):
             inspect_device_slice=None,
             default_device_id=None,
             place_pedal=[],
+            bind_device=[],
             duplicate_after=[],
             chain=None,
             max_new_tokens=4,
@@ -193,6 +198,7 @@ class RuntimeCliCommandTest(unittest.TestCase):
             inspect_device_slice=None,
             default_device_id=None,
             place_pedal=["layer_05_repeat=gpu1"],
+            bind_device=["gpu1=vulkan:5"],
             duplicate_after=[],
             chain="layer_00,layer_05_repeat=layer_05,layer_13",
             max_new_tokens=4,
@@ -213,6 +219,8 @@ class RuntimeCliCommandTest(unittest.TestCase):
                 "--inspect-patch",
                 "--place-pedal",
                 "layer_05_repeat=gpu1",
+                "--bind-device",
+                "gpu1=vulkan:5",
                 "--chain",
                 "layer_00,layer_05_repeat=layer_05,layer_13",
                 "--json",
@@ -230,6 +238,7 @@ class RuntimeCliCommandTest(unittest.TestCase):
             inspect_device_slice=None,
             default_device_id="gpu0",
             place_pedal=["layer_02=gpu1", "layer_07=lan:worker-a"],
+            bind_device=["gpu0=vulkan:0", "gpu1=vulkan:5"],
             duplicate_after=["layer_05=layer_05_repeat"],
             chain="layer_00,layer_01,layer_05,layer_05_repeat=layer_05,layer_06",
             max_new_tokens=4,
@@ -257,6 +266,10 @@ class RuntimeCliCommandTest(unittest.TestCase):
                 "layer_02=gpu1",
                 "--place-pedal",
                 "layer_07=lan:worker-a",
+                "--bind-device",
+                "gpu0=vulkan:0",
+                "--bind-device",
+                "gpu1=vulkan:5",
                 "--duplicate-after",
                 "layer_05=layer_05_repeat",
                 "--chain",
@@ -276,6 +289,19 @@ class RuntimeCliCommandTest(unittest.TestCase):
             parse_pedal_device_overrides(["layer_02"])
         with self.assertRaisesRegex(ValueError, "duplicate"):
             parse_pedal_device_overrides(["layer_02=gpu1", "layer_02=gpu2"])
+
+    def test_parse_device_bindings_requires_explicit_device_targets(self) -> None:
+        self.assertEqual(
+            {"gpu0": "vulkan:0", "gpu1": "vulkan:5", "lan0": "lan:worker-a"},
+            parse_device_bindings(["gpu0=vulkan:0", " gpu1 = vulkan:5 ", "lan0=lan:worker-a"]),
+        )
+
+        with self.assertRaisesRegex(ValueError, "expected DEVICE=TARGET"):
+            parse_device_bindings(["gpu0"])
+        with self.assertRaisesRegex(ValueError, "expected vulkan:N"):
+            parse_device_bindings(["gpu0=vulkan:"])
+        with self.assertRaisesRegex(ValueError, "duplicate"):
+            parse_device_bindings(["gpu0=vulkan:0", "gpu0=vulkan:1"])
 
     def test_parse_duplicate_after_overrides_requires_explicit_instance_pairs(self) -> None:
         self.assertEqual(

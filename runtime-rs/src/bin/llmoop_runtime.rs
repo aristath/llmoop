@@ -4,12 +4,12 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use llmoop_runtime::{
-    CircuitPort, VulkanComputeDevice, VulkanResidentGreedyInProcessPlacedModelPackage,
-    VulkanResidentGreedyModelPackage, VulkanResidentGreedyModelPackageDeviceSlice,
-    VulkanResidentGreedyModelPackageManifest, VulkanResidentHfTokenizerTextCodec,
-    VulkanResidentTokenEngine, VulkanResidentTokenEngineRunBudget,
-    VulkanResidentTokenEngineRunStopCondition, VulkanResidentTokenTextCodec,
-    VulkanReusableKernelArtifactManifest,
+    CircuitPort, PedalPlacement, VulkanComputeDevice,
+    VulkanResidentGreedyInProcessPlacedModelPackage, VulkanResidentGreedyModelPackage,
+    VulkanResidentGreedyModelPackageDeviceSlice, VulkanResidentGreedyModelPackageManifest,
+    VulkanResidentHfTokenizerTextCodec, VulkanResidentTokenEngine,
+    VulkanResidentTokenEngineRunBudget, VulkanResidentTokenEngineRunStopCondition,
+    VulkanResidentTokenTextCodec, VulkanReusableKernelArtifactManifest,
 };
 use serde_json::{Value, json};
 
@@ -23,6 +23,7 @@ struct Args {
     inspect_device_slice: Option<String>,
     default_device_id: Option<String>,
     pedal_devices: BTreeMap<String, String>,
+    device_bindings: BTreeMap<String, String>,
     duplicate_after: Vec<(String, String)>,
     source_chain: Option<Vec<(String, String)>>,
     max_new_tokens: usize,
@@ -47,6 +48,7 @@ impl Default for Args {
             inspect_device_slice: None,
             default_device_id: None,
             pedal_devices: BTreeMap::new(),
+            device_bindings: BTreeMap::new(),
             duplicate_after: Vec::new(),
             source_chain: None,
             max_new_tokens: 4,
@@ -175,6 +177,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                 "device_name": snapshot.device_name,
                 "device_id": stream.device_id,
                 "runtime_patch": runtime_patch_report(&args),
+                "device_bindings": runtime_device_bindings_report(&args, &[stream.device_id.clone()]),
                 "pedal_count": stream.pedal_count,
                 "dispatches_per_tick": stream.per_tick_dispatch_count,
                 "descriptors_per_tick": stream.per_tick_descriptor_count,
@@ -254,8 +257,9 @@ fn run_placed_prompt(
                 "device_name": device.device_name(),
                 "boundary_device_id": package.boundary_device_id,
                 "device_count": package.device_count,
-                "device_ids": package.device_ids,
+                "device_ids": package.device_ids.clone(),
                 "runtime_patch": runtime_patch_report(args),
+                "device_bindings": runtime_device_bindings_report(args, &package.device_ids),
                 "hosted_pedal_count": package.hosted_pedal_count,
                 "resident_capacity_activations": package.dynamic_state_capacity_activations,
                 "needed_capacity_activations": prompt_ids.len() + args.max_new_tokens,
@@ -336,6 +340,7 @@ fn inspect_package(
         "compiled_default_device_id": manifest.placement.default_device_id,
         "compiled_pedal_devices": manifest.placement.pedal_devices,
         "runtime_patch": runtime_patch_report(args),
+        "device_bindings": runtime_device_bindings_report(args, &[]),
         "dynamic_state_capacity_activations": manifest.dynamic_state_capacity_activations,
         "capacity_profiles": manifest.capacity_profiles.iter().map(|profile| json!({
             "min_dynamic_state_capacity_activations": profile.min_dynamic_state_capacity_activations,
@@ -455,6 +460,7 @@ fn inspect_patch(
     )?;
     let effective_graph = source_graph.instantiate_runtime_patch(&patch)?;
     let placement = effective_graph.placement_plan(&patch.placement_spec())?;
+    let placement_device_ids = placement_device_ids(&placement.pedals);
     let instance_count = patch.instances.len();
     let cable_count = placement.cables.len();
     let payload = json!({
@@ -465,6 +471,7 @@ fn inspect_patch(
         "compiled_source_pedal_count": source_graph.circuits.len(),
         "runtime_patch_controls": runtime_patch_report(args),
         "runtime_patch": patch,
+        "device_bindings": runtime_device_bindings_report(args, &placement_device_ids),
         "effective_pedal_count": instance_count,
         "effective_cable_count": cable_count,
         "placement": {
@@ -573,6 +580,7 @@ fn inspect_placement(
         "device_name": device.device_name(),
         "resident_capacity_activations": capacity,
         "runtime_patch": runtime_patch_report(args),
+        "device_bindings": runtime_device_bindings_report(args, &device_ids),
         "device_count": device_ids.len(),
         "device_ids": device_ids,
         "devices": slices,
@@ -686,6 +694,16 @@ fn inspect_device_slice_payload(
     }))
 }
 
+fn placement_device_ids(pedals: &[PedalPlacement]) -> Vec<String> {
+    let mut device_ids = pedals
+        .iter()
+        .map(|pedal| pedal.device_id.clone())
+        .collect::<Vec<_>>();
+    device_ids.sort();
+    device_ids.dedup();
+    device_ids
+}
+
 fn tokenizer_dir_from_package(package_manifest: &Path) -> Result<PathBuf, Box<dyn Error>> {
     let manifest = VulkanResidentGreedyModelPackageManifest::from_json_file(package_manifest)?;
     let manifest_dir = package_manifest
@@ -728,13 +746,50 @@ fn runtime_manifest(
 }
 
 fn runtime_vulkan_device(args: &Args) -> Result<VulkanComputeDevice, Box<dyn Error>> {
-    if let Some(physical_device_index) = args.vulkan_device_index {
+    if let Some(physical_device_index) = runtime_physical_device_index(args)? {
         Ok(VulkanComputeDevice::new_for_physical_device_index(
             physical_device_index,
         )?)
     } else {
         Ok(VulkanComputeDevice::new()?)
     }
+}
+
+fn runtime_physical_device_index(args: &Args) -> Result<Option<usize>, Box<dyn Error>> {
+    let mut selected = args.vulkan_device_index;
+    let mut unsupported_bindings = Vec::new();
+    for (logical_device_id, target) in &args.device_bindings {
+        match parse_vulkan_physical_device_ref(target) {
+            Ok(Some(index)) => {
+                if let Some(existing) = selected {
+                    if existing != index {
+                        return Err(Box::new(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!(
+                                "logical device bindings request multiple Vulkan physical devices ({existing} and {index}); mounted execution still supports one VulkanComputeDevice per process, so use --inspect-patch to preview or bind all logical devices to the same physical device"
+                            ),
+                        )));
+                    }
+                } else {
+                    selected = Some(index);
+                }
+            }
+            Ok(None) => unsupported_bindings.push(format!("{logical_device_id}={target}")),
+            Err(error) => {
+                return Err(Box::new(io::Error::new(io::ErrorKind::InvalidInput, error)));
+            }
+        }
+    }
+    if !unsupported_bindings.is_empty() {
+        return Err(Box::new(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "logical device bindings are not mountable by the local Vulkan runtime yet: {}",
+                unsupported_bindings.join(", ")
+            ),
+        )));
+    }
+    Ok(selected)
 }
 
 fn runtime_patch_report(args: &Args) -> Value {
@@ -755,6 +810,78 @@ fn runtime_patch_report(args: &Args) -> Value {
                 "new_instance_id": new_instance_id,
             })
         }).collect::<Vec<_>>(),
+    })
+}
+
+fn runtime_device_bindings_report(args: &Args, logical_device_ids: &[String]) -> Value {
+    let mut logical_ids = logical_device_ids.iter().cloned().collect::<Vec<_>>();
+    for logical_device_id in args.device_bindings.keys() {
+        if !logical_ids.contains(logical_device_id) {
+            logical_ids.push(logical_device_id.clone());
+        }
+    }
+    logical_ids.sort();
+    logical_ids.dedup();
+
+    let mut vulkan_indices = Vec::new();
+    let mut unsupported_targets = Vec::new();
+    if let Some(index) = args.vulkan_device_index {
+        vulkan_indices.push(index);
+    }
+    for (logical_device_id, target) in &args.device_bindings {
+        match parse_vulkan_physical_device_ref(target) {
+            Ok(Some(index)) => vulkan_indices.push(index),
+            Ok(None) => unsupported_targets.push(format!("{logical_device_id}={target}")),
+            Err(error) => {
+                unsupported_targets.push(format!("{logical_device_id}={target} ({error})"))
+            }
+        }
+    }
+    vulkan_indices.sort_unstable();
+    vulkan_indices.dedup();
+    let can_mount_in_process = unsupported_targets.is_empty() && vulkan_indices.len() <= 1;
+    let requested_vulkan_device_indices = vulkan_indices.clone();
+    let selected_vulkan_device_index = if can_mount_in_process {
+        vulkan_indices.first().copied().or(args.vulkan_device_index)
+    } else {
+        None
+    };
+
+    json!({
+        "schema": "llmoop.runtime_device_bindings.v1",
+        "process_vulkan_device_index": args.vulkan_device_index,
+        "requested_vulkan_device_indices": requested_vulkan_device_indices,
+        "selected_vulkan_device_index": selected_vulkan_device_index,
+        "explicit_bindings": args.device_bindings.clone(),
+        "logical_devices": logical_ids.iter().map(|logical_device_id| {
+            let explicit_target = args.device_bindings.get(logical_device_id);
+            let target = explicit_target
+                .cloned()
+                .or_else(|| selected_vulkan_device_index.map(|index| format!("vulkan:{index}")));
+            json!({
+                "device_id": logical_device_id,
+                "target": target,
+                "binding_source": if explicit_target.is_some() {
+                    "explicit"
+                } else if selected_vulkan_device_index.is_some() {
+                    "process_default"
+                } else {
+                    "runtime_default"
+                },
+            })
+        }).collect::<Vec<_>>(),
+        "can_mount_in_process": can_mount_in_process,
+        "mounting_model": if can_mount_in_process {
+            "single_local_vulkan_device"
+        } else {
+            "preview_only_multi_device"
+        },
+        "unsupported_targets": unsupported_targets,
+        "notes": if can_mount_in_process {
+            vec!["all mounted logical device slices will use one VulkanComputeDevice in this runtime process"]
+        } else {
+            vec!["mixed physical/device bindings can be previewed but mounted execution is not implemented yet"]
+        },
     })
 }
 
@@ -877,6 +1004,19 @@ fn parse_args() -> Result<Args, String> {
                     ));
                 }
             }
+            "--bind-device" | "--device-binding" => {
+                let assignment = next_value(&mut raw, &arg)?;
+                let (device_id, target) = parse_device_binding_assignment(&assignment)?;
+                if parsed
+                    .device_bindings
+                    .insert(device_id.clone(), target)
+                    .is_some()
+                {
+                    return Err(format!(
+                        "duplicate runtime device binding for logical device {device_id:?}"
+                    ));
+                }
+            }
             "--duplicate-after" => {
                 let assignment = next_value(&mut raw, "--duplicate-after")?;
                 parsed
@@ -974,6 +1114,43 @@ fn parse_pedal_device_assignment(raw: &str) -> Result<(String, String), String> 
         ));
     }
     Ok((pedal_id.to_string(), device_id.to_string()))
+}
+
+fn parse_device_binding_assignment(raw: &str) -> Result<(String, String), String> {
+    let (device_id, target) = raw.split_once('=').ok_or_else(|| {
+        format!("invalid runtime device binding {raw:?}; expected LOGICAL_DEVICE_ID=TARGET")
+    })?;
+    let device_id = device_id.trim();
+    let target = target.trim();
+    if device_id.is_empty() {
+        return Err(format!(
+            "invalid runtime device binding {raw:?}; logical device id must not be empty"
+        ));
+    }
+    if target.is_empty() {
+        return Err(format!(
+            "invalid runtime device binding {raw:?}; target must not be empty"
+        ));
+    }
+    if let Err(error) = parse_vulkan_physical_device_ref(target) {
+        return Err(error);
+    }
+    Ok((device_id.to_string(), target.to_string()))
+}
+
+fn parse_vulkan_physical_device_ref(raw: &str) -> Result<Option<usize>, String> {
+    if let Some(index) = raw.strip_prefix("vulkan:") {
+        if index.is_empty() {
+            return Err(format!(
+                "invalid Vulkan physical device reference {raw:?}; expected vulkan:N"
+            ));
+        }
+        return index
+            .parse::<usize>()
+            .map(Some)
+            .map_err(|error| format!("invalid Vulkan physical device reference {raw:?}: {error}"));
+    }
+    Ok(None)
 }
 
 fn parse_duplicate_after_assignment(raw: &str) -> Result<(String, String), String> {
@@ -1085,6 +1262,9 @@ Options:
   --default-device-id <ID>   Alias for --device.
   --place-pedal <PEDAL=DEV>  Assign one runtime pedal instance to a logical device.
   --place <PEDAL=DEV>        Alias for --place-pedal.
+  --bind-device <DEV=TARGET> Bind a logical device to a target, e.g. gpu1=vulkan:5.
+  --device-binding <DEV=TARGET>
+                             Alias for --bind-device.
   --chain <ITEM[,ITEM...]>    Runtime source chain. ITEM is SOURCE or INSTANCE=SOURCE.
   --duplicate-after <AFTER=NEW>
                              Duplicate runtime pedal instance AFTER with id NEW.

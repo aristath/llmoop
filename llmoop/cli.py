@@ -89,6 +89,13 @@ def main() -> None:
         help="assign one runtime pedal instance to a logical device in the runtime patch; may be repeated",
     )
     parser.add_argument(
+        "--bind-device",
+        action="append",
+        default=[],
+        metavar="DEVICE=TARGET",
+        help="bind one logical runtime device to a target such as vulkan:5; may be repeated",
+    )
+    parser.add_argument(
         "--duplicate-after",
         action="append",
         default=[],
@@ -204,6 +211,8 @@ def main() -> None:
         parser.error("--default-device-id is only supported with --run")
     elif args.place_pedal:
         parser.error("--place-pedal is only supported with --run")
+    elif args.bind_device:
+        parser.error("--bind-device is only supported with --run")
     elif args.duplicate_after:
         parser.error("--duplicate-after is only supported with --run")
     elif args.chain is not None:
@@ -237,6 +246,7 @@ def main() -> None:
             parser.error("--vulkan-device-index must be non-negative")
         try:
             parse_pedal_device_overrides(args.place_pedal)
+            parse_device_bindings(args.bind_device)
             parse_duplicate_after_overrides(args.duplicate_after)
             if args.chain is not None:
                 parse_source_chain(args.chain)
@@ -257,6 +267,8 @@ def main() -> None:
             parser.error("--default-device-id is only supported by --run")
         if args.place_pedal:
             parser.error("--place-pedal is only supported by --run")
+        if args.bind_device:
+            parser.error("--bind-device is only supported by --run")
         if args.duplicate_after:
             parser.error("--duplicate-after is only supported by --run")
         if args.chain is not None:
@@ -325,6 +337,39 @@ def parse_pedal_device_overrides(raw_overrides: list[str]) -> dict[str, str]:
             raise ValueError(f"duplicate --place-pedal assignment for {pedal_id!r}")
         pedal_devices[pedal_id] = device_id
     return pedal_devices
+
+
+def parse_device_bindings(raw_bindings: list[str]) -> dict[str, str]:
+    bindings: dict[str, str] = {}
+    for raw_binding in raw_bindings:
+        if "=" not in raw_binding:
+            raise ValueError(
+                f"invalid --bind-device value {raw_binding!r}; expected DEVICE=TARGET"
+            )
+        device_id, target = (part.strip() for part in raw_binding.split("=", 1))
+        if not device_id:
+            raise ValueError(
+                f"invalid --bind-device value {raw_binding!r}; device id is empty"
+            )
+        if not target:
+            raise ValueError(
+                f"invalid --bind-device value {raw_binding!r}; target is empty"
+            )
+        if target == "vulkan:":
+            raise ValueError(
+                f"invalid --bind-device value {raw_binding!r}; expected vulkan:N"
+            )
+        if target.startswith("vulkan:"):
+            try:
+                int(target.split(":", 1)[1])
+            except ValueError as error:
+                raise ValueError(
+                    f"invalid --bind-device value {raw_binding!r}; {error}"
+                ) from error
+        if device_id in bindings:
+            raise ValueError(f"duplicate --bind-device assignment for {device_id!r}")
+        bindings[device_id] = target
+    return bindings
 
 
 def parse_duplicate_after_overrides(raw_overrides: list[str]) -> dict[str, str]:
@@ -411,6 +456,8 @@ def build_runtime_command(args: argparse.Namespace, package_manifest: Path) -> l
         runtime_args.extend(["--device", args.default_device_id])
     for raw_placement in args.place_pedal:
         runtime_args.extend(["--place-pedal", raw_placement])
+    for raw_binding in args.bind_device:
+        runtime_args.extend(["--bind-device", raw_binding])
     for raw_duplicate in args.duplicate_after:
         runtime_args.extend(["--duplicate-after", raw_duplicate])
     if args.chain is not None:
