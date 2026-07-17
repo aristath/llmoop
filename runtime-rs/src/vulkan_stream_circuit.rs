@@ -7936,6 +7936,7 @@ pub struct VulkanResidentGreedyInProcessPlacedPromptStream {
     package: VulkanResidentGreedyInProcessPlacedModelPackage,
     devices: BTreeMap<String, Arc<VulkanComputeDevice>>,
     session: VulkanResidentGreedyInProcessPlacedPromptSession,
+    pending_input_events: VecDeque<VulkanResidentTokenInputEvent>,
 }
 
 impl VulkanResidentGreedyInProcessPlacedPromptStream {
@@ -7981,6 +7982,7 @@ impl VulkanResidentGreedyInProcessPlacedPromptStream {
             package,
             devices,
             session,
+            pending_input_events: VecDeque::new(),
         })
     }
 
@@ -8004,6 +8006,70 @@ impl VulkanResidentGreedyInProcessPlacedPromptStream {
         self.session.completed_prompt_event_count
     }
 
+    pub fn pending_input_event_count(&self) -> usize {
+        self.pending_input_events.len()
+    }
+
+    pub fn is_idle(&self) -> bool {
+        self.pending_input_events.is_empty()
+    }
+
+    pub fn enqueue_input_event(
+        &mut self,
+        event: VulkanResidentTokenInputEvent,
+    ) -> VulkanResidentGreedyInProcessPlacedQueuedInputEvent {
+        self.pending_input_events.push_back(event.clone());
+        VulkanResidentGreedyInProcessPlacedQueuedInputEvent {
+            input_event: event,
+            pending_input_event_count: self.pending_input_events.len(),
+            next_stream_tick: self.next_stream_tick(),
+        }
+    }
+
+    pub fn run_next_queued_input_event_bounded(
+        &mut self,
+        max_scheduler_turns_per_tick: usize,
+    ) -> Result<
+        Option<VulkanResidentGreedyInProcessPlacedSubmittedInputRun>,
+        VulkanResidentGreedyInProcessPlacedModelPackageError,
+    > {
+        let Some(event) = self.pending_input_events.pop_front() else {
+            return Ok(None);
+        };
+        let session_run = self.run_prompt_event_bounded(
+            &event.token_ids,
+            event.max_public_tokens,
+            event.eos_token_id,
+            max_scheduler_turns_per_tick,
+        )?;
+        let output_events = placed_prompt_stream_output_events_for(&event, &session_run);
+        let generated_token_ids = output_events
+            .iter()
+            .map(|event| event.token_id)
+            .collect::<Vec<_>>();
+
+        Ok(Some(VulkanResidentGreedyInProcessPlacedSubmittedInputRun {
+            input_event: event,
+            pending_input_event_count: self.pending_input_events.len(),
+            session_run,
+            output_events,
+            generated_token_ids,
+        }))
+    }
+
+    pub fn submit_input_event_bounded(
+        &mut self,
+        event: VulkanResidentTokenInputEvent,
+        max_scheduler_turns_per_tick: usize,
+    ) -> Result<
+        VulkanResidentGreedyInProcessPlacedSubmittedInputRun,
+        VulkanResidentGreedyInProcessPlacedModelPackageError,
+    > {
+        self.enqueue_input_event(event);
+        self.run_next_queued_input_event_bounded(max_scheduler_turns_per_tick)?
+            .ok_or(VulkanResidentGreedyInProcessPlacedModelPackageError::EmptyPromptEvent)
+    }
+
     pub fn run_prompt_event_bounded(
         &mut self,
         prompt_token_ids: &[u32],
@@ -8024,6 +8090,44 @@ impl VulkanResidentGreedyInProcessPlacedPromptStream {
                 max_scheduler_turns_per_tick,
             )
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanResidentGreedyInProcessPlacedQueuedInputEvent {
+    pub input_event: VulkanResidentTokenInputEvent,
+    pub pending_input_event_count: usize,
+    pub next_stream_tick: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanResidentGreedyInProcessPlacedSubmittedInputRun {
+    pub input_event: VulkanResidentTokenInputEvent,
+    pub pending_input_event_count: usize,
+    pub session_run: VulkanResidentGreedyInProcessPlacedPromptSessionRun,
+    pub output_events: Vec<VulkanResidentTokenOutputEvent>,
+    pub generated_token_ids: Vec<u32>,
+}
+
+fn placed_prompt_stream_output_events_for(
+    event: &VulkanResidentTokenInputEvent,
+    session_run: &VulkanResidentGreedyInProcessPlacedPromptSessionRun,
+) -> Vec<VulkanResidentTokenOutputEvent> {
+    session_run
+        .run
+        .tick_runs
+        .iter()
+        .filter_map(|tick| tick.public_output_token_id.map(|token_id| (tick, token_id)))
+        .enumerate()
+        .map(
+            |(output_index, (tick, token_id))| VulkanResidentTokenOutputEvent {
+                id: format!("{}.{}", event.id, output_index),
+                input_event_id: event.id.clone(),
+                output_index,
+                token_id,
+                source_stream_tick: tick.stream_tick,
+            },
+        )
+        .collect()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -22393,6 +22497,78 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![2, 3]
         );
+    }
+
+    #[test]
+    fn placed_prompt_stream_queues_input_events_and_emits_output_events() {
+        let device = match VulkanComputeDevice::new() {
+            Ok(device) => device,
+            Err(error) => {
+                eprintln!("skipping placed prompt stream queue test: {error}");
+                return;
+            }
+        };
+        let mut manifest = fixture_model_package_manifest();
+        manifest.placement =
+            StreamCircuitPlacementSpec::new("gpu0").with_pedal_device("layer_02", "gpu1");
+        let manifest_path = fixture_model_package_manifest_path();
+        let manifest_dir = manifest_path.parent().unwrap();
+        let device = Arc::new(device);
+        let devices = BTreeMap::from([
+            ("gpu0".to_string(), device.clone()),
+            ("gpu1".to_string(), device.clone()),
+        ]);
+
+        let mut stream =
+            VulkanResidentGreedyInProcessPlacedPromptStream::from_manifest_for_bound_devices(
+                devices,
+                manifest_dir,
+                manifest,
+                Some(8),
+            )
+            .unwrap();
+
+        let queued_a =
+            stream.enqueue_input_event(VulkanResidentTokenInputEvent::new("event_a", vec![1], 1));
+        assert_eq!(queued_a.pending_input_event_count, 1);
+        assert_eq!(queued_a.next_stream_tick, 0);
+        let queued_b = stream.enqueue_input_event(VulkanResidentTokenInputEvent::new(
+            "event_b",
+            vec![36_309],
+            1,
+        ));
+        assert_eq!(queued_b.pending_input_event_count, 2);
+        assert_eq!(stream.pending_input_event_count(), 2);
+        assert!(!stream.is_idle());
+
+        let first = stream
+            .run_next_queued_input_event_bounded(8)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.input_event.id, "event_a");
+        assert_eq!(first.pending_input_event_count, 1);
+        assert_eq!(first.generated_token_ids.len(), 1);
+        assert_eq!(first.output_events.len(), 1);
+        assert_eq!(first.output_events[0].input_event_id, "event_a");
+        assert_eq!(first.output_events[0].output_index, 0);
+        assert_eq!(first.output_events[0].source_stream_tick, 0);
+        assert_eq!(stream.next_stream_tick(), 2);
+
+        let second = stream
+            .run_next_queued_input_event_bounded(8)
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.input_event.id, "event_b");
+        assert_eq!(second.pending_input_event_count, 0);
+        assert_eq!(second.generated_token_ids.len(), 1);
+        assert_eq!(second.output_events.len(), 1);
+        assert_eq!(second.output_events[0].input_event_id, "event_b");
+        assert_eq!(second.output_events[0].source_stream_tick, 2);
+        assert_eq!(stream.next_stream_tick(), 4);
+        assert!(stream.is_idle());
+
+        let idle = stream.run_next_queued_input_event_bounded(8).unwrap();
+        assert!(idle.is_none());
     }
 
     #[test]
