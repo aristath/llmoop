@@ -21,7 +21,8 @@ use llmoop_runtime::{
     RuntimePromptBenchmarkUsizeMetricReport, RuntimePromptTimingReport,
     RuntimeRemoteCableBufferReport, RuntimeSingleDevicePromptRunReport, RuntimeSourcePedal,
     RuntimeTokenizerOptionsReport, RuntimeTopologyReport, VulkanComputeDevice,
-    VulkanPlacedCableTransportStats, VulkanResidentGreedyInProcessPlacedPromptEventRun,
+    VulkanPlacedCableTransportStats, VulkanResidentGreedyInProcessPlacedPromptEngine,
+    VulkanResidentGreedyInProcessPlacedPromptEventRun,
     VulkanResidentGreedyInProcessPlacedPromptStream, VulkanResidentGreedyModelPackage,
     VulkanResidentGreedyModelPackageDeviceSlice, VulkanResidentGreedyModelPackageManifest,
     VulkanResidentHfTokenizerTextCodec, VulkanResidentTokenEngine,
@@ -349,21 +350,37 @@ fn execute_placed_prompt_run(
     }
     let placement = runtime_manifest_placement(manifest_dir, &manifest)?;
     let bound_devices = runtime_bound_vulkan_devices(args, &logical_device_ids)?;
-    let mut stream =
-        VulkanResidentGreedyInProcessPlacedPromptStream::from_manifest_for_bound_devices(
-            bound_devices.devices.clone(),
-            manifest_dir,
-            manifest,
-            Some(capacity),
-        )?;
+    let stream = VulkanResidentGreedyInProcessPlacedPromptStream::from_manifest_for_bound_devices(
+        bound_devices.devices.clone(),
+        manifest_dir,
+        manifest,
+        Some(capacity),
+    )?;
+    let mut engine = VulkanResidentGreedyInProcessPlacedPromptEngine::new();
+    let stream_snapshot = engine.add_stream("main", stream)?;
     let setup_time_ns = elapsed_nanos_u64(setup_start);
     let run_start = Instant::now();
-    let submitted_run = stream.submit_input_event_bounded(
+    let submitted_run = engine.submit_input_event_until_idle_bounded(
+        "main",
         VulkanResidentTokenInputEvent::new("prompt", prompt_ids.to_vec(), args.max_new_tokens),
         args.max_scheduler_turns,
     )?;
     let run_time_ns = elapsed_nanos_u64(run_start);
-    let run = submitted_run.session_run.run;
+    let input_event_id = submitted_run.input_event_id.clone();
+    let run = submitted_run
+        .stream_run
+        .queue_run
+        .submitted_runs
+        .into_iter()
+        .find(|run| run.input_event.id == input_event_id)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "placed prompt engine did not return the submitted prompt event run",
+            )
+        })?
+        .session_run
+        .run;
     let generated_text = codec.decode_tokens(&run.generated_token_ids)?;
     let output_text = codec.decode_tokens(&run.output_token_ids)?;
     let total_scheduler_turns = run
@@ -468,15 +485,15 @@ fn execute_placed_prompt_run(
         execution_mode: "placed_in_process".to_string(),
         package_manifest: package_manifest.to_path_buf(),
         tokenizer_dir: tokenizer_dir.to_path_buf(),
-        boundary_device_id: stream.package().boundary_device_id.clone(),
-        device_count: stream.package().device_count,
-        device_ids: stream.package().device_ids.clone(),
+        boundary_device_id: stream_snapshot.boundary_device_id.clone(),
+        device_count: stream_snapshot.device_ids.len(),
+        device_ids: stream_snapshot.device_ids.clone(),
         bound_devices: bound_devices_report(&bound_devices),
         cable_routes: bound_cable_routes_report(&bound_devices, &placement.cables),
         runtime_patch: runtime_patch_report(args),
-        device_bindings: runtime_device_bindings_report(args, &stream.package().device_ids),
-        hosted_pedal_count: stream.package().hosted_pedal_count,
-        resident_capacity_activations: stream.package().dynamic_state_capacity_activations,
+        device_bindings: runtime_device_bindings_report(args, &stream_snapshot.device_ids),
+        hosted_pedal_count: stream_snapshot.hosted_pedal_count,
+        resident_capacity_activations: stream_snapshot.resident_capacity_activations,
         needed_capacity_activations: prompt_ids.len() + args.max_new_tokens,
         tokenizer: tokenizer_options_report(args),
         prompt_text: prompt.to_string(),
