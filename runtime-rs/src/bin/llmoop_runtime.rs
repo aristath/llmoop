@@ -6,13 +6,13 @@ use std::sync::Arc;
 
 use llmoop_runtime::{
     CircuitPort, PedalCablePlacement, PedalPlacement, RuntimeBoundDevice, RuntimeCableRouteTarget,
-    RuntimeCableRoutes, RuntimeDeviceBindings, RuntimePedalPortSummary, RuntimeSourcePedal,
-    VulkanComputeDevice, VulkanResidentGreedyInProcessPlacedModelPackage,
-    VulkanResidentGreedyModelPackage, VulkanResidentGreedyModelPackageDeviceSlice,
-    VulkanResidentGreedyModelPackageManifest, VulkanResidentHfTokenizerTextCodec,
-    VulkanResidentTokenEngine, VulkanResidentTokenEngineRunBudget,
-    VulkanResidentTokenEngineRunStopCondition, VulkanResidentTokenTextCodec,
-    VulkanReusableKernelArtifactManifest,
+    RuntimeCableRoutes, RuntimeCapacityProfileSummary, RuntimeDeviceBindings,
+    RuntimePedalPortSummary, RuntimeSourcePedal, VulkanComputeDevice,
+    VulkanResidentGreedyInProcessPlacedModelPackage, VulkanResidentGreedyModelPackage,
+    VulkanResidentGreedyModelPackageDeviceSlice, VulkanResidentGreedyModelPackageManifest,
+    VulkanResidentHfTokenizerTextCodec, VulkanResidentTokenEngine,
+    VulkanResidentTokenEngineRunBudget, VulkanResidentTokenEngineRunStopCondition,
+    VulkanResidentTokenTextCodec, VulkanReusableKernelArtifactManifest,
 };
 use serde_json::{Value, json};
 
@@ -412,6 +412,7 @@ fn inspect_runtime_topology(
     let runtime_routes = runtime_cable_routes_report(args, &placement.cables);
     let device_bindings = runtime_device_bindings_report(args, &placement_device_ids);
     let source_pedals = source_pedals_report(&manifest);
+    let capacity_profiles = capacity_profiles_report(&manifest);
 
     let payload = json!({
         "ok": true,
@@ -430,11 +431,7 @@ fn inspect_runtime_topology(
             "source_pedal_count": source_pedals.len(),
             "source_pedals": source_pedals,
             "dynamic_state_capacity_activations": manifest.dynamic_state_capacity_activations,
-            "capacity_profiles": manifest.capacity_profiles.iter().map(|profile| json!({
-                "min_dynamic_state_capacity_activations": profile.min_dynamic_state_capacity_activations,
-                "max_dynamic_state_capacity_activations": profile.max_dynamic_state_capacity_activations,
-                "shader_override_count": profile.pedal_execution_shader_overrides.len(),
-            })).collect::<Vec<_>>(),
+            "capacity_profiles": capacity_profiles,
         },
         "runtime_patch_controls": runtime_patch_report(args),
         "runtime_patch": patch,
@@ -496,11 +493,7 @@ fn inspect_package(
     let available_devices = inspect_available_devices(default_device_id, args.vulkan_device_index);
     let source_pedals = source_pedals_report(&manifest);
     let source_pedal_count = source_pedals.len();
-    let capacity_profiles = manifest.capacity_profiles.iter().map(|profile| json!({
-        "min_dynamic_state_capacity_activations": profile.min_dynamic_state_capacity_activations,
-        "max_dynamic_state_capacity_activations": profile.max_dynamic_state_capacity_activations,
-        "shader_override_count": profile.pedal_execution_shader_overrides.len(),
-    })).collect::<Vec<_>>();
+    let capacity_profiles = capacity_profiles_report(&manifest);
     let payload = json!({
         "ok": true,
         "package_manifest": package_manifest,
@@ -736,6 +729,20 @@ fn package_port_report(port: &CircuitPort) -> RuntimePedalPortSummary {
         source: port.source.clone(),
         pedal_port: port.pedal_port.clone(),
     }
+}
+
+fn capacity_profiles_report(
+    manifest: &VulkanResidentGreedyModelPackageManifest,
+) -> Vec<RuntimeCapacityProfileSummary> {
+    manifest
+        .capacity_profiles
+        .iter()
+        .map(|profile| RuntimeCapacityProfileSummary {
+            min_dynamic_state_capacity_activations: profile.min_dynamic_state_capacity_activations,
+            max_dynamic_state_capacity_activations: profile.max_dynamic_state_capacity_activations,
+            shader_override_count: profile.pedal_execution_shader_overrides.len(),
+        })
+        .collect::<Vec<_>>()
 }
 
 fn inspect_device_slice(

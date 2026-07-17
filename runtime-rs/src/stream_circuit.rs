@@ -1683,6 +1683,13 @@ pub struct RuntimeSourcePedal {
     pub kernel_count: usize,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeCapacityProfileSummary {
+    pub min_dynamic_state_capacity_activations: usize,
+    pub max_dynamic_state_capacity_activations: usize,
+    pub shader_override_count: usize,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CircuitGraphSummary {
     pub circuit_count: usize,
@@ -2614,6 +2621,21 @@ mod tests {
         assert_eq!(payload["input_ports"][0]["pedal_port"], "input");
         assert_eq!(payload["output_ports"][0]["pedal_port"], "output");
         assert_eq!(payload["kernel_count"], 7);
+    }
+
+    #[test]
+    fn runtime_capacity_profile_serializes_capacity_summary() {
+        let profile = RuntimeCapacityProfileSummary {
+            min_dynamic_state_capacity_activations: 4,
+            max_dynamic_state_capacity_activations: 64,
+            shader_override_count: 14,
+        };
+
+        let payload = serde_json::to_value(&profile).unwrap();
+
+        assert_eq!(payload["min_dynamic_state_capacity_activations"], 4);
+        assert_eq!(payload["max_dynamic_state_capacity_activations"], 64);
+        assert_eq!(payload["shader_override_count"], 14);
     }
 
     #[test]
