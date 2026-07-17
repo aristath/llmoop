@@ -1984,6 +1984,19 @@ pub struct RuntimePlacedTransportReport {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimePromptTimingReport {
+    pub setup_time_ns: u64,
+    pub run_time_ns: u64,
+    pub total_time_ns: u64,
+    pub generated_token_count: usize,
+    pub tick_count: usize,
+    pub scheduler_turn_count: usize,
+    pub average_generated_token_time_ns: Option<u64>,
+    pub average_tick_time_ns: Option<u64>,
+    pub average_scheduler_turn_time_ns: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeSingleDevicePromptRunReport {
     pub ok: bool,
     pub execution_mode: String,
@@ -2008,6 +2021,7 @@ pub struct RuntimeSingleDevicePromptRunReport {
     pub stop_reason: String,
     pub scheduler_turns: usize,
     pub runtime_cycles: usize,
+    pub timing: RuntimePromptTimingReport,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -2038,6 +2052,7 @@ pub struct RuntimePlacedPromptRunReport {
     pub max_scheduler_turns_per_tick: usize,
     pub completed_stage_deltas: Vec<usize>,
     pub transport: RuntimePlacedTransportReport,
+    pub timing: RuntimePromptTimingReport,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -3539,6 +3554,17 @@ mod tests {
             add_special_tokens: true,
             skip_special_tokens: true,
         };
+        let timing = RuntimePromptTimingReport {
+            setup_time_ns: 10,
+            run_time_ns: 90,
+            total_time_ns: 100,
+            generated_token_count: 1,
+            tick_count: 1,
+            scheduler_turn_count: 1,
+            average_generated_token_time_ns: Some(90),
+            average_tick_time_ns: Some(90),
+            average_scheduler_turn_time_ns: Some(90),
+        };
         let single = RuntimeSingleDevicePromptRunReport {
             ok: true,
             execution_mode: "single_device_resident".to_string(),
@@ -3568,6 +3594,7 @@ mod tests {
             stop_reason: "max_new_tokens".to_string(),
             scheduler_turns: 1,
             runtime_cycles: 1,
+            timing: timing.clone(),
         };
         let placed = RuntimePlacedPromptRunReport {
             ok: true,
@@ -3633,6 +3660,7 @@ mod tests {
                     direct_receive_byte_count: 4096,
                 }],
             },
+            timing,
         };
 
         let single_payload = serde_json::to_value(&single).unwrap();
@@ -3643,6 +3671,11 @@ mod tests {
         assert_eq!(placed_payload["execution_mode"], "placed_in_process");
         assert_eq!(placed_payload["transport"]["direct_copy_count"], 2);
         assert_eq!(placed_payload["completed_stage_deltas"][0], 42);
+        assert_eq!(single_payload["timing"]["total_time_ns"], 100);
+        assert_eq!(
+            placed_payload["timing"]["average_generated_token_time_ns"],
+            90
+        );
     }
 
     #[test]

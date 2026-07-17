@@ -3,6 +3,7 @@ use std::error::Error;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
 use llmoop_runtime::{
     CircuitPort, PedalCablePlacement, PedalPlacement, RUNTIME_TOPOLOGY_SCHEMA,
@@ -13,14 +14,15 @@ use llmoop_runtime::{
     RuntimePackageInspectionReport, RuntimePatchControls, RuntimePatchDuplicateAfterControl,
     RuntimePatchInspectionReport, RuntimePatchPlacementReport, RuntimePatchSourceChainEntry,
     RuntimePedalPortSummary, RuntimePlacedPromptRunReport, RuntimePlacedTransportReport,
-    RuntimePlacedTransportStatsReport, RuntimePlacementReport, RuntimeRemoteCableBufferReport,
-    RuntimeSingleDevicePromptRunReport, RuntimeSourcePedal, RuntimeTokenizerOptionsReport,
-    RuntimeTopologyReport, VulkanComputeDevice, VulkanPlacedCableTransportStats,
-    VulkanResidentGreedyInProcessPlacedModelPackage, VulkanResidentGreedyModelPackage,
-    VulkanResidentGreedyModelPackageDeviceSlice, VulkanResidentGreedyModelPackageManifest,
-    VulkanResidentHfTokenizerTextCodec, VulkanResidentTokenEngine,
-    VulkanResidentTokenEngineRunBudget, VulkanResidentTokenEngineRunStopCondition,
-    VulkanResidentTokenTextCodec, VulkanReusableKernelArtifactManifest,
+    RuntimePlacedTransportStatsReport, RuntimePlacementReport, RuntimePromptTimingReport,
+    RuntimeRemoteCableBufferReport, RuntimeSingleDevicePromptRunReport, RuntimeSourcePedal,
+    RuntimeTokenizerOptionsReport, RuntimeTopologyReport, VulkanComputeDevice,
+    VulkanPlacedCableTransportStats, VulkanResidentGreedyInProcessPlacedModelPackage,
+    VulkanResidentGreedyModelPackage, VulkanResidentGreedyModelPackageDeviceSlice,
+    VulkanResidentGreedyModelPackageManifest, VulkanResidentHfTokenizerTextCodec,
+    VulkanResidentTokenEngine, VulkanResidentTokenEngineRunBudget,
+    VulkanResidentTokenEngineRunStopCondition, VulkanResidentTokenTextCodec,
+    VulkanReusableKernelArtifactManifest,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -156,6 +158,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         );
     }
 
+    let setup_start = Instant::now();
     let device = runtime_vulkan_device(&args)?;
     let model = VulkanResidentGreedyModelPackage::from_manifest(
         &device,
@@ -166,7 +169,9 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut engine = VulkanResidentTokenEngine::new(device);
     engine.add_model_package("compiled_model", model)?;
     engine.create_stream_from_model("compiled_model", "main")?;
+    let setup_time_ns = elapsed_nanos_u64(setup_start);
 
+    let run_start = Instant::now();
     let turn = engine.submit_live_text_turn_until_idle(
         "main",
         "prompt",
@@ -176,10 +181,21 @@ fn run() -> Result<(), Box<dyn Error>> {
         VulkanResidentTokenEngineRunBudget::new(args.max_scheduler_turns, 1, args.cycle_ticks),
         &codec,
     )?;
+    let run_time_ns = elapsed_nanos_u64(run_start);
     let stream = engine
         .stream("main")
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "runtime stream disappeared"))?;
     let snapshot = engine.snapshot();
+    let scheduler_turns = turn.scheduler_turn_count();
+    let runtime_cycles = turn.runtime_cycle_count;
+    let generated_token_count = turn.generated_token_ids.len();
+    let timing = runtime_prompt_timing_report(
+        setup_time_ns,
+        run_time_ns,
+        generated_token_count,
+        runtime_cycles,
+        scheduler_turns,
+    );
 
     if args.json {
         let payload = RuntimeSingleDevicePromptRunReport {
@@ -204,8 +220,9 @@ fn run() -> Result<(), Box<dyn Error>> {
             generated_text: turn.generated_text.clone(),
             output_text: turn.output_text.clone(),
             stop_reason: engine_stop_label(turn.stop_condition).to_string(),
-            scheduler_turns: turn.scheduler_turn_count(),
-            runtime_cycles: turn.runtime_cycle_count,
+            scheduler_turns,
+            runtime_cycles,
+            timing,
         };
         println!("{}", serde_json::to_string_pretty(&payload)?);
     } else if args.generated_only {
@@ -228,6 +245,7 @@ fn run_placed_prompt(
     manifest: VulkanResidentGreedyModelPackageManifest,
     codec: &VulkanResidentHfTokenizerTextCodec,
 ) -> Result<(), Box<dyn Error>> {
+    let setup_start = Instant::now();
     let mut logical_device_ids = manifest.placement_device_ids();
     if !logical_device_ids.contains(&manifest.device_id) {
         logical_device_ids.push(manifest.device_id.clone());
@@ -240,6 +258,8 @@ fn run_placed_prompt(
         manifest,
         Some(capacity),
     )?;
+    let setup_time_ns = elapsed_nanos_u64(setup_start);
+    let run_start = Instant::now();
     let run = package.run_prompt_event_bounded_on_bound_devices_in_process(
         &bound_devices.devices,
         &prompt_ids,
@@ -248,6 +268,7 @@ fn run_placed_prompt(
         None,
         args.max_scheduler_turns,
     )?;
+    let run_time_ns = elapsed_nanos_u64(run_start);
     let generated_text = codec.decode_tokens(&run.generated_token_ids)?;
     let output_text = codec.decode_tokens(&run.output_token_ids)?;
     let total_scheduler_turns = run
@@ -260,6 +281,15 @@ fn run_placed_prompt(
         .iter()
         .map(|tick| tick.tick_run.placed_run.completed_stage_delta)
         .collect::<Vec<_>>();
+    let tick_count = run.tick_runs.len();
+    let generated_token_count = run.generated_token_ids.len();
+    let timing = runtime_prompt_timing_report(
+        setup_time_ns,
+        run_time_ns,
+        generated_token_count,
+        tick_count,
+        total_scheduler_turns,
+    );
     let transport_stats_by_tick = run
         .tick_runs
         .iter()
@@ -359,7 +389,7 @@ fn run_placed_prompt(
             generated_text: generated_text.clone(),
             output_text: output_text.clone(),
             stop_reason: run.stop_reason.clone(),
-            tick_count: run.tick_runs.len(),
+            tick_count,
             scheduler_turns: total_scheduler_turns,
             max_scheduler_turns_per_tick: args.max_scheduler_turns,
             completed_stage_deltas,
@@ -374,6 +404,7 @@ fn run_placed_prompt(
                 direct_receive_byte_count: transport_direct_receive_byte_count,
                 by_tick: transport_stats_by_tick,
             },
+            timing,
         };
         println!("{}", serde_json::to_string_pretty(&payload)?);
     } else if args.generated_only {
@@ -1336,6 +1367,38 @@ fn runtime_report_default_vulkan_physical_device_index(args: &Args) -> Option<us
             })
         })
         .or_else(|| runtime_default_vulkan_physical_device_index().ok())
+}
+
+fn elapsed_nanos_u64(start: Instant) -> u64 {
+    u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX)
+}
+
+fn average_nanos(total_ns: u64, count: usize) -> Option<u64> {
+    if count == 0 {
+        None
+    } else {
+        Some(total_ns / u64::try_from(count).unwrap_or(u64::MAX))
+    }
+}
+
+fn runtime_prompt_timing_report(
+    setup_time_ns: u64,
+    run_time_ns: u64,
+    generated_token_count: usize,
+    tick_count: usize,
+    scheduler_turn_count: usize,
+) -> RuntimePromptTimingReport {
+    RuntimePromptTimingReport {
+        setup_time_ns,
+        run_time_ns,
+        total_time_ns: setup_time_ns.saturating_add(run_time_ns),
+        generated_token_count,
+        tick_count,
+        scheduler_turn_count,
+        average_generated_token_time_ns: average_nanos(run_time_ns, generated_token_count),
+        average_tick_time_ns: average_nanos(run_time_ns, tick_count),
+        average_scheduler_turn_time_ns: average_nanos(run_time_ns, scheduler_turn_count),
+    }
 }
 
 fn tokenizer_options_report(args: &Args) -> RuntimeTokenizerOptionsReport {
