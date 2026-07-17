@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::error::Error;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -36,6 +36,7 @@ use llmoop_runtime::{
 struct Args {
     package_manifest: Option<PathBuf>,
     prompt: Option<String>,
+    chat: bool,
     inspect_runtime: bool,
     inspect_package: bool,
     inspect_patch: bool,
@@ -64,6 +65,7 @@ impl Default for Args {
         Self {
             package_manifest: None,
             prompt: None,
+            chat: false,
             inspect_runtime: false,
             inspect_package: false,
             inspect_patch: false,
@@ -135,14 +137,36 @@ fn run() -> Result<(), Box<dyn Error>> {
     if let Some(device_id) = args.inspect_device_slice.as_deref() {
         return inspect_device_slice(&args, package_manifest, &manifest_dir, manifest, device_id);
     }
-    let prompt = args
-        .prompt
-        .as_ref()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "--prompt is required"))?;
     let tokenizer_dir = tokenizer_dir_from_package(package_manifest)?;
     let codec = VulkanResidentHfTokenizerTextCodec::from_model_dir(&tokenizer_dir)?
         .with_add_special_tokens(args.add_special_tokens)
         .with_skip_special_tokens(args.skip_special_tokens);
+    if args.chat {
+        let capacity =
+            choose_chat_runtime_capacity(package_manifest, args.capacity, args.max_new_tokens)?;
+        if manifest.placement_device_ids().len() > 1 {
+            return run_placed_chat(
+                &args,
+                &manifest_dir,
+                manifest,
+                capacity,
+                &codec,
+                args.prompt.as_deref(),
+            );
+        }
+        return run_single_device_chat(
+            &args,
+            &manifest_dir,
+            manifest,
+            capacity,
+            &codec,
+            args.prompt.as_deref(),
+        );
+    }
+    let prompt = args
+        .prompt
+        .as_ref()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "--prompt is required"))?;
     let prompt_ids = codec.encode_text(prompt)?;
     let needed_capacity = prompt_ids
         .len()
@@ -306,6 +330,158 @@ fn print_single_device_prompt_report(
         }
     }
     Ok(())
+}
+
+fn run_single_device_chat(
+    args: &Args,
+    manifest_dir: &Path,
+    manifest: VulkanResidentGreedyModelPackageManifest,
+    capacity: usize,
+    codec: &VulkanResidentHfTokenizerTextCodec,
+    initial_prompt: Option<&str>,
+) -> Result<(), Box<dyn Error>> {
+    let setup_start = Instant::now();
+    let device = runtime_vulkan_device(args)?;
+    let model = VulkanResidentGreedyModelPackage::from_manifest(
+        &device,
+        manifest_dir,
+        manifest,
+        Some(capacity),
+    )?;
+    let mut engine = VulkanResidentTokenEngine::new(device);
+    engine.add_model_package("compiled_model", model)?;
+    engine.create_stream_from_model("compiled_model", "main")?;
+    println!(
+        "llmoop chat ready: single_device_resident, capacity={capacity}, setup_ms={:.3}",
+        nanos_to_millis(elapsed_nanos_u64(setup_start))
+    );
+
+    run_chat_repl(initial_prompt, |turn_index, input_text| {
+        let turn = engine.submit_live_text_turn_until_idle(
+            "main",
+            format!("chat_{turn_index}"),
+            input_text,
+            args.max_new_tokens,
+            "cli_chat",
+            VulkanResidentTokenEngineRunBudget::new(args.max_scheduler_turns, 1, args.cycle_ticks),
+            codec,
+        )?;
+        Ok(turn.generated_text)
+    })
+}
+
+fn run_chat_repl<F>(initial_prompt: Option<&str>, mut submit: F) -> Result<(), Box<dyn Error>>
+where
+    F: FnMut(usize, &str) -> Result<String, Box<dyn Error>>,
+{
+    println!("Type a message and press Enter. Type /exit, /quit, exit, or quit to stop.");
+    let mut turn_index = 0usize;
+    if let Some(initial_prompt) = initial_prompt {
+        if !initial_prompt.trim().is_empty() {
+            print_chat_response(&submit(turn_index, initial_prompt)?);
+            turn_index = turn_index.saturating_add(1);
+        }
+    }
+
+    let stdin = io::stdin();
+    let mut line = String::new();
+    loop {
+        print!("you> ");
+        io::stdout().flush()?;
+        line.clear();
+        if stdin.read_line(&mut line)? == 0 {
+            println!();
+            break;
+        }
+        let input_text = line.trim_end_matches(['\r', '\n']);
+        let command = input_text.trim();
+        if command.eq_ignore_ascii_case("exit")
+            || command.eq_ignore_ascii_case("quit")
+            || command.eq_ignore_ascii_case("/exit")
+            || command.eq_ignore_ascii_case("/quit")
+        {
+            break;
+        }
+        if command.is_empty() {
+            continue;
+        }
+
+        let generated_text = submit(turn_index, input_text)?;
+        print_chat_response(&generated_text);
+        turn_index = turn_index.saturating_add(1);
+    }
+    Ok(())
+}
+
+fn print_chat_response(text: &str) {
+    print!("llm> ");
+    print_text(text);
+}
+
+fn run_placed_chat(
+    args: &Args,
+    manifest_dir: &Path,
+    manifest: VulkanResidentGreedyModelPackageManifest,
+    capacity: usize,
+    codec: &VulkanResidentHfTokenizerTextCodec,
+    initial_prompt: Option<&str>,
+) -> Result<(), Box<dyn Error>> {
+    let setup_start = Instant::now();
+    let mut logical_device_ids = manifest.placement_device_ids();
+    if !logical_device_ids.contains(&manifest.device_id) {
+        logical_device_ids.push(manifest.device_id.clone());
+    }
+    let bound_devices = runtime_bound_vulkan_devices(args, &logical_device_ids)?;
+    let stream = VulkanResidentGreedyInProcessPlacedPromptStream::from_manifest_for_bound_devices(
+        bound_devices.devices.clone(),
+        manifest_dir,
+        manifest,
+        Some(capacity),
+    )?;
+    let mut engine = VulkanResidentGreedyInProcessPlacedPromptEngine::new();
+    let stream_snapshot = engine.add_stream("main", stream)?;
+    println!(
+        "llmoop chat ready: placed_in_process, devices={:?}, capacity={}, setup_ms={:.3}",
+        stream_snapshot.device_ids,
+        stream_snapshot.resident_capacity_activations,
+        nanos_to_millis(elapsed_nanos_u64(setup_start))
+    );
+
+    run_chat_repl(initial_prompt, |turn_index, input_text| {
+        let input_event_id = format!("chat_{turn_index}");
+        let input_event = VulkanResidentTokenInputEvent::new(
+            input_event_id.clone(),
+            codec.encode_text(input_text)?,
+            args.max_new_tokens,
+        )
+        .with_origin("cli_chat");
+        let batch_run = engine.submit_input_events_until_idle_bounded(
+            vec![
+                VulkanResidentGreedyInProcessPlacedPromptEngineInputRequest::new(
+                    "main",
+                    input_event,
+                ),
+            ],
+            1,
+            args.max_scheduler_turns,
+        )?;
+        let generated_token_ids = batch_run
+            .engine_run
+            .input_runs
+            .into_iter()
+            .find(|run| {
+                run.stream_id == "main" && run.submitted_run.input_event.id == input_event_id
+            })
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "placed chat engine loop did not return the submitted input event run",
+                )
+            })?
+            .submitted_run
+            .generated_token_ids;
+        Ok(codec.decode_tokens(&generated_token_ids)?)
+    })
 }
 
 fn run_placed_prompt(
@@ -2140,6 +2316,40 @@ fn choose_runtime_capacity(
     )))
 }
 
+fn choose_chat_runtime_capacity(
+    package_manifest: &Path,
+    requested_capacity: Option<usize>,
+    needed_capacity: usize,
+) -> Result<usize, Box<dyn Error>> {
+    if requested_capacity.is_some() {
+        return choose_runtime_capacity(package_manifest, requested_capacity, needed_capacity);
+    }
+
+    let manifest = VulkanResidentGreedyModelPackageManifest::from_json_file(package_manifest)?;
+    let default_capacity = manifest.dynamic_state_capacity_activations;
+    let max_supported_capacity = manifest
+        .capacity_profiles
+        .iter()
+        .map(|profile| profile.max_dynamic_state_capacity_activations)
+        .chain(std::iter::once(default_capacity))
+        .max()
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "compiled package does not declare any supported dynamic-state capacity",
+            )
+        })?;
+    if max_supported_capacity < needed_capacity {
+        return Err(Box::new(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "--max-new-tokens needs at least {needed_capacity} activations, but compiled package supports up to {max_supported_capacity}; reduce --max-new-tokens or recompile with a larger capacity"
+            ),
+        )));
+    }
+    Ok(max_supported_capacity)
+}
+
 fn parse_args() -> Result<Args, String> {
     let mut parsed = Args::default();
     let mut raw = std::env::args().skip(1);
@@ -2151,6 +2361,9 @@ fn parse_args() -> Result<Args, String> {
             }
             "--prompt" => {
                 parsed.prompt = Some(next_value(&mut raw, "--prompt")?);
+            }
+            "--chat" => {
+                parsed.chat = true;
             }
             "--inspect-runtime" | "--inspect-topology" => {
                 parsed.inspect_runtime = true;
@@ -2260,6 +2473,18 @@ fn parse_args() -> Result<Args, String> {
             "--inspect-runtime, --inspect-package, --inspect-patch, --inspect-placement, and --inspect-device-slice are mutually exclusive"
                 .to_string(),
         );
+    }
+    if parsed.chat && inspect_mode_count > 0 {
+        return Err("--chat cannot be combined with inspect modes".to_string());
+    }
+    if parsed.chat && parsed.profile {
+        return Err("--profile is not supported with --chat".to_string());
+    }
+    if parsed.chat && parsed.profile_runs != 1 {
+        return Err("--profile-runs is not supported with --chat".to_string());
+    }
+    if parsed.chat && parsed.json {
+        return Err("--json is not supported with --chat yet".to_string());
     }
     if matches!(parsed.inspect_device_slice.as_deref(), Some("")) {
         return Err("--inspect-device-slice must not be empty".to_string());
@@ -2555,12 +2780,14 @@ fn print_usage() {
 }
 
 fn usage() -> &'static str {
-    "Usage: llmoop-runtime --package <COMPILED_PACKAGE.json> --prompt <TEXT> [OPTIONS]
+    "Usage: llmoop-runtime --package <COMPILED_PACKAGE.json> (--prompt <TEXT> | --chat) [OPTIONS]
 
 Options:
   --package <PATH>           Compiled resident model package manifest. Required.
   --package-manifest <PATH>  Alias for --package.
-  --prompt <TEXT>            External text event to inject into the resident stream. Required.
+  --prompt <TEXT>            External text event to inject into the resident stream.
+                             With --chat, this is the optional first message.
+  --chat                     Start an interactive resident text session.
   --device <DEVICE_ID>       Default logical device for this runtime patch.
   --default-device-id <ID>   Alias for --device.
   --place-pedal <PEDAL=DEV>  Assign one runtime pedal instance to a logical device.
@@ -2594,5 +2821,5 @@ Options:
 
 Example:
   python -m llmoop --compile-model <MODEL_DIR>
-  cargo run --manifest-path runtime-rs/Cargo.toml --features 'vulkan tokenizers' --bin llmoop-runtime -- --package packages/model_xxx/vulkan_resident_greedy_package.json --prompt Hello --max-new-tokens 4"
+  cargo run --manifest-path runtime-rs/Cargo.toml --features 'vulkan tokenizers' --bin llmoop-runtime -- --package packages/model_xxx/vulkan_resident_greedy_package.json --chat --max-new-tokens 4"
 }

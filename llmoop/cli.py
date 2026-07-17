@@ -37,6 +37,11 @@ def main() -> None:
         help="prompt text for --run/--run-model",
     )
     parser.add_argument(
+        "--chat",
+        action="store_true",
+        help="start an interactive resident text session for --run",
+    )
+    parser.add_argument(
         "--inspect-runtime",
         action="store_true",
         help="preview UI-ready package, patch, placement, device, and route facts for --run",
@@ -142,7 +147,7 @@ def main() -> None:
     parser.add_argument(
         "--max-new-tokens",
         type=int,
-        default=32,
+        default=4,
         help="maximum new tokens to generate for --run/--run-model",
     )
     parser.add_argument(
@@ -236,6 +241,8 @@ def main() -> None:
         parser.error("--inspect-patch is only supported with --run")
     elif args.inspect_placement:
         parser.error("--inspect-placement is only supported with --run")
+    elif args.chat:
+        parser.error("--chat is only supported with --run")
     elif args.default_device_id is not None:
         parser.error("--default-device-id is only supported with --run")
     elif args.place_pedal:
@@ -266,10 +273,18 @@ def main() -> None:
             parser.error(
                 "--inspect-runtime, --inspect-package, --inspect-patch, --inspect-device-slice, and --inspect-placement are mutually exclusive"
             )
-        if inspect_mode_count == 0 and args.prompt is None:
+        if args.chat and inspect_mode_count > 0:
+            parser.error("--chat cannot be combined with inspect modes")
+        if inspect_mode_count == 0 and args.prompt is None and not args.chat:
             parser.error("--prompt is required with --run")
         if inspect_mode_count > 0 and args.profile_runs != 1:
             parser.error("--profile-runs is only supported for --run prompt execution")
+        if args.chat and args.profile:
+            parser.error("--profile is not supported with --chat")
+        if args.chat and args.profile_runs != 1:
+            parser.error("--profile-runs is not supported with --chat")
+        if args.chat and args.json:
+            parser.error("--json is not supported with --chat yet")
         if args.temperature is not None:
             parser.error("--temperature is only supported by --run-model")
         if args.top_k is not None:
@@ -303,6 +318,8 @@ def main() -> None:
             parser.error("--inspect-patch is only supported by --run")
         if args.inspect_placement:
             parser.error("--inspect-placement is only supported by --run")
+        if args.chat:
+            parser.error("--chat is only supported by --run")
         if args.default_device_id is not None:
             parser.error("--default-device-id is only supported by --run")
         if args.place_pedal:
@@ -507,14 +524,13 @@ def build_runtime_command(args: argparse.Namespace, package_manifest: Path) -> l
     elif args.inspect_device_slice is not None:
         runtime_args.extend(["--inspect-device-slice", args.inspect_device_slice])
     else:
-        runtime_args.extend(
-            [
-                "--prompt",
-                args.prompt,
-                "--max-new-tokens",
-                str(args.max_new_tokens),
-            ]
-        )
+        if getattr(args, "chat", False):
+            runtime_args.append("--chat")
+            if args.prompt is not None:
+                runtime_args.extend(["--prompt", args.prompt])
+        else:
+            runtime_args.extend(["--prompt", args.prompt])
+        runtime_args.extend(["--max-new-tokens", str(args.max_new_tokens)])
     if args.default_device_id is not None:
         runtime_args.extend(["--device", args.default_device_id])
     for raw_placement in args.place_pedal:
