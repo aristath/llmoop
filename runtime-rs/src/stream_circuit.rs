@@ -1657,6 +1657,32 @@ pub struct RuntimeBoundDevice {
     pub device_name: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimePedalPortSummary {
+    pub id: String,
+    pub signal: String,
+    pub shape: Vec<usize>,
+    pub source: Option<String>,
+    pub pedal_port: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeSourcePedal {
+    pub pedal_index: usize,
+    pub pedal_id: String,
+    pub operator_type: String,
+    pub implementation: String,
+    pub behavioral_role: String,
+    pub source_layer_index: usize,
+    pub circuit_id: String,
+    pub input_ports: Vec<RuntimePedalPortSummary>,
+    pub output_ports: Vec<RuntimePedalPortSummary>,
+    pub state_port_count: usize,
+    pub parameter_ref_count: usize,
+    pub node_count: usize,
+    pub kernel_count: usize,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CircuitGraphSummary {
     pub circuit_count: usize,
@@ -2547,6 +2573,47 @@ mod tests {
         assert_eq!(payload["target"], "vulkan:5");
         assert_eq!(payload["physical_device_index"], 5);
         assert_eq!(payload["device_name"], "Radeon Test Device");
+    }
+
+    #[test]
+    fn runtime_source_pedal_serializes_compiled_pedal_summary() {
+        let pedal = RuntimeSourcePedal {
+            pedal_index: 5,
+            pedal_id: "layer_05".to_string(),
+            operator_type: "attention".to_string(),
+            implementation: "vulkan_resident".to_string(),
+            behavioral_role: "transformer_layer".to_string(),
+            source_layer_index: 5,
+            circuit_id: "layer_05_circuit_v1".to_string(),
+            input_ports: vec![RuntimePedalPortSummary {
+                id: "input_frame".to_string(),
+                signal: "frame".to_string(),
+                shape: vec![1024],
+                source: Some("hidden_states".to_string()),
+                pedal_port: Some("input".to_string()),
+            }],
+            output_ports: vec![RuntimePedalPortSummary {
+                id: "output_frame".to_string(),
+                signal: "frame".to_string(),
+                shape: vec![1024],
+                source: Some("hidden_states".to_string()),
+                pedal_port: Some("output".to_string()),
+            }],
+            state_port_count: 1,
+            parameter_ref_count: 12,
+            node_count: 7,
+            kernel_count: 7,
+        };
+
+        let payload = serde_json::to_value(&pedal).unwrap();
+
+        assert_eq!(payload["pedal_index"], 5);
+        assert_eq!(payload["pedal_id"], "layer_05");
+        assert_eq!(payload["operator_type"], "attention");
+        assert_eq!(payload["input_ports"][0]["id"], "input_frame");
+        assert_eq!(payload["input_ports"][0]["pedal_port"], "input");
+        assert_eq!(payload["output_ports"][0]["pedal_port"], "output");
+        assert_eq!(payload["kernel_count"], 7);
     }
 
     #[test]

@@ -6,12 +6,13 @@ use std::sync::Arc;
 
 use llmoop_runtime::{
     CircuitPort, PedalCablePlacement, PedalPlacement, RuntimeBoundDevice, RuntimeCableRouteTarget,
-    RuntimeCableRoutes, RuntimeDeviceBindings, VulkanComputeDevice,
-    VulkanResidentGreedyInProcessPlacedModelPackage, VulkanResidentGreedyModelPackage,
-    VulkanResidentGreedyModelPackageDeviceSlice, VulkanResidentGreedyModelPackageManifest,
-    VulkanResidentHfTokenizerTextCodec, VulkanResidentTokenEngine,
-    VulkanResidentTokenEngineRunBudget, VulkanResidentTokenEngineRunStopCondition,
-    VulkanResidentTokenTextCodec, VulkanReusableKernelArtifactManifest,
+    RuntimeCableRoutes, RuntimeDeviceBindings, RuntimePedalPortSummary, RuntimeSourcePedal,
+    VulkanComputeDevice, VulkanResidentGreedyInProcessPlacedModelPackage,
+    VulkanResidentGreedyModelPackage, VulkanResidentGreedyModelPackageDeviceSlice,
+    VulkanResidentGreedyModelPackageManifest, VulkanResidentHfTokenizerTextCodec,
+    VulkanResidentTokenEngine, VulkanResidentTokenEngineRunBudget,
+    VulkanResidentTokenEngineRunStopCondition, VulkanResidentTokenTextCodec,
+    VulkanReusableKernelArtifactManifest,
 };
 use serde_json::{Value, json};
 
@@ -544,7 +545,9 @@ fn inspect_package(
     Ok(())
 }
 
-fn source_pedals_report(manifest: &VulkanResidentGreedyModelPackageManifest) -> Vec<Value> {
+fn source_pedals_report(
+    manifest: &VulkanResidentGreedyModelPackageManifest,
+) -> Vec<RuntimeSourcePedal> {
     let execution_by_pedal = manifest
         .pedal_executions
         .iter()
@@ -558,21 +561,35 @@ fn source_pedals_report(manifest: &VulkanResidentGreedyModelPackageManifest) -> 
         .enumerate()
         .map(|(pedal_index, pedal)| {
             let execution = execution_by_pedal.get(pedal.pedal_id.as_str());
-            json!({
-                "pedal_index": pedal_index,
-                "pedal_id": pedal.pedal_id,
-                "operator_type": pedal.operator_type,
-                "implementation": pedal.implementation,
-                "behavioral_role": pedal.behavioral_role,
-                "source_layer_index": pedal.circuit.source.source_layer_index,
-                "circuit_id": pedal.circuit.id,
-                "input_ports": pedal.circuit.boundary.inputs.iter().map(package_port_report).collect::<Vec<_>>(),
-                "output_ports": pedal.circuit.boundary.outputs.iter().map(package_port_report).collect::<Vec<_>>(),
-                "state_port_count": pedal.circuit.state_ports.len(),
-                "parameter_ref_count": pedal.params.refs.len(),
-                "node_count": pedal.circuit.nodes.len(),
-                "kernel_count": execution.map(|execution| execution.kernels.len()).unwrap_or(0),
-            })
+            RuntimeSourcePedal {
+                pedal_index,
+                pedal_id: pedal.pedal_id.clone(),
+                operator_type: pedal.operator_type.clone(),
+                implementation: pedal.implementation.clone(),
+                behavioral_role: pedal.behavioral_role.clone(),
+                source_layer_index: pedal.circuit.source.source_layer_index,
+                circuit_id: pedal.circuit.id.clone(),
+                input_ports: pedal
+                    .circuit
+                    .boundary
+                    .inputs
+                    .iter()
+                    .map(package_port_report)
+                    .collect::<Vec<_>>(),
+                output_ports: pedal
+                    .circuit
+                    .boundary
+                    .outputs
+                    .iter()
+                    .map(package_port_report)
+                    .collect::<Vec<_>>(),
+                state_port_count: pedal.circuit.state_ports.len(),
+                parameter_ref_count: pedal.params.refs.len(),
+                node_count: pedal.circuit.nodes.len(),
+                kernel_count: execution
+                    .map(|execution| execution.kernels.len())
+                    .unwrap_or(0),
+            }
         })
         .collect::<Vec<_>>()
 }
@@ -711,14 +728,14 @@ fn inspect_patch(
     Ok(())
 }
 
-fn package_port_report(port: &CircuitPort) -> Value {
-    json!({
-        "id": port.id,
-        "signal": port.signal,
-        "shape": port.shape,
-        "source": port.source,
-        "pedal_port": port.pedal_port,
-    })
+fn package_port_report(port: &CircuitPort) -> RuntimePedalPortSummary {
+    RuntimePedalPortSummary {
+        id: port.id.clone(),
+        signal: port.signal.clone(),
+        shape: port.shape.clone(),
+        source: port.source.clone(),
+        pedal_port: port.pedal_port.clone(),
+    }
 }
 
 fn inspect_device_slice(
