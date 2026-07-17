@@ -189,6 +189,13 @@ def main() -> None:
         help="print human-readable runtime timing and top-pedal summaries for --run",
     )
     parser.add_argument(
+        "--profile-runs",
+        type=int,
+        default=1,
+        metavar="N",
+        help="run N fresh prompt trials and report aggregate benchmark stats for --run",
+    )
+    parser.add_argument(
         "--no-clean",
         action="store_true",
         help="do not delete an existing transpiled model directory before compiling",
@@ -243,6 +250,8 @@ def main() -> None:
         parser.error("--vulkan-device-index is only supported with --run")
     elif args.profile:
         parser.error("--profile is only supported with --run")
+    elif args.profile_runs != 1:
+        parser.error("--profile-runs is only supported with --run")
     if args.run is not None:
         inspect_mode_count = sum(
             [
@@ -259,6 +268,8 @@ def main() -> None:
             )
         if inspect_mode_count == 0 and args.prompt is None:
             parser.error("--prompt is required with --run")
+        if inspect_mode_count > 0 and args.profile_runs != 1:
+            parser.error("--profile-runs is only supported for --run prompt execution")
         if args.temperature is not None:
             parser.error("--temperature is only supported by --run-model")
         if args.top_k is not None:
@@ -269,6 +280,8 @@ def main() -> None:
             parser.error("--ignore-eos is only supported by --run-model")
         if args.vulkan_device_index is not None and args.vulkan_device_index < 0:
             parser.error("--vulkan-device-index must be non-negative")
+        if args.profile_runs < 1:
+            parser.error("--profile-runs must be at least 1")
         try:
             parse_pedal_device_overrides(args.place_pedal)
             parse_device_bindings(args.bind_device)
@@ -304,6 +317,8 @@ def main() -> None:
             parser.error("--vulkan-device-index is only supported by --run")
         if args.profile:
             parser.error("--profile is only supported by --run")
+        if args.profile_runs != 1:
+            parser.error("--profile-runs is only supported by --run")
         if args.prompt is None:
             parser.error("--prompt is required with --run-model")
         if args.package_dir is None:
@@ -522,6 +537,9 @@ def build_runtime_command(args: argparse.Namespace, package_manifest: Path) -> l
         runtime_args.append("--generated-only")
     if getattr(args, "profile", False):
         runtime_args.append("--profile")
+    profile_runs = getattr(args, "profile_runs", 1)
+    if profile_runs != 1:
+        runtime_args.extend(["--profile-runs", str(profile_runs)])
     if args.json:
         runtime_args.append("--json")
 

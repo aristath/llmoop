@@ -2028,6 +2028,77 @@ pub struct RuntimePlacedPedalTimingSummaryReport {
     pub average_dispatch_time_ns: Option<u64>,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RuntimePromptBenchmarkU64MetricReport {
+    pub total: u64,
+    pub min: u64,
+    pub max: u64,
+    pub average: f64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RuntimePromptBenchmarkUsizeMetricReport {
+    pub total: usize,
+    pub min: usize,
+    pub max: usize,
+    pub average: f64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimePromptBenchmarkTransportTotalsReport {
+    pub published_packet_count: usize,
+    pub published_byte_count: usize,
+    pub received_packet_count: usize,
+    pub received_byte_count: usize,
+    pub direct_copy_count: usize,
+    pub direct_copy_byte_count: usize,
+    pub direct_receive_count: usize,
+    pub direct_receive_byte_count: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RuntimePromptBenchmarkRunReport {
+    pub run_index: usize,
+    pub execution_mode: String,
+    pub stop_reason: String,
+    pub generated_token_count: usize,
+    pub tick_count: usize,
+    pub scheduler_turn_count: usize,
+    pub setup_time_ns: u64,
+    pub run_time_ns: u64,
+    pub total_time_ns: u64,
+    pub generated_tokens_per_second: Option<f64>,
+    pub transport: Option<RuntimePromptBenchmarkTransportTotalsReport>,
+    pub pedal_timing_summaries: Vec<RuntimePlacedPedalTimingSummaryReport>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RuntimePromptBenchmarkReport {
+    pub ok: bool,
+    pub execution_mode: String,
+    pub package_manifest: PathBuf,
+    pub tokenizer_dir: PathBuf,
+    pub runtime_patch: RuntimePatchControls,
+    pub device_bindings: RuntimeDeviceBindings,
+    pub device_count: usize,
+    pub device_ids: Vec<String>,
+    pub profile_runs: usize,
+    pub prompt_text: String,
+    pub prompt_ids: Vec<u32>,
+    pub max_new_tokens: usize,
+    pub setup_time_ns: RuntimePromptBenchmarkU64MetricReport,
+    pub run_time_ns: RuntimePromptBenchmarkU64MetricReport,
+    pub total_time_ns: RuntimePromptBenchmarkU64MetricReport,
+    pub generated_token_count: RuntimePromptBenchmarkUsizeMetricReport,
+    pub tick_count: RuntimePromptBenchmarkUsizeMetricReport,
+    pub scheduler_turn_count: RuntimePromptBenchmarkUsizeMetricReport,
+    pub generated_tokens_per_second: Option<f64>,
+    pub stop_reasons: BTreeMap<String, usize>,
+    pub transport_totals: Option<RuntimePromptBenchmarkTransportTotalsReport>,
+    pub pedal_timing_summaries: Vec<RuntimePlacedPedalTimingSummaryReport>,
+    pub runs: Vec<RuntimePromptBenchmarkRunReport>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeSingleDevicePromptRunReport {
     pub ok: bool,
@@ -3721,9 +3792,88 @@ mod tests {
                 average_dispatch_time_ns: Some(90),
             }],
         };
+        let benchmark_transport = RuntimePromptBenchmarkTransportTotalsReport {
+            published_packet_count: 0,
+            published_byte_count: 0,
+            received_packet_count: 0,
+            received_byte_count: 0,
+            direct_copy_count: 2,
+            direct_copy_byte_count: 4096,
+            direct_receive_count: 2,
+            direct_receive_byte_count: 4096,
+        };
+        let benchmark = RuntimePromptBenchmarkReport {
+            ok: true,
+            execution_mode: "placed_in_process".to_string(),
+            package_manifest: PathBuf::from("package.json"),
+            tokenizer_dir: PathBuf::from("tokenizer"),
+            runtime_patch: placed.runtime_patch.clone(),
+            device_bindings: placed.device_bindings.clone(),
+            device_count: 1,
+            device_ids: vec!["gpu0".to_string()],
+            profile_runs: 1,
+            prompt_text: "Hello".to_string(),
+            prompt_ids: vec![1],
+            max_new_tokens: 1,
+            setup_time_ns: RuntimePromptBenchmarkU64MetricReport {
+                total: 10,
+                min: 10,
+                max: 10,
+                average: 10.0,
+            },
+            run_time_ns: RuntimePromptBenchmarkU64MetricReport {
+                total: 90,
+                min: 90,
+                max: 90,
+                average: 90.0,
+            },
+            total_time_ns: RuntimePromptBenchmarkU64MetricReport {
+                total: 100,
+                min: 100,
+                max: 100,
+                average: 100.0,
+            },
+            generated_token_count: RuntimePromptBenchmarkUsizeMetricReport {
+                total: 1,
+                min: 1,
+                max: 1,
+                average: 1.0,
+            },
+            tick_count: RuntimePromptBenchmarkUsizeMetricReport {
+                total: 1,
+                min: 1,
+                max: 1,
+                average: 1.0,
+            },
+            scheduler_turn_count: RuntimePromptBenchmarkUsizeMetricReport {
+                total: 1,
+                min: 1,
+                max: 1,
+                average: 1.0,
+            },
+            generated_tokens_per_second: Some(11_111_111.111),
+            stop_reasons: BTreeMap::from([("max_new_tokens".to_string(), 1)]),
+            transport_totals: Some(benchmark_transport.clone()),
+            pedal_timing_summaries: placed.pedal_timing_summaries.clone(),
+            runs: vec![RuntimePromptBenchmarkRunReport {
+                run_index: 0,
+                execution_mode: "placed_in_process".to_string(),
+                stop_reason: "max_new_tokens".to_string(),
+                generated_token_count: 1,
+                tick_count: 1,
+                scheduler_turn_count: 1,
+                setup_time_ns: 10,
+                run_time_ns: 90,
+                total_time_ns: 100,
+                generated_tokens_per_second: Some(11_111_111.111),
+                transport: Some(benchmark_transport),
+                pedal_timing_summaries: placed.pedal_timing_summaries.clone(),
+            }],
+        };
 
         let single_payload = serde_json::to_value(&single).unwrap();
         let placed_payload = serde_json::to_value(&placed).unwrap();
+        let benchmark_payload = serde_json::to_value(&benchmark).unwrap();
 
         assert_eq!(single_payload["execution_mode"], "single_device_resident");
         assert_eq!(single_payload["generated_ids"][0], 2);
@@ -3744,6 +3894,12 @@ mod tests {
         assert_eq!(
             placed_payload["pedal_timing_summaries"][0]["total_run_time_ns"],
             90
+        );
+        assert_eq!(benchmark_payload["profile_runs"], 1);
+        assert_eq!(benchmark_payload["run_time_ns"]["average"], 90.0);
+        assert_eq!(
+            benchmark_payload["transport_totals"]["direct_copy_byte_count"],
+            4096
         );
     }
 

@@ -16,10 +16,12 @@ use llmoop_runtime::{
     RuntimePedalPortSummary, RuntimePlacedPedalDispatchTimingReport,
     RuntimePlacedPedalTimingReport, RuntimePlacedPedalTimingSummaryReport,
     RuntimePlacedPromptRunReport, RuntimePlacedTransportReport, RuntimePlacedTransportStatsReport,
-    RuntimePlacementReport, RuntimePromptTimingReport, RuntimeRemoteCableBufferReport,
-    RuntimeSingleDevicePromptRunReport, RuntimeSourcePedal, RuntimeTokenizerOptionsReport,
-    RuntimeTopologyReport, VulkanComputeDevice, VulkanPlacedCableTransportStats,
-    VulkanResidentGreedyInProcessPlacedModelPackage,
+    RuntimePlacementReport, RuntimePromptBenchmarkReport, RuntimePromptBenchmarkRunReport,
+    RuntimePromptBenchmarkTransportTotalsReport, RuntimePromptBenchmarkU64MetricReport,
+    RuntimePromptBenchmarkUsizeMetricReport, RuntimePromptTimingReport,
+    RuntimeRemoteCableBufferReport, RuntimeSingleDevicePromptRunReport, RuntimeSourcePedal,
+    RuntimeTokenizerOptionsReport, RuntimeTopologyReport, VulkanComputeDevice,
+    VulkanPlacedCableTransportStats, VulkanResidentGreedyInProcessPlacedModelPackage,
     VulkanResidentGreedyInProcessPlacedPromptEventRun, VulkanResidentGreedyModelPackage,
     VulkanResidentGreedyModelPackageDeviceSlice, VulkanResidentGreedyModelPackageManifest,
     VulkanResidentHfTokenizerTextCodec, VulkanResidentTokenEngine,
@@ -50,6 +52,7 @@ struct Args {
     skip_special_tokens: bool,
     generated_only: bool,
     profile: bool,
+    profile_runs: usize,
     json: bool,
 }
 
@@ -77,6 +80,7 @@ impl Default for Args {
             skip_special_tokens: true,
             generated_only: false,
             profile: false,
+            profile_runs: 1,
             json: false,
         }
     }
@@ -149,24 +153,79 @@ fn run() -> Result<(), Box<dyn Error>> {
     let capacity = choose_runtime_capacity(package_manifest, args.capacity, needed_capacity)?;
 
     if manifest.placement_device_ids().len() > 1 {
+        if args.profile_runs > 1 {
+            return run_placed_prompt_benchmark(
+                &args,
+                package_manifest,
+                &manifest_dir,
+                &tokenizer_dir,
+                prompt,
+                &prompt_ids,
+                capacity,
+                manifest,
+                &codec,
+            );
+        }
         return run_placed_prompt(
             &args,
             package_manifest,
             &manifest_dir,
             &tokenizer_dir,
             prompt,
-            prompt_ids,
+            &prompt_ids,
             capacity,
             manifest,
             &codec,
         );
     }
 
+    if args.profile_runs > 1 {
+        return run_single_device_prompt_benchmark(
+            &args,
+            package_manifest,
+            &manifest_dir,
+            &tokenizer_dir,
+            prompt,
+            &prompt_ids,
+            needed_capacity,
+            capacity,
+            manifest,
+            &codec,
+        );
+    }
+
+    let report = execute_single_device_prompt_run(
+        &args,
+        package_manifest,
+        &manifest_dir,
+        &tokenizer_dir,
+        prompt,
+        needed_capacity,
+        capacity,
+        manifest,
+        &codec,
+    )?;
+    print_single_device_prompt_report(&args, &report)?;
+
+    Ok(())
+}
+
+fn execute_single_device_prompt_run(
+    args: &Args,
+    package_manifest: &Path,
+    manifest_dir: &Path,
+    tokenizer_dir: &Path,
+    prompt: &str,
+    needed_capacity: usize,
+    capacity: usize,
+    manifest: VulkanResidentGreedyModelPackageManifest,
+    codec: &VulkanResidentHfTokenizerTextCodec,
+) -> Result<RuntimeSingleDevicePromptRunReport, Box<dyn Error>> {
     let setup_start = Instant::now();
-    let device = runtime_vulkan_device(&args)?;
+    let device = runtime_vulkan_device(args)?;
     let model = VulkanResidentGreedyModelPackage::from_manifest(
         &device,
-        &manifest_dir,
+        manifest_dir,
         manifest,
         Some(capacity),
     )?;
@@ -179,11 +238,11 @@ fn run() -> Result<(), Box<dyn Error>> {
     let turn = engine.submit_live_text_turn_until_idle(
         "main",
         "prompt",
-        prompt.clone(),
+        prompt,
         args.max_new_tokens,
         "cli",
         VulkanResidentTokenEngineRunBudget::new(args.max_scheduler_turns, 1, args.cycle_ticks),
-        &codec,
+        codec,
     )?;
     let run_time_ns = elapsed_nanos_u64(run_start);
     let stream = engine
@@ -201,43 +260,48 @@ fn run() -> Result<(), Box<dyn Error>> {
         scheduler_turns,
     );
 
+    Ok(RuntimeSingleDevicePromptRunReport {
+        ok: true,
+        execution_mode: "single_device_resident".to_string(),
+        package_manifest: package_manifest.to_path_buf(),
+        tokenizer_dir: tokenizer_dir.to_path_buf(),
+        device_name: snapshot.device_name,
+        device_id: stream.device_id.clone(),
+        runtime_patch: runtime_patch_report(args),
+        device_bindings: runtime_device_bindings_report(args, &[stream.device_id.clone()]),
+        pedal_count: stream.pedal_count,
+        dispatches_per_tick: stream.per_tick_dispatch_count,
+        descriptors_per_tick: stream.per_tick_descriptor_count,
+        push_constant_bytes_per_tick: stream.per_tick_push_constant_byte_count,
+        resident_capacity_activations: stream.dynamic_state_capacity_activations,
+        needed_capacity_activations: needed_capacity,
+        tokenizer: tokenizer_options_report(args),
+        prompt_text: prompt.to_string(),
+        prompt_ids: turn.queued_input_event.encoded_token_ids.clone(),
+        generated_ids: turn.generated_token_ids.clone(),
+        generated_text: turn.generated_text.clone(),
+        output_text: turn.output_text.clone(),
+        stop_reason: engine_stop_label(turn.stop_condition).to_string(),
+        scheduler_turns,
+        runtime_cycles,
+        timing,
+    })
+}
+
+fn print_single_device_prompt_report(
+    args: &Args,
+    report: &RuntimeSingleDevicePromptRunReport,
+) -> Result<(), Box<dyn Error>> {
     if args.json {
-        let payload = RuntimeSingleDevicePromptRunReport {
-            ok: true,
-            execution_mode: "single_device_resident".to_string(),
-            package_manifest: package_manifest.to_path_buf(),
-            tokenizer_dir: tokenizer_dir.clone(),
-            device_name: snapshot.device_name,
-            device_id: stream.device_id.clone(),
-            runtime_patch: runtime_patch_report(&args),
-            device_bindings: runtime_device_bindings_report(&args, &[stream.device_id.clone()]),
-            pedal_count: stream.pedal_count,
-            dispatches_per_tick: stream.per_tick_dispatch_count,
-            descriptors_per_tick: stream.per_tick_descriptor_count,
-            push_constant_bytes_per_tick: stream.per_tick_push_constant_byte_count,
-            resident_capacity_activations: stream.dynamic_state_capacity_activations,
-            needed_capacity_activations: needed_capacity,
-            tokenizer: tokenizer_options_report(&args),
-            prompt_text: prompt.clone(),
-            prompt_ids: turn.queued_input_event.encoded_token_ids.clone(),
-            generated_ids: turn.generated_token_ids.clone(),
-            generated_text: turn.generated_text.clone(),
-            output_text: turn.output_text.clone(),
-            stop_reason: engine_stop_label(turn.stop_condition).to_string(),
-            scheduler_turns,
-            runtime_cycles,
-            timing,
-        };
-        println!("{}", serde_json::to_string_pretty(&payload)?);
+        println!("{}", serde_json::to_string_pretty(report)?);
     } else if args.generated_only {
-        print_text(&turn.generated_text);
+        print_text(&report.generated_text);
     } else {
-        print_text(&turn.output_text);
+        print_text(&report.output_text);
         if args.profile {
-            print_prompt_timing_profile(&timing);
+            print_prompt_timing_profile(&report.timing);
         }
     }
-
     Ok(())
 }
 
@@ -247,11 +311,36 @@ fn run_placed_prompt(
     manifest_dir: &Path,
     tokenizer_dir: &Path,
     prompt: &str,
-    prompt_ids: Vec<u32>,
+    prompt_ids: &[u32],
     capacity: usize,
     manifest: VulkanResidentGreedyModelPackageManifest,
     codec: &VulkanResidentHfTokenizerTextCodec,
 ) -> Result<(), Box<dyn Error>> {
+    let report = execute_placed_prompt_run(
+        args,
+        package_manifest,
+        manifest_dir,
+        tokenizer_dir,
+        prompt,
+        prompt_ids,
+        capacity,
+        manifest,
+        codec,
+    )?;
+    print_placed_prompt_report(args, &report)
+}
+
+fn execute_placed_prompt_run(
+    args: &Args,
+    package_manifest: &Path,
+    manifest_dir: &Path,
+    tokenizer_dir: &Path,
+    prompt: &str,
+    prompt_ids: &[u32],
+    capacity: usize,
+    manifest: VulkanResidentGreedyModelPackageManifest,
+    codec: &VulkanResidentHfTokenizerTextCodec,
+) -> Result<RuntimePlacedPromptRunReport, Box<dyn Error>> {
     let setup_start = Instant::now();
     let mut logical_device_ids = manifest.placement_device_ids();
     if !logical_device_ids.contains(&manifest.device_id) {
@@ -269,7 +358,7 @@ fn run_placed_prompt(
     let run_start = Instant::now();
     let run = package.run_prompt_event_bounded_on_bound_devices_in_process(
         &bound_devices.devices,
-        &prompt_ids,
+        prompt_ids,
         0,
         args.max_new_tokens,
         None,
@@ -375,59 +464,454 @@ fn run_placed_prompt(
         })
         .sum::<usize>();
 
+    Ok(RuntimePlacedPromptRunReport {
+        ok: true,
+        execution_mode: "placed_in_process".to_string(),
+        package_manifest: package_manifest.to_path_buf(),
+        tokenizer_dir: tokenizer_dir.to_path_buf(),
+        boundary_device_id: package.boundary_device_id.clone(),
+        device_count: package.device_count,
+        device_ids: package.device_ids.clone(),
+        bound_devices: bound_devices_report(&bound_devices),
+        cable_routes: bound_cable_routes_report(&bound_devices, &placement.cables),
+        runtime_patch: runtime_patch_report(args),
+        device_bindings: runtime_device_bindings_report(args, &package.device_ids),
+        hosted_pedal_count: package.hosted_pedal_count,
+        resident_capacity_activations: package.dynamic_state_capacity_activations,
+        needed_capacity_activations: prompt_ids.len() + args.max_new_tokens,
+        tokenizer: tokenizer_options_report(args),
+        prompt_text: prompt.to_string(),
+        prompt_ids: run.prompt_token_ids.clone(),
+        generated_ids: run.generated_token_ids.clone(),
+        generated_text: generated_text.clone(),
+        output_text: output_text.clone(),
+        stop_reason: run.stop_reason.clone(),
+        tick_count,
+        scheduler_turns: total_scheduler_turns,
+        max_scheduler_turns_per_tick: args.max_scheduler_turns,
+        completed_stage_deltas,
+        transport: RuntimePlacedTransportReport {
+            published_packet_count: transport_published_packet_count,
+            published_byte_count: transport_published_byte_count,
+            received_packet_count: transport_received_packet_count,
+            received_byte_count: transport_received_byte_count,
+            direct_copy_count: transport_direct_copy_count,
+            direct_copy_byte_count: transport_direct_copy_byte_count,
+            direct_receive_count: transport_direct_receive_count,
+            direct_receive_byte_count: transport_direct_receive_byte_count,
+            by_tick: transport_stats_by_tick,
+        },
+        timing,
+        pedal_timings,
+        pedal_timing_summaries,
+    })
+}
+
+fn print_placed_prompt_report(
+    args: &Args,
+    report: &RuntimePlacedPromptRunReport,
+) -> Result<(), Box<dyn Error>> {
     if args.json {
-        let payload = RuntimePlacedPromptRunReport {
-            ok: true,
-            execution_mode: "placed_in_process".to_string(),
-            package_manifest: package_manifest.to_path_buf(),
-            tokenizer_dir: tokenizer_dir.to_path_buf(),
-            boundary_device_id: package.boundary_device_id.clone(),
-            device_count: package.device_count,
-            device_ids: package.device_ids.clone(),
-            bound_devices: bound_devices_report(&bound_devices),
-            cable_routes: bound_cable_routes_report(&bound_devices, &placement.cables),
-            runtime_patch: runtime_patch_report(args),
-            device_bindings: runtime_device_bindings_report(args, &package.device_ids),
-            hosted_pedal_count: package.hosted_pedal_count,
-            resident_capacity_activations: package.dynamic_state_capacity_activations,
-            needed_capacity_activations: prompt_ids.len() + args.max_new_tokens,
-            tokenizer: tokenizer_options_report(args),
-            prompt_text: prompt.to_string(),
-            prompt_ids: run.prompt_token_ids.clone(),
-            generated_ids: run.generated_token_ids.clone(),
-            generated_text: generated_text.clone(),
-            output_text: output_text.clone(),
-            stop_reason: run.stop_reason.clone(),
-            tick_count,
-            scheduler_turns: total_scheduler_turns,
-            max_scheduler_turns_per_tick: args.max_scheduler_turns,
-            completed_stage_deltas,
-            transport: RuntimePlacedTransportReport {
-                published_packet_count: transport_published_packet_count,
-                published_byte_count: transport_published_byte_count,
-                received_packet_count: transport_received_packet_count,
-                received_byte_count: transport_received_byte_count,
-                direct_copy_count: transport_direct_copy_count,
-                direct_copy_byte_count: transport_direct_copy_byte_count,
-                direct_receive_count: transport_direct_receive_count,
-                direct_receive_byte_count: transport_direct_receive_byte_count,
-                by_tick: transport_stats_by_tick,
-            },
-            timing,
-            pedal_timings,
-            pedal_timing_summaries,
-        };
-        println!("{}", serde_json::to_string_pretty(&payload)?);
+        println!("{}", serde_json::to_string_pretty(report)?);
     } else if args.generated_only {
-        print_text(&generated_text);
+        print_text(&report.generated_text);
     } else {
-        print_text(&output_text);
+        print_text(&report.output_text);
         if args.profile {
-            print_prompt_timing_profile(&timing);
-            print_placed_pedal_timing_profile(&pedal_timing_summaries, 5);
+            print_prompt_timing_profile(&report.timing);
+            print_placed_pedal_timing_profile(&report.pedal_timing_summaries, 5);
         }
     }
+    Ok(())
+}
 
+fn run_single_device_prompt_benchmark(
+    args: &Args,
+    package_manifest: &Path,
+    manifest_dir: &Path,
+    tokenizer_dir: &Path,
+    prompt: &str,
+    prompt_ids: &[u32],
+    needed_capacity: usize,
+    capacity: usize,
+    manifest: VulkanResidentGreedyModelPackageManifest,
+    codec: &VulkanResidentHfTokenizerTextCodec,
+) -> Result<(), Box<dyn Error>> {
+    let mut runs = Vec::with_capacity(args.profile_runs);
+    for _ in 0..args.profile_runs {
+        runs.push(execute_single_device_prompt_run(
+            args,
+            package_manifest,
+            manifest_dir,
+            tokenizer_dir,
+            prompt,
+            needed_capacity,
+            capacity,
+            manifest.clone(),
+            codec,
+        )?);
+    }
+    let first = runs
+        .first()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "--profile-runs is empty"))?;
+    let benchmark_runs = runs
+        .iter()
+        .enumerate()
+        .map(|(run_index, run)| single_device_benchmark_run_report(run_index, run))
+        .collect::<Vec<_>>();
+    let benchmark = runtime_prompt_benchmark_report(
+        args,
+        package_manifest,
+        tokenizer_dir,
+        prompt,
+        prompt_ids,
+        &first.execution_mode,
+        vec![first.device_id.clone()],
+        first.device_bindings.clone(),
+        benchmark_runs,
+    );
+    print_prompt_benchmark_report(args, &benchmark)
+}
+
+fn run_placed_prompt_benchmark(
+    args: &Args,
+    package_manifest: &Path,
+    manifest_dir: &Path,
+    tokenizer_dir: &Path,
+    prompt: &str,
+    prompt_ids: &[u32],
+    capacity: usize,
+    manifest: VulkanResidentGreedyModelPackageManifest,
+    codec: &VulkanResidentHfTokenizerTextCodec,
+) -> Result<(), Box<dyn Error>> {
+    let mut runs = Vec::with_capacity(args.profile_runs);
+    for _ in 0..args.profile_runs {
+        runs.push(execute_placed_prompt_run(
+            args,
+            package_manifest,
+            manifest_dir,
+            tokenizer_dir,
+            prompt,
+            prompt_ids,
+            capacity,
+            manifest.clone(),
+            codec,
+        )?);
+    }
+    let first = runs
+        .first()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "--profile-runs is empty"))?;
+    let benchmark_runs = runs
+        .iter()
+        .enumerate()
+        .map(|(run_index, run)| placed_benchmark_run_report(run_index, run))
+        .collect::<Vec<_>>();
+    let benchmark = runtime_prompt_benchmark_report(
+        args,
+        package_manifest,
+        tokenizer_dir,
+        prompt,
+        prompt_ids,
+        &first.execution_mode,
+        first.device_ids.clone(),
+        first.device_bindings.clone(),
+        benchmark_runs,
+    );
+    print_prompt_benchmark_report(args, &benchmark)
+}
+
+fn single_device_benchmark_run_report(
+    run_index: usize,
+    run: &RuntimeSingleDevicePromptRunReport,
+) -> RuntimePromptBenchmarkRunReport {
+    RuntimePromptBenchmarkRunReport {
+        run_index,
+        execution_mode: run.execution_mode.clone(),
+        stop_reason: run.stop_reason.clone(),
+        generated_token_count: run.timing.generated_token_count,
+        tick_count: run.timing.tick_count,
+        scheduler_turn_count: run.timing.scheduler_turn_count,
+        setup_time_ns: run.timing.setup_time_ns,
+        run_time_ns: run.timing.run_time_ns,
+        total_time_ns: run.timing.total_time_ns,
+        generated_tokens_per_second: generated_tokens_per_second(
+            run.timing.generated_token_count,
+            run.timing.run_time_ns,
+        ),
+        transport: None,
+        pedal_timing_summaries: Vec::new(),
+    }
+}
+
+fn placed_benchmark_run_report(
+    run_index: usize,
+    run: &RuntimePlacedPromptRunReport,
+) -> RuntimePromptBenchmarkRunReport {
+    RuntimePromptBenchmarkRunReport {
+        run_index,
+        execution_mode: run.execution_mode.clone(),
+        stop_reason: run.stop_reason.clone(),
+        generated_token_count: run.timing.generated_token_count,
+        tick_count: run.timing.tick_count,
+        scheduler_turn_count: run.timing.scheduler_turn_count,
+        setup_time_ns: run.timing.setup_time_ns,
+        run_time_ns: run.timing.run_time_ns,
+        total_time_ns: run.timing.total_time_ns,
+        generated_tokens_per_second: generated_tokens_per_second(
+            run.timing.generated_token_count,
+            run.timing.run_time_ns,
+        ),
+        transport: Some(benchmark_transport_totals_from_report(&run.transport)),
+        pedal_timing_summaries: run.pedal_timing_summaries.clone(),
+    }
+}
+
+fn runtime_prompt_benchmark_report(
+    args: &Args,
+    package_manifest: &Path,
+    tokenizer_dir: &Path,
+    prompt: &str,
+    prompt_ids: &[u32],
+    execution_mode: &str,
+    device_ids: Vec<String>,
+    device_bindings: RuntimeDeviceBindings,
+    runs: Vec<RuntimePromptBenchmarkRunReport>,
+) -> RuntimePromptBenchmarkReport {
+    let setup_values = runs.iter().map(|run| run.setup_time_ns).collect::<Vec<_>>();
+    let run_values = runs.iter().map(|run| run.run_time_ns).collect::<Vec<_>>();
+    let total_values = runs.iter().map(|run| run.total_time_ns).collect::<Vec<_>>();
+    let generated_token_values = runs
+        .iter()
+        .map(|run| run.generated_token_count)
+        .collect::<Vec<_>>();
+    let tick_values = runs.iter().map(|run| run.tick_count).collect::<Vec<_>>();
+    let scheduler_turn_values = runs
+        .iter()
+        .map(|run| run.scheduler_turn_count)
+        .collect::<Vec<_>>();
+    let mut stop_reasons = BTreeMap::new();
+    for run in &runs {
+        *stop_reasons.entry(run.stop_reason.clone()).or_insert(0) += 1;
+    }
+    let total_generated_tokens = generated_token_values.iter().sum::<usize>();
+    let total_run_time_ns = run_values.iter().sum::<u64>();
+
+    RuntimePromptBenchmarkReport {
+        ok: true,
+        execution_mode: execution_mode.to_string(),
+        package_manifest: package_manifest.to_path_buf(),
+        tokenizer_dir: tokenizer_dir.to_path_buf(),
+        runtime_patch: runtime_patch_report(args),
+        device_bindings,
+        device_count: device_ids.len(),
+        device_ids,
+        profile_runs: runs.len(),
+        prompt_text: prompt.to_string(),
+        prompt_ids: prompt_ids.to_vec(),
+        max_new_tokens: args.max_new_tokens,
+        setup_time_ns: benchmark_u64_metric(&setup_values),
+        run_time_ns: benchmark_u64_metric(&run_values),
+        total_time_ns: benchmark_u64_metric(&total_values),
+        generated_token_count: benchmark_usize_metric(&generated_token_values),
+        tick_count: benchmark_usize_metric(&tick_values),
+        scheduler_turn_count: benchmark_usize_metric(&scheduler_turn_values),
+        generated_tokens_per_second: generated_tokens_per_second(
+            total_generated_tokens,
+            total_run_time_ns,
+        ),
+        stop_reasons,
+        transport_totals: aggregate_benchmark_transport_totals(&runs),
+        pedal_timing_summaries: aggregate_benchmark_pedal_timing_summaries(&runs),
+        runs,
+    }
+}
+
+fn benchmark_u64_metric(values: &[u64]) -> RuntimePromptBenchmarkU64MetricReport {
+    let total = values.iter().sum::<u64>();
+    RuntimePromptBenchmarkU64MetricReport {
+        total,
+        min: values.iter().copied().min().unwrap_or(0),
+        max: values.iter().copied().max().unwrap_or(0),
+        average: if values.is_empty() {
+            0.0
+        } else {
+            total as f64 / values.len() as f64
+        },
+    }
+}
+
+fn benchmark_usize_metric(values: &[usize]) -> RuntimePromptBenchmarkUsizeMetricReport {
+    let total = values.iter().sum::<usize>();
+    RuntimePromptBenchmarkUsizeMetricReport {
+        total,
+        min: values.iter().copied().min().unwrap_or(0),
+        max: values.iter().copied().max().unwrap_or(0),
+        average: if values.is_empty() {
+            0.0
+        } else {
+            total as f64 / values.len() as f64
+        },
+    }
+}
+
+fn generated_tokens_per_second(generated_token_count: usize, run_time_ns: u64) -> Option<f64> {
+    if run_time_ns == 0 {
+        None
+    } else {
+        Some(generated_token_count as f64 / (run_time_ns as f64 / 1_000_000_000.0))
+    }
+}
+
+fn benchmark_transport_totals_from_report(
+    transport: &RuntimePlacedTransportReport,
+) -> RuntimePromptBenchmarkTransportTotalsReport {
+    RuntimePromptBenchmarkTransportTotalsReport {
+        published_packet_count: transport.published_packet_count,
+        published_byte_count: transport.published_byte_count,
+        received_packet_count: transport.received_packet_count,
+        received_byte_count: transport.received_byte_count,
+        direct_copy_count: transport.direct_copy_count,
+        direct_copy_byte_count: transport.direct_copy_byte_count,
+        direct_receive_count: transport.direct_receive_count,
+        direct_receive_byte_count: transport.direct_receive_byte_count,
+    }
+}
+
+fn aggregate_benchmark_transport_totals(
+    runs: &[RuntimePromptBenchmarkRunReport],
+) -> Option<RuntimePromptBenchmarkTransportTotalsReport> {
+    let mut total = RuntimePromptBenchmarkTransportTotalsReport {
+        published_packet_count: 0,
+        published_byte_count: 0,
+        received_packet_count: 0,
+        received_byte_count: 0,
+        direct_copy_count: 0,
+        direct_copy_byte_count: 0,
+        direct_receive_count: 0,
+        direct_receive_byte_count: 0,
+    };
+    let mut seen = false;
+    for transport in runs.iter().filter_map(|run| run.transport.as_ref()) {
+        seen = true;
+        total.published_packet_count = total
+            .published_packet_count
+            .saturating_add(transport.published_packet_count);
+        total.published_byte_count = total
+            .published_byte_count
+            .saturating_add(transport.published_byte_count);
+        total.received_packet_count = total
+            .received_packet_count
+            .saturating_add(transport.received_packet_count);
+        total.received_byte_count = total
+            .received_byte_count
+            .saturating_add(transport.received_byte_count);
+        total.direct_copy_count = total
+            .direct_copy_count
+            .saturating_add(transport.direct_copy_count);
+        total.direct_copy_byte_count = total
+            .direct_copy_byte_count
+            .saturating_add(transport.direct_copy_byte_count);
+        total.direct_receive_count = total
+            .direct_receive_count
+            .saturating_add(transport.direct_receive_count);
+        total.direct_receive_byte_count = total
+            .direct_receive_byte_count
+            .saturating_add(transport.direct_receive_byte_count);
+    }
+    seen.then_some(total)
+}
+
+fn aggregate_benchmark_pedal_timing_summaries(
+    runs: &[RuntimePromptBenchmarkRunReport],
+) -> Vec<RuntimePlacedPedalTimingSummaryReport> {
+    let mut summaries = BTreeMap::<(String, String), RuntimePlacedPedalTimingSummaryReport>::new();
+    for run in runs {
+        for timing in &run.pedal_timing_summaries {
+            let entry = summaries
+                .entry((timing.device_id.clone(), timing.pedal_id.clone()))
+                .or_insert_with(|| RuntimePlacedPedalTimingSummaryReport {
+                    device_id: timing.device_id.clone(),
+                    pedal_id: timing.pedal_id.clone(),
+                    tick_count: 0,
+                    dispatch_count: 0,
+                    total_run_time_ns: 0,
+                    average_tick_time_ns: None,
+                    average_dispatch_time_ns: None,
+                });
+            entry.tick_count += timing.tick_count;
+            entry.dispatch_count += timing.dispatch_count;
+            entry.total_run_time_ns = entry
+                .total_run_time_ns
+                .saturating_add(timing.total_run_time_ns);
+        }
+    }
+    let mut summaries = summaries.into_values().collect::<Vec<_>>();
+    for summary in &mut summaries {
+        summary.average_tick_time_ns = average_nanos(summary.total_run_time_ns, summary.tick_count);
+        summary.average_dispatch_time_ns =
+            average_nanos(summary.total_run_time_ns, summary.dispatch_count);
+    }
+    summaries.sort_by(|left, right| {
+        right
+            .total_run_time_ns
+            .cmp(&left.total_run_time_ns)
+            .then_with(|| left.device_id.cmp(&right.device_id))
+            .then_with(|| left.pedal_id.cmp(&right.pedal_id))
+    });
+    summaries
+}
+
+fn print_prompt_benchmark_report(
+    args: &Args,
+    report: &RuntimePromptBenchmarkReport,
+) -> Result<(), Box<dyn Error>> {
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(report)?);
+        return Ok(());
+    }
+
+    println!("benchmark:");
+    println!("  execution_mode={}", report.execution_mode);
+    println!("  runs={}", report.profile_runs);
+    println!("  devices={}", report.device_ids.join(","));
+    println!(
+        "  setup_ms avg={:.3} min={:.3} max={:.3}",
+        nanos_to_millis_f64(report.setup_time_ns.average),
+        nanos_to_millis(report.setup_time_ns.min),
+        nanos_to_millis(report.setup_time_ns.max)
+    );
+    println!(
+        "  run_ms avg={:.3} min={:.3} max={:.3}",
+        nanos_to_millis_f64(report.run_time_ns.average),
+        nanos_to_millis(report.run_time_ns.min),
+        nanos_to_millis(report.run_time_ns.max)
+    );
+    println!(
+        "  total_ms avg={:.3} min={:.3} max={:.3}",
+        nanos_to_millis_f64(report.total_time_ns.average),
+        nanos_to_millis(report.total_time_ns.min),
+        nanos_to_millis(report.total_time_ns.max)
+    );
+    println!(
+        "  generated_tokens total={} avg={:.3}",
+        report.generated_token_count.total, report.generated_token_count.average
+    );
+    if let Some(tokens_per_second) = report.generated_tokens_per_second {
+        println!("  generated_tokens_per_second={tokens_per_second:.3}");
+    }
+    if !report.stop_reasons.is_empty() {
+        println!("stop_reasons:");
+        for (reason, count) in &report.stop_reasons {
+            println!("  {reason}={count}");
+        }
+    }
+    if let Some(transport) = &report.transport_totals {
+        println!("transport_totals:");
+        println!("  published_packets={}", transport.published_packet_count);
+        println!("  received_packets={}", transport.received_packet_count);
+        println!("  direct_copies={}", transport.direct_copy_count);
+    }
+    print_placed_pedal_timing_profile(&report.pedal_timing_summaries, 5);
     Ok(())
 }
 
@@ -1732,6 +2216,9 @@ fn parse_args() -> Result<Args, String> {
             "--profile" => {
                 parsed.profile = true;
             }
+            "--profile-runs" => {
+                parsed.profile_runs = parse_next(&mut raw, "--profile-runs")?;
+            }
             "--json" => {
                 parsed.json = true;
             }
@@ -1772,6 +2259,9 @@ fn parse_args() -> Result<Args, String> {
     }
     if parsed.max_scheduler_turns == 0 {
         return Err("--max-scheduler-turns must be at least 1".to_string());
+    }
+    if parsed.profile_runs == 0 {
+        return Err("--profile-runs must be at least 1".to_string());
     }
 
     Ok(parsed)
@@ -2030,6 +2520,10 @@ fn nanos_to_millis(nanos: u64) -> f64 {
     nanos as f64 / 1_000_000.0
 }
 
+fn nanos_to_millis_f64(nanos: f64) -> f64 {
+    nanos / 1_000_000.0
+}
+
 fn engine_stop_label(stop: VulkanResidentTokenEngineRunStopCondition) -> &'static str {
     match stop {
         VulkanResidentTokenEngineRunStopCondition::Idle => "idle",
@@ -2075,6 +2569,7 @@ Options:
   --keep-special-tokens      Keep tokenizer special tokens in decoded output text.
   --generated-only           Print only newly generated text instead of prompt + generated text.
   --profile                  Print human-readable timing and top-pedal summaries.
+  --profile-runs <N>         Run N fresh prompt trials and report aggregate benchmark stats.
   --json                     Print a machine-readable run report.
   -h, --help                 Show this help.
 
