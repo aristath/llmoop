@@ -11,13 +11,13 @@ use llmoop_runtime::{
     RuntimeCompiledPedalboardSummary, RuntimeDeviceBindings, RuntimeDeviceSliceReport,
     RuntimeDeviceTickPlanReport, RuntimeEffectivePedalboardTopology, RuntimeLocalCableBufferReport,
     RuntimePatchControls, RuntimePatchDuplicateAfterControl, RuntimePatchSourceChainEntry,
-    RuntimePedalPortSummary, RuntimeRemoteCableBufferReport, RuntimeSourcePedal,
-    RuntimeTopologyReport, VulkanComputeDevice, VulkanResidentGreedyInProcessPlacedModelPackage,
-    VulkanResidentGreedyModelPackage, VulkanResidentGreedyModelPackageDeviceSlice,
-    VulkanResidentGreedyModelPackageManifest, VulkanResidentHfTokenizerTextCodec,
-    VulkanResidentTokenEngine, VulkanResidentTokenEngineRunBudget,
-    VulkanResidentTokenEngineRunStopCondition, VulkanResidentTokenTextCodec,
-    VulkanReusableKernelArtifactManifest,
+    RuntimePedalPortSummary, RuntimePlacementReport, RuntimeRemoteCableBufferReport,
+    RuntimeSourcePedal, RuntimeTopologyReport, VulkanComputeDevice,
+    VulkanResidentGreedyInProcessPlacedModelPackage, VulkanResidentGreedyModelPackage,
+    VulkanResidentGreedyModelPackageDeviceSlice, VulkanResidentGreedyModelPackageManifest,
+    VulkanResidentHfTokenizerTextCodec, VulkanResidentTokenEngine,
+    VulkanResidentTokenEngineRunBudget, VulkanResidentTokenEngineRunStopCondition,
+    VulkanResidentTokenTextCodec, VulkanReusableKernelArtifactManifest,
 };
 use serde_json::json;
 
@@ -867,24 +867,24 @@ fn inspect_placement(
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let payload = json!({
-        "ok": true,
-        "package_manifest": package_manifest,
-        "resident_capacity_activations": capacity,
-        "runtime_patch": runtime_patch_report(args),
-        "device_bindings": runtime_device_bindings_report(args, &device_ids),
-        "bound_devices": bound_devices_report(&bound_devices),
-        "cable_routes": bound_cable_routes_report(&bound_devices, &placement.cables),
-        "device_count": device_ids.len(),
-        "device_ids": &device_ids,
-        "devices": &slices,
-    });
+    let payload = RuntimePlacementReport {
+        ok: true,
+        package_manifest: package_manifest.to_path_buf(),
+        resident_capacity_activations: capacity,
+        runtime_patch: runtime_patch_report(args),
+        device_bindings: runtime_device_bindings_report(args, &device_ids),
+        bound_devices: bound_devices_report(&bound_devices),
+        cable_routes: bound_cable_routes_report(&bound_devices, &placement.cables),
+        device_count: device_ids.len(),
+        device_ids,
+        devices: slices,
+    };
 
     if args.json {
         println!("{}", serde_json::to_string_pretty(&payload)?);
     } else {
-        println!("device_count={}", device_ids.len());
-        for device in &slices {
+        println!("device_count={}", payload.device_count);
+        for device in &payload.devices {
             println!(
                 "{} pedals={} incoming={} outgoing={} dispatches={}",
                 device.device_id,

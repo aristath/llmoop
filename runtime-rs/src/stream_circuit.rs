@@ -1891,6 +1891,20 @@ pub struct RuntimeDeviceSliceReport {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimePlacementReport {
+    pub ok: bool,
+    pub package_manifest: PathBuf,
+    pub resident_capacity_activations: usize,
+    pub runtime_patch: RuntimePatchControls,
+    pub device_bindings: RuntimeDeviceBindings,
+    pub bound_devices: Vec<RuntimeBoundDevice>,
+    pub cable_routes: RuntimeCableRoutes,
+    pub device_count: usize,
+    pub device_ids: Vec<String>,
+    pub devices: Vec<RuntimeDeviceSliceReport>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeCapacityProfileSummary {
     pub min_dynamic_state_capacity_activations: usize,
     pub max_dynamic_state_capacity_activations: usize,
@@ -3138,6 +3152,63 @@ mod tests {
             "gpu2"
         );
         assert_eq!(payload["tick_plan"]["can_execute"], true);
+    }
+
+    #[test]
+    fn runtime_placement_report_serializes_device_slice_collection() {
+        let report = RuntimePlacementReport {
+            ok: true,
+            package_manifest: PathBuf::from("package.json"),
+            resident_capacity_activations: 16,
+            runtime_patch: RuntimePatchControls {
+                default_device_id: Some("gpu0".to_string()),
+                pedal_devices: BTreeMap::new(),
+                source_chain: None,
+                duplicate_after: Vec::new(),
+            },
+            device_bindings: RuntimeDeviceBindings::from_vulkan_targets(
+                &["gpu0".to_string()],
+                &BTreeMap::new(),
+                Some(0),
+                |target| {
+                    if let Some(index) = target.strip_prefix("vulkan:") {
+                        return index.parse::<usize>().map(Some).map_err(|error| {
+                            format!("invalid Vulkan physical device reference {target:?}: {error}")
+                        });
+                    }
+                    Ok(None)
+                },
+            ),
+            bound_devices: vec![RuntimeBoundDevice {
+                device_id: "gpu0".to_string(),
+                target: Some("vulkan:0".to_string()),
+                physical_device_index: Some(0),
+                device_name: "Radeon Test Device".to_string(),
+            }],
+            cable_routes: RuntimeCableRoutes {
+                schema: RUNTIME_CABLE_ROUTES_SCHEMA.to_string(),
+                cable_count: 0,
+                logical_local_cable_count: 0,
+                logical_cross_device_cable_count: 0,
+                same_physical_target_cable_count: 0,
+                cross_physical_target_cable_count: 0,
+                unresolved_target_cable_count: 0,
+                routes: Vec::new(),
+            },
+            device_count: 1,
+            device_ids: vec!["gpu0".to_string()],
+            devices: Vec::new(),
+        };
+
+        let payload = serde_json::to_value(&report).unwrap();
+
+        assert_eq!(payload["device_count"], 1);
+        assert_eq!(payload["device_ids"][0], "gpu0");
+        assert_eq!(payload["bound_devices"][0]["target"], "vulkan:0");
+        assert_eq!(
+            payload["device_bindings"]["logical_devices"][0]["binding_source"],
+            "process_default"
+        );
     }
 
     #[test]
