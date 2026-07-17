@@ -13,16 +13,17 @@ use llmoop_runtime::{
     RuntimeDeviceTickPlanReport, RuntimeEffectivePedalboardTopology, RuntimeLocalCableBufferReport,
     RuntimePackageInspectionReport, RuntimePatchControls, RuntimePatchDuplicateAfterControl,
     RuntimePatchInspectionReport, RuntimePatchPlacementReport, RuntimePatchSourceChainEntry,
-    RuntimePedalPortSummary, RuntimePlacedPromptRunReport, RuntimePlacedTransportReport,
+    RuntimePedalPortSummary, RuntimePlacedPedalDispatchTimingReport,
+    RuntimePlacedPedalTimingReport, RuntimePlacedPromptRunReport, RuntimePlacedTransportReport,
     RuntimePlacedTransportStatsReport, RuntimePlacementReport, RuntimePromptTimingReport,
     RuntimeRemoteCableBufferReport, RuntimeSingleDevicePromptRunReport, RuntimeSourcePedal,
     RuntimeTokenizerOptionsReport, RuntimeTopologyReport, VulkanComputeDevice,
     VulkanPlacedCableTransportStats, VulkanResidentGreedyInProcessPlacedModelPackage,
-    VulkanResidentGreedyModelPackage, VulkanResidentGreedyModelPackageDeviceSlice,
-    VulkanResidentGreedyModelPackageManifest, VulkanResidentHfTokenizerTextCodec,
-    VulkanResidentTokenEngine, VulkanResidentTokenEngineRunBudget,
-    VulkanResidentTokenEngineRunStopCondition, VulkanResidentTokenTextCodec,
-    VulkanReusableKernelArtifactManifest,
+    VulkanResidentGreedyInProcessPlacedPromptEventRun, VulkanResidentGreedyModelPackage,
+    VulkanResidentGreedyModelPackageDeviceSlice, VulkanResidentGreedyModelPackageManifest,
+    VulkanResidentHfTokenizerTextCodec, VulkanResidentTokenEngine,
+    VulkanResidentTokenEngineRunBudget, VulkanResidentTokenEngineRunStopCondition,
+    VulkanResidentTokenTextCodec, VulkanReusableKernelArtifactManifest,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -290,6 +291,7 @@ fn run_placed_prompt(
         tick_count,
         total_scheduler_turns,
     );
+    let pedal_timings = runtime_placed_pedal_timings_report(&run);
     let transport_stats_by_tick = run
         .tick_runs
         .iter()
@@ -405,6 +407,7 @@ fn run_placed_prompt(
                 by_tick: transport_stats_by_tick,
             },
             timing,
+            pedal_timings,
         };
         println!("{}", serde_json::to_string_pretty(&payload)?);
     } else if args.generated_only {
@@ -1399,6 +1402,45 @@ fn runtime_prompt_timing_report(
         average_tick_time_ns: average_nanos(run_time_ns, tick_count),
         average_scheduler_turn_time_ns: average_nanos(run_time_ns, scheduler_turn_count),
     }
+}
+
+fn runtime_placed_pedal_timings_report(
+    run: &VulkanResidentGreedyInProcessPlacedPromptEventRun,
+) -> Vec<RuntimePlacedPedalTimingReport> {
+    let mut timings = Vec::new();
+    for tick in &run.tick_runs {
+        for device_run in &tick.tick_run.placed_run.device_runs {
+            let Some(pedalboard_run) = &device_run.pedalboard_run else {
+                continue;
+            };
+            for pedal_run in &pedalboard_run.pedal_runs {
+                let run_time_ns = pedal_run.run_time_ns();
+                let dispatch_count = pedal_run.dispatch_count();
+                let dispatches = pedal_run
+                    .dispatch_runs
+                    .iter()
+                    .map(|dispatch| RuntimePlacedPedalDispatchTimingReport {
+                        dispatch_index: dispatch.dispatch_index,
+                        kernel_id: dispatch.kernel_id.clone(),
+                        node_id: dispatch.node_id.clone(),
+                        op: dispatch.op.clone(),
+                        reusable_family_id: dispatch.reusable_family_id.clone(),
+                        run_time_ns: dispatch.run_time_ns,
+                    })
+                    .collect::<Vec<_>>();
+                timings.push(RuntimePlacedPedalTimingReport {
+                    stream_tick: tick.stream_tick,
+                    device_id: pedalboard_run.device_id.clone(),
+                    pedal_id: pedal_run.pedal_id.clone(),
+                    dispatch_count,
+                    run_time_ns,
+                    average_dispatch_time_ns: average_nanos(run_time_ns, dispatch_count),
+                    dispatches,
+                });
+            }
+        }
+    }
+    timings
 }
 
 fn tokenizer_options_report(args: &Args) -> RuntimeTokenizerOptionsReport {

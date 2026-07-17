@@ -5,6 +5,7 @@ use std::fs;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -9223,9 +9224,11 @@ impl VulkanMountedPlacedResidentPedalRunner {
         let mut dispatch_runs = Vec::with_capacity(self.dispatches.len());
         for dispatch in &self.dispatches {
             let push_constants = push_constant_bytes_for(dispatch)?;
+            let run_start = Instant::now();
             device
                 .run_resident_kernel_dispatch(&dispatch.resident_dispatch, &push_constants)
                 .map_err(VulkanMountedPlacedResidentKernelDispatchError::Vulkan)?;
+            let run_time_ns = u64::try_from(run_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
             dispatch_runs.push(VulkanMountedPlacedResidentPedalDispatchRun {
                 dispatch_index: dispatch.dispatch_index,
                 kernel_id: dispatch.kernel_id.clone(),
@@ -9235,6 +9238,7 @@ impl VulkanMountedPlacedResidentPedalRunner {
                 descriptor_count: dispatch.resident_dispatch.descriptor_count(),
                 workgroup_count_x: dispatch.resident_dispatch.workgroup_count_x(),
                 push_constant_byte_count: dispatch.resident_dispatch.push_constant_byte_count(),
+                run_time_ns,
             });
         }
 
@@ -9266,6 +9270,12 @@ impl VulkanMountedPlacedResidentPedalRun {
         self.dispatch_runs.len()
     }
 
+    pub fn run_time_ns(&self) -> u64 {
+        self.dispatch_runs.iter().fold(0u64, |total, dispatch| {
+            total.saturating_add(dispatch.run_time_ns)
+        })
+    }
+
     pub fn node_ids(&self) -> Vec<&str> {
         self.dispatch_runs
             .iter()
@@ -9284,6 +9294,7 @@ pub struct VulkanMountedPlacedResidentPedalDispatchRun {
     pub descriptor_count: usize,
     pub workgroup_count_x: u32,
     pub push_constant_byte_count: u32,
+    pub run_time_ns: u64,
 }
 
 pub struct VulkanMountedPlacedResidentPedalboardRunner {
@@ -9423,6 +9434,12 @@ impl VulkanMountedPlacedResidentPedalboardRun {
             .iter()
             .map(VulkanMountedPlacedResidentPedalRun::dispatch_count)
             .sum()
+    }
+
+    pub fn run_time_ns(&self) -> u64 {
+        self.pedal_runs.iter().fold(0u64, |total, pedal| {
+            total.saturating_add(pedal.run_time_ns())
+        })
     }
 
     pub fn pedal_ids(&self) -> Vec<&str> {

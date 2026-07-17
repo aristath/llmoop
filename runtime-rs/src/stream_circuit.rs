@@ -1997,6 +1997,27 @@ pub struct RuntimePromptTimingReport {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimePlacedPedalDispatchTimingReport {
+    pub dispatch_index: usize,
+    pub kernel_id: String,
+    pub node_id: String,
+    pub op: String,
+    pub reusable_family_id: String,
+    pub run_time_ns: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimePlacedPedalTimingReport {
+    pub stream_tick: u64,
+    pub device_id: String,
+    pub pedal_id: String,
+    pub dispatch_count: usize,
+    pub run_time_ns: u64,
+    pub average_dispatch_time_ns: Option<u64>,
+    pub dispatches: Vec<RuntimePlacedPedalDispatchTimingReport>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeSingleDevicePromptRunReport {
     pub ok: bool,
     pub execution_mode: String,
@@ -2053,6 +2074,7 @@ pub struct RuntimePlacedPromptRunReport {
     pub completed_stage_deltas: Vec<usize>,
     pub transport: RuntimePlacedTransportReport,
     pub timing: RuntimePromptTimingReport,
+    pub pedal_timings: Vec<RuntimePlacedPedalTimingReport>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -3661,6 +3683,22 @@ mod tests {
                 }],
             },
             timing,
+            pedal_timings: vec![RuntimePlacedPedalTimingReport {
+                stream_tick: 0,
+                device_id: "gpu0".to_string(),
+                pedal_id: "layer_00".to_string(),
+                dispatch_count: 1,
+                run_time_ns: 90,
+                average_dispatch_time_ns: Some(90),
+                dispatches: vec![RuntimePlacedPedalDispatchTimingReport {
+                    dispatch_index: 0,
+                    kernel_id: "matmul".to_string(),
+                    node_id: "layer_00.matmul".to_string(),
+                    op: "linear".to_string(),
+                    reusable_family_id: "linear".to_string(),
+                    run_time_ns: 90,
+                }],
+            }],
         };
 
         let single_payload = serde_json::to_value(&single).unwrap();
@@ -3675,6 +3713,12 @@ mod tests {
         assert_eq!(
             placed_payload["timing"]["average_generated_token_time_ns"],
             90
+        );
+        assert_eq!(placed_payload["pedal_timings"][0]["pedal_id"], "layer_00");
+        assert_eq!(placed_payload["pedal_timings"][0]["run_time_ns"], 90);
+        assert_eq!(
+            placed_payload["pedal_timings"][0]["dispatches"][0]["node_id"],
+            "layer_00.matmul"
         );
     }
 
