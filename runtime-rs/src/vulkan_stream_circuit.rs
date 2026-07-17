@@ -8272,41 +8272,6 @@ impl VulkanResidentGreedyInProcessPlacedPromptEngine {
         )
     }
 
-    pub fn run_stream_until_idle_bounded(
-        &mut self,
-        stream_id: &str,
-        max_scheduler_turns_per_tick: usize,
-    ) -> Result<
-        VulkanResidentGreedyInProcessPlacedPromptEngineStreamRun,
-        VulkanResidentGreedyInProcessPlacedPromptEngineError,
-    > {
-        let stream = self.streams.get_mut(stream_id).ok_or_else(|| {
-            VulkanResidentGreedyInProcessPlacedPromptEngineError::UnknownStream {
-                stream_id: stream_id.to_string(),
-            }
-        })?;
-        let queue_run =
-            stream.run_queued_input_events_until_idle_bounded(max_scheduler_turns_per_tick)?;
-        if queue_run.pending_input_event_count == 0 {
-            self.deactivate_stream_id(stream_id);
-        } else {
-            self.activate_stream_id(stream_id);
-        }
-        let output_events =
-            placed_prompt_engine_output_events_for(stream_id, &queue_run.output_events);
-        let generated_token_ids = output_events
-            .iter()
-            .map(|event| event.output_event.token_id)
-            .collect::<Vec<_>>();
-
-        Ok(VulkanResidentGreedyInProcessPlacedPromptEngineStreamRun {
-            stream_id: stream_id.to_string(),
-            queue_run,
-            output_events,
-            generated_token_ids,
-        })
-    }
-
     pub fn submit_input_event_until_idle_bounded(
         &mut self,
         stream_id: &str,
@@ -8474,10 +8439,6 @@ impl VulkanResidentGreedyInProcessPlacedPromptEngine {
         }
     }
 
-    fn deactivate_stream_id(&mut self, stream_id: &str) {
-        self.active_queue.retain(|active| active != stream_id);
-    }
-
     fn refresh_active_queue(&mut self) {
         let active_stream_ids = self
             .streams
@@ -8510,14 +8471,6 @@ impl VulkanResidentGreedyInProcessPlacedPromptEngineInputRequest {
 pub struct VulkanResidentGreedyInProcessPlacedPromptEngineQueuedInputEvent {
     pub stream_id: String,
     pub queued_input_event: VulkanResidentGreedyInProcessPlacedQueuedInputEvent,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct VulkanResidentGreedyInProcessPlacedPromptEngineStreamRun {
-    pub stream_id: String,
-    pub queue_run: VulkanResidentGreedyInProcessPlacedInputQueueRun,
-    pub output_events: Vec<VulkanResidentTokenRuntimeSchedulerOutputEvent>,
-    pub generated_token_ids: Vec<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
