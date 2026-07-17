@@ -1952,6 +1952,98 @@ pub struct RuntimePlacementReport {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeTokenizerOptionsReport {
+    pub add_special_tokens: bool,
+    pub skip_special_tokens: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimePlacedTransportStatsReport {
+    pub pending_packet_count: usize,
+    pub pending_byte_count: usize,
+    pub pending_direct_cable_count: usize,
+    pub pending_direct_byte_count: usize,
+    pub published_packet_count: usize,
+    pub published_byte_count: usize,
+    pub received_packet_count: usize,
+    pub received_byte_count: usize,
+    pub direct_copy_count: usize,
+    pub direct_copy_byte_count: usize,
+    pub direct_receive_count: usize,
+    pub direct_receive_byte_count: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimePlacedTransportReport {
+    pub published_packet_count: usize,
+    pub published_byte_count: usize,
+    pub received_packet_count: usize,
+    pub received_byte_count: usize,
+    pub direct_copy_count: usize,
+    pub direct_copy_byte_count: usize,
+    pub direct_receive_count: usize,
+    pub direct_receive_byte_count: usize,
+    pub by_tick: Vec<RuntimePlacedTransportStatsReport>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeSingleDevicePromptRunReport {
+    pub ok: bool,
+    pub execution_mode: String,
+    pub package_manifest: PathBuf,
+    pub tokenizer_dir: PathBuf,
+    pub device_name: String,
+    pub device_id: String,
+    pub runtime_patch: RuntimePatchControls,
+    pub device_bindings: RuntimeDeviceBindings,
+    pub pedal_count: usize,
+    pub dispatches_per_tick: usize,
+    pub descriptors_per_tick: usize,
+    pub push_constant_bytes_per_tick: u32,
+    pub resident_capacity_activations: usize,
+    pub needed_capacity_activations: usize,
+    pub tokenizer: RuntimeTokenizerOptionsReport,
+    pub prompt_text: String,
+    pub prompt_ids: Vec<u32>,
+    pub generated_ids: Vec<u32>,
+    pub generated_text: String,
+    pub output_text: String,
+    pub stop_reason: String,
+    pub scheduler_turns: usize,
+    pub runtime_cycles: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimePlacedPromptRunReport {
+    pub ok: bool,
+    pub execution_mode: String,
+    pub package_manifest: PathBuf,
+    pub tokenizer_dir: PathBuf,
+    pub boundary_device_id: String,
+    pub device_count: usize,
+    pub device_ids: Vec<String>,
+    pub bound_devices: Vec<RuntimeBoundDevice>,
+    pub cable_routes: RuntimeCableRoutes,
+    pub runtime_patch: RuntimePatchControls,
+    pub device_bindings: RuntimeDeviceBindings,
+    pub hosted_pedal_count: usize,
+    pub resident_capacity_activations: usize,
+    pub needed_capacity_activations: usize,
+    pub tokenizer: RuntimeTokenizerOptionsReport,
+    pub prompt_text: String,
+    pub prompt_ids: Vec<u32>,
+    pub generated_ids: Vec<u32>,
+    pub generated_text: String,
+    pub output_text: String,
+    pub stop_reason: String,
+    pub tick_count: usize,
+    pub scheduler_turns: usize,
+    pub max_scheduler_turns_per_tick: usize,
+    pub completed_stage_deltas: Vec<usize>,
+    pub transport: RuntimePlacedTransportReport,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeCapacityProfileSummary {
     pub min_dynamic_state_capacity_activations: usize,
     pub max_dynamic_state_capacity_activations: usize,
@@ -3389,6 +3481,131 @@ mod tests {
             payload["device_bindings"]["logical_devices"][0]["binding_source"],
             "process_default"
         );
+    }
+
+    #[test]
+    fn runtime_prompt_run_reports_serialize_execution_contracts() {
+        let bindings = RuntimeDeviceBindings::from_vulkan_targets(
+            &["gpu0".to_string()],
+            &BTreeMap::new(),
+            Some(0),
+            |target| {
+                if let Some(index) = target.strip_prefix("vulkan:") {
+                    return index.parse::<usize>().map(Some).map_err(|error| {
+                        format!("invalid Vulkan physical device reference {target:?}: {error}")
+                    });
+                }
+                Ok(None)
+            },
+        );
+        let tokenizer = RuntimeTokenizerOptionsReport {
+            add_special_tokens: true,
+            skip_special_tokens: true,
+        };
+        let single = RuntimeSingleDevicePromptRunReport {
+            ok: true,
+            execution_mode: "single_device_resident".to_string(),
+            package_manifest: PathBuf::from("package.json"),
+            tokenizer_dir: PathBuf::from("tokenizer"),
+            device_name: "Radeon Test Device".to_string(),
+            device_id: "gpu0".to_string(),
+            runtime_patch: RuntimePatchControls {
+                default_device_id: Some("gpu0".to_string()),
+                pedal_devices: BTreeMap::new(),
+                source_chain: None,
+                duplicate_after: Vec::new(),
+            },
+            device_bindings: bindings.clone(),
+            pedal_count: 14,
+            dispatches_per_tick: 42,
+            descriptors_per_tick: 64,
+            push_constant_bytes_per_tick: 128,
+            resident_capacity_activations: 16,
+            needed_capacity_activations: 2,
+            tokenizer: tokenizer.clone(),
+            prompt_text: "Hello".to_string(),
+            prompt_ids: vec![1],
+            generated_ids: vec![2],
+            generated_text: " world".to_string(),
+            output_text: "Hello world".to_string(),
+            stop_reason: "max_new_tokens".to_string(),
+            scheduler_turns: 1,
+            runtime_cycles: 1,
+        };
+        let placed = RuntimePlacedPromptRunReport {
+            ok: true,
+            execution_mode: "placed_in_process".to_string(),
+            package_manifest: PathBuf::from("package.json"),
+            tokenizer_dir: PathBuf::from("tokenizer"),
+            boundary_device_id: "gpu0".to_string(),
+            device_count: 1,
+            device_ids: vec!["gpu0".to_string()],
+            bound_devices: Vec::new(),
+            cable_routes: RuntimeCableRoutes {
+                schema: RUNTIME_CABLE_ROUTES_SCHEMA.to_string(),
+                cable_count: 0,
+                logical_local_cable_count: 0,
+                logical_cross_device_cable_count: 0,
+                same_physical_target_cable_count: 0,
+                cross_physical_target_cable_count: 0,
+                unresolved_target_cable_count: 0,
+                routes: Vec::new(),
+            },
+            runtime_patch: RuntimePatchControls {
+                default_device_id: Some("gpu0".to_string()),
+                pedal_devices: BTreeMap::new(),
+                source_chain: None,
+                duplicate_after: Vec::new(),
+            },
+            device_bindings: bindings,
+            hosted_pedal_count: 14,
+            resident_capacity_activations: 16,
+            needed_capacity_activations: 2,
+            tokenizer,
+            prompt_text: "Hello".to_string(),
+            prompt_ids: vec![1],
+            generated_ids: vec![2],
+            generated_text: " world".to_string(),
+            output_text: "Hello world".to_string(),
+            stop_reason: "max_new_tokens".to_string(),
+            tick_count: 1,
+            scheduler_turns: 1,
+            max_scheduler_turns_per_tick: 1024,
+            completed_stage_deltas: vec![42],
+            transport: RuntimePlacedTransportReport {
+                published_packet_count: 0,
+                published_byte_count: 0,
+                received_packet_count: 0,
+                received_byte_count: 0,
+                direct_copy_count: 2,
+                direct_copy_byte_count: 4096,
+                direct_receive_count: 2,
+                direct_receive_byte_count: 4096,
+                by_tick: vec![RuntimePlacedTransportStatsReport {
+                    pending_packet_count: 0,
+                    pending_byte_count: 0,
+                    pending_direct_cable_count: 0,
+                    pending_direct_byte_count: 0,
+                    published_packet_count: 0,
+                    published_byte_count: 0,
+                    received_packet_count: 0,
+                    received_byte_count: 0,
+                    direct_copy_count: 2,
+                    direct_copy_byte_count: 4096,
+                    direct_receive_count: 2,
+                    direct_receive_byte_count: 4096,
+                }],
+            },
+        };
+
+        let single_payload = serde_json::to_value(&single).unwrap();
+        let placed_payload = serde_json::to_value(&placed).unwrap();
+
+        assert_eq!(single_payload["execution_mode"], "single_device_resident");
+        assert_eq!(single_payload["generated_ids"][0], 2);
+        assert_eq!(placed_payload["execution_mode"], "placed_in_process");
+        assert_eq!(placed_payload["transport"]["direct_copy_count"], 2);
+        assert_eq!(placed_payload["completed_stage_deltas"][0], 42);
     }
 
     #[test]

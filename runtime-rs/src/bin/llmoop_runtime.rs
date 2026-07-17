@@ -12,15 +12,16 @@ use llmoop_runtime::{
     RuntimeDeviceTickPlanReport, RuntimeEffectivePedalboardTopology, RuntimeLocalCableBufferReport,
     RuntimePackageInspectionReport, RuntimePatchControls, RuntimePatchDuplicateAfterControl,
     RuntimePatchInspectionReport, RuntimePatchPlacementReport, RuntimePatchSourceChainEntry,
-    RuntimePedalPortSummary, RuntimePlacementReport, RuntimeRemoteCableBufferReport,
-    RuntimeSourcePedal, RuntimeTopologyReport, VulkanComputeDevice,
+    RuntimePedalPortSummary, RuntimePlacedPromptRunReport, RuntimePlacedTransportReport,
+    RuntimePlacedTransportStatsReport, RuntimePlacementReport, RuntimeRemoteCableBufferReport,
+    RuntimeSingleDevicePromptRunReport, RuntimeSourcePedal, RuntimeTokenizerOptionsReport,
+    RuntimeTopologyReport, VulkanComputeDevice, VulkanPlacedCableTransportStats,
     VulkanResidentGreedyInProcessPlacedModelPackage, VulkanResidentGreedyModelPackage,
     VulkanResidentGreedyModelPackageDeviceSlice, VulkanResidentGreedyModelPackageManifest,
     VulkanResidentHfTokenizerTextCodec, VulkanResidentTokenEngine,
     VulkanResidentTokenEngineRunBudget, VulkanResidentTokenEngineRunStopCondition,
     VulkanResidentTokenTextCodec, VulkanReusableKernelArtifactManifest,
 };
-use serde_json::json;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Args {
@@ -181,37 +182,32 @@ fn run() -> Result<(), Box<dyn Error>> {
     let snapshot = engine.snapshot();
 
     if args.json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "ok": true,
-                "execution_mode": "single_device_resident",
-                "package_manifest": package_manifest,
-                "tokenizer_dir": tokenizer_dir,
-                "device_name": snapshot.device_name,
-                "device_id": stream.device_id,
-                "runtime_patch": runtime_patch_report(&args),
-                "device_bindings": runtime_device_bindings_report(&args, &[stream.device_id.clone()]),
-                "pedal_count": stream.pedal_count,
-                "dispatches_per_tick": stream.per_tick_dispatch_count,
-                "descriptors_per_tick": stream.per_tick_descriptor_count,
-                "push_constant_bytes_per_tick": stream.per_tick_push_constant_byte_count,
-                "resident_capacity_activations": stream.dynamic_state_capacity_activations,
-                "needed_capacity_activations": needed_capacity,
-                "tokenizer": {
-                    "add_special_tokens": args.add_special_tokens,
-                    "skip_special_tokens": args.skip_special_tokens,
-                },
-                "prompt_text": prompt,
-                "prompt_ids": turn.queued_input_event.encoded_token_ids,
-                "generated_ids": turn.generated_token_ids,
-                "generated_text": turn.generated_text,
-                "output_text": turn.output_text,
-                "stop_reason": engine_stop_label(turn.stop_condition),
-                "scheduler_turns": turn.scheduler_turn_count(),
-                "runtime_cycles": turn.runtime_cycle_count,
-            }))?
-        );
+        let payload = RuntimeSingleDevicePromptRunReport {
+            ok: true,
+            execution_mode: "single_device_resident".to_string(),
+            package_manifest: package_manifest.to_path_buf(),
+            tokenizer_dir: tokenizer_dir.clone(),
+            device_name: snapshot.device_name,
+            device_id: stream.device_id.clone(),
+            runtime_patch: runtime_patch_report(&args),
+            device_bindings: runtime_device_bindings_report(&args, &[stream.device_id.clone()]),
+            pedal_count: stream.pedal_count,
+            dispatches_per_tick: stream.per_tick_dispatch_count,
+            descriptors_per_tick: stream.per_tick_descriptor_count,
+            push_constant_bytes_per_tick: stream.per_tick_push_constant_byte_count,
+            resident_capacity_activations: stream.dynamic_state_capacity_activations,
+            needed_capacity_activations: needed_capacity,
+            tokenizer: tokenizer_options_report(&args),
+            prompt_text: prompt.clone(),
+            prompt_ids: turn.queued_input_event.encoded_token_ids.clone(),
+            generated_ids: turn.generated_token_ids.clone(),
+            generated_text: turn.generated_text.clone(),
+            output_text: turn.output_text.clone(),
+            stop_reason: engine_stop_label(turn.stop_condition).to_string(),
+            scheduler_turns: turn.scheduler_turn_count(),
+            runtime_cycles: turn.runtime_cycle_count,
+        };
+        println!("{}", serde_json::to_string_pretty(&payload)?);
     } else if args.generated_only {
         print_text(&turn.generated_text);
     } else {
@@ -267,7 +263,7 @@ fn run_placed_prompt(
     let transport_stats_by_tick = run
         .tick_runs
         .iter()
-        .map(|tick| tick.tick_run.placed_run.transport_stats.clone())
+        .map(|tick| runtime_transport_stats_report(&tick.tick_run.placed_run.transport_stats))
         .collect::<Vec<_>>();
     let transport_published_packet_count = run
         .tick_runs
@@ -341,50 +337,45 @@ fn run_placed_prompt(
         .sum::<usize>();
 
     if args.json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "ok": true,
-                "execution_mode": "placed_in_process",
-                "package_manifest": package_manifest,
-                "tokenizer_dir": tokenizer_dir,
-                "boundary_device_id": package.boundary_device_id,
-                "device_count": package.device_count,
-                "device_ids": package.device_ids.clone(),
-                "bound_devices": bound_devices_report(&bound_devices),
-                "cable_routes": bound_cable_routes_report(&bound_devices, &placement.cables),
-                "runtime_patch": runtime_patch_report(args),
-                "device_bindings": runtime_device_bindings_report(args, &package.device_ids),
-                "hosted_pedal_count": package.hosted_pedal_count,
-                "resident_capacity_activations": package.dynamic_state_capacity_activations,
-                "needed_capacity_activations": prompt_ids.len() + args.max_new_tokens,
-                "tokenizer": {
-                    "add_special_tokens": args.add_special_tokens,
-                    "skip_special_tokens": args.skip_special_tokens,
-                },
-                "prompt_text": prompt,
-                "prompt_ids": run.prompt_token_ids,
-                "generated_ids": run.generated_token_ids,
-                "generated_text": generated_text,
-                "output_text": output_text,
-                "stop_reason": run.stop_reason,
-                "tick_count": run.tick_runs.len(),
-                "scheduler_turns": total_scheduler_turns,
-                "max_scheduler_turns_per_tick": args.max_scheduler_turns,
-                "completed_stage_deltas": completed_stage_deltas,
-                "transport": {
-                    "published_packet_count": transport_published_packet_count,
-                    "published_byte_count": transport_published_byte_count,
-                    "received_packet_count": transport_received_packet_count,
-                    "received_byte_count": transport_received_byte_count,
-                    "direct_copy_count": transport_direct_copy_count,
-                    "direct_copy_byte_count": transport_direct_copy_byte_count,
-                    "direct_receive_count": transport_direct_receive_count,
-                    "direct_receive_byte_count": transport_direct_receive_byte_count,
-                    "by_tick": transport_stats_by_tick,
-                },
-            }))?
-        );
+        let payload = RuntimePlacedPromptRunReport {
+            ok: true,
+            execution_mode: "placed_in_process".to_string(),
+            package_manifest: package_manifest.to_path_buf(),
+            tokenizer_dir: tokenizer_dir.to_path_buf(),
+            boundary_device_id: package.boundary_device_id.clone(),
+            device_count: package.device_count,
+            device_ids: package.device_ids.clone(),
+            bound_devices: bound_devices_report(&bound_devices),
+            cable_routes: bound_cable_routes_report(&bound_devices, &placement.cables),
+            runtime_patch: runtime_patch_report(args),
+            device_bindings: runtime_device_bindings_report(args, &package.device_ids),
+            hosted_pedal_count: package.hosted_pedal_count,
+            resident_capacity_activations: package.dynamic_state_capacity_activations,
+            needed_capacity_activations: prompt_ids.len() + args.max_new_tokens,
+            tokenizer: tokenizer_options_report(args),
+            prompt_text: prompt.to_string(),
+            prompt_ids: run.prompt_token_ids.clone(),
+            generated_ids: run.generated_token_ids.clone(),
+            generated_text: generated_text.clone(),
+            output_text: output_text.clone(),
+            stop_reason: run.stop_reason.clone(),
+            tick_count: run.tick_runs.len(),
+            scheduler_turns: total_scheduler_turns,
+            max_scheduler_turns_per_tick: args.max_scheduler_turns,
+            completed_stage_deltas,
+            transport: RuntimePlacedTransportReport {
+                published_packet_count: transport_published_packet_count,
+                published_byte_count: transport_published_byte_count,
+                received_packet_count: transport_received_packet_count,
+                received_byte_count: transport_received_byte_count,
+                direct_copy_count: transport_direct_copy_count,
+                direct_copy_byte_count: transport_direct_copy_byte_count,
+                direct_receive_count: transport_direct_receive_count,
+                direct_receive_byte_count: transport_direct_receive_byte_count,
+                by_tick: transport_stats_by_tick,
+            },
+        };
+        println!("{}", serde_json::to_string_pretty(&payload)?);
     } else if args.generated_only {
         print_text(&generated_text);
     } else {
@@ -1310,6 +1301,32 @@ fn runtime_target_for_logical_device(
 fn runtime_report_default_vulkan_physical_device_index(args: &Args) -> Option<usize> {
     args.vulkan_device_index
         .or_else(|| runtime_default_vulkan_physical_device_index().ok())
+}
+
+fn tokenizer_options_report(args: &Args) -> RuntimeTokenizerOptionsReport {
+    RuntimeTokenizerOptionsReport {
+        add_special_tokens: args.add_special_tokens,
+        skip_special_tokens: args.skip_special_tokens,
+    }
+}
+
+fn runtime_transport_stats_report(
+    stats: &VulkanPlacedCableTransportStats,
+) -> RuntimePlacedTransportStatsReport {
+    RuntimePlacedTransportStatsReport {
+        pending_packet_count: stats.pending_packet_count,
+        pending_byte_count: stats.pending_byte_count,
+        pending_direct_cable_count: stats.pending_direct_cable_count,
+        pending_direct_byte_count: stats.pending_direct_byte_count,
+        published_packet_count: stats.published_packet_count,
+        published_byte_count: stats.published_byte_count,
+        received_packet_count: stats.received_packet_count,
+        received_byte_count: stats.received_byte_count,
+        direct_copy_count: stats.direct_copy_count,
+        direct_copy_byte_count: stats.direct_copy_byte_count,
+        direct_receive_count: stats.direct_receive_count,
+        direct_receive_byte_count: stats.direct_receive_byte_count,
+    }
 }
 
 fn runtime_patch_report(args: &Args) -> RuntimePatchControls {
