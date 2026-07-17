@@ -184,6 +184,11 @@ def main() -> None:
         help="print only newly generated text for --run/--run-model",
     )
     parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="print human-readable runtime timing and top-pedal summaries for --run",
+    )
+    parser.add_argument(
         "--no-clean",
         action="store_true",
         help="do not delete an existing transpiled model directory before compiling",
@@ -236,6 +241,8 @@ def main() -> None:
         parser.error("--chain is only supported with --run")
     elif args.vulkan_device_index is not None:
         parser.error("--vulkan-device-index is only supported with --run")
+    elif args.profile:
+        parser.error("--profile is only supported with --run")
     if args.run is not None:
         inspect_mode_count = sum(
             [
@@ -295,6 +302,8 @@ def main() -> None:
             parser.error("--chain is only supported by --run")
         if args.vulkan_device_index is not None:
             parser.error("--vulkan-device-index is only supported by --run")
+        if args.profile:
+            parser.error("--profile is only supported by --run")
         if args.prompt is None:
             parser.error("--prompt is required with --run-model")
         if args.package_dir is None:
@@ -511,6 +520,8 @@ def build_runtime_command(args: argparse.Namespace, package_manifest: Path) -> l
         runtime_args.append("--keep-special-tokens")
     if args.generated_only:
         runtime_args.append("--generated-only")
+    if getattr(args, "profile", False):
+        runtime_args.append("--profile")
     if args.json:
         runtime_args.append("--json")
 

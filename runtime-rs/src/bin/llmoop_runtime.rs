@@ -49,6 +49,7 @@ struct Args {
     add_special_tokens: bool,
     skip_special_tokens: bool,
     generated_only: bool,
+    profile: bool,
     json: bool,
 }
 
@@ -75,6 +76,7 @@ impl Default for Args {
             add_special_tokens: true,
             skip_special_tokens: true,
             generated_only: false,
+            profile: false,
             json: false,
         }
     }
@@ -231,7 +233,9 @@ fn run() -> Result<(), Box<dyn Error>> {
         print_text(&turn.generated_text);
     } else {
         print_text(&turn.output_text);
-        print_prompt_timing_profile(&timing);
+        if args.profile {
+            print_prompt_timing_profile(&timing);
+        }
     }
 
     Ok(())
@@ -418,8 +422,10 @@ fn run_placed_prompt(
         print_text(&generated_text);
     } else {
         print_text(&output_text);
-        print_prompt_timing_profile(&timing);
-        print_placed_pedal_timing_profile(&pedal_timing_summaries, 5);
+        if args.profile {
+            print_prompt_timing_profile(&timing);
+            print_placed_pedal_timing_profile(&pedal_timing_summaries, 5);
+        }
     }
 
     Ok(())
@@ -1723,6 +1729,9 @@ fn parse_args() -> Result<Args, String> {
             "--generated-only" => {
                 parsed.generated_only = true;
             }
+            "--profile" => {
+                parsed.profile = true;
+            }
             "--json" => {
                 parsed.json = true;
             }
@@ -2065,6 +2074,7 @@ Options:
   --no-special-tokens        Do not add tokenizer special tokens to input text.
   --keep-special-tokens      Keep tokenizer special tokens in decoded output text.
   --generated-only           Print only newly generated text instead of prompt + generated text.
+  --profile                  Print human-readable timing and top-pedal summaries.
   --json                     Print a machine-readable run report.
   -h, --help                 Show this help.
 

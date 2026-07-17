@@ -80,6 +80,45 @@ class RuntimeCliCommandTest(unittest.TestCase):
             build_runtime_command(args, package),
         )
 
+    def test_build_runtime_command_forwards_profile_flag(self) -> None:
+        package = Path("packages/model_x/vulkan_resident_greedy_package.json")
+        args = Namespace(
+            prompt="Hello",
+            inspect_runtime=False,
+            inspect_package=False,
+            inspect_patch=False,
+            inspect_placement=False,
+            inspect_device_slice=None,
+            default_device_id=None,
+            place_pedal=[],
+            bind_device=[],
+            duplicate_after=[],
+            chain=None,
+            max_new_tokens=4,
+            capacity=None,
+            vulkan_device_index=None,
+            no_special_tokens=False,
+            keep_special_tokens=False,
+            generated_only=False,
+            profile=True,
+            json=False,
+            runtime_bin=Path("/tmp/llmoop-runtime"),
+        )
+
+        self.assertEqual(
+            [
+                "/tmp/llmoop-runtime",
+                "--package",
+                str(package),
+                "--prompt",
+                "Hello",
+                "--max-new-tokens",
+                "4",
+                "--profile",
+            ],
+            build_runtime_command(args, package),
+        )
+
     def test_build_runtime_command_can_inspect_device_slice_without_prompt(self) -> None:
         package = Path("packages/model_x/vulkan_resident_greedy_package.json")
         args = Namespace(
