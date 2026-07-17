@@ -26,6 +26,7 @@ pub const LOWERED_PEDALBOARD_SCHEMA: &str = "llmoop.lowered_pedalboard.v1";
 pub const STREAM_CIRCUIT_PLACEMENT_SCHEMA: &str = "llmoop.stream_circuit_placement.v1";
 pub const STREAM_CIRCUIT_RUNTIME_PATCH_SCHEMA: &str = "llmoop.stream_circuit_runtime_patch.v1";
 pub const RUNTIME_CABLE_ROUTES_SCHEMA: &str = "llmoop.runtime_cable_routes.v1";
+pub const RUNTIME_DEVICE_BINDINGS_SCHEMA: &str = "llmoop.runtime_device_bindings.v1";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CircuitArtifactError(pub String);
@@ -1539,6 +1540,115 @@ impl RuntimeCableRoutes {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeLogicalDeviceBinding {
+    pub device_id: String,
+    pub target: Option<String>,
+    pub binding_source: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeDeviceBindings {
+    pub schema: String,
+    pub process_vulkan_device_index: Option<usize>,
+    pub requested_vulkan_device_indices: Vec<usize>,
+    pub default_vulkan_device_index: Option<usize>,
+    pub explicit_bindings: BTreeMap<String, String>,
+    pub logical_devices: Vec<RuntimeLogicalDeviceBinding>,
+    pub can_mount_in_process: bool,
+    pub mounting_model: String,
+    pub unsupported_targets: Vec<String>,
+    pub notes: Vec<String>,
+}
+
+impl RuntimeDeviceBindings {
+    pub fn from_vulkan_targets<F>(
+        logical_device_ids: &[String],
+        explicit_bindings: &BTreeMap<String, String>,
+        default_vulkan_device_index: Option<usize>,
+        mut vulkan_physical_device_index_for_target: F,
+    ) -> Self
+    where
+        F: FnMut(&str) -> Result<Option<usize>, String>,
+    {
+        let mut logical_ids = logical_device_ids.to_vec();
+        for logical_device_id in explicit_bindings.keys() {
+            if !logical_ids.contains(logical_device_id) {
+                logical_ids.push(logical_device_id.clone());
+            }
+        }
+        logical_ids.sort();
+        logical_ids.dedup();
+
+        let mut vulkan_indices = Vec::new();
+        let mut unsupported_targets = Vec::new();
+        if let Some(index) = default_vulkan_device_index {
+            vulkan_indices.push(index);
+        }
+        for (logical_device_id, target) in explicit_bindings {
+            match vulkan_physical_device_index_for_target(target) {
+                Ok(Some(index)) => vulkan_indices.push(index),
+                Ok(None) => unsupported_targets.push(format!("{logical_device_id}={target}")),
+                Err(error) => {
+                    unsupported_targets.push(format!("{logical_device_id}={target} ({error})"))
+                }
+            }
+        }
+        vulkan_indices.sort_unstable();
+        vulkan_indices.dedup();
+
+        let logical_devices = logical_ids
+            .iter()
+            .map(|logical_device_id| {
+                let explicit_target = explicit_bindings.get(logical_device_id);
+                let target = explicit_target
+                    .cloned()
+                    .or_else(|| default_vulkan_device_index.map(|index| format!("vulkan:{index}")));
+                let binding_source = if explicit_target.is_some() {
+                    "explicit"
+                } else if default_vulkan_device_index.is_some() {
+                    "process_default"
+                } else {
+                    "runtime_default"
+                };
+                RuntimeLogicalDeviceBinding {
+                    device_id: logical_device_id.clone(),
+                    target,
+                    binding_source: binding_source.to_string(),
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let can_mount_in_process = unsupported_targets.is_empty();
+
+        Self {
+            schema: RUNTIME_DEVICE_BINDINGS_SCHEMA.to_string(),
+            process_vulkan_device_index: default_vulkan_device_index,
+            requested_vulkan_device_indices: vulkan_indices,
+            default_vulkan_device_index,
+            explicit_bindings: explicit_bindings.clone(),
+            logical_devices,
+            can_mount_in_process,
+            mounting_model: if can_mount_in_process {
+                "local_vulkan_device_pool".to_string()
+            } else {
+                "unsupported_targets".to_string()
+            },
+            unsupported_targets,
+            notes: if can_mount_in_process {
+                vec![
+                    "mounted logical device slices can use distinct local Vulkan physical devices in this runtime process"
+                        .to_string(),
+                ]
+            } else {
+                vec![
+                    "only local vulkan:N targets are mountable by this runtime process".to_string(),
+                ]
+            },
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CircuitGraphSummary {
     pub circuit_count: usize,
@@ -2357,6 +2467,61 @@ mod tests {
         assert_eq!(payload["routes"][0]["route_kind"], "same_physical_target");
         assert_eq!(payload["routes"][1]["route_kind"], "cross_physical_target");
         assert_eq!(payload["routes"][3]["route_kind"], "logical_local");
+    }
+
+    #[test]
+    fn runtime_device_bindings_capture_runtime_target_contract() {
+        let logical_device_ids = vec!["gpu0".to_string(), "gpu1".to_string()];
+        let mut explicit_bindings = BTreeMap::new();
+        explicit_bindings.insert("gpu1".to_string(), "vulkan:5".to_string());
+        explicit_bindings.insert("remote0".to_string(), "lan:worker-a".to_string());
+
+        let bindings = RuntimeDeviceBindings::from_vulkan_targets(
+            &logical_device_ids,
+            &explicit_bindings,
+            Some(0),
+            |target| {
+                if let Some(index) = target.strip_prefix("vulkan:") {
+                    return index.parse::<usize>().map(Some).map_err(|error| {
+                        format!("invalid Vulkan physical device reference {target:?}: {error}")
+                    });
+                }
+                Ok(None)
+            },
+        );
+
+        assert_eq!(bindings.schema, RUNTIME_DEVICE_BINDINGS_SCHEMA);
+        assert_eq!(bindings.process_vulkan_device_index, Some(0));
+        assert_eq!(bindings.default_vulkan_device_index, Some(0));
+        assert_eq!(bindings.requested_vulkan_device_indices, vec![0, 5]);
+        assert!(!bindings.can_mount_in_process);
+        assert_eq!(bindings.mounting_model, "unsupported_targets");
+        assert_eq!(bindings.unsupported_targets, vec!["remote0=lan:worker-a"]);
+        assert_eq!(
+            bindings
+                .logical_devices
+                .iter()
+                .map(|device| (
+                    device.device_id.as_str(),
+                    device.target.as_deref(),
+                    device.binding_source.as_str()
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("gpu0", Some("vulkan:0"), "process_default"),
+                ("gpu1", Some("vulkan:5"), "explicit"),
+                ("remote0", Some("lan:worker-a"), "explicit"),
+            ]
+        );
+
+        let payload = serde_json::to_value(&bindings).unwrap();
+        assert_eq!(payload["schema"], RUNTIME_DEVICE_BINDINGS_SCHEMA);
+        assert_eq!(payload["logical_devices"][0]["device_id"], "gpu0");
+        assert_eq!(
+            payload["logical_devices"][0]["binding_source"],
+            "process_default"
+        );
+        assert_eq!(payload["unsupported_targets"][0], "remote0=lan:worker-a");
     }
 
     #[test]
