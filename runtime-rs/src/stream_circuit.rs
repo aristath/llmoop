@@ -1604,10 +1604,8 @@ impl RuntimeDeviceBindings {
                 Ok(None) if logical_device_id.contains(':') => {
                     unsupported_targets.push(logical_device_id.clone())
                 }
-                Err(error) if logical_device_id.contains(':') => {
-                    unsupported_targets.push(format!("{logical_device_id} ({error})"))
-                }
-                Ok(None) | Err(_) => {}
+                Err(error) => unsupported_targets.push(format!("{logical_device_id} ({error})")),
+                Ok(None) => {}
             }
         }
         vulkan_indices.sort_unstable();
@@ -1621,7 +1619,7 @@ impl RuntimeDeviceBindings {
                 let explicit_target = explicit_bindings.get(logical_device_id);
                 let direct_target = if explicit_target.is_none() {
                     match vulkan_physical_device_index_for_target(logical_device_id) {
-                        Ok(Some(_)) => Some(logical_device_id.clone()),
+                        Ok(Some(index)) => Some(format!("vulkan:{index}")),
                         Ok(None) | Err(_) if logical_device_id.contains(':') => {
                             Some(logical_device_id.clone())
                         }
@@ -1630,15 +1628,14 @@ impl RuntimeDeviceBindings {
                 } else {
                     None
                 };
+                let has_direct_target = direct_target.is_some();
                 let target = explicit_target
                     .cloned()
                     .or(direct_target)
                     .or_else(|| default_vulkan_device_index.map(|index| format!("vulkan:{index}")));
                 let binding_source = if explicit_target.is_some() {
                     "explicit"
-                } else if target.as_deref() == Some(logical_device_id.as_str())
-                    && logical_device_id.contains(':')
-                {
+                } else if has_direct_target {
                     "device_id"
                 } else if default_vulkan_device_index.is_some() {
                     "process_default"
@@ -2928,6 +2925,46 @@ mod tests {
             "process_default"
         );
         assert_eq!(payload["unsupported_targets"][0], "remote0=lan:worker-a");
+    }
+
+    #[test]
+    fn runtime_device_bindings_treat_cpu_targets_as_direct_runtime_devices() {
+        let logical_device_ids = vec!["cpu0".to_string(), "gpu0".to_string()];
+        let bindings = RuntimeDeviceBindings::from_vulkan_targets(
+            &logical_device_ids,
+            &BTreeMap::new(),
+            Some(0),
+            |target| match target {
+                "cpu0" => Ok(Some(6)),
+                raw if raw.starts_with("vulkan:") => raw
+                    .strip_prefix("vulkan:")
+                    .unwrap()
+                    .parse::<usize>()
+                    .map(Some)
+                    .map_err(|error| {
+                        format!("invalid Vulkan physical device reference {target:?}: {error}")
+                    }),
+                _ => Ok(None),
+            },
+        );
+
+        assert_eq!(bindings.requested_vulkan_device_indices, vec![0, 6]);
+        assert!(bindings.can_mount_in_process);
+        assert_eq!(
+            bindings
+                .logical_devices
+                .iter()
+                .map(|device| (
+                    device.device_id.as_str(),
+                    device.target.as_deref(),
+                    device.binding_source.as_str()
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("cpu0", Some("vulkan:6"), "device_id"),
+                ("gpu0", Some("vulkan:0"), "process_default"),
+            ]
+        );
     }
 
     #[test]

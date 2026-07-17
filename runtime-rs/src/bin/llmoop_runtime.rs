@@ -395,7 +395,10 @@ fn inspect_runtime_topology(
         .default_device_id
         .as_deref()
         .unwrap_or(&manifest.placement.default_device_id);
-    let available_devices = inspect_available_devices(default_device_id, args.vulkan_device_index);
+    let available_devices = inspect_available_devices(
+        default_device_id,
+        runtime_report_default_vulkan_physical_device_index(args),
+    );
     let source_graph = manifest.resolved_source_graph(manifest_dir.to_path_buf())?;
     let patch = manifest.runtime_patch_from_controls(
         args.default_device_id.as_deref(),
@@ -487,7 +490,10 @@ fn inspect_package(
         .default_device_id
         .as_deref()
         .unwrap_or(&manifest.placement.default_device_id);
-    let available_devices = inspect_available_devices(default_device_id, args.vulkan_device_index);
+    let available_devices = inspect_available_devices(
+        default_device_id,
+        runtime_report_default_vulkan_physical_device_index(args),
+    );
     let source_pedals = source_pedals_report(&manifest);
     let source_pedal_count = source_pedals.len();
     let capacity_profiles = capacity_profiles_report(&manifest);
@@ -605,13 +611,24 @@ fn inspect_available_devices(
             notes: vec!["no compute-capable Vulkan physical devices were found".to_string()],
             error: None,
         }],
-        Ok(devices) => devices
+        Ok(devices) => {
+            let mut cpu_device_ordinal = 0usize;
+            devices
             .iter()
             .map(|device| {
                 let selected_by_runtime = selected_vulkan_device_index
                     .map(|index| index == device.physical_device_index)
                     .unwrap_or(device.selected_by_default);
-                let runtime_device_id = selected_by_runtime.then(|| default_device_id.to_string());
+                let cpu_runtime_device_id = if device.device_type == "cpu" {
+                    let runtime_device_id = format!("cpu{cpu_device_ordinal}");
+                    cpu_device_ordinal += 1;
+                    Some(runtime_device_id)
+                } else {
+                    None
+                };
+                let runtime_device_id = selected_by_runtime
+                    .then(|| default_device_id.to_string())
+                    .or(cpu_runtime_device_id.clone());
                 let device_id = runtime_device_id
                     .clone()
                     .unwrap_or_else(|| device.physical_device_id.clone());
@@ -660,6 +677,11 @@ fn inspect_available_devices(
                                     .to_string(),
                             ]
                         }
+                    } else if let Some(cpu_runtime_device_id) = cpu_runtime_device_id {
+                        vec![format!(
+                            "auto-detected CPU runtime target {cpu_runtime_device_id}; backed by Vulkan CPU compute device {}",
+                            device.physical_device_id
+                        )]
                     } else {
                         vec![
                             "auto-detected by Vulkan inventory; can be selected with --bind-device LOGICAL=vulkan:N"
@@ -669,7 +691,8 @@ fn inspect_available_devices(
                     error: None,
                 }
             })
-            .collect(),
+            .collect()
+        }
         Err(error) => vec![RuntimeAvailableDevice {
             device_id: default_device_id.to_string(),
             backend: "vulkan_compute".to_string(),
@@ -1170,7 +1193,7 @@ fn runtime_physical_device_index(args: &Args) -> Result<Option<usize>, Box<dyn E
     let mut selected = args.vulkan_device_index;
     let mut unsupported_bindings = Vec::new();
     if let Some(default_device_id) = args.default_device_id.as_deref() {
-        match parse_vulkan_physical_device_ref(default_device_id) {
+        match resolve_runtime_vulkan_physical_device_ref(default_device_id) {
             Ok(Some(index)) => {
                 if let Some(existing) = selected {
                     if existing != index {
@@ -1195,7 +1218,7 @@ fn runtime_physical_device_index(args: &Args) -> Result<Option<usize>, Box<dyn E
         }
     }
     for (logical_device_id, target) in &args.device_bindings {
-        match parse_vulkan_physical_device_ref(target) {
+        match resolve_runtime_vulkan_physical_device_ref(target) {
             Ok(Some(index)) => {
                 if let Some(existing) = selected {
                     if existing != index {
@@ -1234,25 +1257,25 @@ fn runtime_mount_physical_device_index(
     default_physical_device_index: usize,
 ) -> Result<usize, io::Error> {
     if let Some(target) = args.device_bindings.get(logical_device_id) {
-        return parse_vulkan_physical_device_ref(target)
+        return resolve_runtime_vulkan_physical_device_ref(target)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?
             .ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidInput,
                     format!(
-                        "logical device {logical_device_id:?} is bound to unsupported target {target:?}; local mounted execution supports vulkan:N targets"
+                        "logical device {logical_device_id:?} is bound to unsupported target {target:?}; local mounted execution supports vulkan:N or cpuN targets"
                     ),
                 )
             });
     }
-    match parse_vulkan_physical_device_ref(logical_device_id)
+    match resolve_runtime_vulkan_physical_device_ref(logical_device_id)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?
     {
         Some(index) => Ok(index),
         None if logical_device_id.contains(':') => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
-                "logical device id {logical_device_id:?} looks like an unsupported direct runtime target; local mounted execution supports vulkan:N targets"
+                "logical device id {logical_device_id:?} looks like an unsupported direct runtime target; local mounted execution supports vulkan:N or cpuN targets"
             ),
         )),
         None => Ok(default_physical_device_index),
@@ -1264,15 +1287,20 @@ fn runtime_target_for_logical_device(
     logical_device_id: &str,
 ) -> RuntimeCableRouteTarget {
     if let Some(target) = args.device_bindings.get(logical_device_id) {
+        let physical_device_index = resolve_runtime_vulkan_physical_device_ref(target)
+            .ok()
+            .flatten();
         return RuntimeCableRouteTarget {
-            target: Some(target.clone()),
-            physical_device_index: parse_vulkan_physical_device_ref(target).ok().flatten(),
+            target: physical_device_index
+                .map(|index| format!("vulkan:{index}"))
+                .or_else(|| Some(target.clone())),
+            physical_device_index,
             binding_source: "explicit".to_string(),
         };
     }
-    match parse_vulkan_physical_device_ref(logical_device_id) {
+    match resolve_runtime_vulkan_physical_device_ref(logical_device_id) {
         Ok(Some(index)) => RuntimeCableRouteTarget {
-            target: Some(logical_device_id.to_string()),
+            target: Some(format!("vulkan:{index}")),
             physical_device_index: Some(index),
             binding_source: "device_id".to_string(),
         },
@@ -1300,6 +1328,13 @@ fn runtime_target_for_logical_device(
 
 fn runtime_report_default_vulkan_physical_device_index(args: &Args) -> Option<usize> {
     args.vulkan_device_index
+        .or_else(|| {
+            args.default_device_id.as_deref().and_then(|device_id| {
+                resolve_runtime_vulkan_physical_device_ref(device_id)
+                    .ok()
+                    .flatten()
+            })
+        })
         .or_else(|| runtime_default_vulkan_physical_device_index().ok())
 }
 
@@ -1365,7 +1400,7 @@ fn runtime_device_bindings_report(
         logical_device_ids,
         &args.device_bindings,
         runtime_report_default_vulkan_physical_device_index(args),
-        parse_vulkan_physical_device_ref,
+        resolve_runtime_vulkan_physical_device_ref,
     )
 }
 
@@ -1620,10 +1655,20 @@ fn parse_device_binding_assignment(raw: &str) -> Result<(String, String), String
             "invalid runtime device binding {raw:?}; target must not be empty"
         ));
     }
-    if let Err(error) = parse_vulkan_physical_device_ref(target) {
+    if let Err(error) = resolve_runtime_vulkan_physical_device_ref(target) {
         return Err(error);
     }
     Ok((device_id.to_string(), target.to_string()))
+}
+
+fn resolve_runtime_vulkan_physical_device_ref(raw: &str) -> Result<Option<usize>, String> {
+    if let Some(index) = parse_vulkan_physical_device_ref(raw)? {
+        return Ok(Some(index));
+    }
+    if let Some(cpu_ordinal) = parse_cpu_runtime_device_ref(raw)? {
+        return runtime_cpu_vulkan_physical_device_index(cpu_ordinal).map(Some);
+    }
+    Ok(None)
 }
 
 fn parse_vulkan_physical_device_ref(raw: &str) -> Result<Option<usize>, String> {
@@ -1639,6 +1684,55 @@ fn parse_vulkan_physical_device_ref(raw: &str) -> Result<Option<usize>, String> 
             .map_err(|error| format!("invalid Vulkan physical device reference {raw:?}: {error}"));
     }
     Ok(None)
+}
+
+fn parse_cpu_runtime_device_ref(raw: &str) -> Result<Option<usize>, String> {
+    if raw == "cpu" {
+        return Ok(Some(0));
+    }
+    if let Some(index) = raw.strip_prefix("cpu:") {
+        if index.is_empty() {
+            return Err(format!(
+                "invalid CPU runtime device reference {raw:?}; expected cpuN or cpu:N"
+            ));
+        }
+        return index
+            .parse::<usize>()
+            .map(Some)
+            .map_err(|error| format!("invalid CPU runtime device reference {raw:?}: {error}"));
+    }
+    if let Some(index) = raw.strip_prefix("cpu") {
+        if index.is_empty() {
+            return Err(format!(
+                "invalid CPU runtime device reference {raw:?}; expected cpuN or cpu:N"
+            ));
+        }
+        if index.chars().all(|ch| ch.is_ascii_digit()) {
+            return index
+                .parse::<usize>()
+                .map(Some)
+                .map_err(|error| format!("invalid CPU runtime device reference {raw:?}: {error}"));
+        }
+        return Err(format!(
+            "invalid CPU runtime device reference {raw:?}; expected cpuN or cpu:N"
+        ));
+    }
+    Ok(None)
+}
+
+fn runtime_cpu_vulkan_physical_device_index(cpu_ordinal: usize) -> Result<usize, String> {
+    let devices = VulkanComputeDevice::available_compute_devices()
+        .map_err(|error| format!("failed to inspect Vulkan devices for CPU target: {error}"))?;
+    devices
+        .iter()
+        .filter(|device| device.device_type == "cpu")
+        .nth(cpu_ordinal)
+        .map(|device| device.physical_device_index)
+        .ok_or_else(|| {
+            format!(
+                "CPU runtime target cpu{cpu_ordinal} requested, but no matching Vulkan CPU compute device is available"
+            )
+        })
 }
 
 fn parse_duplicate_after_assignment(raw: &str) -> Result<(String, String), String> {

@@ -384,14 +384,32 @@ class RuntimeCliCommandTest(unittest.TestCase):
 
     def test_parse_device_bindings_requires_explicit_device_targets(self) -> None:
         self.assertEqual(
-            {"gpu0": "vulkan:0", "gpu1": "vulkan:5", "lan0": "lan:worker-a"},
-            parse_device_bindings(["gpu0=vulkan:0", " gpu1 = vulkan:5 ", "lan0=lan:worker-a"]),
+            {
+                "gpu0": "vulkan:0",
+                "gpu1": "vulkan:5",
+                "cpu0": "cpu0",
+                "cpu1": "cpu:1",
+                "lan0": "lan:worker-a",
+            },
+            parse_device_bindings(
+                [
+                    "gpu0=vulkan:0",
+                    " gpu1 = vulkan:5 ",
+                    "cpu0=cpu0",
+                    "cpu1=cpu:1",
+                    "lan0=lan:worker-a",
+                ]
+            ),
         )
 
         with self.assertRaisesRegex(ValueError, "expected DEVICE=TARGET"):
             parse_device_bindings(["gpu0"])
         with self.assertRaisesRegex(ValueError, "expected vulkan:N"):
             parse_device_bindings(["gpu0=vulkan:"])
+        with self.assertRaisesRegex(ValueError, "expected cpuN"):
+            parse_device_bindings(["cpu0=cpu:"])
+        with self.assertRaisesRegex(ValueError, "expected cpuN"):
+            parse_device_bindings(["cpu0=cpuish"])
         with self.assertRaisesRegex(ValueError, "duplicate"):
             parse_device_bindings(["gpu0=vulkan:0", "gpu0=vulkan:1"])
 

@@ -106,7 +106,7 @@ def main() -> None:
         action="append",
         default=[],
         metavar="DEVICE=TARGET",
-        help="bind one logical runtime device to a target such as vulkan:5; may be repeated",
+        help="bind one logical runtime device to a target such as vulkan:5 or cpu0; may be repeated",
     )
     parser.add_argument(
         "--duplicate-after",
@@ -386,6 +386,23 @@ def parse_device_bindings(raw_bindings: list[str]) -> dict[str, str]:
                 raise ValueError(
                     f"invalid --bind-device value {raw_binding!r}; {error}"
                 ) from error
+        if target == "cpu:" or (target.startswith("cpu:") and not target.split(":", 1)[1]):
+            raise ValueError(
+                f"invalid --bind-device value {raw_binding!r}; expected cpuN or cpu:N"
+            )
+        if target.startswith("cpu:"):
+            try:
+                int(target.split(":", 1)[1])
+            except ValueError as error:
+                raise ValueError(
+                    f"invalid --bind-device value {raw_binding!r}; {error}"
+                ) from error
+        if target.startswith("cpu") and not target.startswith("cpu:") and target != "cpu":
+            suffix = target[3:]
+            if suffix and not suffix.isdigit():
+                raise ValueError(
+                    f"invalid --bind-device value {raw_binding!r}; expected cpuN or cpu:N"
+                )
         if device_id in bindings:
             raise ValueError(f"duplicate --bind-device assignment for {device_id!r}")
         bindings[device_id] = target
