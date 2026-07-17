@@ -1850,6 +1850,32 @@ pub struct RuntimePackageInspectionReport {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimePatchPlacementReport {
+    pub schema: String,
+    pub wiring: String,
+    pub local_cable_count: usize,
+    pub cross_device_cable_count: usize,
+    pub runtime_routes: RuntimeCableRoutes,
+    pub pedals: Vec<PedalPlacement>,
+    pub cables: Vec<PedalCablePlacement>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimePatchInspectionReport {
+    pub ok: bool,
+    pub package_manifest: PathBuf,
+    pub package_root: PathBuf,
+    pub package_id: String,
+    pub compiled_source_pedal_count: usize,
+    pub runtime_patch_controls: RuntimePatchControls,
+    pub runtime_patch: StreamCircuitRuntimePatch,
+    pub device_bindings: RuntimeDeviceBindings,
+    pub effective_pedal_count: usize,
+    pub effective_cable_count: usize,
+    pub placement: RuntimePatchPlacementReport,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeLocalCableBufferReport {
     pub cable_index: usize,
     pub signal: String,
@@ -3148,6 +3174,89 @@ mod tests {
             serde_json::Value::Null
         );
         assert_eq!(payload["source_pedal_count"], 0);
+    }
+
+    #[test]
+    fn runtime_patch_inspection_report_serializes_patch_preview_contract() {
+        let report = RuntimePatchInspectionReport {
+            ok: true,
+            package_manifest: PathBuf::from("package.json"),
+            package_root: PathBuf::from("."),
+            package_id: "model-test".to_string(),
+            compiled_source_pedal_count: 14,
+            runtime_patch_controls: RuntimePatchControls {
+                default_device_id: Some("gpu0".to_string()),
+                pedal_devices: BTreeMap::new(),
+                source_chain: Some(vec![RuntimePatchSourceChainEntry {
+                    instance_id: "layer_05_repeat".to_string(),
+                    source_pedal_id: "layer_05".to_string(),
+                }]),
+                duplicate_after: Vec::new(),
+            },
+            runtime_patch: StreamCircuitRuntimePatch {
+                schema: STREAM_CIRCUIT_RUNTIME_PATCH_SCHEMA.to_string(),
+                wiring: "series".to_string(),
+                default_device_id: "gpu0".to_string(),
+                instances: vec![StreamCircuitPedalInstance {
+                    instance_id: "layer_05_repeat".to_string(),
+                    source_pedal_id: "layer_05".to_string(),
+                    device_id: "vulkan:5".to_string(),
+                    state_policy: StreamCircuitPedalInstanceStatePolicy::Fresh,
+                }],
+            },
+            device_bindings: RuntimeDeviceBindings::from_vulkan_targets(
+                &["vulkan:5".to_string()],
+                &BTreeMap::new(),
+                Some(0),
+                |target| {
+                    if let Some(index) = target.strip_prefix("vulkan:") {
+                        return index.parse::<usize>().map(Some).map_err(|error| {
+                            format!("invalid Vulkan physical device reference {target:?}: {error}")
+                        });
+                    }
+                    Ok(None)
+                },
+            ),
+            effective_pedal_count: 1,
+            effective_cable_count: 0,
+            placement: RuntimePatchPlacementReport {
+                schema: STREAM_CIRCUIT_PLACEMENT_SCHEMA.to_string(),
+                wiring: "series".to_string(),
+                local_cable_count: 0,
+                cross_device_cable_count: 0,
+                runtime_routes: RuntimeCableRoutes {
+                    schema: RUNTIME_CABLE_ROUTES_SCHEMA.to_string(),
+                    cable_count: 0,
+                    logical_local_cable_count: 0,
+                    logical_cross_device_cable_count: 0,
+                    same_physical_target_cable_count: 0,
+                    cross_physical_target_cable_count: 0,
+                    unresolved_target_cable_count: 0,
+                    routes: Vec::new(),
+                },
+                pedals: vec![PedalPlacement {
+                    pedal_index: 0,
+                    pedal_id: "layer_05_repeat".to_string(),
+                    circuit_id: "layer_05_circuit_v1".to_string(),
+                    operator_type: "layer".to_string(),
+                    device_id: "vulkan:5".to_string(),
+                }],
+                cables: Vec::new(),
+            },
+        };
+
+        let payload = serde_json::to_value(&report).unwrap();
+
+        assert_eq!(payload["compiled_source_pedal_count"], 14);
+        assert_eq!(
+            payload["runtime_patch"]["instances"][0]["device_id"],
+            "vulkan:5"
+        );
+        assert_eq!(
+            payload["runtime_patch_controls"]["source_chain"][0]["instance_id"],
+            "layer_05_repeat"
+        );
+        assert_eq!(payload["placement"]["pedals"][0]["device_id"], "vulkan:5");
     }
 
     #[test]

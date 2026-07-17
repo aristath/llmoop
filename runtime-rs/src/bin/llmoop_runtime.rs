@@ -11,8 +11,9 @@ use llmoop_runtime::{
     RuntimeCompiledPedalboardSummary, RuntimeDeviceBindings, RuntimeDeviceSliceReport,
     RuntimeDeviceTickPlanReport, RuntimeEffectivePedalboardTopology, RuntimeLocalCableBufferReport,
     RuntimePackageInspectionReport, RuntimePatchControls, RuntimePatchDuplicateAfterControl,
-    RuntimePatchSourceChainEntry, RuntimePedalPortSummary, RuntimePlacementReport,
-    RuntimeRemoteCableBufferReport, RuntimeSourcePedal, RuntimeTopologyReport, VulkanComputeDevice,
+    RuntimePatchInspectionReport, RuntimePatchPlacementReport, RuntimePatchSourceChainEntry,
+    RuntimePedalPortSummary, RuntimePlacementReport, RuntimeRemoteCableBufferReport,
+    RuntimeSourcePedal, RuntimeTopologyReport, VulkanComputeDevice,
     VulkanResidentGreedyInProcessPlacedModelPackage, VulkanResidentGreedyModelPackage,
     VulkanResidentGreedyModelPackageDeviceSlice, VulkanResidentGreedyModelPackageManifest,
     VulkanResidentHfTokenizerTextCodec, VulkanResidentTokenEngine,
@@ -721,46 +722,42 @@ fn inspect_patch(
     let placement_device_ids = placement_device_ids(&placement.pedals);
     let instance_count = patch.instances.len();
     let cable_count = placement.cables.len();
-    let payload = json!({
-        "ok": true,
-        "package_manifest": package_manifest,
-        "package_root": manifest_dir,
-        "package_id": manifest.package_id,
-        "compiled_source_pedal_count": source_graph.circuits.len(),
-        "runtime_patch_controls": runtime_patch_report(args),
-        "runtime_patch": patch,
-        "device_bindings": runtime_device_bindings_report(args, &placement_device_ids),
-        "effective_pedal_count": instance_count,
-        "effective_cable_count": cable_count,
-        "placement": {
-            "schema": placement.schema,
-            "wiring": placement.wiring,
-            "local_cable_count": placement.local_cable_count,
-            "cross_device_cable_count": placement.cross_device_cable_count,
-            "runtime_routes": runtime_cable_routes_report(args, &placement.cables),
-            "pedals": placement.pedals,
-            "cables": placement.cables,
+    let payload = RuntimePatchInspectionReport {
+        ok: true,
+        package_manifest: package_manifest.to_path_buf(),
+        package_root: manifest_dir.to_path_buf(),
+        package_id: manifest.package_id.clone(),
+        compiled_source_pedal_count: source_graph.circuits.len(),
+        runtime_patch_controls: runtime_patch_report(args),
+        runtime_patch: patch,
+        device_bindings: runtime_device_bindings_report(args, &placement_device_ids),
+        effective_pedal_count: instance_count,
+        effective_cable_count: cable_count,
+        placement: RuntimePatchPlacementReport {
+            schema: placement.schema,
+            wiring: placement.wiring,
+            local_cable_count: placement.local_cable_count,
+            cross_device_cable_count: placement.cross_device_cable_count,
+            runtime_routes: runtime_cable_routes_report(args, &placement.cables),
+            pedals: placement.pedals,
+            cables: placement.cables,
         },
-    });
+    };
 
     if args.json {
         println!("{}", serde_json::to_string_pretty(&payload)?);
     } else {
-        println!("package_id={}", payload["package_id"]);
-        println!("effective_pedal_count={}", payload["effective_pedal_count"]);
-        println!("effective_cable_count={}", payload["effective_cable_count"]);
+        println!("package_id={}", payload.package_id);
+        println!("effective_pedal_count={}", payload.effective_pedal_count);
+        println!("effective_cable_count={}", payload.effective_cable_count);
         println!(
             "cross_device_cable_count={}",
-            payload["placement"]["cross_device_cable_count"]
+            payload.placement.cross_device_cable_count
         );
-        for pedal in payload["placement"]["pedals"]
-            .as_array()
-            .into_iter()
-            .flatten()
-        {
+        for pedal in &payload.placement.pedals {
             println!(
                 "{} circuit={} device={}",
-                pedal["pedal_id"], pedal["circuit_id"], pedal["device_id"]
+                pedal.pedal_id, pedal.circuit_id, pedal.device_id
             );
         }
     }
