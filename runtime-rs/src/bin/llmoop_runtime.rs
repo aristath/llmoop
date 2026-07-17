@@ -291,6 +291,41 @@ fn run_placed_prompt(
         .iter()
         .map(|tick| tick.tick_run.placed_run.transport_stats.received_byte_count)
         .sum::<usize>();
+    let transport_direct_copy_count = run
+        .tick_runs
+        .iter()
+        .map(|tick| tick.tick_run.placed_run.transport_stats.direct_copy_count)
+        .sum::<usize>();
+    let transport_direct_copy_byte_count = run
+        .tick_runs
+        .iter()
+        .map(|tick| {
+            tick.tick_run
+                .placed_run
+                .transport_stats
+                .direct_copy_byte_count
+        })
+        .sum::<usize>();
+    let transport_direct_receive_count = run
+        .tick_runs
+        .iter()
+        .map(|tick| {
+            tick.tick_run
+                .placed_run
+                .transport_stats
+                .direct_receive_count
+        })
+        .sum::<usize>();
+    let transport_direct_receive_byte_count = run
+        .tick_runs
+        .iter()
+        .map(|tick| {
+            tick.tick_run
+                .placed_run
+                .transport_stats
+                .direct_receive_byte_count
+        })
+        .sum::<usize>();
 
     if args.json {
         println!(
@@ -329,6 +364,10 @@ fn run_placed_prompt(
                     "published_byte_count": transport_published_byte_count,
                     "received_packet_count": transport_received_packet_count,
                     "received_byte_count": transport_received_byte_count,
+                    "direct_copy_count": transport_direct_copy_count,
+                    "direct_copy_byte_count": transport_direct_copy_byte_count,
+                    "direct_receive_count": transport_direct_receive_count,
+                    "direct_receive_byte_count": transport_direct_receive_byte_count,
                     "by_tick": transport_stats_by_tick,
                 },
             }))?
@@ -346,10 +385,16 @@ fn transport_stats_report(stats: &VulkanPlacedCableTransportStats) -> Value {
     json!({
         "pending_packet_count": stats.pending_packet_count,
         "pending_byte_count": stats.pending_byte_count,
+        "pending_direct_cable_count": stats.pending_direct_cable_count,
+        "pending_direct_byte_count": stats.pending_direct_byte_count,
         "published_packet_count": stats.published_packet_count,
         "published_byte_count": stats.published_byte_count,
         "received_packet_count": stats.received_packet_count,
         "received_byte_count": stats.received_byte_count,
+        "direct_copy_count": stats.direct_copy_count,
+        "direct_copy_byte_count": stats.direct_copy_byte_count,
+        "direct_receive_count": stats.direct_receive_count,
+        "direct_receive_byte_count": stats.direct_receive_byte_count,
     })
 }
 

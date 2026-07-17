@@ -22,8 +22,8 @@ use crate::stream_plan::{
 };
 use crate::vulkan::{DEFAULT_COMPUTE_LOCAL_SIZE_X, DEFAULT_SPIRV_ENTRY_POINT, read_spirv_words};
 use crate::vulkan_compute::{
-    VulkanComputeDevice, VulkanError, VulkanResidentBuffer, VulkanResidentKernelBufferBinding,
-    VulkanResidentKernelDispatch,
+    VulkanComputeDevice, VulkanError, VulkanResidentBuffer, VulkanResidentBufferCopy,
+    VulkanResidentKernelBufferBinding, VulkanResidentKernelDispatch,
 };
 
 pub const VULKAN_STREAM_CIRCUIT_BACKEND_ID: &str = "vulkan_stream_circuit_ir";
@@ -1689,19 +1689,40 @@ pub struct VulkanPlacedCableTransportReceiveBatch {
 pub struct VulkanPlacedCableTransportStats {
     pub pending_packet_count: usize,
     pub pending_byte_count: usize,
+    pub pending_direct_cable_count: usize,
+    pub pending_direct_byte_count: usize,
     pub published_packet_count: usize,
     pub published_byte_count: usize,
     pub received_packet_count: usize,
     pub received_byte_count: usize,
+    pub direct_copy_count: usize,
+    pub direct_copy_byte_count: usize,
+    pub direct_receive_count: usize,
+    pub direct_receive_byte_count: usize,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Default)]
 pub struct VulkanInProcessPlacedCableTransport {
     packets: BTreeMap<VulkanPlacedCablePacketKey, VulkanPlacedCablePacket>,
+    direct_copies: BTreeMap<VulkanPlacedCablePacketKey, VulkanPlacedCableDirectCopy>,
+    ready_direct_cables: BTreeSet<VulkanPlacedCablePacketKey>,
     published_packet_count: usize,
     published_byte_count: usize,
     received_packet_count: usize,
     received_byte_count: usize,
+    direct_copy_count: usize,
+    direct_copy_byte_count: usize,
+    direct_receive_count: usize,
+    direct_receive_byte_count: usize,
+}
+
+pub struct VulkanPlacedCableDirectCopy {
+    pub key: VulkanPlacedCablePacketKey,
+    pub signal: String,
+    pub source_pedal_id: String,
+    pub destination_pedal_id: String,
+    pub byte_count: usize,
+    copy: VulkanResidentBufferCopy,
 }
 
 impl VulkanInProcessPlacedCableTransport {
@@ -1717,15 +1738,71 @@ impl VulkanInProcessPlacedCableTransport {
         VulkanPlacedCableTransportStats {
             pending_packet_count: self.packets.len(),
             pending_byte_count: self.packets.values().map(|packet| packet.byte_count).sum(),
+            pending_direct_cable_count: self.ready_direct_cables.len(),
+            pending_direct_byte_count: self
+                .ready_direct_cables
+                .iter()
+                .filter_map(|key| self.direct_copies.get(key))
+                .map(|copy| copy.byte_count)
+                .sum(),
             published_packet_count: self.published_packet_count,
             published_byte_count: self.published_byte_count,
             received_packet_count: self.received_packet_count,
             received_byte_count: self.received_byte_count,
+            direct_copy_count: self.direct_copy_count,
+            direct_copy_byte_count: self.direct_copy_byte_count,
+            direct_receive_count: self.direct_receive_count,
+            direct_receive_byte_count: self.direct_receive_byte_count,
         }
     }
 
     pub fn contains_packet(&self, key: &VulkanPlacedCablePacketKey) -> bool {
         self.packets.contains_key(key)
+    }
+
+    pub fn contains_ready_direct_cable(&self, key: &VulkanPlacedCablePacketKey) -> bool {
+        self.ready_direct_cables.contains(key)
+    }
+
+    pub fn register_direct_cable_copy(
+        &mut self,
+        device: &VulkanComputeDevice,
+        outgoing: &VulkanPlacedCableBufferAllocation,
+        incoming: &VulkanPlacedCableBufferAllocation,
+    ) -> Result<(), VulkanPlacedCableTransportError> {
+        let outgoing_key = VulkanPlacedCablePacketKey::from_outgoing_endpoint(&outgoing.endpoint);
+        let incoming_key = VulkanPlacedCablePacketKey::from_incoming_endpoint(&incoming.endpoint);
+        if outgoing_key != incoming_key {
+            return Err(VulkanPlacedCableTransportError::EndpointMismatch {
+                outgoing_key,
+                incoming_key,
+            });
+        }
+        if outgoing.byte_capacity != incoming.byte_capacity {
+            return Err(VulkanPlacedCableTransportError::ByteCapacityMismatch {
+                key: outgoing_key,
+                packet_byte_count: outgoing.byte_capacity,
+                incoming_byte_capacity: incoming.byte_capacity,
+            });
+        }
+        let copy = device
+            .create_resident_buffer_copy(&outgoing.buffer, &incoming.buffer, outgoing.byte_capacity)
+            .map_err(|error| VulkanPlacedCableTransportError::Vulkan {
+                operation: "create direct cable buffer copy",
+                error,
+            })?;
+        self.direct_copies.insert(
+            outgoing_key.clone(),
+            VulkanPlacedCableDirectCopy {
+                key: outgoing_key,
+                signal: outgoing.endpoint.signal.clone(),
+                source_pedal_id: outgoing.endpoint.local_pedal_id.clone(),
+                destination_pedal_id: outgoing.endpoint.remote_pedal_id.clone(),
+                byte_count: outgoing.byte_capacity,
+                copy,
+            },
+        );
+        Ok(())
     }
 
     pub fn publish_outgoing_cable(
@@ -1741,6 +1818,23 @@ impl VulkanInProcessPlacedCableTransport {
                 cable_index,
             })?;
         let key = VulkanPlacedCablePacketKey::from_outgoing_endpoint(&outgoing.endpoint);
+        if let Some(direct_copy) = self.direct_copies.get(&key) {
+            direct_copy
+                .copy
+                .run(direct_copy.byte_count)
+                .map_err(|error| VulkanPlacedCableTransportError::Vulkan {
+                    operation: "run direct cable buffer copy",
+                    error,
+                })?;
+            self.ready_direct_cables.insert(key);
+            self.direct_copy_count += 1;
+            self.direct_copy_byte_count += direct_copy.byte_count;
+            return Ok(VulkanPlacedCableTransportReceipt {
+                key: direct_copy.key.clone(),
+                signal: direct_copy.signal.clone(),
+                byte_count: direct_copy.byte_count,
+            });
+        }
         let bytes = outgoing
             .buffer
             .read_bytes(outgoing.byte_capacity)
@@ -1797,6 +1891,18 @@ impl VulkanInProcessPlacedCableTransport {
                 cable_index,
             })?;
         let key = VulkanPlacedCablePacketKey::from_incoming_endpoint(&incoming.endpoint);
+        if let Some(direct_copy) = self.direct_copies.get(&key) {
+            if !self.ready_direct_cables.remove(&key) {
+                return Err(VulkanPlacedCableTransportError::MissingPacket { key });
+            }
+            self.direct_receive_count += 1;
+            self.direct_receive_byte_count += direct_copy.byte_count;
+            return Ok(VulkanPlacedCableTransportReceipt {
+                key: direct_copy.key.clone(),
+                signal: direct_copy.signal.clone(),
+                byte_count: direct_copy.byte_count,
+            });
+        }
         let packet = self
             .packets
             .remove(&key)
@@ -1866,6 +1972,10 @@ pub enum VulkanPlacedCableTransportError {
         packet_byte_count: usize,
         incoming_byte_capacity: usize,
     },
+    EndpointMismatch {
+        outgoing_key: VulkanPlacedCablePacketKey,
+        incoming_key: VulkanPlacedCablePacketKey,
+    },
     Vulkan {
         operation: &'static str,
         error: VulkanError,
@@ -1906,6 +2016,19 @@ impl Display for VulkanPlacedCableTransportError {
                 key.to_device_id,
                 packet_byte_count,
                 incoming_byte_capacity
+            ),
+            Self::EndpointMismatch {
+                outgoing_key,
+                incoming_key,
+            } => write!(
+                f,
+                "direct in-process cable endpoint mismatch: outgoing cable {} from {:?} to {:?}, incoming cable {} from {:?} to {:?}",
+                outgoing_key.cable_index,
+                outgoing_key.from_device_id,
+                outgoing_key.to_device_id,
+                incoming_key.cable_index,
+                incoming_key.from_device_id,
+                incoming_key.to_device_id
             ),
             Self::Vulkan { operation, error } => write!(f, "{operation} failed: {error}"),
         }
@@ -11930,6 +12053,34 @@ impl From<VulkanMountedPlacedResidentStreamTickError>
     }
 }
 
+fn register_same_device_direct_cable_copies(
+    slices: &[VulkanMountedPlacedResidentInProcessStreamTickSlice<'_>],
+    transport: &mut VulkanInProcessPlacedCableTransport,
+) -> Result<(), VulkanMountedPlacedResidentInProcessStreamTickError> {
+    for source_slice in slices {
+        for outgoing in &source_slice.mounted.cable_io.outgoing_buffers {
+            let destination_slice = slices.iter().find(|slice| {
+                slice.device_id() == outgoing.endpoint.remote_device_id
+                    && std::ptr::eq(slice.device, source_slice.device)
+            });
+            let Some(destination_slice) = destination_slice else {
+                continue;
+            };
+            let Some(incoming) = destination_slice
+                .mounted
+                .cable_io
+                .incoming_buffer(outgoing.endpoint.cable_index)
+            else {
+                continue;
+            };
+            transport
+                .register_direct_cable_copy(source_slice.device, outgoing, incoming)
+                .map_err(VulkanMountedPlacedResidentStreamTickError::Transport)?;
+        }
+    }
+    Ok(())
+}
+
 pub fn run_mounted_placed_resident_stream_tick_slices_in_process(
     slices: &mut [VulkanMountedPlacedResidentInProcessStreamTickSlice<'_>],
     transport: &mut VulkanInProcessPlacedCableTransport,
@@ -11938,6 +12089,8 @@ pub fn run_mounted_placed_resident_stream_tick_slices_in_process(
     VulkanMountedPlacedResidentInProcessStreamTickRun,
     VulkanMountedPlacedResidentInProcessStreamTickError,
 > {
+    register_same_device_direct_cable_copies(slices, transport)?;
+
     let mut scheduler_turn_count = 0usize;
     let mut completed_stage_delta = 0usize;
 
@@ -21362,10 +21515,16 @@ mod tests {
         assert_eq!(run.completed_stage_delta, 246);
         assert_eq!(run.transport_stats.pending_packet_count, 0);
         assert_eq!(run.transport_stats.pending_byte_count, 0);
-        assert_eq!(run.transport_stats.published_packet_count, 2);
-        assert_eq!(run.transport_stats.published_byte_count, 4096);
-        assert_eq!(run.transport_stats.received_packet_count, 2);
-        assert_eq!(run.transport_stats.received_byte_count, 4096);
+        assert_eq!(run.transport_stats.pending_direct_cable_count, 0);
+        assert_eq!(run.transport_stats.pending_direct_byte_count, 0);
+        assert_eq!(run.transport_stats.published_packet_count, 0);
+        assert_eq!(run.transport_stats.published_byte_count, 0);
+        assert_eq!(run.transport_stats.received_packet_count, 0);
+        assert_eq!(run.transport_stats.received_byte_count, 0);
+        assert_eq!(run.transport_stats.direct_copy_count, 2);
+        assert_eq!(run.transport_stats.direct_copy_byte_count, 4096);
+        assert_eq!(run.transport_stats.direct_receive_count, 2);
+        assert_eq!(run.transport_stats.direct_receive_byte_count, 4096);
         assert_eq!(transport.packet_count(), 0);
 
         let gpu0_run = run
@@ -21448,6 +21607,14 @@ mod tests {
         );
         assert_eq!(run.scheduler_turn_count, 2);
         assert_eq!(run.completed_stage_delta, 246);
+        assert_eq!(run.transport_stats.pending_packet_count, 0);
+        assert_eq!(run.transport_stats.pending_direct_cable_count, 0);
+        assert_eq!(run.transport_stats.published_packet_count, 0);
+        assert_eq!(run.transport_stats.received_packet_count, 0);
+        assert_eq!(run.transport_stats.direct_copy_count, 2);
+        assert_eq!(run.transport_stats.direct_copy_byte_count, 4096);
+        assert_eq!(run.transport_stats.direct_receive_count, 2);
+        assert_eq!(run.transport_stats.direct_receive_byte_count, 4096);
 
         let output = placed_package
             .mounted_device("gpu0")

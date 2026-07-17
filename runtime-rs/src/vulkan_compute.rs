@@ -423,6 +423,7 @@ pub struct VulkanU32ResidentCopy {
 
 pub struct VulkanResidentBufferCopy {
     device: ash::Device,
+    queue: vk::Queue,
     command_pool: vk::CommandPool,
     command_buffer: vk::CommandBuffer,
     byte_len: vk::DeviceSize,
@@ -479,6 +480,35 @@ impl VulkanU32ResidentCopy {
 impl VulkanResidentBufferCopy {
     pub fn byte_len(&self) -> usize {
         self.byte_len as usize
+    }
+
+    pub fn run(&self, len: usize) -> Result<(), VulkanError> {
+        if len == 0 {
+            return Err(VulkanError(
+                "resident byte copy length must not be zero".to_string(),
+            ));
+        }
+        let byte_len = len as vk::DeviceSize;
+        if byte_len != self.byte_len {
+            return Err(VulkanError(format!(
+                "resident byte copy binding byte length {} cannot run {} bytes",
+                self.byte_len, byte_len
+            )));
+        }
+
+        unsafe {
+            let command_buffers = [self.command_buffer];
+            let submit_info = [vk::SubmitInfo::default().command_buffers(&command_buffers)];
+            self.device
+                .queue_submit(self.queue, &submit_info, vk::Fence::null())
+                .map_err(|error| {
+                    VulkanError(format!("failed to submit resident byte copy: {error:?}"))
+                })?;
+            self.device.queue_wait_idle(self.queue).map_err(|error| {
+                VulkanError(format!("failed waiting for resident byte copy: {error:?}"))
+            })?;
+            Ok(())
+        }
     }
 }
 
@@ -909,6 +939,7 @@ impl VulkanComputeDevice {
 
             Ok(VulkanResidentBufferCopy {
                 device: self.device.clone(),
+                queue: self.queue,
                 command_pool,
                 command_buffer,
                 byte_len,
@@ -963,32 +994,7 @@ impl VulkanComputeDevice {
         binding: &VulkanResidentBufferCopy,
         len: usize,
     ) -> Result<(), VulkanError> {
-        if len == 0 {
-            return Err(VulkanError(
-                "resident byte copy length must not be zero".to_string(),
-            ));
-        }
-        let byte_len = len as vk::DeviceSize;
-        if byte_len != binding.byte_len {
-            return Err(VulkanError(format!(
-                "resident byte copy binding byte length {} cannot run {} bytes",
-                binding.byte_len, byte_len
-            )));
-        }
-
-        unsafe {
-            let command_buffers = [binding.command_buffer];
-            let submit_info = [vk::SubmitInfo::default().command_buffers(&command_buffers)];
-            self.device
-                .queue_submit(self.queue, &submit_info, vk::Fence::null())
-                .map_err(|error| {
-                    VulkanError(format!("failed to submit resident byte copy: {error:?}"))
-                })?;
-            self.device.queue_wait_idle(self.queue).map_err(|error| {
-                VulkanError(format!("failed waiting for resident byte copy: {error:?}"))
-            })?;
-            Ok(())
-        }
+        binding.run(len)
     }
 
     pub fn install_u32_storage_shader(
