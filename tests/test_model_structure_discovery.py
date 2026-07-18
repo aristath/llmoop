@@ -162,7 +162,69 @@ def test_discovers_nested_hybrid_decoder_by_tensor_structure() -> None:
     attention_circuit = build_pedal_circuit(
         make_layer(structure, structure.layers[1]), Path("layer_01.json")
     )
-    split = next(node for node in attention_circuit["nodes"] if node["id"] == "q_gate_split")
+    split = next(
+        node for node in attention_circuit["nodes"] if node["id"] == "q_gate_split"
+    )
     assert split["attrs"]["layout"] == "per_head_interleaved"
     assert split["attrs"]["blocks"] == 8
     assert split["attrs"]["block_part_width"] == 256
+
+
+def test_discovers_sparse_moe_and_model_specific_numerics_by_structure() -> None:
+    prefix = "model.layers.0"
+    tensors = {
+        "model.embed_tokens.weight": _tensor([49155, 1024]),
+        "model.norm.weight": _tensor([1024]),
+        f"{prefix}.input_layernorm.weight": _tensor([1024]),
+        f"{prefix}.post_attention_layernorm.weight": _tensor([1024]),
+        f"{prefix}.self_attn.q_proj.weight": _tensor([1024, 1024]),
+        f"{prefix}.self_attn.k_proj.weight": _tensor([512, 1024]),
+        f"{prefix}.self_attn.v_proj.weight": _tensor([512, 1024]),
+        f"{prefix}.self_attn.o_proj.weight": _tensor([1024, 1024]),
+        f"{prefix}.block_sparse_moe.input_linear.weight": _tensor([32, 1024, 1024]),
+        f"{prefix}.block_sparse_moe.output_linear.weight": _tensor([32, 1024, 512]),
+        f"{prefix}.block_sparse_moe.router.layer.weight": _tensor([32, 1024]),
+    }
+    config = {
+        "model_type": "synthetic_sparse_decoder",
+        "hidden_size": 1024,
+        "intermediate_size": 512,
+        "num_hidden_layers": 1,
+        "num_attention_heads": 16,
+        "num_key_value_heads": 8,
+        "num_local_experts": 32,
+        "num_experts_per_tok": 8,
+        "embedding_multiplier": 12.0,
+        "residual_multiplier": 0.22,
+        "attention_multiplier": 0.015625,
+        "logits_scaling": 6.0,
+        "vocab_size": 49155,
+        "max_position_embeddings": 131072,
+        "rms_norm_eps": 1e-6,
+        "rope_theta": 1_500_000.0,
+        "tie_word_embeddings": True,
+    }
+
+    structure = discover_model_structure(Path("synthetic"), config, tensors)
+    layer = structure.layers[0]
+    assert layer.operator_type == "full_attention"
+    assert layer.feed_forward_type == "sparse_moe"
+    assert structure.num_experts == 32
+    assert structure.experts_per_token == 8
+    assert structure.embedding_scale == 12.0
+    assert structure.residual_scale == 0.22
+    assert structure.attention_scale == 0.015625
+    assert structure.logits_scale == 6.0
+
+    pedal = make_layer(structure, layer)
+    circuit = build_pedal_circuit(pedal, Path("layer_00.json"))
+    nodes = {node["id"]: node for node in circuit["nodes"]}
+    assert nodes["attention_read"]["attrs"]["scale"] == 0.015625
+    assert nodes["operator_residual"]["op"] == "scaled_residual_add"
+    assert nodes["operator_residual"]["attrs"]["scale"] == 0.22
+    assert nodes["moe_topk"]["attrs"] == {
+        "num_experts": 32,
+        "experts_per_token": 8,
+    }
+    assert nodes["sparse_moe_experts"]["params"] == ["moe_input", "moe_output"]
+    assert nodes["moe_reduce"]["outputs"] == ["ffn_out"]

@@ -1,0 +1,76 @@
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer RouterLogits {
+    uint words[];
+} router_logits;
+
+layout(set = 0, binding = 1) buffer RoutingWeights {
+    uint words[];
+} routing_weights;
+
+const uint NUM_EXPERTS = {{NUM_EXPERTS}}u;
+const uint EXPERTS_PER_TOKEN = {{EXPERTS_PER_TOKEN}}u;
+
+shared uint top_indices[EXPERTS_PER_TOKEN];
+
+float bf16_to_f32(uint value) {
+    return uintBitsToFloat((value & 0xffffu) << 16);
+}
+
+uint f32_to_bf16(float value) {
+    uint bits = floatBitsToUint(value);
+    uint lsb = (bits >> 16) & 1u;
+    return (bits + 0x7fffu + lsb) >> 16;
+}
+
+float read_router(uint index) {
+    uint packed = router_logits.words[index >> 1u];
+    return bf16_to_f32((index & 1u) == 0u ? packed : packed >> 16);
+}
+
+bool already_selected(uint expert, uint count) {
+    for (uint index = 0u; index < count; index++) {
+        if (top_indices[index] == expert) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void main() {
+    if (gl_LocalInvocationID.x != 0u) {
+        return;
+    }
+
+    for (uint word = 0u; word < (NUM_EXPERTS + 1u) / 2u; word++) {
+        routing_weights.words[word] = 0u;
+    }
+    for (uint route = 0u; route < EXPERTS_PER_TOKEN; route++) {
+        float best_score = -uintBitsToFloat(0x7f800000u);
+        uint best_expert = 0u;
+        for (uint expert = 0u; expert < NUM_EXPERTS; expert++) {
+            float score = read_router(expert);
+            if (!already_selected(expert, route) && score > best_score) {
+                best_score = score;
+                best_expert = expert;
+            }
+        }
+        top_indices[route] = best_expert;
+    }
+
+    float maximum = read_router(top_indices[0]);
+    float denominator = 0.0;
+    for (uint route = 0u; route < EXPERTS_PER_TOKEN; route++) {
+        denominator += exp(read_router(top_indices[route]) - maximum);
+    }
+    for (uint route = 0u; route < EXPERTS_PER_TOKEN; route++) {
+        uint expert = top_indices[route];
+        uint value = f32_to_bf16(
+            exp(read_router(expert) - maximum) / denominator
+        );
+        uint word = expert >> 1u;
+        routing_weights.words[word] |= (expert & 1u) == 0u ? value : value << 16;
+    }
+}

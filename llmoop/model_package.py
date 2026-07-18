@@ -75,7 +75,9 @@ def compile_model_package(
         shutil.rmtree(package_dir)
     package_dir.mkdir(parents=True, exist_ok=True)
     write_runtime_config_package(model_graph, package_dir)
-    tokenizer_manifest = copy_tokenizer_package(model_dir, package_dir / TOKENIZER_PACKAGE_DIR)
+    tokenizer_manifest = copy_tokenizer_package(
+        model_dir, package_dir / TOKENIZER_PACKAGE_DIR
+    )
     packaged_tensor_index = copy_tensor_package(tensor_index, package_dir)
     package_manifest = build_vulkan_resident_greedy_package_manifest(
         model_graph=model_graph,
@@ -118,13 +120,17 @@ def build_vulkan_resident_greedy_package_manifest(
     vocab_size = int(dimensions["vocab_size"])
     norm_eps = float(model_graph["numerics"]["rms_norm_eps"])
     norm_weight_offset = float(model_graph["numerics"]["rms_norm_weight_offset"])
+    embedding_scale = float(model_graph["numerics"]["embedding_scale"])
+    logits_scale = float(model_graph["numerics"]["logits_scale"])
     max_context_activations = int(dimensions["max_position_embeddings"])
     dtype = "BF16"
     dtype_bytes = dtype_byte_count(dtype)
     frame_bytes = hidden_size * dtype_bytes
     logits_bytes = vocab_size * dtype_byte_count("F32")
 
-    embed_tensor = model_graph["graph"]["input_transducer"]["params"]["weight"]["tensor"]
+    embed_tensor = model_graph["graph"]["input_transducer"]["params"]["weight"][
+        "tensor"
+    ]
     output_components = model_graph["graph"]["output_transducer"]["components"]
     norm_tensor = next(
         component["params"]["weight"]["tensor"]
@@ -139,18 +145,21 @@ def build_vulkan_resident_greedy_package_manifest(
     embedding_layout = tensor_layout(tensor_index, embed_tensor)
     projection_layout = tensor_layout(tensor_index, projection_tensor)
     embedding_shader_file = (
-        f"embedding_lookup_paired_bf16_{vocab_size}x{hidden_size}.comp"
+        f"embedding_lookup_paired_bf16_{vocab_size}x{hidden_size}"
+        f"_scale{shader_float_token(embedding_scale)}.comp"
         if embedding_layout == VULKAN_BF16_ROW_PAIR_LAYOUT
-        else f"embedding_lookup_bf16_{vocab_size}x{hidden_size}.comp"
+        else f"embedding_lookup_bf16_{vocab_size}x{hidden_size}"
+        f"_scale{shader_float_token(embedding_scale)}.comp"
     )
+    output_scale = 1.0 / logits_scale
     projection_shader_file = (
-        f"tied_output_projection_paired_bf16_{vocab_size}x{hidden_size}_to_f32.comp"
+        f"tied_output_projection_paired_bf16_{vocab_size}x{hidden_size}"
+        f"_scale{shader_float_token(output_scale)}_to_f32.comp"
         if projection_layout == VULKAN_BF16_ROW_PAIR_LAYOUT
-        else f"tied_output_projection_bf16_{vocab_size}x{hidden_size}_to_f32.comp"
+        else f"tied_output_projection_bf16_{vocab_size}x{hidden_size}"
+        f"_scale{shader_float_token(output_scale)}_to_f32.comp"
     )
-    norm_shader_file = rms_norm_shader_file(
-        hidden_size, norm_eps, norm_weight_offset
-    )
+    norm_shader_file = rms_norm_shader_file(hidden_size, norm_eps, norm_weight_offset)
 
     compiled_circuits = {
         circuit_ref["id"]: optimize_circuit_for_vulkan(
@@ -200,7 +209,9 @@ def build_vulkan_resident_greedy_package_manifest(
                 "parameter_tensor": embed_tensor,
                 "parameter_dtype": dtype,
                 "parameter_shape": tensor_shape(tensor_index, embed_tensor),
-                "parameter_byte_capacity": tensor_byte_count(tensor_index, embed_tensor),
+                "parameter_byte_capacity": tensor_byte_count(
+                    tensor_index, embed_tensor
+                ),
                 "output_signal_id": "input_frame",
                 "output_frame_byte_capacity": frame_bytes,
                 "output_frame_word_count": frame_bytes // 4,
@@ -219,10 +230,14 @@ def build_vulkan_resident_greedy_package_manifest(
                 "norm_parameter_tensor": norm_tensor,
                 "norm_parameter_dtype": dtype,
                 "norm_parameter_shape": tensor_shape(tensor_index, norm_tensor),
-                "norm_parameter_byte_capacity": tensor_byte_count(tensor_index, norm_tensor),
+                "norm_parameter_byte_capacity": tensor_byte_count(
+                    tensor_index, norm_tensor
+                ),
                 "projection_parameter_tensor": projection_tensor,
                 "projection_parameter_dtype": dtype,
-                "projection_parameter_shape": tensor_shape(tensor_index, projection_tensor),
+                "projection_parameter_shape": tensor_shape(
+                    tensor_index, projection_tensor
+                ),
                 "projection_parameter_byte_capacity": tensor_byte_count(
                     tensor_index, projection_tensor
                 ),
@@ -384,7 +399,9 @@ def shader_file_for_node(
         part_width = int(node["attrs"]["part_width"])
         return f"split_bf16_{len(node['outputs'])}x{part_width}.comp"
     if op == "multiply":
-        element_count = intermediate_size if node["id"] == "ffn_gate_multiply" else hidden_size
+        element_count = (
+            intermediate_size if node["id"] == "ffn_gate_multiply" else hidden_size
+        )
         return f"multiply_bf16_{element_count}.comp"
     if op == "rolling_state_update":
         temporal_memory = state_port(circuit, "temporal_memory")
@@ -396,6 +413,11 @@ def shader_file_for_node(
         return f"depthwise_conv1d_bf16_{frames}x{state_hidden}.comp"
     if op == "residual_add":
         return f"add_bf16_{hidden_size}.comp"
+    if op == "scaled_residual_add":
+        return (
+            f"scaled_add_bf16_{hidden_size}"
+            f"_scale{shader_float_token(float(node['attrs']['scale']))}.comp"
+        )
     if op == "silu":
         return f"silu_bf16_{intermediate_size}.comp"
     if op == "silu_multiply":
@@ -439,6 +461,7 @@ def shader_file_for_node(
         return (
             "gqa_attention_bf16_"
             f"q{attrs['query_heads']}_kv{attrs['key_value_heads']}_d{attrs['head_width']}"
+            f"_scale{shader_float_token(float(attrs['scale']))}"
             f"__sc{binding}.comp"
         )
     if op == "causal_conv1d_silu":
@@ -454,9 +477,7 @@ def shader_file_for_node(
             "delta_norm": "F32",
         }
         for parameter_id, expected_dtype in expected_dtypes.items():
-            actual_dtype = parameter_dtype_for_id(
-                circuit, parameter_id, tensor_index
-            )
+            actual_dtype = parameter_dtype_for_id(circuit, parameter_id, tensor_index)
             if actual_dtype != expected_dtype:
                 raise ModelCompileError(
                     f"gated-delta parameter {parameter_id} has dtype {actual_dtype}; "
@@ -467,8 +488,24 @@ def shader_file_for_node(
             f"_v{attrs['value_heads']}x{attrs['value_head_width']}"
             f"_eps{shader_float_token(float(attrs['norm_eps']))}.comp"
         )
+    if op == "moe_topk":
+        attrs = node["attrs"]
+        return (
+            f"moe_topk_bf16_e{attrs['num_experts']}_k{attrs['experts_per_token']}.comp"
+        )
+    if op == "sparse_moe_experts":
+        attrs = node["attrs"]
+        return (
+            f"sparse_moe_experts_bf16_h{attrs['hidden_size']}_i{attrs['intermediate_size']}"
+            f"_e{attrs['num_experts']}_k{attrs['experts_per_token']}.comp"
+        )
+    if op == "moe_reduce":
+        attrs = node["attrs"]
+        return f"moe_reduce_bf16_h{attrs['hidden_size']}_e{attrs['num_experts']}.comp"
 
-    raise ModelCompileError(f"no Vulkan shader selector for op {op!r} in node {node['id']!r}")
+    raise ModelCompileError(
+        f"no Vulkan shader selector for op {op!r} in node {node['id']!r}"
+    )
 
 
 def workgroup_count_x_for_node(circuit: Json, node: Json, tensor_index: Json) -> int:
@@ -480,6 +517,8 @@ def workgroup_count_x_for_node(circuit: Json, node: Json, tensor_index: Json) ->
         return int(node["attrs"]["query_heads"])
     if node["op"] == "gated_delta_step":
         return int(node["attrs"]["value_heads"])
+    if node["op"] == "sparse_moe_experts":
+        return int(node["attrs"]["num_experts"])
     if node["op"] in {"rms_norm_per_head", "rotary_position_embedding"}:
         return int(
             node["attrs"]["query_heads"]
@@ -496,6 +535,8 @@ def local_size_x_for_node(node: Json) -> int:
         return 1024
     if node["op"] == "gated_delta_step":
         return int(node["attrs"]["value_head_width"])
+    if node["op"] == "sparse_moe_experts":
+        return 256
     return 64
 
 
@@ -533,7 +574,9 @@ def shader_float_token(value: float) -> str:
     return format(value, ".9g")
 
 
-def copy_shader_templates(source_dir: Path, dest_dir: Path, shader_files: set[str]) -> None:
+def copy_shader_templates(
+    source_dir: Path, dest_dir: Path, shader_files: set[str]
+) -> None:
     if dest_dir.exists():
         shutil.rmtree(dest_dir)
     dest_dir.mkdir(parents=True, exist_ok=True)
@@ -584,24 +627,24 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
             ("INPUT_SIZE", "OUTPUT_SIZE"),
         ),
         (
-            r"embedding_lookup_bf16_(\d+)x(\d+)\.comp",
+            r"embedding_lookup_bf16_(\d+)x(\d+)_scale([0-9eE+.-]+)\.comp",
             "embedding_lookup_bf16.comp.template",
-            ("VOCAB_SIZE", "HIDDEN_SIZE"),
+            ("VOCAB_SIZE", "HIDDEN_SIZE", "EMBEDDING_SCALE"),
         ),
         (
-            r"embedding_lookup_paired_bf16_(\d+)x(\d+)\.comp",
+            r"embedding_lookup_paired_bf16_(\d+)x(\d+)_scale([0-9eE+.-]+)\.comp",
             "embedding_lookup_paired_bf16.comp.template",
-            ("VOCAB_SIZE", "HIDDEN_SIZE"),
+            ("VOCAB_SIZE", "HIDDEN_SIZE", "EMBEDDING_SCALE"),
         ),
         (
-            r"tied_output_projection_bf16_(\d+)x(\d+)_to_f32\.comp",
+            r"tied_output_projection_bf16_(\d+)x(\d+)_scale([0-9eE+.-]+)_to_f32\.comp",
             "tied_output_projection_bf16.comp.template",
-            ("VOCAB_SIZE", "INPUT_SIZE"),
+            ("VOCAB_SIZE", "INPUT_SIZE", "OUTPUT_SCALE"),
         ),
         (
-            r"tied_output_projection_paired_bf16_(\d+)x(\d+)_to_f32\.comp",
+            r"tied_output_projection_paired_bf16_(\d+)x(\d+)_scale([0-9eE+.-]+)_to_f32\.comp",
             "tied_output_projection_paired_bf16.comp.template",
-            ("VOCAB_SIZE", "INPUT_SIZE"),
+            ("VOCAB_SIZE", "INPUT_SIZE", "OUTPUT_SCALE"),
         ),
         (
             r"rms_norm_bf16_h(\d+)_eps([0-9eE+.-]+)_offset([0-9eE+.-]+)\.comp",
@@ -648,6 +691,11 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
             "causal_conv1d_silu_bf16.comp.template",
             ("CHANNELS", "KERNEL_WIDTH"),
         ),
+        (
+            r"scaled_add_bf16_(\d+)_scale([0-9eE+.-]+)\.comp",
+            "scaled_add_bf16.comp.template",
+            ("ELEMENT_COUNT", "RESIDUAL_SCALE"),
+        ),
     )
     for pattern, template, names in shaped_templates:
         match = re.fullmatch(pattern, shader_file)
@@ -663,15 +711,18 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
                     )
             if "ROPE_LAYOUT" in replacements:
                 replacements["ROPE_INTERLEAVED"] = (
-                    "true" if replacements.pop("ROPE_LAYOUT") == "interleaved" else "false"
+                    "true"
+                    if replacements.pop("ROPE_LAYOUT") == "interleaved"
+                    else "false"
                 )
             return render_shader_template(source_dir, template, replacements)
 
     attention_shape = re.fullmatch(
-        r"gqa_attention_bf16_q(\d+)_kv(\d+)_d(\d+)\.comp", shader_file
+        r"gqa_attention_bf16_q(\d+)_kv(\d+)_d(\d+)_scale([0-9eE+.-]+)\.comp",
+        shader_file,
     )
     if attention_shape is not None:
-        query_heads, kv_heads, head_width = map(int, attention_shape.groups())
+        query_heads, kv_heads, head_width = map(int, attention_shape.groups()[:3])
         if query_heads % kv_heads != 0:
             raise ModelCompileError(
                 f"query head count {query_heads} is not divisible by KV head count {kv_heads}"
@@ -689,7 +740,7 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
                 "QUERY_GROUPS_PER_KV_HEAD": str(query_heads // kv_heads),
                 "HEAD_WIDTH": str(head_width),
                 "TILE_TOKENS": str(1024 // head_width),
-                "ATTENTION_SCALE": shader_float_token(head_width**-0.5),
+                "ATTENTION_SCALE": attention_shape.group(4),
             },
         )
 
@@ -722,6 +773,60 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
             },
         )
 
+    moe_topk_shape = re.fullmatch(r"moe_topk_bf16_e(\d+)_k(\d+)\.comp", shader_file)
+    if moe_topk_shape is not None:
+        num_experts, experts_per_token = map(int, moe_topk_shape.groups())
+        if not 0 < experts_per_token <= num_experts <= 64:
+            raise ModelCompileError(
+                f"invalid sparse expert routing e{num_experts} k{experts_per_token}"
+            )
+        return render_shader_template(
+            source_dir,
+            "moe_topk_bf16.comp.template",
+            {
+                "NUM_EXPERTS": str(num_experts),
+                "EXPERTS_PER_TOKEN": str(experts_per_token),
+            },
+        )
+
+    sparse_moe_shape = re.fullmatch(
+        r"sparse_moe_experts_bf16_h(\d+)_i(\d+)_e(\d+)_k(\d+)\.comp",
+        shader_file,
+    )
+    if sparse_moe_shape is not None:
+        hidden_size, intermediate_size, num_experts, experts_per_token = map(
+            int, sparse_moe_shape.groups()
+        )
+        if hidden_size % 2 or intermediate_size % 2:
+            raise ModelCompileError(
+                "packed BF16 sparse experts require even dimensions"
+            )
+        if not 0 < experts_per_token <= num_experts <= 64:
+            raise ModelCompileError(
+                f"invalid sparse expert routing e{num_experts} k{experts_per_token}"
+            )
+        return render_shader_template(
+            source_dir,
+            "sparse_moe_experts_bf16.comp.template",
+            {
+                "HIDDEN_SIZE": str(hidden_size),
+                "INTERMEDIATE_SIZE": str(intermediate_size),
+                "NUM_EXPERTS": str(num_experts),
+                "EXPERTS_PER_TOKEN": str(experts_per_token),
+            },
+        )
+
+    moe_reduce_shape = re.fullmatch(r"moe_reduce_bf16_h(\d+)_e(\d+)\.comp", shader_file)
+    if moe_reduce_shape is not None:
+        hidden_size, num_experts = map(int, moe_reduce_shape.groups())
+        return render_shader_template(
+            source_dir,
+            "moe_reduce_bf16.comp.template",
+            {
+                "HIDDEN_SIZE": str(hidden_size),
+                "NUM_EXPERTS": str(num_experts),
+            },
+        )
 
     raise ModelCompileError(f"missing shader source or template for {shader_file}")
 
@@ -752,7 +857,9 @@ def compile_shader_artifacts(shader_dir: Path) -> None:
 
     sources = sorted(shader_dir.glob("*.comp"))
     if not sources:
-        raise ModelCompileError(f"no Vulkan shader sources were rendered in {shader_dir}")
+        raise ModelCompileError(
+            f"no Vulkan shader sources were rendered in {shader_dir}"
+        )
     for source in sources:
         destination = source.with_suffix(".spv")
         completed = subprocess.run(
@@ -828,6 +935,15 @@ def copy_tokenizer_package(model_dir: Path, dest_dir: Path) -> Json:
             shutil.copy2(source, dest_dir / filename)
             copied_files.append(filename)
 
+    if "chat_template.jinja" not in copied_files:
+        tokenizer_config_path = model_dir / "tokenizer_config.json"
+        if tokenizer_config_path.is_file():
+            tokenizer_config = read_json(tokenizer_config_path)
+            inline_template = tokenizer_config.get("chat_template")
+            if isinstance(inline_template, str):
+                (dest_dir / "chat_template.jinja").write_text(inline_template)
+                copied_files.append("chat_template.jinja")
+
     return {
         "path": TOKENIZER_PACKAGE_DIR,
         "files": copied_files,
@@ -860,9 +976,7 @@ def referenced_tensor_index(
         model_graph["graph"]["input_transducer"]["params"]["weight"]["tensor"]
     }
     for component in model_graph["graph"]["output_transducer"]["components"]:
-        referenced.update(
-            ref["tensor"] for ref in component.get("params", {}).values()
-        )
+        referenced.update(ref["tensor"] for ref in component.get("params", {}).values())
     for circuit_ref in lowered_index["graph"]["circuits"]:
         circuit = read_json(lowered_dir / circuit_ref["circuit"])
         referenced.update(
@@ -976,7 +1090,10 @@ def write_compiled_tensor(
     source_header_bytes, _source_header = read_safetensors_header(source)
     source_start = 8 + source_header_bytes + int(info["data_offsets"][0])
 
-    with source.open("rb") as source_handle, destination.open("wb") as destination_handle:
+    with (
+        source.open("rb") as source_handle,
+        destination.open("wb") as destination_handle,
+    ):
         destination_handle.write(struct.pack("<Q", len(header_payload)))
         destination_handle.write(header_payload)
         source_handle.seek(source_start)
@@ -1012,7 +1129,9 @@ def write_bf16_row_pair_tensor(
         row_0 = source_handle.read(row_bytes)
         row_1 = source_handle.read(row_bytes)
         if len(row_0) != row_bytes or len(row_1) != row_bytes:
-            raise ModelCompileError("unexpected end of BF16 tensor while compiling row pairs")
+            raise ModelCompileError(
+                "unexpected end of BF16 tensor while compiling row pairs"
+            )
         words_0 = numpy.frombuffer(row_0, dtype="<u4", count=word_count)
         words_1 = numpy.frombuffer(row_1, dtype="<u4", count=word_count)
         paired = numpy.empty((word_count, 2), dtype="<u4")
@@ -1021,17 +1140,23 @@ def write_bf16_row_pair_tensor(
         destination_handle.write(paired.tobytes())
 
 
-def copy_exact_bytes(source_handle: Any, destination_handle: Any, byte_count: int) -> None:
+def copy_exact_bytes(
+    source_handle: Any, destination_handle: Any, byte_count: int
+) -> None:
     remaining = byte_count
     while remaining:
         chunk = source_handle.read(min(remaining, 8 * 1024 * 1024))
         if not chunk:
-            raise ModelCompileError("unexpected end of tensor source while compiling package")
+            raise ModelCompileError(
+                "unexpected end of tensor source while compiling package"
+            )
         destination_handle.write(chunk)
         remaining -= len(chunk)
 
 
-def parameter_shape_for_node(circuit: Json, node: Json, tensor_index: Json) -> list[int]:
+def parameter_shape_for_node(
+    circuit: Json, node: Json, tensor_index: Json
+) -> list[int]:
     parameter_id = node["params"][0]
     parameter = circuit["parameters"]["refs"][parameter_id]
     return tensor_shape(tensor_index, parameter["tensor"])
@@ -1080,5 +1205,7 @@ def dtype_byte_count(dtype: str) -> int:
 
 
 def compiled_model_slug(model_dir: Path) -> str:
-    digest = blake2s(str(model_dir.resolve()).encode("utf-8"), digest_size=4).hexdigest()
+    digest = blake2s(
+        str(model_dir.resolve()).encode("utf-8"), digest_size=4
+    ).hexdigest()
     return f"model_{digest}"

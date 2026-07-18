@@ -948,7 +948,11 @@ fn infer_node_output_shapes(
         "rms_norm" | "rms_norm_per_head" | "silu" | "rotary_position_embedding" => {
             Ok(repeat_shape(first_input_shape(node, signals), outputs))
         }
-        "multiply" | "residual_add" | "silu_multiply" | "sigmoid_multiply" => Ok(repeat_shape(
+        "multiply"
+        | "residual_add"
+        | "scaled_residual_add"
+        | "silu_multiply"
+        | "sigmoid_multiply" => Ok(repeat_shape(
             compatible_input_shape(pedal_id, node, signals)?,
             outputs,
         )),
@@ -978,6 +982,20 @@ fn infer_node_output_shapes(
             let output_shape = attr_usize(node, "value_heads")
                 .zip(attr_usize(node, "value_head_width"))
                 .map(|(heads, width)| vec![heads * width]);
+            Ok(repeat_shape(output_shape, outputs))
+        }
+        "moe_topk" => {
+            let output_shape = attr_usize(node, "num_experts").map(|experts| vec![experts]);
+            Ok(repeat_shape(output_shape, outputs))
+        }
+        "sparse_moe_experts" => {
+            let output_shape = attr_usize(node, "num_experts")
+                .zip(attr_usize(node, "hidden_size"))
+                .map(|(experts, hidden)| vec![experts, hidden]);
+            Ok(repeat_shape(output_shape, outputs))
+        }
+        "moe_reduce" => {
+            let output_shape = attr_usize(node, "hidden_size").map(|hidden| vec![hidden]);
             Ok(repeat_shape(output_shape, outputs))
         }
         "append_state_update" => unknown(),

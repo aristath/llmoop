@@ -444,6 +444,7 @@ impl RuntimeChatSession {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum RuntimeChatFormatter {
     ChatMl { bos_token: Option<String> },
+    RoleDelimited,
 }
 
 impl RuntimeChatFormatter {
@@ -462,9 +463,15 @@ impl RuntimeChatFormatter {
         if template.contains("<|im_start|>") && template.contains("<|im_end|>") {
             return Ok(Self::ChatMl { bos_token });
         }
+        if template.contains("<|start_of_role|>")
+            && template.contains("<|end_of_role|>")
+            && template.contains("<|end_of_text|>")
+        {
+            return Ok(Self::RoleDelimited);
+        }
         Err(Box::new(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "chat mode currently supports ChatML-style chat templates; this package has a different template shape",
+            "chat mode currently supports ChatML and role-delimited chat templates; this package has a different template shape",
         )))
     }
 
@@ -488,6 +495,20 @@ impl RuntimeChatFormatter {
                 }
                 if add_generation_prompt {
                     formatted.push_str("<|im_start|>assistant\n");
+                }
+                formatted
+            }
+            Self::RoleDelimited => {
+                let mut formatted = String::new();
+                for message in messages {
+                    formatted.push_str("<|start_of_role|>");
+                    formatted.push_str(&message.role);
+                    formatted.push_str("<|end_of_role|>");
+                    formatted.push_str(&message.content);
+                    formatted.push_str("<|end_of_text|>\n");
+                }
+                if add_generation_prompt {
+                    formatted.push_str("<|start_of_role|>assistant<|end_of_role|>");
                 }
                 formatted
             }

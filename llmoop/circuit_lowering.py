@@ -117,7 +117,7 @@ def build_conv_circuit(pedal: Json, pedal_path: Path) -> Json:
         behavioral_role="source_reference_circuit",
         implementation="reference_shortconv_layer_circuit_v1",
         circuit_id=f"{pedal['id']}_shortconv_circuit_v1",
-        nodes=_conv_nodes(hidden_size, pedal["numerics"]),
+        nodes=_conv_nodes(hidden_size, pedal["numerics"], pedal["feed_forward"]),
         behavioral_notes=(
             "This circuit preserves the source short-convolution layer decomposition.",
             "It is a structural lowering artifact; a backend may replace this source pedal with an executable implementation.",
@@ -139,6 +139,7 @@ def build_attention_circuit(pedal: Json, pedal_path: Path) -> Json:
             pedal["numerics"],
             has_q_norm="q_norm" in parameters,
             has_k_norm="k_norm" in parameters,
+            feed_forward=pedal["feed_forward"],
         ),
         behavioral_notes=(
             "This circuit preserves the source grouped-query attention layer decomposition.",
@@ -155,7 +156,7 @@ def build_gated_delta_circuit(pedal: Json, pedal_path: Path) -> Json:
         behavioral_role="source_reference_circuit",
         implementation="reference_gated_delta_layer_circuit_v1",
         circuit_id=f"{pedal['id']}_gated_delta_circuit_v1",
-        nodes=_gated_delta_nodes(dimensions, pedal["numerics"]),
+        nodes=_gated_delta_nodes(dimensions, pedal["numerics"], pedal["feed_forward"]),
         behavioral_notes=(
             "This circuit preserves a recurrent gated-delta token mixer with fixed per-stream state.",
             "The recurrent matrix is transient pedal-owned DSP state, not a global cache.",
@@ -225,7 +226,10 @@ def _base_circuit(
             ],
             "controls": pedal["ports"].get("controls", []),
         },
-        "state_ports": [_state_port_for_circuit(port, operator_type) for port in pedal.get("state_ports", [])],
+        "state_ports": [
+            _state_port_for_circuit(port, operator_type)
+            for port in pedal.get("state_ports", [])
+        ],
         "parameters": {
             "layout": pedal["parameter_block"]["layout"],
             "storage": pedal["parameter_block"]["storage"],
@@ -249,7 +253,7 @@ def _base_circuit(
     }
 
 
-def _conv_nodes(hidden_size: int, numerics: Json) -> list[Json]:
+def _conv_nodes(hidden_size: int, numerics: Json, feed_forward: Json) -> list[Json]:
     return [
         {
             "id": "operator_norm",
@@ -315,8 +319,8 @@ def _conv_nodes(hidden_size: int, numerics: Json) -> list[Json]:
         },
         *_ffn_tail(
             operator_output="operator_out",
-            norm_eps=float(numerics["rms_norm_eps"]),
-            norm_weight_offset=float(numerics["rms_norm_weight_offset"]),
+            numerics=numerics,
+            feed_forward=feed_forward,
         ),
     ]
 
@@ -327,6 +331,7 @@ def _attention_nodes(
     *,
     has_q_norm: bool,
     has_k_norm: bool,
+    feed_forward: Json,
 ) -> list[Json]:
     nodes = [
         {
@@ -341,7 +346,11 @@ def _attention_nodes(
             "id": "q_projection",
             "op": "linear",
             "inputs": ["operator_norm_out"],
-            "outputs": ["q_and_gate_projected" if numerics.get("attention_output_gate") else "q_projected"],
+            "outputs": [
+                "q_and_gate_projected"
+                if numerics.get("attention_output_gate")
+                else "q_projected"
+            ],
             "params": ["q_projection"],
         },
         {
@@ -414,46 +423,50 @@ def _attention_nodes(
     }
     attention_tail: list[Json] = [
         {
-                "id": "q_rope",
-                "op": "rotary_position_embedding",
-                "inputs": [q_rope_input],
-                "outputs": ["q_positioned"],
-                "attrs": rope_attrs,
+            "id": "q_rope",
+            "op": "rotary_position_embedding",
+            "inputs": [q_rope_input],
+            "outputs": ["q_positioned"],
+            "attrs": rope_attrs,
         },
         {
-                "id": "k_rope",
-                "op": "rotary_position_embedding",
-                "inputs": [k_rope_input],
-                "outputs": ["k_positioned"],
-                "attrs": rope_attrs,
+            "id": "k_rope",
+            "op": "rotary_position_embedding",
+            "inputs": [k_rope_input],
+            "outputs": ["k_positioned"],
+            "attrs": rope_attrs,
         },
         {
-                "id": "kv_memory_append",
-                "op": "append_state_update",
-                "inputs": ["k_positioned", "v_projected", "kv_memory"],
-                "outputs": ["k_memory", "v_memory"],
-                "state_reads": ["kv_memory"],
-                "state_writes": ["kv_memory"],
-                "attrs": {"growth": "per_activation", **heads},
+            "id": "kv_memory_append",
+            "op": "append_state_update",
+            "inputs": ["k_positioned", "v_projected", "kv_memory"],
+            "outputs": ["k_memory", "v_memory"],
+            "state_reads": ["kv_memory"],
+            "state_writes": ["kv_memory"],
+            "attrs": {"growth": "per_activation", **heads},
         },
         {
-                "id": "attention_read",
-                "op": "scaled_dot_product_attention",
-                "inputs": ["q_positioned", "k_memory", "v_memory"],
-                "outputs": ["attention_out"],
-                "attrs": {"causal": True, **heads},
+            "id": "attention_read",
+            "op": "scaled_dot_product_attention",
+            "inputs": ["q_positioned", "k_memory", "v_memory"],
+            "outputs": ["attention_out"],
+            "attrs": {
+                "causal": True,
+                "scale": float(numerics["attention_scale"]),
+                **heads,
+            },
         },
         {
-                "id": "attention_out_projection",
-                "op": "linear",
-                "inputs": ["attention_gated" if attention_gate else "attention_out"],
-                "outputs": ["operator_out"],
-                "params": ["attention_out_projection"],
+            "id": "attention_out_projection",
+            "op": "linear",
+            "inputs": ["attention_gated" if attention_gate else "attention_out"],
+            "outputs": ["operator_out"],
+            "params": ["attention_out_projection"],
         },
         *_ffn_tail(
             operator_output="operator_out",
-            norm_eps=float(numerics["rms_norm_eps"]),
-            norm_weight_offset=float(numerics["rms_norm_weight_offset"]),
+            numerics=numerics,
+            feed_forward=feed_forward,
         ),
     ]
     if attention_gate:
@@ -470,7 +483,9 @@ def _attention_nodes(
     return nodes
 
 
-def _gated_delta_nodes(dimensions: Json, numerics: Json) -> list[Json]:
+def _gated_delta_nodes(
+    dimensions: Json, numerics: Json, feed_forward: Json
+) -> list[Json]:
     key_width = int(dimensions["key_heads"]) * int(dimensions["key_head_width"])
     value_width = int(dimensions["value_heads"]) * int(dimensions["value_head_width"])
     conv_width = key_width * 2 + value_width
@@ -549,70 +564,135 @@ def _gated_delta_nodes(dimensions: Json, numerics: Json) -> list[Json]:
         },
         *_ffn_tail(
             operator_output="operator_out",
-            norm_eps=float(numerics["rms_norm_eps"]),
-            norm_weight_offset=float(numerics["rms_norm_weight_offset"]),
+            numerics=numerics,
+            feed_forward=feed_forward,
         ),
     ]
 
 
-def _ffn_tail(
-    operator_output: str, norm_eps: float, norm_weight_offset: float
-) -> list[Json]:
-    return [
-        {
-            "id": "operator_residual",
-            "op": "residual_add",
-            "inputs": ["input_frame", operator_output],
-            "outputs": ["operator_residual_out"],
-        },
+def _ffn_tail(operator_output: str, numerics: Json, feed_forward: Json) -> list[Json]:
+    residual_scale = float(numerics["residual_scale"])
+    prefix = [
+        _residual_node(
+            node_id="operator_residual",
+            residual="input_frame",
+            update=operator_output,
+            output="operator_residual_out",
+            scale=residual_scale,
+        ),
         {
             "id": "ffn_norm",
             "op": "rms_norm",
             "inputs": ["operator_residual_out"],
             "outputs": ["ffn_norm_out"],
             "params": ["ffn_norm"],
-            "attrs": {"eps": norm_eps, "weight_offset": norm_weight_offset},
-        },
-        {
-            "id": "ffn_gate_projection",
-            "op": "linear",
-            "inputs": ["ffn_norm_out"],
-            "outputs": ["ffn_gate"],
-            "params": ["ffn_gate"],
-        },
-        {
-            "id": "ffn_up_projection",
-            "op": "linear",
-            "inputs": ["ffn_norm_out"],
-            "outputs": ["ffn_up"],
-            "params": ["ffn_up"],
-        },
-        {
-            "id": "ffn_gate_activation",
-            "op": "silu",
-            "inputs": ["ffn_gate"],
-            "outputs": ["ffn_gate_activated"],
-        },
-        {
-            "id": "ffn_gate_multiply",
-            "op": "multiply",
-            "inputs": ["ffn_gate_activated", "ffn_up"],
-            "outputs": ["ffn_hidden"],
-        },
-        {
-            "id": "ffn_down_projection",
-            "op": "linear",
-            "inputs": ["ffn_hidden"],
-            "outputs": ["ffn_out"],
-            "params": ["ffn_down"],
-        },
-        {
-            "id": "ffn_residual",
-            "op": "residual_add",
-            "inputs": ["operator_residual_out", "ffn_out"],
-            "outputs": ["output_frame"],
+            "attrs": _norm_attrs(numerics),
         },
     ]
+    if feed_forward["type"] == "sparse_moe":
+        body = [
+            {
+                "id": "moe_router_projection",
+                "op": "linear",
+                "inputs": ["ffn_norm_out"],
+                "outputs": ["moe_router_logits"],
+                "params": ["moe_router"],
+            },
+            {
+                "id": "moe_topk",
+                "op": "moe_topk",
+                "inputs": ["moe_router_logits"],
+                "outputs": ["moe_routing_weights"],
+                "attrs": {
+                    "num_experts": int(feed_forward["num_experts"]),
+                    "experts_per_token": int(feed_forward["experts_per_token"]),
+                },
+            },
+            {
+                "id": "sparse_moe_experts",
+                "op": "sparse_moe_experts",
+                "inputs": ["ffn_norm_out", "moe_routing_weights"],
+                "outputs": ["moe_expert_outputs"],
+                "params": ["moe_input", "moe_output"],
+                "attrs": {
+                    "hidden_size": int(feed_forward.get("hidden_size", 0)),
+                    "intermediate_size": int(feed_forward["intermediate_size"]),
+                    "num_experts": int(feed_forward["num_experts"]),
+                    "experts_per_token": int(feed_forward["experts_per_token"]),
+                },
+            },
+            {
+                "id": "moe_reduce",
+                "op": "moe_reduce",
+                "inputs": ["moe_expert_outputs"],
+                "outputs": ["ffn_out"],
+                "attrs": {
+                    "hidden_size": int(feed_forward["hidden_size"]),
+                    "num_experts": int(feed_forward["num_experts"]),
+                },
+            },
+        ]
+    else:
+        body = [
+            {
+                "id": "ffn_gate_projection",
+                "op": "linear",
+                "inputs": ["ffn_norm_out"],
+                "outputs": ["ffn_gate"],
+                "params": ["ffn_gate"],
+            },
+            {
+                "id": "ffn_up_projection",
+                "op": "linear",
+                "inputs": ["ffn_norm_out"],
+                "outputs": ["ffn_up"],
+                "params": ["ffn_up"],
+            },
+            {
+                "id": "ffn_gate_activation",
+                "op": "silu",
+                "inputs": ["ffn_gate"],
+                "outputs": ["ffn_gate_activated"],
+            },
+            {
+                "id": "ffn_gate_multiply",
+                "op": "multiply",
+                "inputs": ["ffn_gate_activated", "ffn_up"],
+                "outputs": ["ffn_hidden"],
+            },
+            {
+                "id": "ffn_down_projection",
+                "op": "linear",
+                "inputs": ["ffn_hidden"],
+                "outputs": ["ffn_out"],
+                "params": ["ffn_down"],
+            },
+        ]
+    return [
+        *prefix,
+        *body,
+        _residual_node(
+            node_id="ffn_residual",
+            residual="operator_residual_out",
+            update="ffn_out",
+            output="output_frame",
+            scale=residual_scale,
+        ),
+    ]
+
+
+def _residual_node(
+    *, node_id: str, residual: str, update: str, output: str, scale: float
+) -> Json:
+    node: Json = {
+        "id": node_id,
+        "op": "residual_add" if scale == 1.0 else "scaled_residual_add",
+        "inputs": [residual, update],
+        "outputs": [output],
+    }
+    if scale != 1.0:
+        node["attrs"] = {"scale": scale}
+    return node
 
 
 def _attention_heads_from_state(pedal: Json) -> Json:
@@ -638,7 +718,10 @@ def _state_port_for_circuit(port: Json, operator_type: str) -> Json:
         state.setdefault("layout", "append_only_kv")
         state.setdefault("source_layout", "batch_kvheads_seq_headdim")
     elif operator_type == "gated_delta":
-        state.setdefault("layout", "channel_time" if state["id"] == "conv_state" else "head_key_value")
+        state.setdefault(
+            "layout",
+            "channel_time" if state["id"] == "conv_state" else "head_key_value",
+        )
         state.setdefault("source_layout", state["layout"])
     return state
 
@@ -656,6 +739,9 @@ def _param_role(name: str) -> str:
         "ffn_gate": "feed_forward_swiglu_gate_projection",
         "ffn_down": "feed_forward_down_projection",
         "ffn_up": "feed_forward_up_projection",
+        "moe_router": "mixture_of_experts_router_projection",
+        "moe_input": "mixture_of_experts_gate_up_weights",
+        "moe_output": "mixture_of_experts_down_weights",
         "conv_in_projection": "short_convolution_input_projection",
         "conv_depthwise_kernel": "short_convolution_depthwise_temporal_kernel",
         "conv_out_projection": "short_convolution_output_projection",

@@ -1,0 +1,42 @@
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer ExpertOutputs {
+    uint words[];
+} expert_outputs;
+
+layout(set = 0, binding = 1) buffer OutputFrame {
+    uint words[];
+} output_frame;
+
+const uint HIDDEN_SIZE = {{HIDDEN_SIZE}}u;
+const uint NUM_EXPERTS = {{NUM_EXPERTS}}u;
+const uint HIDDEN_WORDS = HIDDEN_SIZE / 2u;
+
+float bf16_to_f32(uint value) {
+    return uintBitsToFloat((value & 0xffffu) << 16);
+}
+
+uint f32_to_bf16(float value) {
+    uint bits = floatBitsToUint(value);
+    uint lsb = (bits >> 16) & 1u;
+    return (bits + 0x7fffu + lsb) >> 16;
+}
+
+float add_bf16(float left, float right) {
+    return bf16_to_f32(f32_to_bf16(left + right));
+}
+
+void main() {
+    for (uint word = gl_LocalInvocationID.x; word < HIDDEN_WORDS; word += 64u) {
+        float lo = 0.0;
+        float hi = 0.0;
+        for (uint expert = 0u; expert < NUM_EXPERTS; expert++) {
+            uint contribution = expert_outputs.words[expert * HIDDEN_WORDS + word];
+            lo = add_bf16(lo, bf16_to_f32(contribution));
+            hi = add_bf16(hi, bf16_to_f32(contribution >> 16));
+        }
+        output_frame.words[word] = (f32_to_bf16(hi) << 16) | f32_to_bf16(lo);
+    }
+}

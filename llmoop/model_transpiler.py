@@ -23,6 +23,7 @@ class LayerStructure:
     index: int
     prefix: str
     operator_type: str
+    feed_forward_type: str
     tensors: dict[str, str]
 
 
@@ -47,6 +48,12 @@ class ModelStructure:
     rope_theta: float
     rope_interleaved: bool
     rms_norm_weight_offset: float
+    embedding_scale: float
+    residual_scale: float
+    attention_scale: float
+    logits_scale: float
+    num_experts: int | None
+    experts_per_token: int | None
     recurrent_mixer: Json | None
     token_ids: Json
     tensors: dict[str, str]
@@ -104,6 +111,19 @@ FFN_UP_SUFFIXES = (
     "feed_forward.up_proj.weight",
 )
 
+MOE_INPUT_SUFFIXES = (
+    "block_sparse_moe.input_linear.weight",
+    "block_sparse_moe.experts.gate_up_proj",
+)
+MOE_OUTPUT_SUFFIXES = (
+    "block_sparse_moe.output_linear.weight",
+    "block_sparse_moe.experts.down_proj",
+)
+MOE_ROUTER_SUFFIXES = (
+    "block_sparse_moe.router.layer.weight",
+    "block_sparse_moe.gate.weight",
+)
+
 CONV_IN_PROJECTION_SUFFIXES = ("conv.in_proj.weight",)
 CONV_KERNEL_SUFFIXES = ("conv.conv.weight", "conv.depthwise.weight")
 CONV_OUT_PROJECTION_SUFFIXES = ("conv.out_proj.weight",)
@@ -136,7 +156,9 @@ LAYER_ROOT_PATTERNS = (
 )
 
 
-def transpile_model(model_dir: Path, output_dir: Path, *, clean: bool) -> ModelStructure:
+def transpile_model(
+    model_dir: Path, output_dir: Path, *, clean: bool
+) -> ModelStructure:
     model_dir = model_dir.expanduser()
     config = read_json(model_dir / "config.json")
     tensor_index = make_tensor_index(model_dir)
@@ -147,7 +169,9 @@ def transpile_model(model_dir: Path, output_dir: Path, *, clean: bool) -> ModelS
     output_dir.mkdir(parents=True, exist_ok=True)
 
     write_json(output_dir / "tensors.json", tensor_index)
-    write_json(output_dir / "model.json", make_model_graph(structure, output_dir, tensor_index))
+    write_json(
+        output_dir / "model.json", make_model_graph(structure, output_dir, tensor_index)
+    )
 
     for layer in structure.layers:
         write_json(
@@ -176,10 +200,13 @@ def discover_model_structure(
         (f"{model_prefix}.norm.weight", *OUTPUT_NORM_CANDIDATES),
         role="output norm",
     )
-    output_projection = find_first_existing_tensor(
-        tensors,
-        (f"{model_prefix}.lm_head.weight", *OUTPUT_PROJECTION_CANDIDATES),
-    ) or token_embedding
+    output_projection = (
+        find_first_existing_tensor(
+            tensors,
+            (f"{model_prefix}.lm_head.weight", *OUTPUT_PROJECTION_CANDIDATES),
+        )
+        or token_embedding
+    )
 
     hidden_size = int(
         decoder_config.get("hidden_size") or tensors[token_embedding]["shape"][1]
@@ -237,6 +264,22 @@ def discover_model_structure(
         recurrent_mixer=recurrent_mixer,
         attention_output_gate=attention_output_gate,
     )
+    has_sparse_experts = any(
+        layer.feed_forward_type == "sparse_moe" for layer in layers
+    )
+    if has_sparse_experts:
+        num_experts = discover_int_config(
+            decoder_config, "num_local_experts", "num_experts", role="number of experts"
+        )
+        experts_per_token = discover_int_config(
+            decoder_config,
+            "num_experts_per_tok",
+            "experts_per_token",
+            role="experts per token",
+        )
+    else:
+        num_experts = None
+        experts_per_token = None
 
     return ModelStructure(
         model_dir=model_dir,
@@ -263,6 +306,14 @@ def discover_model_structure(
         rope_theta=discover_rope_theta(decoder_config),
         rope_interleaved=bool(decoder_config.get("rope_interleaved", False)),
         rms_norm_weight_offset=rms_norm_weight_offset,
+        embedding_scale=float(decoder_config.get("embedding_multiplier", 1.0)),
+        residual_scale=float(decoder_config.get("residual_multiplier", 1.0)),
+        attention_scale=float(
+            decoder_config.get("attention_multiplier", head_width**-0.5)
+        ),
+        logits_scale=float(decoder_config.get("logits_scaling", 1.0)),
+        num_experts=num_experts,
+        experts_per_token=experts_per_token,
         recurrent_mixer=recurrent_mixer,
         token_ids={
             "bos": decoder_config.get("bos_token_id"),
@@ -287,12 +338,54 @@ def discover_layer_structure(
 ) -> LayerStructure:
     prefix = f"{layer_root}.{layer_index}"
     layer_tensors = {
-        "operator_norm": find_layer_tensor(tensors, prefix, OPERATOR_NORM_SUFFIXES, role="operator norm"),
-        "ffn_norm": find_layer_tensor(tensors, prefix, FFN_NORM_SUFFIXES, role="feed-forward norm"),
-        "ffn_gate": find_layer_tensor(tensors, prefix, FFN_GATE_SUFFIXES, role="feed-forward gate projection"),
-        "ffn_down": find_layer_tensor(tensors, prefix, FFN_DOWN_SUFFIXES, role="feed-forward down projection"),
-        "ffn_up": find_layer_tensor(tensors, prefix, FFN_UP_SUFFIXES, role="feed-forward up projection"),
+        "operator_norm": find_layer_tensor(
+            tensors, prefix, OPERATOR_NORM_SUFFIXES, role="operator norm"
+        ),
+        "ffn_norm": find_layer_tensor(
+            tensors, prefix, FFN_NORM_SUFFIXES, role="feed-forward norm"
+        ),
     }
+    dense_gate = find_optional_layer_tensor(tensors, prefix, FFN_GATE_SUFFIXES)
+    moe_input = find_optional_layer_tensor(tensors, prefix, MOE_INPUT_SUFFIXES)
+    if dense_gate is not None:
+        feed_forward_type = "dense_swiglu"
+        layer_tensors.update(
+            {
+                "ffn_gate": dense_gate,
+                "ffn_down": find_layer_tensor(
+                    tensors,
+                    prefix,
+                    FFN_DOWN_SUFFIXES,
+                    role="feed-forward down projection",
+                ),
+                "ffn_up": find_layer_tensor(
+                    tensors, prefix, FFN_UP_SUFFIXES, role="feed-forward up projection"
+                ),
+            }
+        )
+    elif moe_input is not None:
+        feed_forward_type = "sparse_moe"
+        layer_tensors.update(
+            {
+                "moe_input": moe_input,
+                "moe_output": find_layer_tensor(
+                    tensors,
+                    prefix,
+                    MOE_OUTPUT_SUFFIXES,
+                    role="expert output projection",
+                ),
+                "moe_router": find_layer_tensor(
+                    tensors,
+                    prefix,
+                    MOE_ROUTER_SUFFIXES,
+                    role="expert router projection",
+                ),
+            }
+        )
+    else:
+        raise ModelTranspileError(
+            f"could not discover feed-forward structure for layer prefix {prefix!r}"
+        )
 
     configured = configured_layer_types[layer_index] if configured_layer_types else None
     if configured in ("conv", "short_conv"):
@@ -370,53 +463,91 @@ def discover_layer_structure(
         layer_tensors.update(
             {
                 "delta_qkv_projection": find_layer_tensor(
-                    tensors, prefix, GATED_DELTA_QKV_SUFFIXES, role="gated-delta QKV projection"
+                    tensors,
+                    prefix,
+                    GATED_DELTA_QKV_SUFFIXES,
+                    role="gated-delta QKV projection",
                 ),
                 "delta_z_projection": find_layer_tensor(
-                    tensors, prefix, GATED_DELTA_Z_SUFFIXES, role="gated-delta output gate projection"
+                    tensors,
+                    prefix,
+                    GATED_DELTA_Z_SUFFIXES,
+                    role="gated-delta output gate projection",
                 ),
                 "delta_b_projection": find_layer_tensor(
-                    tensors, prefix, GATED_DELTA_B_SUFFIXES, role="gated-delta beta projection"
+                    tensors,
+                    prefix,
+                    GATED_DELTA_B_SUFFIXES,
+                    role="gated-delta beta projection",
                 ),
                 "delta_a_projection": find_layer_tensor(
-                    tensors, prefix, GATED_DELTA_A_SUFFIXES, role="gated-delta decay projection"
+                    tensors,
+                    prefix,
+                    GATED_DELTA_A_SUFFIXES,
+                    role="gated-delta decay projection",
                 ),
                 "delta_conv_kernel": find_layer_tensor(
-                    tensors, prefix, GATED_DELTA_CONV_SUFFIXES, role="gated-delta convolution kernel"
+                    tensors,
+                    prefix,
+                    GATED_DELTA_CONV_SUFFIXES,
+                    role="gated-delta convolution kernel",
                 ),
                 "delta_a_log": find_layer_tensor(
-                    tensors, prefix, GATED_DELTA_A_LOG_SUFFIXES, role="gated-delta decay parameter"
+                    tensors,
+                    prefix,
+                    GATED_DELTA_A_LOG_SUFFIXES,
+                    role="gated-delta decay parameter",
                 ),
                 "delta_dt_bias": find_layer_tensor(
-                    tensors, prefix, GATED_DELTA_DT_BIAS_SUFFIXES, role="gated-delta time bias"
+                    tensors,
+                    prefix,
+                    GATED_DELTA_DT_BIAS_SUFFIXES,
+                    role="gated-delta time bias",
                 ),
                 "delta_norm": find_layer_tensor(
-                    tensors, prefix, GATED_DELTA_NORM_SUFFIXES, role="gated-delta output norm"
+                    tensors,
+                    prefix,
+                    GATED_DELTA_NORM_SUFFIXES,
+                    role="gated-delta output norm",
                 ),
                 "delta_out_projection": find_layer_tensor(
-                    tensors, prefix, GATED_DELTA_OUT_SUFFIXES, role="gated-delta output projection"
+                    tensors,
+                    prefix,
+                    GATED_DELTA_OUT_SUFFIXES,
+                    role="gated-delta output projection",
                 ),
             }
         )
     else:
-        raise ModelTranspileError(f"unsupported operator type {operator_type!r} for layer {layer_index}")
+        raise ModelTranspileError(
+            f"unsupported operator type {operator_type!r} for layer {layer_index}"
+        )
 
     return LayerStructure(
         index=layer_index,
         prefix=prefix,
         operator_type=operator_type,
+        feed_forward_type=feed_forward_type,
         tensors=layer_tensors,
     )
 
 
 def infer_operator_type(tensors: dict[str, Json], prefix: str) -> str:
-    if find_first_existing_tensor(tensors, (f"{prefix}.{suffix}" for suffix in CONV_IN_PROJECTION_SUFFIXES)):
+    if find_first_existing_tensor(
+        tensors, (f"{prefix}.{suffix}" for suffix in CONV_IN_PROJECTION_SUFFIXES)
+    ):
         return "conv"
-    if find_first_existing_tensor(tensors, (f"{prefix}.{suffix}" for suffix in ATTENTION_Q_PROJECTION_SUFFIXES)):
+    if find_first_existing_tensor(
+        tensors, (f"{prefix}.{suffix}" for suffix in ATTENTION_Q_PROJECTION_SUFFIXES)
+    ):
         return "full_attention"
-    if find_first_existing_tensor(tensors, (f"{prefix}.{suffix}" for suffix in GATED_DELTA_QKV_SUFFIXES)):
+    if find_first_existing_tensor(
+        tensors, (f"{prefix}.{suffix}" for suffix in GATED_DELTA_QKV_SUFFIXES)
+    ):
         return "gated_delta"
-    raise ModelTranspileError(f"could not infer operator type for layer prefix {prefix!r}")
+    raise ModelTranspileError(
+        f"could not infer operator type for layer prefix {prefix!r}"
+    )
 
 
 def discover_layer_root(tensors: dict[str, Json]) -> tuple[str, tuple[int, ...]]:
@@ -432,7 +563,9 @@ def discover_layer_root(tensors: dict[str, Json]) -> tuple[str, tuple[int, ...]]
                 root_indices.setdefault(root, set()).add(index)
                 break
     if not roots:
-        raise ModelTranspileError("could not discover a repeated decoder-layer root in checkpoint tensors")
+        raise ModelTranspileError(
+            "could not discover a repeated decoder-layer root in checkpoint tensors"
+        )
     root = roots.most_common(1)[0][0]
     return root, tuple(sorted(root_indices[root]))
 
@@ -498,7 +631,9 @@ def discover_attention_output_gate(
     return False
 
 
-def discover_recurrent_mixer(config: Json, layers: tuple[LayerStructure, ...]) -> Json | None:
+def discover_recurrent_mixer(
+    config: Json, layers: tuple[LayerStructure, ...]
+) -> Json | None:
     if not any(layer.operator_type == "gated_delta" for layer in layers):
         return None
     keys = (
@@ -519,7 +654,9 @@ def discover_recurrent_mixer(config: Json, layers: tuple[LayerStructure, ...]) -
         "key_heads": int(config["linear_num_key_heads"]),
         "value_heads": int(config["linear_num_value_heads"]),
         "value_head_width": int(config["linear_value_head_dim"]),
-        "state_dtype": str(config.get("mamba_ssm_dtype", "float32")).upper().replace("FLOAT", "F"),
+        "state_dtype": str(config.get("mamba_ssm_dtype", "float32"))
+        .upper()
+        .replace("FLOAT", "F"),
     }
 
 
@@ -532,7 +669,9 @@ def discover_outer_norm_weight_offset(
     return 1.0 if recurrent_mixer is not None and attention_output_gate else 0.0
 
 
-def discover_intermediate_size(config: Json, tensors: dict[str, Json], layers: tuple[LayerStructure, ...]) -> int:
+def discover_intermediate_size(
+    config: Json, tensors: dict[str, Json], layers: tuple[LayerStructure, ...]
+) -> int:
     if "intermediate_size" in config:
         return int(config["intermediate_size"])
     if "ffn_hidden_size" in config:
@@ -541,7 +680,9 @@ def discover_intermediate_size(config: Json, tensors: dict[str, Json], layers: t
     return int(first_gate[0])
 
 
-def discover_conv_l_cache(config: Json, tensors: dict[str, Json], layers: tuple[LayerStructure, ...]) -> int:
+def discover_conv_l_cache(
+    config: Json, tensors: dict[str, Json], layers: tuple[LayerStructure, ...]
+) -> int:
     for key in ("conv_L_cache", "conv_l_cache", "short_conv_kernel_size"):
         if key in config:
             return int(config[key])
@@ -592,8 +733,9 @@ def make_layer(structure: ModelStructure, layer: LayerStructure) -> Json:
         "id": f"layer_{layer.index:02d}",
         "source_layer_index": layer.index,
         "type": "pedal_instance",
-        "pedal_class": make_pedal_class(structure, layer.operator_type),
+        "pedal_class": make_pedal_class(structure, layer),
         "operator_type": layer.operator_type,
+        "feed_forward": make_feed_forward_descriptor(structure, layer),
         "numerics": {
             "rms_norm_eps": structure.norm_eps,
             "rope_theta": structure.rope_theta,
@@ -601,6 +743,8 @@ def make_layer(structure: ModelStructure, layer: LayerStructure) -> Json:
             "rotary_width": structure.rotary_width,
             "rms_norm_weight_offset": structure.rms_norm_weight_offset,
             "attention_output_gate": structure.attention_output_gate,
+            "residual_scale": structure.residual_scale,
+            "attention_scale": structure.attention_scale,
         },
         "ports": {
             "inputs": [{"id": "input", "signal": "frame", "shape": [hidden_size]}],
@@ -608,7 +752,9 @@ def make_layer(structure: ModelStructure, layer: LayerStructure) -> Json:
             "controls": [{"id": "control", "type": "pedal_control", "optional": True}],
         },
         "state_ports": make_state_ports(structure, layer.operator_type),
-        "parameter_block": make_parameter_block(layer.operator_type, layer.tensors),
+        "parameter_block": make_parameter_block(
+            layer.operator_type, layer.feed_forward_type, layer.tensors
+        ),
         "transition_contract": {
             "type": "stateful_frame_transform",
             "equation": "(output_frame, next_state, events) = pedal(input_frame, state, params, control)",
@@ -620,17 +766,21 @@ def make_layer(structure: ModelStructure, layer: LayerStructure) -> Json:
             "compiler_may_fuse_internal_operations": True,
             "compiler_may_replace_reference_decomposition": True,
         },
-        "reference_decomposition": make_reference_decomposition(structure, layer, operator),
+        "reference_decomposition": make_reference_decomposition(
+            structure, layer, operator
+        ),
         "tensor_refs": tensor_refs,
     }
 
 
-def make_model_graph(structure: ModelStructure, output_dir: Path, tensor_index: Json) -> Json:
+def make_model_graph(
+    structure: ModelStructure, output_dir: Path, tensor_index: Json
+) -> Json:
     pedals = [
         {
             "id": f"layer_{layer.index:02d}",
             "type": "pedal_instance",
-            "pedal_class": make_pedal_class(structure, layer.operator_type),
+            "pedal_class": make_pedal_class(structure, layer),
             "operator_type": layer.operator_type,
             "file": f"layers/layer_{layer.index:02d}.json",
         }
@@ -640,6 +790,7 @@ def make_model_graph(structure: ModelStructure, output_dir: Path, tensor_index: 
     output_projection = {
         "id": "output_projection",
         "type": "linear_projection",
+        "attrs": {"scale": 1.0 / structure.logits_scale},
         "params": {"weight": tensor_ref(structure.tensors["output_projection"])},
     }
     if structure.tensors["output_projection"] == structure.tensors["token_embedding"]:
@@ -665,12 +816,18 @@ def make_model_graph(structure: ModelStructure, output_dir: Path, tensor_index: 
             "conv_l_cache": structure.conv_l_cache,
             "vocab_size": structure.vocab_size,
             "max_position_embeddings": structure.max_position_embeddings,
+            "num_experts": structure.num_experts,
+            "experts_per_token": structure.experts_per_token,
         },
         "numerics": {
             "rms_norm_eps": structure.norm_eps,
             "rope_theta": structure.rope_theta,
             "rope_interleaved": structure.rope_interleaved,
             "rms_norm_weight_offset": structure.rms_norm_weight_offset,
+            "embedding_scale": structure.embedding_scale,
+            "residual_scale": structure.residual_scale,
+            "attention_scale": structure.attention_scale,
+            "logits_scale": structure.logits_scale,
         },
         "token_ids": structure.token_ids,
         "files": {
@@ -682,6 +839,7 @@ def make_model_graph(structure: ModelStructure, output_dir: Path, tensor_index: 
                 "id": "token_embedding",
                 "type": "embedding_lookup",
                 "output": "stream_frame",
+                "attrs": {"scale": structure.embedding_scale},
                 "params": {"weight": tensor_ref(structure.tensors["token_embedding"])},
             },
             "pedalboard": {
@@ -697,7 +855,9 @@ def make_model_graph(structure: ModelStructure, output_dir: Path, tensor_index: 
                             "eps": structure.norm_eps,
                             "weight_offset": structure.rms_norm_weight_offset,
                         },
-                        "params": {"weight": tensor_ref(structure.tensors["output_norm"])},
+                        "params": {
+                            "weight": tensor_ref(structure.tensors["output_norm"])
+                        },
                     },
                     output_projection,
                 ]
@@ -712,6 +872,24 @@ def make_model_graph(structure: ModelStructure, output_dir: Path, tensor_index: 
         },
         "output_dir": str(output_dir),
     }
+
+
+def make_feed_forward_descriptor(
+    structure: ModelStructure, layer: LayerStructure
+) -> Json:
+    descriptor: Json = {
+        "type": layer.feed_forward_type,
+        "hidden_size": structure.hidden_size,
+        "intermediate_size": structure.intermediate_size,
+    }
+    if layer.feed_forward_type == "sparse_moe":
+        descriptor.update(
+            {
+                "num_experts": structure.num_experts,
+                "experts_per_token": structure.experts_per_token,
+            }
+        )
+    return descriptor
 
 
 def make_reference_decomposition(
@@ -760,6 +938,19 @@ def make_reference_decomposition(
 
 
 def make_ffn_component(structure: ModelStructure, layer: LayerStructure) -> Json:
+    if layer.feed_forward_type == "sparse_moe":
+        return {
+            "id": "feed_forward",
+            "type": "sparse_moe_feed_forward",
+            "input": "ffn_norm.output",
+            "output": "ffn.output",
+            "dimensions": make_feed_forward_descriptor(structure, layer),
+            "params": {
+                "router": tensor_ref(layer.tensors["moe_router"]),
+                "input": tensor_ref(layer.tensors["moe_input"]),
+                "output": tensor_ref(layer.tensors["moe_output"]),
+            },
+        }
     return {
         "id": "feed_forward",
         "type": "swiglu_feed_forward",
@@ -805,7 +996,8 @@ def make_attention_operator(structure: ModelStructure, layer: LayerStructure) ->
         "query_heads": structure.num_attention_heads,
         "key_value_heads": structure.num_key_value_heads,
         "head_width": head_width,
-        "query_groups_per_kv_head": structure.num_attention_heads // structure.num_key_value_heads,
+        "query_groups_per_kv_head": structure.num_attention_heads
+        // structure.num_key_value_heads,
     }
     params = {
         "q_projection": tensor_ref(layer.tensors["q_projection"]),
@@ -896,7 +1088,9 @@ def make_gated_delta_operator(structure: ModelStructure, layer: LayerStructure) 
     }
 
 
-def make_parameter_block(operator_type: str, tensors: dict[str, str]) -> Json:
+def make_parameter_block(
+    operator_type: str, feed_forward_type: str, tensors: dict[str, str]
+) -> Json:
     if operator_type == "conv":
         layout = "shortconv_layer_params_v1"
     elif operator_type == "full_attention":
@@ -904,9 +1098,11 @@ def make_parameter_block(operator_type: str, tensors: dict[str, str]) -> Json:
     elif operator_type == "gated_delta":
         layout = "gated_delta_layer_params_v1"
     else:
-        raise ModelTranspileError(f"unsupported parameter layout for operator {operator_type!r}")
+        raise ModelTranspileError(
+            f"unsupported parameter layout for operator {operator_type!r}"
+        )
     return {
-        "layout": layout,
+        "layout": f"{layout}_{feed_forward_type}",
         "storage": "source_tensor_refs",
         "params": {name: tensor_ref(tensor) for name, tensor in tensors.items()},
         "tensor_refs": list(tensors.values()),
@@ -944,7 +1140,9 @@ def make_state_ports(structure: ModelStructure, operator_type: str) -> list[Json
     if operator_type == "gated_delta":
         mixer = structure.recurrent_mixer
         if mixer is None:
-            raise ModelTranspileError("gated-delta layer has no recurrent mixer dimensions")
+            raise ModelTranspileError(
+                "gated-delta layer has no recurrent mixer dimensions"
+            )
         key_width = int(mixer["key_heads"]) * int(mixer["key_head_width"])
         value_width = int(mixer["value_heads"]) * int(mixer["value_head_width"])
         conv_width = key_width * 2 + value_width
@@ -974,11 +1172,17 @@ def make_state_ports(structure: ModelStructure, operator_type: str) -> list[Json
     raise ModelTranspileError(f"unsupported state ports for operator {operator_type!r}")
 
 
-def make_pedal_class(structure: ModelStructure, operator_type: str) -> str:
+def make_pedal_class(structure: ModelStructure, layer: LayerStructure) -> str:
+    operator_type = layer.operator_type
+    feed_forward = (
+        f"moe{structure.num_experts}x{structure.experts_per_token}i{structure.intermediate_size}"
+        if layer.feed_forward_type == "sparse_moe"
+        else f"ffn{structure.intermediate_size}"
+    )
     if operator_type == "conv":
         return (
             f"shortconv_layer_h{structure.hidden_size}_"
-            f"k{structure.conv_l_cache}_ffn{structure.intermediate_size}_v1"
+            f"k{structure.conv_l_cache}_{feed_forward}_v1"
         )
 
     if operator_type == "full_attention":
@@ -987,18 +1191,20 @@ def make_pedal_class(structure: ModelStructure, operator_type: str) -> str:
             "gqa_attention_layer_"
             f"h{structure.hidden_size}_q{structure.num_attention_heads}_"
             f"kv{structure.num_key_value_heads}_d{head_width}_"
-            f"ffn{structure.intermediate_size}_v1"
+            f"{feed_forward}_v1"
         )
 
     if operator_type == "gated_delta":
         mixer = structure.recurrent_mixer
         if mixer is None:
-            raise ModelTranspileError("gated-delta layer has no recurrent mixer dimensions")
+            raise ModelTranspileError(
+                "gated-delta layer has no recurrent mixer dimensions"
+            )
         return (
             "gated_delta_layer_"
             f"h{structure.hidden_size}_k{mixer['key_heads']}x{mixer['key_head_width']}_"
             f"v{mixer['value_heads']}x{mixer['value_head_width']}_"
-            f"ffn{structure.intermediate_size}_v1"
+            f"{feed_forward}_v1"
         )
 
     raise ModelTranspileError(f"unsupported pedal class for operator {operator_type!r}")
@@ -1061,7 +1267,9 @@ def discover_safetensor_files(model_dir: Path) -> tuple[Path, ...]:
     index_file = model_dir / "model.safetensors.index.json"
     if index_file.exists():
         index = read_json(index_file)
-        files = sorted({model_dir / filename for filename in index.get("weight_map", {}).values()})
+        files = sorted(
+            {model_dir / filename for filename in index.get("weight_map", {}).values()}
+        )
         if files:
             return tuple(files)
 
@@ -1079,14 +1287,18 @@ def read_safetensors_header(path: Path) -> tuple[int, Json]:
     return header_len, header
 
 
-def find_first_tensor(tensors: dict[str, Json], candidates: Iterable[str], *, role: str) -> str:
+def find_first_tensor(
+    tensors: dict[str, Json], candidates: Iterable[str], *, role: str
+) -> str:
     match = find_first_existing_tensor(tensors, candidates)
     if match is None:
         raise ModelTranspileError(f"could not discover {role} tensor")
     return match
 
 
-def find_first_existing_tensor(tensors: dict[str, Json], candidates: Iterable[str]) -> str | None:
+def find_first_existing_tensor(
+    tensors: dict[str, Json], candidates: Iterable[str]
+) -> str | None:
     for name in candidates:
         if name in tensors:
             return name
@@ -1100,7 +1312,9 @@ def find_layer_tensor(
     *,
     role: str,
 ) -> str:
-    return find_first_tensor(tensors, (f"{prefix}.{suffix}" for suffix in suffixes), role=role)
+    return find_first_tensor(
+        tensors, (f"{prefix}.{suffix}" for suffix in suffixes), role=role
+    )
 
 
 def find_optional_layer_tensor(

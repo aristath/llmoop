@@ -21,6 +21,7 @@ const uint INPUT_SIZE = {{INPUT_SIZE}}u;
 const uint VOCAB_SIZE = {{VOCAB_SIZE}}u;
 const uint INPUT_WORDS = (INPUT_SIZE + 1u) / 2u;
 const uint OUTPUT_WORDS = (VOCAB_SIZE + 1u) / 2u;
+const float OUTPUT_SCALE = {{OUTPUT_SCALE}};
 
 shared float subgroup_lo[64];
 shared float subgroup_hi[64];
@@ -30,9 +31,9 @@ float bf16_to_f32(uint value) {
 }
 
 void store_result(uint output_word, uint lo_row, uint hi_row, float lo_sum, float hi_sum) {
-    logits.values[lo_row] = lo_sum;
+    logits.values[lo_row] = lo_sum * OUTPUT_SCALE;
     if (hi_row < VOCAB_SIZE) {
-        logits.values[hi_row] = hi_sum;
+        logits.values[hi_row] = hi_sum * OUTPUT_SCALE;
     }
 }
 

@@ -16,6 +16,17 @@ layout(set = 0, binding = 2) readonly buffer StreamControl {
 
 const uint VOCAB_SIZE = {{VOCAB_SIZE}}u;
 const uint FRAME_WORDS = ({{HIDDEN_SIZE}}u + 1u) / 2u;
+const float EMBEDDING_SCALE = {{EMBEDDING_SCALE}};
+
+float bf16_to_f32(uint value) {
+    return uintBitsToFloat((value & 0xffffu) << 16);
+}
+
+uint f32_to_bf16(float value) {
+    uint bits = floatBitsToUint(value);
+    uint lsb = (bits >> 16) & 1u;
+    return (bits + 0x7fffu + lsb) >> 16;
+}
 
 void main() {
     uint word_index = gl_GlobalInvocationID.x;
@@ -28,5 +39,8 @@ void main() {
     }
 
     uint source_base = token_id * FRAME_WORDS;
-    output_frame.words[word_index] = embedding_weight.words[source_base + word_index];
+    uint packed = embedding_weight.words[source_base + word_index];
+    uint lo = f32_to_bf16(bf16_to_f32(packed) * EMBEDDING_SCALE);
+    uint hi = f32_to_bf16(bf16_to_f32(packed >> 16) * EMBEDDING_SCALE);
+    output_frame.words[word_index] = (hi << 16) | lo;
 }

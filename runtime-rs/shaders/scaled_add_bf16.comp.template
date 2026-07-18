@@ -1,0 +1,46 @@
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer ResidualInput {
+    uint words[];
+} residual_input;
+
+layout(set = 0, binding = 1) readonly buffer UpdateInput {
+    uint words[];
+} update_input;
+
+layout(set = 0, binding = 2) buffer OutputFrame {
+    uint words[];
+} output_frame;
+
+const uint ELEMENT_COUNT = {{ELEMENT_COUNT}}u;
+const uint WORD_COUNT = ELEMENT_COUNT / 2u;
+const float RESIDUAL_SCALE = {{RESIDUAL_SCALE}};
+
+float bf16_to_f32(uint value) {
+    return uintBitsToFloat((value & 0xffffu) << 16);
+}
+
+uint f32_to_bf16(float value) {
+    uint bits = floatBitsToUint(value);
+    uint lsb = (bits >> 16) & 1u;
+    return (bits + 0x7fffu + lsb) >> 16;
+}
+
+uint scaled_add(uint residual, uint update) {
+    float scaled = bf16_to_f32(f32_to_bf16(bf16_to_f32(update) * RESIDUAL_SCALE));
+    return f32_to_bf16(bf16_to_f32(residual) + scaled);
+}
+
+void main() {
+    for (uint word_index = gl_LocalInvocationID.x;
+         word_index < WORD_COUNT;
+         word_index += 64u) {
+        uint residual = residual_input.words[word_index];
+        uint update = update_input.words[word_index];
+        uint lo = scaled_add(residual, update);
+        uint hi = scaled_add(residual >> 16, update >> 16);
+        output_frame.words[word_index] = (hi << 16) | lo;
+    }
+}
