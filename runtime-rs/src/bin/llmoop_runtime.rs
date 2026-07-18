@@ -469,9 +469,14 @@ impl RuntimeChatSession {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum RuntimeChatFormatter {
-    ChatMl { bos_token: Option<String> },
+    ChatMl {
+        bos_token: Option<String>,
+        assistant_prefix: String,
+    },
     RoleDelimited,
-    TurnDelimited { bos_token: Option<String> },
+    TurnDelimited {
+        bos_token: Option<String>,
+    },
     EndDelimitedRoles,
 }
 
@@ -489,7 +494,17 @@ impl RuntimeChatFormatter {
         })?;
         let bos_token = tokenizer_config_string(tokenizer_dir, "bos_token")?;
         if template.contains("<|im_start|>") && template.contains("<|im_end|>") {
-            return Ok(Self::ChatMl { bos_token });
+            let assistant_prefix = if template.contains("enable_thinking is defined")
+                && template.contains("enable_thinking is false")
+            {
+                "<think>\n\n</think>\n\n".to_string()
+            } else {
+                String::new()
+            };
+            return Ok(Self::ChatMl {
+                bos_token,
+                assistant_prefix,
+            });
         }
         if template.contains("<|start_of_role|>")
             && template.contains("<|end_of_role|>")
@@ -518,7 +533,10 @@ impl RuntimeChatFormatter {
         add_generation_prompt: bool,
     ) -> String {
         match self {
-            Self::ChatMl { bos_token } => {
+            Self::ChatMl {
+                bos_token,
+                assistant_prefix,
+            } => {
                 let mut formatted = String::new();
                 if let Some(bos_token) = bos_token {
                     formatted.push_str(bos_token);
@@ -527,11 +545,15 @@ impl RuntimeChatFormatter {
                     formatted.push_str("<|im_start|>");
                     formatted.push_str(&message.role);
                     formatted.push('\n');
+                    if message.role == "assistant" {
+                        formatted.push_str(assistant_prefix);
+                    }
                     formatted.push_str(&message.content);
                     formatted.push_str("<|im_end|>\n");
                 }
                 if add_generation_prompt {
                     formatted.push_str("<|im_start|>assistant\n");
+                    formatted.push_str(assistant_prefix);
                 }
                 formatted
             }
