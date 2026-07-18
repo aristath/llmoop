@@ -77,7 +77,7 @@ impl Default for Args {
             device_bindings: BTreeMap::new(),
             duplicate_after: Vec::new(),
             source_chain: None,
-            max_new_tokens: 128,
+            max_new_tokens: 65_536,
             context_size: None,
             vulkan_device_index: None,
             cycle_ticks: 4,
@@ -469,14 +469,9 @@ impl RuntimeChatSession {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum RuntimeChatFormatter {
-    ChatMl {
-        bos_token: Option<String>,
-        assistant_prefix: String,
-    },
+    ChatMl { bos_token: Option<String> },
     RoleDelimited,
-    TurnDelimited {
-        bos_token: Option<String>,
-    },
+    TurnDelimited { bos_token: Option<String> },
     EndDelimitedRoles,
 }
 
@@ -494,17 +489,7 @@ impl RuntimeChatFormatter {
         })?;
         let bos_token = tokenizer_config_string(tokenizer_dir, "bos_token")?;
         if template.contains("<|im_start|>") && template.contains("<|im_end|>") {
-            let assistant_prefix = if template.contains("enable_thinking is defined")
-                && template.contains("enable_thinking is false")
-            {
-                "<think>\n\n</think>\n\n".to_string()
-            } else {
-                String::new()
-            };
-            return Ok(Self::ChatMl {
-                bos_token,
-                assistant_prefix,
-            });
+            return Ok(Self::ChatMl { bos_token });
         }
         if template.contains("<|start_of_role|>")
             && template.contains("<|end_of_role|>")
@@ -533,10 +518,7 @@ impl RuntimeChatFormatter {
         add_generation_prompt: bool,
     ) -> String {
         match self {
-            Self::ChatMl {
-                bos_token,
-                assistant_prefix,
-            } => {
+            Self::ChatMl { bos_token } => {
                 let mut formatted = String::new();
                 if let Some(bos_token) = bos_token {
                     formatted.push_str(bos_token);
@@ -545,15 +527,11 @@ impl RuntimeChatFormatter {
                     formatted.push_str("<|im_start|>");
                     formatted.push_str(&message.role);
                     formatted.push('\n');
-                    if message.role == "assistant" {
-                        formatted.push_str(assistant_prefix);
-                    }
                     formatted.push_str(&message.content);
                     formatted.push_str("<|im_end|>\n");
                 }
                 if add_generation_prompt {
                     formatted.push_str("<|im_start|>assistant\n");
-                    formatted.push_str(assistant_prefix);
                 }
                 formatted
             }
@@ -3072,7 +3050,7 @@ Options:
   --inspect-placement        Mount and summarize every logical device slice in the runtime patch.
   --inspect-device-slice <DEVICE_ID>
                              Mount and summarize only the runtime patch pedals assigned to DEVICE_ID.
-  --max-new-tokens <N>       Generation stop condition, independent of context size. Default: 128
+  --max-new-tokens <N>       Generation stop condition, independent of context size. Default: 65536
   --context-size <N>         Runtime transient-state window. Default: auto, up to the model maximum.
   --vulkan-device-index <N>  Use Vulkan physical device index N as the default local target.
   --cycle-ticks <N>          Max runtime ticks per always-on cycle. Default: 4
