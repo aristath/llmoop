@@ -24,6 +24,16 @@ class LayerStructure:
     prefix: str
     operator_type: str
     attention_window_size: int | None
+    num_attention_heads: int
+    num_key_value_heads: int
+    head_width: int
+    rotary_width: int
+    rope_theta: float
+    rope_type: str
+    attention_scale: float
+    value_head_norm: bool
+    shared_kv_source_layer: int | None
+    per_layer_input_width: int | None
     feed_forward_type: str
     shared_intermediate_size: int | None
     tensors: dict[str, str]
@@ -100,6 +110,14 @@ FFN_NORM_SUFFIXES = (
     "post_attention_layer_norm.weight",
     "channel_pre_norm.weight",
 )
+
+OPERATOR_POST_NORM_SUFFIXES = ("post_attention_layernorm.weight",)
+FFN_PRE_NORM_SUFFIXES = ("pre_feedforward_layernorm.weight",)
+FFN_POST_NORM_SUFFIXES = ("post_feedforward_layernorm.weight",)
+PER_LAYER_INPUT_GATE_SUFFIXES = ("per_layer_input_gate.weight",)
+PER_LAYER_PROJECTION_SUFFIXES = ("per_layer_projection.weight",)
+PER_LAYER_POST_NORM_SUFFIXES = ("post_per_layer_input_norm.weight",)
+LAYER_SCALAR_SUFFIXES = ("layer_scalar",)
 
 FFN_GATE_SUFFIXES = (
     "feed_forward.w1.weight",
@@ -240,7 +258,7 @@ def discover_model_structure(
     *,
     generation_config: Json | None = None,
 ) -> ModelStructure:
-    layer_root, layer_indices = discover_layer_root(tensors)
+    layer_root, layer_indices = discover_layer_root(tensors, config=config)
     decoder_config = discover_decoder_config(config, max(layer_indices) + 1)
     model_prefix = layer_root.removesuffix(".layers")
     token_embedding = find_first_tensor(
@@ -270,22 +288,6 @@ def discover_model_structure(
     layer_count = int(
         decoder_config.get("num_hidden_layers") or (max(layer_indices) + 1)
     )
-    configured_layer_types = discover_configured_layer_types(
-        decoder_config, layer_count
-    )
-    attention_window_size = discover_attention_window_size(decoder_config)
-    layers = tuple(
-        discover_layer_structure(
-            tensors=tensors,
-            configured_layer_types=configured_layer_types,
-            configured_attention_window_size=attention_window_size,
-            layer_root=layer_root,
-            layer_index=index,
-        )
-        for index in range(layer_count)
-    )
-
-    intermediate_size = discover_intermediate_size(decoder_config, tensors, layers)
     num_attention_heads = discover_int_config(
         decoder_config,
         "num_attention_heads",
@@ -293,29 +295,66 @@ def discover_model_structure(
         "num_heads",
         role="number of attention heads",
     )
-    num_key_value_heads = int(
+    configured_num_key_value_heads = int(
         decoder_config.get("num_key_value_heads")
         or decoder_config.get("num_kv_heads")
         or decoder_config.get("multi_query_group_num")
         or num_attention_heads
     )
-    head_width = int(
+    configured_head_width = int(
         decoder_config.get("head_dim") or hidden_size // num_attention_heads
     )
-    rope_parameters = decoder_config.get("rope_parameters")
-    partial_rotary_factor = float(
-        rope_parameters.get("partial_rotary_factor", 1.0)
-        if isinstance(rope_parameters, dict)
-        else decoder_config.get("partial_rotary_factor", 1.0)
+    configured_layer_types = discover_configured_layer_types(
+        decoder_config, layer_count
     )
-    rotary_width = int(head_width * partial_rotary_factor)
+    attention_window_size = discover_attention_window_size(decoder_config)
+    per_layer_input = discover_per_layer_input_structure(
+        decoder_config, tensors, model_prefix, layer_count
+    )
+    shared_kv_sources = discover_shared_kv_sources(
+        decoder_config, configured_layer_types, layer_count
+    )
+    layers = tuple(
+        discover_layer_structure(
+            tensors=tensors,
+            decoder_config=decoder_config,
+            configured_layer_types=configured_layer_types,
+            configured_attention_window_size=attention_window_size,
+            num_attention_heads=num_attention_heads,
+            configured_num_key_value_heads=configured_num_key_value_heads,
+            configured_head_width=configured_head_width,
+            shared_kv_source_layer=shared_kv_sources.get(index),
+            per_layer_input=per_layer_input,
+            token_embedding=token_embedding,
+            layer_root=layer_root,
+            layer_index=index,
+        )
+        for index in range(layer_count)
+    )
+
+    intermediate_size = discover_intermediate_size(decoder_config, tensors, layers)
+    first_attention = next(
+        (layer for layer in layers if layer.operator_type == "full_attention"), None
+    )
+    num_key_value_heads = (
+        first_attention.num_key_value_heads
+        if first_attention is not None
+        else configured_num_key_value_heads
+    )
+    head_width = (
+        first_attention.head_width
+        if first_attention is not None
+        else configured_head_width
+    )
+    rotary_width = (
+        first_attention.rotary_width
+        if first_attention is not None
+        else configured_head_width
+    )
     attention_output_gate = discover_attention_output_gate(
         decoder_config,
         tensors,
         layers,
-        num_attention_heads=num_attention_heads,
-        num_key_value_heads=num_key_value_heads,
-        head_width=head_width,
     )
     recurrent_mixer = discover_recurrent_mixer(decoder_config, tensors, layers)
     conv_l_cache = discover_conv_l_cache(decoder_config, tensors, layers)
@@ -365,18 +404,33 @@ def discover_model_structure(
         vocab_size=vocab_size,
         max_position_embeddings=decoder_config.get("max_position_embeddings"),
         norm_eps=discover_norm_eps(decoder_config),
-        rope_theta=discover_rope_theta(decoder_config),
+        rope_theta=(
+            first_attention.rope_theta
+            if first_attention is not None
+            else discover_rope_theta(decoder_config)
+        ),
         rope_interleaved=bool(decoder_config.get("rope_interleaved", False)),
         rms_norm_weight_offset=rms_norm_weight_offset,
-        embedding_scale=discover_embedding_scale(decoder_config, hidden_size),
+        embedding_scale=discover_embedding_scale(
+            decoder_config,
+            hidden_size,
+            scaled_by_structure=per_layer_input is not None,
+        ),
         residual_scale=float(decoder_config.get("residual_multiplier", 1.0)),
-        attention_scale=float(
-            decoder_config.get("attention_multiplier", head_width**-0.5)
+        attention_scale=(
+            first_attention.attention_scale
+            if first_attention is not None
+            else float(decoder_config.get("attention_multiplier", head_width**-0.5))
         ),
         logits_scale=float(decoder_config.get("logits_scaling", 1.0)),
         logits_soft_cap=(
-            float(decoder_config["logits_soft_cap"])
+            float(
+                decoder_config.get("logits_soft_cap")
+                if decoder_config.get("logits_soft_cap") is not None
+                else decoder_config["final_logit_softcapping"]
+            )
             if decoder_config.get("logits_soft_cap") is not None
+            or decoder_config.get("final_logit_softcapping") is not None
             else None
         ),
         activation=discover_activation(decoder_config),
@@ -402,20 +456,84 @@ def discover_model_structure(
 def discover_layer_structure(
     *,
     tensors: dict[str, Json],
+    decoder_config: Json,
     configured_layer_types: list[str] | None,
     configured_attention_window_size: int | None,
+    num_attention_heads: int,
+    configured_num_key_value_heads: int,
+    configured_head_width: int,
+    shared_kv_source_layer: int | None,
+    per_layer_input: Json | None,
+    token_embedding: str,
     layer_root: str,
     layer_index: int,
 ) -> LayerStructure:
     prefix = f"{layer_root}.{layer_index}"
+    configured = configured_layer_types[layer_index] if configured_layer_types else None
+    has_explicit_feed_forward_pre_norm = (
+        find_optional_layer_tensor(tensors, prefix, FFN_PRE_NORM_SUFFIXES) is not None
+    )
     layer_tensors = {
         "operator_norm": find_layer_tensor(
             tensors, prefix, OPERATOR_NORM_SUFFIXES, role="operator norm"
         ),
         "ffn_norm": find_layer_tensor(
-            tensors, prefix, FFN_NORM_SUFFIXES, role="feed-forward norm"
+            tensors,
+            prefix,
+            FFN_PRE_NORM_SUFFIXES
+            if has_explicit_feed_forward_pre_norm
+            else FFN_NORM_SUFFIXES,
+            role="feed-forward norm",
         ),
     }
+    if has_explicit_feed_forward_pre_norm:
+        layer_tensors["operator_post_norm"] = find_layer_tensor(
+            tensors,
+            prefix,
+            OPERATOR_POST_NORM_SUFFIXES,
+            role="post-attention norm",
+        )
+        optional_ffn_post_norm = find_optional_layer_tensor(
+            tensors, prefix, FFN_POST_NORM_SUFFIXES
+        )
+        if optional_ffn_post_norm is not None:
+            layer_tensors["ffn_post_norm"] = optional_ffn_post_norm
+
+    per_layer_input_width = None
+    if per_layer_input is not None:
+        per_layer_input_width = int(per_layer_input["width"])
+        layer_tensors.update(
+            {
+                "token_embedding": token_embedding,
+                "per_layer_embedding": str(per_layer_input["embedding"]),
+                "per_layer_model_projection": str(per_layer_input["model_projection"]),
+                "per_layer_projection_norm": str(per_layer_input["projection_norm"]),
+                "per_layer_input_gate": find_layer_tensor(
+                    tensors,
+                    prefix,
+                    PER_LAYER_INPUT_GATE_SUFFIXES,
+                    role="per-layer input gate",
+                ),
+                "per_layer_projection": find_layer_tensor(
+                    tensors,
+                    prefix,
+                    PER_LAYER_PROJECTION_SUFFIXES,
+                    role="per-layer residual projection",
+                ),
+                "per_layer_post_norm": find_layer_tensor(
+                    tensors,
+                    prefix,
+                    PER_LAYER_POST_NORM_SUFFIXES,
+                    role="per-layer residual post norm",
+                ),
+                "layer_scalar": find_layer_tensor(
+                    tensors,
+                    prefix,
+                    LAYER_SCALAR_SUFFIXES,
+                    role="layer output scalar",
+                ),
+            }
+        )
     dense_gate = find_optional_layer_tensor(tensors, prefix, FFN_GATE_SUFFIXES)
     fused_gate_up = find_optional_layer_tensor(
         tensors, prefix, FFN_FUSED_GATE_UP_SUFFIXES
@@ -497,7 +615,6 @@ def discover_layer_structure(
             f"could not discover feed-forward structure for layer prefix {prefix!r}"
         )
 
-    configured = configured_layer_types[layer_index] if configured_layer_types else None
     if configured in ("conv", "short_conv"):
         operator_type = "conv"
     elif configured in ("full_attention", "attention", "gqa_attention"):
@@ -542,20 +659,26 @@ def discover_layer_structure(
             }
         )
     elif operator_type == "full_attention":
+        head_width = discover_layer_head_width(
+            decoder_config,
+            configured,
+            configured_head_width=configured_head_width,
+        )
         fused_qkv = find_optional_layer_tensor(
             tensors, prefix, ATTENTION_FUSED_QKV_SUFFIXES
         )
         if fused_qkv is not None:
             layer_tensors["qkv_projection"] = fused_qkv
         else:
-            layer_tensors.update(
-                {
-                    "q_projection": find_layer_tensor(
-                        tensors,
-                        prefix,
-                        ATTENTION_Q_PROJECTION_SUFFIXES,
-                        role="attention query projection",
-                    ),
+            layer_tensors["q_projection"] = find_layer_tensor(
+                tensors,
+                prefix,
+                ATTENTION_Q_PROJECTION_SUFFIXES,
+                role="attention query projection",
+            )
+            if shared_kv_source_layer is None:
+                layer_tensors.update(
+                    {
                     "k_projection": find_layer_tensor(
                         tensors,
                         prefix,
@@ -568,8 +691,8 @@ def discover_layer_structure(
                         ATTENTION_V_PROJECTION_SUFFIXES,
                         role="attention value projection",
                     ),
-                }
-            )
+                    }
+                )
         layer_tensors["attention_out_projection"] = find_layer_tensor(
             tensors,
             prefix,
@@ -579,8 +702,10 @@ def discover_layer_structure(
         optional_q_norm = find_optional_layer_tensor(
             tensors, prefix, ATTENTION_Q_NORM_SUFFIXES
         )
-        optional_k_norm = find_optional_layer_tensor(
-            tensors, prefix, ATTENTION_K_NORM_SUFFIXES
+        optional_k_norm = (
+            find_optional_layer_tensor(tensors, prefix, ATTENTION_K_NORM_SUFFIXES)
+            if shared_kv_source_layer is None
+            else None
         )
         if optional_q_norm is not None:
             layer_tensors["q_norm"] = optional_q_norm
@@ -591,9 +716,11 @@ def discover_layer_structure(
         )
         if optional_sinks is not None:
             layer_tensors["attention_sinks"] = optional_sinks
-        attention_linear_ids = (
+        attention_linear_ids: tuple[str, ...] = (
             ("qkv_projection", "attention_out_projection")
             if fused_qkv is not None
+            else ("q_projection", "attention_out_projection")
+            if shared_kv_source_layer is not None
             else (
                 "q_projection",
                 "k_projection",
@@ -731,11 +858,76 @@ def discover_layer_structure(
             f"unsupported operator type {operator_type!r} for layer {layer_index}"
         )
 
+    if operator_type == "full_attention":
+        head_width = discover_layer_head_width(
+            decoder_config,
+            configured,
+            configured_head_width=configured_head_width,
+        )
+        q_projection = layer_tensors.get("q_projection")
+        if q_projection is not None:
+            q_width = int(tensors[q_projection]["shape"][0])
+            configured_output_gate = bool(decoder_config.get("attn_output_gate", False))
+            expected_q_width = num_attention_heads * head_width
+            if q_width == expected_q_width * 2:
+                configured_output_gate = True
+            if q_width != expected_q_width * (2 if configured_output_gate else 1):
+                raise ModelTranspileError(
+                    f"attention query projection width {q_width} is incompatible with "
+                    f"{num_attention_heads} heads of width {head_width}"
+                )
+        num_key_value_heads = configured_num_key_value_heads
+        if shared_kv_source_layer is None and "k_projection" in layer_tensors:
+            k_width = int(tensors[layer_tensors["k_projection"]]["shape"][0])
+            if k_width % head_width:
+                raise ModelTranspileError(
+                    f"attention key projection width {k_width} is not divisible by head width {head_width}"
+                )
+            num_key_value_heads = k_width // head_width
+        rope_parameters = discover_layer_rope_parameters(decoder_config, configured)
+        rope_theta = float(rope_parameters["rope_theta"])
+        rope_type = str(rope_parameters.get("rope_type", "default"))
+        rotary_width = int(
+            head_width * float(rope_parameters.get("partial_rotary_factor", 1.0))
+        )
+        attention_scale = float(
+            decoder_config.get(
+                "attention_multiplier",
+                1.0 if per_layer_input is not None else head_width**-0.5,
+            )
+        )
+        value_head_norm = (
+            per_layer_input is not None
+            and shared_kv_source_layer is None
+            and "q_norm" in layer_tensors
+            and "k_norm" in layer_tensors
+        )
+    else:
+        head_width = configured_head_width
+        num_key_value_heads = configured_num_key_value_heads
+        rotary_width = configured_head_width
+        rope_theta = discover_rope_theta(decoder_config)
+        rope_type = "default"
+        attention_scale = float(
+            decoder_config.get("attention_multiplier", configured_head_width**-0.5)
+        )
+        value_head_norm = False
+
     return LayerStructure(
         index=layer_index,
         prefix=prefix,
         operator_type=operator_type,
         attention_window_size=layer_attention_window_size,
+        num_attention_heads=num_attention_heads,
+        num_key_value_heads=num_key_value_heads,
+        head_width=head_width,
+        rotary_width=rotary_width,
+        rope_theta=rope_theta,
+        rope_type=rope_type,
+        attention_scale=attention_scale,
+        value_head_norm=value_head_norm,
+        shared_kv_source_layer=shared_kv_source_layer,
+        per_layer_input_width=per_layer_input_width,
         feed_forward_type=feed_forward_type,
         shared_intermediate_size=(
             int(tensors[layer_tensors["shared_mlp_input"]]["shape"][0]) // 2
@@ -770,7 +962,9 @@ def infer_operator_type(tensors: dict[str, Json], prefix: str) -> str:
     )
 
 
-def discover_layer_root(tensors: dict[str, Json]) -> tuple[str, tuple[int, ...]]:
+def discover_layer_root(
+    tensors: dict[str, Json], *, config: Json | None = None
+) -> tuple[str, tuple[int, ...]]:
     roots: Counter[str] = Counter()
     root_indices: dict[str, set[int]] = {}
     for name in tensors:
@@ -786,8 +980,65 @@ def discover_layer_root(tensors: dict[str, Json]) -> tuple[str, tuple[int, ...]]
         raise ModelTranspileError(
             "could not discover a repeated decoder-layer root in checkpoint tensors"
         )
-    root = roots.most_common(1)[0][0]
+    if config is None:
+        root = roots.most_common(1)[0][0]
+        return root, tuple(sorted(root_indices[root]))
+
+    decoder_layer_counts = discover_configured_layer_counts(config)
+
+    def score(root: str) -> tuple[int, int]:
+        indices = root_indices[root]
+        model_prefix = root.removesuffix(".layers")
+        contiguous = indices == set(range(max(indices) + 1))
+        boundary_score = 0
+        if f"{model_prefix}.embed_tokens.weight" in tensors:
+            boundary_score += 200
+        if f"{model_prefix}.norm.weight" in tensors:
+            boundary_score += 50
+        layer_count_score = 100 if len(indices) in decoder_layer_counts and contiguous else 0
+        first_prefix = f"{root}.{min(indices)}"
+        decoder_operator_score = 0
+        if find_first_existing_tensor(
+            tensors,
+            (f"{first_prefix}.{suffix}" for suffix in FFN_GATE_SUFFIXES),
+        ) or find_first_existing_tensor(
+            tensors,
+            (f"{first_prefix}.{suffix}" for suffix in FFN_FUSED_GATE_UP_SUFFIXES),
+        ):
+            decoder_operator_score += 25
+        if infer_optional_operator_type(tensors, first_prefix) is not None:
+            decoder_operator_score += 25
+        return (
+            boundary_score + layer_count_score + decoder_operator_score,
+            roots[root],
+        )
+
+    root = max(roots, key=score)
     return root, tuple(sorted(root_indices[root]))
+
+
+def discover_configured_layer_counts(config: Json) -> set[int]:
+    counts: set[int] = set()
+
+    def visit(value: Any) -> None:
+        if not isinstance(value, dict):
+            return
+        configured = value.get("num_hidden_layers")
+        if configured is not None:
+            counts.add(int(configured))
+        for nested in value.values():
+            if isinstance(nested, dict):
+                visit(nested)
+
+    visit(config)
+    return counts
+
+
+def infer_optional_operator_type(tensors: dict[str, Json], prefix: str) -> str | None:
+    try:
+        return infer_operator_type(tensors, prefix)
+    except ModelTranspileError:
+        return None
 
 
 def discover_decoder_config(config: Json, discovered_layer_count: int) -> Json:
@@ -835,21 +1086,123 @@ def discover_configured_layer_types(config: Json, layer_count: int) -> list[str]
     return [values[index % len(values)] for index in range(layer_count)]
 
 
+def discover_per_layer_input_structure(
+    config: Json,
+    tensors: dict[str, Json],
+    model_prefix: str,
+    layer_count: int,
+) -> Json | None:
+    names = {
+        "embedding": f"{model_prefix}.embed_tokens_per_layer.weight",
+        "model_projection": f"{model_prefix}.per_layer_model_projection.weight",
+        "projection_norm": f"{model_prefix}.per_layer_projection_norm.weight",
+    }
+    present = {key: name in tensors for key, name in names.items()}
+    if not any(present.values()):
+        return None
+    if not all(present.values()):
+        missing = ", ".join(key for key, exists in present.items() if not exists)
+        raise ModelTranspileError(
+            f"per-layer input structure is incomplete; missing {missing}"
+        )
+    width = int(config.get("hidden_size_per_layer_input") or 0)
+    if width <= 0:
+        raise ModelTranspileError(
+            "per-layer input tensors require a positive hidden_size_per_layer_input"
+        )
+    packed_width = layer_count * width
+    embedding_shape = tensors[names["embedding"]]["shape"]
+    projection_shape = tensors[names["model_projection"]]["shape"]
+    norm_shape = tensors[names["projection_norm"]]["shape"]
+    if int(embedding_shape[-1]) != packed_width:
+        raise ModelTranspileError(
+            f"packed per-layer embedding width {embedding_shape[-1]} does not equal {layer_count}x{width}"
+        )
+    if int(projection_shape[0]) != packed_width:
+        raise ModelTranspileError(
+            f"packed per-layer projection width {projection_shape[0]} does not equal {layer_count}x{width}"
+        )
+    if list(map(int, norm_shape)) != [width]:
+        raise ModelTranspileError(
+            f"per-layer projection norm shape {norm_shape} does not equal [{width}]"
+        )
+    return {**names, "width": width, "packed_width": packed_width}
+
+
+def discover_shared_kv_sources(
+    config: Json,
+    configured_layer_types: list[str] | None,
+    layer_count: int,
+) -> dict[int, int]:
+    shared_count = int(config.get("num_kv_shared_layers") or 0)
+    if shared_count <= 0:
+        return {}
+    if shared_count >= layer_count:
+        raise ModelTranspileError(
+            f"num_kv_shared_layers {shared_count} leaves no source layer"
+        )
+    if configured_layer_types is None:
+        raise ModelTranspileError(
+            "shared KV layers require structural layer_types to identify their source pedals"
+        )
+    first_shared = layer_count - shared_count
+    source_by_type: dict[str, int] = {}
+    for index in range(first_shared):
+        source_by_type[configured_layer_types[index]] = index
+    result: dict[int, int] = {}
+    for index in range(first_shared, layer_count):
+        layer_type = configured_layer_types[index]
+        if layer_type not in source_by_type:
+            raise ModelTranspileError(
+                f"shared KV layer {index} has no earlier source for type {layer_type!r}"
+            )
+        result[index] = source_by_type[layer_type]
+    return result
+
+
+def discover_layer_head_width(
+    config: Json,
+    configured_layer_type: str | None,
+    *,
+    configured_head_width: int,
+) -> int:
+    if configured_layer_type == "full_attention" and config.get("global_head_dim"):
+        return int(config["global_head_dim"])
+    return configured_head_width
+
+
+def discover_layer_rope_parameters(
+    config: Json, configured_layer_type: str | None
+) -> Json:
+    configured = config.get("rope_parameters")
+    if isinstance(configured, dict):
+        nested = configured.get(configured_layer_type) if configured_layer_type else None
+        if isinstance(nested, dict):
+            return nested
+        if "rope_theta" in configured:
+            return configured
+    if config.get("rope_theta") is not None:
+        return {
+            "rope_theta": config["rope_theta"],
+            "partial_rotary_factor": config.get("partial_rotary_factor", 1.0),
+            "rope_type": "default",
+        }
+    raise ModelTranspileError(
+        f"could not discover RoPE parameters for layer type {configured_layer_type!r}"
+    )
+
+
 def discover_attention_output_gate(
     config: Json,
     tensors: dict[str, Json],
     layers: tuple[LayerStructure, ...],
-    *,
-    num_attention_heads: int,
-    num_key_value_heads: int,
-    head_width: int,
 ) -> bool:
     configured = config.get("attn_output_gate")
-    expected_width = num_attention_heads * head_width
-    kv_width = num_key_value_heads * head_width
     for layer in layers:
         if layer.operator_type != "full_attention":
             continue
+        expected_width = layer.num_attention_heads * layer.head_width
+        kv_width = layer.num_key_value_heads * layer.head_width
         if "qkv_projection" in layer.tensors:
             projection_width = int(tensors[layer.tensors["qkv_projection"]]["shape"][0])
             ordinary_width = expected_width + 2 * kv_width
@@ -860,8 +1213,8 @@ def discover_attention_output_gate(
             ):
                 raise ModelTranspileError(
                     f"fused attention QKV width {projection_width} is incompatible with "
-                    f"{num_attention_heads} query and {num_key_value_heads} KV heads of "
-                    f"width {head_width}"
+                    f"{layer.num_attention_heads} query and {layer.num_key_value_heads} KV heads of "
+                    f"width {layer.head_width}"
                 )
         else:
             projection_width = int(tensors[layer.tensors["q_projection"]]["shape"][0])
@@ -869,7 +1222,7 @@ def discover_attention_output_gate(
             if projection_width not in (expected_width, expected_width * 2):
                 raise ModelTranspileError(
                     f"attention query projection width {projection_width} is incompatible with "
-                    f"{num_attention_heads} heads of width {head_width}"
+                    f"{layer.num_attention_heads} heads of width {layer.head_width}"
                 )
         if configured is not None and bool(configured) != discovered:
             raise ModelTranspileError(
@@ -983,10 +1336,12 @@ def discover_attention_window_size(config: Json) -> int | None:
     return None
 
 
-def discover_embedding_scale(config: Json, hidden_size: int) -> float:
+def discover_embedding_scale(
+    config: Json, hidden_size: int, *, scaled_by_structure: bool = False
+) -> float:
     if "embedding_multiplier" in config:
         return float(config["embedding_multiplier"])
-    if bool(config.get("embeddings_scale_by_sqrt_dim", False)):
+    if bool(config.get("embeddings_scale_by_sqrt_dim", False)) or scaled_by_structure:
         return round_float_to_bf16(math.sqrt(hidden_size))
     return 1.0
 
@@ -1068,25 +1423,34 @@ def make_layer(structure: ModelStructure, layer: LayerStructure) -> Json:
         "feed_forward": make_feed_forward_descriptor(structure, layer),
         "numerics": {
             "rms_norm_eps": structure.norm_eps,
-            "rope_theta": structure.rope_theta,
+            "rope_theta": layer.rope_theta,
+            "rope_type": layer.rope_type,
             "rope_interleaved": structure.rope_interleaved,
-            "rotary_width": structure.rotary_width,
+            "rotary_width": layer.rotary_width,
             "rms_norm_weight_offset": structure.rms_norm_weight_offset,
             "attention_output_gate": structure.attention_output_gate,
             "residual_scale": structure.residual_scale,
-            "attention_scale": structure.attention_scale,
+            "attention_scale": layer.attention_scale,
             "attention_window_size": layer.attention_window_size,
+            "value_head_norm": layer.value_head_norm,
+            "per_layer_input_width": layer.per_layer_input_width,
+            "per_layer_input_layer_index": layer.index,
+            "per_layer_input_layer_count": structure.num_hidden_layers,
+            "token_embedding_scale": structure.embedding_scale,
+            "per_layer_embedding_scale": (
+                round_float_to_bf16(math.sqrt(layer.per_layer_input_width))
+                if layer.per_layer_input_width is not None
+                else None
+            ),
+            "per_layer_model_projection_scale": hidden_size**-0.5,
+            "per_layer_input_scale": 2.0**-0.5,
         },
         "ports": {
             "inputs": [{"id": "input", "signal": "frame", "shape": [hidden_size]}],
             "outputs": [{"id": "output", "signal": "frame", "shape": [hidden_size]}],
             "controls": [{"id": "control", "type": "pedal_control", "optional": True}],
         },
-        "state_ports": make_state_ports(
-            structure,
-            layer.operator_type,
-            attention_window_size=layer.attention_window_size,
-        ),
+        "state_ports": make_state_ports(structure, layer),
         "parameter_block": make_parameter_block(
             layer.operator_type, layer.feed_forward_type, layer.tensors
         ),
@@ -1157,6 +1521,20 @@ def make_model_graph(
             "max_position_embeddings": structure.max_position_embeddings,
             "num_experts": structure.num_experts,
             "experts_per_token": structure.experts_per_token,
+            "attention_layer_shapes": [
+                {
+                    "layer": layer.index,
+                    "query_heads": layer.num_attention_heads,
+                    "key_value_heads": layer.num_key_value_heads,
+                    "head_width": layer.head_width,
+                    "rotary_width": layer.rotary_width,
+                    "rope_theta": layer.rope_theta,
+                    "rope_type": layer.rope_type,
+                    "shared_kv_source_layer": layer.shared_kv_source_layer,
+                }
+                for layer in structure.layers
+                if layer.operator_type == "full_attention"
+            ],
         },
         "numerics": {
             "rms_norm_eps": structure.norm_eps,
@@ -1340,7 +1718,7 @@ def make_conv_operator(structure: ModelStructure, layer: LayerStructure) -> Json
         "circuit_template": f"short_conv_h{structure.hidden_size}_k{structure.conv_l_cache}_v1",
         "input": "operator_norm.output",
         "output": "operator.output",
-        "state_ports": make_state_ports(structure, "conv"),
+        "state_ports": make_state_ports(structure, layer),
         "params": {
             "in_projection": tensor_ref(layer.tensors["conv_in_projection"]),
             "depthwise_kernel": tensor_ref(layer.tensors["conv_depthwise_kernel"]),
@@ -1359,13 +1737,13 @@ def make_conv_operator(structure: ModelStructure, layer: LayerStructure) -> Json
 
 
 def make_attention_operator(structure: ModelStructure, layer: LayerStructure) -> Json:
-    head_width = structure.head_width
+    head_width = layer.head_width
     heads = {
-        "query_heads": structure.num_attention_heads,
-        "key_value_heads": structure.num_key_value_heads,
+        "query_heads": layer.num_attention_heads,
+        "key_value_heads": layer.num_key_value_heads,
         "head_width": head_width,
-        "query_groups_per_kv_head": structure.num_attention_heads
-        // structure.num_key_value_heads,
+        "query_groups_per_kv_head": layer.num_attention_heads
+        // layer.num_key_value_heads,
     }
     if "qkv_projection" in layer.tensors:
         params = {
@@ -1379,10 +1757,15 @@ def make_attention_operator(structure: ModelStructure, layer: LayerStructure) ->
     else:
         params = {
             "q_projection": tensor_ref(layer.tensors["q_projection"]),
-            "k_projection": tensor_ref(layer.tensors["k_projection"]),
-            "v_projection": tensor_ref(layer.tensors["v_projection"]),
             "out_projection": tensor_ref(layer.tensors["attention_out_projection"]),
         }
+        if layer.shared_kv_source_layer is None:
+            params.update(
+                {
+                    "k_projection": tensor_ref(layer.tensors["k_projection"]),
+                    "v_projection": tensor_ref(layer.tensors["v_projection"]),
+                }
+            )
     for source_id, target_id in (
         ("q_projection_bias", "q_projection_bias"),
         ("k_projection_bias", "k_projection_bias"),
@@ -1399,8 +1782,14 @@ def make_attention_operator(structure: ModelStructure, layer: LayerStructure) ->
         if "qkv_projection" in layer.tensors
         else [
             {"id": "q_projection", "type": "linear"},
-            {"id": "k_projection", "type": "linear"},
-            {"id": "v_projection", "type": "linear"},
+            *(
+                [
+                    {"id": "k_projection", "type": "linear"},
+                    {"id": "v_projection", "type": "linear"},
+                ]
+                if layer.shared_kv_source_layer is None
+                else []
+            ),
         ]
     )
     if structure.attention_output_gate:
@@ -1416,7 +1805,14 @@ def make_attention_operator(structure: ModelStructure, layer: LayerStructure) ->
     internal_pedals.extend(
         [
             {"id": "rope", "type": "rotary_position_embedding"},
-            {"id": "kv_memory", "type": "stateful_append_memory"},
+            {
+                "id": "kv_memory",
+                "type": (
+                    "shared_state_read"
+                    if layer.shared_kv_source_layer is not None
+                    else "stateful_append_memory"
+                ),
+            },
             {"id": "attention_read", "type": "scaled_dot_product_attention"},
             *(
                 [{"id": "attention_output_gate", "type": "sigmoid_multiply"}]
@@ -1431,20 +1827,18 @@ def make_attention_operator(structure: ModelStructure, layer: LayerStructure) ->
         "type": "gqa_attention_operator",
         "circuit_template": (
             "gqa_attention_"
-            f"h{structure.hidden_size}_q{structure.num_attention_heads}_"
-            f"kv{structure.num_key_value_heads}_d{head_width}_v1"
+            f"h{structure.hidden_size}_q{layer.num_attention_heads}_"
+            f"kv{layer.num_key_value_heads}_d{head_width}_v1"
         ),
         "input": "operator_norm.output",
         "output": "operator.output",
         "heads": heads,
-        "rotary_width": structure.rotary_width,
+        "rotary_width": layer.rotary_width,
+        "rope_type": layer.rope_type,
         "output_gate": structure.attention_output_gate,
         "window_size": layer.attention_window_size,
-        "state_ports": make_state_ports(
-            structure,
-            "full_attention",
-            attention_window_size=layer.attention_window_size,
-        ),
+        "shared_kv_source_layer": layer.shared_kv_source_layer,
+        "state_ports": make_state_ports(structure, layer),
         "params": params,
         "internal_pedals": internal_pedals,
     }
@@ -1464,7 +1858,7 @@ def make_gated_delta_operator(structure: ModelStructure, layer: LayerStructure) 
         "input": "operator_norm.output",
         "output": "operator.output",
         "dimensions": mixer,
-        "state_ports": make_state_ports(structure, "gated_delta"),
+        "state_ports": make_state_ports(structure, layer),
         "params": {
             "qkv_projection": tensor_ref(layer.tensors["delta_qkv_projection"]),
             "z_projection": tensor_ref(layer.tensors["delta_z_projection"]),
@@ -1525,7 +1919,7 @@ def make_rg_lru_operator(structure: ModelStructure, layer: LayerStructure) -> Js
         "output": "operator.output",
         "dimensions": mixer,
         "activation": structure.activation,
-        "state_ports": make_state_ports(structure, "rg_lru"),
+        "state_ports": make_state_ports(structure, layer),
         "params": params,
         "internal_pedals": [
             {"id": "x_projection", "type": "linear"},
@@ -1564,10 +1958,9 @@ def make_parameter_block(
 
 def make_state_ports(
     structure: ModelStructure,
-    operator_type: str,
-    *,
-    attention_window_size: int | None = None,
+    layer: LayerStructure,
 ) -> list[Json]:
+    operator_type = layer.operator_type
     if operator_type == "conv":
         return [
             {
@@ -1581,18 +1974,23 @@ def make_state_ports(
         ]
 
     if operator_type == "full_attention":
-        head_width = structure.head_width
+        head_width = layer.head_width
+        sharing = (
+            f"shared_from:layer_{layer.shared_kv_source_layer:02d}.kv_memory"
+            if layer.shared_kv_source_layer is not None
+            else "per_stream_per_pedal_instance"
+        )
         return [
             {
                 "id": "kv_memory",
                 "type": "append_only_attention_memory",
-                "query_heads": structure.num_attention_heads,
-                "key_shape_per_token": [structure.num_key_value_heads, head_width],
-                "value_shape_per_token": [structure.num_key_value_heads, head_width],
+                "query_heads": layer.num_attention_heads,
+                "key_shape_per_token": [layer.num_key_value_heads, head_width],
+                "value_shape_per_token": [layer.num_key_value_heads, head_width],
                 "dtype": "BF16",
                 "growth": "per_activation",
-                "window_size": attention_window_size,
-                "sharing": "per_stream_per_pedal_instance",
+                "window_size": layer.attention_window_size,
+                "sharing": sharing,
             }
         ]
 
@@ -1681,11 +2079,11 @@ def make_pedal_class(structure: ModelStructure, layer: LayerStructure) -> str:
         )
 
     if operator_type == "full_attention":
-        head_width = structure.head_width
+        head_width = layer.head_width
         return (
             "gqa_attention_layer_"
-            f"h{structure.hidden_size}_q{structure.num_attention_heads}_"
-            f"kv{structure.num_key_value_heads}_d{head_width}_"
+            f"h{structure.hidden_size}_q{layer.num_attention_heads}_"
+            f"kv{layer.num_key_value_heads}_d{head_width}_"
             f"{feed_forward}_v1"
         )
 

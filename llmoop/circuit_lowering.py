@@ -146,6 +146,7 @@ def build_attention_circuit(pedal: Json, pedal_path: Path) -> Json:
             pedal["numerics"],
             has_q_norm="q_norm" in parameters,
             has_k_norm="k_norm" in parameters,
+            has_value_norm=bool(pedal["numerics"].get("value_head_norm")),
             feed_forward=pedal["feed_forward"],
             parameters=parameters,
         ),
@@ -368,6 +369,7 @@ def _attention_nodes(
     *,
     has_q_norm: bool,
     has_k_norm: bool,
+    has_value_norm: bool,
     feed_forward: Json,
     parameters: Json,
 ) -> list[Json]:
@@ -419,20 +421,26 @@ def _attention_nodes(
                     "outputs": [q_output],
                     "params": _linear_params("q_projection", parameters),
                 },
-                {
-                    "id": "k_projection",
-                    "op": "linear",
-                    "inputs": ["operator_norm_out"],
-                    "outputs": ["k_projected"],
-                    "params": _linear_params("k_projection", parameters),
-                },
-                {
-                    "id": "v_projection",
-                    "op": "linear",
-                    "inputs": ["operator_norm_out"],
-                    "outputs": ["v_projected"],
-                    "params": _linear_params("v_projection", parameters),
-                },
+                *(
+                    [
+                        {
+                            "id": "k_projection",
+                            "op": "linear",
+                            "inputs": ["operator_norm_out"],
+                            "outputs": ["k_projected"],
+                            "params": _linear_params("k_projection", parameters),
+                        },
+                        {
+                            "id": "v_projection",
+                            "op": "linear",
+                            "inputs": ["operator_norm_out"],
+                            "outputs": ["v_projected"],
+                            "params": _linear_params("v_projection", parameters),
+                        },
+                    ]
+                    if "k_projection" in parameters
+                    else []
+                ),
             ]
         )
     attention_gate = None
@@ -481,13 +489,27 @@ def _attention_nodes(
             }
         )
         k_rope_input = "k_normed"
+    value_input = "v_projected"
+    if has_value_norm:
+        nodes.append(
+            {
+                "id": "v_head_norm",
+                "op": "rms_norm_per_head_unscaled",
+                "inputs": ["v_projected"],
+                "outputs": ["v_normed"],
+                "attrs": {**_norm_attrs(numerics), **heads},
+            }
+        )
+        value_input = "v_normed"
     rope_attrs = {
         "position_source": "stream_tick",
         "theta": float(numerics["rope_theta"]),
+        "rope_type": str(numerics.get("rope_type", "default")),
         "interleaved": bool(numerics["rope_interleaved"]),
         "rotary_width": int(numerics["rotary_width"]),
         **heads,
     }
+    shared_kv = "k_projection" not in parameters and "qkv_projection" not in parameters
     attention_tail: list[Json] = [
         {
             "id": "q_rope",
@@ -496,26 +518,36 @@ def _attention_nodes(
             "outputs": ["q_positioned"],
             "attrs": rope_attrs,
         },
-        {
-            "id": "k_rope",
-            "op": "rotary_position_embedding",
-            "inputs": [k_rope_input],
-            "outputs": ["k_positioned"],
-            "attrs": rope_attrs,
-        },
-        {
-            "id": "kv_memory_append",
-            "op": "append_state_update",
-            "inputs": ["k_positioned", "v_projected", "kv_memory"],
-            "outputs": ["k_memory", "v_memory"],
-            "state_reads": ["kv_memory"],
-            "state_writes": ["kv_memory"],
-            "attrs": {"growth": "per_activation", **heads},
-        },
+        *(
+            [
+                {
+                    "id": "k_rope",
+                    "op": "rotary_position_embedding",
+                    "inputs": [k_rope_input],
+                    "outputs": ["k_positioned"],
+                    "attrs": rope_attrs,
+                },
+                {
+                    "id": "kv_memory_append",
+                    "op": "append_state_update",
+                    "inputs": ["k_positioned", value_input, "kv_memory"],
+                    "outputs": ["k_memory", "v_memory"],
+                    "state_reads": ["kv_memory"],
+                    "state_writes": ["kv_memory"],
+                    "attrs": {"growth": "per_activation", **heads},
+                },
+            ]
+            if "k_projection" in parameters or "qkv_projection" in parameters
+            else []
+        ),
         {
             "id": "attention_read",
             "op": "scaled_dot_product_attention",
-            "inputs": ["q_positioned", "k_memory", "v_memory"],
+            "inputs": [
+                "q_positioned",
+                "kv_memory" if shared_kv else "k_memory",
+                "kv_memory" if shared_kv else "v_memory",
+            ],
             "outputs": ["attention_out"],
             "params": (["attention_sinks"] if "attention_sinks" in parameters else []),
             "attrs": {
@@ -722,11 +754,26 @@ def _ffn_tail(
     operator_output: str, numerics: Json, feed_forward: Json, parameters: Json
 ) -> list[Json]:
     residual_scale = float(numerics["residual_scale"])
+    operator_residual_update = operator_output
+    operator_post_norm: list[Json] = []
+    if "operator_post_norm" in parameters:
+        operator_post_norm = [
+            {
+                "id": "operator_post_norm",
+                "op": "rms_norm",
+                "inputs": [operator_output],
+                "outputs": ["operator_post_norm_out"],
+                "params": ["operator_post_norm"],
+                "attrs": _norm_attrs(numerics),
+            }
+        ]
+        operator_residual_update = "operator_post_norm_out"
     prefix = [
+        *operator_post_norm,
         _residual_node(
             node_id="operator_residual",
             residual="input_frame",
-            update=operator_output,
+            update=operator_residual_update,
             output="operator_residual_out",
             scale=residual_scale,
         ),
@@ -882,17 +929,125 @@ def _ffn_tail(
                 },
             ]
         )
-    return [
+    ffn_residual_update = "ffn_out"
+    ffn_post_norm: list[Json] = []
+    if "ffn_post_norm" in parameters:
+        ffn_post_norm = [
+            {
+                "id": "ffn_post_norm",
+                "op": "rms_norm",
+                "inputs": ["ffn_out"],
+                "outputs": ["ffn_post_norm_out"],
+                "params": ["ffn_post_norm"],
+                "attrs": _norm_attrs(numerics),
+            }
+        ]
+        ffn_residual_update = "ffn_post_norm_out"
+
+    tail: list[Json] = [
         *prefix,
         *body,
+        *ffn_post_norm,
         _residual_node(
             node_id="ffn_residual",
             residual="operator_residual_out",
-            update="ffn_out",
-            output="output_frame",
+            update=ffn_residual_update,
+            output=(
+                "ffn_residual_out"
+                if numerics.get("per_layer_input_width") is not None
+                else "output_frame"
+            ),
             scale=residual_scale,
         ),
     ]
+    per_layer_width = numerics.get("per_layer_input_width")
+    if per_layer_width is None:
+        return tail
+
+    width = int(per_layer_width)
+    hidden_size = int(feed_forward["hidden_size"])
+    tail.extend(
+        [
+            {
+                "id": "per_layer_embedding",
+                "op": "per_layer_embedding",
+                "inputs": [],
+                "outputs": ["per_layer_input"],
+                "params": [
+                    "token_embedding",
+                    "per_layer_embedding",
+                    "per_layer_model_projection",
+                    "per_layer_projection_norm",
+                ],
+                "attrs": {
+                    "hidden_size": hidden_size,
+                    "per_layer_width": width,
+                    "layer_index": int(numerics["per_layer_input_layer_index"]),
+                    "layer_count": int(numerics["per_layer_input_layer_count"]),
+                    "norm_eps": float(numerics["rms_norm_eps"]),
+                    "token_embedding_scale": float(numerics["token_embedding_scale"]),
+                    "per_layer_embedding_scale": float(
+                        numerics["per_layer_embedding_scale"]
+                    ),
+                    "model_projection_scale": float(
+                        numerics["per_layer_model_projection_scale"]
+                    ),
+                    "combination_scale": float(numerics["per_layer_input_scale"]),
+                },
+            },
+            {
+                "id": "per_layer_input_gate",
+                "op": "linear",
+                "inputs": ["ffn_residual_out"],
+                "outputs": ["per_layer_gate"],
+                "params": ["per_layer_input_gate"],
+            },
+            {
+                "id": "per_layer_gate_activation",
+                "op": str(feed_forward["activation"]),
+                "inputs": ["per_layer_gate"],
+                "outputs": ["per_layer_gate_activated"],
+                "attrs": {"element_count": width},
+            },
+            {
+                "id": "per_layer_gate_multiply",
+                "op": "multiply",
+                "inputs": ["per_layer_gate_activated", "per_layer_input"],
+                "outputs": ["per_layer_gated"],
+                "attrs": {"element_count": width},
+            },
+            {
+                "id": "per_layer_projection",
+                "op": "linear",
+                "inputs": ["per_layer_gated"],
+                "outputs": ["per_layer_projected"],
+                "params": ["per_layer_projection"],
+            },
+            {
+                "id": "per_layer_post_norm",
+                "op": "rms_norm",
+                "inputs": ["per_layer_projected"],
+                "outputs": ["per_layer_normed"],
+                "params": ["per_layer_post_norm"],
+                "attrs": _norm_attrs(numerics),
+            },
+            {
+                "id": "per_layer_residual",
+                "op": "residual_add",
+                "inputs": ["ffn_residual_out", "per_layer_normed"],
+                "outputs": ["per_layer_residual_out"],
+            },
+            {
+                "id": "layer_scale",
+                "op": "scalar_multiply",
+                "inputs": ["per_layer_residual_out"],
+                "outputs": ["output_frame"],
+                "params": ["layer_scalar"],
+                "attrs": {"element_count": hidden_size},
+            },
+        ]
+    )
+    return tail
 
 
 def _residual_node(
@@ -962,7 +1117,9 @@ def _param_ref(name: str, ref: Json) -> Json:
 def _param_role(name: str) -> str:
     roles = {
         "operator_norm": "operator_normalization_weight",
+        "operator_post_norm": "operator_post_normalization_weight",
         "ffn_norm": "feed_forward_normalization_weight",
+        "ffn_post_norm": "feed_forward_post_normalization_weight",
         "ffn_gate": "feed_forward_swiglu_gate_projection",
         "ffn_gate_bias": "feed_forward_swiglu_gate_projection_bias",
         "ffn_gate_up": "feed_forward_fused_gate_up_projection",
@@ -992,6 +1149,14 @@ def _param_role(name: str) -> str:
         "attention_sinks": "attention_sink_logits",
         "q_norm": "attention_query_head_normalization",
         "k_norm": "attention_key_head_normalization",
+        "token_embedding": "token_embedding_for_per_layer_input",
+        "per_layer_embedding": "packed_per_layer_token_embedding",
+        "per_layer_model_projection": "packed_per_layer_context_projection",
+        "per_layer_projection_norm": "per_layer_context_projection_normalization",
+        "per_layer_input_gate": "per_layer_residual_gate_projection",
+        "per_layer_projection": "per_layer_residual_output_projection",
+        "per_layer_post_norm": "per_layer_residual_post_normalization",
+        "layer_scalar": "layer_output_scalar",
         "delta_qkv_projection": "gated_delta_query_key_value_projection",
         "delta_z_projection": "gated_delta_output_gate_projection",
         "delta_b_projection": "gated_delta_beta_projection",

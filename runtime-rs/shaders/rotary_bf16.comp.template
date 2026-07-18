@@ -19,6 +19,7 @@ const uint HEAD_WIDTH = {{HEAD_WIDTH}}u;
 const uint ROTARY_WIDTH = {{ROTARY_WIDTH}}u;
 const float ROPE_THETA = {{ROPE_THETA}};
 const bool ROPE_INTERLEAVED = {{ROPE_INTERLEAVED}};
+const bool ROPE_PROPORTIONAL = {{ROPE_PROPORTIONAL}};
 
 float bf16_to_f32(uint value) {
     return uintBitsToFloat((value & 0xffffu) << 16);
@@ -38,6 +39,12 @@ float read_input(uint index) {
 }
 
 float rotate_value(uint base, uint dim) {
+    if (ROPE_PROPORTIONAL) {
+        uint half_width = HEAD_WIDTH / 2u;
+        return dim < half_width
+            ? -read_input(base + dim + half_width)
+            : read_input(base + dim - half_width);
+    }
     if (ROPE_INTERLEAVED) {
         return (dim & 1u) == 0u
             ? -read_input(base + dim + 1u)
@@ -49,6 +56,18 @@ float rotate_value(uint base, uint dim) {
 }
 
 float rope_angle(uint dim) {
+    if (ROPE_PROPORTIONAL) {
+        uint half_width = HEAD_WIDTH / 2u;
+        uint frequency_index = dim % half_width;
+        if (frequency_index >= (ROTARY_WIDTH / 2u)) {
+            return 0.0;
+        }
+        float inv_freq = pow(
+            ROPE_THETA,
+            -2.0 * float(frequency_index) / float(HEAD_WIDTH)
+        );
+        return float(stream_control.words[1]) * inv_freq;
+    }
     uint frequency_index = ROPE_INTERLEAVED
         ? dim / 2u
         : dim % (ROTARY_WIDTH / 2u);
@@ -60,7 +79,7 @@ float rope_angle(uint dim) {
 }
 
 float rotate(uint base, uint dim) {
-    if (dim >= ROTARY_WIDTH) {
+    if (!ROPE_PROPORTIONAL && dim >= ROTARY_WIDTH) {
         return read_input(base + dim);
     }
     float angle = rope_angle(dim);

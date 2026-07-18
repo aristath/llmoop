@@ -413,10 +413,15 @@ def shader_file_for_node(
         part_width = int(node["attrs"]["part_width"])
         return f"split_bf16_{len(node['outputs'])}x{part_width}.comp"
     if op == "multiply":
-        element_count = (
-            intermediate_size if node["id"] == "ffn_gate_multiply" else hidden_size
+        element_count = int(
+            node.get("attrs", {}).get(
+                "element_count",
+                intermediate_size if node["id"] == "ffn_gate_multiply" else hidden_size,
+            )
         )
         return f"multiply_bf16_{element_count}.comp"
+    if op == "scalar_multiply":
+        return f"scalar_multiply_bf16_{int(node['attrs']['element_count'])}.comp"
     if op == "rolling_state_update":
         temporal_memory = state_port(circuit, "temporal_memory")
         frames, state_hidden = temporal_memory["shape"]
@@ -451,6 +456,26 @@ def shader_file_for_node(
             f"_eps{shader_float_token(float(node['attrs']['eps']))}"
             f"_offset{shader_float_token(float(node['attrs']['weight_offset']))}.comp"
         )
+    if op == "rms_norm_per_head_unscaled":
+        return (
+            f"rms_norm_per_head_unscaled_bf16_{node['attrs']['key_value_heads']}"
+            f"x{node['attrs']['head_width']}"
+            f"_eps{shader_float_token(float(node['attrs']['eps']))}.comp"
+        )
+    if op == "per_layer_embedding":
+        attrs = node["attrs"]
+        token_shape = parameter_shape_for_id(circuit, "token_embedding", tensor_index)
+        vocab_size = int(token_shape[0])
+        binding = stream_control_binding_for_node(circuit, node)
+        return (
+            f"per_layer_embedding_paired_bf16_v{vocab_size}_h{attrs['hidden_size']}"
+            f"_p{attrs['per_layer_width']}_l{attrs['layer_index']}of{attrs['layer_count']}"
+            f"_eps{shader_float_token(float(attrs['norm_eps']))}"
+            f"_tes{shader_float_token(float(attrs['token_embedding_scale']))}"
+            f"_pes{shader_float_token(float(attrs['per_layer_embedding_scale']))}"
+            f"_mps{shader_float_token(float(attrs['model_projection_scale']))}"
+            f"_cs{shader_float_token(float(attrs['combination_scale']))}__sc{binding}.comp"
+        )
     if op == "rotary_position_embedding":
         heads = (
             node["attrs"]["query_heads"]
@@ -458,7 +483,13 @@ def shader_file_for_node(
             else node["attrs"]["key_value_heads"]
         )
         binding = stream_control_binding_for_node(circuit, node)
-        rope_layout = "interleaved" if node["attrs"]["interleaved"] else "half"
+        rope_layout = (
+            "proportional"
+            if node["attrs"].get("rope_type") == "proportional"
+            else "interleaved"
+            if node["attrs"]["interleaved"]
+            else "half"
+        )
         return (
             f"rotary_bf16_{heads}x{node['attrs']['head_width']}"
             f"_r{node['attrs']['rotary_width']}"
@@ -548,7 +579,11 @@ def workgroup_count_x_for_node(circuit: Json, node: Json, tensor_index: Json) ->
         return int(node["attrs"]["heads"])
     if node["op"] == "sparse_moe_experts":
         return int(node["attrs"]["num_experts"])
-    if node["op"] in {"rms_norm_per_head", "rotary_position_embedding"}:
+    if node["op"] in {
+        "rms_norm_per_head",
+        "rms_norm_per_head_unscaled",
+        "rotary_position_embedding",
+    }:
         return int(
             node["attrs"]["query_heads"]
             if node["id"].startswith("q_")
@@ -704,7 +739,12 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
             ("HEAD_COUNT", "HEAD_WIDTH", "NORM_EPS", "WEIGHT_OFFSET"),
         ),
         (
-            r"rotary_bf16_(\d+)x(\d+)_r(\d+)_theta([0-9eE+.-]+)_(half|interleaved)\.comp",
+            r"rms_norm_per_head_unscaled_bf16_(\d+)x(\d+)_eps([0-9eE+.-]+)\.comp",
+            "rms_norm_per_head_unscaled_bf16.comp.template",
+            ("HEAD_COUNT", "HEAD_WIDTH", "NORM_EPS"),
+        ),
+        (
+            r"rotary_bf16_(\d+)x(\d+)_r(\d+)_theta([0-9eE+.-]+)_(half|interleaved|proportional)\.comp",
             "rotary_bf16.comp.template",
             ("HEAD_COUNT", "HEAD_WIDTH", "ROTARY_WIDTH", "ROPE_THETA", "ROPE_LAYOUT"),
         ),
@@ -759,6 +799,11 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
             ("ELEMENT_COUNT",),
         ),
         (
+            r"scalar_multiply_bf16_(\d+)\.comp",
+            "scalar_multiply_bf16.comp.template",
+            ("ELEMENT_COUNT",),
+        ),
+        (
             r"gelu_tanh_bf16_(\d+)\.comp",
             "gelu_tanh_bf16.comp.template",
             ("ELEMENT_COUNT",),
@@ -777,12 +822,53 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
                         f"got {channels} channels and kernel width {kernel_width}"
                     )
             if "ROPE_LAYOUT" in replacements:
+                rope_layout = replacements.pop("ROPE_LAYOUT")
                 replacements["ROPE_INTERLEAVED"] = (
-                    "true"
-                    if replacements.pop("ROPE_LAYOUT") == "interleaved"
-                    else "false"
+                    "true" if rope_layout == "interleaved" else "false"
+                )
+                replacements["ROPE_PROPORTIONAL"] = (
+                    "true" if rope_layout == "proportional" else "false"
                 )
             return render_shader_template(source_dir, template, replacements)
+
+    per_layer_embedding_shape = re.fullmatch(
+        r"per_layer_embedding_paired_bf16_v(\d+)_h(\d+)_p(\d+)_l(\d+)of(\d+)"
+        r"_eps([0-9eE+.-]+)_tes([0-9eE+.-]+)_pes([0-9eE+.-]+)"
+        r"_mps([0-9eE+.-]+)_cs([0-9eE+.-]+)\.comp",
+        shader_file,
+    )
+    if per_layer_embedding_shape is not None:
+        (
+            vocab_size,
+            hidden_size,
+            per_layer_width,
+            layer_index,
+            layer_count,
+        ) = map(int, per_layer_embedding_shape.groups()[:5])
+        if hidden_size % 2 or per_layer_width % 2:
+            raise ModelCompileError(
+                "paired per-layer embeddings require even hidden and per-layer widths"
+            )
+        if not 0 <= layer_index < layer_count:
+            raise ModelCompileError(
+                f"per-layer embedding index {layer_index} is outside {layer_count} layers"
+            )
+        return render_shader_template(
+            source_dir,
+            "per_layer_embedding_paired_bf16.comp.template",
+            {
+                "VOCAB_SIZE": str(vocab_size),
+                "HIDDEN_SIZE": str(hidden_size),
+                "PER_LAYER_WIDTH": str(per_layer_width),
+                "LAYER_INDEX": str(layer_index),
+                "LAYER_COUNT": str(layer_count),
+                "NORM_EPS": per_layer_embedding_shape.group(6),
+                "TOKEN_EMBEDDING_SCALE": per_layer_embedding_shape.group(7),
+                "PER_LAYER_EMBEDDING_SCALE": per_layer_embedding_shape.group(8),
+                "MODEL_PROJECTION_SCALE": per_layer_embedding_shape.group(9),
+                "COMBINATION_SCALE": per_layer_embedding_shape.group(10),
+            },
+        )
 
     attention_shape = re.fullmatch(
         r"gqa_attention_bf16_q(\d+)_kv(\d+)_d(\d+)_scale([0-9eE+.-]+)(?:_w(\d+))?(_sinks)?\.comp",
@@ -1253,6 +1339,13 @@ def parameter_shape_for_node(
     circuit: Json, node: Json, tensor_index: Json
 ) -> list[int]:
     parameter_id = node["params"][0]
+    parameter = circuit["parameters"]["refs"][parameter_id]
+    return tensor_shape(tensor_index, parameter["tensor"])
+
+
+def parameter_shape_for_id(
+    circuit: Json, parameter_id: str, tensor_index: Json
+) -> list[int]:
     parameter = circuit["parameters"]["refs"][parameter_id]
     return tensor_shape(tensor_index, parameter["tensor"])
 
