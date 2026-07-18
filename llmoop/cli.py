@@ -147,8 +147,8 @@ def main() -> None:
     parser.add_argument(
         "--max-new-tokens",
         type=int,
-        default=128,
-        help="generation stop condition for --run/--run-model; independent of context allocation",
+        default=65_536,
+        help="generation stop condition for --run/--run-model; independent of context allocation (default: 65536)",
     )
     parser.add_argument(
         "--temperature",
