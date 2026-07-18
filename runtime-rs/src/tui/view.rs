@@ -1010,9 +1010,11 @@ fn property_display(property: &super::app::PedalPropertyDraft) -> String {
     .flatten()
     .collect::<Vec<_>>()
     .join("+");
-    let lifecycle = (!lifecycle.is_empty())
-        .then(|| format!(" · {lifecycle}"))
-        .unwrap_or_default();
+    let lifecycle = if lifecycle.is_empty() {
+        String::new()
+    } else {
+        format!(" · {lifecycle}")
+    };
     match &property.schema.kind {
         RuntimeEditorControlKind::Unsupported { declared_type } => {
             format!("unsupported {declared_type} · {}", property.schema.raw)
