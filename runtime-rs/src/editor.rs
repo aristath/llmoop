@@ -175,6 +175,22 @@ pub struct RuntimeModelEditor {
 
 impl RuntimeModelEditor {
     pub fn load(path: impl AsRef<Path>) -> Result<Self, RuntimeEditorError> {
+        Self::load_with_device_provider(path, |default_device_id| {
+            discover_runtime_devices(default_device_id, None)
+        })
+    }
+
+    pub fn load_with_available_devices(
+        path: impl AsRef<Path>,
+        available_devices: Vec<RuntimeAvailableDevice>,
+    ) -> Result<Self, RuntimeEditorError> {
+        Self::load_with_device_provider(path, |_| available_devices)
+    }
+
+    fn load_with_device_provider(
+        path: impl AsRef<Path>,
+        devices: impl FnOnce(&str) -> Vec<RuntimeAvailableDevice>,
+    ) -> Result<Self, RuntimeEditorError> {
         let manifest_path = match classify_runtime_model_path(path)? {
             RuntimeModelPathKind::CompiledPackage { manifest } => manifest,
             RuntimeModelPathKind::SafetensorsSource { .. } => {
@@ -205,8 +221,7 @@ impl RuntimeModelEditor {
                     .to_string(),
             ));
         }
-        let available_devices =
-            discover_runtime_devices(&manifest.placement.default_device_id, None);
+        let available_devices = devices(&manifest.placement.default_device_id);
         Ok(Self {
             package_manifest_path: manifest_path,
             package_root,
@@ -556,6 +571,48 @@ impl RuntimeModelEditor {
             .iter()
             .find(|pedal| pedal.source_id == source_id)
     }
+}
+
+#[cfg(test)]
+pub(crate) fn load_runtime_model_editor_without_hardware(
+    path: impl AsRef<Path>,
+) -> Result<RuntimeModelEditor, RuntimeEditorError> {
+    let path = path.as_ref();
+    let manifest_path = match classify_runtime_model_path(path)? {
+        RuntimeModelPathKind::CompiledPackage { manifest } => manifest,
+        RuntimeModelPathKind::SafetensorsSource { .. } => {
+            return Err(RuntimeEditorError(
+                "test editor requires a compiled package".to_string(),
+            ));
+        }
+    };
+    let manifest = VulkanResidentGreedyModelPackageManifest::from_json_file(&manifest_path)?;
+    let device_id = manifest.placement.default_device_id.clone();
+    RuntimeModelEditor::load_with_available_devices(
+        manifest_path,
+        vec![RuntimeAvailableDevice {
+            device_id: device_id.clone(),
+            backend: "test".to_string(),
+            available: true,
+            runtime_device_id: Some(device_id),
+            physical_device_id: Some("test:0".to_string()),
+            physical_device_index: Some(0),
+            device_name: Some("Deterministic test device".to_string()),
+            device_type: Some("test".to_string()),
+            vendor_id: None,
+            raw_device_id: None,
+            api_version: None,
+            driver_version: None,
+            compute_queue_family_indices: Some(vec![0]),
+            memory_heaps: Some(Vec::new()),
+            selected_by_default: Some(true),
+            selected_by_runtime: Some(true),
+            runtime_binding: Some("test_only".to_string()),
+            can_host_runtime_pedals_on_physical_device: Some(true),
+            notes: vec!["hardware discovery disabled for this test".to_string()],
+            error: None,
+        }],
+    )
 }
 
 fn source_pedals(
@@ -1031,7 +1088,7 @@ mod tests {
         if !package.join(RUNTIME_PACKAGE_MANIFEST_FILE).is_file() {
             return;
         }
-        let mut editor = RuntimeModelEditor::load(&package).unwrap();
+        let mut editor = load_runtime_model_editor_without_hardware(&package).unwrap();
         let original_first = editor.instances()[0].instance_id.clone();
 
         editor.replace_layer_sequence(&[0, 1, 1, 2]).unwrap();

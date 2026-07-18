@@ -1228,8 +1228,9 @@ mod tests {
         let Some(package) = std::env::var_os("LLMOOP_TEST_PACKAGE_DIR") else {
             return;
         };
+        let editor = crate::editor::load_runtime_model_editor_without_hardware(package).unwrap();
         let mut app = App::new();
-        app.load_compiled_model(package);
+        app.install_editor(editor);
         for (width, height) in [(80, 24), (40, 12)] {
             let rendered = rendered_text(&mut app, width, height);
             assert!(rendered.contains("SIGNAL BOARD"));

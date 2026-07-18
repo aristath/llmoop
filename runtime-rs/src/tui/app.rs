@@ -1136,26 +1136,7 @@ impl App {
         let loaded = RuntimeModelEditor::load(&path);
         self.terminal_reset_requested = true;
         match loaded {
-            Ok(editor) => {
-                let sequence = editor.layer_sequence();
-                let selected_instance_id = editor
-                    .instances()
-                    .first()
-                    .map(|instance| instance.instance_id.clone());
-                self.sequence.set(format_layer_sequence(&sequence));
-                self.last_valid_sequence = sequence;
-                self.sequence_error = None;
-                self.selected_instance_id = selected_instance_id;
-                self.board_scroll = 0;
-                self.status = format!(
-                    "Loaded {} · {} pedals · draft not mounted",
-                    editor.package_id(),
-                    editor.instances().len()
-                );
-                self.editor = Some(editor);
-                self.overlay = None;
-                self.focus = FocusRegion::Board;
-            }
+            Ok(editor) => self.install_editor(editor),
             Err(error) => {
                 let mut selector = match self.overlay.take() {
                     Some(Overlay::Compiler(progress)) => progress.selector,
@@ -1168,6 +1149,27 @@ impl App {
                 self.overlay = Some(Overlay::ModelSelector(selector));
             }
         }
+    }
+
+    pub(crate) fn install_editor(&mut self, editor: RuntimeModelEditor) {
+        let sequence = editor.layer_sequence();
+        let selected_instance_id = editor
+            .instances()
+            .first()
+            .map(|instance| instance.instance_id.clone());
+        self.sequence.set(format_layer_sequence(&sequence));
+        self.last_valid_sequence = sequence;
+        self.sequence_error = None;
+        self.selected_instance_id = selected_instance_id;
+        self.board_scroll = 0;
+        self.status = format!(
+            "Loaded {} · {} pedals · draft not mounted",
+            editor.package_id(),
+            editor.instances().len()
+        );
+        self.editor = Some(editor);
+        self.overlay = None;
+        self.focus = FocusRegion::Board;
     }
 
     fn apply_sequence_text(&mut self) {
@@ -1833,8 +1835,9 @@ mod tests {
         let Some(package) = env::var_os("LLMOOP_TEST_PACKAGE_DIR") else {
             return;
         };
+        let editor = crate::editor::load_runtime_model_editor_without_hardware(package).unwrap();
         let mut app = App::new();
-        app.load_compiled_model(package);
+        app.install_editor(editor);
         assert!(app.overlay.is_none());
         let original = app.last_valid_sequence.clone();
         let original_selected = app.selected_instance_id.clone();
