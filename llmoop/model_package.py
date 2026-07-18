@@ -110,6 +110,7 @@ def build_vulkan_resident_greedy_package_manifest(
     dimensions = model_graph["dimensions"]
     hidden_size = int(dimensions["hidden_size"])
     vocab_size = int(dimensions["vocab_size"])
+    norm_eps = float(model_graph["numerics"]["rms_norm_eps"])
     max_context_activations = int(dimensions["max_position_embeddings"])
     dtype = "BF16"
     dtype_bytes = dtype_byte_count(dtype)
@@ -140,6 +141,7 @@ def build_vulkan_resident_greedy_package_manifest(
         if projection_layout == VULKAN_BF16_ROW_PAIR_LAYOUT
         else f"tied_output_projection_bf16_{vocab_size}x{hidden_size}_to_f32.comp"
     )
+    norm_shader_file = rms_norm_shader_file(hidden_size, norm_eps)
 
     compiled_circuits = {
         circuit_ref["id"]: optimize_circuit_for_vulkan(
@@ -161,6 +163,7 @@ def build_vulkan_resident_greedy_package_manifest(
             pedal_executions,
             embedding_shader_file=embedding_shader_file,
             projection_shader_file=projection_shader_file,
+            norm_shader_file=norm_shader_file,
         ),
     )
     compile_shader_artifacts(package_dir / "shaders")
@@ -225,7 +228,7 @@ def build_vulkan_resident_greedy_package_manifest(
                 "projection_local_size_x": 64,
             },
             "embedding_norm_shader_path": compiled_shader_path(
-                "shaders/rms_norm_bf16_serial.comp"
+                f"shaders/{norm_shader_file}"
             ),
             "projection_shader_path": compiled_shader_path(
                 f"shaders/{projection_shader_file}"
@@ -338,7 +341,7 @@ def shader_file_for_node(
     op = node["op"]
 
     if op == "rms_norm":
-        return "rms_norm_bf16_serial.comp"
+        return rms_norm_shader_file(hidden_size, float(node["attrs"]["eps"]))
     if op == "linear":
         parameter_shape = parameter_shape_for_node(circuit, node, tensor_index)
         out_features, in_features = parameter_shape
@@ -384,7 +387,10 @@ def shader_file_for_node(
             if node["id"].startswith("q_")
             else node["attrs"]["key_value_heads"]
         )
-        return f"rms_norm_per_head_bf16_{heads}x{node['attrs']['head_width']}.comp"
+        return (
+            f"rms_norm_per_head_bf16_{heads}x{node['attrs']['head_width']}"
+            f"_eps{shader_float_token(float(node['attrs']['eps']))}.comp"
+        )
     if op == "rotary_position_embedding":
         heads = (
             node["attrs"]["query_heads"]
@@ -392,7 +398,12 @@ def shader_file_for_node(
             else node["attrs"]["key_value_heads"]
         )
         binding = stream_control_binding_for_node(circuit, node)
-        return f"rotary_bf16_{heads}x{node['attrs']['head_width']}__sc{binding}.comp"
+        rope_layout = "interleaved" if node["attrs"]["interleaved"] else "half"
+        return (
+            f"rotary_bf16_{heads}x{node['attrs']['head_width']}"
+            f"_theta{shader_float_token(float(node['attrs']['theta']))}_{rope_layout}"
+            f"__sc{binding}.comp"
+        )
     if op == "append_state_update":
         binding = stream_control_binding_for_node(circuit, node)
         return (
@@ -441,11 +452,12 @@ def required_shader_files(
     *,
     embedding_shader_file: str,
     projection_shader_file: str,
+    norm_shader_file: str,
 ) -> set[str]:
     vocab_size = int(dimensions["vocab_size"])
 
     return {
-        "rms_norm_bf16_serial.comp",
+        norm_shader_file,
         f"greedy_sampler_f32_{vocab_size}.comp",
         embedding_shader_file,
         projection_shader_file,
@@ -457,107 +469,164 @@ def required_shader_files(
     }
 
 
+def rms_norm_shader_file(hidden_size: int, eps: float) -> str:
+    return f"rms_norm_bf16_h{hidden_size}_eps{shader_float_token(eps)}.comp"
+
+
+def shader_float_token(value: float) -> str:
+    return format(value, ".9g")
+
+
 def copy_shader_templates(source_dir: Path, dest_dir: Path, shader_files: set[str]) -> None:
     if dest_dir.exists():
         shutil.rmtree(dest_dir)
     dest_dir.mkdir(parents=True, exist_ok=True)
     for shader_file in sorted(shader_files):
-        source = source_dir / shader_file
         destination = dest_dir / shader_file
-        if source.exists():
-            shutil.copy2(source, destination)
-            continue
+        destination.write_text(render_shader_source(source_dir, shader_file))
 
-        stream_control_variant = re.fullmatch(r"(.+)__sc(\d+)\.comp", shader_file)
-        if stream_control_variant is not None:
-            source_name, binding = stream_control_variant.groups()
-            source = source_dir / f"{source_name}.comp"
-            if not source.exists():
-                raise ModelCompileError(f"missing shader template {source}")
-            rendered, replacement_count = re.subn(
-                r"layout\(set = 0, binding = \d+\) readonly buffer StreamControl",
-                f"layout(set = 0, binding = {binding}) readonly buffer StreamControl",
-                source.read_text(),
+
+def render_shader_source(source_dir: Path, shader_file: str) -> str:
+    source = source_dir / shader_file
+    if source.exists():
+        return source.read_text()
+
+    stream_control_variant = re.fullmatch(r"(.+)__sc(\d+)\.comp", shader_file)
+    if stream_control_variant is not None:
+        source_name, binding = stream_control_variant.groups()
+        rendered = render_shader_source(source_dir, f"{source_name}.comp")
+        rendered, replacement_count = re.subn(
+            r"layout\(set = 0, binding = \d+\) readonly buffer StreamControl",
+            f"layout(set = 0, binding = {binding}) readonly buffer StreamControl",
+            rendered,
+        )
+        if replacement_count != 1:
+            raise ModelCompileError(
+                f"shader {shader_file} has {replacement_count} stream-control bindings; expected one"
             )
-            if replacement_count != 1:
-                raise ModelCompileError(
-                    f"shader template {source} has {replacement_count} stream-control bindings; expected one"
-                )
-            destination.write_text(rendered)
-            continue
+        return rendered
 
-        linear_shape = re.fullmatch(r"linear_bf16_(\d+)x(\d+)\.comp", shader_file)
-        linear_paired_shape = re.fullmatch(
-            r"linear_paired_bf16_(\d+)x(\d+)\.comp", shader_file
-        )
-        linear_residual_shape = re.fullmatch(
-            r"linear_residual_bf16_(\d+)x(\d+)\.comp", shader_file
-        )
-        linear_residual_paired_shape = re.fullmatch(
-            r"linear_residual_paired_bf16_(\d+)x(\d+)\.comp", shader_file
-        )
-        embedding_shape = re.fullmatch(
-            r"embedding_lookup_bf16_(\d+)x(\d+)\.comp", shader_file
-        )
-        embedding_paired_shape = re.fullmatch(
-            r"embedding_lookup_paired_bf16_(\d+)x(\d+)\.comp", shader_file
-        )
-        projection_shape = re.fullmatch(
+    shaped_templates = (
+        (
+            r"linear_bf16_(\d+)x(\d+)\.comp",
+            "linear_bf16.comp.template",
+            ("INPUT_SIZE", "OUTPUT_SIZE"),
+        ),
+        (
+            r"linear_paired_bf16_(\d+)x(\d+)\.comp",
+            "linear_paired_bf16.comp.template",
+            ("INPUT_SIZE", "OUTPUT_SIZE"),
+        ),
+        (
+            r"linear_residual_bf16_(\d+)x(\d+)\.comp",
+            "linear_residual_bf16.comp.template",
+            ("INPUT_SIZE", "OUTPUT_SIZE"),
+        ),
+        (
+            r"linear_residual_paired_bf16_(\d+)x(\d+)\.comp",
+            "linear_residual_paired_bf16.comp.template",
+            ("INPUT_SIZE", "OUTPUT_SIZE"),
+        ),
+        (
+            r"embedding_lookup_bf16_(\d+)x(\d+)\.comp",
+            "embedding_lookup_bf16.comp.template",
+            ("VOCAB_SIZE", "HIDDEN_SIZE"),
+        ),
+        (
+            r"embedding_lookup_paired_bf16_(\d+)x(\d+)\.comp",
+            "embedding_lookup_paired_bf16.comp.template",
+            ("VOCAB_SIZE", "HIDDEN_SIZE"),
+        ),
+        (
             r"tied_output_projection_bf16_(\d+)x(\d+)_to_f32\.comp",
-            shader_file,
-        )
-        projection_paired_shape = re.fullmatch(
+            "tied_output_projection_bf16.comp.template",
+            ("VOCAB_SIZE", "INPUT_SIZE"),
+        ),
+        (
             r"tied_output_projection_paired_bf16_(\d+)x(\d+)_to_f32\.comp",
-            shader_file,
-        )
-        shapes = (
-            linear_shape,
-            linear_paired_shape,
-            linear_residual_shape,
-            linear_residual_paired_shape,
-            embedding_shape,
-            embedding_paired_shape,
-            projection_shape,
-            projection_paired_shape,
-        )
-        if all(shape is None for shape in shapes):
-            raise ModelCompileError(f"missing shader template {source}")
+            "tied_output_projection_paired_bf16.comp.template",
+            ("VOCAB_SIZE", "INPUT_SIZE"),
+        ),
+        (
+            r"rms_norm_bf16_h(\d+)_eps([0-9eE+.-]+)\.comp",
+            "rms_norm_bf16.comp.template",
+            ("HIDDEN_SIZE", "NORM_EPS"),
+        ),
+        (
+            r"rms_norm_per_head_bf16_(\d+)x(\d+)_eps([0-9eE+.-]+)\.comp",
+            "rms_norm_per_head_bf16.comp.template",
+            ("HEAD_COUNT", "HEAD_WIDTH", "NORM_EPS"),
+        ),
+        (
+            r"rotary_bf16_(\d+)x(\d+)_theta([0-9eE+.-]+)_(half|interleaved)\.comp",
+            "rotary_bf16.comp.template",
+            ("HEAD_COUNT", "HEAD_WIDTH", "ROPE_THETA", "ROPE_LAYOUT"),
+        ),
+        (
+            r"append_kv_state_bf16_(\d+)x(\d+)\.comp",
+            "append_kv_state_bf16.comp.template",
+            ("KV_HEADS", "HEAD_WIDTH"),
+        ),
+        (
+            r"greedy_sampler_f32_(\d+)\.comp",
+            "greedy_sampler_f32.comp.template",
+            ("VOCAB_SIZE",),
+        ),
+    )
+    for pattern, template, names in shaped_templates:
+        match = re.fullmatch(pattern, shader_file)
+        if match is not None:
+            replacements = dict(zip(names, match.groups(), strict=True))
+            if "ROPE_LAYOUT" in replacements:
+                replacements["ROPE_INTERLEAVED"] = (
+                    "true" if replacements.pop("ROPE_LAYOUT") == "interleaved" else "false"
+                )
+            return render_shader_template(source_dir, template, replacements)
 
-        template_path = source_dir / (
-            "embedding_lookup_paired_bf16.comp.template"
-            if embedding_paired_shape is not None
-            else "embedding_lookup_bf16.comp.template"
-            if embedding_shape is not None
-            else "tied_output_projection_paired_bf16.comp.template"
-            if projection_paired_shape is not None
-            else "tied_output_projection_bf16.comp.template"
-            if projection_shape is not None
-            else "linear_residual_paired_bf16.comp.template"
-            if linear_residual_paired_shape is not None
-            else "linear_residual_bf16.comp.template"
-            if linear_residual_shape is not None
-            else "linear_paired_bf16.comp.template"
-            if linear_paired_shape is not None
-            else "linear_bf16.comp.template"
+    attention_shape = re.fullmatch(
+        r"gqa_attention_bf16_q(\d+)_kv(\d+)_d(\d+)\.comp", shader_file
+    )
+    if attention_shape is not None:
+        query_heads, kv_heads, head_width = map(int, attention_shape.groups())
+        if query_heads % kv_heads != 0:
+            raise ModelCompileError(
+                f"query head count {query_heads} is not divisible by KV head count {kv_heads}"
+            )
+        if head_width < 2 or head_width % 2 != 0 or 1024 % head_width != 0:
+            raise ModelCompileError(
+                f"attention head width {head_width} cannot be tiled into a 1024-invocation pedal"
+            )
+        return render_shader_template(
+            source_dir,
+            "gqa_attention_bf16.comp.template",
+            {
+                "QUERY_HEADS": str(query_heads),
+                "KV_HEADS": str(kv_heads),
+                "QUERY_GROUPS_PER_KV_HEAD": str(query_heads // kv_heads),
+                "HEAD_WIDTH": str(head_width),
+                "TILE_TOKENS": str(1024 // head_width),
+                "ATTENTION_SCALE": shader_float_token(head_width**-0.5),
+            },
         )
-        if not template_path.exists():
-            raise ModelCompileError(f"missing shader template {template_path}")
-        shape = next(shape for shape in shapes if shape is not None)
-        first_dimension, second_dimension = shape.groups()
-        rendered = template_path.read_text()
-        if embedding_shape is not None or embedding_paired_shape is not None:
-            rendered = rendered.replace("{{VOCAB_SIZE}}", first_dimension).replace(
-                "{{HIDDEN_SIZE}}", second_dimension
-            )
-        elif projection_shape is not None or projection_paired_shape is not None:
-            rendered = rendered.replace("{{VOCAB_SIZE}}", first_dimension).replace(
-                "{{INPUT_SIZE}}", second_dimension
-            )
-        else:
-            rendered = rendered.replace("{{INPUT_SIZE}}", first_dimension).replace(
-                "{{OUTPUT_SIZE}}", second_dimension
-            )
-        destination.write_text(rendered)
+
+    raise ModelCompileError(f"missing shader source or template for {shader_file}")
+
+
+def render_shader_template(
+    source_dir: Path, template_file: str, replacements: dict[str, str]
+) -> str:
+    template_path = source_dir / template_file
+    if not template_path.exists():
+        raise ModelCompileError(f"missing shader template {template_path}")
+    rendered = template_path.read_text()
+    for name, value in replacements.items():
+        rendered = rendered.replace(f"{{{{{name}}}}}", value)
+    unresolved = sorted(set(re.findall(r"\{\{([A-Z0-9_]+)\}\}", rendered)))
+    if unresolved:
+        raise ModelCompileError(
+            f"shader template {template_path} has unresolved values: {', '.join(unresolved)}"
+        )
+    return rendered
 
 
 def compile_shader_artifacts(shader_dir: Path) -> None:

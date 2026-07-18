@@ -23393,7 +23393,7 @@ mod tests {
         assert_eq!(run.tick_run.output_run.dispatch_count, 2);
         assert_eq!(run.sampler_run.descriptor_count, 3);
         assert_eq!(run.sampler_run.token_id, 1);
-        assert_eq!(run.sampler_run.selected_logit_bits, 1_100_857_832);
+        assert_eq!(run.sampler_run.selected_logit_bits, 1_100_541_195);
 
         let input_frame = placed_package
             .mounted_device("gpu0")
@@ -23452,7 +23452,7 @@ mod tests {
                 .iter()
                 .map(|tick| tick.tick_run.sampler_run.selected_logit_bits)
                 .collect::<Vec<_>>(),
-            vec![1_100_857_832, 1_101_644_913]
+            vec![1_100_541_195, 1_101_457_177]
         );
         assert_eq!(
             run.tick_runs
