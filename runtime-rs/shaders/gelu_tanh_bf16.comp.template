@@ -1,0 +1,30 @@
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer InputFrame { uint words[]; } input_frame;
+layout(set = 0, binding = 1) buffer OutputFrame { uint words[]; } output_frame;
+
+const uint ELEMENT_COUNT = {{ELEMENT_COUNT}}u;
+const uint WORD_COUNT = (ELEMENT_COUNT + 1u) / 2u;
+
+float bf16_to_f32(uint value) { return uintBitsToFloat((value & 0xffffu) << 16); }
+uint f32_to_bf16(float value) {
+    uint bits = floatBitsToUint(value);
+    uint lsb = (bits >> 16) & 1u;
+    return (bits + 0x7fffu + lsb) >> 16;
+}
+float gelu_tanh(float value) {
+    const float coefficient = 0.7978845608028654;
+    return 0.5 * value * (1.0 + tanh(coefficient * (value + 0.044715 * value * value * value)));
+}
+void main() {
+    for (uint word = gl_LocalInvocationID.x; word < WORD_COUNT; word += 64u) {
+        uint packed = input_frame.words[word];
+        uint lo = f32_to_bf16(gelu_tanh(bf16_to_f32(packed)));
+        uint hi = word * 2u + 1u < ELEMENT_COUNT
+            ? f32_to_bf16(gelu_tanh(bf16_to_f32(packed >> 16)))
+            : 0u;
+        output_frame.words[word] = (hi << 16) | lo;
+    }
+}

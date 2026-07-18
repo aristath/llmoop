@@ -945,7 +945,7 @@ fn infer_node_output_shapes(
     let unknown = || Ok(vec![None; outputs]);
 
     match node.op.as_str() {
-        "rms_norm" | "rms_norm_per_head" | "silu" | "rotary_position_embedding" => {
+        "rms_norm" | "rms_norm_per_head" | "silu" | "gelu_tanh" | "rotary_position_embedding" => {
             Ok(repeat_shape(first_input_shape(node, signals), outputs))
         }
         "multiply"
@@ -982,6 +982,10 @@ fn infer_node_output_shapes(
             let output_shape = attr_usize(node, "value_heads")
                 .zip(attr_usize(node, "value_head_width"))
                 .map(|(heads, width)| vec![heads * width]);
+            Ok(repeat_shape(output_shape, outputs))
+        }
+        "rg_lru_step" => {
+            let output_shape = attr_usize(node, "width").map(|width| vec![width]);
             Ok(repeat_shape(output_shape, outputs))
         }
         "moe_topk" => {

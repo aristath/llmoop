@@ -122,7 +122,12 @@ def build_vulkan_resident_greedy_package_manifest(
     norm_weight_offset = float(model_graph["numerics"]["rms_norm_weight_offset"])
     embedding_scale = float(model_graph["numerics"]["embedding_scale"])
     logits_scale = float(model_graph["numerics"]["logits_scale"])
-    max_context_activations = int(dimensions["max_position_embeddings"])
+    configured_context = dimensions.get("max_position_embeddings")
+    max_context_activations = int(
+        configured_context
+        if configured_context is not None
+        else dimensions.get("attention_window_size") or 4096
+    )
     dtype = "BF16"
     dtype_bytes = dtype_byte_count(dtype)
     frame_bytes = hidden_size * dtype_bytes
@@ -374,11 +379,13 @@ def shader_file_for_node(
         parameter_shape = parameter_shape_for_node(circuit, node, tensor_index)
         out_features, in_features = parameter_shape
         layout = parameter_layout_for_node(circuit, node, tensor_index)
-        prefix = (
-            "linear_paired_bf16"
-            if layout == VULKAN_BF16_ROW_PAIR_LAYOUT
-            else "linear_bf16"
-        )
+        has_bias = len(node.get("params", [])) == 2
+        prefix = "linear"
+        if has_bias:
+            prefix += "_bias"
+        if layout == VULKAN_BF16_ROW_PAIR_LAYOUT:
+            prefix += "_paired"
+        prefix += "_bf16"
         return f"{prefix}_{in_features}x{out_features}.comp"
     if op == "linear_residual":
         parameter_shape = parameter_shape_for_node(circuit, node, tensor_index)
@@ -420,6 +427,8 @@ def shader_file_for_node(
         )
     if op == "silu":
         return f"silu_bf16_{intermediate_size}.comp"
+    if op == "gelu_tanh":
+        return f"gelu_tanh_bf16_{int(node['attrs']['element_count'])}.comp"
     if op == "silu_multiply":
         return "silu_multiply_bf16.comp"
     if op == "sigmoid_multiply":
@@ -458,12 +467,14 @@ def shader_file_for_node(
     if op == "scaled_dot_product_attention":
         attrs = node["attrs"]
         binding = stream_control_binding_for_node(circuit, node)
-        return (
+        name = (
             "gqa_attention_bf16_"
             f"q{attrs['query_heads']}_kv{attrs['key_value_heads']}_d{attrs['head_width']}"
             f"_scale{shader_float_token(float(attrs['scale']))}"
-            f"__sc{binding}.comp"
         )
+        if attrs.get("window_size") is not None:
+            name += f"_w{int(attrs['window_size'])}"
+        return f"{name}__sc{binding}.comp"
     if op == "causal_conv1d_silu":
         return (
             f"causal_conv1d_silu_bf16_c{node['attrs']['channels']}"
@@ -487,6 +498,13 @@ def shader_file_for_node(
             f"gated_delta_step_k{attrs['key_heads']}x{attrs['key_head_width']}"
             f"_v{attrs['value_heads']}x{attrs['value_head_width']}"
             f"_eps{shader_float_token(float(attrs['norm_eps']))}.comp"
+        )
+    if op == "rg_lru_step":
+        attrs = node["attrs"]
+        binding = stream_control_binding_for_node(circuit, node)
+        return (
+            f"rg_lru_step_bf16_h{attrs['width']}_b{attrs['heads']}x{attrs['block_width']}"
+            f"_k{attrs['conv_kernel_width']}__sc{binding}.comp"
         )
     if op == "moe_topk":
         attrs = node["attrs"]
@@ -517,6 +535,8 @@ def workgroup_count_x_for_node(circuit: Json, node: Json, tensor_index: Json) ->
         return int(node["attrs"]["query_heads"])
     if node["op"] == "gated_delta_step":
         return int(node["attrs"]["value_heads"])
+    if node["op"] == "rg_lru_step":
+        return int(node["attrs"]["heads"])
     if node["op"] == "sparse_moe_experts":
         return int(node["attrs"]["num_experts"])
     if node["op"] in {"rms_norm_per_head", "rotary_position_embedding"}:
@@ -535,6 +555,8 @@ def local_size_x_for_node(node: Json) -> int:
         return 1024
     if node["op"] == "gated_delta_step":
         return int(node["attrs"]["value_head_width"])
+    if node["op"] == "rg_lru_step":
+        return int(node["attrs"]["block_width"])
     if node["op"] == "sparse_moe_experts":
         return 256
     return 64
@@ -617,6 +639,16 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
             ("INPUT_SIZE", "OUTPUT_SIZE"),
         ),
         (
+            r"linear_bias_bf16_(\d+)x(\d+)\.comp",
+            "linear_bias_bf16.comp.template",
+            ("INPUT_SIZE", "OUTPUT_SIZE"),
+        ),
+        (
+            r"linear_bias_paired_bf16_(\d+)x(\d+)\.comp",
+            "linear_bias_paired_bf16.comp.template",
+            ("INPUT_SIZE", "OUTPUT_SIZE"),
+        ),
+        (
             r"linear_residual_bf16_(\d+)x(\d+)\.comp",
             "linear_residual_bf16.comp.template",
             ("INPUT_SIZE", "OUTPUT_SIZE"),
@@ -696,6 +728,21 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
             "scaled_add_bf16.comp.template",
             ("ELEMENT_COUNT", "RESIDUAL_SCALE"),
         ),
+        (
+            r"add_bf16_(\d+)\.comp",
+            "add_bf16.comp.template",
+            ("ELEMENT_COUNT",),
+        ),
+        (
+            r"multiply_bf16_(\d+)\.comp",
+            "multiply_bf16.comp.template",
+            ("ELEMENT_COUNT",),
+        ),
+        (
+            r"gelu_tanh_bf16_(\d+)\.comp",
+            "gelu_tanh_bf16.comp.template",
+            ("ELEMENT_COUNT",),
+        ),
     )
     for pattern, template, names in shaped_templates:
         match = re.fullmatch(pattern, shader_file)
@@ -718,7 +765,7 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
             return render_shader_template(source_dir, template, replacements)
 
     attention_shape = re.fullmatch(
-        r"gqa_attention_bf16_q(\d+)_kv(\d+)_d(\d+)_scale([0-9eE+.-]+)\.comp",
+        r"gqa_attention_bf16_q(\d+)_kv(\d+)_d(\d+)_scale([0-9eE+.-]+)(?:_w(\d+))?\.comp",
         shader_file,
     )
     if attention_shape is not None:
@@ -741,6 +788,7 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
                 "HEAD_WIDTH": str(head_width),
                 "TILE_TOKENS": str(1024 // head_width),
                 "ATTENTION_SCALE": attention_shape.group(4),
+                "ATTENTION_WINDOW": attention_shape.group(5) or "0",
             },
         )
 
@@ -770,6 +818,30 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
                 "VALUE_HEAD_WIDTH": str(value_width),
                 "KEY_HEAD_REPEAT": str(value_heads // key_heads),
                 "NORM_EPS": gated_delta_shape.group(5),
+            },
+        )
+
+    rg_lru_shape = re.fullmatch(
+        r"rg_lru_step_bf16_h(\d+)_b(\d+)x(\d+)_k(\d+)\.comp", shader_file
+    )
+    if rg_lru_shape is not None:
+        width, heads, block_width, kernel_width = map(int, rg_lru_shape.groups())
+        if heads * block_width != width:
+            raise ModelCompileError(
+                f"RG-LRU block shape {heads}x{block_width} does not equal width {width}"
+            )
+        if block_width > 1024 or block_width % 2:
+            raise ModelCompileError(
+                f"RG-LRU block width {block_width} is not a supported workgroup width"
+            )
+        return render_shader_template(
+            source_dir,
+            "rg_lru_step_bf16.comp.template",
+            {
+                "WIDTH": str(width),
+                "HEADS": str(heads),
+                "BLOCK_WIDTH": str(block_width),
+                "KERNEL_WIDTH": str(kernel_width),
             },
         )
 
@@ -900,7 +972,7 @@ def stream_control_binding_for_node(circuit: Json, node: Json) -> int:
     state_view_signals = {
         output
         for producer in circuit["nodes"]
-        if producer.get("state_writes")
+        if producer.get("op") in {"append_state_update", "rolling_state_update"}
         for output in producer.get("outputs", [])
     }
     signal_bindings = [*node.get("inputs", []), *node.get("outputs", [])]

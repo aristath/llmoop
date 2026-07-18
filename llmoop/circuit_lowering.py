@@ -43,6 +43,8 @@ def build_pedal_circuit(pedal: Json, pedal_path: Path) -> Json:
         return build_attention_circuit(pedal, pedal_path)
     if operator_type == "gated_delta":
         return build_gated_delta_circuit(pedal, pedal_path)
+    if operator_type == "rg_lru":
+        return build_rg_lru_circuit(pedal, pedal_path)
     raise ValueError(f"unsupported pedal operator type {operator_type!r}")
 
 
@@ -117,7 +119,12 @@ def build_conv_circuit(pedal: Json, pedal_path: Path) -> Json:
         behavioral_role="source_reference_circuit",
         implementation="reference_shortconv_layer_circuit_v1",
         circuit_id=f"{pedal['id']}_shortconv_circuit_v1",
-        nodes=_conv_nodes(hidden_size, pedal["numerics"], pedal["feed_forward"]),
+        nodes=_conv_nodes(
+            hidden_size,
+            pedal["numerics"],
+            pedal["feed_forward"],
+            pedal["parameter_block"]["params"],
+        ),
         behavioral_notes=(
             "This circuit preserves the source short-convolution layer decomposition.",
             "It is a structural lowering artifact; a backend may replace this source pedal with an executable implementation.",
@@ -140,6 +147,7 @@ def build_attention_circuit(pedal: Json, pedal_path: Path) -> Json:
             has_q_norm="q_norm" in parameters,
             has_k_norm="k_norm" in parameters,
             feed_forward=pedal["feed_forward"],
+            parameters=parameters,
         ),
         behavioral_notes=(
             "This circuit preserves the source grouped-query attention layer decomposition.",
@@ -156,10 +164,36 @@ def build_gated_delta_circuit(pedal: Json, pedal_path: Path) -> Json:
         behavioral_role="source_reference_circuit",
         implementation="reference_gated_delta_layer_circuit_v1",
         circuit_id=f"{pedal['id']}_gated_delta_circuit_v1",
-        nodes=_gated_delta_nodes(dimensions, pedal["numerics"], pedal["feed_forward"]),
+        nodes=_gated_delta_nodes(
+            dimensions,
+            pedal["numerics"],
+            pedal["feed_forward"],
+            pedal["parameter_block"]["params"],
+        ),
         behavioral_notes=(
             "This circuit preserves a recurrent gated-delta token mixer with fixed per-stream state.",
             "The recurrent matrix is transient pedal-owned DSP state, not a global cache.",
+        ),
+    )
+
+
+def build_rg_lru_circuit(pedal: Json, pedal_path: Path) -> Json:
+    dimensions = pedal["reference_decomposition"]["wiring"][1]["dimensions"]
+    return _base_circuit(
+        pedal=pedal,
+        pedal_path=pedal_path,
+        behavioral_role="source_reference_circuit",
+        implementation="reference_rg_lru_layer_circuit_v1",
+        circuit_id=f"{pedal['id']}_rg_lru_circuit_v1",
+        nodes=_rg_lru_nodes(
+            dimensions,
+            pedal["numerics"],
+            pedal["feed_forward"],
+            pedal["parameter_block"]["params"],
+        ),
+        behavioral_notes=(
+            "This circuit preserves a real-gated linear recurrent token mixer with fixed per-stream state.",
+            "The convolution and diagonal recurrence are transient pedal-owned DSP state.",
         ),
     )
 
@@ -253,7 +287,9 @@ def _base_circuit(
     }
 
 
-def _conv_nodes(hidden_size: int, numerics: Json, feed_forward: Json) -> list[Json]:
+def _conv_nodes(
+    hidden_size: int, numerics: Json, feed_forward: Json, parameters: Json
+) -> list[Json]:
     return [
         {
             "id": "operator_norm",
@@ -321,6 +357,7 @@ def _conv_nodes(hidden_size: int, numerics: Json, feed_forward: Json) -> list[Js
             operator_output="operator_out",
             numerics=numerics,
             feed_forward=feed_forward,
+            parameters=parameters,
         ),
     ]
 
@@ -332,6 +369,7 @@ def _attention_nodes(
     has_q_norm: bool,
     has_k_norm: bool,
     feed_forward: Json,
+    parameters: Json,
 ) -> list[Json]:
     nodes = [
         {
@@ -351,21 +389,21 @@ def _attention_nodes(
                 if numerics.get("attention_output_gate")
                 else "q_projected"
             ],
-            "params": ["q_projection"],
+            "params": _linear_params("q_projection", parameters),
         },
         {
             "id": "k_projection",
             "op": "linear",
             "inputs": ["operator_norm_out"],
             "outputs": ["k_projected"],
-            "params": ["k_projection"],
+            "params": _linear_params("k_projection", parameters),
         },
         {
             "id": "v_projection",
             "op": "linear",
             "inputs": ["operator_norm_out"],
             "outputs": ["v_projected"],
-            "params": ["v_projection"],
+            "params": _linear_params("v_projection", parameters),
         },
     ]
     attention_gate = None
@@ -453,6 +491,7 @@ def _attention_nodes(
             "attrs": {
                 "causal": True,
                 "scale": float(numerics["attention_scale"]),
+                "window_size": numerics.get("attention_window_size"),
                 **heads,
             },
         },
@@ -461,12 +500,13 @@ def _attention_nodes(
             "op": "linear",
             "inputs": ["attention_gated" if attention_gate else "attention_out"],
             "outputs": ["operator_out"],
-            "params": ["attention_out_projection"],
+            "params": _linear_params("attention_out_projection", parameters),
         },
         *_ffn_tail(
             operator_output="operator_out",
             numerics=numerics,
             feed_forward=feed_forward,
+            parameters=parameters,
         ),
     ]
     if attention_gate:
@@ -484,7 +524,7 @@ def _attention_nodes(
 
 
 def _gated_delta_nodes(
-    dimensions: Json, numerics: Json, feed_forward: Json
+    dimensions: Json, numerics: Json, feed_forward: Json, parameters: Json
 ) -> list[Json]:
     key_width = int(dimensions["key_heads"]) * int(dimensions["key_head_width"])
     value_width = int(dimensions["value_heads"]) * int(dimensions["value_head_width"])
@@ -566,11 +606,90 @@ def _gated_delta_nodes(
             operator_output="operator_out",
             numerics=numerics,
             feed_forward=feed_forward,
+            parameters=parameters,
         ),
     ]
 
 
-def _ffn_tail(operator_output: str, numerics: Json, feed_forward: Json) -> list[Json]:
+def _rg_lru_nodes(
+    dimensions: Json, numerics: Json, feed_forward: Json, parameters: Json
+) -> list[Json]:
+    recurrent_params = [
+        "rg_lru_conv_kernel",
+        "rg_lru_input_gate_weight",
+        "rg_lru_input_gate_bias",
+        "rg_lru_recurrent_gate_weight",
+        "rg_lru_recurrent_gate_bias",
+        "rg_lru_recurrent_param",
+    ]
+    if "rg_lru_conv_bias" not in parameters:
+        raise ValueError("RG-LRU circuit requires a depthwise convolution bias")
+    recurrent_params.insert(1, "rg_lru_conv_bias")
+    return [
+        {
+            "id": "operator_norm",
+            "op": "rms_norm",
+            "inputs": ["input_frame"],
+            "outputs": ["operator_norm_out"],
+            "params": ["operator_norm"],
+            "attrs": _norm_attrs(numerics),
+        },
+        {
+            "id": "rg_lru_y_projection",
+            "op": "linear",
+            "inputs": ["operator_norm_out"],
+            "outputs": ["rg_lru_y"],
+            "params": _linear_params("rg_lru_y_projection", parameters),
+        },
+        {
+            "id": "rg_lru_y_activation",
+            "op": str(feed_forward["activation"]),
+            "inputs": ["rg_lru_y"],
+            "outputs": ["rg_lru_y_activated"],
+            "attrs": {"element_count": int(dimensions["width"])},
+        },
+        {
+            "id": "rg_lru_x_projection",
+            "op": "linear",
+            "inputs": ["operator_norm_out"],
+            "outputs": ["rg_lru_x"],
+            "params": _linear_params("rg_lru_x_projection", parameters),
+        },
+        {
+            "id": "rg_lru_step",
+            "op": "rg_lru_step",
+            "inputs": ["rg_lru_x"],
+            "outputs": ["rg_lru_recurrent_out"],
+            "params": recurrent_params,
+            "state_reads": ["conv_state", "recurrent_state"],
+            "state_writes": ["conv_state", "recurrent_state"],
+            "attrs": dimensions,
+        },
+        {
+            "id": "rg_lru_output_gate",
+            "op": "multiply",
+            "inputs": ["rg_lru_recurrent_out", "rg_lru_y_activated"],
+            "outputs": ["rg_lru_gated"],
+        },
+        {
+            "id": "rg_lru_out_projection",
+            "op": "linear",
+            "inputs": ["rg_lru_gated"],
+            "outputs": ["operator_out"],
+            "params": _linear_params("rg_lru_out_projection", parameters),
+        },
+        *_ffn_tail(
+            operator_output="operator_out",
+            numerics=numerics,
+            feed_forward=feed_forward,
+            parameters=parameters,
+        ),
+    ]
+
+
+def _ffn_tail(
+    operator_output: str, numerics: Json, feed_forward: Json, parameters: Json
+) -> list[Json]:
     residual_scale = float(numerics["residual_scale"])
     prefix = [
         _residual_node(
@@ -639,20 +758,21 @@ def _ffn_tail(operator_output: str, numerics: Json, feed_forward: Json) -> list[
                 "op": "linear",
                 "inputs": ["ffn_norm_out"],
                 "outputs": ["ffn_gate"],
-                "params": ["ffn_gate"],
+                "params": _linear_params("ffn_gate", parameters),
             },
             {
                 "id": "ffn_up_projection",
                 "op": "linear",
                 "inputs": ["ffn_norm_out"],
                 "outputs": ["ffn_up"],
-                "params": ["ffn_up"],
+                "params": _linear_params("ffn_up", parameters),
             },
             {
                 "id": "ffn_gate_activation",
-                "op": "silu",
+                "op": str(feed_forward["activation"]),
                 "inputs": ["ffn_gate"],
                 "outputs": ["ffn_gate_activated"],
+                "attrs": {"element_count": int(feed_forward["intermediate_size"])},
             },
             {
                 "id": "ffn_gate_multiply",
@@ -665,7 +785,7 @@ def _ffn_tail(operator_output: str, numerics: Json, feed_forward: Json) -> list[
                 "op": "linear",
                 "inputs": ["ffn_hidden"],
                 "outputs": ["ffn_out"],
-                "params": ["ffn_down"],
+                "params": _linear_params("ffn_down", parameters),
             },
         ]
     return [
@@ -693,6 +813,14 @@ def _residual_node(
     if scale != 1.0:
         node["attrs"] = {"scale": scale}
     return node
+
+
+def _linear_params(weight_id: str, parameters: Json) -> list[str]:
+    result = [weight_id]
+    bias_id = f"{weight_id}_bias"
+    if bias_id in parameters:
+        result.append(bias_id)
+    return result
 
 
 def _attention_heads_from_state(pedal: Json) -> Json:
@@ -723,6 +851,11 @@ def _state_port_for_circuit(port: Json, operator_type: str) -> Json:
             "channel_time" if state["id"] == "conv_state" else "head_key_value",
         )
         state.setdefault("source_layout", state["layout"])
+    elif operator_type == "rg_lru":
+        state.setdefault(
+            "layout", "channel_time" if state["id"] == "conv_state" else "channel"
+        )
+        state.setdefault("source_layout", state["layout"])
     return state
 
 
@@ -737,8 +870,11 @@ def _param_role(name: str) -> str:
         "operator_norm": "operator_normalization_weight",
         "ffn_norm": "feed_forward_normalization_weight",
         "ffn_gate": "feed_forward_swiglu_gate_projection",
+        "ffn_gate_bias": "feed_forward_swiglu_gate_projection_bias",
         "ffn_down": "feed_forward_down_projection",
+        "ffn_down_bias": "feed_forward_down_projection_bias",
         "ffn_up": "feed_forward_up_projection",
+        "ffn_up_bias": "feed_forward_up_projection_bias",
         "moe_router": "mixture_of_experts_router_projection",
         "moe_input": "mixture_of_experts_gate_up_weights",
         "moe_output": "mixture_of_experts_down_weights",
@@ -746,9 +882,13 @@ def _param_role(name: str) -> str:
         "conv_depthwise_kernel": "short_convolution_depthwise_temporal_kernel",
         "conv_out_projection": "short_convolution_output_projection",
         "q_projection": "attention_query_projection",
+        "q_projection_bias": "attention_query_projection_bias",
         "k_projection": "attention_key_projection",
+        "k_projection_bias": "attention_key_projection_bias",
         "v_projection": "attention_value_projection",
+        "v_projection_bias": "attention_value_projection_bias",
         "attention_out_projection": "attention_output_projection",
+        "attention_out_projection_bias": "attention_output_projection_bias",
         "q_norm": "attention_query_head_normalization",
         "k_norm": "attention_key_head_normalization",
         "delta_qkv_projection": "gated_delta_query_key_value_projection",
@@ -760,6 +900,19 @@ def _param_role(name: str) -> str:
         "delta_dt_bias": "gated_delta_time_bias",
         "delta_norm": "gated_delta_output_normalization_weight",
         "delta_out_projection": "gated_delta_output_projection",
+        "rg_lru_x_projection": "real_gated_recurrence_x_projection",
+        "rg_lru_x_projection_bias": "real_gated_recurrence_x_projection_bias",
+        "rg_lru_y_projection": "real_gated_recurrence_y_projection",
+        "rg_lru_y_projection_bias": "real_gated_recurrence_y_projection_bias",
+        "rg_lru_out_projection": "real_gated_recurrence_output_projection",
+        "rg_lru_out_projection_bias": "real_gated_recurrence_output_projection_bias",
+        "rg_lru_conv_kernel": "real_gated_recurrence_depthwise_convolution_kernel",
+        "rg_lru_conv_bias": "real_gated_recurrence_depthwise_convolution_bias",
+        "rg_lru_input_gate_weight": "real_gated_recurrence_input_gate_weight",
+        "rg_lru_input_gate_bias": "real_gated_recurrence_input_gate_bias",
+        "rg_lru_recurrent_gate_weight": "real_gated_recurrence_recurrent_gate_weight",
+        "rg_lru_recurrent_gate_bias": "real_gated_recurrence_recurrent_gate_bias",
+        "rg_lru_recurrent_param": "real_gated_recurrence_parameter",
     }
     return roles[name]
 

@@ -156,6 +156,35 @@ def test_compiler_renders_attention_pedals_from_discovered_dimensions(
     )
 
 
+def test_compiler_renders_biased_recurrent_and_windowed_attention_pedals(
+    tmp_path: Path,
+) -> None:
+    shader_source_dir = Path(__file__).parents[1] / "runtime-rs" / "shaders"
+    shader_files = {
+        "linear_bias_paired_bf16_16x24.comp",
+        "gelu_tanh_bf16_24.comp",
+        "rg_lru_step_bf16_h16_b2x8_k4__sc13.comp",
+        "gqa_attention_bf16_q2_kv1_d8_scale0.353553391_w8__sc6.comp",
+        "add_bf16_16.comp",
+        "multiply_bf16_24.comp",
+    }
+
+    copy_shader_templates(shader_source_dir, tmp_path, shader_files)
+
+    linear = (tmp_path / "linear_bias_paired_bf16_16x24.comp").read_text()
+    recurrent = (tmp_path / "rg_lru_step_bf16_h16_b2x8_k4__sc13.comp").read_text()
+    attention = (
+        tmp_path / "gqa_attention_bf16_q2_kv1_d8_scale0.353553391_w8__sc6.comp"
+    ).read_text()
+    assert "binding = 3) readonly buffer Bias" in linear
+    assert "const uint HEADS = 2u;" in recurrent
+    assert "binding = 13) readonly buffer StreamControl" in recurrent
+    assert "const uint ATTENTION_WINDOW = 8u;" in attention
+    assert all(
+        "{{" not in (tmp_path / shader_file).read_text() for shader_file in shader_files
+    )
+
+
 def test_compiler_renders_hybrid_recurrent_and_gated_attention_pedals(
     tmp_path: Path,
 ) -> None:

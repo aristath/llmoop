@@ -445,6 +445,7 @@ impl RuntimeChatSession {
 enum RuntimeChatFormatter {
     ChatMl { bos_token: Option<String> },
     RoleDelimited,
+    TurnDelimited { bos_token: Option<String> },
 }
 
 impl RuntimeChatFormatter {
@@ -469,9 +470,12 @@ impl RuntimeChatFormatter {
         {
             return Ok(Self::RoleDelimited);
         }
+        if template.contains("<start_of_turn>") && template.contains("<end_of_turn>") {
+            return Ok(Self::TurnDelimited { bos_token });
+        }
         Err(Box::new(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "chat mode currently supports ChatML and role-delimited chat templates; this package has a different template shape",
+            "chat mode currently supports ChatML, role-delimited, and turn-delimited chat templates; this package has a different template shape",
         )))
     }
 
@@ -509,6 +513,25 @@ impl RuntimeChatFormatter {
                 }
                 if add_generation_prompt {
                     formatted.push_str("<|start_of_role|>assistant<|end_of_role|>");
+                }
+                formatted
+            }
+            Self::TurnDelimited { bos_token } => {
+                let mut formatted = bos_token.clone().unwrap_or_default();
+                for message in messages {
+                    let role = if message.role == "assistant" {
+                        "model"
+                    } else {
+                        &message.role
+                    };
+                    formatted.push_str("<start_of_turn>");
+                    formatted.push_str(role);
+                    formatted.push('\n');
+                    formatted.push_str(message.content.trim());
+                    formatted.push_str("<end_of_turn>\n");
+                }
+                if add_generation_prompt {
+                    formatted.push_str("<start_of_turn>model\n");
                 }
                 formatted
             }

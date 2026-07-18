@@ -11065,6 +11065,7 @@ impl VulkanKernelStreamMetadata {
                 "rotary_position_embedding"
                     | "append_state_update"
                     | "scaled_dot_product_attention"
+                    | "rg_lru_step"
             ),
         }
     }
@@ -24305,7 +24306,7 @@ mod tests {
     }
 
     #[test]
-    fn resident_plan_keeps_sizes_unknown_without_tensor_and_element_metadata() {
+    fn resident_plan_infers_state_sizes_without_a_tensor_index() {
         let graph = ResolvedLoweredPedalboard::from_index_file(fixture_model_index_path()).unwrap();
         let resource_plan = StreamCircuitResourcePlan::from_graph(&graph).unwrap();
 
@@ -24321,7 +24322,11 @@ mod tests {
             resident_plan.per_stream_dynamic_state_elements_per_activation,
             6 * 1024
         );
-        assert_eq!(resident_plan.per_stream_static_state_bytes, None);
+        assert_eq!(resident_plan.per_stream_static_state_bytes, Some(49_152));
+        assert_eq!(
+            resident_plan.per_stream_dynamic_state_bytes_per_activation,
+            Some(12_288)
+        );
         assert_eq!(resident_plan.per_stream_activation_slot_elements, None);
         assert_eq!(resident_plan.per_stream_activation_slot_bytes, None);
         assert!(!resident_plan.unresolved_activation_slots.is_empty());
@@ -24651,6 +24656,14 @@ mod tests {
         assert_eq!(&bytes[4..12], &42u64.to_le_bytes());
         assert_eq!(&bytes[12..16], &7u32.to_le_bytes());
         assert_eq!(&bytes[16..20], &4u32.to_le_bytes());
+    }
+
+    #[test]
+    fn recurrent_gate_kernel_receives_stream_control_metadata() {
+        let metadata = VulkanKernelStreamMetadata::for_op("rg_lru_step");
+
+        assert!(metadata.uses_stream_tick);
+        assert!(metadata.push_constants().is_empty());
     }
 
     #[test]

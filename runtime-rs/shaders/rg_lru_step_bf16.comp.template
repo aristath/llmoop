@@ -1,0 +1,117 @@
+#version 450
+
+layout(local_size_x = {{BLOCK_WIDTH}}, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer XInput { uint words[]; } x_input;
+layout(set = 0, binding = 1) buffer OutputFrame { uint words[]; } output_frame;
+layout(set = 0, binding = 2) readonly buffer ConvKernel { uint words[]; } conv_kernel;
+layout(set = 0, binding = 3) readonly buffer ConvBias { uint words[]; } conv_bias;
+layout(set = 0, binding = 4) readonly buffer InputGateWeight { uint words[]; } input_gate_weight;
+layout(set = 0, binding = 5) readonly buffer InputGateBias { uint words[]; } input_gate_bias;
+layout(set = 0, binding = 6) readonly buffer RecurrentGateWeight { uint words[]; } recurrent_gate_weight;
+layout(set = 0, binding = 7) readonly buffer RecurrentGateBias { uint words[]; } recurrent_gate_bias;
+layout(set = 0, binding = 8) readonly buffer RecurrentParam { uint words[]; } recurrent_param;
+layout(set = 0, binding = 9) readonly buffer ConvStateRead { uint words[]; } conv_state_read;
+layout(set = 0, binding = 10) readonly buffer RecurrentStateRead { float values[]; } recurrent_state_read;
+layout(set = 0, binding = 11) buffer ConvStateWrite { uint words[]; } conv_state_write;
+layout(set = 0, binding = 12) buffer RecurrentStateWrite { float values[]; } recurrent_state_write;
+layout(set = 0, binding = 13) readonly buffer StreamControl { uint words[]; } stream_control;
+
+const uint WIDTH = {{WIDTH}}u;
+const uint HEADS = {{HEADS}}u;
+const uint BLOCK_WIDTH = {{BLOCK_WIDTH}}u;
+const uint KERNEL_WIDTH = {{KERNEL_WIDTH}}u;
+const uint HISTORY_WIDTH = KERNEL_WIDTH - 1u;
+
+shared float convolved[BLOCK_WIDTH];
+shared float recurrent_output[BLOCK_WIDTH];
+
+float bf16_to_f32(uint value) { return uintBitsToFloat((value & 0xffffu) << 16); }
+uint f32_to_bf16(float value) {
+    uint bits = floatBitsToUint(value);
+    uint lsb = (bits >> 16) & 1u;
+    return (bits + 0x7fffu + lsb) >> 16;
+}
+float round_bf16(float value) { return bf16_to_f32(f32_to_bf16(value)); }
+float unpack_bf16(uint packed, uint index) {
+    return bf16_to_f32((index & 1u) == 0u ? packed : packed >> 16);
+}
+float read_x(uint index) { return unpack_bf16(x_input.words[index >> 1u], index); }
+float read_conv_kernel(uint index) { return unpack_bf16(conv_kernel.words[index >> 1u], index); }
+float read_conv_bias(uint index) { return unpack_bf16(conv_bias.words[index >> 1u], index); }
+float read_input_gate_weight(uint index) { return unpack_bf16(input_gate_weight.words[index >> 1u], index); }
+float read_input_gate_bias(uint index) { return unpack_bf16(input_gate_bias.words[index >> 1u], index); }
+float read_recurrent_gate_weight(uint index) { return unpack_bf16(recurrent_gate_weight.words[index >> 1u], index); }
+float read_recurrent_gate_bias(uint index) { return unpack_bf16(recurrent_gate_bias.words[index >> 1u], index); }
+float read_recurrent_param(uint index) { return unpack_bf16(recurrent_param.words[index >> 1u], index); }
+float read_conv_state(uint index) { return unpack_bf16(conv_state_read.words[index >> 1u], index); }
+void write_conv_state(uint index, float value) {
+    uint encoded = f32_to_bf16(value);
+    uint word = index >> 1u;
+    uint previous = conv_state_write.words[word];
+    conv_state_write.words[word] = (index & 1u) == 0u
+        ? (previous & 0xffff0000u) | encoded
+        : (previous & 0x0000ffffu) | (encoded << 16);
+}
+float softplus(float value) { return value > 20.0 ? value : log(1.0 + exp(value)); }
+float sigmoid_bf16(float value) { return round_bf16(1.0 / (1.0 + exp(-value))); }
+
+void main() {
+    uint head = gl_WorkGroupID.x;
+    uint lane = gl_LocalInvocationID.x;
+    if (head >= HEADS || lane >= BLOCK_WIDTH) { return; }
+    uint channel = head * BLOCK_WIDTH + lane;
+
+    float current = read_x(channel);
+    float conv = 0.0;
+    for (uint step = 0u; step < HISTORY_WIDTH; step++) {
+        uint state_index = channel * KERNEL_WIDTH + step;
+        conv = fma(
+            read_conv_state(state_index),
+            read_conv_kernel(channel * KERNEL_WIDTH + step),
+            conv
+        );
+        float shifted = step + 1u < HISTORY_WIDTH
+            ? read_conv_state(state_index + 1u)
+            : current;
+        write_conv_state(state_index, shifted);
+    }
+    conv = fma(current, read_conv_kernel(channel * KERNEL_WIDTH + HISTORY_WIDTH), conv);
+    convolved[lane] = round_bf16(conv + read_conv_bias(channel));
+    barrier();
+
+    float input_gate_sum = read_input_gate_bias(channel);
+    float recurrent_gate_sum = read_recurrent_gate_bias(channel);
+    uint matrix_base = head * BLOCK_WIDTH * BLOCK_WIDTH;
+    for (uint input_index = 0u; input_index < BLOCK_WIDTH; input_index++) {
+        uint weight_index = matrix_base + input_index * BLOCK_WIDTH + lane;
+        input_gate_sum = fma(
+            convolved[input_index],
+            read_input_gate_weight(weight_index),
+            input_gate_sum
+        );
+        recurrent_gate_sum = fma(
+            convolved[input_index],
+            read_recurrent_gate_weight(weight_index),
+            recurrent_gate_sum
+        );
+    }
+    float input_gate = sigmoid_bf16(round_bf16(input_gate_sum));
+    float recurrent_input = sigmoid_bf16(round_bf16(recurrent_gate_sum));
+    float recurrence_parameter = read_recurrent_param(channel);
+    float log_gate = round_bf16(-8.0 * recurrent_input * round_bf16(softplus(recurrence_parameter)));
+    float recurrence = round_bf16(exp(log_gate));
+    float multiplier = stream_control.words[1] == 0u
+        ? 1.0
+        : round_bf16(sqrt(max(0.0, 1.0 - round_bf16(recurrence * recurrence))));
+    float normalized = round_bf16(round_bf16(convolved[lane] * input_gate) * multiplier);
+    float next_state = recurrence * recurrent_state_read.values[channel] + normalized;
+    recurrent_state_write.values[channel] = next_state;
+    recurrent_output[lane] = next_state;
+    barrier();
+    if ((lane & 1u) == 0u) {
+        output_frame.words[channel >> 1u] =
+            (f32_to_bf16(recurrent_output[lane + 1u]) << 16)
+            | f32_to_bf16(recurrent_output[lane]);
+    }
+}

@@ -40,6 +40,7 @@ class ModelStructure:
     num_key_value_heads: int
     head_width: int
     rotary_width: int
+    attention_window_size: int | None
     attention_output_gate: bool
     conv_l_cache: int
     vocab_size: int
@@ -52,6 +53,8 @@ class ModelStructure:
     residual_scale: float
     attention_scale: float
     logits_scale: float
+    logits_soft_cap: float | None
+    activation: str
     num_experts: int | None
     experts_per_token: int | None
     recurrent_mixer: Json | None
@@ -70,6 +73,7 @@ TOKEN_EMBEDDING_CANDIDATES = (
 OUTPUT_NORM_CANDIDATES = (
     "model.embedding_norm.weight",
     "model.norm.weight",
+    "model.final_norm.weight",
     "model.final_layernorm.weight",
     "transformer.ln_f.weight",
     "gpt_neox.final_layer_norm.weight",
@@ -85,30 +89,35 @@ OPERATOR_NORM_SUFFIXES = (
     "operator_norm.weight",
     "input_layernorm.weight",
     "self_attn_layer_norm.weight",
+    "temporal_pre_norm.weight",
 )
 
 FFN_NORM_SUFFIXES = (
     "ffn_norm.weight",
     "post_attention_layernorm.weight",
     "post_attention_layer_norm.weight",
+    "channel_pre_norm.weight",
 )
 
 FFN_GATE_SUFFIXES = (
     "feed_forward.w1.weight",
     "mlp.gate_proj.weight",
     "feed_forward.gate_proj.weight",
+    "mlp_block.gate_proj.weight",
 )
 
 FFN_DOWN_SUFFIXES = (
     "feed_forward.w2.weight",
     "mlp.down_proj.weight",
     "feed_forward.down_proj.weight",
+    "mlp_block.down_proj.weight",
 )
 
 FFN_UP_SUFFIXES = (
     "feed_forward.w3.weight",
     "mlp.up_proj.weight",
     "feed_forward.up_proj.weight",
+    "mlp_block.up_proj.weight",
 )
 
 MOE_INPUT_SUFFIXES = (
@@ -128,13 +137,26 @@ CONV_IN_PROJECTION_SUFFIXES = ("conv.in_proj.weight",)
 CONV_KERNEL_SUFFIXES = ("conv.conv.weight", "conv.depthwise.weight")
 CONV_OUT_PROJECTION_SUFFIXES = ("conv.out_proj.weight",)
 
-ATTENTION_Q_PROJECTION_SUFFIXES = ("self_attn.q_proj.weight", "attention.wq.weight")
-ATTENTION_K_PROJECTION_SUFFIXES = ("self_attn.k_proj.weight", "attention.wk.weight")
-ATTENTION_V_PROJECTION_SUFFIXES = ("self_attn.v_proj.weight", "attention.wv.weight")
+ATTENTION_Q_PROJECTION_SUFFIXES = (
+    "self_attn.q_proj.weight",
+    "attention.wq.weight",
+    "temporal_block.q_proj.weight",
+)
+ATTENTION_K_PROJECTION_SUFFIXES = (
+    "self_attn.k_proj.weight",
+    "attention.wk.weight",
+    "temporal_block.k_proj.weight",
+)
+ATTENTION_V_PROJECTION_SUFFIXES = (
+    "self_attn.v_proj.weight",
+    "attention.wv.weight",
+    "temporal_block.v_proj.weight",
+)
 ATTENTION_OUT_PROJECTION_SUFFIXES = (
     "self_attn.out_proj.weight",
     "self_attn.o_proj.weight",
     "attention.wo.weight",
+    "temporal_block.o_proj.weight",
 )
 ATTENTION_Q_NORM_SUFFIXES = ("self_attn.q_layernorm.weight", "self_attn.q_norm.weight")
 ATTENTION_K_NORM_SUFFIXES = ("self_attn.k_layernorm.weight", "self_attn.k_norm.weight")
@@ -148,6 +170,16 @@ GATED_DELTA_A_LOG_SUFFIXES = ("linear_attn.A_log",)
 GATED_DELTA_DT_BIAS_SUFFIXES = ("linear_attn.dt_bias",)
 GATED_DELTA_NORM_SUFFIXES = ("linear_attn.norm.weight",)
 GATED_DELTA_OUT_SUFFIXES = ("linear_attn.out_proj.weight",)
+
+RG_LRU_X_SUFFIXES = ("temporal_block.linear_x.weight",)
+RG_LRU_Y_SUFFIXES = ("temporal_block.linear_y.weight",)
+RG_LRU_OUT_SUFFIXES = ("temporal_block.linear_out.weight",)
+RG_LRU_CONV_SUFFIXES = ("temporal_block.conv_1d.weight",)
+RG_LRU_INPUT_GATE_WEIGHT_SUFFIXES = ("temporal_block.rg_lru.input_gate_weight",)
+RG_LRU_INPUT_GATE_BIAS_SUFFIXES = ("temporal_block.rg_lru.input_gate_bias",)
+RG_LRU_RECURRENT_GATE_WEIGHT_SUFFIXES = ("temporal_block.rg_lru.recurrent_gate_weight",)
+RG_LRU_RECURRENT_GATE_BIAS_SUFFIXES = ("temporal_block.rg_lru.recurrent_gate_bias",)
+RG_LRU_RECURRENT_PARAM_SUFFIXES = ("temporal_block.rg_lru.recurrent_param",)
 
 LAYER_ROOT_PATTERNS = (
     re.compile(r"^(?P<root>.+?\.layers)\.(?P<index>\d+)\."),
@@ -220,7 +252,9 @@ def discover_model_structure(
     layers = tuple(
         discover_layer_structure(
             tensors=tensors,
-            configured_layer_types=decoder_config.get("layer_types"),
+            configured_layer_types=discover_configured_layer_types(
+                decoder_config, layer_count
+            ),
             layer_root=layer_root,
             layer_index=index,
         )
@@ -245,10 +279,10 @@ def discover_model_structure(
         decoder_config.get("head_dim") or hidden_size // num_attention_heads
     )
     rope_parameters = decoder_config.get("rope_parameters")
-    partial_rotary_factor = (
-        float(rope_parameters.get("partial_rotary_factor", 1.0))
+    partial_rotary_factor = float(
+        rope_parameters.get("partial_rotary_factor", 1.0)
         if isinstance(rope_parameters, dict)
-        else 1.0
+        else decoder_config.get("partial_rotary_factor", 1.0)
     )
     rotary_width = int(head_width * partial_rotary_factor)
     attention_output_gate = discover_attention_output_gate(
@@ -258,11 +292,13 @@ def discover_model_structure(
         num_attention_heads=num_attention_heads,
         head_width=head_width,
     )
-    recurrent_mixer = discover_recurrent_mixer(decoder_config, layers)
+    recurrent_mixer = discover_recurrent_mixer(decoder_config, tensors, layers)
     conv_l_cache = discover_conv_l_cache(decoder_config, tensors, layers)
     rms_norm_weight_offset = discover_outer_norm_weight_offset(
         recurrent_mixer=recurrent_mixer,
         attention_output_gate=attention_output_gate,
+        output_norm=output_norm,
+        layers=layers,
     )
     has_sparse_experts = any(
         layer.feed_forward_type == "sparse_moe" for layer in layers
@@ -298,6 +334,7 @@ def discover_model_structure(
         num_key_value_heads=num_key_value_heads,
         head_width=head_width,
         rotary_width=rotary_width,
+        attention_window_size=discover_attention_window_size(decoder_config),
         attention_output_gate=attention_output_gate,
         conv_l_cache=conv_l_cache,
         vocab_size=vocab_size,
@@ -306,12 +343,18 @@ def discover_model_structure(
         rope_theta=discover_rope_theta(decoder_config),
         rope_interleaved=bool(decoder_config.get("rope_interleaved", False)),
         rms_norm_weight_offset=rms_norm_weight_offset,
-        embedding_scale=float(decoder_config.get("embedding_multiplier", 1.0)),
+        embedding_scale=discover_embedding_scale(decoder_config, hidden_size),
         residual_scale=float(decoder_config.get("residual_multiplier", 1.0)),
         attention_scale=float(
             decoder_config.get("attention_multiplier", head_width**-0.5)
         ),
         logits_scale=float(decoder_config.get("logits_scaling", 1.0)),
+        logits_soft_cap=(
+            float(decoder_config["logits_soft_cap"])
+            if decoder_config.get("logits_soft_cap") is not None
+            else None
+        ),
+        activation=discover_activation(decoder_config),
         num_experts=num_experts,
         experts_per_token=experts_per_token,
         recurrent_mixer=recurrent_mixer,
@@ -363,6 +406,11 @@ def discover_layer_structure(
                 ),
             }
         )
+        add_optional_linear_biases(
+            tensors,
+            layer_tensors,
+            ("ffn_gate", "ffn_down", "ffn_up"),
+        )
     elif moe_input is not None:
         feed_forward_type = "sparse_moe"
         layer_tensors.update(
@@ -394,6 +442,8 @@ def discover_layer_structure(
         operator_type = "full_attention"
     elif configured in ("linear_attention", "gated_delta"):
         operator_type = "gated_delta"
+    elif configured in ("recurrent", "rg_lru"):
+        operator_type = "rg_lru"
     else:
         operator_type = infer_operator_type(tensors, prefix)
 
@@ -459,6 +509,16 @@ def discover_layer_structure(
             layer_tensors["q_norm"] = optional_q_norm
         if optional_k_norm is not None:
             layer_tensors["k_norm"] = optional_k_norm
+        add_optional_linear_biases(
+            tensors,
+            layer_tensors,
+            (
+                "q_projection",
+                "k_projection",
+                "v_projection",
+                "attention_out_projection",
+            ),
+        )
     elif operator_type == "gated_delta":
         layer_tensors.update(
             {
@@ -518,6 +578,71 @@ def discover_layer_structure(
                 ),
             }
         )
+    elif operator_type == "rg_lru":
+        layer_tensors.update(
+            {
+                "rg_lru_x_projection": find_layer_tensor(
+                    tensors, prefix, RG_LRU_X_SUFFIXES, role="RG-LRU x projection"
+                ),
+                "rg_lru_y_projection": find_layer_tensor(
+                    tensors, prefix, RG_LRU_Y_SUFFIXES, role="RG-LRU y projection"
+                ),
+                "rg_lru_out_projection": find_layer_tensor(
+                    tensors,
+                    prefix,
+                    RG_LRU_OUT_SUFFIXES,
+                    role="RG-LRU output projection",
+                ),
+                "rg_lru_conv_kernel": find_layer_tensor(
+                    tensors,
+                    prefix,
+                    RG_LRU_CONV_SUFFIXES,
+                    role="RG-LRU depthwise convolution kernel",
+                ),
+                "rg_lru_input_gate_weight": find_layer_tensor(
+                    tensors,
+                    prefix,
+                    RG_LRU_INPUT_GATE_WEIGHT_SUFFIXES,
+                    role="RG-LRU input gate weight",
+                ),
+                "rg_lru_input_gate_bias": find_layer_tensor(
+                    tensors,
+                    prefix,
+                    RG_LRU_INPUT_GATE_BIAS_SUFFIXES,
+                    role="RG-LRU input gate bias",
+                ),
+                "rg_lru_recurrent_gate_weight": find_layer_tensor(
+                    tensors,
+                    prefix,
+                    RG_LRU_RECURRENT_GATE_WEIGHT_SUFFIXES,
+                    role="RG-LRU recurrent gate weight",
+                ),
+                "rg_lru_recurrent_gate_bias": find_layer_tensor(
+                    tensors,
+                    prefix,
+                    RG_LRU_RECURRENT_GATE_BIAS_SUFFIXES,
+                    role="RG-LRU recurrent gate bias",
+                ),
+                "rg_lru_recurrent_param": find_layer_tensor(
+                    tensors,
+                    prefix,
+                    RG_LRU_RECURRENT_PARAM_SUFFIXES,
+                    role="RG-LRU recurrence parameter",
+                ),
+            }
+        )
+        add_optional_linear_biases(
+            tensors,
+            layer_tensors,
+            (
+                "rg_lru_x_projection",
+                "rg_lru_y_projection",
+                "rg_lru_out_projection",
+            ),
+        )
+        conv_bias = find_bias_for_weight(tensors, layer_tensors["rg_lru_conv_kernel"])
+        if conv_bias is not None:
+            layer_tensors["rg_lru_conv_bias"] = conv_bias
     else:
         raise ModelTranspileError(
             f"unsupported operator type {operator_type!r} for layer {layer_index}"
@@ -545,6 +670,10 @@ def infer_operator_type(tensors: dict[str, Json], prefix: str) -> str:
         tensors, (f"{prefix}.{suffix}" for suffix in GATED_DELTA_QKV_SUFFIXES)
     ):
         return "gated_delta"
+    if find_first_existing_tensor(
+        tensors, (f"{prefix}.{suffix}" for suffix in RG_LRU_X_SUFFIXES)
+    ):
+        return "rg_lru"
     raise ModelTranspileError(
         f"could not infer operator type for layer prefix {prefix!r}"
     )
@@ -603,6 +732,18 @@ def discover_decoder_config(config: Json, discovered_layer_count: int) -> Json:
     return candidates[0]
 
 
+def discover_configured_layer_types(config: Json, layer_count: int) -> list[str] | None:
+    configured = config.get("layer_types") or config.get("layers_block_type")
+    if configured is None:
+        configured = config.get("_block_types")
+    if not isinstance(configured, list) or not configured:
+        return None
+    values = [str(value) for value in configured]
+    if len(values) == layer_count:
+        return values
+    return [values[index % len(values)] for index in range(layer_count)]
+
+
 def discover_attention_output_gate(
     config: Json,
     tensors: dict[str, Json],
@@ -632,8 +773,25 @@ def discover_attention_output_gate(
 
 
 def discover_recurrent_mixer(
-    config: Json, layers: tuple[LayerStructure, ...]
+    config: Json,
+    tensors: dict[str, Json],
+    layers: tuple[LayerStructure, ...],
 ) -> Json | None:
+    rg_lru_layer = next(
+        (layer for layer in layers if layer.operator_type == "rg_lru"), None
+    )
+    if rg_lru_layer is not None:
+        gate_shape = tensors[rg_lru_layer.tensors["rg_lru_input_gate_weight"]]["shape"]
+        conv_shape = tensors[rg_lru_layer.tensors["rg_lru_conv_kernel"]]["shape"]
+        x_shape = tensors[rg_lru_layer.tensors["rg_lru_x_projection"]]["shape"]
+        return {
+            "type": "rg_lru",
+            "width": int(x_shape[0]),
+            "heads": int(gate_shape[0]),
+            "block_width": int(gate_shape[1]),
+            "conv_kernel_width": int(conv_shape[-1]),
+            "state_dtype": "F32",
+        }
     if not any(layer.operator_type == "gated_delta" for layer in layers):
         return None
     keys = (
@@ -649,6 +807,7 @@ def discover_recurrent_mixer(
             f"gated-delta structure is missing config dimensions: {', '.join(missing)}"
         )
     return {
+        "type": "gated_delta",
         "conv_kernel_width": int(config["linear_conv_kernel_dim"]),
         "key_head_width": int(config["linear_key_head_dim"]),
         "key_heads": int(config["linear_num_key_heads"]),
@@ -661,23 +820,80 @@ def discover_recurrent_mixer(
 
 
 def discover_outer_norm_weight_offset(
-    *, recurrent_mixer: Json | None, attention_output_gate: bool
+    *,
+    recurrent_mixer: Json | None,
+    attention_output_gate: bool,
+    output_norm: str,
+    layers: tuple[LayerStructure, ...],
 ) -> float:
     # This recurrent/full-attention graph stores its outer RMS scales around
     # zero and applies (1 + weight). The gated-delta mixer norm itself is a
     # conventional direct scale and is encoded separately in its circuit.
-    return 1.0 if recurrent_mixer is not None and attention_output_gate else 0.0
+    offset_norm_suffixes = (
+        ".temporal_pre_norm.weight",
+        ".channel_pre_norm.weight",
+        ".final_norm.weight",
+    )
+    stores_offset_weights = output_norm.endswith(offset_norm_suffixes) or any(
+        layer.tensors["operator_norm"].endswith(offset_norm_suffixes)
+        or layer.tensors["ffn_norm"].endswith(offset_norm_suffixes)
+        for layer in layers
+    )
+    return (
+        1.0
+        if stores_offset_weights
+        or (recurrent_mixer is not None and attention_output_gate)
+        else 0.0
+    )
 
 
 def discover_intermediate_size(
     config: Json, tensors: dict[str, Json], layers: tuple[LayerStructure, ...]
 ) -> int:
-    if "intermediate_size" in config:
-        return int(config["intermediate_size"])
-    if "ffn_hidden_size" in config:
-        return int(config["ffn_hidden_size"])
-    first_gate = tensors[layers[0].tensors["ffn_gate"]]["shape"]
-    return int(first_gate[0])
+    discovered: set[int] = set()
+    for layer in layers:
+        if layer.feed_forward_type == "dense_swiglu":
+            discovered.add(int(tensors[layer.tensors["ffn_gate"]]["shape"][0]))
+        elif layer.feed_forward_type == "sparse_moe":
+            shape = tensors[layer.tensors["moe_input"]]["shape"]
+            discovered.add(int(shape[-2]) // 2)
+    if len(discovered) != 1:
+        raise ModelTranspileError(
+            f"feed-forward tensor shapes disagree on intermediate width: {sorted(discovered)}"
+        )
+    return discovered.pop()
+
+
+def discover_attention_window_size(config: Json) -> int | None:
+    for key in ("sliding_window", "attention_window_size"):
+        if config.get(key) is not None:
+            return int(config[key])
+    return None
+
+
+def discover_embedding_scale(config: Json, hidden_size: int) -> float:
+    if "embedding_multiplier" in config:
+        return float(config["embedding_multiplier"])
+    if bool(config.get("embeddings_scale_by_sqrt_dim", False)):
+        return round_float_to_bf16(math.sqrt(hidden_size))
+    return 1.0
+
+
+def discover_activation(config: Json) -> str:
+    configured = str(
+        config.get("hidden_activation") or config.get("hidden_act") or "silu"
+    )
+    if configured in ("silu", "swish"):
+        return "silu"
+    if configured in ("gelu_pytorch_tanh", "gelu_new", "gelu_fast"):
+        return "gelu_tanh"
+    raise ModelTranspileError(f"unsupported feed-forward activation {configured!r}")
+
+
+def round_float_to_bf16(value: float) -> float:
+    bits = struct.unpack("<I", struct.pack("<f", value))[0]
+    rounded = (bits + 0x7FFF + ((bits >> 16) & 1)) & 0xFFFF0000
+    return struct.unpack("<f", struct.pack("<I", rounded))[0]
 
 
 def discover_conv_l_cache(
@@ -726,6 +942,8 @@ def make_layer(structure: ModelStructure, layer: LayerStructure) -> Json:
         else make_attention_operator(structure, layer)
         if layer.operator_type == "full_attention"
         else make_gated_delta_operator(structure, layer)
+        if layer.operator_type == "gated_delta"
+        else make_rg_lru_operator(structure, layer)
     )
 
     return {
@@ -745,6 +963,7 @@ def make_layer(structure: ModelStructure, layer: LayerStructure) -> Json:
             "attention_output_gate": structure.attention_output_gate,
             "residual_scale": structure.residual_scale,
             "attention_scale": structure.attention_scale,
+            "attention_window_size": structure.attention_window_size,
         },
         "ports": {
             "inputs": [{"id": "input", "signal": "frame", "shape": [hidden_size]}],
@@ -790,7 +1009,10 @@ def make_model_graph(
     output_projection = {
         "id": "output_projection",
         "type": "linear_projection",
-        "attrs": {"scale": 1.0 / structure.logits_scale},
+        "attrs": {
+            "scale": 1.0 / structure.logits_scale,
+            "soft_cap": structure.logits_soft_cap,
+        },
         "params": {"weight": tensor_ref(structure.tensors["output_projection"])},
     }
     if structure.tensors["output_projection"] == structure.tensors["token_embedding"]:
@@ -813,6 +1035,7 @@ def make_model_graph(
             "num_key_value_heads": structure.num_key_value_heads,
             "head_width": structure.head_width,
             "rotary_width": structure.rotary_width,
+            "attention_window_size": structure.attention_window_size,
             "conv_l_cache": structure.conv_l_cache,
             "vocab_size": structure.vocab_size,
             "max_position_embeddings": structure.max_position_embeddings,
@@ -828,6 +1051,7 @@ def make_model_graph(
             "residual_scale": structure.residual_scale,
             "attention_scale": structure.attention_scale,
             "logits_scale": structure.logits_scale,
+            "logits_soft_cap": structure.logits_soft_cap,
         },
         "token_ids": structure.token_ids,
         "files": {
@@ -865,6 +1089,7 @@ def make_model_graph(
         },
         "component_templates": {
             "shortconv_layer": "opaque layer pedal with fixed rolling temporal state",
+            "rg_lru_layer": "opaque recurrent layer pedal with fixed convolution and recurrent state",
             "gqa_attention_layer": "opaque layer pedal with append-only KV state",
             "swiglu_feed_forward": "dense gated feed-forward operator",
             "rms_norm": "stateless normalization operator",
@@ -881,6 +1106,7 @@ def make_feed_forward_descriptor(
         "type": layer.feed_forward_type,
         "hidden_size": structure.hidden_size,
         "intermediate_size": structure.intermediate_size,
+        "activation": structure.activation,
     }
     if layer.feed_forward_type == "sparse_moe":
         descriptor.update(
@@ -951,17 +1177,26 @@ def make_ffn_component(structure: ModelStructure, layer: LayerStructure) -> Json
                 "output": tensor_ref(layer.tensors["moe_output"]),
             },
         }
+    params = {
+        "gate": tensor_ref(layer.tensors["ffn_gate"]),
+        "down": tensor_ref(layer.tensors["ffn_down"]),
+        "up": tensor_ref(layer.tensors["ffn_up"]),
+    }
+    for source_id, target_id in (
+        ("ffn_gate_bias", "gate_bias"),
+        ("ffn_down_bias", "down_bias"),
+        ("ffn_up_bias", "up_bias"),
+    ):
+        if source_id in layer.tensors:
+            params[target_id] = tensor_ref(layer.tensors[source_id])
     return {
         "id": "feed_forward",
         "type": "swiglu_feed_forward",
         "circuit_template": f"swiglu_ffn_{structure.hidden_size}_{structure.intermediate_size}_v1",
         "input": "ffn_norm.output",
         "output": "ffn.output",
-        "params": {
-            "gate": tensor_ref(layer.tensors["ffn_gate"]),
-            "down": tensor_ref(layer.tensors["ffn_down"]),
-            "up": tensor_ref(layer.tensors["ffn_up"]),
-        },
+        "activation": structure.activation,
+        "params": params,
     }
 
 
@@ -1005,6 +1240,14 @@ def make_attention_operator(structure: ModelStructure, layer: LayerStructure) ->
         "v_projection": tensor_ref(layer.tensors["v_projection"]),
         "out_projection": tensor_ref(layer.tensors["attention_out_projection"]),
     }
+    for source_id, target_id in (
+        ("q_projection_bias", "q_projection_bias"),
+        ("k_projection_bias", "k_projection_bias"),
+        ("v_projection_bias", "v_projection_bias"),
+        ("attention_out_projection_bias", "out_projection_bias"),
+    ):
+        if source_id in layer.tensors:
+            params[target_id] = tensor_ref(layer.tensors[source_id])
     internal_pedals = [
         {"id": "q_projection", "type": "linear"},
         {"id": "k_projection", "type": "linear"},
@@ -1044,6 +1287,7 @@ def make_attention_operator(structure: ModelStructure, layer: LayerStructure) ->
         "heads": heads,
         "rotary_width": structure.rotary_width,
         "output_gate": structure.attention_output_gate,
+        "window_size": structure.attention_window_size,
         "state_ports": make_state_ports(structure, "full_attention"),
         "params": params,
         "internal_pedals": internal_pedals,
@@ -1088,6 +1332,57 @@ def make_gated_delta_operator(structure: ModelStructure, layer: LayerStructure) 
     }
 
 
+def make_rg_lru_operator(structure: ModelStructure, layer: LayerStructure) -> Json:
+    mixer = structure.recurrent_mixer
+    if mixer is None or mixer.get("type") != "rg_lru":
+        raise ModelTranspileError("RG-LRU layer has no recurrent mixer dimensions")
+    params = {
+        name: tensor_ref(layer.tensors[name])
+        for name in (
+            "rg_lru_x_projection",
+            "rg_lru_y_projection",
+            "rg_lru_out_projection",
+            "rg_lru_conv_kernel",
+            "rg_lru_input_gate_weight",
+            "rg_lru_input_gate_bias",
+            "rg_lru_recurrent_gate_weight",
+            "rg_lru_recurrent_gate_bias",
+            "rg_lru_recurrent_param",
+        )
+    }
+    for name in (
+        "rg_lru_x_projection_bias",
+        "rg_lru_y_projection_bias",
+        "rg_lru_out_projection_bias",
+        "rg_lru_conv_bias",
+    ):
+        if name in layer.tensors:
+            params[name] = tensor_ref(layer.tensors[name])
+    return {
+        "id": "operator",
+        "type": "rg_lru_operator",
+        "circuit_template": (
+            f"rg_lru_h{structure.hidden_size}_b{mixer['heads']}x{mixer['block_width']}"
+            f"_k{mixer['conv_kernel_width']}_v1"
+        ),
+        "input": "operator_norm.output",
+        "output": "operator.output",
+        "dimensions": mixer,
+        "activation": structure.activation,
+        "state_ports": make_state_ports(structure, "rg_lru"),
+        "params": params,
+        "internal_pedals": [
+            {"id": "x_projection", "type": "linear"},
+            {"id": "y_projection", "type": "linear"},
+            {"id": "y_activation", "type": structure.activation},
+            {"id": "depthwise_convolution", "type": "stateful_depthwise_convolution"},
+            {"id": "real_gated_recurrence", "type": "rg_lru_recurrence"},
+            {"id": "output_gate", "type": "multiply"},
+            {"id": "out_projection", "type": "linear"},
+        ],
+    }
+
+
 def make_parameter_block(
     operator_type: str, feed_forward_type: str, tensors: dict[str, str]
 ) -> Json:
@@ -1097,6 +1392,8 @@ def make_parameter_block(
         layout = "gqa_attention_layer_params_v1"
     elif operator_type == "gated_delta":
         layout = "gated_delta_layer_params_v1"
+    elif operator_type == "rg_lru":
+        layout = "rg_lru_layer_params_v1"
     else:
         raise ModelTranspileError(
             f"unsupported parameter layout for operator {operator_type!r}"
@@ -1133,6 +1430,7 @@ def make_state_ports(structure: ModelStructure, operator_type: str) -> list[Json
                 "value_shape_per_token": [structure.num_key_value_heads, head_width],
                 "dtype": "BF16",
                 "growth": "per_activation",
+                "window_size": structure.attention_window_size,
                 "sharing": "per_stream_per_pedal_instance",
             }
         ]
@@ -1169,6 +1467,32 @@ def make_state_ports(structure: ModelStructure, operator_type: str) -> list[Json
             },
         ]
 
+    if operator_type == "rg_lru":
+        mixer = structure.recurrent_mixer
+        if mixer is None or mixer.get("type") != "rg_lru":
+            raise ModelTranspileError("RG-LRU layer has no recurrent mixer dimensions")
+        return [
+            {
+                "id": "conv_state",
+                "type": "rolling_channel_memory",
+                "shape": [
+                    int(mixer["width"]),
+                    int(mixer["conv_kernel_width"]),
+                ],
+                "dtype": "BF16",
+                "update": "shift_append",
+                "sharing": "per_stream_per_pedal_instance",
+            },
+            {
+                "id": "recurrent_state",
+                "type": "diagonal_recurrent_memory",
+                "shape": [int(mixer["width"])],
+                "dtype": str(mixer["state_dtype"]),
+                "update": "real_gated_linear_recurrence",
+                "sharing": "per_stream_per_pedal_instance",
+            },
+        ]
+
     raise ModelTranspileError(f"unsupported state ports for operator {operator_type!r}")
 
 
@@ -1183,6 +1507,16 @@ def make_pedal_class(structure: ModelStructure, layer: LayerStructure) -> str:
         return (
             f"shortconv_layer_h{structure.hidden_size}_"
             f"k{structure.conv_l_cache}_{feed_forward}_v1"
+        )
+
+    if operator_type == "rg_lru":
+        mixer = structure.recurrent_mixer
+        if mixer is None or mixer.get("type") != "rg_lru":
+            raise ModelTranspileError("RG-LRU layer has no recurrent mixer dimensions")
+        return (
+            "rg_lru_layer_"
+            f"h{structure.hidden_size}_b{mixer['heads']}x{mixer['block_width']}_"
+            f"k{mixer['conv_kernel_width']}_{feed_forward}_v1"
         )
 
     if operator_type == "full_attention":
@@ -1323,6 +1657,24 @@ def find_optional_layer_tensor(
     return find_first_existing_tensor(
         tensors, (f"{prefix}.{suffix}" for suffix in suffixes)
     )
+
+
+def find_bias_for_weight(tensors: dict[str, Json], weight: str) -> str | None:
+    if not weight.endswith(".weight"):
+        return None
+    bias = f"{weight[: -len('.weight')]}.bias"
+    return bias if bias in tensors else None
+
+
+def add_optional_linear_biases(
+    tensors: dict[str, Json],
+    layer_tensors: dict[str, str],
+    weight_ids: Iterable[str],
+) -> None:
+    for weight_id in weight_ids:
+        bias = find_bias_for_weight(tensors, layer_tensors[weight_id])
+        if bias is not None:
+            layer_tensors[f"{weight_id}_bias"] = bias
 
 
 def tensor_ref(name: str) -> dict[str, str]:
