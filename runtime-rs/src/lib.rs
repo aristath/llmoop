@@ -4,6 +4,8 @@ pub mod contract_backend;
 pub mod editor;
 pub mod stream_circuit;
 pub mod stream_plan;
+#[cfg(feature = "tui")]
+pub mod tui;
 pub mod types;
 pub mod vulkan;
 #[cfg(feature = "vulkan")]
