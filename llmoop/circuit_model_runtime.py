@@ -130,6 +130,8 @@ class CircuitModelRuntime:
         self.embed_tokens_weight = tensor_store.get(input_embedding_tensor)
         self.embedding_norm_weight = tensor_store.get(output_norm_tensor)
         self.output_projection_weight = tensor_store.get(output_projection_tensor)
+        self.norm_eps = float(board.index["numerics"]["rms_norm_eps"])
+        self.rope_interleaved = bool(board.index["numerics"]["rope_interleaved"])
         self.pedals = tuple(self._build_pedal(pedal) for pedal in board.pedals)
         self.inv_freq, self.attention_scaling = self._build_rope_parameters()
 
@@ -258,7 +260,11 @@ class CircuitModelRuntime:
         position_ids_expanded = position_ids[:, None, :].float()
         with self.torch.no_grad():
             freqs = (inv_freq.float() @ position_ids_expanded.float()).transpose(1, 2)
-            emb = self.torch.cat((freqs, freqs), dim=-1)
+            emb = (
+                freqs.repeat_interleave(2, dim=-1)
+                if self.rope_interleaved
+                else self.torch.cat((freqs, freqs), dim=-1)
+            )
             cos = emb.cos() * self.attention_scaling
             sin = emb.sin() * self.attention_scaling
         return cos.to(dtype=hidden.dtype), sin.to(dtype=hidden.dtype)
@@ -267,7 +273,7 @@ class CircuitModelRuntime:
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.to(self.torch.float32)
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * self.torch.rsqrt(variance + float(self.config["norm_eps"]))
+        hidden_states = hidden_states * self.torch.rsqrt(variance + self.norm_eps)
         return weight * hidden_states.to(input_dtype)
 
     def _build_pedal(self, pedal: Any) -> Any:
@@ -276,20 +282,19 @@ class CircuitModelRuntime:
                 tensor_store=self.tensor_store,
                 torch=self.torch,
                 circuit=pedal.circuit,
-                config=self.config,
             )
         if pedal.operator_type == "full_attention":
             return GQAAttentionCircuitPedal.from_tensor_store(
                 tensor_store=self.tensor_store,
                 torch=self.torch,
                 circuit=pedal.circuit,
-                config=self.config,
             )
         raise ValueError(f"unsupported circuit pedal operator type {pedal.operator_type!r}")
 
     def _build_rope_parameters(self) -> tuple[Any, float]:
-        base = float(self.config["rope_parameters"]["rope_theta"])
-        head_dim = int(self.config.get("head_dim") or self.config["hidden_size"] // self.config["num_attention_heads"])
+        base = float(self.board.index["numerics"]["rope_theta"])
+        dimensions = self.board.index["dimensions"]
+        head_dim = int(dimensions["hidden_size"]) // int(dimensions["num_attention_heads"])
         inv_freq = 1.0 / (
             base ** (self.torch.arange(0, head_dim, 2, dtype=self.torch.int64).to(dtype=self.torch.float32) / head_dim)
         )

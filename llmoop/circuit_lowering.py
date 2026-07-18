@@ -78,6 +78,8 @@ def lower_pedalboard(pedalboard_dir: Path, out_dir: Path) -> Json:
         },
         "architecture": model["architecture"],
         "dimensions": model["dimensions"],
+        "numerics": model["numerics"],
+        "token_ids": model["token_ids"],
         "graph": {
             "wiring": model["graph"]["pedalboard"]["wiring"],
             "circuits": lowered,
@@ -113,7 +115,7 @@ def build_conv_circuit(pedal: Json, pedal_path: Path) -> Json:
         behavioral_role="source_reference_circuit",
         implementation="reference_shortconv_layer_circuit_v1",
         circuit_id=f"{pedal['id']}_shortconv_circuit_v1",
-        nodes=_conv_nodes(hidden_size),
+        nodes=_conv_nodes(hidden_size, pedal["numerics"]),
         behavioral_notes=(
             "This circuit preserves the source short-convolution layer decomposition.",
             "It is a structural lowering artifact; a backend may replace this source pedal with an executable implementation.",
@@ -123,13 +125,19 @@ def build_conv_circuit(pedal: Json, pedal_path: Path) -> Json:
 
 def build_attention_circuit(pedal: Json, pedal_path: Path) -> Json:
     heads = _attention_heads_from_state(pedal)
+    parameters = pedal["parameter_block"]["params"]
     return _base_circuit(
         pedal=pedal,
         pedal_path=pedal_path,
         behavioral_role="source_reference_circuit",
         implementation="reference_gqa_attention_layer_circuit_v1",
         circuit_id=f"{pedal['id']}_gqa_attention_circuit_v1",
-        nodes=_attention_nodes(heads),
+        nodes=_attention_nodes(
+            heads,
+            pedal["numerics"],
+            has_q_norm="q_norm" in parameters,
+            has_k_norm="k_norm" in parameters,
+        ),
         behavioral_notes=(
             "This circuit preserves the source grouped-query attention layer decomposition.",
             "KV is represented as stream-owned append-only transient state, not as a disposable host cache.",
@@ -223,7 +231,7 @@ def _base_circuit(
     }
 
 
-def _conv_nodes(hidden_size: int) -> list[Json]:
+def _conv_nodes(hidden_size: int, numerics: Json) -> list[Json]:
     return [
         {
             "id": "operator_norm",
@@ -231,7 +239,7 @@ def _conv_nodes(hidden_size: int) -> list[Json]:
             "inputs": ["input_frame"],
             "outputs": ["operator_norm_out"],
             "params": ["operator_norm"],
-            "attrs": {"eps_source": "model.config.norm_eps"},
+            "attrs": {"eps": float(numerics["rms_norm_eps"])},
         },
         {
             "id": "conv_in_projection",
@@ -283,19 +291,28 @@ def _conv_nodes(hidden_size: int) -> list[Json]:
             "outputs": ["operator_out"],
             "params": ["conv_out_projection"],
         },
-        *_ffn_tail(operator_output="operator_out"),
+        *_ffn_tail(
+            operator_output="operator_out",
+            norm_eps=float(numerics["rms_norm_eps"]),
+        ),
     ]
 
 
-def _attention_nodes(heads: Json) -> list[Json]:
-    return [
+def _attention_nodes(
+    heads: Json,
+    numerics: Json,
+    *,
+    has_q_norm: bool,
+    has_k_norm: bool,
+) -> list[Json]:
+    nodes = [
         {
             "id": "operator_norm",
             "op": "rms_norm",
             "inputs": ["input_frame"],
             "outputs": ["operator_norm_out"],
             "params": ["operator_norm"],
-            "attrs": {"eps_source": "model.config.norm_eps"},
+            "attrs": {"eps": float(numerics["rms_norm_eps"])},
         },
         {
             "id": "q_projection",
@@ -318,64 +335,88 @@ def _attention_nodes(heads: Json) -> list[Json]:
             "outputs": ["v_projected"],
             "params": ["v_projection"],
         },
-        {
-            "id": "q_head_norm",
-            "op": "rms_norm_per_head",
-            "inputs": ["q_projected"],
-            "outputs": ["q_normed"],
-            "params": ["q_norm"],
-            "attrs": heads,
-        },
-        {
-            "id": "k_head_norm",
-            "op": "rms_norm_per_head",
-            "inputs": ["k_projected"],
-            "outputs": ["k_normed"],
-            "params": ["k_norm"],
-            "attrs": heads,
-        },
-        {
-            "id": "q_rope",
-            "op": "rotary_position_embedding",
-            "inputs": ["q_normed"],
-            "outputs": ["q_positioned"],
-            "attrs": {"position_source": "stream_tick", **heads},
-        },
-        {
-            "id": "k_rope",
-            "op": "rotary_position_embedding",
-            "inputs": ["k_normed"],
-            "outputs": ["k_positioned"],
-            "attrs": {"position_source": "stream_tick", **heads},
-        },
-        {
-            "id": "kv_memory_append",
-            "op": "append_state_update",
-            "inputs": ["k_positioned", "v_projected", "kv_memory"],
-            "outputs": ["k_memory", "v_memory"],
-            "state_reads": ["kv_memory"],
-            "state_writes": ["kv_memory"],
-            "attrs": {"growth": "per_activation", **heads},
-        },
-        {
-            "id": "attention_read",
-            "op": "scaled_dot_product_attention",
-            "inputs": ["q_positioned", "k_memory", "v_memory"],
-            "outputs": ["attention_out"],
-            "attrs": {"causal": True, **heads},
-        },
-        {
-            "id": "attention_out_projection",
-            "op": "linear",
-            "inputs": ["attention_out"],
-            "outputs": ["operator_out"],
-            "params": ["attention_out_projection"],
-        },
-        *_ffn_tail(operator_output="operator_out"),
     ]
+    q_rope_input = "q_projected"
+    if has_q_norm:
+        nodes.append(
+            {
+                "id": "q_head_norm",
+                "op": "rms_norm_per_head",
+                "inputs": ["q_projected"],
+                "outputs": ["q_normed"],
+                "params": ["q_norm"],
+                "attrs": {"eps": float(numerics["rms_norm_eps"]), **heads},
+            }
+        )
+        q_rope_input = "q_normed"
+    k_rope_input = "k_projected"
+    if has_k_norm:
+        nodes.append(
+            {
+                "id": "k_head_norm",
+                "op": "rms_norm_per_head",
+                "inputs": ["k_projected"],
+                "outputs": ["k_normed"],
+                "params": ["k_norm"],
+                "attrs": {"eps": float(numerics["rms_norm_eps"]), **heads},
+            }
+        )
+        k_rope_input = "k_normed"
+    rope_attrs = {
+        "position_source": "stream_tick",
+        "theta": float(numerics["rope_theta"]),
+        "interleaved": bool(numerics["rope_interleaved"]),
+        **heads,
+    }
+    nodes.extend(
+        [
+            {
+                "id": "q_rope",
+                "op": "rotary_position_embedding",
+                "inputs": [q_rope_input],
+                "outputs": ["q_positioned"],
+                "attrs": rope_attrs,
+            },
+            {
+                "id": "k_rope",
+                "op": "rotary_position_embedding",
+                "inputs": [k_rope_input],
+                "outputs": ["k_positioned"],
+                "attrs": rope_attrs,
+            },
+            {
+                "id": "kv_memory_append",
+                "op": "append_state_update",
+                "inputs": ["k_positioned", "v_projected", "kv_memory"],
+                "outputs": ["k_memory", "v_memory"],
+                "state_reads": ["kv_memory"],
+                "state_writes": ["kv_memory"],
+                "attrs": {"growth": "per_activation", **heads},
+            },
+            {
+                "id": "attention_read",
+                "op": "scaled_dot_product_attention",
+                "inputs": ["q_positioned", "k_memory", "v_memory"],
+                "outputs": ["attention_out"],
+                "attrs": {"causal": True, **heads},
+            },
+            {
+                "id": "attention_out_projection",
+                "op": "linear",
+                "inputs": ["attention_out"],
+                "outputs": ["operator_out"],
+                "params": ["attention_out_projection"],
+            },
+            *_ffn_tail(
+                operator_output="operator_out",
+                norm_eps=float(numerics["rms_norm_eps"]),
+            ),
+        ]
+    )
+    return nodes
 
 
-def _ffn_tail(operator_output: str) -> list[Json]:
+def _ffn_tail(operator_output: str, norm_eps: float) -> list[Json]:
     return [
         {
             "id": "operator_residual",
@@ -389,7 +430,7 @@ def _ffn_tail(operator_output: str) -> list[Json]:
             "inputs": ["operator_residual_out"],
             "outputs": ["ffn_norm_out"],
             "params": ["ffn_norm"],
-            "attrs": {"eps_source": "model.config.norm_eps"},
+            "attrs": {"eps": norm_eps},
         },
         {
             "id": "ffn_gate_projection",

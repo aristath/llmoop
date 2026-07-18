@@ -50,7 +50,7 @@ class ShortConvCircuitPedal:
             layer_index=int(circuit["source"]["source_layer_index"]),
             hidden_size=int(circuit["boundary"]["inputs"][0]["shape"][0]),
             conv_l_cache=int(circuit["state_ports"][0]["shape"][0]),
-            norm_eps=model.config.norm_eps,
+            norm_eps=_norm_eps(circuit),
             circuit_id=circuit["id"],
             weights=weights,
         )
@@ -61,7 +61,6 @@ class ShortConvCircuitPedal:
         tensor_store: Any,
         torch: Any,
         circuit: Json,
-        config: Json,
     ) -> "ShortConvCircuitPedal":
         _validate_shortconv_circuit(circuit)
         refs = circuit["parameters"]["refs"]
@@ -81,7 +80,7 @@ class ShortConvCircuitPedal:
             layer_index=int(circuit["source"]["source_layer_index"]),
             hidden_size=int(circuit["boundary"]["inputs"][0]["shape"][0]),
             conv_l_cache=int(circuit["state_ports"][0]["shape"][0]),
-            norm_eps=float(config["norm_eps"]),
+            norm_eps=_norm_eps(circuit),
             circuit_id=circuit["id"],
             weights=weights,
         )
@@ -170,6 +169,7 @@ class GQAAttentionCircuitPedal:
     head_width: int
     query_groups_per_kv_head: int
     norm_eps: float
+    rope_interleaved: bool
     circuit_id: str
     weights: dict[str, Any]
 
@@ -188,12 +188,13 @@ class GQAAttentionCircuitPedal:
             "k_proj": state[refs["k_projection"]["tensor"]],
             "v_proj": state[refs["v_projection"]["tensor"]],
             "out_proj": state[refs["attention_out_projection"]["tensor"]],
-            "q_norm": state[refs["q_norm"]["tensor"]],
-            "k_norm": state[refs["k_norm"]["tensor"]],
             "ffn_w1": state[refs["ffn_gate"]["tensor"]],
             "ffn_w2": state[refs["ffn_down"]["tensor"]],
             "ffn_w3": state[refs["ffn_up"]["tensor"]],
         }
+        for parameter, weight in (("q_norm", "q_norm"), ("k_norm", "k_norm")):
+            if parameter in refs:
+                weights[weight] = state[refs[parameter]["tensor"]]
         return cls(
             torch=torch,
             pedal_id=circuit["source"]["pedal_id"],
@@ -203,7 +204,8 @@ class GQAAttentionCircuitPedal:
             key_value_heads=int(heads["key_value_heads"]),
             head_width=int(heads["head_width"]),
             query_groups_per_kv_head=int(heads["query_groups_per_kv_head"]),
-            norm_eps=model.config.norm_eps,
+            norm_eps=_norm_eps(circuit),
+            rope_interleaved=_rope_interleaved(circuit),
             circuit_id=circuit["id"],
             weights=weights,
         )
@@ -214,7 +216,6 @@ class GQAAttentionCircuitPedal:
         tensor_store: Any,
         torch: Any,
         circuit: Json,
-        config: Json,
     ) -> "GQAAttentionCircuitPedal":
         _validate_attention_circuit(circuit)
         refs = circuit["parameters"]["refs"]
@@ -226,12 +227,13 @@ class GQAAttentionCircuitPedal:
             "k_proj": tensor_store.get(refs["k_projection"]["tensor"]),
             "v_proj": tensor_store.get(refs["v_projection"]["tensor"]),
             "out_proj": tensor_store.get(refs["attention_out_projection"]["tensor"]),
-            "q_norm": tensor_store.get(refs["q_norm"]["tensor"]),
-            "k_norm": tensor_store.get(refs["k_norm"]["tensor"]),
             "ffn_w1": tensor_store.get(refs["ffn_gate"]["tensor"]),
             "ffn_w2": tensor_store.get(refs["ffn_down"]["tensor"]),
             "ffn_w3": tensor_store.get(refs["ffn_up"]["tensor"]),
         }
+        for parameter, weight in (("q_norm", "q_norm"), ("k_norm", "k_norm")):
+            if parameter in refs:
+                weights[weight] = tensor_store.get(refs[parameter]["tensor"])
         return cls(
             torch=torch,
             pedal_id=circuit["source"]["pedal_id"],
@@ -241,7 +243,8 @@ class GQAAttentionCircuitPedal:
             key_value_heads=int(heads["key_value_heads"]),
             head_width=int(heads["head_width"]),
             query_groups_per_kv_head=int(heads["query_groups_per_kv_head"]),
-            norm_eps=float(config["norm_eps"]),
+            norm_eps=_norm_eps(circuit),
+            rope_interleaved=_rope_interleaved(circuit),
             circuit_id=circuit["id"],
             weights=weights,
         )
@@ -284,11 +287,15 @@ class GQAAttentionCircuitPedal:
 
         query_states = functional.linear(hidden_states, self.weights["q_proj"])
         query_states = query_states.view(*input_shape, self.query_heads, self.head_width)
-        query_states = self._rms_norm(query_states, self.weights["q_norm"]).transpose(1, 2)
+        if "q_norm" in self.weights:
+            query_states = self._rms_norm(query_states, self.weights["q_norm"])
+        query_states = query_states.transpose(1, 2)
 
         key_states = functional.linear(hidden_states, self.weights["k_proj"])
         key_states = key_states.view(*input_shape, self.key_value_heads, self.head_width)
-        key_states = self._rms_norm(key_states, self.weights["k_norm"]).transpose(1, 2)
+        if "k_norm" in self.weights:
+            key_states = self._rms_norm(key_states, self.weights["k_norm"])
+        key_states = key_states.transpose(1, 2)
 
         value_states = functional.linear(hidden_states, self.weights["v_proj"])
         value_states = value_states.view(*input_shape, self.key_value_heads, self.head_width).transpose(1, 2)
@@ -323,6 +330,10 @@ class GQAAttentionCircuitPedal:
         return query_states, key_states
 
     def _rotate_half(self, tensor: Any) -> Any:
+        if self.rope_interleaved:
+            even = tensor[..., ::2]
+            odd = tensor[..., 1::2]
+            return self.torch.stack((-odd, even), dim=-1).flatten(-2)
         first = tensor[..., : tensor.shape[-1] // 2]
         second = tensor[..., tensor.shape[-1] // 2 :]
         return self.torch.cat((-second, first), dim=-1)
@@ -419,7 +430,7 @@ def _validate_attention_circuit(circuit: Json) -> None:
     report.raise_for_errors()
     if circuit["source"]["source_operator_type"] != "full_attention":
         raise ValueError(f"{circuit['id']} is not a full_attention circuit")
-    expected_params = {
+    required_params = {
         "operator_norm",
         "ffn_norm",
         "ffn_gate",
@@ -429,11 +440,10 @@ def _validate_attention_circuit(circuit: Json) -> None:
         "k_projection",
         "v_projection",
         "attention_out_projection",
-        "q_norm",
-        "k_norm",
     }
+    optional_params = {"q_norm", "k_norm"}
     actual_params = set(circuit["parameters"]["refs"])
-    if actual_params != expected_params:
+    if not required_params <= actual_params or not actual_params <= required_params | optional_params:
         raise ValueError(f"{circuit['id']} has unexpected params: {sorted(actual_params)}")
     if len(circuit["state_ports"]) != 1 or circuit["state_ports"][0]["id"] != "kv_memory":
         raise ValueError(f"{circuit['id']} must declare one kv_memory state port")
@@ -453,3 +463,17 @@ def _attention_heads(circuit: Json) -> Json:
         "head_width": head_width,
         "query_groups_per_kv_head": query_heads // key_value_heads,
     }
+
+
+def _norm_eps(circuit: Json) -> float:
+    for node in circuit["nodes"]:
+        if node["id"] == "operator_norm" and node["op"] == "rms_norm":
+            return float(node["attrs"]["eps"])
+    raise ValueError(f"{circuit['id']} does not declare operator RMS epsilon")
+
+
+def _rope_interleaved(circuit: Json) -> bool:
+    for node in circuit["nodes"]:
+        if node["op"] == "rotary_position_embedding":
+            return bool(node["attrs"]["interleaved"])
+    raise ValueError(f"{circuit['id']} does not declare rotary layout")

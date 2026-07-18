@@ -40,6 +40,9 @@ class ModelStructure:
     conv_l_cache: int
     vocab_size: int
     max_position_embeddings: int | None
+    norm_eps: float
+    rope_theta: float
+    rope_interleaved: bool
     token_ids: Json
     tensors: dict[str, str]
     layers: tuple[LayerStructure, ...]
@@ -192,6 +195,9 @@ def discover_model_structure(
         conv_l_cache=conv_l_cache,
         vocab_size=vocab_size,
         max_position_embeddings=config.get("max_position_embeddings"),
+        norm_eps=discover_norm_eps(config),
+        rope_theta=discover_rope_theta(config),
+        rope_interleaved=bool(config.get("rope_interleaved", False)),
         token_ids={
             "bos": config.get("bos_token_id"),
             "eos": config.get("eos_token_id"),
@@ -280,20 +286,18 @@ def discover_layer_structure(
                     ATTENTION_OUT_PROJECTION_SUFFIXES,
                     role="attention output projection",
                 ),
-                "q_norm": find_layer_tensor(
-                    tensors,
-                    prefix,
-                    ATTENTION_Q_NORM_SUFFIXES,
-                    role="attention query norm",
-                ),
-                "k_norm": find_layer_tensor(
-                    tensors,
-                    prefix,
-                    ATTENTION_K_NORM_SUFFIXES,
-                    role="attention key norm",
-                ),
             }
         )
+        optional_q_norm = find_optional_layer_tensor(
+            tensors, prefix, ATTENTION_Q_NORM_SUFFIXES
+        )
+        optional_k_norm = find_optional_layer_tensor(
+            tensors, prefix, ATTENTION_K_NORM_SUFFIXES
+        )
+        if optional_q_norm is not None:
+            layer_tensors["q_norm"] = optional_q_norm
+        if optional_k_norm is not None:
+            layer_tensors["k_norm"] = optional_k_norm
     else:
         raise ModelTranspileError(f"unsupported operator type {operator_type!r} for layer {layer_index}")
 
@@ -357,6 +361,24 @@ def discover_int_config(config: Json, *keys: str, role: str) -> int:
     raise ModelTranspileError(f"could not discover {role} from config keys {keys}")
 
 
+def discover_norm_eps(config: Json) -> float:
+    for key in ("rms_norm_eps", "norm_eps", "block_norm_eps"):
+        if key in config:
+            return float(config[key])
+    raise ModelTranspileError(
+        "could not discover RMS normalization epsilon from model config"
+    )
+
+
+def discover_rope_theta(config: Json) -> float:
+    rope_parameters = config.get("rope_parameters")
+    if isinstance(rope_parameters, dict) and "rope_theta" in rope_parameters:
+        return float(rope_parameters["rope_theta"])
+    if "rope_theta" in config:
+        return float(config["rope_theta"])
+    raise ModelTranspileError("could not discover RoPE theta from model config")
+
+
 def make_layer(structure: ModelStructure, layer: LayerStructure) -> Json:
     hidden_size = structure.hidden_size
     tensor_refs = list(layer.tensors.values())
@@ -373,6 +395,11 @@ def make_layer(structure: ModelStructure, layer: LayerStructure) -> Json:
         "type": "pedal_instance",
         "pedal_class": make_pedal_class(structure, layer.operator_type),
         "operator_type": layer.operator_type,
+        "numerics": {
+            "rms_norm_eps": structure.norm_eps,
+            "rope_theta": structure.rope_theta,
+            "rope_interleaved": structure.rope_interleaved,
+        },
         "ports": {
             "inputs": [{"id": "input", "signal": "frame", "shape": [hidden_size]}],
             "outputs": [{"id": "output", "signal": "frame", "shape": [hidden_size]}],
@@ -435,6 +462,11 @@ def make_model_graph(structure: ModelStructure, output_dir: Path, tensor_index: 
             "vocab_size": structure.vocab_size,
             "max_position_embeddings": structure.max_position_embeddings,
         },
+        "numerics": {
+            "rms_norm_eps": structure.norm_eps,
+            "rope_theta": structure.rope_theta,
+            "rope_interleaved": structure.rope_interleaved,
+        },
         "token_ids": structure.token_ids,
         "files": {
             "tensor_index": "tensors.json",
@@ -456,6 +488,7 @@ def make_model_graph(structure: ModelStructure, output_dir: Path, tensor_index: 
                     {
                         "id": "output_norm",
                         "type": "rms_norm",
+                        "attrs": {"eps": structure.norm_eps},
                         "params": {"weight": tensor_ref(structure.tensors["output_norm"])},
                     },
                     output_projection,
@@ -566,6 +599,31 @@ def make_attention_operator(structure: ModelStructure, layer: LayerStructure) ->
         "head_width": head_width,
         "query_groups_per_kv_head": structure.num_attention_heads // structure.num_key_value_heads,
     }
+    params = {
+        "q_projection": tensor_ref(layer.tensors["q_projection"]),
+        "k_projection": tensor_ref(layer.tensors["k_projection"]),
+        "v_projection": tensor_ref(layer.tensors["v_projection"]),
+        "out_projection": tensor_ref(layer.tensors["attention_out_projection"]),
+    }
+    internal_pedals = [
+        {"id": "q_projection", "type": "linear"},
+        {"id": "k_projection", "type": "linear"},
+        {"id": "v_projection", "type": "linear"},
+    ]
+    if "q_norm" in layer.tensors:
+        params["q_norm"] = tensor_ref(layer.tensors["q_norm"])
+        internal_pedals.append({"id": "q_norm", "type": "rms_norm_per_head"})
+    if "k_norm" in layer.tensors:
+        params["k_norm"] = tensor_ref(layer.tensors["k_norm"])
+        internal_pedals.append({"id": "k_norm", "type": "rms_norm_per_head"})
+    internal_pedals.extend(
+        [
+            {"id": "rope", "type": "rotary_position_embedding"},
+            {"id": "kv_memory", "type": "stateful_append_memory"},
+            {"id": "attention_read", "type": "scaled_dot_product_attention"},
+            {"id": "out_projection", "type": "linear"},
+        ]
+    )
     return {
         "id": "operator",
         "type": "gqa_attention_operator",
@@ -578,25 +636,8 @@ def make_attention_operator(structure: ModelStructure, layer: LayerStructure) ->
         "output": "operator.output",
         "heads": heads,
         "state_ports": make_state_ports(structure, "full_attention"),
-        "params": {
-            "q_projection": tensor_ref(layer.tensors["q_projection"]),
-            "k_projection": tensor_ref(layer.tensors["k_projection"]),
-            "v_projection": tensor_ref(layer.tensors["v_projection"]),
-            "out_projection": tensor_ref(layer.tensors["attention_out_projection"]),
-            "q_norm": tensor_ref(layer.tensors["q_norm"]),
-            "k_norm": tensor_ref(layer.tensors["k_norm"]),
-        },
-        "internal_pedals": [
-            {"id": "q_projection", "type": "linear"},
-            {"id": "k_projection", "type": "linear"},
-            {"id": "v_projection", "type": "linear"},
-            {"id": "q_norm", "type": "rms_norm_per_head"},
-            {"id": "k_norm", "type": "rms_norm_per_head"},
-            {"id": "rope", "type": "rotary_position_embedding"},
-            {"id": "kv_memory", "type": "stateful_append_memory"},
-            {"id": "attention_read", "type": "scaled_dot_product_attention"},
-            {"id": "out_projection", "type": "linear"},
-        ],
+        "params": params,
+        "internal_pedals": internal_pedals,
     }
 
 
@@ -759,6 +800,14 @@ def find_layer_tensor(
     role: str,
 ) -> str:
     return find_first_tensor(tensors, (f"{prefix}.{suffix}" for suffix in suffixes), role=role)
+
+
+def find_optional_layer_tensor(
+    tensors: dict[str, Json], prefix: str, suffixes: Iterable[str]
+) -> str | None:
+    return find_first_existing_tensor(
+        tensors, (f"{prefix}.{suffix}" for suffix in suffixes)
+    )
 
 
 def tensor_ref(name: str) -> dict[str, str]:
