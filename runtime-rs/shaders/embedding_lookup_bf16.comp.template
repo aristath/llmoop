@@ -14,8 +14,8 @@ layout(set = 0, binding = 2) readonly buffer StreamControl {
     uint words[];
 } stream_control;
 
-const uint VOCAB_SIZE = 65536u;
-const uint FRAME_WORDS = 512u;
+const uint VOCAB_SIZE = {{VOCAB_SIZE}}u;
+const uint FRAME_WORDS = ({{HIDDEN_SIZE}}u + 1u) / 2u;
 
 void main() {
     uint word_index = gl_GlobalInvocationID.x;

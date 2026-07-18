@@ -2,13 +2,6 @@
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
-layout(push_constant) uniform StreamControl {
-    uint stream_tick_lo;
-    uint stream_tick_hi;
-    uint control_flags;
-    uint dynamic_state_capacity_activations;
-} control;
-
 layout(set = 0, binding = 0) readonly buffer InputFrame {
     uint words[];
 } input_frame;
@@ -17,9 +10,15 @@ layout(set = 0, binding = 1) buffer OutputFrame {
     uint words[];
 } output_frame;
 
+layout(set = 0, binding = 2) readonly buffer StreamControl {
+    uint words[];
+} stream_control;
+
 const uint HEAD_COUNT = 8u;
 const uint HEAD_WIDTH = 64u;
 const float ROPE_THETA = 1000000.0;
+
+shared float rotated[64];
 
 float bf16_to_f32(uint value) {
     return uintBitsToFloat((value & 0xffffu) << 16);
@@ -48,25 +47,24 @@ float rotate_value(uint base, uint dim) {
 float rope_angle(uint dim) {
     uint pair_dim = dim % (HEAD_WIDTH / 2u);
     float inv_freq = pow(ROPE_THETA, -float(pair_dim) / float(HEAD_WIDTH / 2u));
-    return float(control.stream_tick_lo) * inv_freq;
+    return float(stream_control.words[1]) * inv_freq;
 }
 
 void main() {
-    if (gl_GlobalInvocationID.x != 0u) {
+    uint head = gl_WorkGroupID.x;
+    uint dim = gl_LocalInvocationID.x;
+    if (head >= HEAD_COUNT) {
         return;
     }
 
-    for (uint head = 0u; head < HEAD_COUNT; head = head + 1u) {
-        uint base = head * HEAD_WIDTH;
-        for (uint dim = 0u; dim < HEAD_WIDTH; dim = dim + 2u) {
-            float angle_lo = rope_angle(dim);
-            float angle_hi = rope_angle(dim + 1u);
-            float lo = (read_input(base + dim) * cos(angle_lo))
-                + (rotate_value(base, dim) * sin(angle_lo));
-            float hi = (read_input(base + dim + 1u) * cos(angle_hi))
-                + (rotate_value(base, dim + 1u) * sin(angle_hi));
-            output_frame.words[(base + dim) >> 1] =
-                (f32_to_bf16(hi) << 16) | f32_to_bf16(lo);
-        }
+    uint base = head * HEAD_WIDTH;
+    float angle = rope_angle(dim);
+    rotated[dim] = (read_input(base + dim) * cos(angle))
+        + (rotate_value(base, dim) * sin(angle));
+    barrier();
+
+    if ((dim & 1u) == 0u) {
+        output_frame.words[(base + dim) >> 1] =
+            (f32_to_bf16(rotated[dim + 1u]) << 16) | f32_to_bf16(rotated[dim]);
     }
 }

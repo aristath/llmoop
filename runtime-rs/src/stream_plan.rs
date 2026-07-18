@@ -931,11 +931,13 @@ fn infer_node_output_shapes(
         "rms_norm" | "rms_norm_per_head" | "silu" | "rotary_position_embedding" => {
             Ok(repeat_shape(first_input_shape(node, signals), outputs))
         }
-        "multiply" | "residual_add" => Ok(repeat_shape(
+        "multiply" | "residual_add" | "silu_multiply" => Ok(repeat_shape(
             compatible_input_shape(pedal_id, node, signals)?,
             outputs,
         )),
-        "linear" => infer_linear_output_shapes(pedal_id, node, signals, params, tensor_index),
+        "linear" | "linear_residual" => {
+            infer_linear_output_shapes(pedal_id, node, signals, params, tensor_index)
+        }
         "split" => infer_split_output_shapes(pedal_id, node, signals),
         "rolling_state_update" => {
             let state_shape = node

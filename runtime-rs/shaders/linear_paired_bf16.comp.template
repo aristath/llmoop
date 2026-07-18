@@ -1,0 +1,91 @@
+#version 450
+
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer InputFrame {
+    uint words[];
+} input_frame;
+
+layout(set = 0, binding = 1) buffer OutputFrame {
+    uint words[];
+} output_frame;
+
+layout(set = 0, binding = 2) readonly buffer Weight {
+    uvec2 words[];
+} weight;
+
+const uint INPUT_SIZE = {{INPUT_SIZE}}u;
+const uint OUTPUT_SIZE = {{OUTPUT_SIZE}}u;
+const uint OUTPUT_WORDS = (OUTPUT_SIZE + 1u) / 2u;
+const uint INPUT_WORDS = (INPUT_SIZE + 1u) / 2u;
+
+shared float subgroup_lo[64];
+shared float subgroup_hi[64];
+
+float bf16_to_f32(uint value) {
+    return uintBitsToFloat((value & 0xffffu) << 16);
+}
+
+uint f32_to_bf16(float value) {
+    uint bits = floatBitsToUint(value);
+    uint lsb = (bits >> 16) & 1u;
+    uint rounding_bias = 0x7fffu + lsb;
+    return (bits + rounding_bias) >> 16;
+}
+
+void main() {
+    uint word_index = gl_WorkGroupID.x;
+    uint lane = gl_LocalInvocationID.x;
+    uint hi_row = word_index * 2u + 1u;
+
+    float lo_sum = 0.0;
+    float hi_sum = 0.0;
+    if (word_index < OUTPUT_WORDS) {
+        uint weight_offset = word_index * INPUT_WORDS;
+        for (uint column_word = lane; column_word < INPUT_WORDS; column_word += 64u) {
+            uint input_pair = input_frame.words[column_word];
+            float input_lo = bf16_to_f32(input_pair);
+            float input_hi = bf16_to_f32(input_pair >> 16);
+            uvec2 weight_pair = weight.words[weight_offset + column_word];
+
+            lo_sum = fma(input_lo, bf16_to_f32(weight_pair.x), lo_sum);
+            lo_sum = fma(input_hi, bf16_to_f32(weight_pair.x >> 16), lo_sum);
+            if (hi_row < OUTPUT_SIZE) {
+                hi_sum = fma(input_lo, bf16_to_f32(weight_pair.y), hi_sum);
+                hi_sum = fma(input_hi, bf16_to_f32(weight_pair.y >> 16), hi_sum);
+            }
+        }
+    }
+
+    lo_sum = subgroupAdd(lo_sum);
+    hi_sum = subgroupAdd(hi_sum);
+    if (gl_NumSubgroups == 1u) {
+        if (gl_SubgroupInvocationID == 0u && word_index < OUTPUT_WORDS) {
+            uint lo = f32_to_bf16(lo_sum);
+            uint hi = (hi_row < OUTPUT_SIZE) ? f32_to_bf16(hi_sum) : 0u;
+            output_frame.words[word_index] = (hi << 16) | lo;
+        }
+        return;
+    }
+
+    if (gl_SubgroupInvocationID == 0u) {
+        subgroup_lo[gl_SubgroupID] = lo_sum;
+        subgroup_hi[gl_SubgroupID] = hi_sum;
+    }
+    barrier();
+
+    if (lane == 0u && word_index < OUTPUT_WORDS) {
+        float lo_total = 0.0;
+        float hi_total = 0.0;
+        for (uint subgroup = 0u; subgroup < gl_NumSubgroups; subgroup++) {
+            lo_total += subgroup_lo[subgroup];
+            hi_total += subgroup_hi[subgroup];
+        }
+        uint lo = f32_to_bf16(lo_total);
+        uint hi = (hi_row < OUTPUT_SIZE) ? f32_to_bf16(hi_total) : 0u;
+        output_frame.words[word_index] = (hi << 16) | lo;
+    }
+}

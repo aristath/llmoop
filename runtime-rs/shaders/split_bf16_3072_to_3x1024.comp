@@ -21,11 +21,7 @@ layout(set = 0, binding = 3) buffer OutputC {
 const uint CHUNK_WORDS = 512u;
 
 void main() {
-    if (gl_GlobalInvocationID.x != 0u) {
-        return;
-    }
-
-    for (uint word_index = 0u; word_index < CHUNK_WORDS; word_index = word_index + 1u) {
+    for (uint word_index = gl_LocalInvocationID.x; word_index < CHUNK_WORDS; word_index += 64u) {
         output_a.words[word_index] = input_frame.words[word_index];
         output_b.words[word_index] = input_frame.words[CHUNK_WORDS + word_index];
         output_c.words[word_index] = input_frame.words[(2u * CHUNK_WORDS) + word_index];

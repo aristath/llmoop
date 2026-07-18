@@ -1,0 +1,47 @@
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer GateInput {
+    uint words[];
+} gate_input;
+
+layout(set = 0, binding = 1) readonly buffer UpInput {
+    uint words[];
+} up_input;
+
+layout(set = 0, binding = 2) buffer OutputFrame {
+    uint words[];
+} output_frame;
+
+float bf16_to_f32(uint value) {
+    return uintBitsToFloat((value & 0xffffu) << 16);
+}
+
+uint f32_to_bf16(float value) {
+    uint bits = floatBitsToUint(value);
+    uint lsb = (bits >> 16) & 1u;
+    uint rounding_bias = 0x7fffu + lsb;
+    return (bits + rounding_bias) >> 16;
+}
+
+float rounded_silu(float value) {
+    float activated = value / (1.0 + exp(-value));
+    return bf16_to_f32(f32_to_bf16(activated));
+}
+
+void main() {
+    uint word_count = uint(output_frame.words.length());
+    for (uint word_index = gl_LocalInvocationID.x; word_index < word_count; word_index += 64u) {
+        uint gate = gate_input.words[word_index];
+        uint up = up_input.words[word_index];
+        float gate_lo = bf16_to_f32(gate);
+        float gate_hi = bf16_to_f32(gate >> 16);
+        float up_lo = bf16_to_f32(up);
+        float up_hi = bf16_to_f32(up >> 16);
+        float lo = rounded_silu(gate_lo) * up_lo;
+        float hi = rounded_silu(gate_hi) * up_hi;
+        output_frame.words[word_index] =
+            (f32_to_bf16(hi) << 16) | f32_to_bf16(lo);
+    }
+}

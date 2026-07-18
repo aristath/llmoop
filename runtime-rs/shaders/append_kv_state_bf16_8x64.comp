@@ -2,13 +2,6 @@
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
-layout(push_constant) uniform StreamControl {
-    uint stream_tick_lo;
-    uint stream_tick_hi;
-    uint control_flags;
-    uint dynamic_state_capacity_activations;
-} control;
-
 layout(set = 0, binding = 0) readonly buffer KInput {
     uint words[];
 } k_input;
@@ -21,23 +14,25 @@ layout(set = 0, binding = 6) buffer KvStateWrite {
     uint words[];
 } kv_state_write;
 
+layout(set = 0, binding = 9) readonly buffer StreamControl {
+    uint words[];
+} stream_control;
+
 const uint KV_ELEMENT_COUNT = 512u;
 const uint KV_WORD_COUNT = KV_ELEMENT_COUNT / 2u;
 const uint SLOT_WORD_COUNT = KV_WORD_COUNT * 2u;
 
 void main() {
-    if (gl_GlobalInvocationID.x != 0u) {
-        return;
-    }
-    if (control.dynamic_state_capacity_activations == 0u) {
+    uint capacity = stream_control.words[4];
+    if (capacity == 0u) {
         return;
     }
 
-    uint slot = control.stream_tick_lo % control.dynamic_state_capacity_activations;
+    uint slot = stream_control.words[1] % capacity;
     uint slot_base = slot * SLOT_WORD_COUNT;
     uint v_base = slot_base + KV_WORD_COUNT;
 
-    for (uint word_index = 0u; word_index < KV_WORD_COUNT; word_index = word_index + 1u) {
+    for (uint word_index = gl_LocalInvocationID.x; word_index < KV_WORD_COUNT; word_index += 64u) {
         kv_state_write.words[slot_base + word_index] = k_input.words[word_index];
         kv_state_write.words[v_base + word_index] = v_input.words[word_index];
     }

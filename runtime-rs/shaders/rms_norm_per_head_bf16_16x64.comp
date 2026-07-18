@@ -1,5 +1,8 @@
 #version 450
 
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
 layout(set = 0, binding = 0) readonly buffer InputFrame {
@@ -16,6 +19,8 @@ layout(set = 0, binding = 2) readonly buffer Weight {
 
 const uint HEAD_COUNT = 16u;
 const uint HEAD_WIDTH = 64u;
+
+shared float reduction[64];
 
 float bf16_to_f32(uint value) {
     return uintBitsToFloat((value & 0xffffu) << 16);
@@ -41,24 +46,32 @@ float read_weight(uint index) {
 }
 
 void main() {
-    if (gl_GlobalInvocationID.x != 0u) {
+    uint head = gl_WorkGroupID.x;
+    uint dim = gl_LocalInvocationID.x;
+    if (head >= HEAD_COUNT) {
         return;
     }
 
-    for (uint head = 0u; head < HEAD_COUNT; head = head + 1u) {
-        uint base = head * HEAD_WIDTH;
-        float sum_squares = 0.0;
-        for (uint dim = 0u; dim < HEAD_WIDTH; dim = dim + 1u) {
-            float value = read_input(base + dim);
-            sum_squares = sum_squares + value * value;
+    uint base = head * HEAD_WIDTH;
+    float value = read_input(base + dim);
+    float sum_squares = subgroupAdd(value * value);
+    if (gl_NumSubgroups > 1u) {
+        if (gl_SubgroupInvocationID == 0u) {
+            reduction[gl_SubgroupID] = sum_squares;
         }
-        float inv_rms = inversesqrt((sum_squares / float(HEAD_WIDTH)) + 0.00001);
+        barrier();
+        sum_squares = 0.0;
+        for (uint subgroup = 0u; subgroup < gl_NumSubgroups; subgroup++) {
+            sum_squares += reduction[subgroup];
+        }
+    }
+    float inv_rms = inversesqrt((sum_squares / float(HEAD_WIDTH)) + 0.00001);
 
-        for (uint dim = 0u; dim < HEAD_WIDTH; dim = dim + 2u) {
-            float lo = read_input(base + dim) * inv_rms * read_weight(dim);
-            float hi = read_input(base + dim + 1u) * inv_rms * read_weight(dim + 1u);
-            output_frame.words[(base + dim) >> 1] =
+    if (dim < (HEAD_WIDTH / 2u)) {
+        uint pair_dim = dim * 2u;
+        float lo = read_input(base + pair_dim) * inv_rms * read_weight(pair_dim);
+        float hi = read_input(base + pair_dim + 1u) * inv_rms * read_weight(pair_dim + 1u);
+        output_frame.words[(base + pair_dim) >> 1] =
                 (f32_to_bf16(hi) << 16) | f32_to_bf16(lo);
-        }
     }
 }

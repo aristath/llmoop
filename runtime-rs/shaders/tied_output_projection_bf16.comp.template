@@ -17,8 +17,8 @@ layout(set = 0, binding = 2) buffer Logits {
     float values[];
 } logits;
 
-const uint INPUT_SIZE = 1024u;
-const uint VOCAB_SIZE = 65536u;
+const uint INPUT_SIZE = {{INPUT_SIZE}}u;
+const uint VOCAB_SIZE = {{VOCAB_SIZE}}u;
 const uint INPUT_WORDS = (INPUT_SIZE + 1u) / 2u;
 const uint OUTPUT_WORDS = (VOCAB_SIZE + 1u) / 2u;
 
@@ -27,6 +27,13 @@ shared float subgroup_hi[64];
 
 float bf16_to_f32(uint value) {
     return uintBitsToFloat((value & 0xffffu) << 16);
+}
+
+void store_result(uint output_word, uint lo_row, uint hi_row, float lo_sum, float hi_sum) {
+    logits.values[lo_row] = lo_sum;
+    if (hi_row < VOCAB_SIZE) {
+        logits.values[hi_row] = hi_sum;
+    }
 }
 
 void main() {
@@ -48,7 +55,6 @@ void main() {
             uint lo_weight_pair = embedding_weight.words[lo_weight_offset + column_word];
             lo_sum = fma(input_lo, bf16_to_f32(lo_weight_pair), lo_sum);
             lo_sum = fma(input_hi, bf16_to_f32(lo_weight_pair >> 16), lo_sum);
-
             if (hi_row < VOCAB_SIZE) {
                 uint hi_weight_pair = embedding_weight.words[hi_weight_offset + column_word];
                 hi_sum = fma(input_lo, bf16_to_f32(hi_weight_pair), hi_sum);
@@ -61,10 +67,7 @@ void main() {
     hi_sum = subgroupAdd(hi_sum);
     if (gl_NumSubgroups == 1u) {
         if (gl_SubgroupInvocationID == 0u && output_word < OUTPUT_WORDS) {
-            logits.values[lo_row] = lo_sum;
-            if (hi_row < VOCAB_SIZE) {
-                logits.values[hi_row] = hi_sum;
-            }
+            store_result(output_word, lo_row, hi_row, lo_sum, hi_sum);
         }
         return;
     }
@@ -82,9 +85,6 @@ void main() {
             lo_total += subgroup_lo[subgroup];
             hi_total += subgroup_hi[subgroup];
         }
-        logits.values[lo_row] = lo_total;
-        if (hi_row < VOCAB_SIZE) {
-            logits.values[hi_row] = hi_total;
-        }
+        store_result(output_word, lo_row, hi_row, lo_total, hi_total);
     }
 }

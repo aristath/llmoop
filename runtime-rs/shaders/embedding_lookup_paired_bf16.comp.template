@@ -3,7 +3,7 @@
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
 layout(set = 0, binding = 0) readonly buffer EmbeddingWeight {
-    uint words[];
+    uvec2 words[];
 } embedding_weight;
 
 layout(set = 0, binding = 1) buffer OutputFrame {
@@ -14,8 +14,8 @@ layout(set = 0, binding = 2) readonly buffer StreamControl {
     uint words[];
 } stream_control;
 
-const uint VOCAB_SIZE = 65536u;
-const uint FRAME_WORDS = 512u;
+const uint VOCAB_SIZE = {{VOCAB_SIZE}}u;
+const uint FRAME_WORDS = ({{HIDDEN_SIZE}}u + 1u) / 2u;
 
 void main() {
     uint word_index = gl_GlobalInvocationID.x;
@@ -27,6 +27,7 @@ void main() {
         return;
     }
 
-    uint source_base = token_id * FRAME_WORDS;
-    output_frame.words[word_index] = embedding_weight.words[source_base + word_index];
+    uint row_pair = token_id / 2u;
+    uvec2 pair = embedding_weight.words[row_pair * FRAME_WORDS + word_index];
+    output_frame.words[word_index] = ((token_id & 1u) == 0u) ? pair.x : pair.y;
 }

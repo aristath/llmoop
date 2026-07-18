@@ -1,5 +1,8 @@
 #version 450
 
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
 layout(set = 0, binding = 0) readonly buffer InputFrame {
@@ -15,6 +18,8 @@ layout(set = 0, binding = 2) readonly buffer Weight {
 } weight;
 
 const uint HIDDEN_SIZE = 1024u;
+
+shared float reduction[64];
 
 float bf16_to_f32(uint value) {
     return uintBitsToFloat((value & 0xffffu) << 16);
@@ -40,18 +45,26 @@ float read_weight(uint index) {
 }
 
 void main() {
-    if (gl_GlobalInvocationID.x != 0u) {
-        return;
-    }
-
+    uint lane = gl_LocalInvocationID.x;
     float sum_squares = 0.0;
-    for (uint index = 0u; index < HIDDEN_SIZE; index = index + 1u) {
+    for (uint index = lane; index < HIDDEN_SIZE; index += 64u) {
         float value = read_input(index);
-        sum_squares = sum_squares + value * value;
+        sum_squares = fma(value, value, sum_squares);
+    }
+    sum_squares = subgroupAdd(sum_squares);
+    if (gl_NumSubgroups > 1u) {
+        if (gl_SubgroupInvocationID == 0u) {
+            reduction[gl_SubgroupID] = sum_squares;
+        }
+        barrier();
+        sum_squares = 0.0;
+        for (uint subgroup = 0u; subgroup < gl_NumSubgroups; subgroup++) {
+            sum_squares += reduction[subgroup];
+        }
     }
     float inv_rms = inversesqrt((sum_squares / float(HIDDEN_SIZE)) + 0.000001);
 
-    for (uint index = 0u; index < HIDDEN_SIZE; index = index + 2u) {
+    for (uint index = lane * 2u; index < HIDDEN_SIZE; index += 128u) {
         float lo = read_input(index) * inv_rms * read_weight(index);
         float hi = read_input(index + 1u) * inv_rms * read_weight(index + 1u);
         output_frame.words[index >> 1] = (f32_to_bf16(hi) << 16) | f32_to_bf16(lo);
