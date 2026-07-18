@@ -201,6 +201,27 @@ def test_compiler_renders_windowed_attention_with_learned_sink_logits(
     assert "{{" not in attention
 
 
+def test_compiler_renders_subgroup_padded_attention_and_unequal_qkv_split(
+    tmp_path: Path,
+) -> None:
+    shader_source_dir = Path(__file__).parents[1] / "runtime-rs" / "shaders"
+    attention_file = "gqa_attention_bf16_q32_kv32_d96_scale0.102062073_w2047__sc6.comp"
+    split_file = "split_bf16_3x16_8_8.comp"
+
+    copy_shader_templates(shader_source_dir, tmp_path, {attention_file, split_file})
+
+    attention = (tmp_path / attention_file).read_text()
+    split = (tmp_path / split_file).read_text()
+    assert "layout(local_size_x = 1024" in attention
+    assert "const uint HEAD_WIDTH = 96u;" in attention
+    assert "const uint TILE_TOKENS = 8u;" in attention
+    assert "local_index < TILE_TOKENS * HEAD_WIDTH" in attention
+    assert "const uint PART_A_WORDS = 16u / 2u;" in split
+    assert "const uint PART_B_WORDS = 8u / 2u;" in split
+    assert "{{" not in attention
+    assert "{{" not in split
+
+
 def test_compiler_renders_hybrid_recurrent_and_gated_attention_pedals(
     tmp_path: Path,
 ) -> None:

@@ -3,7 +3,7 @@
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
 
-layout(local_size_x = 1024, local_size_y = 1, local_size_z = 1) in;
+layout(local_size_x = {{LOCAL_SIZE}}, local_size_y = 1, local_size_z = 1) in;
 
 layout(set = 0, binding = 0) readonly buffer QueryFrame {
     uint words[];
@@ -174,7 +174,7 @@ void main() {
 
         uint value_token = tile_start + (local_index / HEAD_WIDTH);
         uint value_dim = local_index % HEAD_WIDTH;
-        if (value_token < tokens) {
+        if (local_index < TILE_TOKENS * HEAD_WIDTH && value_token < tokens) {
             uint slot = chronological_start + value_token;
             if (slot >= capacity) {
                 slot -= capacity;

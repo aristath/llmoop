@@ -403,6 +403,13 @@ def shader_file_for_node(
                 f"split_bf16_2x{node['attrs']['blocks']}x{node['attrs']['block_part_width']}"
                 "_head_interleaved.comp"
             )
+        if node["attrs"].get("part_widths") is not None:
+            part_widths = [int(width) for width in node["attrs"]["part_widths"]]
+            if len(part_widths) != 3:
+                raise ModelCompileError(
+                    f"split node {node['id']!r} has unsupported unequal part widths {part_widths}"
+                )
+            return "split_bf16_3x" + "_".join(map(str, part_widths)) + ".comp"
         part_width = int(node["attrs"]["part_width"])
         return f"split_bf16_{len(node['outputs'])}x{part_width}.comp"
     if op == "multiply":
@@ -554,7 +561,7 @@ def local_size_x_for_node(node: Json) -> int:
     # The tiled attention kernel maps sixteen 64-wide head reductions onto one
     # workgroup. This execution geometry belongs to the compiled pedal package.
     if node["op"] == "scaled_dot_product_attention":
-        return 1024
+        return attention_workgroup_shape(int(node["attrs"]["head_width"]))[0]
     if node["op"] == "gated_delta_step":
         return int(node["attrs"]["value_head_width"])
     if node["op"] == "rg_lru_step":
@@ -562,6 +569,12 @@ def local_size_x_for_node(node: Json) -> int:
     if node["op"] == "sparse_moe_experts":
         return 256
     return 64
+
+
+def attention_workgroup_shape(head_width: int) -> tuple[int, int]:
+    padded_head_width = ((head_width + 63) // 64) * 64
+    tile_tokens = 1024 // padded_head_width
+    return padded_head_width * tile_tokens, tile_tokens
 
 
 def required_shader_files(
@@ -716,6 +729,11 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
             ("PART_WIDTH",),
         ),
         (
+            r"split_bf16_3x(\d+)_(\d+)_(\d+)\.comp",
+            "split_bf16_3way_widths.comp.template",
+            ("PART_A_WIDTH", "PART_B_WIDTH", "PART_C_WIDTH"),
+        ),
+        (
             r"split_bf16_2x(\d+)x(\d+)_head_interleaved\.comp",
             "split_bf16_2way_head_interleaved.comp.template",
             ("BLOCKS", "BLOCK_PART_WIDTH"),
@@ -776,9 +794,10 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
             raise ModelCompileError(
                 f"query head count {query_heads} is not divisible by KV head count {kv_heads}"
             )
-        if head_width < 2 or head_width % 2 != 0 or 1024 % head_width != 0:
+        local_size, tile_tokens = attention_workgroup_shape(head_width)
+        if head_width < 2 or head_width % 2 != 0 or tile_tokens == 0:
             raise ModelCompileError(
-                f"attention head width {head_width} cannot be tiled into a 1024-invocation pedal"
+                f"attention head width {head_width} cannot be tiled into a Vulkan workgroup"
             )
         return render_shader_template(
             source_dir,
@@ -788,7 +807,8 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
                 "KV_HEADS": str(kv_heads),
                 "QUERY_GROUPS_PER_KV_HEAD": str(query_heads // kv_heads),
                 "HEAD_WIDTH": str(head_width),
-                "TILE_TOKENS": str(1024 // head_width),
+                "LOCAL_SIZE": str(local_size),
+                "TILE_TOKENS": str(tile_tokens),
                 "ATTENTION_SCALE": attention_shape.group(4),
                 "ATTENTION_WINDOW": attention_shape.group(5) or "0",
                 "HAS_SINKS": "1" if attention_shape.group(6) else "0",

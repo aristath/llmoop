@@ -122,6 +122,8 @@ FFN_UP_SUFFIXES = (
     "mlp_block.up_proj.weight",
 )
 
+FFN_FUSED_GATE_UP_SUFFIXES = ("mlp.gate_up_proj.weight",)
+
 MOE_INPUT_SUFFIXES = (
     "block_sparse_moe.input_linear.weight",
     "block_sparse_moe.experts.gate_up_proj",
@@ -148,6 +150,7 @@ ATTENTION_Q_PROJECTION_SUFFIXES = (
     "attention.wq.weight",
     "temporal_block.q_proj.weight",
 )
+ATTENTION_FUSED_QKV_SUFFIXES = ("self_attn.qkv_proj.weight",)
 ATTENTION_K_PROJECTION_SUFFIXES = (
     "self_attn.k_proj.weight",
     "attention.wk.weight",
@@ -311,6 +314,7 @@ def discover_model_structure(
         tensors,
         layers,
         num_attention_heads=num_attention_heads,
+        num_key_value_heads=num_key_value_heads,
         head_width=head_width,
     )
     recurrent_mixer = discover_recurrent_mixer(decoder_config, tensors, layers)
@@ -413,6 +417,9 @@ def discover_layer_structure(
         ),
     }
     dense_gate = find_optional_layer_tensor(tensors, prefix, FFN_GATE_SUFFIXES)
+    fused_gate_up = find_optional_layer_tensor(
+        tensors, prefix, FFN_FUSED_GATE_UP_SUFFIXES
+    )
     moe_input = find_optional_layer_tensor(tensors, prefix, MOE_INPUT_SUFFIXES)
     if dense_gate is not None:
         feed_forward_type = "dense_swiglu"
@@ -434,6 +441,24 @@ def discover_layer_structure(
             tensors,
             layer_tensors,
             ("ffn_gate", "ffn_down", "ffn_up"),
+        )
+    elif fused_gate_up is not None:
+        feed_forward_type = "dense_swiglu"
+        layer_tensors.update(
+            {
+                "ffn_gate_up": fused_gate_up,
+                "ffn_down": find_layer_tensor(
+                    tensors,
+                    prefix,
+                    FFN_DOWN_SUFFIXES,
+                    role="feed-forward down projection",
+                ),
+            }
+        )
+        add_optional_linear_biases(
+            tensors,
+            layer_tensors,
+            ("ffn_gate_up", "ffn_down"),
         )
     elif moe_input is not None:
         feed_forward_type = "sparse_moe"
@@ -517,33 +542,39 @@ def discover_layer_structure(
             }
         )
     elif operator_type == "full_attention":
-        layer_tensors.update(
-            {
-                "q_projection": find_layer_tensor(
-                    tensors,
-                    prefix,
-                    ATTENTION_Q_PROJECTION_SUFFIXES,
-                    role="attention query projection",
-                ),
-                "k_projection": find_layer_tensor(
-                    tensors,
-                    prefix,
-                    ATTENTION_K_PROJECTION_SUFFIXES,
-                    role="attention key projection",
-                ),
-                "v_projection": find_layer_tensor(
-                    tensors,
-                    prefix,
-                    ATTENTION_V_PROJECTION_SUFFIXES,
-                    role="attention value projection",
-                ),
-                "attention_out_projection": find_layer_tensor(
-                    tensors,
-                    prefix,
-                    ATTENTION_OUT_PROJECTION_SUFFIXES,
-                    role="attention output projection",
-                ),
-            }
+        fused_qkv = find_optional_layer_tensor(
+            tensors, prefix, ATTENTION_FUSED_QKV_SUFFIXES
+        )
+        if fused_qkv is not None:
+            layer_tensors["qkv_projection"] = fused_qkv
+        else:
+            layer_tensors.update(
+                {
+                    "q_projection": find_layer_tensor(
+                        tensors,
+                        prefix,
+                        ATTENTION_Q_PROJECTION_SUFFIXES,
+                        role="attention query projection",
+                    ),
+                    "k_projection": find_layer_tensor(
+                        tensors,
+                        prefix,
+                        ATTENTION_K_PROJECTION_SUFFIXES,
+                        role="attention key projection",
+                    ),
+                    "v_projection": find_layer_tensor(
+                        tensors,
+                        prefix,
+                        ATTENTION_V_PROJECTION_SUFFIXES,
+                        role="attention value projection",
+                    ),
+                }
+            )
+        layer_tensors["attention_out_projection"] = find_layer_tensor(
+            tensors,
+            prefix,
+            ATTENTION_OUT_PROJECTION_SUFFIXES,
+            role="attention output projection",
         )
         optional_q_norm = find_optional_layer_tensor(
             tensors, prefix, ATTENTION_Q_NORM_SUFFIXES
@@ -560,16 +591,17 @@ def discover_layer_structure(
         )
         if optional_sinks is not None:
             layer_tensors["attention_sinks"] = optional_sinks
-        add_optional_linear_biases(
-            tensors,
-            layer_tensors,
-            (
+        attention_linear_ids = (
+            ("qkv_projection", "attention_out_projection")
+            if fused_qkv is not None
+            else (
                 "q_projection",
                 "k_projection",
                 "v_projection",
                 "attention_out_projection",
-            ),
+            )
         )
+        add_optional_linear_biases(tensors, layer_tensors, attention_linear_ids)
     elif operator_type == "gated_delta":
         layer_tensors.update(
             {
@@ -721,6 +753,8 @@ def infer_operator_type(tensors: dict[str, Json], prefix: str) -> str:
         return "conv"
     if find_first_existing_tensor(
         tensors, (f"{prefix}.{suffix}" for suffix in ATTENTION_Q_PROJECTION_SUFFIXES)
+    ) or find_first_existing_tensor(
+        tensors, (f"{prefix}.{suffix}" for suffix in ATTENTION_FUSED_QKV_SUFFIXES)
     ):
         return "full_attention"
     if find_first_existing_tensor(
@@ -807,20 +841,36 @@ def discover_attention_output_gate(
     layers: tuple[LayerStructure, ...],
     *,
     num_attention_heads: int,
+    num_key_value_heads: int,
     head_width: int,
 ) -> bool:
     configured = config.get("attn_output_gate")
     expected_width = num_attention_heads * head_width
+    kv_width = num_key_value_heads * head_width
     for layer in layers:
         if layer.operator_type != "full_attention":
             continue
-        projection_width = int(tensors[layer.tensors["q_projection"]]["shape"][0])
-        discovered = projection_width == expected_width * 2
-        if projection_width not in (expected_width, expected_width * 2):
-            raise ModelTranspileError(
-                f"attention query projection width {projection_width} is incompatible with "
-                f"{num_attention_heads} heads of width {head_width}"
-            )
+        if "qkv_projection" in layer.tensors:
+            projection_width = int(tensors[layer.tensors["qkv_projection"]]["shape"][0])
+            ordinary_width = expected_width + 2 * kv_width
+            discovered = projection_width == ordinary_width + expected_width
+            if projection_width not in (
+                ordinary_width,
+                ordinary_width + expected_width,
+            ):
+                raise ModelTranspileError(
+                    f"fused attention QKV width {projection_width} is incompatible with "
+                    f"{num_attention_heads} query and {num_key_value_heads} KV heads of "
+                    f"width {head_width}"
+                )
+        else:
+            projection_width = int(tensors[layer.tensors["q_projection"]]["shape"][0])
+            discovered = projection_width == expected_width * 2
+            if projection_width not in (expected_width, expected_width * 2):
+                raise ModelTranspileError(
+                    f"attention query projection width {projection_width} is incompatible with "
+                    f"{num_attention_heads} heads of width {head_width}"
+                )
         if configured is not None and bool(configured) != discovered:
             raise ModelTranspileError(
                 "attention output-gate config disagrees with query projection shape"
@@ -910,7 +960,12 @@ def discover_intermediate_size(
     discovered: set[int] = set()
     for layer in layers:
         if layer.feed_forward_type == "dense_swiglu":
-            discovered.add(int(tensors[layer.tensors["ffn_gate"]]["shape"][0]))
+            if "ffn_gate_up" in layer.tensors:
+                discovered.add(
+                    int(tensors[layer.tensors["ffn_gate_up"]]["shape"][0]) // 2
+                )
+            else:
+                discovered.add(int(tensors[layer.tensors["ffn_gate"]]["shape"][0]))
         elif layer.feed_forward_type == "sparse_moe":
             shape = tensors[layer.tensors["moe_input"]]["shape"]
             discovered.add(int(shape[-2]) // 2)
@@ -1247,11 +1302,19 @@ def make_ffn_component(structure: ModelStructure, layer: LayerStructure) -> Json
             "dimensions": make_feed_forward_descriptor(structure, layer),
             "params": params,
         }
-    params = {
-        "gate": tensor_ref(layer.tensors["ffn_gate"]),
-        "down": tensor_ref(layer.tensors["ffn_down"]),
-        "up": tensor_ref(layer.tensors["ffn_up"]),
-    }
+    if "ffn_gate_up" in layer.tensors:
+        params = {
+            "gate_up": tensor_ref(layer.tensors["ffn_gate_up"]),
+            "down": tensor_ref(layer.tensors["ffn_down"]),
+        }
+        if "ffn_gate_up_bias" in layer.tensors:
+            params["gate_up_bias"] = tensor_ref(layer.tensors["ffn_gate_up_bias"])
+    else:
+        params = {
+            "gate": tensor_ref(layer.tensors["ffn_gate"]),
+            "down": tensor_ref(layer.tensors["ffn_down"]),
+            "up": tensor_ref(layer.tensors["ffn_up"]),
+        }
     for source_id, target_id in (
         ("ffn_gate_bias", "gate_bias"),
         ("ffn_down_bias", "down_bias"),
@@ -1304,12 +1367,22 @@ def make_attention_operator(structure: ModelStructure, layer: LayerStructure) ->
         "query_groups_per_kv_head": structure.num_attention_heads
         // structure.num_key_value_heads,
     }
-    params = {
-        "q_projection": tensor_ref(layer.tensors["q_projection"]),
-        "k_projection": tensor_ref(layer.tensors["k_projection"]),
-        "v_projection": tensor_ref(layer.tensors["v_projection"]),
-        "out_projection": tensor_ref(layer.tensors["attention_out_projection"]),
-    }
+    if "qkv_projection" in layer.tensors:
+        params = {
+            "qkv_projection": tensor_ref(layer.tensors["qkv_projection"]),
+            "out_projection": tensor_ref(layer.tensors["attention_out_projection"]),
+        }
+        if "qkv_projection_bias" in layer.tensors:
+            params["qkv_projection_bias"] = tensor_ref(
+                layer.tensors["qkv_projection_bias"]
+            )
+    else:
+        params = {
+            "q_projection": tensor_ref(layer.tensors["q_projection"]),
+            "k_projection": tensor_ref(layer.tensors["k_projection"]),
+            "v_projection": tensor_ref(layer.tensors["v_projection"]),
+            "out_projection": tensor_ref(layer.tensors["attention_out_projection"]),
+        }
     for source_id, target_id in (
         ("q_projection_bias", "q_projection_bias"),
         ("k_projection_bias", "k_projection_bias"),
@@ -1318,11 +1391,18 @@ def make_attention_operator(structure: ModelStructure, layer: LayerStructure) ->
     ):
         if source_id in layer.tensors:
             params[target_id] = tensor_ref(layer.tensors[source_id])
-    internal_pedals = [
-        {"id": "q_projection", "type": "linear"},
-        {"id": "k_projection", "type": "linear"},
-        {"id": "v_projection", "type": "linear"},
-    ]
+    internal_pedals = (
+        [
+            {"id": "qkv_projection", "type": "linear"},
+            {"id": "qkv_split", "type": "split"},
+        ]
+        if "qkv_projection" in layer.tensors
+        else [
+            {"id": "q_projection", "type": "linear"},
+            {"id": "k_projection", "type": "linear"},
+            {"id": "v_projection", "type": "linear"},
+        ]
+    )
     if structure.attention_output_gate:
         internal_pedals.append({"id": "q_gate_split", "type": "split"})
     if "q_norm" in layer.tensors:

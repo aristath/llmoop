@@ -1069,6 +1069,39 @@ fn infer_split_output_shapes(
     let Some(channel_dim) = input_shape.last_mut() else {
         return Ok(vec![None; node.outputs.len()]);
     };
+    if let Some(part_widths) = node
+        .attrs
+        .get("part_widths")
+        .and_then(|value| value.as_array())
+    {
+        let widths = part_widths
+            .iter()
+            .map(|value| value.as_u64().and_then(|width| usize::try_from(width).ok()))
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| {
+                CircuitPlanError(format!(
+                    "{} node {} has non-integer split part widths",
+                    pedal_id, node.id
+                ))
+            })?;
+        if widths.len() != node.outputs.len() || widths.iter().sum::<usize>() != *channel_dim {
+            return Err(CircuitPlanError(format!(
+                "{} node {} cannot split shape {:?} into widths {:?}",
+                pedal_id,
+                node.id,
+                first_input_shape(node, signals),
+                widths
+            )));
+        }
+        return Ok(widths
+            .into_iter()
+            .map(|width| {
+                let mut shape = input_shape.clone();
+                *shape.last_mut().unwrap() = width;
+                Some(shape)
+            })
+            .collect());
+    }
     if node.outputs.is_empty() || *channel_dim % node.outputs.len() != 0 {
         return Err(CircuitPlanError(format!(
             "{} node {} cannot split shape {:?} across {} outputs",
@@ -1256,6 +1289,36 @@ mod tests {
     fn fixture_model_tensor_index_path() -> PathBuf {
         compiled_artifact_dir("LLMOOP_TEST_TRANSPILED_DIR", "transpiled", "tensors.json")
             .join("tensors.json")
+    }
+
+    #[test]
+    fn infers_unequal_fused_projection_split_shapes() {
+        let node = crate::stream_circuit::CircuitNode {
+            id: "qkv_split".to_string(),
+            op: "split".to_string(),
+            inputs: vec!["qkv".to_string()],
+            outputs: vec!["q".to_string(), "k".to_string(), "v".to_string()],
+            params: Vec::new(),
+            state_reads: Vec::new(),
+            state_writes: Vec::new(),
+            attrs: serde_json::json!({"part_widths": [16, 8, 8]}),
+        };
+        let signals = BTreeMap::from([(
+            "qkv".to_string(),
+            PlannedSignal {
+                id: "qkv".to_string(),
+                producer: SignalProducer::BoundaryInput,
+                consumers: vec!["qkv_split".to_string()],
+                shape: Some(vec![32]),
+                storage: SignalStorage::Boundary,
+                is_boundary_output: false,
+            },
+        )]);
+
+        assert_eq!(
+            infer_split_output_shapes("layer_00", &node, &signals).unwrap(),
+            vec![Some(vec![16]), Some(vec![8]), Some(vec![8])]
+        );
     }
 
     #[test]

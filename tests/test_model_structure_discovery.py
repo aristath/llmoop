@@ -292,6 +292,47 @@ def test_discovers_mixed_window_attention_sinks_and_shared_sparse_experts() -> N
     assert nodes["shared_and_sparse_expert_add"]["outputs"] == ["ffn_out"]
 
 
+def test_discovers_fused_qkv_and_gate_up_projections_by_shape() -> None:
+    prefix = "model.layers.0"
+    tensors = {
+        "model.embed_tokens.weight": _tensor([256, 16]),
+        "model.norm.weight": _tensor([16]),
+        "lm_head.weight": _tensor([256, 16]),
+        f"{prefix}.input_layernorm.weight": _tensor([16]),
+        f"{prefix}.post_attention_layernorm.weight": _tensor([16]),
+        f"{prefix}.self_attn.qkv_proj.weight": _tensor([32, 16]),
+        f"{prefix}.self_attn.o_proj.weight": _tensor([16, 16]),
+        f"{prefix}.mlp.gate_up_proj.weight": _tensor([24, 16]),
+        f"{prefix}.mlp.down_proj.weight": _tensor([16, 12]),
+    }
+    config = {
+        "model_type": "synthetic_fused_decoder",
+        "hidden_size": 16,
+        "intermediate_size": 12,
+        "num_hidden_layers": 1,
+        "num_attention_heads": 2,
+        "num_key_value_heads": 1,
+        "vocab_size": 256,
+        "max_position_embeddings": 1024,
+        "sliding_window": 128,
+        "rms_norm_eps": 1e-5,
+        "rope_theta": 10_000.0,
+    }
+
+    structure = discover_model_structure(Path("synthetic"), config, tensors)
+    layer = structure.layers[0]
+    assert structure.intermediate_size == 12
+    assert layer.tensors["qkv_projection"].endswith("qkv_proj.weight")
+    assert layer.tensors["ffn_gate_up"].endswith("gate_up_proj.weight")
+
+    circuit = build_pedal_circuit(make_layer(structure, layer), Path("layer_00.json"))
+    nodes = {node["id"]: node for node in circuit["nodes"]}
+    assert nodes["qkv_projection"]["params"] == ["qkv_projection"]
+    assert nodes["qkv_split"]["attrs"] == {"part_widths": [16, 8, 8]}
+    assert nodes["ffn_gate_up_projection"]["params"] == ["ffn_gate_up"]
+    assert nodes["ffn_gate_up_split"]["attrs"] == {"part_width": 12}
+
+
 def test_discovers_recurrent_block_pattern_biases_and_numerics_by_structure() -> None:
     tensors = {
         "model.embed_tokens.weight": _tensor([256, 16]),

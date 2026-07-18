@@ -379,33 +379,62 @@ def _attention_nodes(
             "outputs": ["operator_norm_out"],
             "params": ["operator_norm"],
             "attrs": _norm_attrs(numerics),
-        },
-        {
-            "id": "q_projection",
-            "op": "linear",
-            "inputs": ["operator_norm_out"],
-            "outputs": [
-                "q_and_gate_projected"
-                if numerics.get("attention_output_gate")
-                else "q_projected"
-            ],
-            "params": _linear_params("q_projection", parameters),
-        },
-        {
-            "id": "k_projection",
-            "op": "linear",
-            "inputs": ["operator_norm_out"],
-            "outputs": ["k_projected"],
-            "params": _linear_params("k_projection", parameters),
-        },
-        {
-            "id": "v_projection",
-            "op": "linear",
-            "inputs": ["operator_norm_out"],
-            "outputs": ["v_projected"],
-            "params": _linear_params("v_projection", parameters),
-        },
+        }
     ]
+    q_output = (
+        "q_and_gate_projected"
+        if numerics.get("attention_output_gate")
+        else "q_projected"
+    )
+    if "qkv_projection" in parameters:
+        query_width = int(heads["query_heads"]) * int(heads["head_width"])
+        if numerics.get("attention_output_gate"):
+            query_width *= 2
+        kv_width = int(heads["key_value_heads"]) * int(heads["head_width"])
+        nodes.extend(
+            [
+                {
+                    "id": "qkv_projection",
+                    "op": "linear",
+                    "inputs": ["operator_norm_out"],
+                    "outputs": ["qkv_projected"],
+                    "params": _linear_params("qkv_projection", parameters),
+                },
+                {
+                    "id": "qkv_split",
+                    "op": "split",
+                    "inputs": ["qkv_projected"],
+                    "outputs": [q_output, "k_projected", "v_projected"],
+                    "attrs": {"part_widths": [query_width, kv_width, kv_width]},
+                },
+            ]
+        )
+    else:
+        nodes.extend(
+            [
+                {
+                    "id": "q_projection",
+                    "op": "linear",
+                    "inputs": ["operator_norm_out"],
+                    "outputs": [q_output],
+                    "params": _linear_params("q_projection", parameters),
+                },
+                {
+                    "id": "k_projection",
+                    "op": "linear",
+                    "inputs": ["operator_norm_out"],
+                    "outputs": ["k_projected"],
+                    "params": _linear_params("k_projection", parameters),
+                },
+                {
+                    "id": "v_projection",
+                    "op": "linear",
+                    "inputs": ["operator_norm_out"],
+                    "outputs": ["v_projected"],
+                    "params": _linear_params("v_projection", parameters),
+                },
+            ]
+        )
     attention_gate = None
     if numerics.get("attention_output_gate"):
         attention_width = int(heads["query_heads"]) * int(heads["head_width"])
@@ -795,42 +824,64 @@ def _ffn_tail(
                 ]
             )
     else:
-        body = [
-            {
-                "id": "ffn_gate_projection",
-                "op": "linear",
-                "inputs": ["ffn_norm_out"],
-                "outputs": ["ffn_gate"],
-                "params": _linear_params("ffn_gate", parameters),
-            },
-            {
-                "id": "ffn_up_projection",
-                "op": "linear",
-                "inputs": ["ffn_norm_out"],
-                "outputs": ["ffn_up"],
-                "params": _linear_params("ffn_up", parameters),
-            },
-            {
-                "id": "ffn_gate_activation",
-                "op": str(feed_forward["activation"]),
-                "inputs": ["ffn_gate"],
-                "outputs": ["ffn_gate_activated"],
-                "attrs": {"element_count": int(feed_forward["intermediate_size"])},
-            },
-            {
-                "id": "ffn_gate_multiply",
-                "op": "multiply",
-                "inputs": ["ffn_gate_activated", "ffn_up"],
-                "outputs": ["ffn_hidden"],
-            },
-            {
-                "id": "ffn_down_projection",
-                "op": "linear",
-                "inputs": ["ffn_hidden"],
-                "outputs": ["ffn_out"],
-                "params": _linear_params("ffn_down", parameters),
-            },
-        ]
+        if "ffn_gate_up" in parameters:
+            body = [
+                {
+                    "id": "ffn_gate_up_projection",
+                    "op": "linear",
+                    "inputs": ["ffn_norm_out"],
+                    "outputs": ["ffn_gate_up"],
+                    "params": _linear_params("ffn_gate_up", parameters),
+                },
+                {
+                    "id": "ffn_gate_up_split",
+                    "op": "split",
+                    "inputs": ["ffn_gate_up"],
+                    "outputs": ["ffn_gate", "ffn_up"],
+                    "attrs": {"part_width": int(feed_forward["intermediate_size"])},
+                },
+            ]
+        else:
+            body = [
+                {
+                    "id": "ffn_gate_projection",
+                    "op": "linear",
+                    "inputs": ["ffn_norm_out"],
+                    "outputs": ["ffn_gate"],
+                    "params": _linear_params("ffn_gate", parameters),
+                },
+                {
+                    "id": "ffn_up_projection",
+                    "op": "linear",
+                    "inputs": ["ffn_norm_out"],
+                    "outputs": ["ffn_up"],
+                    "params": _linear_params("ffn_up", parameters),
+                },
+            ]
+        body.extend(
+            [
+                {
+                    "id": "ffn_gate_activation",
+                    "op": str(feed_forward["activation"]),
+                    "inputs": ["ffn_gate"],
+                    "outputs": ["ffn_gate_activated"],
+                    "attrs": {"element_count": int(feed_forward["intermediate_size"])},
+                },
+                {
+                    "id": "ffn_gate_multiply",
+                    "op": "multiply",
+                    "inputs": ["ffn_gate_activated", "ffn_up"],
+                    "outputs": ["ffn_hidden"],
+                },
+                {
+                    "id": "ffn_down_projection",
+                    "op": "linear",
+                    "inputs": ["ffn_hidden"],
+                    "outputs": ["ffn_out"],
+                    "params": _linear_params("ffn_down", parameters),
+                },
+            ]
+        )
     return [
         *prefix,
         *body,
@@ -914,6 +965,8 @@ def _param_role(name: str) -> str:
         "ffn_norm": "feed_forward_normalization_weight",
         "ffn_gate": "feed_forward_swiglu_gate_projection",
         "ffn_gate_bias": "feed_forward_swiglu_gate_projection_bias",
+        "ffn_gate_up": "feed_forward_fused_gate_up_projection",
+        "ffn_gate_up_bias": "feed_forward_fused_gate_up_projection_bias",
         "ffn_down": "feed_forward_down_projection",
         "ffn_down_bias": "feed_forward_down_projection_bias",
         "ffn_up": "feed_forward_up_projection",
@@ -928,6 +981,8 @@ def _param_role(name: str) -> str:
         "conv_out_projection": "short_convolution_output_projection",
         "q_projection": "attention_query_projection",
         "q_projection_bias": "attention_query_projection_bias",
+        "qkv_projection": "attention_fused_query_key_value_projection",
+        "qkv_projection_bias": "attention_fused_query_key_value_projection_bias",
         "k_projection": "attention_key_projection",
         "k_projection_bias": "attention_key_projection_bias",
         "v_projection": "attention_value_projection",
