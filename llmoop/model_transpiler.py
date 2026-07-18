@@ -200,8 +200,17 @@ def transpile_model(
 ) -> ModelStructure:
     model_dir = model_dir.expanduser()
     config = read_json(model_dir / "config.json")
+    generation_config_path = model_dir / "generation_config.json"
+    generation_config = (
+        read_json(generation_config_path) if generation_config_path.is_file() else {}
+    )
     tensor_index = make_tensor_index(model_dir)
-    structure = discover_model_structure(model_dir, config, tensor_index["tensors"])
+    structure = discover_model_structure(
+        model_dir,
+        config,
+        tensor_index["tensors"],
+        generation_config=generation_config,
+    )
 
     if clean and output_dir.exists():
         shutil.rmtree(output_dir)
@@ -225,6 +234,8 @@ def discover_model_structure(
     model_dir: Path,
     config: Json,
     tensors: dict[str, Json],
+    *,
+    generation_config: Json | None = None,
 ) -> ModelStructure:
     layer_root, layer_indices = discover_layer_root(tensors)
     decoder_config = discover_decoder_config(config, max(layer_indices) + 1)
@@ -370,7 +381,9 @@ def discover_model_structure(
         recurrent_mixer=recurrent_mixer,
         token_ids={
             "bos": decoder_config.get("bos_token_id"),
-            "eos": decoder_config.get("eos_token_id"),
+            "eos": (generation_config or {}).get(
+                "eos_token_id", decoder_config.get("eos_token_id")
+            ),
             "pad": decoder_config.get("pad_token_id"),
         },
         tensors={

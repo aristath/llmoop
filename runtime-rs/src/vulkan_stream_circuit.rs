@@ -4688,6 +4688,7 @@ pub struct VulkanResidentGreedyRunningStream {
     pub next_stream_tick: u64,
     pub remaining_public_outputs: usize,
     pub eos_token_id: Option<u32>,
+    pub stop_token_ids: Vec<u32>,
     pub loop_open: bool,
     pub last_stop_reason: Option<String>,
     processor: VulkanResidentGreedyStreamProcessor,
@@ -4711,6 +4712,7 @@ impl VulkanResidentGreedyRunningStream {
             next_stream_tick: 0,
             remaining_public_outputs: 0,
             eos_token_id: None,
+            stop_token_ids: Vec::new(),
             loop_open: false,
             last_stop_reason: None,
             processor,
@@ -4767,6 +4769,24 @@ impl VulkanResidentGreedyRunningStream {
         Vec<VulkanResidentGreedyExternalInputSignal>,
         VulkanResidentGreedyFeedbackLoopRunnerError,
     > {
+        self.inject_external_tokens_with_stop_tokens(
+            token_ids,
+            max_new_tokens,
+            eos_token_id.into_iter().collect(),
+            origin,
+        )
+    }
+
+    pub fn inject_external_tokens_with_stop_tokens(
+        &mut self,
+        token_ids: &[u32],
+        max_new_tokens: usize,
+        stop_token_ids: Vec<u32>,
+        origin: impl Into<String>,
+    ) -> Result<
+        Vec<VulkanResidentGreedyExternalInputSignal>,
+        VulkanResidentGreedyFeedbackLoopRunnerError,
+    > {
         if token_ids.is_empty() {
             return Err(VulkanResidentGreedyFeedbackLoopRunnerError::EmptyPromptEvent);
         }
@@ -4776,7 +4796,8 @@ impl VulkanResidentGreedyRunningStream {
             self.remaining_public_outputs
                 .checked_add(max_new_tokens)
                 .ok_or(VulkanResidentGreedyFeedbackLoopRunnerError::OutputBudgetOverflow)?;
-        self.eos_token_id = eos_token_id;
+        self.eos_token_id = stop_token_ids.first().copied();
+        self.stop_token_ids = stop_token_ids;
         self.loop_open = self.remaining_public_outputs > 0;
         self.last_stop_reason = (max_new_tokens == 0).then(|| "max_new_tokens".to_string());
 
@@ -4940,7 +4961,7 @@ impl VulkanResidentGreedyRunningStream {
             self.public_counter += 1;
             self.public_outputs.push(public.clone());
 
-            let close_after_feedback = if self.eos_token_id == Some(sampled_token_id) {
+            let close_after_feedback = if self.stop_token_ids.contains(&sampled_token_id) {
                 self.remaining_public_outputs = 0;
                 self.last_stop_reason = Some("eos".to_string());
                 true
@@ -5098,7 +5119,7 @@ impl VulkanResidentGreedyRunningStream {
             self.public_counter += 1;
             self.public_outputs.push(public.clone());
 
-            let sampled_eos = self.eos_token_id == Some(sampled_token_id);
+            let sampled_eos = self.stop_token_ids.contains(&sampled_token_id);
             let close_after_feedback = if sampled_eos {
                 self.remaining_public_outputs = 0;
                 self.last_stop_reason = Some("eos".to_string());
@@ -5451,10 +5472,10 @@ impl VulkanResidentTokenStream {
     {
         let start_stream_tick = self.inner.next_stream_tick;
         let enqueued_token_count = event.token_ids.len();
-        self.inner.inject_external_tokens(
+        self.inner.inject_external_tokens_with_stop_tokens(
             &event.token_ids,
             event.max_public_tokens,
-            event.eos_token_id,
+            event.stop_token_ids.clone(),
             event.origin.clone(),
         )?;
         self.current_input_event_id = Some(event.id.clone());
@@ -5636,6 +5657,7 @@ pub struct VulkanResidentTokenInputEvent {
     pub token_ids: Vec<u32>,
     pub max_public_tokens: usize,
     pub eos_token_id: Option<u32>,
+    pub stop_token_ids: Vec<u32>,
     pub origin: String,
 }
 
@@ -5646,12 +5668,20 @@ impl VulkanResidentTokenInputEvent {
             token_ids,
             max_public_tokens,
             eos_token_id: None,
+            stop_token_ids: Vec::new(),
             origin: "host".to_string(),
         }
     }
 
     pub fn with_eos_token(mut self, eos_token_id: u32) -> Self {
         self.eos_token_id = Some(eos_token_id);
+        self.stop_token_ids = vec![eos_token_id];
+        self
+    }
+
+    pub fn with_stop_tokens(mut self, stop_token_ids: Vec<u32>) -> Self {
+        self.eos_token_id = stop_token_ids.last().copied();
+        self.stop_token_ids = stop_token_ids;
         self
     }
 
@@ -18055,7 +18085,7 @@ mod tests {
                 .into_token_stream(stream_id)
         };
         let event = VulkanResidentTokenInputEvent::new("eos_event", vec![1, 50_471, 1_413], 8)
-            .with_eos_token(1_033);
+            .with_stop_tokens(vec![999, 1_033, 2_000]);
 
         let mut scalar = create_stream("scalar_stream");
         scalar.enqueue_external_event(event.clone()).unwrap();

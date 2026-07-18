@@ -346,7 +346,7 @@ fn run_single_device_chat(
 ) -> Result<(), Box<dyn Error>> {
     let setup_start = Instant::now();
     let device = runtime_vulkan_device(args)?;
-    let eos_token_id = eos_token_id_from_manifest(manifest_dir, &manifest)?;
+    let stop_token_ids = stop_token_ids_from_manifest(manifest_dir, &manifest)?;
     let chat_session = RuntimeChatSession::from_tokenizer_dir(tokenizer_dir)?;
     let model = VulkanResidentGreedyModelPackage::from_manifest(
         &device,
@@ -362,25 +362,36 @@ fn run_single_device_chat(
         nanos_to_millis(elapsed_nanos_u64(setup_start))
     );
 
-    run_chat_repl(initial_prompt, chat_session, |turn_index, input_text| {
-        let encoded_token_ids = codec.encode_text(input_text)?;
-        let mut event = VulkanResidentTokenInputEvent::new(
-            format!("chat_{turn_index}"),
-            encoded_token_ids.clone(),
-            args.max_new_tokens,
-        )
-        .with_origin("cli_chat");
-        if let Some(eos_token_id) = eos_token_id {
-            event = event.with_eos_token(eos_token_id);
-        }
-        let submitted = engine.submit_input_event_until_idle(
-            "main",
-            event,
-            VulkanResidentTokenEngineRunBudget::new(args.max_scheduler_turns, 1, args.cycle_ticks),
-        )?;
-        let generated_text = codec.decode_tokens(&submitted.generated_token_ids)?;
-        Ok(RuntimeChatTurn { generated_text })
-    })
+    run_chat_repl(
+        initial_prompt,
+        chat_session,
+        codec,
+        |turn_index, token_ids| {
+            let mut event = VulkanResidentTokenInputEvent::new(
+                format!("chat_{turn_index}"),
+                token_ids.to_vec(),
+                args.max_new_tokens,
+            )
+            .with_origin("cli_chat");
+            if !stop_token_ids.is_empty() {
+                event = event.with_stop_tokens(stop_token_ids.clone());
+            }
+            let submitted = engine.submit_input_event_until_idle(
+                "main",
+                event,
+                VulkanResidentTokenEngineRunBudget::new(
+                    args.max_scheduler_turns,
+                    1,
+                    args.cycle_ticks,
+                ),
+            )?;
+            let generated_text = codec.decode_tokens(&submitted.generated_token_ids)?;
+            Ok(RuntimeChatTurn {
+                generated_text,
+                generated_token_count: submitted.generated_token_ids.len(),
+            })
+        },
+    )
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -393,7 +404,7 @@ struct RuntimeChatMessage {
 struct RuntimeChatSession {
     formatter: RuntimeChatFormatter,
     messages: Vec<RuntimeChatMessage>,
-    committed_formatted_len: usize,
+    committed_token_count: usize,
 }
 
 impl RuntimeChatSession {
@@ -401,32 +412,39 @@ impl RuntimeChatSession {
         Ok(Self {
             formatter: RuntimeChatFormatter::from_tokenizer_dir(tokenizer_dir)?,
             messages: Vec::new(),
-            committed_formatted_len: 0,
+            committed_token_count: 0,
         })
     }
 
-    fn render_user_prompt_delta(&self, user_content: &str) -> Result<String, Box<dyn Error>> {
+    fn render_user_prompt_token_delta<C>(
+        &self,
+        user_content: &str,
+        codec: &C,
+    ) -> Result<Vec<u32>, Box<dyn Error>>
+    where
+        C: VulkanResidentTokenTextCodec,
+    {
         let mut messages = self.messages.clone();
         messages.push(RuntimeChatMessage {
             role: "user".to_string(),
             content: user_content.to_string(),
         });
         let formatted = self.formatter.format_messages(&messages, true);
-        if self.committed_formatted_len > formatted.len()
-            || !formatted.is_char_boundary(self.committed_formatted_len)
-        {
+        let formatted_token_ids = codec.encode_text(&formatted)?;
+        if self.committed_token_count > formatted_token_ids.len() {
             return Err(Box::new(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "chat template prefix length no longer matches the formatted conversation",
+                "chat template token prefix no longer matches the resident conversation",
             )));
         }
-        Ok(formatted[self.committed_formatted_len..].to_string())
+        Ok(formatted_token_ids[self.committed_token_count..].to_vec())
     }
 
     fn commit_assistant_turn(
         &mut self,
         user_content: &str,
         assistant_content: &str,
+        appended_token_count: usize,
     ) -> Result<(), Box<dyn Error>> {
         self.messages.push(RuntimeChatMessage {
             role: "user".to_string(),
@@ -436,7 +454,15 @@ impl RuntimeChatSession {
             role: "assistant".to_string(),
             content: assistant_content.to_string(),
         });
-        self.committed_formatted_len = self.formatter.format_messages(&self.messages, false).len();
+        self.committed_token_count = self
+            .committed_token_count
+            .checked_add(appended_token_count)
+            .ok_or_else(|| {
+                Box::new(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "resident chat token cursor overflowed",
+                )) as Box<dyn Error>
+            })?;
         Ok(())
     }
 }
@@ -446,6 +472,7 @@ enum RuntimeChatFormatter {
     ChatMl { bos_token: Option<String> },
     RoleDelimited,
     TurnDelimited { bos_token: Option<String> },
+    EndDelimitedRoles,
 }
 
 impl RuntimeChatFormatter {
@@ -473,9 +500,15 @@ impl RuntimeChatFormatter {
         if template.contains("<start_of_turn>") && template.contains("<end_of_turn>") {
             return Ok(Self::TurnDelimited { bos_token });
         }
+        if template.contains("<|user|>")
+            && template.contains("<|assistant|>")
+            && template.contains("<|end|>")
+        {
+            return Ok(Self::EndDelimitedRoles);
+        }
         Err(Box::new(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "chat mode currently supports ChatML, role-delimited, and turn-delimited chat templates; this package has a different template shape",
+            "chat mode currently supports ChatML, role-delimited, turn-delimited, and end-delimited role templates; this package has a different template shape",
         )))
     }
 
@@ -535,6 +568,20 @@ impl RuntimeChatFormatter {
                 }
                 formatted
             }
+            Self::EndDelimitedRoles => {
+                let mut formatted = String::new();
+                for message in messages {
+                    formatted.push_str("<|");
+                    formatted.push_str(&message.role);
+                    formatted.push_str("|>\n");
+                    formatted.push_str(&message.content);
+                    formatted.push_str("<|end|>\n");
+                }
+                if add_generation_prompt {
+                    formatted.push_str("<|assistant|>\n");
+                }
+                formatted
+            }
         }
     }
 }
@@ -542,21 +589,30 @@ impl RuntimeChatFormatter {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct RuntimeChatTurn {
     generated_text: String,
+    generated_token_count: usize,
 }
 
-fn run_chat_repl<F>(
+fn run_chat_repl<C, F>(
     initial_prompt: Option<&str>,
     mut chat_session: RuntimeChatSession,
+    codec: &C,
     mut submit: F,
 ) -> Result<(), Box<dyn Error>>
 where
-    F: FnMut(usize, &str) -> Result<RuntimeChatTurn, Box<dyn Error>>,
+    C: VulkanResidentTokenTextCodec,
+    F: FnMut(usize, &[u32]) -> Result<RuntimeChatTurn, Box<dyn Error>>,
 {
     println!("Type a message and press Enter. Type /exit, /quit, exit, or quit to stop.");
     let mut turn_index = 0usize;
     if let Some(initial_prompt) = initial_prompt {
         if !initial_prompt.trim().is_empty() {
-            if !submit_chat_turn(&mut chat_session, &mut submit, turn_index, initial_prompt)? {
+            if !submit_chat_turn(
+                &mut chat_session,
+                codec,
+                &mut submit,
+                turn_index,
+                initial_prompt,
+            )? {
                 return Ok(());
             }
             turn_index = turn_index.saturating_add(1);
@@ -586,7 +642,13 @@ where
             continue;
         }
 
-        if !submit_chat_turn(&mut chat_session, &mut submit, turn_index, input_text)? {
+        if !submit_chat_turn(
+            &mut chat_session,
+            codec,
+            &mut submit,
+            turn_index,
+            input_text,
+        )? {
             break;
         }
         turn_index = turn_index.saturating_add(1);
@@ -594,20 +656,26 @@ where
     Ok(())
 }
 
-fn submit_chat_turn<F>(
+fn submit_chat_turn<C, F>(
     chat_session: &mut RuntimeChatSession,
+    codec: &C,
     submit: &mut F,
     turn_index: usize,
     input_text: &str,
 ) -> Result<bool, Box<dyn Error>>
 where
-    F: FnMut(usize, &str) -> Result<RuntimeChatTurn, Box<dyn Error>>,
+    C: VulkanResidentTokenTextCodec,
+    F: FnMut(usize, &[u32]) -> Result<RuntimeChatTurn, Box<dyn Error>>,
 {
-    let prompt_delta = chat_session.render_user_prompt_delta(input_text)?;
+    let prompt_delta = chat_session.render_user_prompt_token_delta(input_text, codec)?;
     match submit(turn_index, &prompt_delta) {
         Ok(turn) => {
             print_chat_response(&turn.generated_text);
-            chat_session.commit_assistant_turn(input_text, &turn.generated_text)?;
+            chat_session.commit_assistant_turn(
+                input_text,
+                &turn.generated_text,
+                prompt_delta.len() + turn.generated_token_count,
+            )?;
             Ok(true)
         }
         Err(error) => Err(error),
@@ -634,26 +702,29 @@ fn tokenizer_config_string(
         .map(str::to_string))
 }
 
-fn eos_token_id_from_manifest(
+fn stop_token_ids_from_manifest(
     manifest_dir: &Path,
     manifest: &VulkanResidentGreedyModelPackageManifest,
-) -> Result<Option<u32>, Box<dyn Error>> {
+) -> Result<Vec<u32>, Box<dyn Error>> {
     let config_path = manifest_dir.join(&manifest.config_path);
     if !config_path.is_file() {
-        return Ok(None);
+        return Ok(Vec::new());
     }
     let config: serde_json::Value = serde_json::from_slice(&fs::read(&config_path)?)?;
     let Some(raw_eos) = config.get("eos_token_id") else {
-        return Ok(None);
+        return Ok(Vec::new());
     };
-    let eos_value = if let Some(id) = raw_eos.as_u64() {
-        Some(id)
+    let eos_values = if let Some(id) = raw_eos.as_u64() {
+        vec![id]
     } else if let Some(ids) = raw_eos.as_array() {
-        ids.iter().find_map(serde_json::Value::as_u64)
+        ids.iter()
+            .filter_map(serde_json::Value::as_u64)
+            .collect::<Vec<_>>()
     } else {
-        None
+        Vec::new()
     };
-    eos_value
+    eos_values
+        .into_iter()
         .map(|id| {
             u32::try_from(id).map_err(|_| {
                 io::Error::new(
@@ -662,7 +733,7 @@ fn eos_token_id_from_manifest(
                 )
             })
         })
-        .transpose()
+        .collect::<Result<Vec<_>, _>>()
         .map_err(Into::into)
 }
 
@@ -676,7 +747,7 @@ fn run_placed_chat(
     initial_prompt: Option<&str>,
 ) -> Result<(), Box<dyn Error>> {
     let setup_start = Instant::now();
-    let eos_token_id = eos_token_id_from_manifest(manifest_dir, &manifest)?;
+    let stop_token_ids = stop_token_ids_from_manifest(manifest_dir, &manifest)?;
     let chat_session = RuntimeChatSession::from_tokenizer_dir(tokenizer_dir)?;
     let mut logical_device_ids = manifest.placement_device_ids();
     if !logical_device_ids.contains(&manifest.device_id) {
@@ -698,48 +769,55 @@ fn run_placed_chat(
         nanos_to_millis(elapsed_nanos_u64(setup_start))
     );
 
-    run_chat_repl(initial_prompt, chat_session, |turn_index, input_text| {
-        let input_event_id = format!("chat_{turn_index}");
-        let encoded_token_ids = codec.encode_text(input_text)?;
-        let input_event = VulkanResidentTokenInputEvent::new(
-            input_event_id.clone(),
-            encoded_token_ids.clone(),
-            args.max_new_tokens,
-        )
-        .with_origin("cli_chat");
-        let input_event = if let Some(eos_token_id) = eos_token_id {
-            input_event.with_eos_token(eos_token_id)
-        } else {
-            input_event
-        };
-        let batch_run = engine.submit_input_events_until_idle_bounded(
-            vec![
-                VulkanResidentGreedyInProcessPlacedPromptEngineInputRequest::new(
-                    "main",
-                    input_event,
-                ),
-            ],
-            1,
-            args.max_scheduler_turns,
-        )?;
-        let generated_token_ids = batch_run
-            .engine_run
-            .input_runs
-            .into_iter()
-            .find(|run| {
-                run.stream_id == "main" && run.submitted_run.input_event.id == input_event_id
+    run_chat_repl(
+        initial_prompt,
+        chat_session,
+        codec,
+        |turn_index, token_ids| {
+            let input_event_id = format!("chat_{turn_index}");
+            let input_event = VulkanResidentTokenInputEvent::new(
+                input_event_id.clone(),
+                token_ids.to_vec(),
+                args.max_new_tokens,
+            )
+            .with_origin("cli_chat");
+            let input_event = if !stop_token_ids.is_empty() {
+                input_event.with_stop_tokens(stop_token_ids.clone())
+            } else {
+                input_event
+            };
+            let batch_run = engine.submit_input_events_until_idle_bounded(
+                vec![
+                    VulkanResidentGreedyInProcessPlacedPromptEngineInputRequest::new(
+                        "main",
+                        input_event,
+                    ),
+                ],
+                1,
+                args.max_scheduler_turns,
+            )?;
+            let generated_token_ids = batch_run
+                .engine_run
+                .input_runs
+                .into_iter()
+                .find(|run| {
+                    run.stream_id == "main" && run.submitted_run.input_event.id == input_event_id
+                })
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "placed chat engine loop did not return the submitted input event run",
+                    )
+                })?
+                .submitted_run
+                .generated_token_ids;
+            let generated_text = codec.decode_tokens(&generated_token_ids)?;
+            Ok(RuntimeChatTurn {
+                generated_text,
+                generated_token_count: generated_token_ids.len(),
             })
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::NotFound,
-                    "placed chat engine loop did not return the submitted input event run",
-                )
-            })?
-            .submitted_run
-            .generated_token_ids;
-        let generated_text = codec.decode_tokens(&generated_token_ids)?;
-        Ok(RuntimeChatTurn { generated_text })
-    })
+        },
+    )
 }
 
 fn run_placed_prompt(
