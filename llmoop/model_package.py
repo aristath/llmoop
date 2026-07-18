@@ -8,7 +8,7 @@ import subprocess
 from copy import deepcopy
 from hashlib import blake2s
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from llmoop.circuit_lowering import lower_pedalboard
 from llmoop.circuit_optimizer import optimize_circuit_for_vulkan
@@ -17,6 +17,8 @@ from llmoop.model_compiler import (
     CompiledModelReport,
     Json,
     ModelCompileError,
+    check_compile_cancelled,
+    emit_compile_event,
     read_json,
     relative_json_path,
     write_json,
@@ -52,16 +54,43 @@ def compile_model_package(
     package_dir: Path | None,
     clean: bool,
     shader_source_dir: Path,
+    event_sink: Callable[[Json], None] | None = None,
+    cancel_requested: Callable[[], bool] | None = None,
 ) -> CompiledModelReport:
     slug = compiled_model_slug(model_dir)
     transpiled_dir = transpiled_dir or Path("transpiled") / slug
     lowered_dir = lowered_dir or Path("lowered") / slug
     package_dir = package_dir or Path("packages") / slug
 
-    structure = transpile_model(model_dir, transpiled_dir, clean=clean)
+    structure = transpile_model(
+        model_dir,
+        transpiled_dir,
+        clean=clean,
+        progress=lambda current, total, pedal_id: emit_compile_event(
+            event_sink,
+            "PedalTranspiled",
+            current=current,
+            total=total,
+            pedal_id=pedal_id,
+        ),
+        cancel_requested=cancel_requested,
+    )
+    check_compile_cancelled(cancel_requested)
     if clean and lowered_dir.exists():
         shutil.rmtree(lowered_dir)
-    lowered = lower_pedalboard(transpiled_dir, lowered_dir)
+    lowered = lower_pedalboard(
+        transpiled_dir,
+        lowered_dir,
+        progress=lambda current, total, pedal_id: emit_compile_event(
+            event_sink,
+            "PedalLoweringStarted",
+            current=current,
+            total=total,
+            pedal_id=pedal_id,
+        ),
+        cancel_requested=cancel_requested,
+    )
+    check_compile_cancelled(cancel_requested)
     tensor_index = read_json(transpiled_dir / "tensors.json")
     model_graph = read_json(transpiled_dir / "model.json")
     tensor_index = referenced_tensor_index(
@@ -74,11 +103,23 @@ def compile_model_package(
     if clean and package_dir.exists():
         shutil.rmtree(package_dir)
     package_dir.mkdir(parents=True, exist_ok=True)
+    emit_compile_event(event_sink, "ArtifactWritingStarted", package_dir=str(package_dir))
     write_runtime_config_package(model_graph, package_dir)
     tokenizer_manifest = copy_tokenizer_package(
         model_dir, package_dir / TOKENIZER_PACKAGE_DIR
     )
-    packaged_tensor_index = copy_tensor_package(tensor_index, package_dir)
+    packaged_tensor_index = copy_tensor_package(
+        tensor_index,
+        package_dir,
+        progress=lambda current, total, tensor_name: emit_compile_event(
+            event_sink,
+            "TensorPackagingStarted",
+            current=current,
+            total=total,
+            tensor_name=tensor_name,
+        ),
+        cancel_requested=cancel_requested,
+    )
     package_manifest = build_vulkan_resident_greedy_package_manifest(
         model_graph=model_graph,
         tensor_index=packaged_tensor_index,
@@ -88,9 +129,16 @@ def compile_model_package(
         package_id=f"{slug}_vulkan_resident_greedy",
         shader_source_dir=shader_source_dir,
         tokenizer_manifest=tokenizer_manifest,
+        event_sink=event_sink,
+        cancel_requested=cancel_requested,
     )
     package_manifest_path = package_dir / "vulkan_resident_greedy_package.json"
     write_json(package_manifest_path, package_manifest)
+    emit_compile_event(
+        event_sink, "PackageValidationStarted", package=str(package_manifest_path)
+    )
+    validate_compiled_package(package_dir, package_manifest)
+    check_compile_cancelled(cancel_requested)
 
     return CompiledModelReport(
         model_dir=model_dir,
@@ -114,6 +162,8 @@ def build_vulkan_resident_greedy_package_manifest(
     package_id: str,
     shader_source_dir: Path,
     tokenizer_manifest: Json,
+    event_sink: Callable[[Json], None] | None = None,
+    cancel_requested: Callable[[], bool] | None = None,
 ) -> Json:
     dimensions = model_graph["dimensions"]
     hidden_size = int(dimensions["hidden_size"])
@@ -189,7 +239,17 @@ def build_vulkan_resident_greedy_package_manifest(
             norm_shader_file=norm_shader_file,
         ),
     )
-    compile_shader_artifacts(package_dir / "shaders")
+    compile_shader_artifacts(
+        package_dir / "shaders",
+        progress=lambda current, total, shader_name: emit_compile_event(
+            event_sink,
+            "ShaderCompilationStarted",
+            current=current,
+            total=total,
+            shader_name=shader_name,
+        ),
+        cancel_requested=cancel_requested,
+    )
     for execution in pedal_executions:
         for kernel in execution["kernels"]:
             kernel["shader_path"] = compiled_shader_path(kernel["shader_path"])
@@ -1029,7 +1089,12 @@ def render_shader_template(
     return rendered
 
 
-def compile_shader_artifacts(shader_dir: Path) -> None:
+def compile_shader_artifacts(
+    shader_dir: Path,
+    *,
+    progress: Callable[[int, int, str], None] | None = None,
+    cancel_requested: Callable[[], bool] | None = None,
+) -> None:
     compiler = shutil.which("glslangValidator")
     if compiler is None:
         raise ModelCompileError(
@@ -1041,7 +1106,11 @@ def compile_shader_artifacts(shader_dir: Path) -> None:
         raise ModelCompileError(
             f"no Vulkan shader sources were rendered in {shader_dir}"
         )
-    for source in sources:
+    total = len(sources)
+    for index, source in enumerate(sources, start=1):
+        check_compile_cancelled(cancel_requested)
+        if progress is not None:
+            progress(index, total, source.name)
         destination = source.with_suffix(".spv")
         completed = subprocess.run(
             [
@@ -1185,7 +1254,13 @@ def referenced_tensor_index(
     return selected
 
 
-def copy_tensor_package(tensor_index: Json, package_dir: Path) -> Json:
+def copy_tensor_package(
+    tensor_index: Json,
+    package_dir: Path,
+    *,
+    progress: Callable[[int, int, str], None] | None = None,
+    cancel_requested: Callable[[], bool] | None = None,
+) -> Json:
     weights_dir = package_dir / WEIGHTS_PACKAGE_DIR
     if weights_dir.exists():
         shutil.rmtree(weights_dir)
@@ -1196,7 +1271,12 @@ def copy_tensor_package(tensor_index: Json, package_dir: Path) -> Json:
 
     packaged = deepcopy(tensor_index)
     compiled_sources = []
-    for tensor_name, info in sorted(packaged["tensors"].items()):
+    tensors = sorted(packaged["tensors"].items())
+    total = len(tensors)
+    for index, (tensor_name, info) in enumerate(tensors, start=1):
+        check_compile_cancelled(cancel_requested)
+        if progress is not None:
+            progress(index, total, tensor_name)
         source = Path(info["source_file"])
         if not source.is_file():
             raise ModelCompileError(f"tensor source file does not exist: {source}")
@@ -1235,6 +1315,61 @@ def copy_tensor_package(tensor_index: Json, package_dir: Path) -> Json:
 
     write_json(package_dir / "tensors.json", packaged)
     return packaged
+
+
+def validate_compiled_package(package_dir: Path, manifest: Json) -> None:
+    if manifest.get("schema") != PACKAGE_SCHEMA:
+        raise ModelCompileError(
+            f"compiled package has unsupported schema {manifest.get('schema')!r}"
+        )
+    required_files = (
+        package_dir / str(manifest.get("config_path", "")),
+        package_dir / str(manifest.get("tensor_index_path", "")),
+    )
+    for path in required_files:
+        if not path.is_file():
+            raise ModelCompileError(f"compiled package is missing required artifact {path}")
+
+    tokenizer = manifest.get("tokenizer")
+    if not isinstance(tokenizer, dict) or not tokenizer.get("path"):
+        raise ModelCompileError("compiled package does not declare tokenizer artifacts")
+    tokenizer_dir = package_dir / str(tokenizer["path"])
+    for filename in tokenizer.get("files", []):
+        path = tokenizer_dir / str(filename)
+        if not path.is_file():
+            raise ModelCompileError(f"compiled package is missing tokenizer artifact {path}")
+
+    tensor_index = read_json(package_dir / str(manifest["tensor_index_path"]))
+    for tensor_name, info in tensor_index.get("tensors", {}).items():
+        source = package_dir / str(info.get("source_file", ""))
+        if not source.is_file():
+            raise ModelCompileError(
+                f"compiled tensor {tensor_name!r} references missing artifact {source}"
+            )
+
+    shader_paths: set[str] = set()
+
+    def collect_shader_paths(value: Any) -> None:
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if key.endswith("shader_path") and isinstance(child, str):
+                    shader_paths.add(child)
+                else:
+                    collect_shader_paths(child)
+        elif isinstance(value, list):
+            for child in value:
+                collect_shader_paths(child)
+
+    collect_shader_paths(manifest)
+    if not shader_paths:
+        raise ModelCompileError("compiled package does not reference any shader artifacts")
+    for relative_path in sorted(shader_paths):
+        shader = package_dir / relative_path
+        if not shader.is_file():
+            raise ModelCompileError(f"compiled package references missing shader {shader}")
+        payload = shader.read_bytes()
+        if len(payload) < 4 or payload[:4] != b"\x03\x02#\x07":
+            raise ModelCompileError(f"compiled package shader is not valid SPIR-V: {shader}")
 
 
 def compiled_tensor_layout(info: Json) -> str:

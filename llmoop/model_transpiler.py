@@ -8,7 +8,9 @@ import struct
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
+
+from llmoop.model_compiler import check_compile_cancelled
 
 
 Json = dict[str, Any]
@@ -217,7 +219,12 @@ LAYER_ROOT_PATTERNS = (
 
 
 def transpile_model(
-    model_dir: Path, output_dir: Path, *, clean: bool
+    model_dir: Path,
+    output_dir: Path,
+    *,
+    clean: bool,
+    progress: Callable[[int, int, str], None] | None = None,
+    cancel_requested: Callable[[], bool] | None = None,
 ) -> ModelStructure:
     model_dir = model_dir.expanduser()
     config = read_json(model_dir / "config.json")
@@ -232,6 +239,7 @@ def transpile_model(
         tensor_index["tensors"],
         generation_config=generation_config,
     )
+    check_compile_cancelled(cancel_requested)
 
     if clean and output_dir.exists():
         shutil.rmtree(output_dir)
@@ -242,11 +250,15 @@ def transpile_model(
         output_dir / "model.json", make_model_graph(structure, output_dir, tensor_index)
     )
 
-    for layer in structure.layers:
+    total = len(structure.layers)
+    for current, layer in enumerate(structure.layers, start=1):
+        check_compile_cancelled(cancel_requested)
         write_json(
             output_dir / "layers" / f"layer_{layer.index:02d}.json",
             make_layer(structure, layer),
         )
+        if progress is not None:
+            progress(current, total, f"layer_{layer.index:02d}")
 
     return structure
 

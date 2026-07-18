@@ -3,9 +3,10 @@ from __future__ import annotations
 import json
 from collections import Counter
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from llmoop.circuit_ir import validate_circuit_against_pedal
+from llmoop.model_compiler import check_compile_cancelled
 
 
 Json = dict[str, Any]
@@ -48,13 +49,23 @@ def build_pedal_circuit(pedal: Json, pedal_path: Path) -> Json:
     raise ValueError(f"unsupported pedal operator type {operator_type!r}")
 
 
-def lower_pedalboard(pedalboard_dir: Path, out_dir: Path) -> Json:
+def lower_pedalboard(
+    pedalboard_dir: Path,
+    out_dir: Path,
+    *,
+    progress: Callable[[int, int, str], None] | None = None,
+    cancel_requested: Callable[[], bool] | None = None,
+) -> Json:
     model = read_json(pedalboard_dir / "model.json")
     source_pedals = model["graph"]["pedalboard"]["pedals"]
 
     lowered: list[Json] = []
     operator_counts: Counter[str] = Counter()
-    for source_pedal in source_pedals:
+    total = len(source_pedals)
+    for current, source_pedal in enumerate(source_pedals, start=1):
+        check_compile_cancelled(cancel_requested)
+        if progress is not None:
+            progress(current, total, source_pedal["id"])
         pedal_path = pedalboard_dir / source_pedal["file"]
         pedal_out_dir = out_dir / source_pedal["id"]
         result = lower_pedal(pedal_path, pedal_out_dir)

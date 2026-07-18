@@ -3,10 +3,16 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import signal
 import subprocess
 from pathlib import Path
 
-from llmoop.model_compiler import compile_model
+from llmoop.model_compiler import (
+    ModelCompileCancelled,
+    ModelCompileError,
+    compile_model,
+    discover_source_model,
+)
 
 
 RUNTIME_PACKAGE_MANIFEST = "vulkan_resident_greedy_package.json"
@@ -19,6 +25,12 @@ def main() -> None:
         type=Path,
         metavar="MODEL_DIR",
         help="compile a source model directory into llmoop engine artifacts",
+    )
+    parser.add_argument(
+        "--discover-model",
+        type=Path,
+        metavar="MODEL_DIR",
+        help="discover and validate Safetensors source-model artifacts without compiling",
     )
     parser.add_argument(
         "--run",
@@ -210,20 +222,62 @@ def main() -> None:
         action="store_true",
         help="print a machine-readable report",
     )
+    parser.add_argument(
+        "--compiler-events-jsonl",
+        action="store_true",
+        help="stream structured compiler job events as JSON Lines",
+    )
     args = parser.parse_args()
 
     selected_actions = [
         args.compile_model is not None,
+        args.discover_model is not None,
         args.run is not None,
         args.run_model is not None,
     ]
     if sum(selected_actions) > 1:
-        parser.error("--compile-model, --run, and --run-model are mutually exclusive")
+        parser.error(
+            "--compile-model, --discover-model, --run, and --run-model are mutually exclusive"
+        )
     if not any(selected_actions):
         parser.print_help()
         raise SystemExit(2)
     if args.context_size is not None and args.context_size < 1:
         parser.error("--context-size must be at least 1")
+    if args.compiler_events_jsonl and args.compile_model is None and args.discover_model is None:
+        parser.error("--compiler-events-jsonl requires --compile-model or --discover-model")
+    if args.compiler_events_jsonl and args.json:
+        parser.error("--compiler-events-jsonl and --json are mutually exclusive")
+    if args.discover_model is not None:
+        reporter = JsonLineCompileReporter() if args.compiler_events_jsonl else None
+        if reporter is not None:
+            reporter({"type": "DiscoveryStarted", "model_dir": str(args.discover_model)})
+        try:
+            discovery = discover_source_model(args.discover_model)
+        except ModelCompileError as error:
+            if reporter is not None:
+                reporter(
+                    {
+                        "type": "Failed",
+                        "diagnostics": [
+                            {"kind": type(error).__name__, "message": str(error)}
+                        ],
+                    }
+                )
+                raise SystemExit(1) from None
+            raise SystemExit(str(error)) from None
+        if reporter is not None:
+            reporter({"type": "SourceDiscovered", "source": discovery.to_json()})
+            reporter({"type": "Completed", "discovery": discovery.to_json()})
+        elif args.json:
+            print(json.dumps({"ok": True, **discovery.to_json()}, indent=2))
+        else:
+            print(f"discovered {discovery.model_dir}")
+            print(f"  model_type: {discovery.model_type}")
+            print(f"  weight_files: {len(discovery.weight_files)}")
+            print(f"  tokenizer: {', '.join(discovery.tokenizer_files)}")
+            print(f"  chat_template: {discovery.has_chat_template}")
+        return
     if args.compile_model is None:
         if args.inspect_runtime and args.run is None:
             parser.error("--inspect-runtime is only supported with --run")
@@ -349,14 +403,39 @@ def main() -> None:
         run_model(args)
         return
 
-    report = compile_model(
-        args.compile_model,
-        transpiled_dir=args.transpiled_dir,
-        lowered_dir=args.lowered_dir,
-        package_dir=args.package_dir,
-        clean=not args.no_clean,
-        shader_source_dir=args.shader_source_dir,
-    )
+    reporter = JsonLineCompileReporter() if args.compiler_events_jsonl else None
+    cancel_requested = False
+
+    def request_cancel(_signum: int, _frame: object) -> None:
+        nonlocal cancel_requested
+        cancel_requested = True
+
+    previous_sigint = signal.getsignal(signal.SIGINT)
+    previous_sigterm = signal.getsignal(signal.SIGTERM)
+    signal.signal(signal.SIGINT, request_cancel)
+    signal.signal(signal.SIGTERM, request_cancel)
+    try:
+        report = compile_model(
+            args.compile_model,
+            transpiled_dir=args.transpiled_dir,
+            lowered_dir=args.lowered_dir,
+            package_dir=args.package_dir,
+            clean=not args.no_clean,
+            shader_source_dir=args.shader_source_dir,
+            event_sink=reporter,
+            cancel_requested=lambda: cancel_requested,
+        )
+    except ModelCompileCancelled:
+        raise SystemExit(130) from None
+    except ModelCompileError as error:
+        if reporter is not None:
+            raise SystemExit(1) from None
+        raise SystemExit(str(error)) from None
+    finally:
+        signal.signal(signal.SIGINT, previous_sigint)
+        signal.signal(signal.SIGTERM, previous_sigterm)
+    if reporter is not None:
+        return
     if args.json:
         print(json.dumps(report.to_json(), indent=2))
     else:
@@ -368,6 +447,29 @@ def main() -> None:
         print(f"  package:    {report.package_manifest}")
         print(f"  circuits:   {report.circuit_count}")
         print(f"  shaders:    {report.shader_count}")
+
+
+class JsonLineCompileReporter:
+    def __init__(self) -> None:
+        self.sequence = 0
+
+    def __call__(self, event: dict[str, object]) -> None:
+        emit_jsonl_event(self.sequence, event)
+        self.sequence += 1
+
+
+def emit_jsonl_event(sequence: int, event: dict[str, object]) -> None:
+    print(
+        json.dumps(
+            {
+                "schema": "llmoop.compiler_event.v1",
+                "sequence": sequence,
+                **event,
+            },
+            separators=(",", ":"),
+        ),
+        flush=True,
+    )
 
 
 def run_engine(args: argparse.Namespace) -> None:
