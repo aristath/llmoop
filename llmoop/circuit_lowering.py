@@ -41,6 +41,8 @@ def build_pedal_circuit(pedal: Json, pedal_path: Path) -> Json:
         return build_conv_circuit(pedal, pedal_path)
     if operator_type == "full_attention":
         return build_attention_circuit(pedal, pedal_path)
+    if operator_type == "gated_delta":
+        return build_gated_delta_circuit(pedal, pedal_path)
     raise ValueError(f"unsupported pedal operator type {operator_type!r}")
 
 
@@ -145,6 +147,22 @@ def build_attention_circuit(pedal: Json, pedal_path: Path) -> Json:
     )
 
 
+def build_gated_delta_circuit(pedal: Json, pedal_path: Path) -> Json:
+    dimensions = pedal["reference_decomposition"]["wiring"][1]["dimensions"]
+    return _base_circuit(
+        pedal=pedal,
+        pedal_path=pedal_path,
+        behavioral_role="source_reference_circuit",
+        implementation="reference_gated_delta_layer_circuit_v1",
+        circuit_id=f"{pedal['id']}_gated_delta_circuit_v1",
+        nodes=_gated_delta_nodes(dimensions, pedal["numerics"]),
+        behavioral_notes=(
+            "This circuit preserves a recurrent gated-delta token mixer with fixed per-stream state.",
+            "The recurrent matrix is transient pedal-owned DSP state, not a global cache.",
+        ),
+    )
+
+
 def build_params_artifact(circuit: Json) -> Json:
     return {
         "schema": "llmoop.circuit_params.v1",
@@ -239,7 +257,7 @@ def _conv_nodes(hidden_size: int, numerics: Json) -> list[Json]:
             "inputs": ["input_frame"],
             "outputs": ["operator_norm_out"],
             "params": ["operator_norm"],
-            "attrs": {"eps": float(numerics["rms_norm_eps"])},
+            "attrs": _norm_attrs(numerics),
         },
         {
             "id": "conv_in_projection",
@@ -253,7 +271,11 @@ def _conv_nodes(hidden_size: int, numerics: Json) -> list[Json]:
             "op": "split",
             "inputs": ["conv_projected"],
             "outputs": ["gate_b", "gate_c", "projected_x"],
-            "attrs": {"axis": "channel", "parts": ["b", "c", "x"]},
+            "attrs": {
+                "axis": "channel",
+                "parts": ["b", "c", "x"],
+                "part_width": hidden_size,
+            },
         },
         {
             "id": "input_gate",
@@ -294,6 +316,7 @@ def _conv_nodes(hidden_size: int, numerics: Json) -> list[Json]:
         *_ffn_tail(
             operator_output="operator_out",
             norm_eps=float(numerics["rms_norm_eps"]),
+            norm_weight_offset=float(numerics["rms_norm_weight_offset"]),
         ),
     ]
 
@@ -312,13 +335,13 @@ def _attention_nodes(
             "inputs": ["input_frame"],
             "outputs": ["operator_norm_out"],
             "params": ["operator_norm"],
-            "attrs": {"eps": float(numerics["rms_norm_eps"])},
+            "attrs": _norm_attrs(numerics),
         },
         {
             "id": "q_projection",
             "op": "linear",
             "inputs": ["operator_norm_out"],
-            "outputs": ["q_projected"],
+            "outputs": ["q_and_gate_projected" if numerics.get("attention_output_gate") else "q_projected"],
             "params": ["q_projection"],
         },
         {
@@ -336,6 +359,26 @@ def _attention_nodes(
             "params": ["v_projection"],
         },
     ]
+    attention_gate = None
+    if numerics.get("attention_output_gate"):
+        attention_width = int(heads["query_heads"]) * int(heads["head_width"])
+        nodes.append(
+            {
+                "id": "q_gate_split",
+                "op": "split",
+                "inputs": ["q_and_gate_projected"],
+                "outputs": ["q_projected", "attention_gate"],
+                "attrs": {
+                    "axis": "channel",
+                    "parts": 2,
+                    "part_width": attention_width,
+                    "layout": "per_head_interleaved",
+                    "blocks": int(heads["query_heads"]),
+                    "block_part_width": int(heads["head_width"]),
+                },
+            }
+        )
+        attention_gate = "attention_gate"
     q_rope_input = "q_projected"
     if has_q_norm:
         nodes.append(
@@ -345,7 +388,7 @@ def _attention_nodes(
                 "inputs": ["q_projected"],
                 "outputs": ["q_normed"],
                 "params": ["q_norm"],
-                "attrs": {"eps": float(numerics["rms_norm_eps"]), **heads},
+                "attrs": {**_norm_attrs(numerics), **heads},
             }
         )
         q_rope_input = "q_normed"
@@ -358,7 +401,7 @@ def _attention_nodes(
                 "inputs": ["k_projected"],
                 "outputs": ["k_normed"],
                 "params": ["k_norm"],
-                "attrs": {"eps": float(numerics["rms_norm_eps"]), **heads},
+                "attrs": {**_norm_attrs(numerics), **heads},
             }
         )
         k_rope_input = "k_normed"
@@ -366,25 +409,25 @@ def _attention_nodes(
         "position_source": "stream_tick",
         "theta": float(numerics["rope_theta"]),
         "interleaved": bool(numerics["rope_interleaved"]),
+        "rotary_width": int(numerics["rotary_width"]),
         **heads,
     }
-    nodes.extend(
-        [
-            {
+    attention_tail: list[Json] = [
+        {
                 "id": "q_rope",
                 "op": "rotary_position_embedding",
                 "inputs": [q_rope_input],
                 "outputs": ["q_positioned"],
                 "attrs": rope_attrs,
-            },
-            {
+        },
+        {
                 "id": "k_rope",
                 "op": "rotary_position_embedding",
                 "inputs": [k_rope_input],
                 "outputs": ["k_positioned"],
                 "attrs": rope_attrs,
-            },
-            {
+        },
+        {
                 "id": "kv_memory_append",
                 "op": "append_state_update",
                 "inputs": ["k_positioned", "v_projected", "kv_memory"],
@@ -392,31 +435,129 @@ def _attention_nodes(
                 "state_reads": ["kv_memory"],
                 "state_writes": ["kv_memory"],
                 "attrs": {"growth": "per_activation", **heads},
-            },
-            {
+        },
+        {
                 "id": "attention_read",
                 "op": "scaled_dot_product_attention",
                 "inputs": ["q_positioned", "k_memory", "v_memory"],
                 "outputs": ["attention_out"],
                 "attrs": {"causal": True, **heads},
-            },
-            {
+        },
+        {
                 "id": "attention_out_projection",
                 "op": "linear",
-                "inputs": ["attention_out"],
+                "inputs": ["attention_gated" if attention_gate else "attention_out"],
                 "outputs": ["operator_out"],
                 "params": ["attention_out_projection"],
+        },
+        *_ffn_tail(
+            operator_output="operator_out",
+            norm_eps=float(numerics["rms_norm_eps"]),
+            norm_weight_offset=float(numerics["rms_norm_weight_offset"]),
+        ),
+    ]
+    if attention_gate:
+        attention_tail.insert(
+            4,
+            {
+                "id": "attention_output_gate",
+                "op": "sigmoid_multiply",
+                "inputs": ["attention_out", attention_gate],
+                "outputs": ["attention_gated"],
             },
-            *_ffn_tail(
-                operator_output="operator_out",
-                norm_eps=float(numerics["rms_norm_eps"]),
-            ),
-        ]
-    )
+        )
+    nodes.extend(attention_tail)
     return nodes
 
 
-def _ffn_tail(operator_output: str, norm_eps: float) -> list[Json]:
+def _gated_delta_nodes(dimensions: Json, numerics: Json) -> list[Json]:
+    key_width = int(dimensions["key_heads"]) * int(dimensions["key_head_width"])
+    value_width = int(dimensions["value_heads"]) * int(dimensions["value_head_width"])
+    conv_width = key_width * 2 + value_width
+    return [
+        {
+            "id": "operator_norm",
+            "op": "rms_norm",
+            "inputs": ["input_frame"],
+            "outputs": ["operator_norm_out"],
+            "params": ["operator_norm"],
+            "attrs": _norm_attrs(numerics),
+        },
+        {
+            "id": "delta_qkv_projection",
+            "op": "linear",
+            "inputs": ["operator_norm_out"],
+            "outputs": ["delta_qkv_projected"],
+            "params": ["delta_qkv_projection"],
+        },
+        {
+            "id": "delta_z_projection",
+            "op": "linear",
+            "inputs": ["operator_norm_out"],
+            "outputs": ["delta_z"],
+            "params": ["delta_z_projection"],
+        },
+        {
+            "id": "delta_b_projection",
+            "op": "linear",
+            "inputs": ["operator_norm_out"],
+            "outputs": ["delta_b"],
+            "params": ["delta_b_projection"],
+        },
+        {
+            "id": "delta_a_projection",
+            "op": "linear",
+            "inputs": ["operator_norm_out"],
+            "outputs": ["delta_a"],
+            "params": ["delta_a_projection"],
+        },
+        {
+            "id": "delta_causal_conv",
+            "op": "causal_conv1d_silu",
+            "inputs": ["delta_qkv_projected"],
+            "outputs": ["delta_qkv_convolved"],
+            "params": ["delta_conv_kernel"],
+            "state_reads": ["conv_state"],
+            "state_writes": ["conv_state"],
+            "attrs": {
+                "channels": conv_width,
+                "kernel_width": int(dimensions["conv_kernel_width"]),
+            },
+        },
+        {
+            "id": "gated_delta_update",
+            "op": "gated_delta_step",
+            "inputs": ["delta_qkv_convolved", "delta_z", "delta_b", "delta_a"],
+            "outputs": ["delta_mixed"],
+            "params": ["delta_a_log", "delta_dt_bias", "delta_norm"],
+            "state_reads": ["recurrent_state"],
+            "state_writes": ["recurrent_state"],
+            "attrs": {
+                **dimensions,
+                "key_width": key_width,
+                "value_width": value_width,
+                "norm_eps": float(numerics["rms_norm_eps"]),
+                "norm_weight_offset": 0.0,
+            },
+        },
+        {
+            "id": "delta_out_projection",
+            "op": "linear",
+            "inputs": ["delta_mixed"],
+            "outputs": ["operator_out"],
+            "params": ["delta_out_projection"],
+        },
+        *_ffn_tail(
+            operator_output="operator_out",
+            norm_eps=float(numerics["rms_norm_eps"]),
+            norm_weight_offset=float(numerics["rms_norm_weight_offset"]),
+        ),
+    ]
+
+
+def _ffn_tail(
+    operator_output: str, norm_eps: float, norm_weight_offset: float
+) -> list[Json]:
     return [
         {
             "id": "operator_residual",
@@ -430,7 +571,7 @@ def _ffn_tail(operator_output: str, norm_eps: float) -> list[Json]:
             "inputs": ["operator_residual_out"],
             "outputs": ["ffn_norm_out"],
             "params": ["ffn_norm"],
-            "attrs": {"eps": norm_eps},
+            "attrs": {"eps": norm_eps, "weight_offset": norm_weight_offset},
         },
         {
             "id": "ffn_gate_projection",
@@ -478,7 +619,7 @@ def _attention_heads_from_state(pedal: Json) -> Json:
     state = pedal["state_ports"][0]
     kv_heads, head_width = state["key_shape_per_token"]
     hidden_size = pedal["ports"]["inputs"][0]["shape"][0]
-    query_heads = hidden_size // head_width
+    query_heads = int(state.get("query_heads") or hidden_size // head_width)
     return {
         "query_heads": query_heads,
         "key_value_heads": kv_heads,
@@ -496,6 +637,9 @@ def _state_port_for_circuit(port: Json, operator_type: str) -> Json:
     elif operator_type == "full_attention":
         state.setdefault("layout", "append_only_kv")
         state.setdefault("source_layout", "batch_kvheads_seq_headdim")
+    elif operator_type == "gated_delta":
+        state.setdefault("layout", "channel_time" if state["id"] == "conv_state" else "head_key_value")
+        state.setdefault("source_layout", state["layout"])
     return state
 
 
@@ -521,8 +665,24 @@ def _param_role(name: str) -> str:
         "attention_out_projection": "attention_output_projection",
         "q_norm": "attention_query_head_normalization",
         "k_norm": "attention_key_head_normalization",
+        "delta_qkv_projection": "gated_delta_query_key_value_projection",
+        "delta_z_projection": "gated_delta_output_gate_projection",
+        "delta_b_projection": "gated_delta_beta_projection",
+        "delta_a_projection": "gated_delta_decay_projection",
+        "delta_conv_kernel": "gated_delta_depthwise_convolution_kernel",
+        "delta_a_log": "gated_delta_decay_parameter",
+        "delta_dt_bias": "gated_delta_time_bias",
+        "delta_norm": "gated_delta_output_normalization_weight",
+        "delta_out_projection": "gated_delta_output_projection",
     }
     return roles[name]
+
+
+def _norm_attrs(numerics: Json) -> Json:
+    return {
+        "eps": float(numerics["rms_norm_eps"]),
+        "weight_offset": float(numerics["rms_norm_weight_offset"]),
+    }
 
 
 def read_json(path: Path) -> Json:

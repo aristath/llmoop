@@ -100,8 +100,8 @@ def test_compiler_renders_paired_matrix_and_transducer_shaders(tmp_path: Path) -
 def test_compiler_renders_attention_pedals_from_discovered_dimensions(tmp_path: Path) -> None:
     shader_source_dir = Path(__file__).parents[1] / "runtime-rs" / "shaders"
     shader_files = {
-        "rms_norm_bf16_h960_eps1e-05.comp",
-        "rotary_bf16_15x64_theta100000_half__sc2.comp",
+        "rms_norm_bf16_h960_eps1e-05_offset0.comp",
+        "rotary_bf16_15x64_r64_theta100000_half__sc2.comp",
         "append_kv_state_bf16_5x64__sc9.comp",
         "gqa_attention_bf16_q15_kv5_d64__sc6.comp",
         "greedy_sampler_f32_49152.comp",
@@ -109,9 +109,9 @@ def test_compiler_renders_attention_pedals_from_discovered_dimensions(tmp_path: 
 
     copy_shader_templates(shader_source_dir, tmp_path, shader_files)
 
-    norm = (tmp_path / "rms_norm_bf16_h960_eps1e-05.comp").read_text()
+    norm = (tmp_path / "rms_norm_bf16_h960_eps1e-05_offset0.comp").read_text()
     rope = (
-        tmp_path / "rotary_bf16_15x64_theta100000_half__sc2.comp"
+        tmp_path / "rotary_bf16_15x64_r64_theta100000_half__sc2.comp"
     ).read_text()
     append = (tmp_path / "append_kv_state_bf16_5x64__sc9.comp").read_text()
     attention = (
@@ -121,7 +121,9 @@ def test_compiler_renders_attention_pedals_from_discovered_dimensions(tmp_path: 
 
     assert "const uint HIDDEN_SIZE = 960u;" in norm
     assert "const float NORM_EPS = 1e-05;" in norm
+    assert "const float WEIGHT_OFFSET = 0;" in norm
     assert "const uint HEAD_COUNT = 15u;" in rope
+    assert "const uint ROTARY_WIDTH = 64u;" in rope
     assert "const float ROPE_THETA = 100000;" in rope
     assert "const bool ROPE_INTERLEAVED = false;" in rope
     assert "binding = 2) readonly buffer StreamControl" in rope
@@ -131,4 +133,26 @@ def test_compiler_renders_attention_pedals_from_discovered_dimensions(tmp_path: 
     assert "const uint QUERY_GROUPS_PER_KV_HEAD = 3u;" in attention
     assert "binding = 6) readonly buffer StreamControl" in attention
     assert "const uint VOCAB_SIZE = 49152u;" in sampler
+    assert all("{{" not in (tmp_path / shader_file).read_text() for shader_file in shader_files)
+
+
+def test_compiler_renders_hybrid_recurrent_and_gated_attention_pedals(tmp_path: Path) -> None:
+    shader_source_dir = Path(__file__).parents[1] / "runtime-rs" / "shaders"
+    shader_files = {
+        "causal_conv1d_silu_bf16_c6144_k4.comp",
+        "gated_delta_step_k16x128_v16x128_eps1e-06.comp",
+        "split_bf16_2x8x256_head_interleaved.comp",
+        "sigmoid_multiply_bf16.comp",
+    }
+
+    copy_shader_templates(shader_source_dir, tmp_path, shader_files)
+
+    convolution = (tmp_path / "causal_conv1d_silu_bf16_c6144_k4.comp").read_text()
+    recurrence = (tmp_path / "gated_delta_step_k16x128_v16x128_eps1e-06.comp").read_text()
+    split = (tmp_path / "split_bf16_2x8x256_head_interleaved.comp").read_text()
+    assert "const uint CHANNELS = 6144u;" in convolution
+    assert "const uint KEY_HEADS = 16u;" in recurrence
+    assert "const uint VALUE_HEAD_WIDTH = 128u;" in recurrence
+    assert "const uint BLOCKS = 8u;" in split
+    assert "const uint BLOCK_PART_WIDTH = 256u;" in split
     assert all("{{" not in (tmp_path / shader_file).read_text() for shader_file in shader_files)

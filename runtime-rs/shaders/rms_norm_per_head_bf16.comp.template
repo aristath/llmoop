@@ -20,6 +20,7 @@ layout(set = 0, binding = 2) readonly buffer Weight {
 const uint HEAD_COUNT = {{HEAD_COUNT}}u;
 const uint HEAD_WIDTH = {{HEAD_WIDTH}}u;
 const float NORM_EPS = {{NORM_EPS}};
+const float WEIGHT_OFFSET = {{WEIGHT_OFFSET}};
 
 shared float reduction[64];
 
@@ -71,8 +72,8 @@ void main() {
     float inv_rms = inversesqrt((sum_squares / float(HEAD_WIDTH)) + NORM_EPS);
 
     for (uint pair_dim = lane * 2u; pair_dim < HEAD_WIDTH; pair_dim += 128u) {
-        float lo = read_input(base + pair_dim) * inv_rms * read_weight(pair_dim);
-        float hi = read_input(base + pair_dim + 1u) * inv_rms * read_weight(pair_dim + 1u);
+        float lo = read_input(base + pair_dim) * inv_rms * (read_weight(pair_dim) + WEIGHT_OFFSET);
+        float hi = read_input(base + pair_dim + 1u) * inv_rms * (read_weight(pair_dim + 1u) + WEIGHT_OFFSET);
         output_frame.words[(base + pair_dim) >> 1] =
             (f32_to_bf16(hi) << 16) | f32_to_bf16(lo);
     }

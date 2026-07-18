@@ -37,12 +37,17 @@ class ModelStructure:
     num_hidden_layers: int
     num_attention_heads: int
     num_key_value_heads: int
+    head_width: int
+    rotary_width: int
+    attention_output_gate: bool
     conv_l_cache: int
     vocab_size: int
     max_position_embeddings: int | None
     norm_eps: float
     rope_theta: float
     rope_interleaved: bool
+    rms_norm_weight_offset: float
+    recurrent_mixer: Json | None
     token_ids: Json
     tensors: dict[str, str]
     layers: tuple[LayerStructure, ...]
@@ -114,6 +119,16 @@ ATTENTION_OUT_PROJECTION_SUFFIXES = (
 ATTENTION_Q_NORM_SUFFIXES = ("self_attn.q_layernorm.weight", "self_attn.q_norm.weight")
 ATTENTION_K_NORM_SUFFIXES = ("self_attn.k_layernorm.weight", "self_attn.k_norm.weight")
 
+GATED_DELTA_QKV_SUFFIXES = ("linear_attn.in_proj_qkv.weight",)
+GATED_DELTA_Z_SUFFIXES = ("linear_attn.in_proj_z.weight",)
+GATED_DELTA_B_SUFFIXES = ("linear_attn.in_proj_b.weight",)
+GATED_DELTA_A_SUFFIXES = ("linear_attn.in_proj_a.weight",)
+GATED_DELTA_CONV_SUFFIXES = ("linear_attn.conv1d.weight",)
+GATED_DELTA_A_LOG_SUFFIXES = ("linear_attn.A_log",)
+GATED_DELTA_DT_BIAS_SUFFIXES = ("linear_attn.dt_bias",)
+GATED_DELTA_NORM_SUFFIXES = ("linear_attn.norm.weight",)
+GATED_DELTA_OUT_SUFFIXES = ("linear_attn.out_proj.weight",)
+
 LAYER_ROOT_PATTERNS = (
     re.compile(r"^(?P<root>.+?\.layers)\.(?P<index>\d+)\."),
     re.compile(r"^(?P<root>transformer\.h)\.(?P<index>\d+)\."),
@@ -148,60 +163,111 @@ def discover_model_structure(
     config: Json,
     tensors: dict[str, Json],
 ) -> ModelStructure:
-    token_embedding = find_first_tensor(tensors, TOKEN_EMBEDDING_CANDIDATES, role="token embedding")
-    output_norm = find_first_tensor(tensors, OUTPUT_NORM_CANDIDATES, role="output norm")
-    output_projection = find_first_existing_tensor(tensors, OUTPUT_PROJECTION_CANDIDATES) or token_embedding
-
-    hidden_size = int(config.get("hidden_size") or tensors[token_embedding]["shape"][1])
-    vocab_size = int(config.get("vocab_size") or tensors[token_embedding]["shape"][0])
     layer_root, layer_indices = discover_layer_root(tensors)
-    layer_count = int(config.get("num_hidden_layers") or (max(layer_indices) + 1))
+    decoder_config = discover_decoder_config(config, max(layer_indices) + 1)
+    model_prefix = layer_root.removesuffix(".layers")
+    token_embedding = find_first_tensor(
+        tensors,
+        (f"{model_prefix}.embed_tokens.weight", *TOKEN_EMBEDDING_CANDIDATES),
+        role="token embedding",
+    )
+    output_norm = find_first_tensor(
+        tensors,
+        (f"{model_prefix}.norm.weight", *OUTPUT_NORM_CANDIDATES),
+        role="output norm",
+    )
+    output_projection = find_first_existing_tensor(
+        tensors,
+        (f"{model_prefix}.lm_head.weight", *OUTPUT_PROJECTION_CANDIDATES),
+    ) or token_embedding
+
+    hidden_size = int(
+        decoder_config.get("hidden_size") or tensors[token_embedding]["shape"][1]
+    )
+    vocab_size = int(
+        decoder_config.get("vocab_size") or tensors[token_embedding]["shape"][0]
+    )
+    layer_count = int(
+        decoder_config.get("num_hidden_layers") or (max(layer_indices) + 1)
+    )
     layers = tuple(
         discover_layer_structure(
             tensors=tensors,
-            configured_layer_types=config.get("layer_types"),
+            configured_layer_types=decoder_config.get("layer_types"),
             layer_root=layer_root,
             layer_index=index,
         )
         for index in range(layer_count)
     )
 
-    intermediate_size = discover_intermediate_size(config, tensors, layers)
+    intermediate_size = discover_intermediate_size(decoder_config, tensors, layers)
     num_attention_heads = discover_int_config(
-        config,
+        decoder_config,
         "num_attention_heads",
         "n_head",
         "num_heads",
         role="number of attention heads",
     )
     num_key_value_heads = int(
-        config.get("num_key_value_heads")
-        or config.get("num_kv_heads")
-        or config.get("multi_query_group_num")
+        decoder_config.get("num_key_value_heads")
+        or decoder_config.get("num_kv_heads")
+        or decoder_config.get("multi_query_group_num")
         or num_attention_heads
     )
-    conv_l_cache = discover_conv_l_cache(config, tensors, layers)
+    head_width = int(
+        decoder_config.get("head_dim") or hidden_size // num_attention_heads
+    )
+    rope_parameters = decoder_config.get("rope_parameters")
+    partial_rotary_factor = (
+        float(rope_parameters.get("partial_rotary_factor", 1.0))
+        if isinstance(rope_parameters, dict)
+        else 1.0
+    )
+    rotary_width = int(head_width * partial_rotary_factor)
+    attention_output_gate = discover_attention_output_gate(
+        decoder_config,
+        tensors,
+        layers,
+        num_attention_heads=num_attention_heads,
+        head_width=head_width,
+    )
+    recurrent_mixer = discover_recurrent_mixer(decoder_config, layers)
+    conv_l_cache = discover_conv_l_cache(decoder_config, tensors, layers)
+    rms_norm_weight_offset = discover_outer_norm_weight_offset(
+        recurrent_mixer=recurrent_mixer,
+        attention_output_gate=attention_output_gate,
+    )
 
     return ModelStructure(
         model_dir=model_dir,
-        model_type=config.get("model_type"),
+        model_type=decoder_config.get("model_type") or config.get("model_type"),
         architectures=tuple(config.get("architectures", ())),
-        dtype=config.get("dtype") or config.get("torch_dtype"),
+        dtype=(
+            decoder_config.get("dtype")
+            or decoder_config.get("torch_dtype")
+            or config.get("dtype")
+            or config.get("torch_dtype")
+        ),
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
         num_hidden_layers=layer_count,
         num_attention_heads=num_attention_heads,
         num_key_value_heads=num_key_value_heads,
+        head_width=head_width,
+        rotary_width=rotary_width,
+        attention_output_gate=attention_output_gate,
         conv_l_cache=conv_l_cache,
         vocab_size=vocab_size,
-        max_position_embeddings=config.get("max_position_embeddings"),
-        norm_eps=discover_norm_eps(config),
-        rope_theta=discover_rope_theta(config),
-        rope_interleaved=bool(config.get("rope_interleaved", False)),
+        max_position_embeddings=decoder_config.get("max_position_embeddings"),
+        norm_eps=discover_norm_eps(decoder_config),
+        rope_theta=discover_rope_theta(decoder_config),
+        rope_interleaved=bool(decoder_config.get("rope_interleaved", False)),
+        rms_norm_weight_offset=rms_norm_weight_offset,
+        recurrent_mixer=recurrent_mixer,
         token_ids={
-            "bos": config.get("bos_token_id"),
-            "eos": config.get("eos_token_id"),
-            "pad": config.get("pad_token_id"),
+            "bos": decoder_config.get("bos_token_id"),
+            "eos": decoder_config.get("eos_token_id"),
+            "pad": decoder_config.get("pad_token_id"),
         },
         tensors={
             "token_embedding": token_embedding,
@@ -233,6 +299,8 @@ def discover_layer_structure(
         operator_type = "conv"
     elif configured in ("full_attention", "attention", "gqa_attention"):
         operator_type = "full_attention"
+    elif configured in ("linear_attention", "gated_delta"):
+        operator_type = "gated_delta"
     else:
         operator_type = infer_operator_type(tensors, prefix)
 
@@ -298,6 +366,38 @@ def discover_layer_structure(
             layer_tensors["q_norm"] = optional_q_norm
         if optional_k_norm is not None:
             layer_tensors["k_norm"] = optional_k_norm
+    elif operator_type == "gated_delta":
+        layer_tensors.update(
+            {
+                "delta_qkv_projection": find_layer_tensor(
+                    tensors, prefix, GATED_DELTA_QKV_SUFFIXES, role="gated-delta QKV projection"
+                ),
+                "delta_z_projection": find_layer_tensor(
+                    tensors, prefix, GATED_DELTA_Z_SUFFIXES, role="gated-delta output gate projection"
+                ),
+                "delta_b_projection": find_layer_tensor(
+                    tensors, prefix, GATED_DELTA_B_SUFFIXES, role="gated-delta beta projection"
+                ),
+                "delta_a_projection": find_layer_tensor(
+                    tensors, prefix, GATED_DELTA_A_SUFFIXES, role="gated-delta decay projection"
+                ),
+                "delta_conv_kernel": find_layer_tensor(
+                    tensors, prefix, GATED_DELTA_CONV_SUFFIXES, role="gated-delta convolution kernel"
+                ),
+                "delta_a_log": find_layer_tensor(
+                    tensors, prefix, GATED_DELTA_A_LOG_SUFFIXES, role="gated-delta decay parameter"
+                ),
+                "delta_dt_bias": find_layer_tensor(
+                    tensors, prefix, GATED_DELTA_DT_BIAS_SUFFIXES, role="gated-delta time bias"
+                ),
+                "delta_norm": find_layer_tensor(
+                    tensors, prefix, GATED_DELTA_NORM_SUFFIXES, role="gated-delta output norm"
+                ),
+                "delta_out_projection": find_layer_tensor(
+                    tensors, prefix, GATED_DELTA_OUT_SUFFIXES, role="gated-delta output projection"
+                ),
+            }
+        )
     else:
         raise ModelTranspileError(f"unsupported operator type {operator_type!r} for layer {layer_index}")
 
@@ -314,6 +414,8 @@ def infer_operator_type(tensors: dict[str, Json], prefix: str) -> str:
         return "conv"
     if find_first_existing_tensor(tensors, (f"{prefix}.{suffix}" for suffix in ATTENTION_Q_PROJECTION_SUFFIXES)):
         return "full_attention"
+    if find_first_existing_tensor(tensors, (f"{prefix}.{suffix}" for suffix in GATED_DELTA_QKV_SUFFIXES)):
+        return "gated_delta"
     raise ModelTranspileError(f"could not infer operator type for layer prefix {prefix!r}")
 
 
@@ -333,6 +435,101 @@ def discover_layer_root(tensors: dict[str, Json]) -> tuple[str, tuple[int, ...]]
         raise ModelTranspileError("could not discover a repeated decoder-layer root in checkpoint tensors")
     root = roots.most_common(1)[0][0]
     return root, tuple(sorted(root_indices[root]))
+
+
+def discover_decoder_config(config: Json, discovered_layer_count: int) -> Json:
+    candidates: list[Json] = []
+
+    def visit(value: Any) -> None:
+        if not isinstance(value, dict):
+            return
+        if int(value.get("num_hidden_layers", -1)) == discovered_layer_count:
+            candidates.append(value)
+        for nested in value.values():
+            if isinstance(nested, dict):
+                visit(nested)
+
+    visit(config)
+    if not candidates:
+        raise ModelTranspileError(
+            f"could not discover decoder config for {discovered_layer_count} repeated layers"
+        )
+    candidates.sort(
+        key=lambda candidate: sum(
+            key in candidate
+            for key in (
+                "hidden_size",
+                "intermediate_size",
+                "num_attention_heads",
+                "vocab_size",
+                "layer_types",
+            )
+        ),
+        reverse=True,
+    )
+    return candidates[0]
+
+
+def discover_attention_output_gate(
+    config: Json,
+    tensors: dict[str, Json],
+    layers: tuple[LayerStructure, ...],
+    *,
+    num_attention_heads: int,
+    head_width: int,
+) -> bool:
+    configured = config.get("attn_output_gate")
+    expected_width = num_attention_heads * head_width
+    for layer in layers:
+        if layer.operator_type != "full_attention":
+            continue
+        projection_width = int(tensors[layer.tensors["q_projection"]]["shape"][0])
+        discovered = projection_width == expected_width * 2
+        if projection_width not in (expected_width, expected_width * 2):
+            raise ModelTranspileError(
+                f"attention query projection width {projection_width} is incompatible with "
+                f"{num_attention_heads} heads of width {head_width}"
+            )
+        if configured is not None and bool(configured) != discovered:
+            raise ModelTranspileError(
+                "attention output-gate config disagrees with query projection shape"
+            )
+        return discovered
+    return False
+
+
+def discover_recurrent_mixer(config: Json, layers: tuple[LayerStructure, ...]) -> Json | None:
+    if not any(layer.operator_type == "gated_delta" for layer in layers):
+        return None
+    keys = (
+        "linear_conv_kernel_dim",
+        "linear_key_head_dim",
+        "linear_num_key_heads",
+        "linear_num_value_heads",
+        "linear_value_head_dim",
+    )
+    missing = [key for key in keys if key not in config]
+    if missing:
+        raise ModelTranspileError(
+            f"gated-delta structure is missing config dimensions: {', '.join(missing)}"
+        )
+    return {
+        "conv_kernel_width": int(config["linear_conv_kernel_dim"]),
+        "key_head_width": int(config["linear_key_head_dim"]),
+        "key_heads": int(config["linear_num_key_heads"]),
+        "value_heads": int(config["linear_num_value_heads"]),
+        "value_head_width": int(config["linear_value_head_dim"]),
+        "state_dtype": str(config.get("mamba_ssm_dtype", "float32")).upper().replace("FLOAT", "F"),
+    }
+
+
+def discover_outer_norm_weight_offset(
+    *, recurrent_mixer: Json | None, attention_output_gate: bool
+) -> float:
+    # This recurrent/full-attention graph stores its outer RMS scales around
+    # zero and applies (1 + weight). The gated-delta mixer norm itself is a
+    # conventional direct scale and is encoded separately in its circuit.
+    return 1.0 if recurrent_mixer is not None and attention_output_gate else 0.0
 
 
 def discover_intermediate_size(config: Json, tensors: dict[str, Json], layers: tuple[LayerStructure, ...]) -> int:
@@ -386,6 +583,8 @@ def make_layer(structure: ModelStructure, layer: LayerStructure) -> Json:
         make_conv_operator(structure, layer)
         if layer.operator_type == "conv"
         else make_attention_operator(structure, layer)
+        if layer.operator_type == "full_attention"
+        else make_gated_delta_operator(structure, layer)
     )
 
     return {
@@ -399,6 +598,9 @@ def make_layer(structure: ModelStructure, layer: LayerStructure) -> Json:
             "rms_norm_eps": structure.norm_eps,
             "rope_theta": structure.rope_theta,
             "rope_interleaved": structure.rope_interleaved,
+            "rotary_width": structure.rotary_width,
+            "rms_norm_weight_offset": structure.rms_norm_weight_offset,
+            "attention_output_gate": structure.attention_output_gate,
         },
         "ports": {
             "inputs": [{"id": "input", "signal": "frame", "shape": [hidden_size]}],
@@ -458,6 +660,8 @@ def make_model_graph(structure: ModelStructure, output_dir: Path, tensor_index: 
             "num_hidden_layers": structure.num_hidden_layers,
             "num_attention_heads": structure.num_attention_heads,
             "num_key_value_heads": structure.num_key_value_heads,
+            "head_width": structure.head_width,
+            "rotary_width": structure.rotary_width,
             "conv_l_cache": structure.conv_l_cache,
             "vocab_size": structure.vocab_size,
             "max_position_embeddings": structure.max_position_embeddings,
@@ -466,6 +670,7 @@ def make_model_graph(structure: ModelStructure, output_dir: Path, tensor_index: 
             "rms_norm_eps": structure.norm_eps,
             "rope_theta": structure.rope_theta,
             "rope_interleaved": structure.rope_interleaved,
+            "rms_norm_weight_offset": structure.rms_norm_weight_offset,
         },
         "token_ids": structure.token_ids,
         "files": {
@@ -488,7 +693,10 @@ def make_model_graph(structure: ModelStructure, output_dir: Path, tensor_index: 
                     {
                         "id": "output_norm",
                         "type": "rms_norm",
-                        "attrs": {"eps": structure.norm_eps},
+                        "attrs": {
+                            "eps": structure.norm_eps,
+                            "weight_offset": structure.rms_norm_weight_offset,
+                        },
                         "params": {"weight": tensor_ref(structure.tensors["output_norm"])},
                     },
                     output_projection,
@@ -592,7 +800,7 @@ def make_conv_operator(structure: ModelStructure, layer: LayerStructure) -> Json
 
 
 def make_attention_operator(structure: ModelStructure, layer: LayerStructure) -> Json:
-    head_width = structure.hidden_size // structure.num_attention_heads
+    head_width = structure.head_width
     heads = {
         "query_heads": structure.num_attention_heads,
         "key_value_heads": structure.num_key_value_heads,
@@ -610,6 +818,8 @@ def make_attention_operator(structure: ModelStructure, layer: LayerStructure) ->
         {"id": "k_projection", "type": "linear"},
         {"id": "v_projection", "type": "linear"},
     ]
+    if structure.attention_output_gate:
+        internal_pedals.append({"id": "q_gate_split", "type": "split"})
     if "q_norm" in layer.tensors:
         params["q_norm"] = tensor_ref(layer.tensors["q_norm"])
         internal_pedals.append({"id": "q_norm", "type": "rms_norm_per_head"})
@@ -621,6 +831,11 @@ def make_attention_operator(structure: ModelStructure, layer: LayerStructure) ->
             {"id": "rope", "type": "rotary_position_embedding"},
             {"id": "kv_memory", "type": "stateful_append_memory"},
             {"id": "attention_read", "type": "scaled_dot_product_attention"},
+            *(
+                [{"id": "attention_output_gate", "type": "sigmoid_multiply"}]
+                if structure.attention_output_gate
+                else []
+            ),
             {"id": "out_projection", "type": "linear"},
         ]
     )
@@ -635,9 +850,49 @@ def make_attention_operator(structure: ModelStructure, layer: LayerStructure) ->
         "input": "operator_norm.output",
         "output": "operator.output",
         "heads": heads,
+        "rotary_width": structure.rotary_width,
+        "output_gate": structure.attention_output_gate,
         "state_ports": make_state_ports(structure, "full_attention"),
         "params": params,
         "internal_pedals": internal_pedals,
+    }
+
+
+def make_gated_delta_operator(structure: ModelStructure, layer: LayerStructure) -> Json:
+    mixer = structure.recurrent_mixer
+    if mixer is None:
+        raise ModelTranspileError("gated-delta layer has no recurrent mixer dimensions")
+    return {
+        "id": "operator",
+        "type": "gated_delta_operator",
+        "circuit_template": (
+            f"gated_delta_k{mixer['key_heads']}x{mixer['key_head_width']}_"
+            f"v{mixer['value_heads']}x{mixer['value_head_width']}_v1"
+        ),
+        "input": "operator_norm.output",
+        "output": "operator.output",
+        "dimensions": mixer,
+        "state_ports": make_state_ports(structure, "gated_delta"),
+        "params": {
+            "qkv_projection": tensor_ref(layer.tensors["delta_qkv_projection"]),
+            "z_projection": tensor_ref(layer.tensors["delta_z_projection"]),
+            "b_projection": tensor_ref(layer.tensors["delta_b_projection"]),
+            "a_projection": tensor_ref(layer.tensors["delta_a_projection"]),
+            "conv_kernel": tensor_ref(layer.tensors["delta_conv_kernel"]),
+            "a_log": tensor_ref(layer.tensors["delta_a_log"]),
+            "dt_bias": tensor_ref(layer.tensors["delta_dt_bias"]),
+            "norm": tensor_ref(layer.tensors["delta_norm"]),
+            "out_projection": tensor_ref(layer.tensors["delta_out_projection"]),
+        },
+        "internal_pedals": [
+            {"id": "qkv_projection", "type": "linear"},
+            {"id": "z_projection", "type": "linear"},
+            {"id": "b_projection", "type": "linear"},
+            {"id": "a_projection", "type": "linear"},
+            {"id": "causal_conv", "type": "stateful_depthwise_convolution"},
+            {"id": "delta_update", "type": "gated_delta_recurrence"},
+            {"id": "out_projection", "type": "linear"},
+        ],
     }
 
 
@@ -646,6 +901,8 @@ def make_parameter_block(operator_type: str, tensors: dict[str, str]) -> Json:
         layout = "shortconv_layer_params_v1"
     elif operator_type == "full_attention":
         layout = "gqa_attention_layer_params_v1"
+    elif operator_type == "gated_delta":
+        layout = "gated_delta_layer_params_v1"
     else:
         raise ModelTranspileError(f"unsupported parameter layout for operator {operator_type!r}")
     return {
@@ -663,22 +920,55 @@ def make_state_ports(structure: ModelStructure, operator_type: str) -> list[Json
                 "id": "temporal_memory",
                 "type": "rolling_frame_memory",
                 "shape": [structure.conv_l_cache, structure.hidden_size],
+                "dtype": "BF16",
                 "update": "shift_append",
                 "sharing": "per_stream_per_pedal_instance",
             }
         ]
 
     if operator_type == "full_attention":
-        head_width = structure.hidden_size // structure.num_attention_heads
+        head_width = structure.head_width
         return [
             {
                 "id": "kv_memory",
                 "type": "append_only_attention_memory",
+                "query_heads": structure.num_attention_heads,
                 "key_shape_per_token": [structure.num_key_value_heads, head_width],
                 "value_shape_per_token": [structure.num_key_value_heads, head_width],
+                "dtype": "BF16",
                 "growth": "per_activation",
                 "sharing": "per_stream_per_pedal_instance",
             }
+        ]
+
+    if operator_type == "gated_delta":
+        mixer = structure.recurrent_mixer
+        if mixer is None:
+            raise ModelTranspileError("gated-delta layer has no recurrent mixer dimensions")
+        key_width = int(mixer["key_heads"]) * int(mixer["key_head_width"])
+        value_width = int(mixer["value_heads"]) * int(mixer["value_head_width"])
+        conv_width = key_width * 2 + value_width
+        return [
+            {
+                "id": "conv_state",
+                "type": "rolling_channel_memory",
+                "shape": [conv_width, int(mixer["conv_kernel_width"])],
+                "dtype": "BF16",
+                "update": "shift_append",
+                "sharing": "per_stream_per_pedal_instance",
+            },
+            {
+                "id": "recurrent_state",
+                "type": "gated_delta_matrix_memory",
+                "shape": [
+                    int(mixer["value_heads"]),
+                    int(mixer["key_head_width"]),
+                    int(mixer["value_head_width"]),
+                ],
+                "dtype": mixer["state_dtype"],
+                "update": "decay_delta_outer_product",
+                "sharing": "per_stream_per_pedal_instance",
+            },
         ]
 
     raise ModelTranspileError(f"unsupported state ports for operator {operator_type!r}")
@@ -692,11 +982,22 @@ def make_pedal_class(structure: ModelStructure, operator_type: str) -> str:
         )
 
     if operator_type == "full_attention":
-        head_width = structure.hidden_size // structure.num_attention_heads
+        head_width = structure.head_width
         return (
             "gqa_attention_layer_"
             f"h{structure.hidden_size}_q{structure.num_attention_heads}_"
             f"kv{structure.num_key_value_heads}_d{head_width}_"
+            f"ffn{structure.intermediate_size}_v1"
+        )
+
+    if operator_type == "gated_delta":
+        mixer = structure.recurrent_mixer
+        if mixer is None:
+            raise ModelTranspileError("gated-delta layer has no recurrent mixer dimensions")
+        return (
+            "gated_delta_layer_"
+            f"h{structure.hidden_size}_k{mixer['key_heads']}x{mixer['key_head_width']}_"
+            f"v{mixer['value_heads']}x{mixer['value_head_width']}_"
             f"ffn{structure.intermediate_size}_v1"
         )
 

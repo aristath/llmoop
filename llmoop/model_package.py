@@ -64,11 +64,17 @@ def compile_model_package(
     lowered = lower_pedalboard(transpiled_dir, lowered_dir)
     tensor_index = read_json(transpiled_dir / "tensors.json")
     model_graph = read_json(transpiled_dir / "model.json")
+    tensor_index = referenced_tensor_index(
+        tensor_index,
+        model_graph=model_graph,
+        lowered_index=lowered["index"],
+        lowered_dir=lowered_dir,
+    )
 
     if clean and package_dir.exists():
         shutil.rmtree(package_dir)
     package_dir.mkdir(parents=True, exist_ok=True)
-    copy_config_package(model_dir, package_dir)
+    write_runtime_config_package(model_graph, package_dir)
     tokenizer_manifest = copy_tokenizer_package(model_dir, package_dir / TOKENIZER_PACKAGE_DIR)
     packaged_tensor_index = copy_tensor_package(tensor_index, package_dir)
     package_manifest = build_vulkan_resident_greedy_package_manifest(
@@ -111,6 +117,7 @@ def build_vulkan_resident_greedy_package_manifest(
     hidden_size = int(dimensions["hidden_size"])
     vocab_size = int(dimensions["vocab_size"])
     norm_eps = float(model_graph["numerics"]["rms_norm_eps"])
+    norm_weight_offset = float(model_graph["numerics"]["rms_norm_weight_offset"])
     max_context_activations = int(dimensions["max_position_embeddings"])
     dtype = "BF16"
     dtype_bytes = dtype_byte_count(dtype)
@@ -141,7 +148,9 @@ def build_vulkan_resident_greedy_package_manifest(
         if projection_layout == VULKAN_BF16_ROW_PAIR_LAYOUT
         else f"tied_output_projection_bf16_{vocab_size}x{hidden_size}_to_f32.comp"
     )
-    norm_shader_file = rms_norm_shader_file(hidden_size, norm_eps)
+    norm_shader_file = rms_norm_shader_file(
+        hidden_size, norm_eps, norm_weight_offset
+    )
 
     compiled_circuits = {
         circuit_ref["id"]: optimize_circuit_for_vulkan(
@@ -341,7 +350,11 @@ def shader_file_for_node(
     op = node["op"]
 
     if op == "rms_norm":
-        return rms_norm_shader_file(hidden_size, float(node["attrs"]["eps"]))
+        return rms_norm_shader_file(
+            hidden_size,
+            float(node["attrs"]["eps"]),
+            float(node["attrs"]["weight_offset"]),
+        )
     if op == "linear":
         parameter_shape = parameter_shape_for_node(circuit, node, tensor_index)
         out_features, in_features = parameter_shape
@@ -363,7 +376,13 @@ def shader_file_for_node(
         )
         return f"{prefix}_{in_features}x{out_features}.comp"
     if op == "split":
-        return f"split_bf16_{hidden_size * 3}_to_3x{hidden_size}.comp"
+        if node["attrs"].get("layout") == "per_head_interleaved":
+            return (
+                f"split_bf16_2x{node['attrs']['blocks']}x{node['attrs']['block_part_width']}"
+                "_head_interleaved.comp"
+            )
+        part_width = int(node["attrs"]["part_width"])
+        return f"split_bf16_{len(node['outputs'])}x{part_width}.comp"
     if op == "multiply":
         element_count = intermediate_size if node["id"] == "ffn_gate_multiply" else hidden_size
         return f"multiply_bf16_{element_count}.comp"
@@ -381,6 +400,8 @@ def shader_file_for_node(
         return f"silu_bf16_{intermediate_size}.comp"
     if op == "silu_multiply":
         return "silu_multiply_bf16.comp"
+    if op == "sigmoid_multiply":
+        return "sigmoid_multiply_bf16.comp"
     if op == "rms_norm_per_head":
         heads = (
             node["attrs"]["query_heads"]
@@ -389,7 +410,8 @@ def shader_file_for_node(
         )
         return (
             f"rms_norm_per_head_bf16_{heads}x{node['attrs']['head_width']}"
-            f"_eps{shader_float_token(float(node['attrs']['eps']))}.comp"
+            f"_eps{shader_float_token(float(node['attrs']['eps']))}"
+            f"_offset{shader_float_token(float(node['attrs']['weight_offset']))}.comp"
         )
     if op == "rotary_position_embedding":
         heads = (
@@ -401,6 +423,7 @@ def shader_file_for_node(
         rope_layout = "interleaved" if node["attrs"]["interleaved"] else "half"
         return (
             f"rotary_bf16_{heads}x{node['attrs']['head_width']}"
+            f"_r{node['attrs']['rotary_width']}"
             f"_theta{shader_float_token(float(node['attrs']['theta']))}_{rope_layout}"
             f"__sc{binding}.comp"
         )
@@ -418,6 +441,32 @@ def shader_file_for_node(
             f"q{attrs['query_heads']}_kv{attrs['key_value_heads']}_d{attrs['head_width']}"
             f"__sc{binding}.comp"
         )
+    if op == "causal_conv1d_silu":
+        return (
+            f"causal_conv1d_silu_bf16_c{node['attrs']['channels']}"
+            f"_k{node['attrs']['kernel_width']}.comp"
+        )
+    if op == "gated_delta_step":
+        attrs = node["attrs"]
+        expected_dtypes = {
+            "delta_a_log": "F32",
+            "delta_dt_bias": "BF16",
+            "delta_norm": "F32",
+        }
+        for parameter_id, expected_dtype in expected_dtypes.items():
+            actual_dtype = parameter_dtype_for_id(
+                circuit, parameter_id, tensor_index
+            )
+            if actual_dtype != expected_dtype:
+                raise ModelCompileError(
+                    f"gated-delta parameter {parameter_id} has dtype {actual_dtype}; "
+                    f"expected {expected_dtype}"
+                )
+        return (
+            f"gated_delta_step_k{attrs['key_heads']}x{attrs['key_head_width']}"
+            f"_v{attrs['value_heads']}x{attrs['value_head_width']}"
+            f"_eps{shader_float_token(float(attrs['norm_eps']))}.comp"
+        )
 
     raise ModelCompileError(f"no Vulkan shader selector for op {op!r} in node {node['id']!r}")
 
@@ -429,6 +478,8 @@ def workgroup_count_x_for_node(circuit: Json, node: Json, tensor_index: Json) ->
         return (int(out_features) + 1) // 2
     if node["op"] == "scaled_dot_product_attention":
         return int(node["attrs"]["query_heads"])
+    if node["op"] == "gated_delta_step":
+        return int(node["attrs"]["value_heads"])
     if node["op"] in {"rms_norm_per_head", "rotary_position_embedding"}:
         return int(
             node["attrs"]["query_heads"]
@@ -443,6 +494,8 @@ def local_size_x_for_node(node: Json) -> int:
     # workgroup. This execution geometry belongs to the compiled pedal package.
     if node["op"] == "scaled_dot_product_attention":
         return 1024
+    if node["op"] == "gated_delta_step":
+        return int(node["attrs"]["value_head_width"])
     return 64
 
 
@@ -469,8 +522,11 @@ def required_shader_files(
     }
 
 
-def rms_norm_shader_file(hidden_size: int, eps: float) -> str:
-    return f"rms_norm_bf16_h{hidden_size}_eps{shader_float_token(eps)}.comp"
+def rms_norm_shader_file(hidden_size: int, eps: float, weight_offset: float) -> str:
+    return (
+        f"rms_norm_bf16_h{hidden_size}_eps{shader_float_token(eps)}"
+        f"_offset{shader_float_token(weight_offset)}.comp"
+    )
 
 
 def shader_float_token(value: float) -> str:
@@ -548,19 +604,19 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
             ("VOCAB_SIZE", "INPUT_SIZE"),
         ),
         (
-            r"rms_norm_bf16_h(\d+)_eps([0-9eE+.-]+)\.comp",
+            r"rms_norm_bf16_h(\d+)_eps([0-9eE+.-]+)_offset([0-9eE+.-]+)\.comp",
             "rms_norm_bf16.comp.template",
-            ("HIDDEN_SIZE", "NORM_EPS"),
+            ("HIDDEN_SIZE", "NORM_EPS", "WEIGHT_OFFSET"),
         ),
         (
-            r"rms_norm_per_head_bf16_(\d+)x(\d+)_eps([0-9eE+.-]+)\.comp",
+            r"rms_norm_per_head_bf16_(\d+)x(\d+)_eps([0-9eE+.-]+)_offset([0-9eE+.-]+)\.comp",
             "rms_norm_per_head_bf16.comp.template",
-            ("HEAD_COUNT", "HEAD_WIDTH", "NORM_EPS"),
+            ("HEAD_COUNT", "HEAD_WIDTH", "NORM_EPS", "WEIGHT_OFFSET"),
         ),
         (
-            r"rotary_bf16_(\d+)x(\d+)_theta([0-9eE+.-]+)_(half|interleaved)\.comp",
+            r"rotary_bf16_(\d+)x(\d+)_r(\d+)_theta([0-9eE+.-]+)_(half|interleaved)\.comp",
             "rotary_bf16.comp.template",
-            ("HEAD_COUNT", "HEAD_WIDTH", "ROPE_THETA", "ROPE_LAYOUT"),
+            ("HEAD_COUNT", "HEAD_WIDTH", "ROTARY_WIDTH", "ROPE_THETA", "ROPE_LAYOUT"),
         ),
         (
             r"append_kv_state_bf16_(\d+)x(\d+)\.comp",
@@ -572,11 +628,39 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
             "greedy_sampler_f32.comp.template",
             ("VOCAB_SIZE",),
         ),
+        (
+            r"split_bf16_2x(\d+)\.comp",
+            "split_bf16_2way.comp.template",
+            ("PART_WIDTH",),
+        ),
+        (
+            r"split_bf16_3x(\d+)\.comp",
+            "split_bf16_3way.comp.template",
+            ("PART_WIDTH",),
+        ),
+        (
+            r"split_bf16_2x(\d+)x(\d+)_head_interleaved\.comp",
+            "split_bf16_2way_head_interleaved.comp.template",
+            ("BLOCKS", "BLOCK_PART_WIDTH"),
+        ),
+        (
+            r"causal_conv1d_silu_bf16_c(\d+)_k(\d+)\.comp",
+            "causal_conv1d_silu_bf16.comp.template",
+            ("CHANNELS", "KERNEL_WIDTH"),
+        ),
     )
     for pattern, template, names in shaped_templates:
         match = re.fullmatch(pattern, shader_file)
         if match is not None:
             replacements = dict(zip(names, match.groups(), strict=True))
+            if template == "causal_conv1d_silu_bf16.comp.template":
+                channels = int(replacements["CHANNELS"])
+                kernel_width = int(replacements["KERNEL_WIDTH"])
+                if channels % 2 != 0 or kernel_width % 2 != 0:
+                    raise ModelCompileError(
+                        "packed BF16 causal convolution requires even channel and kernel widths, "
+                        f"got {channels} channels and kernel width {kernel_width}"
+                    )
             if "ROPE_LAYOUT" in replacements:
                 replacements["ROPE_INTERLEAVED"] = (
                     "true" if replacements.pop("ROPE_LAYOUT") == "interleaved" else "false"
@@ -608,6 +692,36 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
                 "ATTENTION_SCALE": shader_float_token(head_width**-0.5),
             },
         )
+
+    gated_delta_shape = re.fullmatch(
+        r"gated_delta_step_k(\d+)x(\d+)_v(\d+)x(\d+)_eps([0-9eE+.-]+)\.comp",
+        shader_file,
+    )
+    if gated_delta_shape is not None:
+        key_heads, key_width, value_heads, value_width = map(
+            int, gated_delta_shape.groups()[:4]
+        )
+        if value_heads % key_heads != 0:
+            raise ModelCompileError(
+                f"gated-delta value head count {value_heads} is not divisible by key head count {key_heads}"
+            )
+        if value_width > 1024 or value_width < 2 or value_width % 2 != 0:
+            raise ModelCompileError(
+                f"gated-delta value head width {value_width} is not a supported workgroup width"
+            )
+        return render_shader_template(
+            source_dir,
+            "gated_delta_step.comp.template",
+            {
+                "KEY_HEADS": str(key_heads),
+                "KEY_HEAD_WIDTH": str(key_width),
+                "VALUE_HEADS": str(value_heads),
+                "VALUE_HEAD_WIDTH": str(value_width),
+                "KEY_HEAD_REPEAT": str(value_heads // key_heads),
+                "NORM_EPS": gated_delta_shape.group(5),
+            },
+        )
+
 
     raise ModelCompileError(f"missing shader source or template for {shader_file}")
 
@@ -720,11 +834,60 @@ def copy_tokenizer_package(model_dir: Path, dest_dir: Path) -> Json:
     }
 
 
-def copy_config_package(model_dir: Path, package_dir: Path) -> None:
-    source = model_dir / CONFIG_PACKAGE_FILE
-    if not source.is_file():
-        raise ModelCompileError(f"source model does not contain required config file {source}")
-    shutil.copy2(source, package_dir / CONFIG_PACKAGE_FILE)
+def write_runtime_config_package(model_graph: Json, package_dir: Path) -> None:
+    token_ids = model_graph["token_ids"]
+    write_json(
+        package_dir / CONFIG_PACKAGE_FILE,
+        {
+            "schema": "llmoop.runtime_model_config.v1",
+            "bos_token_id": token_ids["bos"],
+            "eos_token_id": token_ids["eos"],
+            "pad_token_id": token_ids["pad"],
+            "dimensions": model_graph["dimensions"],
+            "numerics": model_graph["numerics"],
+        },
+    )
+
+
+def referenced_tensor_index(
+    tensor_index: Json,
+    *,
+    model_graph: Json,
+    lowered_index: Json,
+    lowered_dir: Path,
+) -> Json:
+    referenced = {
+        model_graph["graph"]["input_transducer"]["params"]["weight"]["tensor"]
+    }
+    for component in model_graph["graph"]["output_transducer"]["components"]:
+        referenced.update(
+            ref["tensor"] for ref in component.get("params", {}).values()
+        )
+    for circuit_ref in lowered_index["graph"]["circuits"]:
+        circuit = read_json(lowered_dir / circuit_ref["circuit"])
+        referenced.update(
+            ref["tensor"] for ref in circuit["parameters"]["refs"].values()
+        )
+
+    missing = sorted(referenced - set(tensor_index["tensors"]))
+    if missing:
+        raise ModelCompileError(
+            f"compiled circuit graph references missing tensors: {', '.join(missing)}"
+        )
+    selected = deepcopy(tensor_index)
+    selected["tensors"] = {
+        name: deepcopy(tensor_index["tensors"][name]) for name in sorted(referenced)
+    }
+    selected["totals"] = {
+        "tensor_count": len(selected["tensors"]),
+        "parameter_count": sum(
+            int(info["parameter_count"]) for info in selected["tensors"].values()
+        ),
+        "byte_count": sum(
+            int(info["byte_count"]) for info in selected["tensors"].values()
+        ),
+    }
+    return selected
 
 
 def copy_tensor_package(tensor_index: Json, package_dir: Path) -> Json:
@@ -878,6 +1041,11 @@ def parameter_layout_for_node(circuit: Json, node: Json, tensor_index: Json) -> 
     parameter_id = node["params"][0]
     parameter = circuit["parameters"]["refs"][parameter_id]
     return tensor_layout(tensor_index, parameter["tensor"])
+
+
+def parameter_dtype_for_id(circuit: Json, parameter_id: str, tensor_index: Json) -> str:
+    parameter = circuit["parameters"]["refs"][parameter_id]
+    return str(tensor_index["tensors"][parameter["tensor"]]["dtype"])
 
 
 def state_port(circuit: Json, state_id: str) -> Json:

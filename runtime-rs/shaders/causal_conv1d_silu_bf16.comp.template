@@ -1,0 +1,89 @@
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer CurrentFrame {
+    uint words[];
+} current_frame;
+
+layout(set = 0, binding = 1) buffer OutputFrame {
+    uint words[];
+} output_frame;
+
+layout(set = 0, binding = 2) readonly buffer ConvKernel {
+    uint words[];
+} conv_kernel;
+
+layout(set = 0, binding = 3) readonly buffer StateRead {
+    uint words[];
+} state_read;
+
+layout(set = 0, binding = 4) buffer StateWrite {
+    uint words[];
+} state_write;
+
+const uint CHANNELS = {{CHANNELS}}u;
+const uint KERNEL_WIDTH = {{KERNEL_WIDTH}}u;
+
+float bf16_to_f32(uint value) {
+    return uintBitsToFloat((value & 0xffffu) << 16);
+}
+
+uint f32_to_bf16(float value) {
+    uint bits = floatBitsToUint(value);
+    uint lsb = (bits >> 16) & 1u;
+    uint rounding_bias = 0x7fffu + lsb;
+    return (bits + rounding_bias) >> 16;
+}
+
+uint unpack_bf16(uint packed, uint index) {
+    return (index & 1u) == 0u ? packed & 0xffffu : packed >> 16;
+}
+
+uint read_current(uint index) {
+    return unpack_bf16(current_frame.words[index >> 1u], index);
+}
+
+uint read_kernel(uint index) {
+    return unpack_bf16(conv_kernel.words[index >> 1u], index);
+}
+
+uint read_state(uint index) {
+    return unpack_bf16(state_read.words[index >> 1u], index);
+}
+
+uint convolve_and_advance(uint channel) {
+    uint state_base = channel * KERNEL_WIDTH;
+    float convolution = 0.0;
+    for (uint tap = 0u; tap < KERNEL_WIDTH; tap += 2u) {
+        uint first = tap + 1u < KERNEL_WIDTH
+            ? read_state(state_base + tap + 1u)
+            : read_current(channel);
+        uint second = tap + 2u < KERNEL_WIDTH
+            ? read_state(state_base + tap + 2u)
+            : read_current(channel);
+        state_write.words[(state_base + tap) >> 1u] = first | (second << 16);
+        convolution = fma(
+            bf16_to_f32(first),
+            bf16_to_f32(read_kernel(state_base + tap)),
+            convolution
+        );
+        convolution = fma(
+            bf16_to_f32(second),
+            bf16_to_f32(read_kernel(state_base + tap + 1u)),
+            convolution
+        );
+    }
+    return f32_to_bf16(convolution / (1.0 + exp(-convolution)));
+}
+
+void main() {
+    for (uint channel_pair = gl_LocalInvocationID.x;
+         channel_pair < CHANNELS / 2u;
+         channel_pair += 64u) {
+        uint first_channel = channel_pair * 2u;
+        uint first = convolve_and_advance(first_channel);
+        uint second = convolve_and_advance(first_channel + 1u);
+        output_frame.words[channel_pair] = first | (second << 16);
+    }
+}

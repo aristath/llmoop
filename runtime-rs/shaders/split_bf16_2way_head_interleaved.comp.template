@@ -1,0 +1,34 @@
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer InputFrame {
+    uint words[];
+} input_frame;
+
+layout(set = 0, binding = 1) buffer OutputA {
+    uint words[];
+} output_a;
+
+layout(set = 0, binding = 2) buffer OutputB {
+    uint words[];
+} output_b;
+
+const uint BLOCKS = {{BLOCKS}}u;
+const uint BLOCK_PART_WIDTH = {{BLOCK_PART_WIDTH}}u;
+const uint BLOCK_PART_WORDS = BLOCK_PART_WIDTH / 2u;
+
+void main() {
+    uint output_word_count = BLOCKS * BLOCK_PART_WORDS;
+    for (uint output_word = gl_LocalInvocationID.x;
+         output_word < output_word_count;
+         output_word += 64u) {
+        uint block = output_word / BLOCK_PART_WORDS;
+        uint word_in_block = output_word % BLOCK_PART_WORDS;
+        uint input_block = block * 2u * BLOCK_PART_WORDS;
+        output_a.words[output_word] = input_frame.words[input_block + word_in_block];
+        output_b.words[output_word] = input_frame.words[
+            input_block + BLOCK_PART_WORDS + word_in_block
+        ];
+    }
+}
