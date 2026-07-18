@@ -7034,11 +7034,16 @@ impl VulkanResidentGreedyModelPackageManifest {
             .map(|execution| (execution.pedal_id.as_str(), execution))
             .collect::<BTreeMap<_, _>>();
 
-        let mut pedals = Vec::with_capacity(patch.instances.len());
-        let mut pedal_executions = Vec::with_capacity(patch.instances.len());
+        let enabled_instance_count = patch
+            .instances
+            .iter()
+            .filter(|instance| instance.enabled)
+            .count();
+        let mut pedals = Vec::with_capacity(enabled_instance_count);
+        let mut pedal_executions = Vec::with_capacity(enabled_instance_count);
         let mut placement = StreamCircuitPlacementSpec::new(patch.default_device_id.clone());
 
-        for instance in &patch.instances {
+        for instance in patch.instances.iter().filter(|instance| instance.enabled) {
             let source_pedal = source_pedals
                 .get(instance.source_pedal_id.as_str())
                 .ok_or_else(|| {

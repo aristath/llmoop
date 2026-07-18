@@ -872,6 +872,7 @@ impl StreamCircuitRuntimePatch {
                         instance_id: instance_id.clone(),
                         source_pedal_id: source_pedal_id.clone(),
                         device_id: String::new(),
+                        enabled: true,
                         state_policy: StreamCircuitPedalInstanceStatePolicy::Fresh,
                     },
                 )
@@ -900,6 +901,7 @@ impl StreamCircuitRuntimePatch {
                     instance_id: artifact.pedal.id.clone(),
                     source_pedal_id: artifact.pedal.id.clone(),
                     device_id: spec.device_for_pedal(&artifact.pedal.id).to_string(),
+                    enabled: true,
                     state_policy: StreamCircuitPedalInstanceStatePolicy::Fresh,
                 })
                 .collect(),
@@ -908,7 +910,7 @@ impl StreamCircuitRuntimePatch {
 
     pub fn placement_spec(&self) -> StreamCircuitPlacementSpec {
         let mut spec = StreamCircuitPlacementSpec::new(self.default_device_id.clone());
-        for instance in &self.instances {
+        for instance in self.instances.iter().filter(|instance| instance.enabled) {
             if instance.device_id != self.default_device_id {
                 spec = spec.with_pedal_device(&instance.instance_id, &instance.device_id);
             }
@@ -950,6 +952,7 @@ impl StreamCircuitRuntimePatch {
             instance_id: new_instance_id,
             source_pedal_id: source.source_pedal_id,
             device_id: source.device_id,
+            enabled: source.enabled,
             state_policy: StreamCircuitPedalInstanceStatePolicy::Fresh,
         };
         self.instances.insert(after_index + 1, duplicate);
@@ -961,15 +964,17 @@ impl StreamCircuitRuntimePatch {
         graph: &ResolvedLoweredPedalboard,
         chain: &[(String, String)],
     ) -> Result<Self, CircuitPlacementError> {
-        let previous_devices = self
+        let previous_instances = self
             .instances
             .iter()
-            .map(|instance| (instance.instance_id.clone(), instance.device_id.clone()))
+            .map(|instance| (instance.instance_id.clone(), instance.clone()))
             .collect::<BTreeMap<_, _>>();
         let mut patch = Self::from_source_chain(graph, self.default_device_id, chain)?;
         for instance in &mut patch.instances {
-            if let Some(device_id) = previous_devices.get(&instance.instance_id) {
-                instance.device_id = device_id.clone();
+            if let Some(previous) = previous_instances.get(&instance.instance_id) {
+                instance.device_id = previous.device_id.clone();
+                instance.enabled = previous.enabled;
+                instance.state_policy = previous.state_policy.clone();
             }
         }
         patch.validate_against_graph(graph)?;
@@ -1000,6 +1005,24 @@ impl StreamCircuitRuntimePatch {
         Ok(self)
     }
 
+    pub fn with_instance_enabled(
+        mut self,
+        instance_id: &str,
+        enabled: bool,
+    ) -> Result<Self, CircuitPlacementError> {
+        let instance = self
+            .instances
+            .iter_mut()
+            .find(|instance| instance.instance_id == instance_id)
+            .ok_or_else(|| {
+                CircuitPlacementError(format!(
+                    "runtime patch has no pedal instance {instance_id:?}"
+                ))
+            })?;
+        instance.enabled = enabled;
+        Ok(self)
+    }
+
     pub fn instantiate_graph(
         &self,
         graph: &ResolvedLoweredPedalboard,
@@ -1014,7 +1037,7 @@ impl StreamCircuitRuntimePatch {
         let mut circuit_refs = Vec::with_capacity(self.instances.len());
         let mut operator_counts = BTreeMap::new();
 
-        for instance in &self.instances {
+        for instance in self.instances.iter().filter(|instance| instance.enabled) {
             let source = source_by_id
                 .get(instance.source_pedal_id.as_str())
                 .ok_or_else(|| {
@@ -1074,6 +1097,11 @@ impl StreamCircuitRuntimePatch {
                 "runtime patch must contain at least one pedal instance".to_string(),
             ));
         }
+        if !self.instances.iter().any(|instance| instance.enabled) {
+            return Err(CircuitPlacementError(
+                "runtime patch must contain at least one enabled pedal instance".to_string(),
+            ));
+        }
 
         let source_by_id = graph
             .circuits
@@ -1107,7 +1135,12 @@ impl StreamCircuitRuntimePatch {
             }
         }
 
-        for pair in self.instances.windows(2) {
+        let enabled_instances = self
+            .instances
+            .iter()
+            .filter(|instance| instance.enabled)
+            .collect::<Vec<_>>();
+        for pair in enabled_instances.windows(2) {
             let source_instance = &pair[0];
             let destination_instance = &pair[1];
             let source = source_by_id[source_instance.source_pedal_id.as_str()];
@@ -1143,7 +1176,13 @@ pub struct StreamCircuitPedalInstance {
     pub instance_id: String,
     pub source_pedal_id: String,
     pub device_id: String,
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
     pub state_policy: StreamCircuitPedalInstanceStatePolicy,
+}
+
+fn default_enabled() -> bool {
+    true
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -2863,6 +2902,31 @@ mod tests {
     }
 
     #[test]
+    fn bypassed_instance_is_retained_in_draft_and_removed_from_execution_graph() {
+        let source =
+            ResolvedLoweredPedalboard::from_index_file(fixture_model_index_path()).unwrap();
+        let patch = StreamCircuitRuntimePatch::from_source_series(&source, "gpu0")
+            .unwrap()
+            .with_instance_enabled("layer_01", false)
+            .unwrap();
+
+        let effective = source.instantiate_runtime_patch(&patch).unwrap();
+        let placement = effective.placement_plan(&patch.placement_spec()).unwrap();
+
+        assert_eq!(patch.instances.len(), 14);
+        assert!(!patch.instances[1].enabled);
+        assert_eq!(effective.circuits.len(), 13);
+        assert!(
+            effective
+                .circuits
+                .iter()
+                .all(|circuit| circuit.pedal.id != "layer_01")
+        );
+        assert_eq!(placement.cables[0].source_pedal_id, "layer_00");
+        assert_eq!(placement.cables[0].destination_pedal_id, "layer_02");
+    }
+
+    #[test]
     fn placement_plan_changes_cables_not_pedalboard_when_devices_differ() {
         let resolved =
             ResolvedLoweredPedalboard::from_index_file(fixture_model_index_path()).unwrap();
@@ -3294,6 +3358,7 @@ mod tests {
                     instance_id: "layer_00".to_string(),
                     source_pedal_id: "layer_00".to_string(),
                     device_id: "gpu0".to_string(),
+                    enabled: true,
                     state_policy: StreamCircuitPedalInstanceStatePolicy::Fresh,
                 }],
             },
@@ -3420,6 +3485,7 @@ mod tests {
                     instance_id: "layer_05_repeat".to_string(),
                     source_pedal_id: "layer_05".to_string(),
                     device_id: "vulkan:5".to_string(),
+                    enabled: true,
                     state_policy: StreamCircuitPedalInstanceStatePolicy::Fresh,
                 }],
             },
