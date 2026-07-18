@@ -3,8 +3,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import signal
 import subprocess
+import sys
 from pathlib import Path
 
 from llmoop.model_compiler import (
@@ -240,8 +242,10 @@ def main() -> None:
             "--compile-model, --discover-model, --run, and --run-model are mutually exclusive"
         )
     if not any(selected_actions):
-        parser.print_help()
-        raise SystemExit(2)
+        if len(sys.argv) == 1:
+            run_tui()
+            return
+        parser.error("choose an action, or run llmoop without arguments to open the TUI")
     if args.context_size is not None and args.context_size < 1:
         parser.error("--context-size must be at least 1")
     if args.compiler_events_jsonl and args.compile_model is None and args.discover_model is None:
@@ -456,6 +460,42 @@ class JsonLineCompileReporter:
     def __call__(self, event: dict[str, object]) -> None:
         emit_jsonl_event(self.sequence, event)
         self.sequence += 1
+
+
+def run_tui() -> None:
+    command, working_directory = build_tui_command()
+    completed = subprocess.run(command, cwd=working_directory)
+    if completed.returncode != 0:
+        raise SystemExit(completed.returncode)
+
+
+def build_tui_command() -> tuple[list[str], Path]:
+    workspace = Path(__file__).resolve().parent.parent
+    configured = os.environ.get("LLMOOP_TUI_BIN")
+    if configured:
+        return [configured], workspace
+    installed = shutil.which("llmoop-tui")
+    if installed:
+        return [installed], workspace
+    for profile in ("release", "debug"):
+        built = workspace / "runtime-rs" / "target" / profile / "llmoop-tui"
+        if built.is_file() and os.access(built, os.X_OK):
+            return [str(built)], workspace
+    manifest = workspace / "runtime-rs" / "Cargo.toml"
+    if manifest.is_file():
+        return [
+            "cargo",
+            "run",
+            "--manifest-path",
+            str(manifest),
+            "--features",
+            "vulkan,tokenizers,tui",
+            "--bin",
+            "llmoop-tui",
+        ], workspace
+    raise SystemExit(
+        "llmoop-tui is not installed; set LLMOOP_TUI_BIN to the executable path"
+    )
 
 
 def emit_jsonl_event(sequence: int, event: dict[str, object]) -> None:
