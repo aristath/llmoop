@@ -474,6 +474,8 @@ def shader_file_for_node(
         )
         if attrs.get("window_size") is not None:
             name += f"_w{int(attrs['window_size'])}"
+        if attrs.get("attention_sinks"):
+            name += "_sinks"
         return f"{name}__sc{binding}.comp"
     if op == "causal_conv1d_silu":
         return (
@@ -765,7 +767,7 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
             return render_shader_template(source_dir, template, replacements)
 
     attention_shape = re.fullmatch(
-        r"gqa_attention_bf16_q(\d+)_kv(\d+)_d(\d+)_scale([0-9eE+.-]+)(?:_w(\d+))?\.comp",
+        r"gqa_attention_bf16_q(\d+)_kv(\d+)_d(\d+)_scale([0-9eE+.-]+)(?:_w(\d+))?(_sinks)?\.comp",
         shader_file,
     )
     if attention_shape is not None:
@@ -789,6 +791,7 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
                 "TILE_TOKENS": str(1024 // head_width),
                 "ATTENTION_SCALE": attention_shape.group(4),
                 "ATTENTION_WINDOW": attention_shape.group(5) or "0",
+                "HAS_SINKS": "1" if attention_shape.group(6) else "0",
             },
         )
 

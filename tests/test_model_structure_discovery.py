@@ -230,6 +230,68 @@ def test_discovers_sparse_moe_and_model_specific_numerics_by_structure() -> None
     assert nodes["moe_reduce"]["outputs"] == ["ffn_out"]
 
 
+def test_discovers_mixed_window_attention_sinks_and_shared_sparse_experts() -> None:
+    tensors = {
+        "model.embed_tokens.weight": _tensor([256, 16]),
+        "model.norm.weight": _tensor([16]),
+    }
+    for index in range(2):
+        prefix = f"model.layers.{index}"
+        tensors.update(
+            {
+                f"{prefix}.input_layernorm.weight": _tensor([16]),
+                f"{prefix}.post_attention_layernorm.weight": _tensor([16]),
+                f"{prefix}.self_attn.q_proj.weight": _tensor([16, 16]),
+                f"{prefix}.self_attn.k_proj.weight": _tensor([8, 16]),
+                f"{prefix}.self_attn.v_proj.weight": _tensor([8, 16]),
+                f"{prefix}.self_attn.o_proj.weight": _tensor([16, 16]),
+                f"{prefix}.self_attn.sinks": _tensor([2]),
+                f"{prefix}.block_sparse_moe.experts.gate_up_proj": _tensor([4, 12, 16]),
+                f"{prefix}.block_sparse_moe.experts.down_proj": _tensor([4, 16, 6]),
+                f"{prefix}.block_sparse_moe.router.weight": _tensor([4, 16]),
+                f"{prefix}.shared_mlp.input_linear.weight": _tensor([20, 16]),
+                f"{prefix}.shared_mlp.output_linear.weight": _tensor([16, 10]),
+            }
+        )
+    config = {
+        "model_type": "synthetic_mixed_window_decoder",
+        "hidden_size": 16,
+        "intermediate_size": 6,
+        "shared_intermediate_size": 10,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 2,
+        "num_key_value_heads": 1,
+        "num_local_experts": 4,
+        "num_experts_per_tok": 2,
+        "layer_types": ["full_attention", "sliding_attention"],
+        "sliding_window": 128,
+        "vocab_size": 256,
+        "max_position_embeddings": 1024,
+        "rms_norm_eps": 1e-5,
+        "rope_theta": 10_000.0,
+    }
+
+    structure = discover_model_structure(Path("synthetic"), config, tensors)
+    assert [layer.attention_window_size for layer in structure.layers] == [None, 128]
+    assert [layer.shared_intermediate_size for layer in structure.layers] == [10, 10]
+
+    full = make_layer(structure, structure.layers[0])
+    sliding = make_layer(structure, structure.layers[1])
+    assert full["state_ports"][0]["window_size"] is None
+    assert sliding["state_ports"][0]["window_size"] == 128
+
+    circuit = build_pedal_circuit(sliding, Path("layer_01.json"))
+    nodes = {node["id"]: node for node in circuit["nodes"]}
+    assert nodes["attention_read"]["params"] == ["attention_sinks"]
+    assert nodes["attention_read"]["attrs"]["attention_sinks"] is True
+    assert nodes["attention_read"]["attrs"]["window_size"] == 128
+    assert nodes["moe_reduce"]["outputs"] == ["moe_out"]
+    assert nodes["shared_mlp_input_projection"]["params"] == ["shared_mlp_input"]
+    assert nodes["shared_mlp_split"]["attrs"] == {"part_width": 10}
+    assert nodes["shared_mlp_output_projection"]["params"] == ["shared_mlp_output"]
+    assert nodes["shared_and_sparse_expert_add"]["outputs"] == ["ffn_out"]
+
+
 def test_discovers_recurrent_block_pattern_biases_and_numerics_by_structure() -> None:
     tensors = {
         "model.embed_tokens.weight": _tensor([256, 16]),

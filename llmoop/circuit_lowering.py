@@ -488,10 +488,12 @@ def _attention_nodes(
             "op": "scaled_dot_product_attention",
             "inputs": ["q_positioned", "k_memory", "v_memory"],
             "outputs": ["attention_out"],
+            "params": (["attention_sinks"] if "attention_sinks" in parameters else []),
             "attrs": {
                 "causal": True,
                 "scale": float(numerics["attention_scale"]),
                 "window_size": numerics.get("attention_window_size"),
+                "attention_sinks": "attention_sinks" in parameters,
                 **heads,
             },
         },
@@ -709,6 +711,8 @@ def _ffn_tail(
         },
     ]
     if feed_forward["type"] == "sparse_moe":
+        shared_intermediate_size = feed_forward.get("shared_intermediate_size")
+        has_shared_expert = shared_intermediate_size is not None
         body = [
             {
                 "id": "moe_router_projection",
@@ -744,13 +748,52 @@ def _ffn_tail(
                 "id": "moe_reduce",
                 "op": "moe_reduce",
                 "inputs": ["moe_expert_outputs"],
-                "outputs": ["ffn_out"],
+                "outputs": ["moe_out" if has_shared_expert else "ffn_out"],
                 "attrs": {
                     "hidden_size": int(feed_forward["hidden_size"]),
                     "num_experts": int(feed_forward["num_experts"]),
                 },
             },
         ]
+        if has_shared_expert:
+            shared_width = int(shared_intermediate_size)
+            body.extend(
+                [
+                    {
+                        "id": "shared_mlp_input_projection",
+                        "op": "linear",
+                        "inputs": ["ffn_norm_out"],
+                        "outputs": ["shared_gate_up"],
+                        "params": ["shared_mlp_input"],
+                    },
+                    {
+                        "id": "shared_mlp_split",
+                        "op": "split",
+                        "inputs": ["shared_gate_up"],
+                        "outputs": ["shared_gate", "shared_up"],
+                        "attrs": {"part_width": shared_width},
+                    },
+                    {
+                        "id": "shared_mlp_activation",
+                        "op": "silu_multiply",
+                        "inputs": ["shared_gate", "shared_up"],
+                        "outputs": ["shared_hidden"],
+                    },
+                    {
+                        "id": "shared_mlp_output_projection",
+                        "op": "linear",
+                        "inputs": ["shared_hidden"],
+                        "outputs": ["shared_out"],
+                        "params": ["shared_mlp_output"],
+                    },
+                    {
+                        "id": "shared_and_sparse_expert_add",
+                        "op": "residual_add",
+                        "inputs": ["moe_out", "shared_out"],
+                        "outputs": ["ffn_out"],
+                    },
+                ]
+            )
     else:
         body = [
             {
@@ -878,6 +921,8 @@ def _param_role(name: str) -> str:
         "moe_router": "mixture_of_experts_router_projection",
         "moe_input": "mixture_of_experts_gate_up_weights",
         "moe_output": "mixture_of_experts_down_weights",
+        "shared_mlp_input": "shared_expert_gate_up_projection",
+        "shared_mlp_output": "shared_expert_down_projection",
         "conv_in_projection": "short_convolution_input_projection",
         "conv_depthwise_kernel": "short_convolution_depthwise_temporal_kernel",
         "conv_out_projection": "short_convolution_output_projection",
@@ -889,6 +934,7 @@ def _param_role(name: str) -> str:
         "v_projection_bias": "attention_value_projection_bias",
         "attention_out_projection": "attention_output_projection",
         "attention_out_projection_bias": "attention_output_projection_bias",
+        "attention_sinks": "attention_sink_logits",
         "q_norm": "attention_query_head_normalization",
         "k_norm": "attention_key_head_normalization",
         "delta_qkv_projection": "gated_delta_query_key_value_projection",

@@ -21,6 +21,12 @@ layout(set = 0, binding = 3) buffer OutputFrame {
     uint words[];
 } output_frame;
 
+#if {{HAS_SINKS}}
+layout(set = 0, binding = 4) readonly buffer AttentionSinks {
+    uint words[];
+} attention_sinks;
+#endif
+
 layout(set = 0, binding = 6) readonly buffer StreamControl {
     uint words[];
 } stream_control;
@@ -44,6 +50,7 @@ shared float tile_value_weight[{{TILE_TOKENS}}];
 shared float value_contributions[1024];
 shared float tile_accumulator_carry;
 shared float softmax_denominator;
+shared float attention_output_scale;
 shared float output_values[{{HEAD_WIDTH}}];
 shared uint chronological_start;
 
@@ -77,6 +84,13 @@ float read_v(uint slot, uint kv_head, uint dim) {
     uint value = ((element_index & 1u) == 0u) ? (packed & 0xffffu) : (packed >> 16);
     return bf16_to_f32(value);
 }
+
+#if {{HAS_SINKS}}
+float read_attention_sink(uint head) {
+    uint packed = attention_sinks.words[head >> 1u];
+    return bf16_to_f32((head & 1u) == 0u ? packed : packed >> 16);
+}
+#endif
 
 uint available_tokens(uint capacity) {
     uint tokens = stream_control.words[1] + 1u;
@@ -185,13 +199,21 @@ void main() {
 
     if (local_index == 0u) {
         softmax_denominator = denominator;
+#if {{HAS_SINKS}}
+        float logsumexp = maximum + log(denominator);
+        attention_output_scale = denominator == 0.0
+            ? 0.0
+            : 1.0 / (1.0 + exp(read_attention_sink(query_head) - logsumexp));
+#else
+        attention_output_scale = 1.0;
+#endif
     }
     barrier();
 
     if (local_index < HEAD_WIDTH) {
         output_values[local_index] = tokens == 0u || softmax_denominator == 0.0
             ? 0.0
-            : accumulator / softmax_denominator;
+            : (accumulator / softmax_denominator) * attention_output_scale;
     }
     barrier();
 

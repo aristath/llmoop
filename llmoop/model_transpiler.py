@@ -23,7 +23,9 @@ class LayerStructure:
     index: int
     prefix: str
     operator_type: str
+    attention_window_size: int | None
     feed_forward_type: str
+    shared_intermediate_size: int | None
     tensors: dict[str, str]
 
 
@@ -130,8 +132,12 @@ MOE_OUTPUT_SUFFIXES = (
 )
 MOE_ROUTER_SUFFIXES = (
     "block_sparse_moe.router.layer.weight",
+    "block_sparse_moe.router.weight",
     "block_sparse_moe.gate.weight",
 )
+
+SHARED_MLP_INPUT_SUFFIXES = ("shared_mlp.input_linear.weight",)
+SHARED_MLP_OUTPUT_SUFFIXES = ("shared_mlp.output_linear.weight",)
 
 CONV_IN_PROJECTION_SUFFIXES = ("conv.in_proj.weight",)
 CONV_KERNEL_SUFFIXES = ("conv.conv.weight", "conv.depthwise.weight")
@@ -160,6 +166,7 @@ ATTENTION_OUT_PROJECTION_SUFFIXES = (
 )
 ATTENTION_Q_NORM_SUFFIXES = ("self_attn.q_layernorm.weight", "self_attn.q_norm.weight")
 ATTENTION_K_NORM_SUFFIXES = ("self_attn.k_layernorm.weight", "self_attn.k_norm.weight")
+ATTENTION_SINK_SUFFIXES = ("self_attn.sinks",)
 
 GATED_DELTA_QKV_SUFFIXES = ("linear_attn.in_proj_qkv.weight",)
 GATED_DELTA_Z_SUFFIXES = ("linear_attn.in_proj_z.weight",)
@@ -249,12 +256,15 @@ def discover_model_structure(
     layer_count = int(
         decoder_config.get("num_hidden_layers") or (max(layer_indices) + 1)
     )
+    configured_layer_types = discover_configured_layer_types(
+        decoder_config, layer_count
+    )
+    attention_window_size = discover_attention_window_size(decoder_config)
     layers = tuple(
         discover_layer_structure(
             tensors=tensors,
-            configured_layer_types=discover_configured_layer_types(
-                decoder_config, layer_count
-            ),
+            configured_layer_types=configured_layer_types,
+            configured_attention_window_size=attention_window_size,
             layer_root=layer_root,
             layer_index=index,
         )
@@ -334,7 +344,7 @@ def discover_model_structure(
         num_key_value_heads=num_key_value_heads,
         head_width=head_width,
         rotary_width=rotary_width,
-        attention_window_size=discover_attention_window_size(decoder_config),
+        attention_window_size=attention_window_size,
         attention_output_gate=attention_output_gate,
         conv_l_cache=conv_l_cache,
         vocab_size=vocab_size,
@@ -376,6 +386,7 @@ def discover_layer_structure(
     *,
     tensors: dict[str, Json],
     configured_layer_types: list[str] | None,
+    configured_attention_window_size: int | None,
     layer_root: str,
     layer_index: int,
 ) -> LayerStructure:
@@ -430,6 +441,19 @@ def discover_layer_structure(
                 ),
             }
         )
+        shared_input = find_optional_layer_tensor(
+            tensors, prefix, SHARED_MLP_INPUT_SUFFIXES
+        )
+        shared_output = find_optional_layer_tensor(
+            tensors, prefix, SHARED_MLP_OUTPUT_SUFFIXES
+        )
+        if (shared_input is None) != (shared_output is None):
+            raise ModelTranspileError(
+                f"layer prefix {prefix!r} has an incomplete shared feed-forward expert"
+            )
+        if shared_input is not None and shared_output is not None:
+            layer_tensors["shared_mlp_input"] = shared_input
+            layer_tensors["shared_mlp_output"] = shared_output
     else:
         raise ModelTranspileError(
             f"could not discover feed-forward structure for layer prefix {prefix!r}"
@@ -440,12 +464,21 @@ def discover_layer_structure(
         operator_type = "conv"
     elif configured in ("full_attention", "attention", "gqa_attention"):
         operator_type = "full_attention"
+    elif configured in ("sliding_attention", "window_attention"):
+        operator_type = "full_attention"
     elif configured in ("linear_attention", "gated_delta"):
         operator_type = "gated_delta"
     elif configured in ("recurrent", "rg_lru"):
         operator_type = "rg_lru"
     else:
         operator_type = infer_operator_type(tensors, prefix)
+
+    if configured == "full_attention":
+        layer_attention_window_size = None
+    elif operator_type == "full_attention":
+        layer_attention_window_size = configured_attention_window_size
+    else:
+        layer_attention_window_size = None
 
     if operator_type == "conv":
         layer_tensors.update(
@@ -509,6 +542,11 @@ def discover_layer_structure(
             layer_tensors["q_norm"] = optional_q_norm
         if optional_k_norm is not None:
             layer_tensors["k_norm"] = optional_k_norm
+        optional_sinks = find_optional_layer_tensor(
+            tensors, prefix, ATTENTION_SINK_SUFFIXES
+        )
+        if optional_sinks is not None:
+            layer_tensors["attention_sinks"] = optional_sinks
         add_optional_linear_biases(
             tensors,
             layer_tensors,
@@ -652,7 +690,13 @@ def discover_layer_structure(
         index=layer_index,
         prefix=prefix,
         operator_type=operator_type,
+        attention_window_size=layer_attention_window_size,
         feed_forward_type=feed_forward_type,
+        shared_intermediate_size=(
+            int(tensors[layer_tensors["shared_mlp_input"]]["shape"][0]) // 2
+            if "shared_mlp_input" in layer_tensors
+            else None
+        ),
         tensors=layer_tensors,
     )
 
@@ -963,14 +1007,18 @@ def make_layer(structure: ModelStructure, layer: LayerStructure) -> Json:
             "attention_output_gate": structure.attention_output_gate,
             "residual_scale": structure.residual_scale,
             "attention_scale": structure.attention_scale,
-            "attention_window_size": structure.attention_window_size,
+            "attention_window_size": layer.attention_window_size,
         },
         "ports": {
             "inputs": [{"id": "input", "signal": "frame", "shape": [hidden_size]}],
             "outputs": [{"id": "output", "signal": "frame", "shape": [hidden_size]}],
             "controls": [{"id": "control", "type": "pedal_control", "optional": True}],
         },
-        "state_ports": make_state_ports(structure, layer.operator_type),
+        "state_ports": make_state_ports(
+            structure,
+            layer.operator_type,
+            attention_window_size=layer.attention_window_size,
+        ),
         "parameter_block": make_parameter_block(
             layer.operator_type, layer.feed_forward_type, layer.tensors
         ),
@@ -1113,6 +1161,7 @@ def make_feed_forward_descriptor(
             {
                 "num_experts": structure.num_experts,
                 "experts_per_token": structure.experts_per_token,
+                "shared_intermediate_size": layer.shared_intermediate_size,
             }
         )
     return descriptor
@@ -1165,17 +1214,25 @@ def make_reference_decomposition(
 
 def make_ffn_component(structure: ModelStructure, layer: LayerStructure) -> Json:
     if layer.feed_forward_type == "sparse_moe":
+        params = {
+            "router": tensor_ref(layer.tensors["moe_router"]),
+            "input": tensor_ref(layer.tensors["moe_input"]),
+            "output": tensor_ref(layer.tensors["moe_output"]),
+        }
+        if layer.shared_intermediate_size is not None:
+            params.update(
+                {
+                    "shared_input": tensor_ref(layer.tensors["shared_mlp_input"]),
+                    "shared_output": tensor_ref(layer.tensors["shared_mlp_output"]),
+                }
+            )
         return {
             "id": "feed_forward",
             "type": "sparse_moe_feed_forward",
             "input": "ffn_norm.output",
             "output": "ffn.output",
             "dimensions": make_feed_forward_descriptor(structure, layer),
-            "params": {
-                "router": tensor_ref(layer.tensors["moe_router"]),
-                "input": tensor_ref(layer.tensors["moe_input"]),
-                "output": tensor_ref(layer.tensors["moe_output"]),
-            },
+            "params": params,
         }
     params = {
         "gate": tensor_ref(layer.tensors["ffn_gate"]),
@@ -1261,6 +1318,8 @@ def make_attention_operator(structure: ModelStructure, layer: LayerStructure) ->
     if "k_norm" in layer.tensors:
         params["k_norm"] = tensor_ref(layer.tensors["k_norm"])
         internal_pedals.append({"id": "k_norm", "type": "rms_norm_per_head"})
+    if "attention_sinks" in layer.tensors:
+        params["attention_sinks"] = tensor_ref(layer.tensors["attention_sinks"])
     internal_pedals.extend(
         [
             {"id": "rope", "type": "rotary_position_embedding"},
@@ -1287,8 +1346,12 @@ def make_attention_operator(structure: ModelStructure, layer: LayerStructure) ->
         "heads": heads,
         "rotary_width": structure.rotary_width,
         "output_gate": structure.attention_output_gate,
-        "window_size": structure.attention_window_size,
-        "state_ports": make_state_ports(structure, "full_attention"),
+        "window_size": layer.attention_window_size,
+        "state_ports": make_state_ports(
+            structure,
+            "full_attention",
+            attention_window_size=layer.attention_window_size,
+        ),
         "params": params,
         "internal_pedals": internal_pedals,
     }
@@ -1406,7 +1469,12 @@ def make_parameter_block(
     }
 
 
-def make_state_ports(structure: ModelStructure, operator_type: str) -> list[Json]:
+def make_state_ports(
+    structure: ModelStructure,
+    operator_type: str,
+    *,
+    attention_window_size: int | None = None,
+) -> list[Json]:
     if operator_type == "conv":
         return [
             {
@@ -1430,7 +1498,7 @@ def make_state_ports(structure: ModelStructure, operator_type: str) -> list[Json
                 "value_shape_per_token": [structure.num_key_value_heads, head_width],
                 "dtype": "BF16",
                 "growth": "per_activation",
-                "window_size": structure.attention_window_size,
+                "window_size": attention_window_size,
                 "sharing": "per_stream_per_pedal_instance",
             }
         ]

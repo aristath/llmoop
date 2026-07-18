@@ -185,6 +185,22 @@ def test_compiler_renders_biased_recurrent_and_windowed_attention_pedals(
     )
 
 
+def test_compiler_renders_windowed_attention_with_learned_sink_logits(
+    tmp_path: Path,
+) -> None:
+    shader_source_dir = Path(__file__).parents[1] / "runtime-rs" / "shaders"
+    shader_file = "gqa_attention_bf16_q20_kv4_d64_scale0.015625_w128_sinks__sc7.comp"
+
+    copy_shader_templates(shader_source_dir, tmp_path, {shader_file})
+
+    attention = (tmp_path / shader_file).read_text()
+    assert "binding = 4) readonly buffer AttentionSinks" in attention
+    assert "binding = 7) readonly buffer StreamControl" in attention
+    assert "const uint ATTENTION_WINDOW = 128u;" in attention
+    assert "float logsumexp = maximum + log(denominator);" in attention
+    assert "{{" not in attention
+
+
 def test_compiler_renders_hybrid_recurrent_and_gated_attention_pedals(
     tmp_path: Path,
 ) -> None:
