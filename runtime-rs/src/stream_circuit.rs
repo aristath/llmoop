@@ -1789,8 +1789,7 @@ pub struct RuntimeCompiledPedalboardSummary {
     pub pedal_devices: BTreeMap<String, String>,
     pub source_pedal_count: usize,
     pub source_pedals: Vec<RuntimeSourcePedal>,
-    pub dynamic_state_capacity_activations: usize,
-    pub capacity_profiles: Vec<RuntimeCapacityProfileSummary>,
+    pub max_context_activations: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1839,8 +1838,7 @@ pub struct RuntimePackageInspectionReport {
     pub compiled_pedal_devices: BTreeMap<String, String>,
     pub runtime_patch: RuntimePatchControls,
     pub device_bindings: RuntimeDeviceBindings,
-    pub dynamic_state_capacity_activations: usize,
-    pub capacity_profiles: Vec<RuntimeCapacityProfileSummary>,
+    pub max_context_activations: usize,
     pub source_pedal_count: usize,
     pub source_pedals: Vec<RuntimeSourcePedal>,
     pub available_devices: Vec<RuntimeAvailableDevice>,
@@ -1914,7 +1912,7 @@ pub struct RuntimeDeviceSliceReport {
     pub package_manifest: PathBuf,
     pub device_name: String,
     pub device_id: String,
-    pub resident_capacity_activations: usize,
+    pub context_window_activations: usize,
     pub hosted_pedals: Vec<String>,
     pub local_cables: Vec<RuntimeLocalCableBufferReport>,
     pub incoming_cables: Vec<RuntimeRemoteCableBufferReport>,
@@ -1938,7 +1936,7 @@ pub struct RuntimeDeviceSliceReport {
 pub struct RuntimePlacementReport {
     pub ok: bool,
     pub package_manifest: PathBuf,
-    pub resident_capacity_activations: usize,
+    pub context_window_activations: usize,
     pub runtime_patch: RuntimePatchControls,
     pub device_bindings: RuntimeDeviceBindings,
     pub bound_devices: Vec<RuntimeBoundDevice>,
@@ -2113,8 +2111,8 @@ pub struct RuntimeSingleDevicePromptRunReport {
     pub dispatches_per_tick: usize,
     pub descriptors_per_tick: usize,
     pub push_constant_bytes_per_tick: u32,
-    pub resident_capacity_activations: usize,
-    pub needed_capacity_activations: usize,
+    pub context_window_activations: usize,
+    pub scheduled_token_activations: usize,
     pub tokenizer: RuntimeTokenizerOptionsReport,
     pub prompt_text: String,
     pub prompt_ids: Vec<u32>,
@@ -2141,8 +2139,8 @@ pub struct RuntimePlacedPromptRunReport {
     pub runtime_patch: RuntimePatchControls,
     pub device_bindings: RuntimeDeviceBindings,
     pub hosted_pedal_count: usize,
-    pub resident_capacity_activations: usize,
-    pub needed_capacity_activations: usize,
+    pub context_window_activations: usize,
+    pub scheduled_token_activations: usize,
     pub tokenizer: RuntimeTokenizerOptionsReport,
     pub prompt_text: String,
     pub prompt_ids: Vec<u32>,
@@ -2158,13 +2156,6 @@ pub struct RuntimePlacedPromptRunReport {
     pub timing: RuntimePromptTimingReport,
     pub pedal_timings: Vec<RuntimePlacedPedalTimingReport>,
     pub pedal_timing_summaries: Vec<RuntimePlacedPedalTimingSummaryReport>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RuntimeCapacityProfileSummary {
-    pub min_dynamic_state_capacity_activations: usize,
-    pub max_dynamic_state_capacity_activations: usize,
-    pub shader_override_count: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3217,21 +3208,6 @@ mod tests {
     }
 
     #[test]
-    fn runtime_capacity_profile_serializes_capacity_summary() {
-        let profile = RuntimeCapacityProfileSummary {
-            min_dynamic_state_capacity_activations: 4,
-            max_dynamic_state_capacity_activations: 64,
-            shader_override_count: 14,
-        };
-
-        let payload = serde_json::to_value(&profile).unwrap();
-
-        assert_eq!(payload["min_dynamic_state_capacity_activations"], 4);
-        assert_eq!(payload["max_dynamic_state_capacity_activations"], 64);
-        assert_eq!(payload["shader_override_count"], 14);
-    }
-
-    #[test]
     fn runtime_topology_report_serializes_ui_facing_contract() {
         let logical_device_ids = vec!["gpu0".to_string()];
         let bindings = RuntimeDeviceBindings::from_vulkan_targets(
@@ -3299,12 +3275,7 @@ mod tests {
                 pedal_devices: BTreeMap::new(),
                 source_pedal_count: 1,
                 source_pedals: vec![source_pedal],
-                dynamic_state_capacity_activations: 16,
-                capacity_profiles: vec![RuntimeCapacityProfileSummary {
-                    min_dynamic_state_capacity_activations: 1,
-                    max_dynamic_state_capacity_activations: 16,
-                    shader_override_count: 1,
-                }],
+                max_context_activations: 16,
             },
             runtime_patch_controls: RuntimePatchControls {
                 default_device_id: Some("gpu0".to_string()),
@@ -3407,8 +3378,7 @@ mod tests {
                     Ok(None)
                 },
             ),
-            dynamic_state_capacity_activations: 16,
-            capacity_profiles: Vec::new(),
+            max_context_activations: 16,
             source_pedal_count: 0,
             source_pedals: Vec::new(),
             available_devices: Vec::new(),
@@ -3515,7 +3485,7 @@ mod tests {
             package_manifest: PathBuf::from("package.json"),
             device_name: "Radeon Test Device".to_string(),
             device_id: "gpu1".to_string(),
-            resident_capacity_activations: 16,
+            context_window_activations: 16,
             hosted_pedals: vec!["layer_05".to_string(), "layer_06".to_string()],
             local_cables: vec![RuntimeLocalCableBufferReport {
                 cable_index: 5,
@@ -3588,7 +3558,7 @@ mod tests {
         let report = RuntimePlacementReport {
             ok: true,
             package_manifest: PathBuf::from("package.json"),
-            resident_capacity_activations: 16,
+            context_window_activations: 16,
             runtime_patch: RuntimePatchControls {
                 default_device_id: Some("gpu0".to_string()),
                 pedal_devices: BTreeMap::new(),
@@ -3688,8 +3658,8 @@ mod tests {
             dispatches_per_tick: 42,
             descriptors_per_tick: 64,
             push_constant_bytes_per_tick: 128,
-            resident_capacity_activations: 16,
-            needed_capacity_activations: 2,
+            context_window_activations: 16,
+            scheduled_token_activations: 2,
             tokenizer: tokenizer.clone(),
             prompt_text: "Hello".to_string(),
             prompt_ids: vec![1],
@@ -3728,8 +3698,8 @@ mod tests {
             },
             device_bindings: bindings,
             hosted_pedal_count: 14,
-            resident_capacity_activations: 16,
-            needed_capacity_activations: 2,
+            context_window_activations: 16,
+            scheduled_token_activations: 2,
             tokenizer,
             prompt_text: "Hello".to_string(),
             prompt_ids: vec![1],

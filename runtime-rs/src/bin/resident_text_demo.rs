@@ -14,7 +14,7 @@ use llmoop_runtime::{
 struct Args {
     model_dir: Option<PathBuf>,
     package_manifest: Option<PathBuf>,
-    capacity: usize,
+    context_size: usize,
     prompt: String,
     max_new_tokens: usize,
     then_prompt: Option<String>,
@@ -30,7 +30,7 @@ impl Default for Args {
         Self {
             model_dir: None,
             package_manifest: None,
-            capacity: 8,
+            context_size: 8,
             prompt: "Hello".to_string(),
             max_new_tokens: 3,
             then_prompt: None,
@@ -80,7 +80,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let model = VulkanResidentGreedyModelPackage::from_manifest_file_with_capacity(
         &device,
         package_manifest,
-        Some(args.capacity),
+        Some(args.context_size),
     )?;
     let mut engine = VulkanResidentTokenEngine::new(device);
     engine.add_model_package("demo_model", model)?;
@@ -103,7 +103,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         stream.per_tick_push_constant_byte_count
     );
     println!(
-        "resident_capacity_activations={}",
+        "context_window_activations={}",
         stream.dynamic_state_capacity_activations
     );
     println!(
@@ -216,8 +216,8 @@ fn parse_args() -> Result<Args, String> {
                 parsed.package_manifest =
                     Some(PathBuf::from(next_value(&mut raw, "--package-manifest")?));
             }
-            "--capacity" => {
-                parsed.capacity = parse_next(&mut raw, "--capacity")?;
+            "--context-size" => {
+                parsed.context_size = parse_next(&mut raw, "--context-size")?;
             }
             "--prompt" => {
                 parsed.prompt = next_value(&mut raw, "--prompt")?;
@@ -422,7 +422,7 @@ fn usage() -> &'static str {
 Options:
   --model-dir <PATH>          Directory containing tokenizer.json. Required.
   --package-manifest <PATH>  Compiled resident model package manifest. Required.
-  --capacity <N>              Resident activation capacity. Default: 8
+  --context-size <N>          Runtime transient-state window. Default: 8
   --prompt <TEXT>             First external text event. Default: Hello
   --max-new-tokens <N>        Public outputs to emit after the first prompt. Default: 3
   --then-prompt <TEXT>        Optional later external text event.

@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::error::Error;
+use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -8,9 +9,9 @@ use std::time::Instant;
 use llmoop_runtime::{
     CircuitPort, PedalCablePlacement, PedalPlacement, RUNTIME_TOPOLOGY_SCHEMA,
     RuntimeAvailableDevice, RuntimeAvailableMemoryHeap, RuntimeBoundDevice,
-    RuntimeCableRouteTarget, RuntimeCableRoutes, RuntimeCapacityProfileSummary,
-    RuntimeCompiledPedalboardSummary, RuntimeDeviceBindings, RuntimeDeviceSliceReport,
-    RuntimeDeviceTickPlanReport, RuntimeEffectivePedalboardTopology, RuntimeLocalCableBufferReport,
+    RuntimeCableRouteTarget, RuntimeCableRoutes, RuntimeCompiledPedalboardSummary,
+    RuntimeDeviceBindings, RuntimeDeviceSliceReport, RuntimeDeviceTickPlanReport,
+    RuntimeEffectivePedalboardTopology, RuntimeLocalCableBufferReport,
     RuntimePackageInspectionReport, RuntimePatchControls, RuntimePatchDuplicateAfterControl,
     RuntimePatchInspectionReport, RuntimePatchPlacementReport, RuntimePatchSourceChainEntry,
     RuntimePedalPortSummary, RuntimePlacedPedalDispatchTimingReport,
@@ -48,7 +49,7 @@ struct Args {
     duplicate_after: Vec<(String, String)>,
     source_chain: Option<Vec<(String, String)>>,
     max_new_tokens: usize,
-    capacity: Option<usize>,
+    context_size: Option<usize>,
     vulkan_device_index: Option<usize>,
     cycle_ticks: usize,
     max_scheduler_turns: usize,
@@ -76,8 +77,8 @@ impl Default for Args {
             device_bindings: BTreeMap::new(),
             duplicate_after: Vec::new(),
             source_chain: None,
-            max_new_tokens: 4,
-            capacity: None,
+            max_new_tokens: 128,
+            context_size: None,
             vulkan_device_index: None,
             cycle_ticks: 4,
             max_scheduler_turns: 1_024,
@@ -142,12 +143,12 @@ fn run() -> Result<(), Box<dyn Error>> {
         .with_add_special_tokens(args.add_special_tokens)
         .with_skip_special_tokens(args.skip_special_tokens);
     if args.chat {
-        let capacity =
-            choose_chat_runtime_capacity(package_manifest, args.capacity, args.max_new_tokens)?;
+        let capacity = choose_chat_runtime_context_size(package_manifest, args.context_size)?;
         if manifest.placement_device_ids().len() > 1 {
             return run_placed_chat(
                 &args,
                 &manifest_dir,
+                &tokenizer_dir,
                 manifest,
                 capacity,
                 &codec,
@@ -157,6 +158,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         return run_single_device_chat(
             &args,
             &manifest_dir,
+            &tokenizer_dir,
             manifest,
             capacity,
             &codec,
@@ -177,7 +179,8 @@ fn run() -> Result<(), Box<dyn Error>> {
                 "prompt token count plus --max-new-tokens overflowed usize",
             )
         })?;
-    let capacity = choose_runtime_capacity(package_manifest, args.capacity, needed_capacity)?;
+    let capacity =
+        choose_runtime_context_size(package_manifest, args.context_size, prompt_ids.len())?;
 
     if manifest.placement_device_ids().len() > 1 {
         if args.profile_runs > 1 {
@@ -300,8 +303,8 @@ fn execute_single_device_prompt_run(
         dispatches_per_tick: stream.per_tick_dispatch_count,
         descriptors_per_tick: stream.per_tick_descriptor_count,
         push_constant_bytes_per_tick: stream.per_tick_push_constant_byte_count,
-        resident_capacity_activations: stream.dynamic_state_capacity_activations,
-        needed_capacity_activations: needed_capacity,
+        context_window_activations: stream.dynamic_state_capacity_activations,
+        scheduled_token_activations: needed_capacity,
         tokenizer: tokenizer_options_report(args),
         prompt_text: prompt.to_string(),
         prompt_ids: turn.queued_input_event.encoded_token_ids.clone(),
@@ -335,6 +338,7 @@ fn print_single_device_prompt_report(
 fn run_single_device_chat(
     args: &Args,
     manifest_dir: &Path,
+    tokenizer_dir: &Path,
     manifest: VulkanResidentGreedyModelPackageManifest,
     capacity: usize,
     codec: &VulkanResidentHfTokenizerTextCodec,
@@ -342,6 +346,8 @@ fn run_single_device_chat(
 ) -> Result<(), Box<dyn Error>> {
     let setup_start = Instant::now();
     let device = runtime_vulkan_device(args)?;
+    let eos_token_id = eos_token_id_from_manifest(manifest_dir, &manifest)?;
+    let chat_session = RuntimeChatSession::from_tokenizer_dir(tokenizer_dir)?;
     let model = VulkanResidentGreedyModelPackage::from_manifest(
         &device,
         manifest_dir,
@@ -352,33 +358,163 @@ fn run_single_device_chat(
     engine.add_model_package("compiled_model", model)?;
     engine.create_stream_from_model("compiled_model", "main")?;
     println!(
-        "llmoop chat ready: single_device_resident, capacity={capacity}, setup_ms={:.3}",
+        "llmoop chat ready: single_device_resident, context_size={capacity}, setup_ms={:.3}",
         nanos_to_millis(elapsed_nanos_u64(setup_start))
     );
 
-    run_chat_repl(initial_prompt, |turn_index, input_text| {
-        let turn = engine.submit_live_text_turn_until_idle(
-            "main",
+    run_chat_repl(initial_prompt, chat_session, |turn_index, input_text| {
+        let encoded_token_ids = codec.encode_text(input_text)?;
+        let mut event = VulkanResidentTokenInputEvent::new(
             format!("chat_{turn_index}"),
-            input_text,
+            encoded_token_ids.clone(),
             args.max_new_tokens,
-            "cli_chat",
+        )
+        .with_origin("cli_chat");
+        if let Some(eos_token_id) = eos_token_id {
+            event = event.with_eos_token(eos_token_id);
+        }
+        let submitted = engine.submit_input_event_until_idle(
+            "main",
+            event,
             VulkanResidentTokenEngineRunBudget::new(args.max_scheduler_turns, 1, args.cycle_ticks),
-            codec,
         )?;
-        Ok(turn.generated_text)
+        let generated_text = codec.decode_tokens(&submitted.generated_token_ids)?;
+        Ok(RuntimeChatTurn { generated_text })
     })
 }
 
-fn run_chat_repl<F>(initial_prompt: Option<&str>, mut submit: F) -> Result<(), Box<dyn Error>>
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RuntimeChatMessage {
+    role: String,
+    content: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RuntimeChatSession {
+    formatter: RuntimeChatFormatter,
+    messages: Vec<RuntimeChatMessage>,
+    committed_formatted_len: usize,
+}
+
+impl RuntimeChatSession {
+    fn from_tokenizer_dir(tokenizer_dir: &Path) -> Result<Self, Box<dyn Error>> {
+        Ok(Self {
+            formatter: RuntimeChatFormatter::from_tokenizer_dir(tokenizer_dir)?,
+            messages: Vec::new(),
+            committed_formatted_len: 0,
+        })
+    }
+
+    fn render_user_prompt_delta(&self, user_content: &str) -> Result<String, Box<dyn Error>> {
+        let mut messages = self.messages.clone();
+        messages.push(RuntimeChatMessage {
+            role: "user".to_string(),
+            content: user_content.to_string(),
+        });
+        let formatted = self.formatter.format_messages(&messages, true);
+        if self.committed_formatted_len > formatted.len()
+            || !formatted.is_char_boundary(self.committed_formatted_len)
+        {
+            return Err(Box::new(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "chat template prefix length no longer matches the formatted conversation",
+            )));
+        }
+        Ok(formatted[self.committed_formatted_len..].to_string())
+    }
+
+    fn commit_assistant_turn(
+        &mut self,
+        user_content: &str,
+        assistant_content: &str,
+    ) -> Result<(), Box<dyn Error>> {
+        self.messages.push(RuntimeChatMessage {
+            role: "user".to_string(),
+            content: user_content.to_string(),
+        });
+        self.messages.push(RuntimeChatMessage {
+            role: "assistant".to_string(),
+            content: assistant_content.to_string(),
+        });
+        self.committed_formatted_len = self.formatter.format_messages(&self.messages, false).len();
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RuntimeChatFormatter {
+    ChatMl { bos_token: Option<String> },
+}
+
+impl RuntimeChatFormatter {
+    fn from_tokenizer_dir(tokenizer_dir: &Path) -> Result<Self, Box<dyn Error>> {
+        let template_path = tokenizer_dir.join("chat_template.jinja");
+        let template = fs::read_to_string(&template_path).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "chat mode requires a supported chat template; failed to read {:?}: {error}",
+                    template_path
+                ),
+            )
+        })?;
+        let bos_token = tokenizer_config_string(tokenizer_dir, "bos_token")?;
+        if template.contains("<|im_start|>") && template.contains("<|im_end|>") {
+            return Ok(Self::ChatMl { bos_token });
+        }
+        Err(Box::new(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "chat mode currently supports ChatML-style chat templates; this package has a different template shape",
+        )))
+    }
+
+    fn format_messages(
+        &self,
+        messages: &[RuntimeChatMessage],
+        add_generation_prompt: bool,
+    ) -> String {
+        match self {
+            Self::ChatMl { bos_token } => {
+                let mut formatted = String::new();
+                if let Some(bos_token) = bos_token {
+                    formatted.push_str(bos_token);
+                }
+                for message in messages {
+                    formatted.push_str("<|im_start|>");
+                    formatted.push_str(&message.role);
+                    formatted.push('\n');
+                    formatted.push_str(&message.content);
+                    formatted.push_str("<|im_end|>\n");
+                }
+                if add_generation_prompt {
+                    formatted.push_str("<|im_start|>assistant\n");
+                }
+                formatted
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RuntimeChatTurn {
+    generated_text: String,
+}
+
+fn run_chat_repl<F>(
+    initial_prompt: Option<&str>,
+    mut chat_session: RuntimeChatSession,
+    mut submit: F,
+) -> Result<(), Box<dyn Error>>
 where
-    F: FnMut(usize, &str) -> Result<String, Box<dyn Error>>,
+    F: FnMut(usize, &str) -> Result<RuntimeChatTurn, Box<dyn Error>>,
 {
     println!("Type a message and press Enter. Type /exit, /quit, exit, or quit to stop.");
     let mut turn_index = 0usize;
     if let Some(initial_prompt) = initial_prompt {
         if !initial_prompt.trim().is_empty() {
-            print_chat_response(&submit(turn_index, initial_prompt)?);
+            if !submit_chat_turn(&mut chat_session, &mut submit, turn_index, initial_prompt)? {
+                return Ok(());
+            }
             turn_index = turn_index.saturating_add(1);
         }
     }
@@ -406,11 +542,32 @@ where
             continue;
         }
 
-        let generated_text = submit(turn_index, input_text)?;
-        print_chat_response(&generated_text);
+        if !submit_chat_turn(&mut chat_session, &mut submit, turn_index, input_text)? {
+            break;
+        }
         turn_index = turn_index.saturating_add(1);
     }
     Ok(())
+}
+
+fn submit_chat_turn<F>(
+    chat_session: &mut RuntimeChatSession,
+    submit: &mut F,
+    turn_index: usize,
+    input_text: &str,
+) -> Result<bool, Box<dyn Error>>
+where
+    F: FnMut(usize, &str) -> Result<RuntimeChatTurn, Box<dyn Error>>,
+{
+    let prompt_delta = chat_session.render_user_prompt_delta(input_text)?;
+    match submit(turn_index, &prompt_delta) {
+        Ok(turn) => {
+            print_chat_response(&turn.generated_text);
+            chat_session.commit_assistant_turn(input_text, &turn.generated_text)?;
+            Ok(true)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn print_chat_response(text: &str) {
@@ -418,15 +575,65 @@ fn print_chat_response(text: &str) {
     print_text(text);
 }
 
+fn tokenizer_config_string(
+    tokenizer_dir: &Path,
+    key: &str,
+) -> Result<Option<String>, Box<dyn Error>> {
+    let path = tokenizer_dir.join("tokenizer_config.json");
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let config: serde_json::Value = serde_json::from_slice(&fs::read(&path)?)?;
+    Ok(config
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string))
+}
+
+fn eos_token_id_from_manifest(
+    manifest_dir: &Path,
+    manifest: &VulkanResidentGreedyModelPackageManifest,
+) -> Result<Option<u32>, Box<dyn Error>> {
+    let config_path = manifest_dir.join(&manifest.config_path);
+    if !config_path.is_file() {
+        return Ok(None);
+    }
+    let config: serde_json::Value = serde_json::from_slice(&fs::read(&config_path)?)?;
+    let Some(raw_eos) = config.get("eos_token_id") else {
+        return Ok(None);
+    };
+    let eos_value = if let Some(id) = raw_eos.as_u64() {
+        Some(id)
+    } else if let Some(ids) = raw_eos.as_array() {
+        ids.iter().find_map(serde_json::Value::as_u64)
+    } else {
+        None
+    };
+    eos_value
+        .map(|id| {
+            u32::try_from(id).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("eos_token_id {id} does not fit in u32"),
+                )
+            })
+        })
+        .transpose()
+        .map_err(Into::into)
+}
+
 fn run_placed_chat(
     args: &Args,
     manifest_dir: &Path,
+    tokenizer_dir: &Path,
     manifest: VulkanResidentGreedyModelPackageManifest,
     capacity: usize,
     codec: &VulkanResidentHfTokenizerTextCodec,
     initial_prompt: Option<&str>,
 ) -> Result<(), Box<dyn Error>> {
     let setup_start = Instant::now();
+    let eos_token_id = eos_token_id_from_manifest(manifest_dir, &manifest)?;
+    let chat_session = RuntimeChatSession::from_tokenizer_dir(tokenizer_dir)?;
     let mut logical_device_ids = manifest.placement_device_ids();
     if !logical_device_ids.contains(&manifest.device_id) {
         logical_device_ids.push(manifest.device_id.clone());
@@ -441,20 +648,26 @@ fn run_placed_chat(
     let mut engine = VulkanResidentGreedyInProcessPlacedPromptEngine::new();
     let stream_snapshot = engine.add_stream("main", stream)?;
     println!(
-        "llmoop chat ready: placed_in_process, devices={:?}, capacity={}, setup_ms={:.3}",
+        "llmoop chat ready: placed_in_process, devices={:?}, context_size={}, setup_ms={:.3}",
         stream_snapshot.device_ids,
-        stream_snapshot.resident_capacity_activations,
+        stream_snapshot.context_window_activations,
         nanos_to_millis(elapsed_nanos_u64(setup_start))
     );
 
-    run_chat_repl(initial_prompt, |turn_index, input_text| {
+    run_chat_repl(initial_prompt, chat_session, |turn_index, input_text| {
         let input_event_id = format!("chat_{turn_index}");
+        let encoded_token_ids = codec.encode_text(input_text)?;
         let input_event = VulkanResidentTokenInputEvent::new(
             input_event_id.clone(),
-            codec.encode_text(input_text)?,
+            encoded_token_ids.clone(),
             args.max_new_tokens,
         )
         .with_origin("cli_chat");
+        let input_event = if let Some(eos_token_id) = eos_token_id {
+            input_event.with_eos_token(eos_token_id)
+        } else {
+            input_event
+        };
         let batch_run = engine.submit_input_events_until_idle_bounded(
             vec![
                 VulkanResidentGreedyInProcessPlacedPromptEngineInputRequest::new(
@@ -480,7 +693,8 @@ fn run_placed_chat(
             })?
             .submitted_run
             .generated_token_ids;
-        Ok(codec.decode_tokens(&generated_token_ids)?)
+        let generated_text = codec.decode_tokens(&generated_token_ids)?;
+        Ok(RuntimeChatTurn { generated_text })
     })
 }
 
@@ -672,8 +886,8 @@ fn execute_placed_prompt_run(
         runtime_patch: runtime_patch_report(args),
         device_bindings: runtime_device_bindings_report(args, &stream_snapshot.device_ids),
         hosted_pedal_count: stream_snapshot.hosted_pedal_count,
-        resident_capacity_activations: stream_snapshot.resident_capacity_activations,
-        needed_capacity_activations: prompt_ids.len() + args.max_new_tokens,
+        context_window_activations: stream_snapshot.context_window_activations,
+        scheduled_token_activations: prompt_ids.len() + args.max_new_tokens,
         tokenizer: tokenizer_options_report(args),
         prompt_text: prompt.to_string(),
         prompt_ids: run.prompt_token_ids.clone(),
@@ -1137,8 +1351,6 @@ fn inspect_runtime_topology(
     let runtime_routes = runtime_cable_routes_report(args, &placement.cables);
     let device_bindings = runtime_device_bindings_report(args, &placement_device_ids);
     let source_pedals = source_pedals_report(&manifest);
-    let capacity_profiles = capacity_profiles_report(&manifest);
-
     let payload = RuntimeTopologyReport {
         ok: true,
         schema: RUNTIME_TOPOLOGY_SCHEMA.to_string(),
@@ -1155,8 +1367,7 @@ fn inspect_runtime_topology(
             pedal_devices: manifest.placement.pedal_devices.clone(),
             source_pedal_count: source_pedals.len(),
             source_pedals,
-            dynamic_state_capacity_activations: manifest.dynamic_state_capacity_activations,
-            capacity_profiles,
+            max_context_activations: manifest.max_context_activations,
         },
         runtime_patch_controls: runtime_patch_report(args),
         runtime_patch: patch,
@@ -1221,7 +1432,6 @@ fn inspect_package(
     );
     let source_pedals = source_pedals_report(&manifest);
     let source_pedal_count = source_pedals.len();
-    let capacity_profiles = capacity_profiles_report(&manifest);
     let payload = RuntimePackageInspectionReport {
         ok: true,
         package_manifest: package_manifest.to_path_buf(),
@@ -1235,8 +1445,7 @@ fn inspect_package(
         compiled_pedal_devices: manifest.placement.pedal_devices.clone(),
         runtime_patch: runtime_patch_report(args),
         device_bindings: runtime_device_bindings_report(args, &[]),
-        dynamic_state_capacity_activations: manifest.dynamic_state_capacity_activations,
-        capacity_profiles,
+        max_context_activations: manifest.max_context_activations,
         source_pedal_count,
         source_pedals,
         available_devices,
@@ -1514,20 +1723,6 @@ fn package_port_report(port: &CircuitPort) -> RuntimePedalPortSummary {
     }
 }
 
-fn capacity_profiles_report(
-    manifest: &VulkanResidentGreedyModelPackageManifest,
-) -> Vec<RuntimeCapacityProfileSummary> {
-    manifest
-        .capacity_profiles
-        .iter()
-        .map(|profile| RuntimeCapacityProfileSummary {
-            min_dynamic_state_capacity_activations: profile.min_dynamic_state_capacity_activations,
-            max_dynamic_state_capacity_activations: profile.max_dynamic_state_capacity_activations,
-            shader_override_count: profile.pedal_execution_shader_overrides.len(),
-        })
-        .collect::<Vec<_>>()
-}
-
 fn inspect_device_slice(
     args: &Args,
     package_manifest: &Path,
@@ -1535,7 +1730,7 @@ fn inspect_device_slice(
     manifest: VulkanResidentGreedyModelPackageManifest,
     device_id: &str,
 ) -> Result<(), Box<dyn Error>> {
-    let capacity = choose_runtime_capacity(package_manifest, args.capacity, 1)?;
+    let capacity = choose_runtime_context_size(package_manifest, args.context_size, 1)?;
     let logical_device_ids = vec![device_id.to_string()];
     let bound_devices = runtime_bound_vulkan_devices(args, &logical_device_ids)?;
     let device = bound_devices.devices.get(device_id).ok_or_else(|| {
@@ -1574,7 +1769,7 @@ fn inspect_placement(
     manifest_dir: &Path,
     manifest: VulkanResidentGreedyModelPackageManifest,
 ) -> Result<(), Box<dyn Error>> {
-    let capacity = choose_runtime_capacity(package_manifest, args.capacity, 1)?;
+    let capacity = choose_runtime_context_size(package_manifest, args.context_size, 1)?;
     let device_ids = manifest.placement_device_ids();
     let placement = runtime_manifest_placement(manifest_dir, &manifest)?;
     let bound_devices = runtime_bound_vulkan_devices(args, &device_ids)?;
@@ -1600,7 +1795,7 @@ fn inspect_placement(
     let payload = RuntimePlacementReport {
         ok: true,
         package_manifest: package_manifest.to_path_buf(),
-        resident_capacity_activations: capacity,
+        context_window_activations: capacity,
         runtime_patch: runtime_patch_report(args),
         device_bindings: runtime_device_bindings_report(args, &device_ids),
         bound_devices: bound_devices_report(&bound_devices),
@@ -1663,7 +1858,7 @@ fn inspect_device_slice_payload(
         package_manifest: package_manifest.to_path_buf(),
         device_name: device.device_name().to_string(),
         device_id: slice.device_id,
-        resident_capacity_activations: capacity,
+        context_window_activations: capacity,
         hosted_pedals: resident_plan.hosted_pedal_ids.clone(),
         local_cables: resident_plan
             .local_cables
@@ -2237,117 +2432,44 @@ fn runtime_device_bindings_report(
     )
 }
 
-fn choose_runtime_capacity(
+const DEFAULT_RUNTIME_CONTEXT_SIZE: usize = 4_096;
+
+fn choose_runtime_context_size(
     package_manifest: &Path,
-    requested_capacity: Option<usize>,
-    needed_capacity: usize,
+    requested_context_size: Option<usize>,
+    prompt_token_count: usize,
 ) -> Result<usize, Box<dyn Error>> {
     let manifest = VulkanResidentGreedyModelPackageManifest::from_json_file(package_manifest)?;
-    let default_capacity = manifest.dynamic_state_capacity_activations;
-    let max_supported_capacity = manifest
-        .capacity_profiles
-        .iter()
-        .map(|profile| profile.max_dynamic_state_capacity_activations)
-        .chain(std::iter::once(default_capacity))
-        .max()
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "compiled package does not declare any supported dynamic-state capacity",
-            )
-        })?;
-
-    if let Some(capacity) = requested_capacity {
-        if capacity < needed_capacity {
-            return Err(Box::new(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "requested capacity {capacity} is too small: prompt plus generation needs {needed_capacity} activations"
-                ),
-            )));
-        }
-        if capacity > max_supported_capacity {
-            return Err(Box::new(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "requested capacity {capacity} exceeds compiled package support ({max_supported_capacity}); recompile with a larger capacity"
-                ),
-            )));
-        }
-        let supported = capacity == default_capacity
-            || manifest.capacity_profiles.iter().any(|profile| {
-                profile.min_dynamic_state_capacity_activations <= capacity
-                    && capacity <= profile.max_dynamic_state_capacity_activations
-            });
-        if !supported {
-            return Err(Box::new(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "requested capacity {capacity} is not supported by this compiled package; recompile with a matching capacity profile"
-                ),
-            )));
-        }
-        return Ok(capacity);
-    }
-
-    if default_capacity >= needed_capacity {
-        return Ok(default_capacity);
-    }
-
-    let mut profiles = manifest.capacity_profiles;
-    profiles.sort_by_key(|profile| {
-        (
-            profile.max_dynamic_state_capacity_activations,
-            profile.min_dynamic_state_capacity_activations,
-        )
-    });
-    if let Some(profile) = profiles
-        .into_iter()
-        .find(|profile| needed_capacity <= profile.max_dynamic_state_capacity_activations)
-    {
-        return Ok(needed_capacity.max(profile.min_dynamic_state_capacity_activations));
-    }
-
-    Err(Box::new(io::Error::new(
-        io::ErrorKind::InvalidInput,
-        format!(
-            "prompt plus generation needs {needed_capacity} activations, but compiled package supports up to {max_supported_capacity}; recompile with a larger capacity"
-        ),
-    )))
-}
-
-fn choose_chat_runtime_capacity(
-    package_manifest: &Path,
-    requested_capacity: Option<usize>,
-    needed_capacity: usize,
-) -> Result<usize, Box<dyn Error>> {
-    if requested_capacity.is_some() {
-        return choose_runtime_capacity(package_manifest, requested_capacity, needed_capacity);
-    }
-
-    let manifest = VulkanResidentGreedyModelPackageManifest::from_json_file(package_manifest)?;
-    let default_capacity = manifest.dynamic_state_capacity_activations;
-    let max_supported_capacity = manifest
-        .capacity_profiles
-        .iter()
-        .map(|profile| profile.max_dynamic_state_capacity_activations)
-        .chain(std::iter::once(default_capacity))
-        .max()
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "compiled package does not declare any supported dynamic-state capacity",
-            )
-        })?;
-    if max_supported_capacity < needed_capacity {
+    let max_context_size = manifest.max_context_activations;
+    if max_context_size == 0 {
         return Err(Box::new(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "--max-new-tokens needs at least {needed_capacity} activations, but compiled package supports up to {max_supported_capacity}; reduce --max-new-tokens or recompile with a larger capacity"
-            ),
+            io::ErrorKind::InvalidData,
+            "compiled package declares a zero maximum context size",
         )));
     }
-    Ok(max_supported_capacity)
+
+    if let Some(context_size) = requested_context_size {
+        if context_size > max_context_size {
+            return Err(Box::new(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "requested context size {context_size} exceeds the model maximum ({max_context_size})"
+                ),
+            )));
+        }
+        return Ok(context_size);
+    }
+
+    Ok(DEFAULT_RUNTIME_CONTEXT_SIZE
+        .max(prompt_token_count)
+        .min(max_context_size))
+}
+
+fn choose_chat_runtime_context_size(
+    package_manifest: &Path,
+    requested_context_size: Option<usize>,
+) -> Result<usize, Box<dyn Error>> {
+    choose_runtime_context_size(package_manifest, requested_context_size, 0)
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -2424,8 +2546,8 @@ fn parse_args() -> Result<Args, String> {
             "--max-new-tokens" => {
                 parsed.max_new_tokens = parse_next(&mut raw, "--max-new-tokens")?;
             }
-            "--capacity" => {
-                parsed.capacity = Some(parse_next(&mut raw, "--capacity")?);
+            "--context-size" => {
+                parsed.context_size = Some(parse_next(&mut raw, "--context-size")?);
             }
             "--vulkan-device-index" => {
                 parsed.vulkan_device_index = Some(parse_next(&mut raw, "--vulkan-device-index")?);
@@ -2495,8 +2617,8 @@ fn parse_args() -> Result<Args, String> {
     if parsed.max_new_tokens == 0 {
         return Err("--max-new-tokens must be at least 1".to_string());
     }
-    if matches!(parsed.capacity, Some(0)) {
-        return Err("--capacity must be at least 1".to_string());
+    if matches!(parsed.context_size, Some(0)) {
+        return Err("--context-size must be at least 1".to_string());
     }
     if parsed.cycle_ticks == 0 {
         return Err("--cycle-ticks must be at least 1".to_string());
@@ -2806,8 +2928,8 @@ Options:
   --inspect-placement        Mount and summarize every logical device slice in the runtime patch.
   --inspect-device-slice <DEVICE_ID>
                              Mount and summarize only the runtime patch pedals assigned to DEVICE_ID.
-  --max-new-tokens <N>       Public output tokens to emit after the prompt. Default: 4
-  --capacity <N>             Override resident activation capacity selected from the package.
+  --max-new-tokens <N>       Generation stop condition, independent of context size. Default: 128
+  --context-size <N>         Runtime transient-state window. Default: auto, up to the model maximum.
   --vulkan-device-index <N>  Use Vulkan physical device index N as the default local target.
   --cycle-ticks <N>          Max runtime ticks per always-on cycle. Default: 4
   --max-scheduler-turns <N>  Max engine scheduler turns before stopping. Default: 1024
@@ -2821,5 +2943,5 @@ Options:
 
 Example:
   python -m llmoop --compile-model <MODEL_DIR>
-  cargo run --manifest-path runtime-rs/Cargo.toml --features 'vulkan tokenizers' --bin llmoop-runtime -- --package packages/model_xxx/vulkan_resident_greedy_package.json --chat --max-new-tokens 4"
+  cargo run --manifest-path runtime-rs/Cargo.toml --features 'vulkan tokenizers' --bin llmoop-runtime -- --package packages/model_xxx/vulkan_resident_greedy_package.json --chat"
 }

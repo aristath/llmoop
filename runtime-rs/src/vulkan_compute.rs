@@ -3,7 +3,9 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::ffi::CString;
 use std::fmt::{Display, Formatter};
+#[cfg(test)]
 use std::path::Path;
+use std::time::Instant;
 
 use ash::{Entry, vk};
 
@@ -183,8 +185,10 @@ pub struct VulkanComputeDevice {
     queue_family_index: u32,
     queue: vk::Queue,
     device_name: String,
+    timestamp_period_ns: f32,
     u32_storage_pipelines: RefCell<HashMap<VulkanPipelineKey, VulkanU32StoragePipeline>>,
     generic_storage_pipelines: RefCell<HashMap<VulkanGenericPipelineKey, VulkanStoragePipeline>>,
+    immediate_kernel_sequence: RefCell<Option<VulkanResidentKernelSequence>>,
     pipeline_cache_hits: Cell<u64>,
     pipeline_cache_misses: Cell<u64>,
 }
@@ -250,6 +254,7 @@ pub struct VulkanU32ResidentBuffer {
     device: ash::Device,
     buffer: vk::Buffer,
     memory: vk::DeviceMemory,
+    memory_access: VulkanResidentMemoryAccess,
     capacity: usize,
     byte_capacity: vk::DeviceSize,
 }
@@ -258,13 +263,65 @@ pub struct VulkanResidentBuffer {
     device: ash::Device,
     buffer: vk::Buffer,
     memory: vk::DeviceMemory,
+    memory_access: VulkanResidentMemoryAccess,
     byte_capacity: vk::DeviceSize,
+    persistent_mapping: Option<usize>,
+}
+
+#[derive(Clone)]
+struct VulkanResidentMemoryAccess {
+    queue: vk::Queue,
+    queue_family_index: u32,
+    property_flags: vk::MemoryPropertyFlags,
+    staging_memory_type_index: Option<u32>,
+}
+
+impl VulkanResidentMemoryAccess {
+    fn is_directly_mappable(&self) -> bool {
+        self.property_flags.contains(
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        )
+    }
 }
 
 pub struct VulkanResidentKernelBufferBinding<'a> {
     pub binding: u32,
     pub buffer: &'a VulkanResidentBuffer,
     pub byte_len: usize,
+    pub access: VulkanResidentKernelBufferAccess,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VulkanResidentKernelBufferAccess {
+    Read,
+    Write,
+    ReadWrite,
+}
+
+impl VulkanResidentKernelBufferAccess {
+    fn reads(self) -> bool {
+        matches!(self, Self::Read | Self::ReadWrite)
+    }
+
+    fn writes(self) -> bool {
+        matches!(self, Self::Write | Self::ReadWrite)
+    }
+
+    fn conflicts_with(self, next: Self) -> bool {
+        self.writes() || next.writes()
+    }
+
+    fn merge(self, other: Self) -> Self {
+        match (
+            self.reads() || other.reads(),
+            self.writes() || other.writes(),
+        ) {
+            (true, true) => Self::ReadWrite,
+            (true, false) => Self::Read,
+            (false, true) => Self::Write,
+            (false, false) => unreachable!("a resident buffer access must read or write"),
+        }
+    }
 }
 
 impl<'a> VulkanResidentKernelBufferBinding<'a> {
@@ -273,7 +330,13 @@ impl<'a> VulkanResidentKernelBufferBinding<'a> {
             binding,
             buffer,
             byte_len,
+            access: VulkanResidentKernelBufferAccess::ReadWrite,
         }
+    }
+
+    pub fn with_access(mut self, access: VulkanResidentKernelBufferAccess) -> Self {
+        self.access = access;
+        self
     }
 }
 
@@ -284,12 +347,37 @@ impl VulkanU32ResidentBuffer {
 
     pub fn write(&self, input: &[u32]) -> Result<(), VulkanError> {
         let byte_len = self.byte_len(input.len())?;
-        unsafe { write_u32_memory(&self.device, self.memory, byte_len, input) }
+        if self.memory_access.is_directly_mappable() {
+            unsafe { write_u32_memory(&self.device, self.memory, byte_len, input) }
+        } else {
+            let bytes = unsafe {
+                std::slice::from_raw_parts(input.as_ptr().cast::<u8>(), byte_len as usize)
+            };
+            unsafe {
+                write_device_local_bytes(
+                    &self.device,
+                    self.buffer,
+                    &self.memory_access,
+                    byte_len,
+                    bytes,
+                )
+            }
+        }
     }
 
     pub fn read(&self, len: usize) -> Result<Vec<u32>, VulkanError> {
         let byte_len = self.byte_len(len)?;
-        unsafe { read_u32_memory(&self.device, self.memory, byte_len, len) }
+        if self.memory_access.is_directly_mappable() {
+            unsafe { read_u32_memory(&self.device, self.memory, byte_len, len) }
+        } else {
+            let bytes = unsafe {
+                read_device_local_bytes(&self.device, self.buffer, &self.memory_access, byte_len)?
+            };
+            Ok(bytes
+                .chunks_exact(4)
+                .map(|chunk| u32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                .collect())
+        }
     }
 
     fn byte_len(&self, len: usize) -> Result<vk::DeviceSize, VulkanError> {
@@ -327,18 +415,123 @@ impl VulkanU32ResidentBuffer {
 }
 
 impl VulkanResidentBuffer {
+    pub fn persistently_map(&mut self) -> Result<(), VulkanError> {
+        if self.persistent_mapping.is_some() {
+            return Ok(());
+        }
+        if !self.memory_access.is_directly_mappable() {
+            return Err(VulkanError(
+                "resident buffer memory is not host-visible and coherent".to_string(),
+            ));
+        }
+        let pointer = unsafe {
+            self.device
+                .map_memory(
+                    self.memory,
+                    0,
+                    self.byte_capacity,
+                    vk::MemoryMapFlags::empty(),
+                )
+                .map_err(|error| {
+                    VulkanError(format!(
+                        "failed to persistently map resident buffer memory: {error:?}"
+                    ))
+                })?
+        };
+        self.persistent_mapping = Some(pointer as usize);
+        Ok(())
+    }
+
     pub fn byte_capacity(&self) -> usize {
         self.byte_capacity as usize
     }
 
     pub fn write_bytes(&self, input: &[u8]) -> Result<(), VulkanError> {
-        let byte_len = self.byte_len(input.len())?;
-        unsafe { write_byte_memory(&self.device, self.memory, byte_len, input) }
+        self.write_bytes_at(0, input)
+    }
+
+    pub fn write_bytes_at(&self, offset: usize, input: &[u8]) -> Result<(), VulkanError> {
+        if input.is_empty() {
+            return Err(VulkanError(
+                "resident byte buffer write must not be empty".to_string(),
+            ));
+        }
+        let end = offset
+            .checked_add(input.len())
+            .ok_or_else(|| VulkanError("resident byte buffer write overflowed".to_string()))?;
+        if end > self.byte_capacity as usize {
+            return Err(VulkanError(format!(
+                "resident byte buffer capacity {} cannot write {} bytes at offset {}",
+                self.byte_capacity,
+                input.len(),
+                offset
+            )));
+        }
+        let byte_len = input.len() as vk::DeviceSize;
+        if let Some(address) = self.persistent_mapping {
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    input.as_ptr(),
+                    (address as *mut u8).add(offset),
+                    input.len(),
+                );
+            }
+            Ok(())
+        } else if offset != 0 {
+            Err(VulkanError(
+                "offset resident buffer writes require persistent mapping".to_string(),
+            ))
+        } else if self.memory_access.is_directly_mappable() {
+            unsafe { write_byte_memory(&self.device, self.memory, byte_len, input) }
+        } else {
+            unsafe {
+                write_device_local_bytes(
+                    &self.device,
+                    self.buffer,
+                    &self.memory_access,
+                    byte_len,
+                    input,
+                )
+            }
+        }
     }
 
     pub fn read_bytes(&self, len: usize) -> Result<Vec<u8>, VulkanError> {
-        let byte_len = self.byte_len(len)?;
-        unsafe { read_byte_memory(&self.device, self.memory, byte_len, len) }
+        self.read_bytes_at(0, len)
+    }
+
+    pub fn read_bytes_at(&self, offset: usize, len: usize) -> Result<Vec<u8>, VulkanError> {
+        if len == 0 {
+            return Err(VulkanError(
+                "resident byte buffer length must not be zero".to_string(),
+            ));
+        }
+        let end = offset
+            .checked_add(len)
+            .ok_or_else(|| VulkanError("resident byte buffer read overflowed".to_string()))?;
+        if end > self.byte_capacity as usize {
+            return Err(VulkanError(format!(
+                "resident byte buffer capacity {} cannot read {} bytes at offset {}",
+                self.byte_capacity, len, offset
+            )));
+        }
+        let byte_len = len as vk::DeviceSize;
+        if let Some(address) = self.persistent_mapping {
+            Ok(
+                unsafe { std::slice::from_raw_parts((address as *const u8).add(offset), len) }
+                    .to_vec(),
+            )
+        } else if offset == 0 && self.memory_access.is_directly_mappable() {
+            unsafe { read_byte_memory(&self.device, self.memory, byte_len, len) }
+        } else if offset != 0 {
+            Err(VulkanError(
+                "offset resident buffer reads require persistent mapping".to_string(),
+            ))
+        } else {
+            unsafe {
+                read_device_local_bytes(&self.device, self.buffer, &self.memory_access, byte_len)
+            }
+        }
     }
 
     fn byte_len(&self, len: usize) -> Result<vk::DeviceSize, VulkanError> {
@@ -378,6 +571,9 @@ impl Drop for VulkanU32ResidentBuffer {
 impl Drop for VulkanResidentBuffer {
     fn drop(&mut self) {
         unsafe {
+            if self.persistent_mapping.is_some() {
+                self.device.unmap_memory(self.memory);
+            }
             self.device.destroy_buffer(self.buffer, None);
             self.device.free_memory(self.memory, None);
         }
@@ -386,7 +582,9 @@ impl Drop for VulkanResidentBuffer {
 
 pub struct VulkanU32ResidentDispatch {
     device: ash::Device,
+    buffer: vk::Buffer,
     memory: vk::DeviceMemory,
+    memory_access: VulkanResidentMemoryAccess,
     descriptor_pool: vk::DescriptorPool,
     descriptor_set: vk::DescriptorSet,
     command_pool: vk::CommandPool,
@@ -403,14 +601,206 @@ pub struct VulkanResidentKernelDispatch {
     device: ash::Device,
     descriptor_pool: vk::DescriptorPool,
     descriptor_set: vk::DescriptorSet,
-    command_pool: vk::CommandPool,
-    command_buffer: vk::CommandBuffer,
     pipeline_key: VulkanGenericPipelineKey,
     pipeline_layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
     descriptor_count: usize,
     workgroup_count_x: u32,
     push_constant_byte_count: u32,
+    buffer_accesses: Vec<(vk::Buffer, VulkanResidentKernelBufferAccess)>,
+}
+
+/// Owns the Vulkan recording/submission resources for a composed sequence of
+/// resident kernel dispatches. Kernel bindings remain independently reusable;
+/// this object defines an execution boundary, not a model or pedal boundary.
+pub struct VulkanResidentKernelSequence {
+    device: ash::Device,
+    command_pool: vk::CommandPool,
+    command_buffer: vk::CommandBuffer,
+    completion_fence: vk::Fence,
+    timestamp_period_ns: f32,
+    recorded_steps: RefCell<Option<Vec<VulkanResidentKernelRecordedStep>>>,
+    recorded_snapshot_copies: RefCell<Option<Vec<VulkanResidentKernelRecordedSnapshotCopy>>>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct VulkanResidentKernelRecordedStep {
+    pipeline: vk::Pipeline,
+    descriptor_set: vk::DescriptorSet,
+    workgroup_count_x: u32,
+    push_constants: Vec<u8>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct VulkanResidentKernelRecordedSnapshotCopy {
+    after_step_index: usize,
+    source: vk::Buffer,
+    destination: vk::Buffer,
+    source_offset: vk::DeviceSize,
+    destination_offset: vk::DeviceSize,
+    byte_len: vk::DeviceSize,
+}
+
+#[derive(Clone, Copy)]
+pub struct VulkanResidentKernelSequenceStep<'a> {
+    dispatch: &'a VulkanResidentKernelDispatch,
+    push_constants: &'a [u8],
+}
+
+impl<'a> VulkanResidentKernelSequenceStep<'a> {
+    pub fn new(dispatch: &'a VulkanResidentKernelDispatch, push_constants: &'a [u8]) -> Self {
+        Self {
+            dispatch,
+            push_constants,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct VulkanResidentKernelSequenceSnapshotCopy<'a> {
+    pub after_step_index: usize,
+    source: &'a VulkanResidentBuffer,
+    destination: &'a VulkanResidentBuffer,
+    source_offset: vk::DeviceSize,
+    destination_offset: vk::DeviceSize,
+    byte_len: vk::DeviceSize,
+}
+
+impl<'a> VulkanResidentKernelSequenceSnapshotCopy<'a> {
+    pub fn new(
+        after_step_index: usize,
+        source: &'a VulkanResidentBuffer,
+        destination: &'a VulkanResidentBuffer,
+        source_offset: usize,
+        destination_offset: usize,
+        byte_len: usize,
+    ) -> Result<Self, VulkanError> {
+        if byte_len == 0 {
+            return Err(VulkanError(
+                "resident kernel sequence snapshot length must not be zero".to_string(),
+            ));
+        }
+        let source_end = source_offset
+            .checked_add(byte_len)
+            .ok_or_else(|| VulkanError("resident snapshot source range overflowed".to_string()))?;
+        let destination_end = destination_offset.checked_add(byte_len).ok_or_else(|| {
+            VulkanError("resident snapshot destination range overflowed".to_string())
+        })?;
+        if source_end > source.byte_capacity() {
+            return Err(VulkanError(format!(
+                "resident snapshot source capacity {} cannot copy {} bytes at offset {}",
+                source.byte_capacity(),
+                byte_len,
+                source_offset
+            )));
+        }
+        if destination_end > destination.byte_capacity() {
+            return Err(VulkanError(format!(
+                "resident snapshot destination capacity {} cannot copy {} bytes at offset {}",
+                destination.byte_capacity(),
+                byte_len,
+                destination_offset
+            )));
+        }
+        Ok(Self {
+            after_step_index,
+            source,
+            destination,
+            source_offset: source_offset as vk::DeviceSize,
+            destination_offset: destination_offset as vk::DeviceSize,
+            byte_len: byte_len as vk::DeviceSize,
+        })
+    }
+
+    fn recorded(self) -> VulkanResidentKernelRecordedSnapshotCopy {
+        VulkanResidentKernelRecordedSnapshotCopy {
+            after_step_index: self.after_step_index,
+            source: self.source.buffer,
+            destination: self.destination.buffer,
+            source_offset: self.source_offset,
+            destination_offset: self.destination_offset,
+            byte_len: self.byte_len,
+        }
+    }
+}
+
+fn print_resident_kernel_timestamp_summary(
+    steps: &[VulkanResidentKernelSequenceStep<'_>],
+    timestamps: &[u64],
+    timestamp_period_ns: f32,
+    host_elapsed_ns: u128,
+) {
+    if timestamps.len() != steps.len() + 1 {
+        eprintln!(
+            "llmoop Vulkan timings unavailable: expected {} timestamps, received {}",
+            steps.len() + 1,
+            timestamps.len()
+        );
+        return;
+    }
+
+    let mut groups = HashMap::<(u32, usize, u32), (usize, f64)>::new();
+    let mut intervals = Vec::with_capacity(steps.len());
+    for (step_index, step) in steps.iter().enumerate() {
+        let elapsed_ticks = timestamps[step_index + 1].saturating_sub(timestamps[step_index]);
+        let elapsed_ns = elapsed_ticks as f64 * f64::from(timestamp_period_ns);
+        let key = (
+            step.dispatch.workgroup_count_x,
+            step.dispatch.descriptor_count,
+            step.dispatch.push_constant_byte_count,
+        );
+        let group = groups.entry(key).or_insert((0, 0.0));
+        group.0 += 1;
+        group.1 += elapsed_ns;
+        intervals.push((step_index, key, elapsed_ns));
+    }
+
+    let total_ns = timestamps
+        .last()
+        .copied()
+        .unwrap_or_default()
+        .saturating_sub(timestamps[0]) as f64
+        * f64::from(timestamp_period_ns);
+    eprintln!(
+        "llmoop Vulkan timings: steps={}, gpu_total_ms={:.3}, host_submit_wait_ms={:.3}, host_minus_gpu_ms={:.3}",
+        steps.len(),
+        total_ns / 1_000_000.0,
+        host_elapsed_ns as f64 / 1_000_000.0,
+        (host_elapsed_ns as f64 - total_ns).max(0.0) / 1_000_000.0,
+    );
+
+    let mut groups = groups.into_iter().collect::<Vec<_>>();
+    groups.sort_by(|left, right| {
+        right
+            .1
+            .1
+            .partial_cmp(&left.1.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    eprintln!("  grouped step intervals (dispatch plus preceding dependency):");
+    for ((workgroups, descriptors, push_bytes), (count, elapsed_ns)) in groups {
+        eprintln!(
+            "    workgroups={workgroups:<5} descriptors={descriptors:<2} push_bytes={push_bytes:<3} count={count:<3} total_us={:.3} avg_us={:.3}",
+            elapsed_ns / 1_000.0,
+            elapsed_ns / count as f64 / 1_000.0,
+        );
+    }
+
+    intervals.sort_by(|left, right| {
+        right
+            .2
+            .partial_cmp(&left.2)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    eprintln!("  slowest step intervals:");
+    for (step_index, (workgroups, descriptors, push_bytes), elapsed_ns) in
+        intervals.into_iter().take(12)
+    {
+        eprintln!(
+            "    step={step_index:<3} workgroups={workgroups:<5} descriptors={descriptors:<2} push_bytes={push_bytes:<3} elapsed_us={:.3}",
+            elapsed_ns / 1_000.0,
+        );
+    }
 }
 
 pub struct VulkanU32ResidentCopy {
@@ -436,7 +826,17 @@ impl VulkanU32ResidentDispatch {
 
     pub fn read(&self, len: usize) -> Result<Vec<u32>, VulkanError> {
         let byte_len = self.byte_len(len)?;
-        unsafe { read_u32_memory(&self.device, self.memory, byte_len, len) }
+        if self.memory_access.is_directly_mappable() {
+            unsafe { read_u32_memory(&self.device, self.memory, byte_len, len) }
+        } else {
+            let bytes = unsafe {
+                read_device_local_bytes(&self.device, self.buffer, &self.memory_access, byte_len)?
+            };
+            Ok(bytes
+                .chunks_exact(4)
+                .map(|chunk| u32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                .collect())
+        }
     }
 
     fn byte_len(&self, len: usize) -> Result<vk::DeviceSize, VulkanError> {
@@ -555,9 +955,17 @@ impl VulkanResidentKernelDispatch {
 impl Drop for VulkanResidentKernelDispatch {
     fn drop(&mut self) {
         unsafe {
-            self.device.destroy_command_pool(self.command_pool, None);
             self.device
                 .destroy_descriptor_pool(self.descriptor_pool, None);
+        }
+    }
+}
+
+impl Drop for VulkanResidentKernelSequence {
+    fn drop(&mut self) {
+        unsafe {
+            self.device.destroy_fence(self.completion_fence, None);
+            self.device.destroy_command_pool(self.command_pool, None);
         }
     }
 }
@@ -640,6 +1048,10 @@ impl VulkanComputeDevice {
                     VulkanError(format!("failed to create Vulkan device: {error:?}"))
                 })?;
             let queue = device.get_device_queue(queue_family_index, 0);
+            let timestamp_period_ns = instance
+                .get_physical_device_properties(physical_device)
+                .limits
+                .timestamp_period;
 
             Ok(Self {
                 _entry: entry,
@@ -649,8 +1061,10 @@ impl VulkanComputeDevice {
                 queue_family_index,
                 queue,
                 device_name,
+                timestamp_period_ns,
                 u32_storage_pipelines: RefCell::new(HashMap::new()),
                 generic_storage_pipelines: RefCell::new(HashMap::new()),
+                immediate_kernel_sequence: RefCell::new(None),
                 pipeline_cache_hits: Cell::new(0),
                 pipeline_cache_misses: Cell::new(0),
             })
@@ -678,12 +1092,42 @@ impl VulkanComputeDevice {
                 "resident byte buffer capacity must not be zero".to_string(),
             ));
         }
-        let (buffer, memory, byte_capacity) = self.create_resident_storage_buffer(byte_capacity)?;
+        let (buffer, memory, byte_capacity, memory_access) = self.create_resident_storage_buffer(
+            byte_capacity,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        )?;
         Ok(VulkanResidentBuffer {
             device: self.device.clone(),
             buffer,
             memory,
+            memory_access,
             byte_capacity,
+            persistent_mapping: None,
+        })
+    }
+
+    pub fn create_host_visible_resident_buffer(
+        &self,
+        byte_capacity: usize,
+    ) -> Result<VulkanResidentBuffer, VulkanError> {
+        if byte_capacity == 0 {
+            return Err(VulkanError(
+                "resident byte buffer capacity must not be zero".to_string(),
+            ));
+        }
+        let (buffer, memory, byte_capacity, memory_access) = self.create_resident_storage_buffer(
+            byte_capacity,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        )?;
+        Ok(VulkanResidentBuffer {
+            device: self.device.clone(),
+            buffer,
+            memory,
+            memory_access,
+            byte_capacity,
+            persistent_mapping: None,
         })
     }
 
@@ -701,11 +1145,16 @@ impl VulkanComputeDevice {
             .ok_or_else(|| VulkanError("resident buffer byte capacity overflowed".to_string()))?
             as usize;
 
-        let (buffer, memory, byte_capacity) = self.create_resident_storage_buffer(byte_capacity)?;
+        let (buffer, memory, byte_capacity, memory_access) = self.create_resident_storage_buffer(
+            byte_capacity,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        )?;
         Ok(VulkanU32ResidentBuffer {
             device: self.device.clone(),
             buffer,
             memory,
+            memory_access,
             capacity,
             byte_capacity,
         })
@@ -714,7 +1163,17 @@ impl VulkanComputeDevice {
     fn create_resident_storage_buffer(
         &self,
         byte_capacity: usize,
-    ) -> Result<(vk::Buffer, vk::DeviceMemory, vk::DeviceSize), VulkanError> {
+        required_memory_flags: vk::MemoryPropertyFlags,
+        preferred_memory_flags: vk::MemoryPropertyFlags,
+    ) -> Result<
+        (
+            vk::Buffer,
+            vk::DeviceMemory,
+            vk::DeviceSize,
+            VulkanResidentMemoryAccess,
+        ),
+        VulkanError,
+    > {
         let byte_capacity = byte_capacity as vk::DeviceSize;
         unsafe {
             let buffer_info = vk::BufferCreateInfo::default()
@@ -738,13 +1197,42 @@ impl VulkanComputeDevice {
                 &self.instance,
                 self.physical_device,
                 requirements.memory_type_bits,
-                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+                required_memory_flags,
+                preferred_memory_flags,
             )
             .ok_or_else(|| {
-                VulkanError(
-                    "no host-visible coherent memory type for resident storage buffer".to_string(),
-                )
+                VulkanError(format!(
+                    "no memory type with required flags {required_memory_flags:?} for resident storage buffer"
+                ))
             })?;
+            let memory_properties = self
+                .instance
+                .get_physical_device_memory_properties(self.physical_device);
+            let property_flags =
+                memory_properties.memory_types[memory_type_index as usize].property_flags;
+            let directly_mappable = property_flags.contains(
+                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+            );
+            let staging_memory_type_index = if directly_mappable {
+                None
+            } else {
+                Some(
+                    find_memory_type(
+                        &self.instance,
+                        self.physical_device,
+                        u32::MAX,
+                        vk::MemoryPropertyFlags::HOST_VISIBLE
+                            | vk::MemoryPropertyFlags::HOST_COHERENT,
+                        vk::MemoryPropertyFlags::empty(),
+                    )
+                    .ok_or_else(|| {
+                        VulkanError(
+                            "no host-visible coherent memory type for resident staging transfers"
+                                .to_string(),
+                        )
+                    })?,
+                )
+            };
             let memory_info = vk::MemoryAllocateInfo::default()
                 .allocation_size(requirements.size)
                 .memory_type_index(memory_type_index);
@@ -763,7 +1251,17 @@ impl VulkanComputeDevice {
                         "failed to bind resident storage buffer memory: {error:?}"
                     ))
                 })?;
-            Ok((buffer, memory, byte_capacity))
+            Ok((
+                buffer,
+                memory,
+                byte_capacity,
+                VulkanResidentMemoryAccess {
+                    queue: self.queue,
+                    queue_family_index: self.queue_family_index,
+                    property_flags,
+                    staging_memory_type_index,
+                },
+            ))
         }
     }
 
@@ -1101,7 +1599,9 @@ impl VulkanComputeDevice {
 
             Ok(VulkanU32ResidentDispatch {
                 device: self.device.clone(),
+                buffer: resident_buffer.buffer,
                 memory: resident_buffer.memory,
+                memory_access: resident_buffer.memory_access.clone(),
                 descriptor_pool,
                 descriptor_set,
                 command_pool,
@@ -1142,6 +1642,8 @@ impl VulkanComputeDevice {
         }
 
         let mut descriptor_bindings = Vec::with_capacity(buffers.len());
+        let mut buffer_accesses =
+            Vec::<(vk::Buffer, VulkanResidentKernelBufferAccess)>::with_capacity(buffers.len());
         for buffer in buffers {
             buffer.buffer.byte_len(buffer.byte_len)?;
             if descriptor_bindings.contains(&buffer.binding) {
@@ -1151,6 +1653,14 @@ impl VulkanComputeDevice {
                 )));
             }
             descriptor_bindings.push(buffer.binding);
+            if let Some((_, access)) = buffer_accesses
+                .iter_mut()
+                .find(|(resident_buffer, _)| *resident_buffer == buffer.buffer.buffer)
+            {
+                *access = access.merge(buffer.access);
+            } else {
+                buffer_accesses.push((buffer.buffer.buffer, buffer.access));
+            }
         }
         descriptor_bindings.sort_unstable();
 
@@ -1217,6 +1727,45 @@ impl VulkanComputeDevice {
                 .collect::<Vec<_>>();
             self.device.update_descriptor_sets(&descriptor_writes, &[]);
 
+            Ok(VulkanResidentKernelDispatch {
+                device: self.device.clone(),
+                descriptor_pool,
+                descriptor_set,
+                pipeline_key,
+                pipeline_layout,
+                pipeline,
+                descriptor_count: buffers.len(),
+                workgroup_count_x,
+                push_constant_byte_count,
+                buffer_accesses,
+            })
+        }
+    }
+
+    pub fn run_resident_kernel_dispatch(
+        &self,
+        binding: &VulkanResidentKernelDispatch,
+        push_constants: &[u8],
+    ) -> Result<(), VulkanError> {
+        let mut immediate = self.immediate_kernel_sequence.borrow_mut();
+        if immediate.is_none() {
+            *immediate = Some(self.create_resident_kernel_sequence()?);
+        }
+        self.run_resident_kernel_sequence(
+            immediate
+                .as_ref()
+                .expect("immediate sequence was initialized"),
+            &[VulkanResidentKernelSequenceStep::new(
+                binding,
+                push_constants,
+            )],
+        )
+    }
+
+    pub fn create_resident_kernel_sequence(
+        &self,
+    ) -> Result<VulkanResidentKernelSequence, VulkanError> {
+        unsafe {
             let command_pool_info = vk::CommandPoolCreateInfo::default()
                 .queue_family_index(self.queue_family_index)
                 .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
@@ -1224,9 +1773,8 @@ impl VulkanComputeDevice {
                 .device
                 .create_command_pool(&command_pool_info, None)
                 .map_err(|error| {
-                    self.device.destroy_descriptor_pool(descriptor_pool, None);
                     VulkanError(format!(
-                        "failed to create resident kernel command pool: {error:?}"
+                        "failed to create resident kernel sequence command pool: {error:?}"
                     ))
                 })?;
             let command_alloc_info = vk::CommandBufferAllocateInfo::default()
@@ -1238,103 +1786,403 @@ impl VulkanComputeDevice {
                 .allocate_command_buffers(&command_alloc_info)
                 .map_err(|error| {
                     self.device.destroy_command_pool(command_pool, None);
-                    self.device.destroy_descriptor_pool(descriptor_pool, None);
                     VulkanError(format!(
-                        "failed to allocate resident kernel command buffer: {error:?}"
+                        "failed to allocate resident kernel sequence command buffer: {error:?}"
                     ))
                 })?
                 .remove(0);
+            let completion_fence = self
+                .device
+                .create_fence(&vk::FenceCreateInfo::default(), None)
+                .map_err(|error| {
+                    self.device.destroy_command_pool(command_pool, None);
+                    VulkanError(format!(
+                        "failed to create resident kernel sequence completion fence: {error:?}"
+                    ))
+                })?;
 
-            Ok(VulkanResidentKernelDispatch {
+            Ok(VulkanResidentKernelSequence {
                 device: self.device.clone(),
-                descriptor_pool,
-                descriptor_set,
                 command_pool,
                 command_buffer,
-                pipeline_key,
-                pipeline_layout,
-                pipeline,
-                descriptor_count: buffers.len(),
-                workgroup_count_x,
-                push_constant_byte_count,
+                completion_fence,
+                timestamp_period_ns: self.timestamp_period_ns,
+                recorded_steps: RefCell::new(None),
+                recorded_snapshot_copies: RefCell::new(None),
             })
         }
     }
 
-    pub fn run_resident_kernel_dispatch(
+    pub fn run_resident_kernel_sequence(
         &self,
-        binding: &VulkanResidentKernelDispatch,
-        push_constants: &[u8],
+        sequence: &VulkanResidentKernelSequence,
+        steps: &[VulkanResidentKernelSequenceStep<'_>],
     ) -> Result<(), VulkanError> {
-        if binding.pipeline_key.push_constant_byte_count != push_constants.len() as u32 {
+        self.run_resident_kernel_sequence_with_snapshot_copies(sequence, steps, &[])
+    }
+
+    pub fn run_resident_kernel_sequence_with_snapshot_copies(
+        &self,
+        sequence: &VulkanResidentKernelSequence,
+        steps: &[VulkanResidentKernelSequenceStep<'_>],
+        snapshot_copies: &[VulkanResidentKernelSequenceSnapshotCopy<'_>],
+    ) -> Result<(), VulkanError> {
+        if steps.is_empty() {
+            return Err(VulkanError(
+                "resident kernel sequence must contain at least one dispatch".to_string(),
+            ));
+        }
+        for (step_index, step) in steps.iter().enumerate() {
+            if step.dispatch.pipeline_key.push_constant_byte_count
+                != step.push_constants.len() as u32
+            {
+                return Err(VulkanError(format!(
+                    "resident kernel sequence step {step_index} expects {} push-constant bytes, got {}",
+                    step.dispatch.pipeline_key.push_constant_byte_count,
+                    step.push_constants.len()
+                )));
+            }
+        }
+        if let Some(copy) = snapshot_copies
+            .iter()
+            .find(|copy| copy.after_step_index >= steps.len())
+        {
             return Err(VulkanError(format!(
-                "resident kernel dispatch expects {} push-constant bytes, got {}",
-                binding.pipeline_key.push_constant_byte_count,
-                push_constants.len()
+                "resident snapshot follows step {}, but sequence contains {} steps",
+                copy.after_step_index,
+                steps.len()
             )));
         }
 
         unsafe {
-            self.device
-                .reset_command_buffer(binding.command_buffer, vk::CommandBufferResetFlags::empty())
-                .map_err(|error| {
-                    VulkanError(format!(
-                        "failed to reset resident kernel command buffer: {error:?}"
-                    ))
-                })?;
+            let profiling_enabled = std::env::var_os("LLMOOP_VK_PERF_LOGGER").is_some();
+            let command_buffer_matches = !profiling_enabled
+                && sequence
+                    .recorded_steps
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|recorded| {
+                        recorded.len() == steps.len()
+                            && recorded.iter().zip(steps).all(|(recorded, step)| {
+                                recorded.pipeline == step.dispatch.pipeline
+                                    && recorded.descriptor_set == step.dispatch.descriptor_set
+                                    && recorded.workgroup_count_x == step.dispatch.workgroup_count_x
+                                    && recorded.push_constants == step.push_constants
+                            })
+                    })
+                && sequence
+                    .recorded_snapshot_copies
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|recorded| {
+                        recorded.len() == snapshot_copies.len()
+                            && recorded
+                                .iter()
+                                .zip(snapshot_copies)
+                                .all(|(recorded, copy)| *recorded == copy.recorded())
+                    });
+            let host_start = profiling_enabled.then(Instant::now);
+            let query_count = u32::try_from(steps.len() + 1).map_err(|_| {
+                VulkanError("resident kernel timestamp count overflowed".to_string())
+            })?;
+            let query_pool = if profiling_enabled {
+                let query_pool_info = vk::QueryPoolCreateInfo::default()
+                    .query_type(vk::QueryType::TIMESTAMP)
+                    .query_count(query_count);
+                Some(
+                    self.device
+                        .create_query_pool(&query_pool_info, None)
+                        .map_err(|error| {
+                            VulkanError(format!(
+                                "failed to create resident kernel timestamp pool: {error:?}"
+                            ))
+                        })?,
+                )
+            } else {
+                None
+            };
 
-            let command_begin = vk::CommandBufferBeginInfo::default();
-            self.device
-                .begin_command_buffer(binding.command_buffer, &command_begin)
-                .map_err(|error| {
-                    VulkanError(format!(
-                        "failed to begin resident kernel command buffer: {error:?}"
-                    ))
-                })?;
-            self.device.cmd_bind_pipeline(
-                binding.command_buffer,
-                vk::PipelineBindPoint::COMPUTE,
-                binding.pipeline,
-            );
-            self.device.cmd_bind_descriptor_sets(
-                binding.command_buffer,
-                vk::PipelineBindPoint::COMPUTE,
-                binding.pipeline_layout,
-                0,
-                &[binding.descriptor_set],
-                &[],
-            );
-            if !push_constants.is_empty() {
-                self.device.cmd_push_constants(
-                    binding.command_buffer,
-                    binding.pipeline_layout,
-                    vk::ShaderStageFlags::COMPUTE,
+            if !command_buffer_matches {
+                self.device
+                    .reset_command_buffer(
+                        sequence.command_buffer,
+                        vk::CommandBufferResetFlags::empty(),
+                    )
+                    .map_err(|error| {
+                        VulkanError(format!(
+                            "failed to reset resident kernel sequence command buffer: {error:?}"
+                        ))
+                    })?;
+
+                let command_begin = vk::CommandBufferBeginInfo::default();
+                self.device
+                    .begin_command_buffer(sequence.command_buffer, &command_begin)
+                    .map_err(|error| {
+                        VulkanError(format!(
+                            "failed to begin resident kernel sequence command buffer: {error:?}"
+                        ))
+                    })?;
+            }
+
+            if !command_buffer_matches && let Some(query_pool) = query_pool {
+                self.device.cmd_reset_query_pool(
+                    sequence.command_buffer,
+                    query_pool,
                     0,
-                    push_constants,
+                    query_count,
+                );
+                self.device.cmd_write_timestamp(
+                    sequence.command_buffer,
+                    vk::PipelineStageFlags::TOP_OF_PIPE,
+                    query_pool,
+                    0,
                 );
             }
-            self.device
-                .cmd_dispatch(binding.command_buffer, binding.workgroup_count_x, 1, 1);
-            self.device
-                .end_command_buffer(binding.command_buffer)
-                .map_err(|error| {
-                    VulkanError(format!(
-                        "failed to end resident kernel command buffer: {error:?}"
-                    ))
-                })?;
 
-            let command_buffers = [binding.command_buffer];
+            if !command_buffer_matches {
+                let host_write_barrier = [vk::MemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::HOST_WRITE)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ)];
+                self.device.cmd_pipeline_barrier(
+                    sequence.command_buffer,
+                    vk::PipelineStageFlags::HOST,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &host_write_barrier,
+                    &[],
+                    &[],
+                );
+            }
+
+            let mut pending_buffer_accesses =
+                Vec::<(vk::Buffer, VulkanResidentKernelBufferAccess)>::new();
+            if !command_buffer_matches {
+                for (step_index, step) in steps.iter().enumerate() {
+                    let has_buffer_hazard = step.dispatch.buffer_accesses.iter().any(
+                        |(current_buffer, current_access)| {
+                            pending_buffer_accesses.iter().any(
+                                |(pending_buffer, pending_access)| {
+                                    pending_buffer == current_buffer
+                                        && pending_access.conflicts_with(*current_access)
+                                },
+                            )
+                        },
+                    );
+                    if has_buffer_hazard {
+                        let memory_barrier = [vk::MemoryBarrier::default()
+                            .src_access_mask(
+                                vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+                            )
+                            .dst_access_mask(
+                                vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+                            )];
+                        self.device.cmd_pipeline_barrier(
+                            sequence.command_buffer,
+                            vk::PipelineStageFlags::COMPUTE_SHADER,
+                            vk::PipelineStageFlags::COMPUTE_SHADER,
+                            vk::DependencyFlags::empty(),
+                            &memory_barrier,
+                            &[],
+                            &[],
+                        );
+                        pending_buffer_accesses.clear();
+                    }
+
+                    self.device.cmd_bind_pipeline(
+                        sequence.command_buffer,
+                        vk::PipelineBindPoint::COMPUTE,
+                        step.dispatch.pipeline,
+                    );
+                    self.device.cmd_bind_descriptor_sets(
+                        sequence.command_buffer,
+                        vk::PipelineBindPoint::COMPUTE,
+                        step.dispatch.pipeline_layout,
+                        0,
+                        &[step.dispatch.descriptor_set],
+                        &[],
+                    );
+                    if !step.push_constants.is_empty() {
+                        self.device.cmd_push_constants(
+                            sequence.command_buffer,
+                            step.dispatch.pipeline_layout,
+                            vk::ShaderStageFlags::COMPUTE,
+                            0,
+                            step.push_constants,
+                        );
+                    }
+                    self.device.cmd_dispatch(
+                        sequence.command_buffer,
+                        step.dispatch.workgroup_count_x,
+                        1,
+                        1,
+                    );
+                    for (current_buffer, current_access) in &step.dispatch.buffer_accesses {
+                        if let Some((_, pending_access)) = pending_buffer_accesses
+                            .iter_mut()
+                            .find(|(pending_buffer, _)| pending_buffer == current_buffer)
+                        {
+                            *pending_access = pending_access.merge(*current_access);
+                        } else {
+                            pending_buffer_accesses.push((*current_buffer, *current_access));
+                        }
+                    }
+                    if let Some(query_pool) = query_pool {
+                        self.device.cmd_write_timestamp(
+                            sequence.command_buffer,
+                            vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                            query_pool,
+                            u32::try_from(step_index + 1).map_err(|_| {
+                                VulkanError(
+                                    "resident kernel timestamp index overflowed".to_string(),
+                                )
+                            })?,
+                        );
+                    }
+
+                    let step_snapshot_copies = snapshot_copies
+                        .iter()
+                        .filter(|copy| copy.after_step_index == step_index)
+                        .collect::<Vec<_>>();
+                    if !step_snapshot_copies.is_empty() {
+                        let compute_to_transfer = [vk::MemoryBarrier::default()
+                            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                            .dst_access_mask(vk::AccessFlags::TRANSFER_READ)];
+                        self.device.cmd_pipeline_barrier(
+                            sequence.command_buffer,
+                            vk::PipelineStageFlags::COMPUTE_SHADER,
+                            vk::PipelineStageFlags::TRANSFER,
+                            vk::DependencyFlags::empty(),
+                            &compute_to_transfer,
+                            &[],
+                            &[],
+                        );
+                        for copy in step_snapshot_copies {
+                            let regions = [vk::BufferCopy {
+                                src_offset: copy.source_offset,
+                                dst_offset: copy.destination_offset,
+                                size: copy.byte_len,
+                            }];
+                            self.device.cmd_copy_buffer(
+                                sequence.command_buffer,
+                                copy.source.buffer,
+                                copy.destination.buffer,
+                                &regions,
+                            );
+                        }
+                        let transfer_to_compute = [vk::MemoryBarrier::default()
+                            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                            .dst_access_mask(
+                                vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+                            )];
+                        self.device.cmd_pipeline_barrier(
+                            sequence.command_buffer,
+                            vk::PipelineStageFlags::TRANSFER,
+                            vk::PipelineStageFlags::COMPUTE_SHADER,
+                            vk::DependencyFlags::empty(),
+                            &transfer_to_compute,
+                            &[],
+                            &[],
+                        );
+                        pending_buffer_accesses.clear();
+                    }
+                }
+
+                let host_visibility_barrier = [vk::MemoryBarrier::default()
+                    .src_access_mask(
+                        vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE,
+                    )
+                    .dst_access_mask(vk::AccessFlags::HOST_READ)];
+                self.device.cmd_pipeline_barrier(
+                    sequence.command_buffer,
+                    vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::HOST,
+                    vk::DependencyFlags::empty(),
+                    &host_visibility_barrier,
+                    &[],
+                    &[],
+                );
+
+                self.device
+                    .end_command_buffer(sequence.command_buffer)
+                    .map_err(|error| {
+                        VulkanError(format!(
+                            "failed to end resident kernel sequence command buffer: {error:?}"
+                        ))
+                    })?;
+
+                if profiling_enabled {
+                    *sequence.recorded_steps.borrow_mut() = None;
+                    *sequence.recorded_snapshot_copies.borrow_mut() = None;
+                } else {
+                    *sequence.recorded_steps.borrow_mut() = Some(
+                        steps
+                            .iter()
+                            .map(|step| VulkanResidentKernelRecordedStep {
+                                pipeline: step.dispatch.pipeline,
+                                descriptor_set: step.dispatch.descriptor_set,
+                                workgroup_count_x: step.dispatch.workgroup_count_x,
+                                push_constants: step.push_constants.to_vec(),
+                            })
+                            .collect(),
+                    );
+                    *sequence.recorded_snapshot_copies.borrow_mut() = Some(
+                        snapshot_copies
+                            .iter()
+                            .copied()
+                            .map(VulkanResidentKernelSequenceSnapshotCopy::recorded)
+                            .collect(),
+                    );
+                }
+            }
+
+            let command_buffers = [sequence.command_buffer];
             let submit_info = [vk::SubmitInfo::default().command_buffers(&command_buffers)];
             self.device
-                .queue_submit(self.queue, &submit_info, vk::Fence::null())
+                .reset_fences(&[sequence.completion_fence])
                 .map_err(|error| {
-                    VulkanError(format!("failed to submit resident kernel work: {error:?}"))
+                    VulkanError(format!(
+                        "failed to reset resident kernel sequence completion fence: {error:?}"
+                    ))
                 })?;
-            self.device.queue_wait_idle(self.queue).map_err(|error| {
-                VulkanError(format!(
-                    "failed waiting for resident kernel work: {error:?}"
-                ))
-            })?;
+            self.device
+                .queue_submit(self.queue, &submit_info, sequence.completion_fence)
+                .map_err(|error| {
+                    VulkanError(format!(
+                        "failed to submit resident kernel sequence: {error:?}"
+                    ))
+                })?;
+            self.device
+                .wait_for_fences(&[sequence.completion_fence], true, u64::MAX)
+                .map_err(|error| {
+                    VulkanError(format!(
+                        "failed waiting for resident kernel sequence: {error:?}"
+                    ))
+                })?;
+            let host_submit_wait_ns = host_start
+                .map(|start| start.elapsed().as_nanos())
+                .unwrap_or_default();
+
+            if let Some(query_pool) = query_pool {
+                let mut timestamps = vec![0u64; query_count as usize];
+                let result = self.device.get_query_pool_results(
+                    query_pool,
+                    0,
+                    &mut timestamps,
+                    vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
+                );
+                self.device.destroy_query_pool(query_pool, None);
+                result.map_err(|error| {
+                    VulkanError(format!(
+                        "failed to read resident kernel timestamps: {error:?}"
+                    ))
+                })?;
+                print_resident_kernel_timestamp_summary(
+                    steps,
+                    &timestamps,
+                    sequence.timestamp_period_ns,
+                    host_submit_wait_ns,
+                );
+            }
 
             Ok(())
         }
@@ -1709,6 +2557,7 @@ impl Drop for VulkanComputeDevice {
     fn drop(&mut self) {
         unsafe {
             let _ = self.device.device_wait_idle();
+            self.immediate_kernel_sequence.get_mut().take();
             for (_, pipeline) in self.u32_storage_pipelines.get_mut().drain() {
                 self.device.destroy_pipeline(pipeline.pipeline, None);
                 self.device
@@ -1888,7 +2737,7 @@ unsafe fn create_llmoop_vulkan_instance(entry: &Entry) -> Result<ash::Instance, 
         .application_version(1)
         .engine_name(&engine_name)
         .engine_version(1)
-        .api_version(vk::API_VERSION_1_1);
+        .api_version(vk::make_api_version(0, 1, 4, 0));
     let instance_info = vk::InstanceCreateInfo::default().application_info(&app_info);
     unsafe { entry.create_instance(&instance_info, None) }
         .map_err(|error| VulkanError(format!("failed to create Vulkan instance: {error:?}")))
@@ -1899,14 +2748,192 @@ unsafe fn find_memory_type(
     physical_device: vk::PhysicalDevice,
     memory_type_bits: u32,
     required_flags: vk::MemoryPropertyFlags,
+    preferred_flags: vk::MemoryPropertyFlags,
 ) -> Option<u32> {
     let memory_properties =
         unsafe { instance.get_physical_device_memory_properties(physical_device) };
-    (0..memory_properties.memory_type_count).find(|index| {
-        let supported = (memory_type_bits & (1 << index)) != 0;
-        let properties = memory_properties.memory_types[*index as usize].property_flags;
-        supported && properties.contains(required_flags)
-    })
+    (0..memory_properties.memory_type_count)
+        .filter(|index| {
+            let supported = (memory_type_bits & (1 << index)) != 0;
+            let properties = memory_properties.memory_types[*index as usize].property_flags;
+            supported && properties.contains(required_flags)
+        })
+        .max_by_key(|index| {
+            let memory_type = memory_properties.memory_types[*index as usize];
+            let heap_size = memory_properties.memory_heaps[memory_type.heap_index as usize].size;
+            let preferred_property_count = (memory_type.property_flags & preferred_flags)
+                .as_raw()
+                .count_ones();
+            (heap_size, preferred_property_count)
+        })
+}
+
+unsafe fn write_device_local_bytes(
+    device: &ash::Device,
+    destination: vk::Buffer,
+    access: &VulkanResidentMemoryAccess,
+    byte_len: vk::DeviceSize,
+    input: &[u8],
+) -> Result<(), VulkanError> {
+    let memory_type_index = access
+        .staging_memory_type_index
+        .ok_or_else(|| VulkanError("device-local buffer has no staging memory type".to_string()))?;
+    let (staging_buffer, staging_memory) = unsafe {
+        create_temporary_staging_buffer(
+            device,
+            byte_len,
+            vk::BufferUsageFlags::TRANSFER_SRC,
+            memory_type_index,
+        )?
+    };
+    let result = (|| {
+        unsafe { write_byte_memory(device, staging_memory, byte_len, input) }?;
+        unsafe {
+            copy_buffer_immediately(
+                device,
+                access.queue,
+                access.queue_family_index,
+                staging_buffer,
+                destination,
+                byte_len,
+            )
+        }
+    })();
+    unsafe {
+        device.destroy_buffer(staging_buffer, None);
+        device.free_memory(staging_memory, None);
+    }
+    result
+}
+
+unsafe fn read_device_local_bytes(
+    device: &ash::Device,
+    source: vk::Buffer,
+    access: &VulkanResidentMemoryAccess,
+    byte_len: vk::DeviceSize,
+) -> Result<Vec<u8>, VulkanError> {
+    let memory_type_index = access
+        .staging_memory_type_index
+        .ok_or_else(|| VulkanError("device-local buffer has no staging memory type".to_string()))?;
+    let (staging_buffer, staging_memory) = unsafe {
+        create_temporary_staging_buffer(
+            device,
+            byte_len,
+            vk::BufferUsageFlags::TRANSFER_DST,
+            memory_type_index,
+        )?
+    };
+    let result = (|| unsafe {
+        copy_buffer_immediately(
+            device,
+            access.queue,
+            access.queue_family_index,
+            source,
+            staging_buffer,
+            byte_len,
+        )?;
+        read_byte_memory(device, staging_memory, byte_len, byte_len as usize)
+    })();
+    unsafe {
+        device.destroy_buffer(staging_buffer, None);
+        device.free_memory(staging_memory, None);
+    }
+    result
+}
+
+unsafe fn create_temporary_staging_buffer(
+    device: &ash::Device,
+    byte_len: vk::DeviceSize,
+    usage: vk::BufferUsageFlags,
+    memory_type_index: u32,
+) -> Result<(vk::Buffer, vk::DeviceMemory), VulkanError> {
+    let buffer_info = vk::BufferCreateInfo::default()
+        .size(byte_len)
+        .usage(usage)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE);
+    let buffer = unsafe { device.create_buffer(&buffer_info, None) }
+        .map_err(|error| VulkanError(format!("failed to create staging buffer: {error:?}")))?;
+    let requirements = unsafe { device.get_buffer_memory_requirements(buffer) };
+    if requirements.memory_type_bits & (1 << memory_type_index) == 0 {
+        unsafe { device.destroy_buffer(buffer, None) };
+        return Err(VulkanError(format!(
+            "staging memory type {memory_type_index} is incompatible with transfer buffer"
+        )));
+    }
+    let memory_info = vk::MemoryAllocateInfo::default()
+        .allocation_size(requirements.size)
+        .memory_type_index(memory_type_index);
+    let memory = match unsafe { device.allocate_memory(&memory_info, None) } {
+        Ok(memory) => memory,
+        Err(error) => {
+            unsafe { device.destroy_buffer(buffer, None) };
+            return Err(VulkanError(format!(
+                "failed to allocate staging buffer memory: {error:?}"
+            )));
+        }
+    };
+    if let Err(error) = unsafe { device.bind_buffer_memory(buffer, memory, 0) } {
+        unsafe {
+            device.free_memory(memory, None);
+            device.destroy_buffer(buffer, None);
+        }
+        return Err(VulkanError(format!(
+            "failed to bind staging buffer memory: {error:?}"
+        )));
+    }
+    Ok((buffer, memory))
+}
+
+unsafe fn copy_buffer_immediately(
+    device: &ash::Device,
+    queue: vk::Queue,
+    queue_family_index: u32,
+    source: vk::Buffer,
+    destination: vk::Buffer,
+    byte_len: vk::DeviceSize,
+) -> Result<(), VulkanError> {
+    let command_pool_info = vk::CommandPoolCreateInfo::default()
+        .queue_family_index(queue_family_index)
+        .flags(vk::CommandPoolCreateFlags::TRANSIENT);
+    let command_pool =
+        unsafe { device.create_command_pool(&command_pool_info, None) }.map_err(|error| {
+            VulkanError(format!("failed to create staging command pool: {error:?}"))
+        })?;
+    let result = (|| {
+        let command_alloc_info = vk::CommandBufferAllocateInfo::default()
+            .command_pool(command_pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(1);
+        let command_buffer = unsafe { device.allocate_command_buffers(&command_alloc_info) }
+            .map_err(|error| {
+                VulkanError(format!(
+                    "failed to allocate staging command buffer: {error:?}"
+                ))
+            })?
+            .remove(0);
+        let begin_info = vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        unsafe { device.begin_command_buffer(command_buffer, &begin_info) }.map_err(|error| {
+            VulkanError(format!("failed to begin staging command buffer: {error:?}"))
+        })?;
+        let regions = [vk::BufferCopy {
+            src_offset: 0,
+            dst_offset: 0,
+            size: byte_len,
+        }];
+        unsafe { device.cmd_copy_buffer(command_buffer, source, destination, &regions) };
+        unsafe { device.end_command_buffer(command_buffer) }.map_err(|error| {
+            VulkanError(format!("failed to end staging command buffer: {error:?}"))
+        })?;
+        let command_buffers = [command_buffer];
+        let submit_info = [vk::SubmitInfo::default().command_buffers(&command_buffers)];
+        unsafe { device.queue_submit(queue, &submit_info, vk::Fence::null()) }
+            .map_err(|error| VulkanError(format!("failed to submit staging copy: {error:?}")))?;
+        unsafe { device.queue_wait_idle(queue) }
+            .map_err(|error| VulkanError(format!("failed waiting for staging copy: {error:?}")))
+    })();
+    unsafe { device.destroy_command_pool(command_pool, None) };
+    result
 }
 
 unsafe fn write_u32_memory(
@@ -1983,11 +3010,46 @@ pub(crate) fn compile_test_shader_words() -> Option<Vec<u32>> {
 #[cfg(test)]
 pub(crate) fn compile_shader_words_from_source(shader_file: &str) -> Option<Vec<u32>> {
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    compile_shader_words_from_source_path(&manifest_dir.join("shaders").join(shader_file))
+    let shader_path = manifest_dir.join("shaders").join(shader_file);
+    if shader_path.exists() {
+        return compile_shader_words_from_source_path(&shader_path);
+    }
+
+    let shape = shader_file
+        .strip_prefix("linear_bf16_")?
+        .strip_suffix(".comp")?;
+    let (input_size, output_size) = shape.split_once('x')?;
+    if !input_size.bytes().all(|byte| byte.is_ascii_digit())
+        || !output_size.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+
+    let template = std::fs::read_to_string(
+        manifest_dir
+            .join("shaders")
+            .join("linear_bf16.comp.template"),
+    )
+    .ok()?;
+    let rendered = template
+        .replace("{{INPUT_SIZE}}", input_size)
+        .replace("{{OUTPUT_SIZE}}", output_size);
+    static SOURCE_COUNTER: AtomicU64 = AtomicU64::new(0);
+    let source_id = SOURCE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let rendered_path = std::env::temp_dir().join(format!(
+        "llmoop-linear-{input_size}x{output_size}-{}-{source_id}.comp",
+        std::process::id()
+    ));
+    std::fs::write(&rendered_path, rendered).ok()?;
+    let words = compile_shader_words_from_source_path(&rendered_path);
+    let _ = std::fs::remove_file(rendered_path);
+    words
 }
 
+#[cfg(test)]
 pub(crate) fn compile_shader_words_from_source_path(shader: &Path) -> Option<Vec<u32>> {
     use std::process::{Command, Stdio};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -2008,6 +3070,8 @@ pub(crate) fn compile_shader_words_from_source_path(shader: &Path) -> Option<Vec
     let compiled = if test_command_exists("glslangValidator") {
         Command::new("glslangValidator")
             .arg("-V")
+            .arg("--target-env")
+            .arg("vulkan1.4")
             .arg(&shader)
             .arg("-o")
             .arg(&output)
@@ -2018,6 +3082,7 @@ pub(crate) fn compile_shader_words_from_source_path(shader: &Path) -> Option<Vec
             .success()
     } else if test_command_exists("glslc") {
         Command::new("glslc")
+            .arg("--target-env=vulkan1.4")
             .arg(&shader)
             .arg("-o")
             .arg(&output)
@@ -2049,6 +3114,7 @@ pub(crate) fn compile_test_shader_words_from_source(shader_file: &str) -> Option
     compile_shader_words_from_source(shader_file)
 }
 
+#[cfg(test)]
 fn test_command_exists(command: &str) -> bool {
     use std::process::{Command, Stdio};
 
@@ -2267,6 +3333,84 @@ mod tests {
     }
 
     #[test]
+    fn resident_kernel_sequence_composes_dispatches_in_one_submission() {
+        let Some(spirv_words) = compile_test_shader_words() else {
+            eprintln!("skipping Vulkan smoke: no GLSL to SPIR-V compiler found");
+            return;
+        };
+        let device = match VulkanComputeDevice::new() {
+            Ok(device) => device,
+            Err(error) => {
+                eprintln!("skipping Vulkan smoke: {error}");
+                return;
+            }
+        };
+        let buffer = device.create_resident_buffer(12).unwrap();
+        buffer.write_bytes(&u32_bytes(&[1, 2, 41])).unwrap();
+        let binding = VulkanResidentKernelBufferBinding::new(0, &buffer, 12);
+        let dispatch = device
+            .create_resident_kernel_dispatch(&spirv_words, &[binding], 1, 64, 0)
+            .unwrap();
+        let sequence = device.create_resident_kernel_sequence().unwrap();
+
+        device
+            .run_resident_kernel_sequence(
+                &sequence,
+                &[
+                    VulkanResidentKernelSequenceStep::new(&dispatch, &[]),
+                    VulkanResidentKernelSequenceStep::new(&dispatch, &[]),
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(
+            bytes_to_u32(&buffer.read_bytes(12).unwrap()),
+            vec![3, 4, 43]
+        );
+    }
+
+    #[test]
+    fn resident_kernel_sequence_snapshots_state_between_dispatch_groups() {
+        let Some(spirv_words) = compile_test_shader_words() else {
+            eprintln!("skipping Vulkan smoke: no GLSL to SPIR-V compiler found");
+            return;
+        };
+        let device = match VulkanComputeDevice::new() {
+            Ok(device) => device,
+            Err(error) => {
+                eprintln!("skipping Vulkan smoke: {error}");
+                return;
+            }
+        };
+        let state = device.create_resident_buffer(12).unwrap();
+        state.write_bytes(&u32_bytes(&[1, 2, 41])).unwrap();
+        let snapshots = device.create_host_visible_resident_buffer(24).unwrap();
+        let binding = VulkanResidentKernelBufferBinding::new(0, &state, 12);
+        let dispatch = device
+            .create_resident_kernel_dispatch(&spirv_words, &[binding], 1, 64, 0)
+            .unwrap();
+        let sequence = device.create_resident_kernel_sequence().unwrap();
+        let steps = [
+            VulkanResidentKernelSequenceStep::new(&dispatch, &[]),
+            VulkanResidentKernelSequenceStep::new(&dispatch, &[]),
+        ];
+        let copies = [
+            VulkanResidentKernelSequenceSnapshotCopy::new(0, &state, &snapshots, 0, 0, 12).unwrap(),
+            VulkanResidentKernelSequenceSnapshotCopy::new(1, &state, &snapshots, 0, 12, 12)
+                .unwrap(),
+        ];
+
+        device
+            .run_resident_kernel_sequence_with_snapshot_copies(&sequence, &steps, &copies)
+            .unwrap();
+
+        assert_eq!(
+            bytes_to_u32(&snapshots.read_bytes(24).unwrap()),
+            vec![2, 3, 42, 3, 4, 43]
+        );
+    }
+
+    #[test]
     fn generic_resident_kernel_dispatch_validates_push_constant_size() {
         let Some(spirv_words) = compile_test_shader_words() else {
             eprintln!("skipping Vulkan smoke: no GLSL to SPIR-V compiler found");
@@ -2293,7 +3437,7 @@ mod tests {
         assert_eq!(
             error,
             VulkanError(
-                "resident kernel dispatch expects 4 push-constant bytes, got 0".to_string()
+                "resident kernel sequence step 0 expects 4 push-constant bytes, got 0".to_string()
             )
         );
     }

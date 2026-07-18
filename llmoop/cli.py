@@ -133,10 +133,10 @@ def main() -> None:
         help="directory containing backend shader templates",
     )
     parser.add_argument(
-        "--capacity",
+        "--context-size",
         type=int,
         default=None,
-        help="resident dynamic-state activation capacity; compile default is 4, runtime default is auto",
+        help="runtime transient-state context window; defaults to an automatic size",
     )
     parser.add_argument(
         "--vulkan-device-index",
@@ -147,8 +147,8 @@ def main() -> None:
     parser.add_argument(
         "--max-new-tokens",
         type=int,
-        default=4,
-        help="maximum new tokens to generate for --run/--run-model",
+        default=128,
+        help="generation stop condition for --run/--run-model; independent of context allocation",
     )
     parser.add_argument(
         "--temperature",
@@ -222,6 +222,8 @@ def main() -> None:
     if not any(selected_actions):
         parser.print_help()
         raise SystemExit(2)
+    if args.context_size is not None and args.context_size < 1:
+        parser.error("--context-size must be at least 1")
     if args.compile_model is None:
         if args.inspect_runtime and args.run is None:
             parser.error("--inspect-runtime is only supported with --run")
@@ -255,6 +257,8 @@ def main() -> None:
         parser.error("--chain is only supported with --run")
     elif args.vulkan_device_index is not None:
         parser.error("--vulkan-device-index is only supported with --run")
+    elif args.context_size is not None:
+        parser.error("--context-size is only supported with --run")
     elif args.profile:
         parser.error("--profile is only supported with --run")
     elif args.profile_runs != 1:
@@ -332,6 +336,8 @@ def main() -> None:
             parser.error("--chain is only supported by --run")
         if args.vulkan_device_index is not None:
             parser.error("--vulkan-device-index is only supported by --run")
+        if args.context_size is not None:
+            parser.error("--context-size is only supported by --run")
         if args.profile:
             parser.error("--profile is only supported by --run")
         if args.profile_runs != 1:
@@ -350,7 +356,6 @@ def main() -> None:
         package_dir=args.package_dir,
         clean=not args.no_clean,
         shader_source_dir=args.shader_source_dir,
-        default_dynamic_state_capacity_activations=args.capacity or 4,
     )
     if args.json:
         print(json.dumps(report.to_json(), indent=2))
@@ -541,8 +546,8 @@ def build_runtime_command(args: argparse.Namespace, package_manifest: Path) -> l
         runtime_args.extend(["--duplicate-after", raw_duplicate])
     if args.chain is not None:
         runtime_args.extend(["--chain", args.chain])
-    if args.capacity is not None:
-        runtime_args.extend(["--capacity", str(args.capacity)])
+    if args.context_size is not None:
+        runtime_args.extend(["--context-size", str(args.context_size)])
     if args.vulkan_device_index is not None:
         runtime_args.extend(["--vulkan-device-index", str(args.vulkan_device_index)])
     if args.no_special_tokens:
