@@ -24,6 +24,17 @@ Ratatui has an [official interactive custom-widget example](https://ratatui.rs/e
 
 Ratatui is an immediate-mode rendering library rather than a complete retained GUI toolkit. llmoop will therefore own application state, focus, semantic actions, modal behavior, scrolling, and hit testing. This is appropriate for a specialized pedalboard editor because those behaviors are part of the product rather than generic form behavior.
 
+## Launching the editor
+
+Running `python -m llmoop` without an action opens the TUI. During source development the editor can also be started directly with:
+
+```text
+cargo run --manifest-path runtime-rs/Cargo.toml \
+  --features vulkan,tokenizers,tui --bin llmoop-tui
+```
+
+`LLMOOP_TUI_BIN` may point the Python launcher at an installed TUI executable. `LLMOOP_WORKSPACE`, `LLMOOP_PYTHON`, and `LLMOOP_COMPILER_BIN` can override the compiler-client launch boundary without putting model-family knowledge in the TUI.
+
 ## Core terminology
 
 The TUI must preserve the distinctions defined in `CONCEPT.md`:
@@ -128,10 +139,10 @@ The application opens into the model editor and gives the pedalboard most of the
 
 ```text
 ┌ Model: LFM2.5-230M ───────────────────────────────────────────────────────┐
-│ Layer order: [1,2,3,4,5,6,2,3,4,5,6,7,8,9,10,11,12]                    │
+│ Layer order: [0,1,2,3,4,5,5,6,7,7,8,9,10,11,12,13]                     │
 ├ Pedalboard ───────────────────────────────────────────────────────────────┤
 │                                                                          │
-│  [1]──[2]──[3]──[4]──[5]──[6]──[2²]──[3²]──[4²]──[5²]──[6²]──[7] ...  │
+│  [0]──[1]──[2]──[3]──[4]──[5]──[5²]──[6]──[7]──[7²]──[8]──[9] ...     │
 │  GPU0 GPU0 GPU0 GPU0 GPU0 GPU0 CPU  CPU  GPU1 GPU1 GPU1 GPU1             │
 │                                                                          │
 ├──────────────────────────────────────────────────────────────────────────┤
@@ -153,7 +164,7 @@ The editor must remain useful in a small terminal. A small viewport may scroll, 
 The layer-order field provides a direct, simple way to define the serial order of layer pedals:
 
 ```text
-[1,2,3,4,5,6,2,3,4,5,6,7,8,9,10,11,12]
+[0,1,2,3,4,5,5,6,7,7,8,9,10,11,12,13]
 ```
 
 The field is a real text editor, not a sequence of single-character shortcuts. It must support normal cursor movement, insertion, deletion, selection where the terminal permits it, and bracketed paste.
@@ -181,7 +192,7 @@ text buffer
 An incomplete bracket, missing comma, or unknown layer must not make the pedalboard disappear or partially mutate. The error must identify the problematic position and explain the correction, for example:
 
 ```text
-Unknown source pedal `17` at column 14. Available layers: 1-16.
+Unknown layer `14` at column 14. Available layers: 0-13.
 ```
 
 ## Pedal instances and duplication
@@ -191,17 +202,17 @@ Every occurrence in the sequence creates a distinct pedal instance, even when se
 For example:
 
 ```text
-[1,2,3,2,4]
+[0,1,2,1,3]
 ```
 
-contains two instances of source pedal `2`. Internally they require stable and distinct identities, such as:
+contains two instances of source pedal `1`. Internally they require stable and distinct identities, such as:
 
 ```text
-layer_02@1
-layer_02@2
+layer_01@1
+layer_01@2
 ```
 
-The display may use a compact occurrence marker such as `2²`, but an accessible textual label must remain available, for example `Layer 2, occurrence 2`.
+The display may use a compact occurrence marker such as `1²`, but an accessible textual label must remain available, for example `Layer 1, occurrence 2`.
 
 Duplicated instances may reference the same immutable compiled circuit and parameters. They do not implicitly share transient state, placement, or controls. Each instance can have:
 
@@ -254,8 +265,8 @@ During every render, the board widget records the `Rect` occupied by each visibl
 Opening a pedal presents a modal for the selected pedal instance, not merely its shared source definition.
 
 ```text
-┌ Layer 2 · occurrence 2 ──────────────────────┐
-│ Source pedal: layer_02                       │
+┌ Layer 1 · occurrence 2 ──────────────────────┐
+│ Source pedal: layer_01                       │
 │ Type: transformer                            │
 │                                              │
 │ Device:       [ Vulkan GPU 1             ▼ ] │
@@ -430,16 +441,11 @@ The interface should feel like a technical signal-chain instrument rather than a
 
 The distinctive element is not a decorative color scheme. It is the live, editable signal path whose pedals visibly carry identity, placement, and state.
 
-## Decisions still to settle
+## Settled public convention
 
-### Display indexing
+The layer-order field uses zero-based numeric indices, for example `[0,1,2,1,3]`. The field does not repeat a ceremonial `layer_` prefix. Internal source-pedal and instance IDs remain stable model-package identities such as `layer_01` and `layer_01@2`; they are shown as metadata where that identity matters, but are not mixed into the numeric order field.
 
-The layer-order field needs one unambiguous public convention:
-
-- user-facing one-based indices, as in `[1,2,3]`; or
-- model-native zero-based identifiers, matching names such as `layer_00`.
-
-Internal source-pedal IDs must remain stable regardless of the display convention. The interface must not silently mix both forms in the same field.
+## Remaining runtime decisions
 
 ### Running-board edits
 
