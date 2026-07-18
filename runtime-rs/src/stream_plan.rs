@@ -847,6 +847,7 @@ pub struct PlannedNode {
     pub index: usize,
     pub id: String,
     pub op: String,
+    pub specialization: String,
     pub inputs: Vec<String>,
     pub outputs: Vec<String>,
     pub params: Vec<String>,
@@ -860,6 +861,17 @@ impl PlannedNode {
             index,
             id: node.id.clone(),
             op: node.op.clone(),
+            specialization: if node.attrs.is_null()
+                || node
+                    .attrs
+                    .as_object()
+                    .is_some_and(serde_json::Map::is_empty)
+            {
+                String::new()
+            } else {
+                serde_json::to_string(&node.attrs)
+                    .expect("circuit node attributes must serialize as JSON")
+            },
             inputs: node.inputs.clone(),
             outputs: node.outputs.clone(),
             params: node.params.clone(),
@@ -945,8 +957,16 @@ fn infer_node_output_shapes(
     let unknown = || Ok(vec![None; outputs]);
 
     match node.op.as_str() {
-        "rms_norm" | "rms_norm_per_head" | "silu" | "gelu_tanh" | "rotary_position_embedding" => {
-            Ok(repeat_shape(first_input_shape(node, signals), outputs))
+        "rms_norm"
+        | "rms_norm_per_head"
+        | "rms_norm_per_head_unscaled"
+        | "silu"
+        | "gelu_tanh"
+        | "rotary_position_embedding"
+        | "scalar_multiply" => Ok(repeat_shape(first_input_shape(node, signals), outputs)),
+        "per_layer_embedding" => {
+            let output_shape = attr_usize(node, "per_layer_width").map(|width| vec![width]);
+            Ok(repeat_shape(output_shape, outputs))
         }
         "multiply"
         | "residual_add"

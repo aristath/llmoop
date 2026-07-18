@@ -2160,7 +2160,7 @@ impl VulkanStreamCircuitBindingPlan {
 
         let parameter_bindings =
             parameter_binding_index(resource_plan, resident_plan, hosted_pedals)?;
-        let state_bindings = state_binding_index(resident_plan)?;
+        let state_bindings = state_binding_index(resource_plan, resident_plan)?;
         let activation_bindings = activation_binding_index(resident_plan)?;
 
         let circuits = execution_plan
@@ -2255,6 +2255,7 @@ pub struct VulkanNodeBinding {
     pub node_index: usize,
     pub node_id: String,
     pub op: String,
+    pub specialization: String,
     pub inputs: Vec<VulkanSignalBinding>,
     pub outputs: Vec<VulkanSignalBinding>,
     pub parameters: Vec<VulkanParameterBinding>,
@@ -2321,6 +2322,7 @@ pub struct VulkanParameterBinding {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VulkanStateBinding {
+    pub pedal_id: String,
     pub state_id: String,
     pub state_type: String,
     pub static_bytes: Option<usize>,
@@ -11037,6 +11039,7 @@ pub struct VulkanKernelInterface {
     pub node_index: usize,
     pub node_id: String,
     pub op: String,
+    pub specialization: String,
     pub inputs: Vec<VulkanSignalBinding>,
     pub outputs: Vec<VulkanSignalBinding>,
     pub parameters: Vec<VulkanParameterBinding>,
@@ -11062,6 +11065,7 @@ impl VulkanKernelInterface {
             node_index: node.node_index,
             node_id: node.node_id.clone(),
             op: node.op.clone(),
+            specialization: node.specialization.clone(),
             inputs: node.inputs.clone(),
             outputs: node.outputs.clone(),
             parameters: node.parameters.clone(),
@@ -11095,6 +11099,7 @@ impl VulkanKernelStreamMetadata {
                 "rotary_position_embedding"
                     | "append_state_update"
                     | "scaled_dot_product_attention"
+                    | "per_layer_embedding"
                     | "rg_lru_step"
             ),
         }
@@ -11187,6 +11192,7 @@ pub struct VulkanKernelDispatchCommand {
     pub node_index: usize,
     pub node_id: String,
     pub op: String,
+    pub specialization: String,
     pub descriptor_bindings: Vec<VulkanKernelDescriptorBinding>,
     pub push_constants: Vec<VulkanKernelScalarBinding>,
     pub uses_stream_tick: bool,
@@ -11208,6 +11214,7 @@ impl VulkanKernelDispatchCommand {
             node_index: kernel.node_index,
             node_id: kernel.node_id.clone(),
             op: kernel.op.clone(),
+            specialization: kernel.specialization.clone(),
             descriptor_bindings: descriptor_bindings_for_kernel(kernel),
             push_constants: kernel.stream_metadata.push_constants(),
             uses_stream_tick: kernel.stream_metadata.uses_stream_tick,
@@ -14886,6 +14893,7 @@ impl VulkanKernelDispatchRef {
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct VulkanReusableKernelKey {
     op: String,
+    specialization: String,
     descriptor_signature: Vec<VulkanKernelDescriptorSlotSignature>,
     push_constants: Vec<VulkanKernelScalarBinding>,
     uses_stream_tick: bool,
@@ -14895,6 +14903,7 @@ impl VulkanReusableKernelKey {
     fn from_command(command: &VulkanKernelDispatchCommand) -> Self {
         Self {
             op: command.op.clone(),
+            specialization: command.specialization.clone(),
             descriptor_signature: command
                 .descriptor_bindings
                 .iter()
@@ -15008,7 +15017,7 @@ fn descriptor_bindings_for_kernel(
             VulkanKernelDescriptorUsage::StateRead,
             state.state_id.clone(),
             VulkanKernelDescriptorResource::State {
-                pedal_id: kernel.pedal_id.clone(),
+                pedal_id: state.pedal_id.clone(),
                 binding: state.clone(),
             },
         );
@@ -15019,7 +15028,7 @@ fn descriptor_bindings_for_kernel(
             VulkanKernelDescriptorUsage::StateWrite,
             state.state_id.clone(),
             VulkanKernelDescriptorResource::State {
-                pedal_id: kernel.pedal_id.clone(),
+                pedal_id: state.pedal_id.clone(),
                 binding: state.clone(),
             },
         );
@@ -15108,6 +15117,7 @@ fn parameter_binding_index(
 }
 
 fn state_binding_index(
+    resource_plan: &StreamCircuitResourcePlan,
     resident_plan: &VulkanStreamCircuitResidentPlan,
 ) -> Result<BTreeMap<(String, String), VulkanStateBinding>, VulkanBindingPlanError> {
     let mut bindings = BTreeMap::new();
@@ -15116,6 +15126,7 @@ fn state_binding_index(
         let previous = bindings.insert(
             key.clone(),
             VulkanStateBinding {
+                pedal_id: state.pedal_id.clone(),
                 state_id: state.state_id.clone(),
                 state_type: state.state_type.clone(),
                 static_bytes: state.static_bytes,
@@ -15129,7 +15140,86 @@ fn state_binding_index(
             )));
         }
     }
+
+    let mut aliases = BTreeMap::new();
+    for state in &resource_plan.state_allocations {
+        let target = (state.pedal_id.clone(), state.state_id.clone());
+        if !bindings.contains_key(&target) {
+            continue;
+        }
+        let Some(source) = state
+            .sharing
+            .as_deref()
+            .map(shared_state_source)
+            .transpose()?
+            .flatten()
+        else {
+            continue;
+        };
+        aliases.insert(target, source);
+    }
+
+    for (target, initial_source) in &aliases {
+        let mut source = initial_source.clone();
+        let mut visited = BTreeSet::from([target.clone()]);
+        while let Some(next) = aliases.get(&source) {
+            if !visited.insert(source.clone()) {
+                return Err(VulkanBindingPlanError(format!(
+                    "shared state alias cycle reaches {}.{}",
+                    source.0, source.1
+                )));
+            }
+            source = next.clone();
+        }
+        if !visited.insert(source.clone()) {
+            return Err(VulkanBindingPlanError(format!(
+                "shared state alias cycle reaches {}.{}",
+                source.0, source.1
+            )));
+        }
+
+        let target_binding = bindings.get(target).cloned().ok_or_else(|| {
+            VulkanBindingPlanError(format!(
+                "shared state target {}.{} is not resident",
+                target.0, target.1
+            ))
+        })?;
+        let source_binding = bindings.get(&source).cloned().ok_or_else(|| {
+            VulkanBindingPlanError(format!(
+                "shared state {}.{} references non-resident source {}.{}",
+                target.0, target.1, source.0, source.1
+            ))
+        })?;
+        if target_binding.state_type != source_binding.state_type
+            || target_binding.static_bytes != source_binding.static_bytes
+            || target_binding.bytes_per_activation != source_binding.bytes_per_activation
+        {
+            return Err(VulkanBindingPlanError(format!(
+                "shared state {}.{} is incompatible with source {}.{}",
+                target.0, target.1, source.0, source.1
+            )));
+        }
+        bindings.insert(target.clone(), source_binding);
+    }
+
     Ok(bindings)
+}
+
+fn shared_state_source(sharing: &str) -> Result<Option<(String, String)>, VulkanBindingPlanError> {
+    let Some(source) = sharing.strip_prefix("shared_from:") else {
+        return Ok(None);
+    };
+    let Some((pedal_id, state_id)) = source.rsplit_once('.') else {
+        return Err(VulkanBindingPlanError(format!(
+            "shared state source {source:?} must be PEDAL_ID.STATE_ID"
+        )));
+    };
+    if pedal_id.is_empty() || state_id.is_empty() {
+        return Err(VulkanBindingPlanError(format!(
+            "shared state source {source:?} must contain non-empty pedal and state ids"
+        )));
+    }
+    Ok(Some((pedal_id.to_string(), state_id.to_string())))
 }
 
 fn activation_binding_index(
@@ -15237,6 +15327,7 @@ fn bind_node(
         node_index: node.index,
         node_id: node.id.clone(),
         op: node.op.clone(),
+        specialization: node.specialization.clone(),
         inputs,
         outputs,
         parameters,
@@ -15296,7 +15387,7 @@ fn bind_signal(
                         ))
                     })?;
                 VulkanSignalResource::StateBuffer {
-                    pedal_id: circuit.pedal_id.clone(),
+                    pedal_id: state.pedal_id.clone(),
                     state_id: state.state_id.clone(),
                     static_bytes: state.static_bytes,
                     bytes_per_activation: state.bytes_per_activation,
@@ -15328,8 +15419,8 @@ fn bind_signal(
                         ))
                     })?;
                 VulkanSignalResource::StateView {
-                    pedal_id: circuit.pedal_id.clone(),
-                    state_id,
+                    pedal_id: state.pedal_id.clone(),
+                    state_id: state.state_id.clone(),
                     static_bytes: state.static_bytes,
                     bytes_per_activation: state.bytes_per_activation,
                 }
@@ -24794,6 +24885,7 @@ mod tests {
             VulkanKernelDescriptorResource::State {
                 pedal_id: "layer_02".to_string(),
                 binding: VulkanStateBinding {
+                    pedal_id: "layer_02".to_string(),
                     state_id: "kv_memory".to_string(),
                     state_type: "append_only_attention_memory".to_string(),
                     static_bytes: None,
@@ -24955,6 +25047,54 @@ mod tests {
                 .to_string()
                 .contains("layer_02.kv_memory requires non-zero dynamic state capacity")
         );
+    }
+
+    #[test]
+    fn reusable_kernel_plan_keeps_compile_time_specializations_distinct() {
+        let command = |dispatch_index: usize, pedal_id: &str, specialization: &str| {
+            VulkanKernelDispatchCommand {
+                dispatch_index,
+                circuit_index: dispatch_index,
+                kernel_id: format!("{pedal_id}.per_layer_embedding"),
+                pedal_id: pedal_id.to_string(),
+                circuit_id: format!("{pedal_id}_circuit"),
+                node_index: 0,
+                node_id: "per_layer_embedding".to_string(),
+                op: "per_layer_embedding".to_string(),
+                specialization: specialization.to_string(),
+                descriptor_bindings: Vec::new(),
+                push_constants: Vec::new(),
+                uses_stream_tick: true,
+            }
+        };
+        let dispatch_plan = VulkanKernelDispatchPlan {
+            backend_id: VULKAN_STREAM_CIRCUIT_BACKEND_ID.to_string(),
+            commands: vec![
+                command(0, "layer_00", r#"{"layer_index":0}"#),
+                command(1, "layer_01", r#"{"layer_index":1}"#),
+            ],
+        };
+
+        let reusable_plan = VulkanReusableKernelPlan::from_dispatch_plan(&dispatch_plan);
+
+        assert_eq!(reusable_plan.total_family_count(), 2);
+        assert_eq!(reusable_plan.reusable_family_count(), 0);
+        assert!(
+            reusable_plan
+                .families
+                .iter()
+                .all(|family| family.command_refs.len() == 1)
+        );
+    }
+
+    #[test]
+    fn parses_explicit_shared_state_sources() {
+        assert_eq!(
+            shared_state_source("shared_from:layer_22.kv_memory").unwrap(),
+            Some(("layer_22".to_string(), "kv_memory".to_string()))
+        );
+        assert_eq!(shared_state_source("private").unwrap(), None);
+        assert!(shared_state_source("shared_from:kv_memory").is_err());
     }
 
     #[test]
