@@ -7,7 +7,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Gauge, List, ListItem, Paragraph, Wrap};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::{RuntimeAvailableDevice, RuntimeEditorInstance};
+use crate::{RuntimeAvailableDevice, RuntimeEditorControlKind, RuntimeEditorInstance};
 
 use super::app::{
     App, BrowserEntry, CompilerProgressState, FocusRegion, HitTarget, ModelSelectorFocus,
@@ -822,38 +822,7 @@ fn render_pedal_modal(frame: &mut Frame<'_>, app: &mut App, modal: &PedalModalSt
         );
         app.hit_map.insert(area, HitTarget::ModalRow(index));
     }
-    let properties = if modal.source.controls.is_empty() {
-        vec![Line::styled(
-            "No runtime-editable controls declared by this compiled source pedal.",
-            Style::default().fg(META),
-        )]
-    } else {
-        let mut lines = vec![Line::styled(
-            "Declared control metadata (read-only unless schema marks it editable)",
-            Style::default().fg(META),
-        )];
-        lines.extend(modal.source.controls.iter().map(|control| {
-            Line::styled(
-                truncate(
-                    &control.to_string(),
-                    rows[6].width.saturating_sub(2) as usize,
-                ),
-                Style::default().fg(TEXT),
-            )
-        }));
-        lines
-    };
-    frame.render_widget(
-        Paragraph::new(properties)
-            .block(
-                Block::default()
-                    .title(" Properties ")
-                    .borders(Borders::TOP)
-                    .border_style(Style::default().fg(QUIET)),
-            )
-            .wrap(Wrap { trim: true }),
-        rows[6],
-    );
+    render_pedal_properties(frame, app, modal, rows[6]);
     if let Some(error) = &modal.error {
         frame.render_widget(
             Paragraph::new(truncate(error, rows[6].width as usize))
@@ -866,8 +835,8 @@ fn render_pedal_modal(frame: &mut Frame<'_>, app: &mut App, modal: &PedalModalSt
             ),
         );
     }
-    let apply_style = modal_row_style(modal.focus_row == 4);
-    let cancel_style = modal_row_style(modal.focus_row == 5);
+    let apply_style = modal_row_style(modal.focus_row == modal.apply_row());
+    let cancel_style = modal_row_style(modal.focus_row == modal.cancel_row());
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled("[ Apply ]", apply_style),
@@ -886,6 +855,174 @@ fn render_pedal_modal(frame: &mut Frame<'_>, app: &mut App, modal: &PedalModalSt
         Rect::new(middle + 2, rows[7].y, 10, 1),
         HitTarget::ModalCancel,
     );
+}
+
+fn render_pedal_properties(
+    frame: &mut Frame<'_>,
+    app: &mut App,
+    modal: &PedalModalState,
+    area: Rect,
+) {
+    let block = Block::default()
+        .title(" Instance properties ")
+        .borders(Borders::TOP)
+        .border_style(Style::default().fg(QUIET));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if modal.properties.is_empty() {
+        frame.render_widget(
+            Paragraph::new("No control schema declared by this source pedal.")
+                .style(Style::default().fg(META)),
+            inner,
+        );
+        return;
+    }
+    let detail_height = u16::from(inner.height >= 2);
+    let list_area = Rect::new(
+        inner.x,
+        inner.y,
+        inner.width,
+        inner.height.saturating_sub(detail_height),
+    );
+    let visible = list_area.height as usize;
+    let selected = modal.property_index().unwrap_or(0);
+    let start = selected.saturating_sub(visible.saturating_sub(1));
+    for (visual_row, (property_index, property)) in modal
+        .properties
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(visible)
+        .enumerate()
+    {
+        let row = Rect::new(
+            list_area.x,
+            list_area.y + visual_row as u16,
+            list_area.width,
+            1,
+        );
+        let focused = modal.focus_row == property_index + 4;
+        let label_width = (inner.width / 3).clamp(12, 22);
+        let label_area = Rect::new(row.x, row.y, label_width.min(row.width), 1);
+        let value_area = Rect::new(
+            label_area.right().saturating_add(1),
+            row.y,
+            row.right()
+                .saturating_sub(label_area.right().saturating_add(1)),
+            1,
+        );
+        let label = format!(
+            "{}{}",
+            if focused { "› " } else { "  " },
+            property.schema.name
+        );
+        frame.render_widget(
+            Paragraph::new(truncate(&label, label_area.width as usize)).style(if focused {
+                Style::default().fg(SIGNAL).bold()
+            } else {
+                Style::default().fg(META)
+            }),
+            label_area,
+        );
+        if property.accepts_text() {
+            let width = value_area.width.saturating_sub(1) as usize;
+            let (start, line, cursor) = buffer_line(&property.buffer, width.max(1));
+            frame.render_widget(
+                Paragraph::new(line).style(if property.error.is_some() {
+                    Style::default().fg(FAULT)
+                } else if focused {
+                    Style::default().fg(SIGNAL).underlined()
+                } else {
+                    Style::default().fg(TEXT)
+                }),
+                value_area,
+            );
+            if focused && property.buffer.cursor() >= start {
+                frame.set_cursor_position(Position::new(value_area.x + cursor as u16, row.y));
+            }
+        } else {
+            let value = property_display(property);
+            frame.render_widget(
+                Paragraph::new(truncate(&value, value_area.width as usize)).style(
+                    if property.error.is_some() {
+                        Style::default().fg(FAULT)
+                    } else if focused {
+                        Style::default().fg(SIGNAL).underlined()
+                    } else if property.editable() {
+                        Style::default().fg(TEXT)
+                    } else {
+                        Style::default().fg(META)
+                    },
+                ),
+                value_area,
+            );
+        }
+        app.hit_map
+            .insert(row, HitTarget::ModalRow(property_index + 4));
+    }
+    if detail_height > 0 {
+        let selected = modal
+            .property_index()
+            .and_then(|index| modal.properties.get(index));
+        let detail = selected
+            .and_then(|property| {
+                property
+                    .error
+                    .as_deref()
+                    .map(|error| (format!("! {error}"), FAULT))
+                    .or_else(|| {
+                        property
+                            .schema
+                            .description
+                            .as_deref()
+                            .map(|description| (description.to_string(), META))
+                    })
+            })
+            .unwrap_or_else(|| {
+                (
+                    "Arrows change controls · text fields accept typing and paste".to_string(),
+                    QUIET,
+                )
+            });
+        frame.render_widget(
+            Paragraph::new(truncate(&detail.0, inner.width as usize))
+                .style(Style::default().fg(detail.1)),
+            Rect::new(inner.x, inner.bottom().saturating_sub(1), inner.width, 1),
+        );
+    }
+}
+
+fn property_display(property: &super::app::PedalPropertyDraft) -> String {
+    let units = property
+        .schema
+        .units
+        .as_deref()
+        .map(|units| format!(" {units}"))
+        .unwrap_or_default();
+    let lifecycle = [
+        property.schema.requires_state_reset.then_some("reset"),
+        property.schema.requires_remount.then_some("remount"),
+        property.schema.requires_recompile.then_some("recompile"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join("+");
+    let lifecycle = (!lifecycle.is_empty())
+        .then(|| format!(" · {lifecycle}"))
+        .unwrap_or_default();
+    match &property.schema.kind {
+        RuntimeEditorControlKind::Unsupported { declared_type } => {
+            format!("unsupported {declared_type} · {}", property.schema.raw)
+        }
+        RuntimeEditorControlKind::ReadOnly => {
+            format!("{}{} · read-only", property.display_value(), units)
+        }
+        _ if !property.editable() => {
+            format!("{}{} · read-only", property.display_value(), units)
+        }
+        _ => format!("‹ {}{} ›{lifecycle}", property.display_value(), units),
+    }
 }
 
 fn short_device_label(

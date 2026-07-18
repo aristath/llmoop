@@ -142,8 +142,33 @@ fn action_from_key(app: &App, key: KeyEvent) -> Option<AppAction> {
             KeyCode::Esc => Some(AppAction::CloseOverlay),
             KeyCode::Up => Some(AppAction::ModalPrevious),
             KeyCode::Down => Some(AppAction::ModalNext),
+            KeyCode::Left if app.modal_text_entry_active() && !alt => {
+                Some(AppAction::MoveTextCursor {
+                    motion: CursorMotion::Left,
+                    selecting: shift,
+                })
+            }
+            KeyCode::Right if app.modal_text_entry_active() && !alt => {
+                Some(AppAction::MoveTextCursor {
+                    motion: CursorMotion::Right,
+                    selecting: shift,
+                })
+            }
             KeyCode::Left => Some(AppAction::ModalChange(-1)),
             KeyCode::Right => Some(AppAction::ModalChange(1)),
+            KeyCode::Home if app.modal_text_entry_active() => Some(AppAction::MoveTextCursor {
+                motion: CursorMotion::Home,
+                selecting: shift,
+            }),
+            KeyCode::End if app.modal_text_entry_active() => Some(AppAction::MoveTextCursor {
+                motion: CursorMotion::End,
+                selecting: shift,
+            }),
+            KeyCode::Backspace if app.modal_text_entry_active() => Some(AppAction::Backspace),
+            KeyCode::Delete if app.modal_text_entry_active() => Some(AppAction::DeleteForward),
+            KeyCode::Char(character) if app.modal_text_entry_active() && !ctrl && !alt => {
+                Some(AppAction::InsertText(character.to_string()))
+            }
             KeyCode::Enter => Some(AppAction::ActivateModal),
             _ => None,
         },

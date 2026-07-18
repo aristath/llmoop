@@ -93,9 +93,52 @@ pub struct RuntimeEditorSourcePedal {
     pub output_shape: Vec<usize>,
     pub state_ports: Vec<Value>,
     pub controls: Vec<Value>,
+    pub control_schemas: Vec<RuntimeEditorControlSchema>,
     pub parameter_ref_count: usize,
     pub node_count: usize,
     pub kernel_count: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RuntimeEditorControlChoice {
+    pub value: Value,
+    pub label: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum RuntimeEditorControlKind {
+    Boolean,
+    Integer,
+    Number,
+    Text,
+    Enumeration {
+        choices: Vec<RuntimeEditorControlChoice>,
+    },
+    ReadOnly,
+    Unsupported {
+        declared_type: String,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RuntimeEditorControlSchema {
+    pub id: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub kind: RuntimeEditorControlKind,
+    pub current_value: Option<Value>,
+    pub default_value: Option<Value>,
+    pub minimum: Option<f64>,
+    pub maximum: Option<f64>,
+    pub step: Option<f64>,
+    pub units: Option<String>,
+    pub editable_at_runtime: bool,
+    pub requires_state_reset: bool,
+    pub requires_remount: bool,
+    pub requires_recompile: bool,
+    pub scope: String,
+    pub raw: Value,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -106,6 +149,7 @@ pub struct RuntimeEditorInstance {
     pub occurrence: usize,
     pub device_id: String,
     pub enabled: bool,
+    pub control_values: BTreeMap<String, Value>,
     pub state_policy: StreamCircuitPedalInstanceStatePolicy,
 }
 
@@ -249,6 +293,7 @@ impl RuntimeModelEditor {
                     occurrence: *occurrence,
                     device_id: instance.device_id.clone(),
                     enabled: instance.enabled,
+                    control_values: instance.control_values.clone(),
                     state_policy: instance.state_policy.clone(),
                 })
             })
@@ -300,6 +345,7 @@ impl RuntimeModelEditor {
                     source_pedal_id: source_id.clone(),
                     device_id: self.draft.default_device_id.clone(),
                     enabled: true,
+                    control_values: BTreeMap::new(),
                     state_policy: StreamCircuitPedalInstanceStatePolicy::Fresh,
                 }
             };
@@ -352,6 +398,69 @@ impl RuntimeModelEditor {
         Ok(())
     }
 
+    pub fn set_instance_control_value(
+        &mut self,
+        instance_id: &str,
+        control_id: &str,
+        value: Value,
+    ) -> Result<(), RuntimeEditorError> {
+        let source = self.source_pedal_for_instance(instance_id).ok_or_else(|| {
+            RuntimeEditorError(format!(
+                "runtime patch has no pedal instance {instance_id:?}"
+            ))
+        })?;
+        let schema = source
+            .control_schemas
+            .iter()
+            .find(|schema| schema.id == control_id)
+            .ok_or_else(|| {
+                RuntimeEditorError(format!(
+                    "source pedal {} declares no control {control_id:?}",
+                    source.source_id
+                ))
+            })?;
+        validate_runtime_editor_control_value(schema, &value)?;
+        let instance = self
+            .draft
+            .instances
+            .iter_mut()
+            .find(|instance| instance.instance_id == instance_id)
+            .ok_or_else(|| {
+                RuntimeEditorError(format!(
+                    "runtime patch has no pedal instance {instance_id:?}"
+                ))
+            })?;
+        instance
+            .control_values
+            .insert(control_id.to_string(), value);
+        Ok(())
+    }
+
+    pub fn effective_instance_control_value(
+        &self,
+        instance_id: &str,
+        control_id: &str,
+    ) -> Option<Value> {
+        let instance = self
+            .draft
+            .instances
+            .iter()
+            .find(|instance| instance.instance_id == instance_id)?;
+        if let Some(value) = instance.control_values.get(control_id) {
+            return Some(value.clone());
+        }
+        self.source_pedal_for_instance(instance_id)?
+            .control_schemas
+            .iter()
+            .find(|schema| schema.id == control_id)
+            .and_then(|schema| {
+                schema
+                    .current_value
+                    .clone()
+                    .or_else(|| schema.default_value.clone())
+            })
+    }
+
     pub fn set_instance_state_policy(
         &mut self,
         instance_id: &str,
@@ -383,6 +492,33 @@ impl RuntimeModelEditor {
                     "instance {} is assigned to unavailable device {}",
                     instance.instance_id, instance.device_id
                 ));
+            }
+            if let Some(source) = self
+                .source_pedals
+                .iter()
+                .find(|source| source.source_id == instance.source_pedal_id)
+            {
+                for (control_id, value) in &instance.control_values {
+                    match source
+                        .control_schemas
+                        .iter()
+                        .find(|schema| schema.id == *control_id)
+                    {
+                        Some(schema) => {
+                            if let Err(error) = validate_runtime_editor_control_value(schema, value)
+                            {
+                                errors.push(format!(
+                                    "instance {} control {}: {}",
+                                    instance.instance_id, control_id, error
+                                ));
+                            }
+                        }
+                        None => errors.push(format!(
+                            "instance {} has undeclared control {}",
+                            instance.instance_id, control_id
+                        )),
+                    }
+                }
             }
         }
         if let Err(error) = self.draft.validate_against_graph(&self.source_graph) {
@@ -461,6 +597,14 @@ fn source_pedals(
                 .filter_map(|state| serde_json::to_value(state).ok())
                 .collect(),
             controls: pedal.circuit.boundary.controls.clone(),
+            control_schemas: pedal
+                .circuit
+                .boundary
+                .controls
+                .iter()
+                .enumerate()
+                .map(|(index, control)| runtime_editor_control_schema(index, control))
+                .collect(),
             parameter_ref_count: pedal.params.refs.len(),
             node_count: pedal.circuit.nodes.len(),
             kernel_count: execution_by_pedal
@@ -469,6 +613,199 @@ fn source_pedals(
                 .unwrap_or(0),
         })
         .collect()
+}
+
+pub fn runtime_editor_control_schema(index: usize, raw: &Value) -> RuntimeEditorControlSchema {
+    let object = raw.as_object();
+    let string_field = |names: &[&str]| {
+        object.and_then(|object| {
+            names
+                .iter()
+                .find_map(|name| object.get(*name).and_then(Value::as_str))
+                .map(ToOwned::to_owned)
+        })
+    };
+    let bool_field = |names: &[&str]| {
+        object.and_then(|object| {
+            names
+                .iter()
+                .find_map(|name| object.get(*name).and_then(Value::as_bool))
+        })
+    };
+    let value_field = |names: &[&str]| {
+        object.and_then(|object| names.iter().find_map(|name| object.get(*name).cloned()))
+    };
+    let number_field = |names: &[&str]| {
+        object.and_then(|object| {
+            names
+                .iter()
+                .find_map(|name| object.get(*name).and_then(Value::as_f64))
+        })
+    };
+    let id = string_field(&["id", "property_id"]).unwrap_or_else(|| format!("control_{index}"));
+    let name = string_field(&["name", "label"]).unwrap_or_else(|| id.clone());
+    let declared_type = string_field(&["value_type", "type"])
+        .unwrap_or_else(|| "unspecified".to_string())
+        .to_lowercase();
+    let choices = object
+        .and_then(|object| {
+            ["choices", "values", "enum"]
+                .into_iter()
+                .find_map(|name| object.get(name).and_then(Value::as_array))
+        })
+        .map(|choices| {
+            choices
+                .iter()
+                .map(|choice| {
+                    if let Some(object) = choice.as_object() {
+                        let value = object.get("value").cloned().unwrap_or(Value::Null);
+                        let label = object
+                            .get("label")
+                            .and_then(Value::as_str)
+                            .map(ToOwned::to_owned)
+                            .unwrap_or_else(|| display_json_value(&value));
+                        RuntimeEditorControlChoice { value, label }
+                    } else {
+                        RuntimeEditorControlChoice {
+                            value: choice.clone(),
+                            label: display_json_value(choice),
+                        }
+                    }
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let kind = match declared_type.as_str() {
+        "bool" | "boolean" | "toggle" => RuntimeEditorControlKind::Boolean,
+        "int" | "integer" | "u32" | "u64" | "i32" | "i64" => RuntimeEditorControlKind::Integer,
+        "float" | "number" | "f32" | "f64" => RuntimeEditorControlKind::Number,
+        "string" | "text" => RuntimeEditorControlKind::Text,
+        "enum" | "enumeration" | "select" if !choices.is_empty() => {
+            RuntimeEditorControlKind::Enumeration { choices }
+        }
+        "readonly" | "read_only" => RuntimeEditorControlKind::ReadOnly,
+        _ => RuntimeEditorControlKind::Unsupported {
+            declared_type: declared_type.clone(),
+        },
+    };
+    RuntimeEditorControlSchema {
+        id,
+        name,
+        description: string_field(&["description", "help"]),
+        kind,
+        current_value: value_field(&["current_value", "current", "value"]),
+        default_value: value_field(&["default_value", "default"]),
+        minimum: number_field(&["minimum", "min"]),
+        maximum: number_field(&["maximum", "max"]),
+        step: number_field(&["step"]),
+        units: string_field(&["units", "unit"]),
+        editable_at_runtime: bool_field(&["editable_at_runtime", "runtime_editable"])
+            .unwrap_or(false),
+        requires_state_reset: bool_field(&["requires_state_reset"]).unwrap_or(false),
+        requires_remount: bool_field(&["requires_remount"]).unwrap_or(false),
+        requires_recompile: bool_field(&["requires_recompile"]).unwrap_or(false),
+        scope: string_field(&["scope"])
+            .unwrap_or_else(|| "instance".to_string())
+            .to_lowercase(),
+        raw: raw.clone(),
+    }
+}
+
+pub fn validate_runtime_editor_control_value(
+    schema: &RuntimeEditorControlSchema,
+    value: &Value,
+) -> Result<(), RuntimeEditorError> {
+    if !schema.editable_at_runtime {
+        return Err(RuntimeEditorError(format!(
+            "control {:?} is not editable at runtime",
+            schema.id
+        )));
+    }
+    if schema.scope != "instance" {
+        return Err(RuntimeEditorError(format!(
+            "control {:?} has {:?} scope; this editor changes pedal instances",
+            schema.id, schema.scope
+        )));
+    }
+    let numeric = match &schema.kind {
+        RuntimeEditorControlKind::Boolean if value.is_boolean() => None,
+        RuntimeEditorControlKind::Integer
+            if value.as_i64().is_some() || value.as_u64().is_some() =>
+        {
+            value.as_f64()
+        }
+        RuntimeEditorControlKind::Number if value.as_f64().is_some() => value.as_f64(),
+        RuntimeEditorControlKind::Text if value.is_string() => None,
+        RuntimeEditorControlKind::Enumeration { choices }
+            if choices.iter().any(|choice| choice.value == *value) =>
+        {
+            None
+        }
+        RuntimeEditorControlKind::ReadOnly => {
+            return Err(RuntimeEditorError(format!(
+                "control {:?} is read-only",
+                schema.id
+            )));
+        }
+        RuntimeEditorControlKind::Unsupported { declared_type } => {
+            return Err(RuntimeEditorError(format!(
+                "control {:?} uses unsupported value type {:?}",
+                schema.id, declared_type
+            )));
+        }
+        _ => {
+            return Err(RuntimeEditorError(format!(
+                "control {:?} received a value incompatible with its declared type",
+                schema.id
+            )));
+        }
+    };
+    if let Some(numeric) = numeric {
+        if schema.minimum.is_some_and(|minimum| numeric < minimum) {
+            return Err(RuntimeEditorError(format!(
+                "value {numeric} is below minimum {}",
+                schema.minimum.unwrap_or_default()
+            )));
+        }
+        if schema.maximum.is_some_and(|maximum| numeric > maximum) {
+            return Err(RuntimeEditorError(format!(
+                "value {numeric} is above maximum {}",
+                schema.maximum.unwrap_or_default()
+            )));
+        }
+        if let Some(step) = schema.step {
+            if !step.is_finite() || step <= 0.0 {
+                return Err(RuntimeEditorError(format!(
+                    "control {:?} declares a non-positive or non-finite step",
+                    schema.id
+                )));
+            }
+            if matches!(schema.kind, RuntimeEditorControlKind::Integer)
+                && (step - step.round()).abs() > f64::EPSILON
+            {
+                return Err(RuntimeEditorError(format!(
+                    "integer control {:?} declares non-whole step {step}",
+                    schema.id
+                )));
+            }
+            let anchor = schema.minimum.unwrap_or(0.0);
+            let step_position = (numeric - anchor) / step;
+            let tolerance = 1e-9 * step_position.abs().max(1.0);
+            if (step_position - step_position.round()).abs() > tolerance {
+                return Err(RuntimeEditorError(format!(
+                    "value {numeric} does not align to step {step} from {anchor}",
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn display_json_value(value: &Value) -> String {
+    value
+        .as_str()
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| value.to_string())
 }
 
 fn allocate_instance_id(
@@ -706,5 +1043,54 @@ mod tests {
         assert_eq!(instances[2].occurrence, 2);
         assert_ne!(instances[1].instance_id, instances[2].instance_id);
         assert!(editor.validation().valid);
+    }
+
+    #[test]
+    fn generic_control_schema_preserves_constraints_and_rejects_bad_values() {
+        let raw = serde_json::json!({
+            "id": "attention_window",
+            "name": "Attention window",
+            "description": "Local temporal span",
+            "value_type": "integer",
+            "current": 4096,
+            "default": 2048,
+            "min": 128,
+            "max": 8192,
+            "step": 128,
+            "units": "tokens",
+            "editable_at_runtime": true,
+            "requires_state_reset": true,
+            "scope": "instance"
+        });
+        let schema = runtime_editor_control_schema(0, &raw);
+        assert_eq!(schema.id, "attention_window");
+        assert_eq!(schema.kind, RuntimeEditorControlKind::Integer);
+        assert_eq!(schema.current_value, Some(serde_json::json!(4096)));
+        assert_eq!(schema.minimum, Some(128.0));
+        assert_eq!(schema.maximum, Some(8192.0));
+        assert!(schema.requires_state_reset);
+        assert!(validate_runtime_editor_control_value(&schema, &serde_json::json!(1024)).is_ok());
+        assert!(
+            validate_runtime_editor_control_value(&schema, &serde_json::json!(64))
+                .unwrap_err()
+                .to_string()
+                .contains("below minimum")
+        );
+        assert!(
+            validate_runtime_editor_control_value(&schema, &serde_json::json!(1000))
+                .unwrap_err()
+                .to_string()
+                .contains("does not align to step")
+        );
+
+        let unsupported = runtime_editor_control_schema(
+            1,
+            &serde_json::json!({"id":"control","type":"pedal_control"}),
+        );
+        assert!(matches!(
+            unsupported.kind,
+            RuntimeEditorControlKind::Unsupported { .. }
+        ));
+        assert!(!unsupported.editable_at_runtime);
     }
 }

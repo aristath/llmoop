@@ -873,6 +873,7 @@ impl StreamCircuitRuntimePatch {
                         source_pedal_id: source_pedal_id.clone(),
                         device_id: String::new(),
                         enabled: true,
+                        control_values: BTreeMap::new(),
                         state_policy: StreamCircuitPedalInstanceStatePolicy::Fresh,
                     },
                 )
@@ -902,6 +903,7 @@ impl StreamCircuitRuntimePatch {
                     source_pedal_id: artifact.pedal.id.clone(),
                     device_id: spec.device_for_pedal(&artifact.pedal.id).to_string(),
                     enabled: true,
+                    control_values: BTreeMap::new(),
                     state_policy: StreamCircuitPedalInstanceStatePolicy::Fresh,
                 })
                 .collect(),
@@ -953,6 +955,7 @@ impl StreamCircuitRuntimePatch {
             source_pedal_id: source.source_pedal_id,
             device_id: source.device_id,
             enabled: source.enabled,
+            control_values: BTreeMap::new(),
             state_policy: StreamCircuitPedalInstanceStatePolicy::Fresh,
         };
         self.instances.insert(after_index + 1, duplicate);
@@ -974,6 +977,7 @@ impl StreamCircuitRuntimePatch {
             if let Some(previous) = previous_instances.get(&instance.instance_id) {
                 instance.device_id = previous.device_id.clone();
                 instance.enabled = previous.enabled;
+                instance.control_values = previous.control_values.clone();
                 instance.state_policy = previous.state_policy.clone();
             }
         }
@@ -1178,6 +1182,8 @@ pub struct StreamCircuitPedalInstance {
     pub device_id: String,
     #[serde(default = "default_enabled")]
     pub enabled: bool,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub control_values: BTreeMap<String, serde_json::Value>,
     pub state_policy: StreamCircuitPedalInstanceStatePolicy,
 }
 
@@ -3359,6 +3365,7 @@ mod tests {
                     source_pedal_id: "layer_00".to_string(),
                     device_id: "gpu0".to_string(),
                     enabled: true,
+                    control_values: BTreeMap::new(),
                     state_policy: StreamCircuitPedalInstanceStatePolicy::Fresh,
                 }],
             },
@@ -3486,6 +3493,7 @@ mod tests {
                     source_pedal_id: "layer_05".to_string(),
                     device_id: "vulkan:5".to_string(),
                     enabled: true,
+                    control_values: BTreeMap::new(),
                     state_policy: StreamCircuitPedalInstanceStatePolicy::Fresh,
                 }],
             },

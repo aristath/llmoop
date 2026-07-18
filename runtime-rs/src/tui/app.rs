@@ -8,8 +8,10 @@ use ratatui::layout::Rect;
 use serde_json::Value;
 
 use crate::{
-    RuntimeEditorInstance, RuntimeEditorSourcePedal, RuntimeModelEditor, RuntimeModelPathKind,
+    RuntimeEditorControlKind, RuntimeEditorControlSchema, RuntimeEditorInstance,
+    RuntimeEditorSourcePedal, RuntimeModelEditor, RuntimeModelPathKind,
     StreamCircuitPedalInstanceStatePolicy, classify_runtime_model_path,
+    validate_runtime_editor_control_value,
 };
 
 use super::compiler::{
@@ -291,13 +293,27 @@ pub(crate) struct PedalModalState {
     pub policy: PedalPolicyKind,
     pub policy_targets: Vec<String>,
     pub policy_target_index: usize,
+    pub properties: Vec<PedalPropertyDraft>,
     pub focus_row: usize,
     pub error: Option<String>,
 }
 
 impl PedalModalState {
     fn row_count(&self) -> usize {
-        6
+        6 + self.properties.len()
+    }
+
+    pub(crate) fn property_index(&self) -> Option<usize> {
+        let index = self.focus_row.checked_sub(4)?;
+        (index < self.properties.len()).then_some(index)
+    }
+
+    pub(crate) fn apply_row(&self) -> usize {
+        4 + self.properties.len()
+    }
+
+    pub(crate) fn cancel_row(&self) -> usize {
+        self.apply_row() + 1
     }
 
     fn state_policy(&self) -> StreamCircuitPedalInstanceStatePolicy {
@@ -318,6 +334,156 @@ impl PedalModalState {
                     .unwrap_or_default(),
             },
         }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PedalPropertyDraft {
+    pub schema: RuntimeEditorControlSchema,
+    pub original_value: Value,
+    pub value: Value,
+    pub buffer: TextBuffer,
+    pub error: Option<String>,
+}
+
+impl PedalPropertyDraft {
+    fn new(schema: RuntimeEditorControlSchema, value: Value) -> Self {
+        let buffer = TextBuffer::new(control_value_text(&value));
+        let mut property = Self {
+            schema,
+            original_value: value.clone(),
+            value,
+            buffer,
+            error: None,
+        };
+        property.revalidate();
+        property
+    }
+
+    pub fn editable(&self) -> bool {
+        self.schema.editable_at_runtime
+            && self.schema.scope == "instance"
+            && !matches!(
+                self.schema.kind,
+                RuntimeEditorControlKind::ReadOnly | RuntimeEditorControlKind::Unsupported { .. }
+            )
+    }
+
+    pub fn accepts_text(&self) -> bool {
+        self.editable()
+            && matches!(
+                self.schema.kind,
+                RuntimeEditorControlKind::Integer
+                    | RuntimeEditorControlKind::Number
+                    | RuntimeEditorControlKind::Text
+            )
+    }
+
+    pub fn changed(&self) -> bool {
+        self.value != self.original_value
+    }
+
+    fn revalidate(&mut self) {
+        self.error = if self.editable() {
+            validate_runtime_editor_control_value(&self.schema, &self.value)
+                .map_err(|error| error.to_string())
+                .err()
+        } else {
+            None
+        };
+    }
+
+    fn reparse_buffer(&mut self) {
+        let parsed = match self.schema.kind {
+            RuntimeEditorControlKind::Integer => self
+                .buffer
+                .text()
+                .parse::<i64>()
+                .map(Value::from)
+                .map_err(|_| "Expected a whole number".to_string()),
+            RuntimeEditorControlKind::Number => self
+                .buffer
+                .text()
+                .parse::<f64>()
+                .map_err(|_| "Expected a number".to_string())
+                .and_then(|number| {
+                    serde_json::Number::from_f64(number)
+                        .map(Value::Number)
+                        .ok_or_else(|| "Number must be finite".to_string())
+                }),
+            RuntimeEditorControlKind::Text => Ok(Value::String(self.buffer.text().to_string())),
+            _ => Ok(self.value.clone()),
+        };
+        match parsed {
+            Ok(value) => {
+                self.value = value;
+                self.revalidate();
+            }
+            Err(error) => self.error = Some(error),
+        }
+    }
+
+    fn change(&mut self, delta: i32) {
+        if !self.editable() {
+            return;
+        }
+        match &self.schema.kind {
+            RuntimeEditorControlKind::Boolean => {
+                self.value = Value::Bool(!self.value.as_bool().unwrap_or(false));
+                self.buffer.set(control_value_text(&self.value));
+                self.revalidate();
+            }
+            RuntimeEditorControlKind::Enumeration { choices } if !choices.is_empty() => {
+                let current = choices
+                    .iter()
+                    .position(|choice| choice.value == self.value)
+                    .unwrap_or(0);
+                let next = cycle_index(current, choices.len(), delta);
+                self.value = choices[next].value.clone();
+                self.buffer.set(control_value_text(&self.value));
+                self.revalidate();
+            }
+            RuntimeEditorControlKind::Integer => {
+                let step = self.schema.step.unwrap_or(1.0).round() as i64;
+                let current = self.value.as_i64().unwrap_or(0);
+                let mut next = current.saturating_add(step.saturating_mul(delta as i64));
+                if let Some(minimum) = self.schema.minimum {
+                    next = next.max(minimum.ceil() as i64);
+                }
+                if let Some(maximum) = self.schema.maximum {
+                    next = next.min(maximum.floor() as i64);
+                }
+                self.value = Value::from(next);
+                self.buffer.set(next.to_string());
+                self.revalidate();
+            }
+            RuntimeEditorControlKind::Number => {
+                let step = self.schema.step.unwrap_or(0.1);
+                let current = self.value.as_f64().unwrap_or(0.0);
+                let mut next = current + step * delta as f64;
+                if let Some(minimum) = self.schema.minimum {
+                    next = next.max(minimum);
+                }
+                if let Some(maximum) = self.schema.maximum {
+                    next = next.min(maximum);
+                }
+                if let Some(number) = serde_json::Number::from_f64(next) {
+                    self.value = Value::Number(number);
+                    self.buffer.set(next.to_string());
+                    self.revalidate();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    pub fn display_value(&self) -> String {
+        if let RuntimeEditorControlKind::Enumeration { choices } = &self.schema.kind
+            && let Some(choice) = choices.iter().find(|choice| choice.value == self.value)
+        {
+            return choice.label.clone();
+        }
+        control_value_text(&self.value)
     }
 }
 
@@ -397,6 +563,16 @@ impl App {
 
     pub fn take_terminal_reset_request(&mut self) -> bool {
         std::mem::take(&mut self.terminal_reset_requested)
+    }
+
+    pub fn modal_text_entry_active(&self) -> bool {
+        let Some(Overlay::Pedal(modal)) = &self.overlay else {
+            return false;
+        };
+        modal
+            .property_index()
+            .and_then(|index| modal.properties.get(index))
+            .is_some_and(PedalPropertyDraft::accepts_text)
     }
 
     pub fn action_at(&self, column: u16, row: u16) -> Option<AppAction> {
@@ -649,10 +825,16 @@ impl App {
                 modal.focus_row = row.min(modal.row_count().saturating_sub(1));
                 if row <= 3 {
                     change_pedal_modal(modal, 1);
-                } else if row == 4 {
+                } else if row == modal.apply_row() {
                     self.apply_pedal_modal();
-                } else if row == 5 {
+                } else if row == modal.cancel_row() {
                     self.overlay = None;
+                } else if modal
+                    .property_index()
+                    .and_then(|index| modal.properties.get(index))
+                    .is_some_and(|property| !property.accepts_text())
+                {
+                    change_pedal_modal(modal, 1);
                 }
             }
             AppAction::ActivateModal => {
@@ -660,10 +842,54 @@ impl App {
                     modal.enabled = !modal.enabled;
                 } else if matches!(modal.focus_row, 0 | 2 | 3) {
                     change_pedal_modal(modal, 1);
-                } else if modal.focus_row == 4 {
+                } else if modal.focus_row == modal.apply_row() {
                     self.apply_pedal_modal();
-                } else if modal.focus_row == 5 {
+                } else if modal.focus_row == modal.cancel_row() {
                     self.overlay = None;
+                } else if modal
+                    .property_index()
+                    .and_then(|index| modal.properties.get(index))
+                    .is_some_and(|property| !property.accepts_text())
+                {
+                    change_pedal_modal(modal, 1);
+                }
+            }
+            AppAction::InsertText(value) => {
+                if let Some(property) = focused_property_mut(modal)
+                    && property.accepts_text()
+                {
+                    property.buffer.insert(&value);
+                    property.reparse_buffer();
+                }
+            }
+            AppAction::Backspace => {
+                if let Some(property) = focused_property_mut(modal)
+                    && property.accepts_text()
+                {
+                    property.buffer.backspace();
+                    property.reparse_buffer();
+                }
+            }
+            AppAction::DeleteForward => {
+                if let Some(property) = focused_property_mut(modal)
+                    && property.accepts_text()
+                {
+                    property.buffer.delete();
+                    property.reparse_buffer();
+                }
+            }
+            AppAction::MoveTextCursor { motion, selecting } => {
+                if let Some(property) = focused_property_mut(modal)
+                    && property.accepts_text()
+                {
+                    move_text_cursor(&mut property.buffer, motion, selecting);
+                }
+            }
+            AppAction::SelectAllText => {
+                if let Some(property) = focused_property_mut(modal)
+                    && property.accepts_text()
+                {
+                    property.buffer.select_all();
                 }
             }
             AppAction::ApplyPedal => self.apply_pedal_modal(),
@@ -1065,6 +1291,17 @@ impl App {
                     .position(|candidate| candidate == target)
             })
             .unwrap_or(0);
+        let properties = source
+            .control_schemas
+            .iter()
+            .cloned()
+            .map(|schema| {
+                let value = editor
+                    .effective_instance_control_value(instance_id, &schema.id)
+                    .unwrap_or(Value::Null);
+                PedalPropertyDraft::new(schema, value)
+            })
+            .collect();
         self.overlay = Some(Overlay::Pedal(PedalModalState {
             instance_id: instance.instance_id,
             source,
@@ -1077,6 +1314,7 @@ impl App {
             policy,
             policy_targets,
             policy_target_index,
+            properties,
             focus_row: 0,
             error: None,
         }));
@@ -1102,18 +1340,72 @@ impl App {
             }
             return;
         }
+        if let Some(property) = modal
+            .properties
+            .iter()
+            .find(|property| property.editable() && property.error.is_some())
+        {
+            if let Some(Overlay::Pedal(modal)) = &mut self.overlay {
+                modal.error = Some(format!(
+                    "{}: {}",
+                    property.schema.name,
+                    property.error.as_deref().unwrap_or("invalid value")
+                ));
+            }
+            return;
+        }
         let mut candidate = editor.clone();
-        let result = candidate
+        let mut result = candidate
             .set_instance_device(&modal.instance_id, device_id)
             .and_then(|_| candidate.set_instance_enabled(&modal.instance_id, modal.enabled))
             .and_then(|_| {
                 candidate.set_instance_state_policy(&modal.instance_id, modal.state_policy())
             });
+        if result.is_ok() {
+            for property in modal
+                .properties
+                .iter()
+                .filter(|property| property.editable() && property.changed())
+            {
+                if let Err(error) = candidate.set_instance_control_value(
+                    &modal.instance_id,
+                    &property.schema.id,
+                    property.value.clone(),
+                ) {
+                    result = Err(error);
+                    break;
+                }
+            }
+        }
         match result {
             Ok(()) => {
+                let lifecycle = modal
+                    .properties
+                    .iter()
+                    .filter(|property| property.editable() && property.changed())
+                    .flat_map(|property| {
+                        [
+                            property
+                                .schema
+                                .requires_state_reset
+                                .then_some("state reset"),
+                            property.schema.requires_remount.then_some("remount"),
+                            property.schema.requires_recompile.then_some("recompile"),
+                        ]
+                    })
+                    .flatten()
+                    .collect::<BTreeSet<_>>();
                 self.editor = Some(candidate);
                 self.overlay = None;
-                self.status = format!("Updated {} · draft not mounted", modal.instance_id);
+                self.status = if lifecycle.is_empty() {
+                    format!("Updated {} · draft not mounted", modal.instance_id)
+                } else {
+                    format!(
+                        "Updated {} · requires {} · draft not mounted",
+                        modal.instance_id,
+                        lifecycle.into_iter().collect::<Vec<_>>().join(", ")
+                    )
+                };
             }
             Err(error) => {
                 if let Some(Overlay::Pedal(modal)) = &mut self.overlay {
@@ -1261,8 +1553,17 @@ fn change_pedal_modal(modal: &mut PedalModalState, delta: i32) {
             modal.policy_target_index =
                 cycle_index(modal.policy_target_index, modal.policy_targets.len(), delta);
         }
-        _ => {}
+        _ => {
+            if let Some(property) = focused_property_mut(modal) {
+                property.change(delta);
+            }
+        }
     }
+}
+
+fn focused_property_mut(modal: &mut PedalModalState) -> Option<&mut PedalPropertyDraft> {
+    let index = modal.property_index()?;
+    modal.properties.get_mut(index)
 }
 
 fn cycle_index(current: usize, len: usize, delta: i32) -> usize {
@@ -1270,6 +1571,13 @@ fn cycle_index(current: usize, len: usize, delta: i32) -> usize {
         return 0;
     }
     (current as i32 + delta).rem_euclid(len as i32) as usize
+}
+
+fn control_value_text(value: &Value) -> String {
+    value
+        .as_str()
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| value.to_string())
 }
 
 fn browser_entries(directory: &Path) -> Vec<BrowserEntry> {
@@ -1368,6 +1676,64 @@ mod tests {
     #[test]
     fn visual_sequence_format_is_zero_based_and_has_no_ceremonial_prefix() {
         assert_eq!(format_layer_sequence(&[0, 1, 5, 5, 7]), "[0,1,5,5,7]");
+    }
+
+    #[test]
+    fn property_draft_tracks_real_changes_and_schema_validation() {
+        let schema = crate::runtime_editor_control_schema(
+            0,
+            &serde_json::json!({
+                "id": "window",
+                "name": "Window",
+                "type": "integer",
+                "current": 4,
+                "min": 2,
+                "max": 10,
+                "step": 2,
+                "editable_at_runtime": true,
+                "scope": "INSTANCE"
+            }),
+        );
+        let mut property = PedalPropertyDraft::new(schema, serde_json::json!(4));
+        assert!(property.editable());
+        assert!(!property.changed());
+        assert!(property.error.is_none());
+
+        property.change(1);
+        assert_eq!(property.value, serde_json::json!(6));
+        assert!(property.changed());
+        assert!(property.error.is_none());
+
+        property.buffer.set("5");
+        property.reparse_buffer();
+        assert!(
+            property
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("step"))
+        );
+
+        property.buffer.set("4");
+        property.reparse_buffer();
+        assert!(!property.changed());
+        assert!(property.error.is_none());
+
+        let missing = crate::runtime_editor_control_schema(
+            1,
+            &serde_json::json!({
+                "id": "missing",
+                "type": "number",
+                "editable_at_runtime": true,
+                "scope": "instance"
+            }),
+        );
+        let missing = PedalPropertyDraft::new(missing, Value::Null);
+        assert!(
+            missing
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("declared type"))
+        );
     }
 
     #[test]
