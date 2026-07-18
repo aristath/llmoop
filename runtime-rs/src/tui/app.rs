@@ -289,6 +289,7 @@ pub(crate) struct PedalModalState {
     pub device_ids: Vec<String>,
     pub device_labels: Vec<String>,
     pub device_index: usize,
+    pub original_device_id: String,
     pub enabled: bool,
     pub policy: PedalPolicyKind,
     pub policy_targets: Vec<String>,
@@ -347,7 +348,7 @@ pub(crate) struct PedalPropertyDraft {
 }
 
 impl PedalPropertyDraft {
-    fn new(schema: RuntimeEditorControlSchema, value: Value) -> Self {
+    pub(crate) fn new(schema: RuntimeEditorControlSchema, value: Value) -> Self {
         let buffer = TextBuffer::new(control_value_text(&value));
         let mut property = Self {
             schema,
@@ -504,6 +505,7 @@ pub struct App {
     pub(crate) selected_instance_id: Option<String>,
     pub(crate) board_scroll: usize,
     pub(crate) overlay: Option<Overlay>,
+    help_return_overlay: Option<Overlay>,
     pub(crate) status: String,
     pub(crate) should_quit: bool,
     pub(crate) mouse_capture: bool,
@@ -527,6 +529,7 @@ impl App {
             overlay: Some(Overlay::ModelSelector(ModelSelectorState::new(
                 initial_path,
             ))),
+            help_return_overlay: None,
             status: "No model loaded · draft not mounted".to_string(),
             should_quit: false,
             mouse_capture: true,
@@ -593,6 +596,19 @@ impl App {
     }
 
     pub fn dispatch(&mut self, action: AppAction) {
+        if matches!(action, AppAction::ToggleMouseCapture) {
+            self.mouse_capture = !self.mouse_capture;
+            return;
+        }
+        if matches!(action, AppAction::ToggleHelp) {
+            if matches!(self.overlay, Some(Overlay::Help)) {
+                self.overlay = self.help_return_overlay.take();
+            } else {
+                self.help_return_overlay = self.overlay.take();
+                self.overlay = Some(Overlay::Help);
+            }
+            return;
+        }
         if self.overlay.is_some() {
             self.dispatch_overlay(action);
             return;
@@ -600,8 +616,6 @@ impl App {
         match action {
             AppAction::Quit => self.should_quit = true,
             AppAction::OpenModelSelector => self.open_model_selector(),
-            AppAction::ToggleHelp => self.overlay = Some(Overlay::Help),
-            AppAction::ToggleMouseCapture => self.mouse_capture = !self.mouse_capture,
             AppAction::RefreshDevices => {
                 if let Some(editor) = &mut self.editor {
                     editor.refresh_devices();
@@ -695,7 +709,7 @@ impl App {
             Some(Overlay::Pedal(_)) => self.dispatch_pedal_modal(action),
             Some(Overlay::Help) => match action {
                 AppAction::Quit => self.should_quit = true,
-                AppAction::CloseOverlay | AppAction::ToggleHelp => self.overlay = None,
+                AppAction::CloseOverlay => self.overlay = self.help_return_overlay.take(),
                 _ => {}
             },
             None => {}
@@ -723,7 +737,6 @@ impl App {
         match action {
             AppAction::Quit => self.should_quit = true,
             AppAction::CloseOverlay => self.overlay = None,
-            AppAction::ToggleMouseCapture => self.mouse_capture = !self.mouse_capture,
             AppAction::FocusNext => {
                 selector.focus = match selector.focus {
                     ModelSelectorFocus::Path => ModelSelectorFocus::Browser,
@@ -762,9 +775,16 @@ impl App {
             AppAction::ModalPrevious if selector.focus == ModelSelectorFocus::Browser => {
                 selector.selected_entry = selector.selected_entry.saturating_sub(1);
             }
+            AppAction::ModalPrevious if selector.focus == ModelSelectorFocus::Action => {
+                selector.diagnostic_scroll = selector.diagnostic_scroll.saturating_sub(1);
+            }
             AppAction::ModalNext if selector.focus == ModelSelectorFocus::Browser => {
                 selector.selected_entry =
                     (selector.selected_entry + 1).min(selector.entries.len().saturating_sub(1));
+            }
+            AppAction::ModalNext if selector.focus == ModelSelectorFocus::Action => {
+                selector.diagnostic_scroll = (selector.diagnostic_scroll + 1)
+                    .min(selector.diagnostics.len().saturating_sub(1));
             }
             AppAction::ModelBrowserSelect(index) => {
                 selector.selected_entry = index.min(selector.entries.len().saturating_sub(1));
@@ -1238,9 +1258,6 @@ impl App {
         let devices = editor
             .available_devices()
             .iter()
-            .filter(|device| {
-                device.available && device.can_host_runtime_pedals_on_physical_device != Some(false)
-            })
             .map(|device| {
                 let name = device.device_name.as_deref().unwrap_or("unnamed device");
                 let memory = device
@@ -1255,11 +1272,30 @@ impl App {
                     })
                     .map(|bytes| format!(" · {:.1} GiB", bytes as f64 / 1_073_741_824.0))
                     .unwrap_or_default();
+                let status = if !device.available {
+                    " · UNAVAILABLE"
+                } else if device.can_host_runtime_pedals_on_physical_device == Some(false) {
+                    " · INCOMPATIBLE"
+                } else {
+                    ""
+                };
                 (
                     device.device_id.clone(),
-                    format!("{} · {}{memory}", device.device_id, name),
+                    format!("{} · {}{memory}{status}", device.device_id, name),
                 )
             })
+            .chain(
+                (!editor
+                    .available_devices()
+                    .iter()
+                    .any(|device| device.device_id == instance.device_id))
+                .then(|| {
+                    (
+                        instance.device_id.clone(),
+                        format!("{} · UNAVAILABLE", instance.device_id),
+                    )
+                }),
+            )
             .collect::<Vec<_>>();
         let device_ids = devices.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>();
         let device_labels = devices
@@ -1310,6 +1346,7 @@ impl App {
             device_ids,
             device_labels,
             device_index,
+            original_device_id: instance.device_id,
             enabled: instance.enabled,
             policy,
             policy_targets,
@@ -1355,12 +1392,15 @@ impl App {
             return;
         }
         let mut candidate = editor.clone();
-        let mut result = candidate
-            .set_instance_device(&modal.instance_id, device_id)
-            .and_then(|_| candidate.set_instance_enabled(&modal.instance_id, modal.enabled))
-            .and_then(|_| {
-                candidate.set_instance_state_policy(&modal.instance_id, modal.state_policy())
-            });
+        let mut result = if device_id == &modal.original_device_id {
+            Ok(())
+        } else {
+            candidate.set_instance_device(&modal.instance_id, device_id)
+        }
+        .and_then(|_| candidate.set_instance_enabled(&modal.instance_id, modal.enabled))
+        .and_then(|_| {
+            candidate.set_instance_state_policy(&modal.instance_id, modal.state_policy())
+        });
         if result.is_ok() {
             for property in modal
                 .properties
@@ -1734,6 +1774,39 @@ mod tests {
                 .as_deref()
                 .is_some_and(|error| error.contains("declared type"))
         );
+    }
+
+    #[test]
+    fn help_and_mouse_capture_remain_global_without_losing_the_open_overlay() {
+        let mut app = App::new();
+        assert!(matches!(app.overlay, Some(Overlay::ModelSelector(_))));
+        let original_mouse_capture = app.mouse_capture;
+
+        app.dispatch(AppAction::ToggleHelp);
+        assert!(matches!(app.overlay, Some(Overlay::Help)));
+        app.dispatch(AppAction::ToggleMouseCapture);
+        assert_eq!(app.mouse_capture, !original_mouse_capture);
+
+        app.dispatch(AppAction::ToggleHelp);
+        assert!(matches!(app.overlay, Some(Overlay::ModelSelector(_))));
+    }
+
+    #[test]
+    fn model_selector_diagnostics_scroll_without_changing_browser_selection() {
+        let mut app = App::new();
+        let Some(Overlay::ModelSelector(selector)) = &mut app.overlay else {
+            panic!("model selector did not open");
+        };
+        selector.focus = ModelSelectorFocus::Action;
+        selector.diagnostics = vec!["first".to_string(), "second".to_string()];
+        let selected_entry = selector.selected_entry;
+
+        app.dispatch(AppAction::ModalNext);
+        let Some(Overlay::ModelSelector(selector)) = &app.overlay else {
+            panic!("model selector closed");
+        };
+        assert_eq!(selector.diagnostic_scroll, 1);
+        assert_eq!(selector.selected_entry, selected_entry);
     }
 
     #[test]

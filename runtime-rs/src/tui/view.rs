@@ -303,9 +303,11 @@ fn render_pedal(
     devices: Option<&[RuntimeAvailableDevice]>,
 ) {
     let device_available = devices.is_some_and(|devices| {
-        devices
-            .iter()
-            .any(|device| device.device_id == instance.device_id && device.available)
+        devices.iter().any(|device| {
+            device.device_id == instance.device_id
+                && device.available
+                && device.can_host_runtime_pedals_on_physical_device != Some(false)
+        })
     });
     let border_color = if !device_available {
         FAULT
@@ -1196,6 +1198,16 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
+    fn rendered_text(app: &mut App, width: u16, height: u16) -> String {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..height)
+            .flat_map(|y| (0..width).map(move |x| buffer[(x, y)].symbol()))
+            .collect::<String>()
+    }
+
     #[test]
     fn truncation_respects_terminal_cell_width() {
         assert_eq!(truncate("abcdef", 4), "abc…");
@@ -1219,16 +1231,72 @@ mod tests {
         let mut app = App::new();
         app.load_compiled_model(package);
         for (width, height) in [(80, 24), (40, 12)] {
-            let backend = TestBackend::new(width, height);
-            let mut terminal = Terminal::new(backend).unwrap();
-            terminal.draw(|frame| render(frame, &mut app)).unwrap();
-            let buffer = terminal.backend().buffer();
-            let rendered = (0..height)
-                .flat_map(|y| (0..width).map(move |x| buffer[(x, y)].symbol()))
-                .collect::<String>();
+            let rendered = rendered_text(&mut app, width, height);
             assert!(rendered.contains("SIGNAL BOARD"));
             assert!(rendered.contains("PEDALBOARD"));
             assert!(rendered.contains("ZERO-BASED"));
         }
+    }
+
+    #[test]
+    fn model_selector_and_pedal_modal_keep_actions_visible_in_small_terminals() {
+        let mut app = App::new();
+        let rendered = rendered_text(&mut app, 40, 12);
+        assert!(rendered.contains("OPEN MODEL"));
+        assert!(rendered.contains("Cancel"));
+
+        let schema = crate::runtime_editor_control_schema(
+            0,
+            &serde_json::json!({
+                "id": "window",
+                "name": "Window",
+                "description": "Local temporal span",
+                "type": "integer",
+                "current": 4,
+                "min": 2,
+                "max": 10,
+                "step": 2,
+                "editable_at_runtime": true,
+                "scope": "instance"
+            }),
+        );
+        let property = super::super::app::PedalPropertyDraft::new(schema, serde_json::json!(4));
+        let mut modal = PedalModalState {
+            instance_id: "layer_00".to_string(),
+            source: crate::RuntimeEditorSourcePedal {
+                source_id: "layer_00".to_string(),
+                layer_index: 0,
+                operator_type: "transformer".to_string(),
+                implementation: "compiled_circuit".to_string(),
+                behavioral_role: "stream_transform".to_string(),
+                input_shape: vec![64],
+                output_shape: vec![64],
+                state_ports: Vec::new(),
+                controls: Vec::new(),
+                control_schemas: Vec::new(),
+                parameter_ref_count: 4,
+                node_count: 8,
+                kernel_count: 3,
+            },
+            layer_index: 0,
+            occurrence: 1,
+            device_ids: vec!["gpu0".to_string()],
+            device_labels: vec!["gpu0 · fixture".to_string()],
+            device_index: 0,
+            original_device_id: "gpu0".to_string(),
+            enabled: true,
+            policy: PedalPolicyKind::Independent,
+            policy_targets: Vec::new(),
+            policy_target_index: 0,
+            properties: vec![property],
+            focus_row: 5,
+            error: None,
+        };
+        modal.focus_row = modal.apply_row();
+        app.overlay = Some(Overlay::Pedal(modal));
+        let rendered = rendered_text(&mut app, 40, 12);
+        assert!(rendered.contains("LAYER 0"));
+        assert!(rendered.contains("Apply"));
+        assert!(rendered.contains("Cancel"));
     }
 }

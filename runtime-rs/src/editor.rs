@@ -483,11 +483,11 @@ impl RuntimeModelEditor {
     pub fn validation(&self) -> RuntimeEditorValidation {
         let mut errors = Vec::new();
         for instance in &self.draft.instances {
-            if !self
-                .available_devices
-                .iter()
-                .any(|device| device.device_id == instance.device_id && device.available)
-            {
+            if !self.available_devices.iter().any(|device| {
+                device.device_id == instance.device_id
+                    && device.available
+                    && device.can_host_runtime_pedals_on_physical_device != Some(false)
+            }) {
                 errors.push(format!(
                     "instance {} is assigned to unavailable device {}",
                     instance.instance_id, instance.device_id
