@@ -472,6 +472,7 @@ enum RuntimeChatFormatter {
     ChatMl { bos_token: Option<String> },
     RoleDelimited,
     TurnDelimited { bos_token: Option<String> },
+    PipeTurnDelimited { bos_token: Option<String> },
     EndDelimitedRoles,
 }
 
@@ -500,6 +501,9 @@ impl RuntimeChatFormatter {
         if template.contains("<start_of_turn>") && template.contains("<end_of_turn>") {
             return Ok(Self::TurnDelimited { bos_token });
         }
+        if template.contains("<|turn>") && template.contains("<turn|>") {
+            return Ok(Self::PipeTurnDelimited { bos_token });
+        }
         if template.contains("<|user|>")
             && template.contains("<|assistant|>")
             && template.contains("<|end|>")
@@ -508,7 +512,7 @@ impl RuntimeChatFormatter {
         }
         Err(Box::new(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "chat mode currently supports ChatML, role-delimited, turn-delimited, and end-delimited role templates; this package has a different template shape",
+            "chat mode currently supports ChatML, role-delimited, turn-delimited, pipe-turn-delimited, and end-delimited role templates; this package has a different template shape",
         )))
     }
 
@@ -565,6 +569,25 @@ impl RuntimeChatFormatter {
                 }
                 if add_generation_prompt {
                     formatted.push_str("<start_of_turn>model\n");
+                }
+                formatted
+            }
+            Self::PipeTurnDelimited { bos_token } => {
+                let mut formatted = bos_token.clone().unwrap_or_default();
+                for message in messages {
+                    let role = if message.role == "assistant" {
+                        "model"
+                    } else {
+                        &message.role
+                    };
+                    formatted.push_str("<|turn>");
+                    formatted.push_str(role);
+                    formatted.push('\n');
+                    formatted.push_str(message.content.trim());
+                    formatted.push_str("<turn|>\n");
+                }
+                if add_generation_prompt {
+                    formatted.push_str("<|turn>model\n");
                 }
                 formatted
             }
@@ -3066,4 +3089,35 @@ Options:
 Example:
   python -m llmoop --compile-model <MODEL_DIR>
   cargo run --manifest-path runtime-rs/Cargo.toml --features 'vulkan tokenizers' --bin llmoop-runtime -- --package packages/model_xxx/vulkan_resident_greedy_package.json --chat"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RuntimeChatFormatter, RuntimeChatMessage};
+
+    #[test]
+    fn pipe_turn_chat_formatter_preserves_model_turn_prefixes() {
+        let formatter = RuntimeChatFormatter::PipeTurnDelimited {
+            bos_token: Some("<bos>".to_string()),
+        };
+        let messages = vec![
+            RuntimeChatMessage {
+                role: "user".to_string(),
+                content: "Hello".to_string(),
+            },
+            RuntimeChatMessage {
+                role: "assistant".to_string(),
+                content: "Hi there".to_string(),
+            },
+            RuntimeChatMessage {
+                role: "user".to_string(),
+                content: "Remember me".to_string(),
+            },
+        ];
+
+        assert_eq!(
+            formatter.format_messages(&messages, true),
+            "<bos><|turn>user\nHello<turn|>\n<|turn>model\nHi there<turn|>\n<|turn>user\nRemember me<turn|>\n<|turn>model\n"
+        );
+    }
 }
