@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fs;
 use std::io::{self, Write};
@@ -349,8 +349,13 @@ fn run_single_device_chat(
 ) -> Result<(), Box<dyn Error>> {
     let setup_start = Instant::now();
     let device = runtime_vulkan_device(args)?;
-    let stop_token_ids = chat_stop_token_ids_from_manifest(manifest_dir, tokenizer_dir, &manifest)?;
     let chat_session = RuntimeChatSession::from_tokenizer_dir(tokenizer_dir)?;
+    let stop_token_ids = chat_stop_token_ids_from_manifest(
+        manifest_dir,
+        tokenizer_dir,
+        &manifest,
+        &chat_session.formatter,
+    )?;
     let transcript_codec = VulkanResidentHfTokenizerTextCodec::from_model_dir(tokenizer_dir)?
         .with_add_special_tokens(args.add_special_tokens)
         .with_skip_special_tokens(false);
@@ -500,7 +505,7 @@ impl RuntimeChatFormatter {
             )
         })?;
         let formatter = Self {
-            template_source: template,
+            template_source: normalize_chat_template_for_runtime(&template),
             template_variables: tokenizer_template_variables(tokenizer_dir)?,
             render_time: Local::now().fixed_offset(),
         };
@@ -545,6 +550,36 @@ impl RuntimeChatFormatter {
         );
         Ok(environment.get_template("chat")?.render(context)?)
     }
+}
+
+fn normalize_chat_template_for_runtime(source: &str) -> String {
+    let mut normalized = String::with_capacity(source.len());
+    let mut cursor = 0usize;
+    while let Some(relative_start) = source[cursor..].find("{%") {
+        let start = cursor + relative_start;
+        let tag_body_start = start + 2;
+        let Some(relative_end) = source[tag_body_start..].find("%}") else {
+            break;
+        };
+        let end = tag_body_start + relative_end;
+        let tag_body = &source[tag_body_start..end];
+        let statement = tag_body.trim().trim_matches('-').trim();
+        normalized.push_str(&source[cursor..start]);
+        if matches!(statement, "generation" | "endgeneration") {
+            normalized.push_str(if tag_body.starts_with('-') {
+                "{#-"
+            } else {
+                "{#"
+            });
+            normalized.push_str(statement);
+            normalized.push_str(if tag_body.ends_with('-') { "-#}" } else { "#}" });
+        } else {
+            normalized.push_str(&source[start..end + 2]);
+        }
+        cursor = end + 2;
+    }
+    normalized.push_str(&source[cursor..]);
+    normalized
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -707,6 +742,7 @@ fn chat_stop_token_ids_from_manifest(
     manifest_dir: &Path,
     tokenizer_dir: &Path,
     manifest: &VulkanResidentGreedyModelPackageManifest,
+    formatter: &RuntimeChatFormatter,
 ) -> Result<Vec<u32>, Box<dyn Error>> {
     let config_path = manifest_dir.join(&manifest.config_path);
     let eos_values = if config_path.is_file() {
@@ -764,7 +800,81 @@ fn chat_stop_token_ids_from_manifest(
             }
         }
     }
+    if let Some(token_id) = model_owned_assistant_turn_stop_token_id(tokenizer_dir, formatter)? {
+        if !stop_token_ids.contains(&token_id) {
+            stop_token_ids.push(token_id);
+        }
+    }
     Ok(stop_token_ids)
+}
+
+fn model_owned_assistant_turn_stop_token_id(
+    tokenizer_dir: &Path,
+    formatter: &RuntimeChatFormatter,
+) -> Result<Option<u32>, Box<dyn Error>> {
+    const ASSISTANT_SENTINEL: &str = "LLMOOP_ASSISTANT_TURN_CONTENT_SENTINEL_7F3A9C";
+    let rendered = formatter.format_messages(
+        &[
+            RuntimeChatMessage {
+                role: "user".to_string(),
+                content: "Discover the model-owned assistant turn delimiter.".to_string(),
+            },
+            RuntimeChatMessage {
+                role: "assistant".to_string(),
+                content: ASSISTANT_SENTINEL.to_string(),
+            },
+        ],
+        false,
+    )?;
+    let sentinel_start = rendered.rfind(ASSISTANT_SENTINEL).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "chat template did not preserve the synthetic assistant content used to discover its turn delimiter",
+        )
+    })?;
+    let suffix = &rendered[sentinel_start + ASSISTANT_SENTINEL.len()..];
+    let codec = VulkanResidentHfTokenizerTextCodec::from_model_dir(tokenizer_dir)?
+        .with_add_special_tokens(false)
+        .with_skip_special_tokens(false);
+    let suffix_token_ids = codec.encode_text(suffix)?;
+    let special_token_ids = tokenizer_special_token_ids(tokenizer_dir)?;
+    Ok(first_special_token_id(
+        &suffix_token_ids,
+        &special_token_ids,
+    ))
+}
+
+fn tokenizer_special_token_ids(tokenizer_dir: &Path) -> Result<BTreeSet<u32>, Box<dyn Error>> {
+    let path = tokenizer_dir.join("tokenizer.json");
+    let tokenizer: serde_json::Value = serde_json::from_slice(&fs::read(&path)?)?;
+    tokenizer
+        .get("added_tokens")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|token| {
+            token
+                .get("special")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+        })
+        .filter_map(|token| token.get("id").and_then(serde_json::Value::as_u64))
+        .map(|id| {
+            u32::try_from(id).map_err(|_| {
+                Box::<dyn Error>::from(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("special token id {id} in {path:?} does not fit in u32"),
+                ))
+            })
+        })
+        .collect()
+}
+
+fn first_special_token_id(token_ids: &[u32], special_token_ids: &BTreeSet<u32>) -> Option<u32> {
+    token_ids
+        .iter()
+        .copied()
+        .find(|token_id| special_token_ids.contains(token_id))
 }
 
 fn run_placed_chat(
@@ -777,8 +887,13 @@ fn run_placed_chat(
     initial_prompt: Option<&str>,
 ) -> Result<(), Box<dyn Error>> {
     let setup_start = Instant::now();
-    let stop_token_ids = chat_stop_token_ids_from_manifest(manifest_dir, tokenizer_dir, &manifest)?;
     let chat_session = RuntimeChatSession::from_tokenizer_dir(tokenizer_dir)?;
+    let stop_token_ids = chat_stop_token_ids_from_manifest(
+        manifest_dir,
+        tokenizer_dir,
+        &manifest,
+        &chat_session.formatter,
+    )?;
     let transcript_codec = VulkanResidentHfTokenizerTextCodec::from_model_dir(tokenizer_dir)?
         .with_add_special_tokens(args.add_special_tokens)
         .with_skip_special_tokens(false);
@@ -3103,11 +3218,17 @@ Example:
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     use chrono::{FixedOffset, TimeZone};
+    use tokenizers::models::wordlevel::WordLevel;
+    use tokenizers::{AddedToken, Tokenizer};
 
     use super::{
         RuntimeChatFormatter, RuntimeChatMessage, assistant_content_token_ids,
-        incremental_chat_token_delta,
+        incremental_chat_token_delta, model_owned_assistant_turn_stop_token_id,
+        normalize_chat_template_for_runtime,
     };
 
     fn formatter(template_source: &str) -> RuntimeChatFormatter {
@@ -3172,6 +3293,19 @@ mod tests {
     }
 
     #[test]
+    fn hugging_face_generation_metadata_preserves_rendered_content_and_trimming() {
+        let normalized = normalize_chat_template_for_runtime(
+            "before \n{%- generation -%}\nassistant content\n{%- endgeneration -%}\n after",
+        );
+        let formatter = formatter(&normalized);
+
+        assert_eq!(
+            formatter.format_messages(&[], false).unwrap(),
+            "beforeassistant contentafter"
+        );
+    }
+
+    #[test]
     fn model_template_can_supply_a_dated_default_system_turn() {
         let formatter = formatter(
             "{%- if messages[0].role == 'system' %}{%- set loop_messages = messages[1:] %}{%- else %}{{- '<|start_of_role|>system<|end_of_role|>Current Date: ' + strftime_now('%B %d, %Y') + '.<|end_of_text|>\n' }}{%- set loop_messages = messages %}{%- endif %}{%- for message in loop_messages %}{{- '<|start_of_role|>' + message.role + '<|end_of_role|>' + message.content + '<|end_of_text|>\n' }}{%- if loop.last and add_generation_prompt %}{{- '<|start_of_role|>assistant<|end_of_role|>' }}{%- endif %}{%- endfor %}",
@@ -3211,6 +3345,54 @@ mod tests {
         assert_eq!(
             assistant_content_token_ids(&[1, 2, 98, 99], &[98, 99]),
             &[1, 2]
+        );
+    }
+
+    #[test]
+    fn model_owned_assistant_turn_delimiter_is_discovered_generically() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let tokenizer_dir = std::env::temp_dir().join(format!(
+            "llmoop-chat-delimiter-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&tokenizer_dir).unwrap();
+        let mut tokenizer = Tokenizer::new(WordLevel::default());
+        tokenizer
+            .add_special_tokens([AddedToken::from("<end_of_turn>", true)])
+            .unwrap();
+        tokenizer
+            .save(tokenizer_dir.join("tokenizer.json"), false)
+            .unwrap();
+        let formatter = formatter(
+            "{%- for message in messages %}{{- message.content }}{%- if message.role == 'assistant' %}{{- '<end_of_turn>' }}{%- endif %}{%- endfor %}",
+        );
+
+        assert_eq!(
+            model_owned_assistant_turn_stop_token_id(&tokenizer_dir, &formatter).unwrap(),
+            Some(0)
+        );
+
+        fs::remove_dir_all(tokenizer_dir).unwrap();
+    }
+
+    #[test]
+    fn configured_model_owned_assistant_turn_delimiter_is_discovered() {
+        let Some(tokenizer_dir) = std::env::var_os("LLMOOP_TEST_CHAT_TOKENIZER_DIR") else {
+            return;
+        };
+        let expected = std::env::var("LLMOOP_TEST_CHAT_STOP_ID")
+            .expect("LLMOOP_TEST_CHAT_STOP_ID must accompany LLMOOP_TEST_CHAT_TOKENIZER_DIR")
+            .parse::<u32>()
+            .expect("LLMOOP_TEST_CHAT_STOP_ID must be a u32");
+        let tokenizer_dir = std::path::PathBuf::from(tokenizer_dir);
+        let formatter = RuntimeChatFormatter::from_tokenizer_dir(&tokenizer_dir).unwrap();
+
+        assert_eq!(
+            model_owned_assistant_turn_stop_token_id(&tokenizer_dir, &formatter).unwrap(),
+            Some(expected)
         );
     }
 }
