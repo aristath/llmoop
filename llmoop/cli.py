@@ -474,18 +474,12 @@ def build_tui_command() -> tuple[list[str], Path]:
     configured = os.environ.get("LLMOOP_TUI_BIN")
     if configured:
         return [configured], workspace
-    installed = shutil.which("llmoop-tui")
-    if installed:
-        return [installed], workspace
-    for profile in ("release", "debug"):
-        built = workspace / "runtime-rs" / "target" / profile / "llmoop-tui"
-        if built.is_file() and os.access(built, os.X_OK):
-            return [str(built)], workspace
     manifest = workspace / "runtime-rs" / "Cargo.toml"
     if manifest.is_file():
         return [
             "cargo",
             "run",
+            "--quiet",
             "--manifest-path",
             str(manifest),
             "--features",
@@ -493,6 +487,9 @@ def build_tui_command() -> tuple[list[str], Path]:
             "--bin",
             "llmoop-tui",
         ], workspace
+    installed = shutil.which("llmoop-tui")
+    if installed:
+        return [installed], workspace
     raise SystemExit(
         "llmoop-tui is not installed; set LLMOOP_TUI_BIN to the executable path"
     )

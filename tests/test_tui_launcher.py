@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -37,15 +36,22 @@ def test_tui_launcher_prefers_explicit_binary(monkeypatch) -> None:
     assert workspace == Path(cli.__file__).resolve().parent.parent
 
 
-def test_tui_launcher_uses_current_source_build_without_shell(monkeypatch) -> None:
+def test_tui_launcher_uses_current_source_tree_without_shell(monkeypatch) -> None:
     monkeypatch.delenv("LLMOOP_TUI_BIN", raising=False)
     monkeypatch.setattr(cli.shutil, "which", lambda _name: None)
     workspace = Path(cli.__file__).resolve().parent.parent
-    debug_binary = workspace / "runtime-rs/target/debug/llmoop-tui"
-    assert debug_binary.is_file()
-    assert os.access(debug_binary, os.X_OK)
 
     command, command_workspace = cli.build_tui_command()
 
-    assert command == [str(debug_binary)]
+    assert command == [
+        "cargo",
+        "run",
+        "--quiet",
+        "--manifest-path",
+        str(workspace / "runtime-rs/Cargo.toml"),
+        "--features",
+        "vulkan,tokenizers,tui",
+        "--bin",
+        "llmoop-tui",
+    ]
     assert command_workspace == workspace
