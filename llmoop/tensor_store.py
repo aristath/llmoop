@@ -12,6 +12,7 @@ class TensorInfo:
     dtype: str
     shape: tuple[int, ...]
     source_file: Path
+    layout: str
 
 
 class SafetensorsTensorStore:
@@ -66,6 +67,8 @@ class SafetensorsTensorStore:
                 if name not in tensors.keys():
                     raise KeyError(f"tensor {name!r} not found in {weights_file}")
                 tensor = tensors.get_tensor(name)
+            if self.infos()[name].layout == "vulkan_bf16_row_pair_u32":
+                tensor = restore_bf16_row_pair_tensor(tensor)
             self._cache[name] = tensor.to(dtype=self.dtype)
         return self._cache[name]
 
@@ -83,6 +86,7 @@ class SafetensorsTensorStore:
                             tensor_index_root,
                             info["source_file"],
                         ),
+                        layout=str(info.get("layout", "row_major")),
                     )
                     for name, info in index["tensors"].items()
                 }
@@ -96,6 +100,7 @@ class SafetensorsTensorStore:
                             dtype=str(tensors.get_tensor(name).dtype),
                             shape=tuple(tensors.get_tensor(name).shape),
                             source_file=self.weights_file,
+                            layout="row_major",
                         )
                         for name in tensors.keys()
                     }
@@ -115,3 +120,18 @@ class SafetensorsTensorStore:
 def resolve_tensor_source_file(tensor_index_root: Path, source_file: str) -> Path:
     path = Path(source_file)
     return path if path.is_absolute() else tensor_index_root / path
+
+
+def restore_bf16_row_pair_tensor(tensor: Any) -> Any:
+    if tensor.ndim != 2 or tensor.shape[0] % 2 != 0 or tensor.shape[1] % 2 != 0:
+        raise ValueError(
+            "vulkan BF16 row-pair tensor requires an even two-dimensional shape, "
+            f"got {tuple(tensor.shape)}"
+        )
+    rows, columns = tensor.shape
+    return (
+        tensor.reshape(rows // 2, columns // 2, 2, 2)
+        .permute(0, 2, 1, 3)
+        .contiguous()
+        .reshape(rows, columns)
+    )
