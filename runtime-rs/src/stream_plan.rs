@@ -283,6 +283,12 @@ impl StreamCircuitResourcePlan {
                     owner: state.owner.clone(),
                     layout: state.layout.clone(),
                     source_layout: state.source_layout.clone(),
+                    element_bytes: state
+                        .extra
+                        .get("dtype")
+                        .and_then(serde_json::Value::as_str)
+                        .map(state_dtype_bytes)
+                        .transpose()?,
                 });
             }
 
@@ -483,6 +489,17 @@ pub struct PlannedStateResource {
     pub owner: Option<String>,
     pub layout: Option<String>,
     pub source_layout: Option<String>,
+    pub element_bytes: Option<usize>,
+}
+
+fn state_dtype_bytes(dtype: &str) -> Result<usize, CircuitPlanError> {
+    match dtype {
+        "BF16" | "F16" => Ok(2),
+        "F32" => Ok(4),
+        unsupported => Err(CircuitPlanError(format!(
+            "unsupported circuit state dtype {unsupported:?}"
+        ))),
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -931,7 +948,7 @@ fn infer_node_output_shapes(
         "rms_norm" | "rms_norm_per_head" | "silu" | "rotary_position_embedding" => {
             Ok(repeat_shape(first_input_shape(node, signals), outputs))
         }
-        "multiply" | "residual_add" | "silu_multiply" => Ok(repeat_shape(
+        "multiply" | "residual_add" | "silu_multiply" | "sigmoid_multiply" => Ok(repeat_shape(
             compatible_input_shape(pedal_id, node, signals)?,
             outputs,
         )),
@@ -954,6 +971,13 @@ fn infer_node_output_shapes(
                     first_input_shape(node, signals)
                         .and_then(|shape| shape.last().copied().map(|last| vec![last]))
                 });
+            Ok(repeat_shape(output_shape, outputs))
+        }
+        "causal_conv1d_silu" => Ok(repeat_shape(first_input_shape(node, signals), outputs)),
+        "gated_delta_step" => {
+            let output_shape = attr_usize(node, "value_heads")
+                .zip(attr_usize(node, "value_head_width"))
+                .map(|(heads, width)| vec![heads * width]);
             Ok(repeat_shape(output_shape, outputs))
         }
         "append_state_update" => unknown(),

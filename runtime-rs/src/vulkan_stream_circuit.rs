@@ -121,6 +121,8 @@ impl VulkanStreamCircuitResidentPlan {
         let mut stream_state_buffers = Vec::with_capacity(resource_plan.state_allocations.len());
         let mut per_stream_static_state_elements = 0usize;
         let mut per_stream_dynamic_state_elements_per_activation = 0usize;
+        let mut per_stream_static_state_bytes = Some(0usize);
+        let mut per_stream_dynamic_state_bytes_per_activation = Some(0usize);
 
         for state in &resource_plan.state_allocations {
             if !hosts_pedal(&state.pedal_id) {
@@ -142,6 +144,21 @@ impl VulkanStreamCircuitResidentPlan {
                 )?;
             }
 
+            let state_element_bytes = state.element_bytes.or(activation_element_bytes);
+            per_stream_static_state_bytes = optional_add(
+                per_stream_static_state_bytes,
+                optional_state_contribution_bytes(static_elements, state_element_bytes)?,
+                "per-stream static state bytes",
+            )?;
+            per_stream_dynamic_state_bytes_per_activation = optional_add(
+                per_stream_dynamic_state_bytes_per_activation,
+                optional_state_contribution_bytes(
+                    state.elements_per_activation,
+                    state_element_bytes,
+                )?,
+                "per-stream dynamic state bytes per activation",
+            )?;
+
             stream_state_buffers.push(VulkanResidentStateBuffer {
                 pedal_id: state.pedal_id.clone(),
                 state_id: state.state_id.clone(),
@@ -149,10 +166,10 @@ impl VulkanStreamCircuitResidentPlan {
                 layout: state.layout.clone(),
                 static_elements,
                 elements_per_activation: state.elements_per_activation,
-                static_bytes: optional_mul(static_elements, activation_element_bytes)?,
+                static_bytes: optional_mul(static_elements, state_element_bytes)?,
                 bytes_per_activation: optional_mul(
                     state.elements_per_activation,
-                    activation_element_bytes,
+                    state_element_bytes,
                 )?,
             });
         }
@@ -220,14 +237,8 @@ impl VulkanStreamCircuitResidentPlan {
             per_stream_static_state_elements,
             per_stream_dynamic_state_elements_per_activation,
             per_stream_activation_slot_elements,
-            per_stream_static_state_bytes: optional_mul(
-                Some(per_stream_static_state_elements),
-                activation_element_bytes,
-            )?,
-            per_stream_dynamic_state_bytes_per_activation: optional_mul(
-                Some(per_stream_dynamic_state_elements_per_activation),
-                activation_element_bytes,
-            )?,
+            per_stream_static_state_bytes,
+            per_stream_dynamic_state_bytes_per_activation,
             per_stream_activation_slot_bytes: optional_mul(
                 per_stream_activation_slot_elements,
                 activation_element_bytes,
@@ -15362,6 +15373,27 @@ fn optional_mul(
             "resident byte count",
         )?)),
         _ => Ok(None),
+    }
+}
+
+fn optional_add(
+    left: Option<usize>,
+    right: Option<usize>,
+    label: &str,
+) -> Result<Option<usize>, VulkanResidentPlanError> {
+    match (left, right) {
+        (Some(left), Some(right)) => Ok(Some(checked_add(left, right, label)?)),
+        _ => Ok(None),
+    }
+}
+
+fn optional_state_contribution_bytes(
+    elements: Option<usize>,
+    bytes_per_element: Option<usize>,
+) -> Result<Option<usize>, VulkanResidentPlanError> {
+    match elements {
+        Some(elements) => optional_mul(Some(elements), bytes_per_element),
+        None => Ok(Some(0)),
     }
 }
 
