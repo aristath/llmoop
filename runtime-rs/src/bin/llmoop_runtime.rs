@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
+use chrono::{DateTime, FixedOffset, Local};
 use llmoop_runtime::{
     CircuitPort, PedalCablePlacement, PedalPlacement, RUNTIME_TOPOLOGY_SCHEMA,
     RuntimeAvailableDevice, RuntimeAvailableMemoryHeap, RuntimeBoundDevice,
@@ -32,6 +33,8 @@ use llmoop_runtime::{
     VulkanResidentTokenInputEvent, VulkanResidentTokenTextCodec,
     VulkanReusableKernelArtifactManifest,
 };
+use minijinja::{Environment, Error as TemplateError, ErrorKind as TemplateErrorKind};
+use serde::Serialize;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Args {
@@ -346,8 +349,11 @@ fn run_single_device_chat(
 ) -> Result<(), Box<dyn Error>> {
     let setup_start = Instant::now();
     let device = runtime_vulkan_device(args)?;
-    let stop_token_ids = stop_token_ids_from_manifest(manifest_dir, &manifest)?;
+    let stop_token_ids = chat_stop_token_ids_from_manifest(manifest_dir, tokenizer_dir, &manifest)?;
     let chat_session = RuntimeChatSession::from_tokenizer_dir(tokenizer_dir)?;
+    let transcript_codec = VulkanResidentHfTokenizerTextCodec::from_model_dir(tokenizer_dir)?
+        .with_add_special_tokens(args.add_special_tokens)
+        .with_skip_special_tokens(false);
     let model = VulkanResidentGreedyModelPackage::from_manifest(
         &device,
         manifest_dir,
@@ -366,6 +372,8 @@ fn run_single_device_chat(
         initial_prompt,
         chat_session,
         codec,
+        &transcript_codec,
+        &stop_token_ids,
         |turn_index, token_ids| {
             let mut event = VulkanResidentTokenInputEvent::new(
                 format!("chat_{turn_index}"),
@@ -385,26 +393,23 @@ fn run_single_device_chat(
                     args.cycle_ticks,
                 ),
             )?;
-            let generated_text = codec.decode_tokens(&submitted.generated_token_ids)?;
             Ok(RuntimeChatTurn {
-                generated_text,
-                generated_token_count: submitted.generated_token_ids.len(),
+                generated_token_ids: submitted.generated_token_ids,
             })
         },
     )
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 struct RuntimeChatMessage {
     role: String,
     content: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 struct RuntimeChatSession {
     formatter: RuntimeChatFormatter,
     messages: Vec<RuntimeChatMessage>,
-    committed_token_count: usize,
 }
 
 impl RuntimeChatSession {
@@ -412,7 +417,6 @@ impl RuntimeChatSession {
         Ok(Self {
             formatter: RuntimeChatFormatter::from_tokenizer_dir(tokenizer_dir)?,
             messages: Vec::new(),
-            committed_token_count: 0,
         })
     }
 
@@ -420,6 +424,7 @@ impl RuntimeChatSession {
         &self,
         user_content: &str,
         codec: &C,
+        stop_token_ids: &[u32],
     ) -> Result<Vec<u32>, Box<dyn Error>>
     where
         C: VulkanResidentTokenTextCodec,
@@ -429,23 +434,16 @@ impl RuntimeChatSession {
             role: "user".to_string(),
             content: user_content.to_string(),
         });
-        let formatted = self.formatter.format_messages(&messages, true);
+        let formatted = self.formatter.format_messages(&messages, true)?;
         let formatted_token_ids = codec.encode_text(&formatted)?;
-        if self.committed_token_count > formatted_token_ids.len() {
-            return Err(Box::new(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "chat template token prefix no longer matches the resident conversation",
-            )));
-        }
-        Ok(formatted_token_ids[self.committed_token_count..].to_vec())
+        Ok(incremental_chat_token_delta(
+            &formatted_token_ids,
+            stop_token_ids,
+            !self.messages.is_empty(),
+        )?)
     }
 
-    fn commit_assistant_turn(
-        &mut self,
-        user_content: &str,
-        assistant_content: &str,
-        appended_token_count: usize,
-    ) -> Result<(), Box<dyn Error>> {
+    fn commit_assistant_turn(&mut self, user_content: &str, assistant_content: &str) {
         self.messages.push(RuntimeChatMessage {
             role: "user".to_string(),
             content: user_content.to_string(),
@@ -454,26 +452,39 @@ impl RuntimeChatSession {
             role: "assistant".to_string(),
             content: assistant_content.to_string(),
         });
-        self.committed_token_count = self
-            .committed_token_count
-            .checked_add(appended_token_count)
-            .ok_or_else(|| {
-                Box::new(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "resident chat token cursor overflowed",
-                )) as Box<dyn Error>
-            })?;
-        Ok(())
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum RuntimeChatFormatter {
-    ChatMl { bos_token: Option<String> },
-    RoleDelimited,
-    TurnDelimited { bos_token: Option<String> },
-    PipeTurnDelimited { bos_token: Option<String> },
-    EndDelimitedRoles,
+fn incremental_chat_token_delta(
+    rendered_token_ids: &[u32],
+    stop_token_ids: &[u32],
+    has_resident_history: bool,
+) -> Result<Vec<u32>, io::Error> {
+    if !has_resident_history {
+        return Ok(rendered_token_ids.to_vec());
+    }
+    let stop_positions = rendered_token_ids
+        .iter()
+        .enumerate()
+        .filter_map(|(index, token_id)| stop_token_ids.contains(token_id).then_some(index))
+        .collect::<Vec<_>>();
+    if stop_positions.len() < 2 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "rendered chat template must contain the previous assistant and current user turn delimiters; found stop tokens at {stop_positions:?}"
+            ),
+        ));
+    }
+    let previous_assistant_end = stop_positions[stop_positions.len() - 2];
+    Ok(rendered_token_ids[previous_assistant_end + 1..].to_vec())
+}
+
+#[derive(Clone, Debug)]
+struct RuntimeChatFormatter {
+    template_source: String,
+    template_variables: serde_json::Map<String, serde_json::Value>,
+    render_time: DateTime<FixedOffset>,
 }
 
 impl RuntimeChatFormatter {
@@ -488,141 +499,70 @@ impl RuntimeChatFormatter {
                 ),
             )
         })?;
-        let bos_token = tokenizer_config_string(tokenizer_dir, "bos_token")?;
-        if template.contains("<|im_start|>") && template.contains("<|im_end|>") {
-            return Ok(Self::ChatMl { bos_token });
-        }
-        if template.contains("<|start_of_role|>")
-            && template.contains("<|end_of_role|>")
-            && template.contains("<|end_of_text|>")
-        {
-            return Ok(Self::RoleDelimited);
-        }
-        if template.contains("<start_of_turn>") && template.contains("<end_of_turn>") {
-            return Ok(Self::TurnDelimited { bos_token });
-        }
-        if template.contains("<|turn>") && template.contains("<turn|>") {
-            return Ok(Self::PipeTurnDelimited { bos_token });
-        }
-        if template.contains("<|user|>")
-            && template.contains("<|assistant|>")
-            && template.contains("<|end|>")
-        {
-            return Ok(Self::EndDelimitedRoles);
-        }
-        Err(Box::new(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "chat mode currently supports ChatML, role-delimited, turn-delimited, pipe-turn-delimited, and end-delimited role templates; this package has a different template shape",
-        )))
+        let formatter = Self {
+            template_source: template,
+            template_variables: tokenizer_template_variables(tokenizer_dir)?,
+            render_time: Local::now().fixed_offset(),
+        };
+        formatter.format_messages(
+            &[RuntimeChatMessage {
+                role: "user".to_string(),
+                content: "template validation".to_string(),
+            }],
+            true,
+        )?;
+        Ok(formatter)
     }
 
     fn format_messages(
         &self,
         messages: &[RuntimeChatMessage],
         add_generation_prompt: bool,
-    ) -> String {
-        match self {
-            Self::ChatMl { bos_token } => {
-                let mut formatted = String::new();
-                if let Some(bos_token) = bos_token {
-                    formatted.push_str(bos_token);
-                }
-                for message in messages {
-                    formatted.push_str("<|im_start|>");
-                    formatted.push_str(&message.role);
-                    formatted.push('\n');
-                    formatted.push_str(&message.content);
-                    formatted.push_str("<|im_end|>\n");
-                }
-                if add_generation_prompt {
-                    formatted.push_str("<|im_start|>assistant\n");
-                }
-                formatted
-            }
-            Self::RoleDelimited => {
-                let mut formatted = String::new();
-                for message in messages {
-                    formatted.push_str("<|start_of_role|>");
-                    formatted.push_str(&message.role);
-                    formatted.push_str("<|end_of_role|>");
-                    formatted.push_str(&message.content);
-                    formatted.push_str("<|end_of_text|>\n");
-                }
-                if add_generation_prompt {
-                    formatted.push_str("<|start_of_role|>assistant<|end_of_role|>");
-                }
-                formatted
-            }
-            Self::TurnDelimited { bos_token } => {
-                let mut formatted = bos_token.clone().unwrap_or_default();
-                for message in messages {
-                    let role = if message.role == "assistant" {
-                        "model"
-                    } else {
-                        &message.role
-                    };
-                    formatted.push_str("<start_of_turn>");
-                    formatted.push_str(role);
-                    formatted.push('\n');
-                    formatted.push_str(message.content.trim());
-                    formatted.push_str("<end_of_turn>\n");
-                }
-                if add_generation_prompt {
-                    formatted.push_str("<start_of_turn>model\n");
-                }
-                formatted
-            }
-            Self::PipeTurnDelimited { bos_token } => {
-                let mut formatted = bos_token.clone().unwrap_or_default();
-                for message in messages {
-                    let role = if message.role == "assistant" {
-                        "model"
-                    } else {
-                        &message.role
-                    };
-                    formatted.push_str("<|turn>");
-                    formatted.push_str(role);
-                    formatted.push('\n');
-                    formatted.push_str(message.content.trim());
-                    formatted.push_str("<turn|>\n");
-                }
-                if add_generation_prompt {
-                    formatted.push_str("<|turn>model\n");
-                }
-                formatted
-            }
-            Self::EndDelimitedRoles => {
-                let mut formatted = String::new();
-                for message in messages {
-                    formatted.push_str("<|");
-                    formatted.push_str(&message.role);
-                    formatted.push_str("|>\n");
-                    formatted.push_str(&message.content);
-                    formatted.push_str("<|end|>\n");
-                }
-                if add_generation_prompt {
-                    formatted.push_str("<|assistant|>\n");
-                }
-                formatted
-            }
-        }
+    ) -> Result<String, Box<dyn Error>> {
+        let mut environment = Environment::new();
+        environment
+            .set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
+        environment.add_function(
+            "raise_exception",
+            |message: String| -> Result<String, TemplateError> {
+                Err(TemplateError::new(
+                    TemplateErrorKind::InvalidOperation,
+                    message,
+                ))
+            },
+        );
+        let render_time = self.render_time;
+        environment.add_function("strftime_now", move |format: String| {
+            render_time.format(&format).to_string()
+        });
+        environment.add_template("chat", &self.template_source)?;
+
+        let mut context = self.template_variables.clone();
+        context.insert("messages".to_string(), serde_json::to_value(messages)?);
+        context.insert(
+            "add_generation_prompt".to_string(),
+            serde_json::Value::Bool(add_generation_prompt),
+        );
+        Ok(environment.get_template("chat")?.render(context)?)
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct RuntimeChatTurn {
-    generated_text: String,
-    generated_token_count: usize,
+    generated_token_ids: Vec<u32>,
 }
 
-fn run_chat_repl<C, F>(
+fn run_chat_repl<C, T, F>(
     initial_prompt: Option<&str>,
     mut chat_session: RuntimeChatSession,
     codec: &C,
+    transcript_codec: &T,
+    stop_token_ids: &[u32],
     mut submit: F,
 ) -> Result<(), Box<dyn Error>>
 where
     C: VulkanResidentTokenTextCodec,
+    T: VulkanResidentTokenTextCodec,
     F: FnMut(usize, &[u32]) -> Result<RuntimeChatTurn, Box<dyn Error>>,
 {
     println!("Type a message and press Enter. Type /exit, /quit, exit, or quit to stop.");
@@ -632,6 +572,8 @@ where
             if !submit_chat_turn(
                 &mut chat_session,
                 codec,
+                transcript_codec,
+                stop_token_ids,
                 &mut submit,
                 turn_index,
                 initial_prompt,
@@ -668,6 +610,8 @@ where
         if !submit_chat_turn(
             &mut chat_session,
             codec,
+            transcript_codec,
+            stop_token_ids,
             &mut submit,
             turn_index,
             input_text,
@@ -679,30 +623,48 @@ where
     Ok(())
 }
 
-fn submit_chat_turn<C, F>(
+fn submit_chat_turn<C, T, F>(
     chat_session: &mut RuntimeChatSession,
     codec: &C,
+    transcript_codec: &T,
+    stop_token_ids: &[u32],
     submit: &mut F,
     turn_index: usize,
     input_text: &str,
 ) -> Result<bool, Box<dyn Error>>
 where
     C: VulkanResidentTokenTextCodec,
+    T: VulkanResidentTokenTextCodec,
     F: FnMut(usize, &[u32]) -> Result<RuntimeChatTurn, Box<dyn Error>>,
 {
-    let prompt_delta = chat_session.render_user_prompt_token_delta(input_text, codec)?;
+    let prompt_delta = chat_session.render_user_prompt_token_delta(
+        input_text,
+        transcript_codec,
+        stop_token_ids,
+    )?;
     match submit(turn_index, &prompt_delta) {
         Ok(turn) => {
-            print_chat_response(&turn.generated_text);
-            chat_session.commit_assistant_turn(
-                input_text,
-                &turn.generated_text,
-                prompt_delta.len() + turn.generated_token_count,
-            )?;
+            let generated_text = codec.decode_tokens(&turn.generated_token_ids)?;
+            let assistant_content_ids =
+                assistant_content_token_ids(&turn.generated_token_ids, stop_token_ids);
+            let assistant_content = transcript_codec.decode_tokens(assistant_content_ids)?;
+            print_chat_response(&generated_text);
+            chat_session.commit_assistant_turn(input_text, &assistant_content);
             Ok(true)
         }
         Err(error) => Err(error),
     }
+}
+
+fn assistant_content_token_ids<'a>(
+    generated_token_ids: &'a [u32],
+    stop_token_ids: &[u32],
+) -> &'a [u32] {
+    let mut content_len = generated_token_ids.len();
+    while content_len > 0 && stop_token_ids.contains(&generated_token_ids[content_len - 1]) {
+        content_len -= 1;
+    }
+    &generated_token_ids[..content_len]
 }
 
 fn print_chat_response(text: &str) {
@@ -710,43 +672,59 @@ fn print_chat_response(text: &str) {
     print_text(text);
 }
 
-fn tokenizer_config_string(
+fn tokenizer_template_variables(
     tokenizer_dir: &Path,
-    key: &str,
-) -> Result<Option<String>, Box<dyn Error>> {
+) -> Result<serde_json::Map<String, serde_json::Value>, Box<dyn Error>> {
     let path = tokenizer_dir.join("tokenizer_config.json");
     if !path.is_file() {
-        return Ok(None);
+        return Ok(serde_json::Map::new());
     }
     let config: serde_json::Value = serde_json::from_slice(&fs::read(&path)?)?;
-    Ok(config
-        .get(key)
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_string))
+    let object = config.as_object().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("tokenizer config {path:?} must contain a JSON object"),
+        )
+    })?;
+    Ok(object
+        .iter()
+        .map(|(key, value)| {
+            let value = if key.ends_with("_token") {
+                value
+                    .get("content")
+                    .and_then(serde_json::Value::as_str)
+                    .map(|content| serde_json::Value::String(content.to_string()))
+                    .unwrap_or_else(|| value.clone())
+            } else {
+                value.clone()
+            };
+            (key.clone(), value)
+        })
+        .collect())
 }
 
-fn stop_token_ids_from_manifest(
+fn chat_stop_token_ids_from_manifest(
     manifest_dir: &Path,
+    tokenizer_dir: &Path,
     manifest: &VulkanResidentGreedyModelPackageManifest,
 ) -> Result<Vec<u32>, Box<dyn Error>> {
     let config_path = manifest_dir.join(&manifest.config_path);
-    if !config_path.is_file() {
-        return Ok(Vec::new());
-    }
-    let config: serde_json::Value = serde_json::from_slice(&fs::read(&config_path)?)?;
-    let Some(raw_eos) = config.get("eos_token_id") else {
-        return Ok(Vec::new());
-    };
-    let eos_values = if let Some(id) = raw_eos.as_u64() {
-        vec![id]
-    } else if let Some(ids) = raw_eos.as_array() {
-        ids.iter()
-            .filter_map(serde_json::Value::as_u64)
-            .collect::<Vec<_>>()
+    let eos_values = if config_path.is_file() {
+        let config: serde_json::Value = serde_json::from_slice(&fs::read(&config_path)?)?;
+        let raw_eos = config.get("eos_token_id");
+        if let Some(id) = raw_eos.and_then(serde_json::Value::as_u64) {
+            vec![id]
+        } else if let Some(ids) = raw_eos.and_then(serde_json::Value::as_array) {
+            ids.iter()
+                .filter_map(serde_json::Value::as_u64)
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        }
     } else {
         Vec::new()
     };
-    eos_values
+    let mut stop_token_ids = eos_values
         .into_iter()
         .map(|id| {
             u32::try_from(id).map_err(|_| {
@@ -757,7 +735,36 @@ fn stop_token_ids_from_manifest(
             })
         })
         .collect::<Result<Vec<_>, _>>()
-        .map_err(Into::into)
+        .map_err(Box::<dyn Error>::from)?;
+
+    let tokenizer_config_path = tokenizer_dir.join("tokenizer_config.json");
+    if tokenizer_config_path.is_file() {
+        let tokenizer_config: serde_json::Value =
+            serde_json::from_slice(&fs::read(&tokenizer_config_path)?)?;
+        let eos_token = tokenizer_config.get("eos_token").and_then(|value| {
+            value
+                .as_str()
+                .or_else(|| value.get("content").and_then(serde_json::Value::as_str))
+        });
+        if let Some(eos_token) = eos_token {
+            let stop_codec = VulkanResidentHfTokenizerTextCodec::from_model_dir(tokenizer_dir)?
+                .with_add_special_tokens(false)
+                .with_skip_special_tokens(false);
+            let encoded = stop_codec.encode_text(eos_token)?;
+            let [token_id] = encoded.as_slice() else {
+                return Err(Box::new(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "chat tokenizer eos_token {eos_token:?} must encode to exactly one token, got {encoded:?}"
+                    ),
+                )));
+            };
+            if !stop_token_ids.contains(token_id) {
+                stop_token_ids.push(*token_id);
+            }
+        }
+    }
+    Ok(stop_token_ids)
 }
 
 fn run_placed_chat(
@@ -770,8 +777,11 @@ fn run_placed_chat(
     initial_prompt: Option<&str>,
 ) -> Result<(), Box<dyn Error>> {
     let setup_start = Instant::now();
-    let stop_token_ids = stop_token_ids_from_manifest(manifest_dir, &manifest)?;
+    let stop_token_ids = chat_stop_token_ids_from_manifest(manifest_dir, tokenizer_dir, &manifest)?;
     let chat_session = RuntimeChatSession::from_tokenizer_dir(tokenizer_dir)?;
+    let transcript_codec = VulkanResidentHfTokenizerTextCodec::from_model_dir(tokenizer_dir)?
+        .with_add_special_tokens(args.add_special_tokens)
+        .with_skip_special_tokens(false);
     let mut logical_device_ids = manifest.placement_device_ids();
     if !logical_device_ids.contains(&manifest.device_id) {
         logical_device_ids.push(manifest.device_id.clone());
@@ -796,6 +806,8 @@ fn run_placed_chat(
         initial_prompt,
         chat_session,
         codec,
+        &transcript_codec,
+        &stop_token_ids,
         |turn_index, token_ids| {
             let input_event_id = format!("chat_{turn_index}");
             let input_event = VulkanResidentTokenInputEvent::new(
@@ -834,10 +846,8 @@ fn run_placed_chat(
                 })?
                 .submitted_run
                 .generated_token_ids;
-            let generated_text = codec.decode_tokens(&generated_token_ids)?;
             Ok(RuntimeChatTurn {
-                generated_text,
-                generated_token_count: generated_token_ids.len(),
+                generated_token_ids,
             })
         },
     )
@@ -3093,13 +3103,33 @@ Example:
 
 #[cfg(test)]
 mod tests {
-    use super::{RuntimeChatFormatter, RuntimeChatMessage};
+    use chrono::{FixedOffset, TimeZone};
+
+    use super::{
+        RuntimeChatFormatter, RuntimeChatMessage, assistant_content_token_ids,
+        incremental_chat_token_delta,
+    };
+
+    fn formatter(template_source: &str) -> RuntimeChatFormatter {
+        RuntimeChatFormatter {
+            template_source: template_source.to_string(),
+            template_variables: serde_json::Map::new(),
+            render_time: FixedOffset::east_opt(0)
+                .unwrap()
+                .with_ymd_and_hms(2026, 7, 18, 12, 0, 0)
+                .unwrap(),
+        }
+    }
 
     #[test]
-    fn pipe_turn_chat_formatter_preserves_model_turn_prefixes() {
-        let formatter = RuntimeChatFormatter::PipeTurnDelimited {
-            bos_token: Some("<bos>".to_string()),
-        };
+    fn model_template_controls_pipe_turn_role_names() {
+        let mut formatter = formatter(
+            "{%- for message in messages %}{{- '<|turn>' + ('model' if message.role == 'assistant' else message.role) + '\n' + (message.content | trim) + '<turn|>\n' }}{%- endfor %}{%- if add_generation_prompt %}{{- '<|turn>model\n' }}{%- endif %}",
+        );
+        formatter.template_variables.insert(
+            "bos_token".to_string(),
+            serde_json::Value::String("<bos>".to_string()),
+        );
         let messages = vec![
             RuntimeChatMessage {
                 role: "user".to_string(),
@@ -3116,8 +3146,71 @@ mod tests {
         ];
 
         assert_eq!(
-            formatter.format_messages(&messages, true),
-            "<bos><|turn>user\nHello<turn|>\n<|turn>model\nHi there<turn|>\n<|turn>user\nRemember me<turn|>\n<|turn>model\n"
+            formatter.format_messages(&messages, true).unwrap(),
+            "<|turn>user\nHello<turn|>\n<|turn>model\nHi there<turn|>\n<|turn>user\nRemember me<turn|>\n<|turn>model\n"
+        );
+    }
+
+    #[test]
+    fn model_template_keeps_default_reasoning_branch() {
+        let formatter = formatter(
+            "{%- for message in messages %}{{- '<|im_start|>' + message.role + '\n' + message.content + '<|im_end|>\n' }}{%- endfor %}{%- if add_generation_prompt %}{{- '<|im_start|>assistant\n' }}{%- if enable_thinking is defined and enable_thinking is false %}{{- '<think>\n\n</think>\n\n' }}{%- else %}{{- '<think>\n' }}{%- endif %}{%- endif %}",
+        );
+
+        assert_eq!(
+            formatter
+                .format_messages(
+                    &[RuntimeChatMessage {
+                        role: "user".to_string(),
+                        content: "Solve this".to_string(),
+                    }],
+                    true,
+                )
+                .unwrap(),
+            "<|im_start|>user\nSolve this<|im_end|>\n<|im_start|>assistant\n<think>\n"
+        );
+    }
+
+    #[test]
+    fn model_template_can_supply_a_dated_default_system_turn() {
+        let formatter = formatter(
+            "{%- if messages[0].role == 'system' %}{%- set loop_messages = messages[1:] %}{%- else %}{{- '<|start_of_role|>system<|end_of_role|>Current Date: ' + strftime_now('%B %d, %Y') + '.<|end_of_text|>\n' }}{%- set loop_messages = messages %}{%- endif %}{%- for message in loop_messages %}{{- '<|start_of_role|>' + message.role + '<|end_of_role|>' + message.content + '<|end_of_text|>\n' }}{%- if loop.last and add_generation_prompt %}{{- '<|start_of_role|>assistant<|end_of_role|>' }}{%- endif %}{%- endfor %}",
+        );
+
+        assert_eq!(
+            formatter
+                .format_messages(
+                    &[RuntimeChatMessage {
+                        role: "user".to_string(),
+                        content: "Hello".to_string(),
+                    }],
+                    true,
+                )
+                .unwrap(),
+            "<|start_of_role|>system<|end_of_role|>Current Date: July 18, 2026.<|end_of_text|>\n<|start_of_role|>user<|end_of_role|>Hello<|end_of_text|>\n<|start_of_role|>assistant<|end_of_role|>"
+        );
+    }
+
+    #[test]
+    fn incremental_chat_delta_starts_after_previous_assistant_delimiter() {
+        let fully_rendered = vec![10, 99, 11, 99, 12, 99, 13, 99, 14, 15];
+
+        assert_eq!(
+            incremental_chat_token_delta(&fully_rendered, &[99], true).unwrap(),
+            vec![13, 99, 14, 15]
+        );
+        assert_eq!(
+            incremental_chat_token_delta(&fully_rendered, &[99], false).unwrap(),
+            fully_rendered
+        );
+    }
+
+    #[test]
+    fn assistant_transcript_excludes_trailing_turn_stop_tokens() {
+        assert_eq!(assistant_content_token_ids(&[1, 2, 99], &[98, 99]), &[1, 2]);
+        assert_eq!(
+            assistant_content_token_ids(&[1, 2, 98, 99], &[98, 99]),
+            &[1, 2]
         );
     }
 }
