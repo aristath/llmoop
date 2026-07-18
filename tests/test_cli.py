@@ -17,7 +17,7 @@ from llmoop.cli import (
     parse_source_chain,
     resolve_runtime_package_manifest,
 )
-from llmoop.model_package import package_placement
+from llmoop.model_package import copy_shader_templates, package_placement
 from tests.fixtures import compiled_model_or_skip
 
 
@@ -28,6 +28,22 @@ CLI_DEPS_AVAILABLE = all(
 
 
 class RuntimeCliCommandTest(unittest.TestCase):
+    def test_model_compiler_renders_linear_shader_for_discovered_shape(self) -> None:
+        shader_source_dir = Path(__file__).parents[1] / "runtime-rs" / "shaders"
+        with tempfile.TemporaryDirectory() as raw_dest:
+            destination = Path(raw_dest)
+            copy_shader_templates(
+                shader_source_dir,
+                destination,
+                {"linear_bf16_768x2048.comp"},
+            )
+            shader = (destination / "linear_bf16_768x2048.comp").read_text()
+
+        self.assertIn("const uint INPUT_SIZE = 768u;", shader)
+        self.assertIn("const uint OUTPUT_SIZE = 2048u;", shader)
+        self.assertIn("uint word_index = gl_WorkGroupID.x;", shader)
+        self.assertNotIn("{{INPUT_SIZE}}", shader)
+
     def test_resolve_runtime_package_manifest_accepts_package_dir_or_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as raw_root:
             root = Path(raw_root)
@@ -52,7 +68,7 @@ class RuntimeCliCommandTest(unittest.TestCase):
             duplicate_after=[],
             chain=None,
             max_new_tokens=4,
-            capacity=8,
+            context_size=8,
             vulkan_device_index=None,
             no_special_tokens=True,
             keep_special_tokens=True,
@@ -70,7 +86,7 @@ class RuntimeCliCommandTest(unittest.TestCase):
                 "Hello",
                 "--max-new-tokens",
                 "4",
-                "--capacity",
+                "--context-size",
                 "8",
                 "--no-special-tokens",
                 "--keep-special-tokens",
@@ -96,7 +112,7 @@ class RuntimeCliCommandTest(unittest.TestCase):
             duplicate_after=[],
             chain=None,
             max_new_tokens=4,
-            capacity=None,
+            context_size=None,
             vulkan_device_index=None,
             no_special_tokens=False,
             keep_special_tokens=False,
@@ -134,7 +150,7 @@ class RuntimeCliCommandTest(unittest.TestCase):
             duplicate_after=[],
             chain=None,
             max_new_tokens=4,
-            capacity=None,
+            context_size=None,
             vulkan_device_index=None,
             no_special_tokens=False,
             keep_special_tokens=False,
@@ -173,7 +189,7 @@ class RuntimeCliCommandTest(unittest.TestCase):
             duplicate_after=[],
             chain=None,
             max_new_tokens=4,
-            capacity=None,
+            context_size=None,
             vulkan_device_index=None,
             no_special_tokens=False,
             keep_special_tokens=False,
@@ -215,7 +231,7 @@ class RuntimeCliCommandTest(unittest.TestCase):
             duplicate_after=[],
             chain=None,
             max_new_tokens=4,
-            capacity=4,
+            context_size=4,
             vulkan_device_index=None,
             no_special_tokens=False,
             keep_special_tokens=False,
@@ -231,7 +247,7 @@ class RuntimeCliCommandTest(unittest.TestCase):
                 str(package),
                 "--inspect-device-slice",
                 "gpu1",
-                "--capacity",
+                "--context-size",
                 "4",
                 "--json",
             ],
@@ -253,7 +269,7 @@ class RuntimeCliCommandTest(unittest.TestCase):
             duplicate_after=[],
             chain=None,
             max_new_tokens=4,
-            capacity=4,
+            context_size=4,
             vulkan_device_index=None,
             no_special_tokens=False,
             keep_special_tokens=False,
@@ -268,7 +284,7 @@ class RuntimeCliCommandTest(unittest.TestCase):
                 "--package",
                 str(package),
                 "--inspect-placement",
-                "--capacity",
+                "--context-size",
                 "4",
                 "--json",
             ],
@@ -290,7 +306,7 @@ class RuntimeCliCommandTest(unittest.TestCase):
             duplicate_after=[],
             chain=None,
             max_new_tokens=4,
-            capacity=None,
+            context_size=None,
             vulkan_device_index=5,
             no_special_tokens=False,
             keep_special_tokens=False,
@@ -327,7 +343,7 @@ class RuntimeCliCommandTest(unittest.TestCase):
             duplicate_after=[],
             chain="layer_00,layer_05_repeat=layer_05,layer_13",
             max_new_tokens=4,
-            capacity=None,
+            context_size=None,
             vulkan_device_index=None,
             no_special_tokens=False,
             keep_special_tokens=False,
@@ -368,7 +384,7 @@ class RuntimeCliCommandTest(unittest.TestCase):
             duplicate_after=[],
             chain="layer_00,layer_01,layer_02",
             max_new_tokens=4,
-            capacity=None,
+            context_size=None,
             vulkan_device_index=None,
             no_special_tokens=False,
             keep_special_tokens=False,
@@ -409,7 +425,7 @@ class RuntimeCliCommandTest(unittest.TestCase):
             duplicate_after=[],
             chain="layer_00,layer_05_repeat=layer_05,layer_13",
             max_new_tokens=4,
-            capacity=None,
+            context_size=None,
             vulkan_device_index=None,
             no_special_tokens=False,
             keep_special_tokens=False,
@@ -454,7 +470,7 @@ class RuntimeCliCommandTest(unittest.TestCase):
             duplicate_after=["layer_05=layer_05_repeat"],
             chain="layer_00,layer_01,layer_05,layer_05_repeat=layer_05,layer_06",
             max_new_tokens=4,
-            capacity=None,
+            context_size=None,
             vulkan_device_index=None,
             no_special_tokens=False,
             keep_special_tokens=False,
@@ -633,22 +649,57 @@ class CompiledPackageTest(unittest.TestCase):
                 "temporal_memory_update",
                 "depthwise_temporal_conv",
                 "output_gate",
-                "conv_out_projection",
-                "operator_residual",
+                "conv_out_projection__operator_residual",
                 "ffn_norm",
                 "ffn_gate_projection",
                 "ffn_up_projection",
-                "ffn_gate_activation",
-                "ffn_gate_multiply",
-                "ffn_down_projection",
-                "ffn_residual",
+                "ffn_gate_activation__ffn_gate_multiply",
+                "ffn_down_projection__ffn_residual",
             ],
             [kernel["node_id"] for kernel in layer_00["kernels"]],
         )
-        self.assertEqual(list(range(16)), [kernel["execution_index"] for kernel in layer_00["kernels"]])
-        for profile in manifest["capacity_profiles"]:
-            self.assertIn("pedal_execution_shader_overrides", profile)
-            self.assertNotIn("reusable_kernel_shader_overrides", profile)
+        self.assertEqual(list(range(13)), [kernel["execution_index"] for kernel in layer_00["kernels"]])
+        self.assertEqual(
+            ["linear_residual", "silu_multiply", "linear_residual"],
+            [
+                kernel["op"]
+                for kernel in layer_00["kernels"]
+                if kernel["op"] in {"linear_residual", "silu_multiply"}
+            ],
+        )
+        self.assertNotIn("capacity_profiles", manifest)
+        self.assertTrue(
+            all(kernel["workgroup_count_x"] >= 1 for execution in executions for kernel in execution["kernels"])
+        )
+        attention = next(
+            kernel
+            for execution in executions
+            for kernel in execution["kernels"]
+            if kernel["op"] == "scaled_dot_product_attention"
+        )
+        self.assertEqual(16, attention["workgroup_count_x"])
+        self.assertNotIn("_cap", attention["shader_path"])
+
+    def test_compiled_package_contains_only_precompiled_spirv_shaders(self) -> None:
+        fixture = compiled_model_or_skip()
+        manifest = json.loads(fixture.package_manifest.read_text())
+        shader_paths = [
+            manifest["input_transducer"]["shader_path"],
+            manifest["output_transducer"]["embedding_norm_shader_path"],
+            manifest["output_transducer"]["projection_shader_path"],
+            manifest["sampler"]["shader_path"],
+            *(
+                kernel["shader_path"]
+                for execution in manifest["pedal_executions"]
+                for kernel in execution["kernels"]
+            ),
+        ]
+
+        self.assertTrue(all(path.endswith(".spv") for path in shader_paths))
+        self.assertTrue(
+            all((fixture.package_dir / path).is_file() for path in shader_paths)
+        )
+        self.assertFalse(any((fixture.package_dir / "shaders").glob("*.comp")))
 
     def test_compiled_package_embeds_runtime_circuit_graph(self) -> None:
         fixture = compiled_model_or_skip()

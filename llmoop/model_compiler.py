@@ -50,7 +50,6 @@ def compile_model(
     package_dir: Path | None = None,
     clean: bool = True,
     shader_source_dir: Path = Path("runtime-rs/shaders"),
-    default_dynamic_state_capacity_activations: int = 4,
 ) -> CompiledModelReport:
     model_dir = model_dir.expanduser()
     from llmoop.model_package import compile_model_package
@@ -62,7 +61,6 @@ def compile_model(
         package_dir=package_dir,
         clean=clean,
         shader_source_dir=shader_source_dir,
-        default_dynamic_state_capacity_activations=default_dynamic_state_capacity_activations,
     )
 
 
