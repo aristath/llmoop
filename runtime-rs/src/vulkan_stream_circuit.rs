@@ -18,8 +18,8 @@ use crate::stream_circuit::{
     StreamCircuitPlacementSpec, StreamCircuitRuntimePatch,
 };
 use crate::stream_plan::{
-    CircuitActivationPlan, PlannedNode, PlannedPort, SignalProducer, SignalStorage,
-    StreamCircuitExecutionPlan, StreamCircuitResourcePlan, TensorIndex,
+    CircuitActivationPlan, PlannedNode, PlannedParameterResource, PlannedPort, SignalProducer,
+    SignalStorage, StreamCircuitExecutionPlan, StreamCircuitResourcePlan, TensorIndex,
 };
 use crate::vulkan::{DEFAULT_COMPUTE_LOCAL_SIZE_X, DEFAULT_SPIRV_ENTRY_POINT, read_spirv_words};
 use crate::vulkan_compute::{
@@ -387,6 +387,37 @@ impl VulkanPermanentParameterBufferPlan {
         resource_plan: &StreamCircuitResourcePlan,
         tensor_index: Option<&TensorIndex>,
     ) -> Result<Self, VulkanPermanentParameterBufferPlanError> {
+        Self::from_transducer_parameters_matching(device_id, resource_plan, tensor_index, |_| true)
+    }
+
+    pub fn from_transducer_parameters_for(
+        device_id: impl Into<String>,
+        resource_plan: &StreamCircuitResourcePlan,
+        tensor_index: Option<&TensorIndex>,
+        transducer_id: &str,
+    ) -> Result<Self, VulkanPermanentParameterBufferPlanError> {
+        Self::from_transducer_parameters_matching(
+            device_id,
+            resource_plan,
+            tensor_index,
+            |parameter| {
+                parameter
+                    .uses
+                    .iter()
+                    .any(|parameter_use| parameter_use.circuit_id == transducer_id)
+            },
+        )
+    }
+
+    fn from_transducer_parameters_matching<F>(
+        device_id: impl Into<String>,
+        resource_plan: &StreamCircuitResourcePlan,
+        tensor_index: Option<&TensorIndex>,
+        mut include: F,
+    ) -> Result<Self, VulkanPermanentParameterBufferPlanError>
+    where
+        F: FnMut(&PlannedParameterResource) -> bool,
+    {
         let device_id = device_id.into();
         let mut parameters = Vec::with_capacity(resource_plan.transducer_parameters.len());
         let mut tensor_ids = BTreeSet::new();
@@ -394,6 +425,9 @@ impl VulkanPermanentParameterBufferPlan {
         let mut unresolved_tensors = Vec::new();
 
         for parameter in &resource_plan.transducer_parameters {
+            if !include(parameter) {
+                continue;
+            }
             if !tensor_ids.insert(parameter.tensor.clone()) {
                 return Err(VulkanPermanentParameterBufferPlanError(format!(
                     "{device_id} transducer parameter tensor {:?} appears more than once",
@@ -7435,14 +7469,16 @@ impl VulkanResidentGreedyModelPackageDeviceSlice {
 
 pub struct VulkanResidentGreedyInProcessPlacedModelPackage {
     pub package_id: String,
-    pub boundary_device_id: String,
+    pub input_device_id: String,
+    pub output_device_id: String,
     pub dynamic_state_capacity_activations: usize,
     pub device_ids: Vec<String>,
     pub device_count: usize,
     pub hosted_pedal_count: usize,
     pub transducer_parameter_count: usize,
     pub transducer_parameter_bytes: usize,
-    _transducer_parameter_buffers: Arc<VulkanPermanentParameterBuffers>,
+    _input_transducer_parameter_buffers: Arc<VulkanPermanentParameterBuffers>,
+    _output_transducer_parameter_buffers: Arc<VulkanPermanentParameterBuffers>,
     input_transducer: VulkanResidentInputEmbeddingTransducerRunner,
     output_transducer: VulkanResidentOutputTransducerRunner,
     sampler: VulkanResidentGreedySamplerRunner,
@@ -7549,28 +7585,73 @@ impl VulkanResidentGreedyInProcessPlacedModelPackage {
     {
         let manifest_dir = manifest_dir.as_ref();
         let package_id = manifest.package_id.clone();
-        let boundary_device_id = manifest.placement.default_device_id.clone();
+        let input_device_id = manifest
+            .circuit_graph
+            .pedals
+            .first()
+            .map(|pedal| {
+                manifest
+                    .placement
+                    .device_for_pedal(&pedal.pedal_id)
+                    .to_string()
+            })
+            .ok_or_else(|| {
+                VulkanResidentGreedyInProcessPlacedModelPackageError::Package(
+                    VulkanResidentTokenModelPackageError::new(format!(
+                        "placed package {package_id:?} has no input pedal"
+                    )),
+                )
+            })?;
+        let output_device_id = manifest
+            .circuit_graph
+            .pedals
+            .last()
+            .map(|pedal| {
+                manifest
+                    .placement
+                    .device_for_pedal(&pedal.pedal_id)
+                    .to_string()
+            })
+            .ok_or_else(|| {
+                VulkanResidentGreedyInProcessPlacedModelPackageError::Package(
+                    VulkanResidentTokenModelPackageError::new(format!(
+                        "placed package {package_id:?} has no output pedal"
+                    )),
+                )
+            })?;
         let capacity =
             dynamic_state_capacity_activations.unwrap_or(manifest.max_context_activations);
         let tensor_index_path =
             resolve_resident_model_package_path(manifest_dir, &manifest.tensor_index_path);
         let (tensor_index, resource_plan, _placement_plan, _boundary_placed_plan) =
             plan_resident_greedy_package_placed_stream_circuit(
-                &boundary_device_id,
+                &input_device_id,
                 &manifest.placement,
                 &manifest.circuit_graph,
                 manifest_dir,
                 &tensor_index_path,
                 manifest.activation_element_bytes,
             )?;
-        let boundary_device = device_for(&boundary_device_id)?;
-        let transducer_parameter_buffers =
-            Arc::new(load_resident_greedy_package_transducer_parameter_buffers(
-                boundary_device,
-                &boundary_device_id,
+        let input_device = device_for(&input_device_id)?;
+        let output_device = device_for(&output_device_id)?;
+        let input_transducer_parameter_buffers = Arc::new(
+            load_resident_greedy_package_transducer_parameter_buffers_for(
+                input_device,
+                &input_device_id,
                 &resource_plan,
                 &tensor_index,
-            )?);
+                "input_transducer",
+            )?,
+        );
+        let output_transducer_parameter_buffers = Arc::new(
+            load_resident_greedy_package_transducer_parameter_buffers_for(
+                output_device,
+                &output_device_id,
+                &resource_plan,
+                &tensor_index,
+                "output_transducer",
+            )?,
+        );
         let input_transducer_spirv_words = load_required_resident_model_package_shader(
             manifest_dir,
             &manifest.input_transducer.shader_path,
@@ -7639,38 +7720,48 @@ impl VulkanResidentGreedyInProcessPlacedModelPackage {
                 mounted_bound,
             });
         }
-        let boundary_slice = device_slices
+        let input_slice = device_slices
             .iter()
-            .find(|slice| slice.device_id == boundary_device_id)
+            .find(|slice| slice.device_id == input_device_id)
             .ok_or_else(|| {
                 VulkanResidentGreedyInProcessPlacedModelPackageError::Package(
                     VulkanResidentTokenModelPackageError::new(format!(
-                        "placed package {package_id:?} has no mounted boundary device slice {boundary_device_id:?}"
+                        "placed package {package_id:?} has no mounted input device slice {input_device_id:?}"
+                    )),
+                )
+        })?;
+        let output_slice = device_slices
+            .iter()
+            .find(|slice| slice.device_id == output_device_id)
+            .ok_or_else(|| {
+                VulkanResidentGreedyInProcessPlacedModelPackageError::Package(
+                    VulkanResidentTokenModelPackageError::new(format!(
+                        "placed package {package_id:?} has no mounted output device slice {output_device_id:?}"
                     )),
                 )
         })?;
         let input_transducer =
             VulkanResidentInputEmbeddingTransducerRunner::from_mounted_token_embedding(
-                boundary_device,
-                &boundary_slice.mounted,
-                &transducer_parameter_buffers,
+                input_device,
+                &input_slice.mounted,
+                &input_transducer_parameter_buffers,
                 &input_transducer_spirv_words,
                 &manifest.input_transducer.spec,
             )
             .map_err(VulkanResidentGreedyInProcessPlacedModelPackageError::InputTransducer)?;
         let output_transducer =
             VulkanResidentOutputTransducerRunner::from_mounted_output_transducer(
-                boundary_device,
-                &boundary_slice.mounted,
-                &transducer_parameter_buffers,
+                output_device,
+                &output_slice.mounted,
+                &output_transducer_parameter_buffers,
                 &embedding_norm_spirv_words,
                 &tied_projection_spirv_words,
                 &manifest.output_transducer.spec,
             )
             .map_err(VulkanResidentGreedyInProcessPlacedModelPackageError::OutputTransducer)?;
         let sampler = VulkanResidentGreedySamplerRunner::from_output_transducer_with_spec(
-            boundary_device,
-            &boundary_slice.mounted,
+            output_device,
+            &output_slice.mounted,
             &output_transducer,
             &sampler_spirv_words,
             &manifest.sampler.spec,
@@ -7679,14 +7770,18 @@ impl VulkanResidentGreedyInProcessPlacedModelPackage {
 
         Ok(Self {
             package_id,
-            boundary_device_id,
+            input_device_id,
+            output_device_id,
             dynamic_state_capacity_activations: capacity,
             device_count: device_ids.len(),
             device_ids,
             hosted_pedal_count,
-            transducer_parameter_count: transducer_parameter_buffers.plan.parameter_count,
-            transducer_parameter_bytes: transducer_parameter_buffers.total_byte_capacity,
-            _transducer_parameter_buffers: transducer_parameter_buffers,
+            transducer_parameter_count: input_transducer_parameter_buffers.plan.parameter_count
+                + output_transducer_parameter_buffers.plan.parameter_count,
+            transducer_parameter_bytes: input_transducer_parameter_buffers.total_byte_capacity
+                + output_transducer_parameter_buffers.total_byte_capacity,
+            _input_transducer_parameter_buffers: input_transducer_parameter_buffers,
+            _output_transducer_parameter_buffers: output_transducer_parameter_buffers,
             input_transducer,
             output_transducer,
             sampler,
@@ -7874,7 +7969,8 @@ impl VulkanResidentGreedyInProcessPlacedModelPackage {
             .run(device)
             .map_err(VulkanResidentGreedyInProcessPlacedModelPackageError::OutputTransducer)?;
         Ok(VulkanResidentGreedyInProcessPlacedSingleTokenTickRun {
-            boundary_device_id: self.boundary_device_id.clone(),
+            input_device_id: self.input_device_id.clone(),
+            output_device_id: self.output_device_id.clone(),
             token_id,
             stream_tick,
             input_run,
@@ -7914,17 +8010,25 @@ impl VulkanResidentGreedyInProcessPlacedModelPackage {
         VulkanResidentGreedyInProcessPlacedSingleTokenTickRun,
         VulkanResidentGreedyInProcessPlacedModelPackageError,
     > {
-        let boundary_device = devices
-            .get(&self.boundary_device_id)
+        let input_device = devices
+            .get(&self.input_device_id)
             .map(|device| device.as_ref())
             .ok_or_else(|| {
                 VulkanResidentGreedyInProcessPlacedModelPackageError::MissingBoundDevice {
-                    device_id: self.boundary_device_id.clone(),
+                    device_id: self.input_device_id.clone(),
+                }
+            })?;
+        let output_device = devices
+            .get(&self.output_device_id)
+            .map(|device| device.as_ref())
+            .ok_or_else(|| {
+                VulkanResidentGreedyInProcessPlacedModelPackageError::MissingBoundDevice {
+                    device_id: self.output_device_id.clone(),
                 }
             })?;
         let input_run = self
             .input_transducer
-            .run_token_id(boundary_device, token_id)
+            .run_token_id(input_device, token_id)
             .map_err(VulkanResidentGreedyInProcessPlacedModelPackageError::InputTransducer)?;
         let placed_run = self.run_stream_tick_on_bound_devices_in_process_with_transport(
             devices,
@@ -7941,10 +8045,11 @@ impl VulkanResidentGreedyInProcessPlacedModelPackage {
         }
         let output_run = self
             .output_transducer
-            .run(boundary_device)
+            .run(output_device)
             .map_err(VulkanResidentGreedyInProcessPlacedModelPackageError::OutputTransducer)?;
         Ok(VulkanResidentGreedyInProcessPlacedSingleTokenTickRun {
-            boundary_device_id: self.boundary_device_id.clone(),
+            input_device_id: self.input_device_id.clone(),
+            output_device_id: self.output_device_id.clone(),
             token_id,
             stream_tick,
             input_run,
@@ -8046,7 +8151,8 @@ impl VulkanResidentGreedyInProcessPlacedModelPackage {
         }
 
         Ok(VulkanResidentGreedyInProcessPlacedFeedbackLoopRun {
-            boundary_device_id: self.boundary_device_id.clone(),
+            input_device_id: self.input_device_id.clone(),
+            output_device_id: self.output_device_id.clone(),
             initial_token_id,
             sampled_token_ids,
             tick_runs,
@@ -8076,7 +8182,7 @@ impl VulkanResidentGreedyInProcessPlacedModelPackage {
         prompt_token_ids: &[u32],
         start_stream_tick: u64,
         max_new_tokens: usize,
-        eos_token_id: Option<u32>,
+        stop_token_ids: &[u32],
         max_scheduler_turns_per_tick: usize,
     ) -> Result<
         VulkanResidentGreedyInProcessPlacedPromptEventRun,
@@ -8089,7 +8195,7 @@ impl VulkanResidentGreedyInProcessPlacedModelPackage {
             prompt_token_ids,
             start_stream_tick,
             max_new_tokens,
-            eos_token_id,
+            stop_token_ids,
             max_scheduler_turns_per_tick,
         )
     }
@@ -8101,7 +8207,7 @@ impl VulkanResidentGreedyInProcessPlacedModelPackage {
         prompt_token_ids: &[u32],
         start_stream_tick: u64,
         max_new_tokens: usize,
-        eos_token_id: Option<u32>,
+        stop_token_ids: &[u32],
         max_scheduler_turns_per_tick: usize,
     ) -> Result<
         VulkanResidentGreedyInProcessPlacedPromptEventRun,
@@ -8172,7 +8278,7 @@ impl VulkanResidentGreedyInProcessPlacedModelPackage {
                 public_output_token_id = Some(sampled_token_id);
                 remaining_public_outputs -= 1;
 
-                let close_after_feedback = if eos_token_id == Some(sampled_token_id) {
+                let close_after_feedback = if stop_token_ids.contains(&sampled_token_id) {
                     remaining_public_outputs = 0;
                     stop_reason = Some("eos".to_string());
                     true
@@ -8219,7 +8325,8 @@ impl VulkanResidentGreedyInProcessPlacedModelPackage {
             .collect();
 
         Ok(VulkanResidentGreedyInProcessPlacedPromptEventRun {
-            boundary_device_id: self.boundary_device_id.clone(),
+            input_device_id: self.input_device_id.clone(),
+            output_device_id: self.output_device_id.clone(),
             prompt_token_ids: prompt_token_ids.to_vec(),
             generated_token_ids,
             output_token_ids,
@@ -8234,7 +8341,7 @@ impl VulkanResidentGreedyInProcessPlacedModelPackage {
         prompt_token_ids: &[u32],
         start_stream_tick: u64,
         max_new_tokens: usize,
-        eos_token_id: Option<u32>,
+        stop_token_ids: &[u32],
         max_scheduler_turns_per_tick: usize,
     ) -> Result<
         VulkanResidentGreedyInProcessPlacedPromptEventRun,
@@ -8247,7 +8354,7 @@ impl VulkanResidentGreedyInProcessPlacedModelPackage {
             prompt_token_ids,
             start_stream_tick,
             max_new_tokens,
-            eos_token_id,
+            stop_token_ids,
             max_scheduler_turns_per_tick,
         )
     }
@@ -8259,21 +8366,50 @@ impl VulkanResidentGreedyInProcessPlacedModelPackage {
         prompt_token_ids: &[u32],
         start_stream_tick: u64,
         max_new_tokens: usize,
-        eos_token_id: Option<u32>,
+        stop_token_ids: &[u32],
         max_scheduler_turns_per_tick: usize,
     ) -> Result<
         VulkanResidentGreedyInProcessPlacedPromptEventRun,
         VulkanResidentGreedyInProcessPlacedModelPackageError,
     > {
+        self.run_prompt_event_bounded_on_bound_devices_in_process_with_transport_and_output(
+            devices,
+            transport,
+            prompt_token_ids,
+            start_stream_tick,
+            max_new_tokens,
+            stop_token_ids,
+            max_scheduler_turns_per_tick,
+            |_| {},
+        )
+    }
+
+    pub fn run_prompt_event_bounded_on_bound_devices_in_process_with_transport_and_output<F>(
+        &self,
+        devices: &BTreeMap<String, Arc<VulkanComputeDevice>>,
+        transport: &mut VulkanInProcessPlacedCableTransport,
+        prompt_token_ids: &[u32],
+        start_stream_tick: u64,
+        max_new_tokens: usize,
+        stop_token_ids: &[u32],
+        max_scheduler_turns_per_tick: usize,
+        mut on_output_token: F,
+    ) -> Result<
+        VulkanResidentGreedyInProcessPlacedPromptEventRun,
+        VulkanResidentGreedyInProcessPlacedModelPackageError,
+    >
+    where
+        F: FnMut(u32),
+    {
         if prompt_token_ids.is_empty() {
             return Err(VulkanResidentGreedyInProcessPlacedModelPackageError::EmptyPromptEvent);
         }
-        let boundary_device = devices
-            .get(&self.boundary_device_id)
+        let output_device = devices
+            .get(&self.output_device_id)
             .map(|device| device.as_ref())
             .ok_or_else(|| {
                 VulkanResidentGreedyInProcessPlacedModelPackageError::MissingBoundDevice {
-                    device_id: self.boundary_device_id.clone(),
+                    device_id: self.output_device_id.clone(),
                 }
             })?;
 
@@ -8332,14 +8468,15 @@ impl VulkanResidentGreedyInProcessPlacedModelPackage {
             if should_emit_public_output {
                 let run = self
                     .sampler
-                    .run(boundary_device)
+                    .run(output_device)
                     .map_err(VulkanResidentGreedyInProcessPlacedModelPackageError::Sampler)?;
                 let sampled_token_id = run.token_id;
                 generated_token_ids.push(sampled_token_id);
+                on_output_token(sampled_token_id);
                 public_output_token_id = Some(sampled_token_id);
                 remaining_public_outputs -= 1;
 
-                let close_after_feedback = if eos_token_id == Some(sampled_token_id) {
+                let close_after_feedback = if stop_token_ids.contains(&sampled_token_id) {
                     remaining_public_outputs = 0;
                     stop_reason = Some("eos".to_string());
                     true
@@ -8386,7 +8523,8 @@ impl VulkanResidentGreedyInProcessPlacedModelPackage {
             .collect();
 
         Ok(VulkanResidentGreedyInProcessPlacedPromptEventRun {
-            boundary_device_id: self.boundary_device_id.clone(),
+            input_device_id: self.input_device_id.clone(),
+            output_device_id: self.output_device_id.clone(),
             prompt_token_ids: prompt_token_ids.to_vec(),
             generated_token_ids,
             output_token_ids,
@@ -8398,7 +8536,8 @@ impl VulkanResidentGreedyInProcessPlacedModelPackage {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VulkanResidentGreedyInProcessPlacedSingleTokenTickRun {
-    pub boundary_device_id: String,
+    pub input_device_id: String,
+    pub output_device_id: String,
     pub token_id: u32,
     pub stream_tick: u64,
     pub input_run: VulkanResidentInputEmbeddingTransducerRun,
@@ -8414,7 +8553,8 @@ pub struct VulkanResidentGreedyInProcessPlacedSingleTokenSampleRun {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VulkanResidentGreedyInProcessPlacedFeedbackLoopRun {
-    pub boundary_device_id: String,
+    pub input_device_id: String,
+    pub output_device_id: String,
     pub initial_token_id: u32,
     pub sampled_token_ids: Vec<u32>,
     pub tick_runs: Vec<VulkanResidentGreedyInProcessPlacedFeedbackTickRun>,
@@ -8430,7 +8570,8 @@ pub struct VulkanResidentGreedyInProcessPlacedFeedbackTickRun {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VulkanResidentGreedyInProcessPlacedPromptEventRun {
-    pub boundary_device_id: String,
+    pub input_device_id: String,
+    pub output_device_id: String,
     pub prompt_token_ids: Vec<u32>,
     pub generated_token_ids: Vec<u32>,
     pub output_token_ids: Vec<u32>,
@@ -8471,7 +8612,7 @@ impl VulkanResidentGreedyInProcessPlacedPromptSession {
         device: &VulkanComputeDevice,
         prompt_token_ids: &[u32],
         max_new_tokens: usize,
-        eos_token_id: Option<u32>,
+        stop_token_ids: &[u32],
         max_scheduler_turns_per_tick: usize,
     ) -> Result<
         VulkanResidentGreedyInProcessPlacedPromptSessionRun,
@@ -8484,9 +8625,40 @@ impl VulkanResidentGreedyInProcessPlacedPromptSession {
             prompt_token_ids,
             start_stream_tick,
             max_new_tokens,
-            eos_token_id,
+            stop_token_ids,
             max_scheduler_turns_per_tick,
         )?;
+        self.complete_prompt_event(start_stream_tick, run)
+    }
+
+    pub fn run_prompt_event_bounded_on_bound_devices_in_process_with_output<F>(
+        &mut self,
+        package: &VulkanResidentGreedyInProcessPlacedModelPackage,
+        devices: &BTreeMap<String, Arc<VulkanComputeDevice>>,
+        prompt_token_ids: &[u32],
+        max_new_tokens: usize,
+        stop_token_ids: &[u32],
+        max_scheduler_turns_per_tick: usize,
+        on_output_token: F,
+    ) -> Result<
+        VulkanResidentGreedyInProcessPlacedPromptSessionRun,
+        VulkanResidentGreedyInProcessPlacedModelPackageError,
+    >
+    where
+        F: FnMut(u32),
+    {
+        let start_stream_tick = self.next_stream_tick;
+        let run = package
+            .run_prompt_event_bounded_on_bound_devices_in_process_with_transport_and_output(
+                devices,
+                &mut self.transport,
+                prompt_token_ids,
+                start_stream_tick,
+                max_new_tokens,
+                stop_token_ids,
+                max_scheduler_turns_per_tick,
+                on_output_token,
+            )?;
         self.complete_prompt_event(start_stream_tick, run)
     }
 
@@ -8496,7 +8668,7 @@ impl VulkanResidentGreedyInProcessPlacedPromptSession {
         devices: &BTreeMap<String, Arc<VulkanComputeDevice>>,
         prompt_token_ids: &[u32],
         max_new_tokens: usize,
-        eos_token_id: Option<u32>,
+        stop_token_ids: &[u32],
         max_scheduler_turns_per_tick: usize,
     ) -> Result<
         VulkanResidentGreedyInProcessPlacedPromptSessionRun,
@@ -8509,7 +8681,7 @@ impl VulkanResidentGreedyInProcessPlacedPromptSession {
             prompt_token_ids,
             start_stream_tick,
             max_new_tokens,
-            eos_token_id,
+            stop_token_ids,
             max_scheduler_turns_per_tick,
         )?;
         self.complete_prompt_event(start_stream_tick, run)
@@ -8667,7 +8839,7 @@ impl VulkanResidentGreedyInProcessPlacedPromptStream {
         let session_run = self.run_prompt_event_bounded(
             &event.token_ids,
             event.max_public_tokens,
-            event.eos_token_id,
+            &event.stop_token_ids,
             max_scheduler_turns_per_tick,
         )?;
         let output_events = placed_prompt_stream_output_events_for(&event, &session_run);
@@ -8758,7 +8930,7 @@ impl VulkanResidentGreedyInProcessPlacedPromptStream {
         &mut self,
         prompt_token_ids: &[u32],
         max_new_tokens: usize,
-        eos_token_id: Option<u32>,
+        stop_token_ids: &[u32],
         max_scheduler_turns_per_tick: usize,
     ) -> Result<
         VulkanResidentGreedyInProcessPlacedPromptSessionRun,
@@ -8770,8 +8942,34 @@ impl VulkanResidentGreedyInProcessPlacedPromptStream {
                 &self.devices,
                 prompt_token_ids,
                 max_new_tokens,
-                eos_token_id,
+                stop_token_ids,
                 max_scheduler_turns_per_tick,
+            )
+    }
+
+    pub fn run_prompt_event_bounded_with_output<F>(
+        &mut self,
+        prompt_token_ids: &[u32],
+        max_new_tokens: usize,
+        stop_token_ids: &[u32],
+        max_scheduler_turns_per_tick: usize,
+        on_output_token: F,
+    ) -> Result<
+        VulkanResidentGreedyInProcessPlacedPromptSessionRun,
+        VulkanResidentGreedyInProcessPlacedModelPackageError,
+    >
+    where
+        F: FnMut(u32),
+    {
+        self.session
+            .run_prompt_event_bounded_on_bound_devices_in_process_with_output(
+                &self.package,
+                &self.devices,
+                prompt_token_ids,
+                max_new_tokens,
+                stop_token_ids,
+                max_scheduler_turns_per_tick,
+                on_output_token,
             )
     }
 }
@@ -9158,7 +9356,8 @@ pub struct VulkanResidentGreedyInProcessPlacedPromptEngineSnapshot {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VulkanResidentGreedyInProcessPlacedPromptEngineStreamSnapshot {
     pub stream_id: String,
-    pub boundary_device_id: String,
+    pub input_device_id: String,
+    pub output_device_id: String,
     pub device_ids: Vec<String>,
     pub hosted_pedal_count: usize,
     pub context_window_activations: usize,
@@ -9227,7 +9426,8 @@ fn placed_prompt_engine_stream_snapshot(
 ) -> VulkanResidentGreedyInProcessPlacedPromptEngineStreamSnapshot {
     VulkanResidentGreedyInProcessPlacedPromptEngineStreamSnapshot {
         stream_id: stream_id.to_string(),
-        boundary_device_id: stream.package().boundary_device_id.clone(),
+        input_device_id: stream.package().input_device_id.clone(),
+        output_device_id: stream.package().output_device_id.clone(),
         device_ids: stream.package().device_ids.clone(),
         hosted_pedal_count: stream.package().hosted_pedal_count,
         context_window_activations: stream.package().dynamic_state_capacity_activations,
@@ -10045,6 +10245,43 @@ fn load_resident_greedy_package_transducer_parameter_buffers(
     Ok(transducer_parameter_buffers)
 }
 
+fn load_resident_greedy_package_transducer_parameter_buffers_for(
+    device: &VulkanComputeDevice,
+    device_id: &str,
+    resource_plan: &StreamCircuitResourcePlan,
+    tensor_index: &TensorIndex,
+    transducer_id: &str,
+) -> Result<VulkanPermanentParameterBuffers, VulkanResidentTokenModelPackageError> {
+    let transducer_parameter_plan =
+        VulkanPermanentParameterBufferPlan::from_transducer_parameters_for(
+            device_id,
+            resource_plan,
+            Some(tensor_index),
+            transducer_id,
+        )
+        .map_err(|error| {
+            VulkanResidentTokenModelPackageError::new(format!(
+                "failed to create {transducer_id} parameter plan: {error}"
+            ))
+        })?;
+    let transducer_parameter_buffers =
+        transducer_parameter_plan
+            .allocate_buffers(device)
+            .map_err(|error| {
+                VulkanResidentTokenModelPackageError::new(format!(
+                    "failed to allocate {transducer_id} parameter buffers: {error}"
+                ))
+            })?;
+    transducer_parameter_buffers
+        .load_from_tensor_index(tensor_index)
+        .map_err(|error| {
+            VulkanResidentTokenModelPackageError::new(format!(
+                "failed to load {transducer_id} parameters: {error}"
+            ))
+        })?;
+    Ok(transducer_parameter_buffers)
+}
+
 fn resident_greedy_package_reusable_kernel_manifest(
     placed_plan: &VulkanPlacedStreamCircuitPlan,
 ) -> VulkanReusableKernelArtifactManifest {
@@ -10379,6 +10616,32 @@ pub struct VulkanResidentHfTokenizerTextCodec {
 }
 
 #[cfg(feature = "tokenizers")]
+pub struct VulkanResidentHfTokenDecodeStream<'a> {
+    stream: tokenizers::DecodeStream<
+        'a,
+        tokenizers::models::ModelWrapper,
+        tokenizers::normalizers::NormalizerWrapper,
+        tokenizers::pre_tokenizers::PreTokenizerWrapper,
+        tokenizers::processors::PostProcessorWrapper,
+        tokenizers::decoders::DecoderWrapper,
+    >,
+}
+
+#[cfg(feature = "tokenizers")]
+impl VulkanResidentHfTokenDecodeStream<'_> {
+    pub fn step(
+        &mut self,
+        token_id: u32,
+    ) -> Result<Option<String>, VulkanResidentTokenTextCodecError> {
+        self.stream.step(token_id).map_err(|error| {
+            VulkanResidentTokenTextCodecError::new(format!(
+                "failed to incrementally decode token id {token_id}: {error}"
+            ))
+        })
+    }
+}
+
+#[cfg(feature = "tokenizers")]
 impl VulkanResidentHfTokenizerTextCodec {
     pub fn from_model_dir(
         model_dir: impl AsRef<Path>,
@@ -10419,6 +10682,12 @@ impl VulkanResidentHfTokenizerTextCodec {
 
     pub fn skip_special_tokens(&self) -> bool {
         self.skip_special_tokens
+    }
+
+    pub fn decode_stream(&self) -> VulkanResidentHfTokenDecodeStream<'_> {
+        VulkanResidentHfTokenDecodeStream {
+            stream: self.tokenizer.decode_stream(self.skip_special_tokens),
+        }
     }
 }
 
@@ -16122,6 +16391,74 @@ mod tests {
         assert_eq!(loaded.loaded_count, 2);
         assert_eq!(loaded.total_bytes_loaded, 134_219_776);
         transducer_parameter_buffers
+    }
+
+    #[test]
+    fn transducer_parameter_plans_are_isolated_by_host_boundary() {
+        let tensor_index = TensorIndex::from_json_file(fixture_model_tensor_index_path()).unwrap();
+        let graph = ResolvedLoweredPedalboard::from_index_file(fixture_model_index_path()).unwrap();
+        let execution_plan =
+            StreamCircuitExecutionPlan::from_graph_with_tensor_index(&graph, &tensor_index)
+                .unwrap();
+        let resource_plan =
+            StreamCircuitResourcePlan::from_graph_and_plan(&graph, &execution_plan).unwrap();
+
+        let input = VulkanPermanentParameterBufferPlan::from_transducer_parameters_for(
+            "gpu0",
+            &resource_plan,
+            Some(&tensor_index),
+            "input_transducer",
+        )
+        .unwrap();
+        let output = VulkanPermanentParameterBufferPlan::from_transducer_parameters_for(
+            "gpu1",
+            &resource_plan,
+            Some(&tensor_index),
+            "output_transducer",
+        )
+        .unwrap();
+
+        let expected_input_tensors = resource_plan
+            .transducer_parameters
+            .iter()
+            .filter(|parameter| {
+                parameter
+                    .uses
+                    .iter()
+                    .any(|parameter_use| parameter_use.circuit_id == "input_transducer")
+            })
+            .map(|parameter| parameter.tensor.as_str())
+            .collect::<BTreeSet<_>>();
+        let expected_output_tensors = resource_plan
+            .transducer_parameters
+            .iter()
+            .filter(|parameter| {
+                parameter
+                    .uses
+                    .iter()
+                    .any(|parameter_use| parameter_use.circuit_id == "output_transducer")
+            })
+            .map(|parameter| parameter.tensor.as_str())
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(
+            input
+                .parameters
+                .iter()
+                .map(|parameter| parameter.tensor.as_str())
+                .collect::<BTreeSet<_>>(),
+            expected_input_tensors
+        );
+        assert_eq!(
+            output
+                .parameters
+                .iter()
+                .map(|parameter| parameter.tensor.as_str())
+                .collect::<BTreeSet<_>>(),
+            expected_output_tensors
+        );
+        assert!(input.parameter_count > 0);
+        assert!(output.parameter_count > 0);
     }
 
     fn load_fixture_model_conv_layer_parameters(
@@ -23530,17 +23867,19 @@ mod tests {
                 Some(4),
             )
             .unwrap();
-        assert_eq!(placed_package.boundary_device_id, "gpu0");
-        assert_eq!(placed_package.transducer_parameter_count, 2);
+        assert_eq!(placed_package.input_device_id, "gpu0");
+        assert_eq!(placed_package.output_device_id, "gpu1");
+        assert_eq!(placed_package.transducer_parameter_count, 3);
         assert_eq!(
             placed_package.transducer_parameter_bytes,
-            FIXTURE_MODEL_EMBED_TOKENS_BYTES + 2_048
+            2 * FIXTURE_MODEL_EMBED_TOKENS_BYTES + 2_048
         );
 
         let run = placed_package
             .sample_token_id_stream_tick_in_process(&device, 1, 0, 8)
             .unwrap();
-        assert_eq!(run.tick_run.boundary_device_id, "gpu0");
+        assert_eq!(run.tick_run.input_device_id, "gpu0");
+        assert_eq!(run.tick_run.output_device_id, "gpu1");
         assert_eq!(run.tick_run.token_id, 1);
         assert_eq!(run.tick_run.stream_tick, 0);
         assert_eq!(run.tick_run.input_run.dispatch_count, 1);
@@ -23596,7 +23935,8 @@ mod tests {
             .run_greedy_feedback_bounded_in_process(&device, 1, 0, 2, 8)
             .unwrap();
 
-        assert_eq!(run.boundary_device_id, "gpu0");
+        assert_eq!(run.input_device_id, "gpu0");
+        assert_eq!(run.output_device_id, "gpu1");
         assert_eq!(run.initial_token_id, 1);
         assert_eq!(run.sampled_token_ids, vec![1, 1]);
         assert_eq!(run.tick_runs.len(), 2);
@@ -23646,10 +23986,11 @@ mod tests {
             )
             .unwrap();
         let run = placed_package
-            .run_prompt_event_bounded_in_process(&device, &[1, 36_309], 0, 1, None, 8)
+            .run_prompt_event_bounded_in_process(&device, &[1, 36_309], 0, 1, &[], 8)
             .unwrap();
 
-        assert_eq!(run.boundary_device_id, "gpu0");
+        assert_eq!(run.input_device_id, "gpu0");
+        assert_eq!(run.output_device_id, "gpu1");
         assert_eq!(run.prompt_token_ids, vec![1, 36_309]);
         assert_eq!(run.generated_token_ids.len(), 1);
         assert_eq!(
@@ -23734,7 +24075,7 @@ mod tests {
         let mut session = placed_package.prompt_session();
 
         let first = session
-            .run_prompt_event_bounded_in_process(&placed_package, &device, &[1], 1, None, 8)
+            .run_prompt_event_bounded_in_process(&placed_package, &device, &[1], 1, &[], 8)
             .unwrap();
         assert_eq!(first.prompt_event_index, 0);
         assert_eq!(first.start_stream_tick, 0);
@@ -23754,7 +24095,7 @@ mod tests {
         assert_eq!(session.transport_stats().pending_packet_count, 0);
 
         let second = session
-            .run_prompt_event_bounded_in_process(&placed_package, &device, &[36_309], 1, None, 8)
+            .run_prompt_event_bounded_in_process(&placed_package, &device, &[36_309], 1, &[], 8)
             .unwrap();
         assert_eq!(second.prompt_event_index, 1);
         assert_eq!(second.start_stream_tick, 2);
@@ -23805,11 +24146,12 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(stream.package().boundary_device_id, "gpu0");
+        assert_eq!(stream.package().input_device_id, "gpu0");
+        assert_eq!(stream.package().output_device_id, "gpu1");
         assert_eq!(stream.devices().len(), 2);
         assert_eq!(stream.next_stream_tick(), 0);
 
-        let first = stream.run_prompt_event_bounded(&[1], 1, None, 8).unwrap();
+        let first = stream.run_prompt_event_bounded(&[1], 1, &[], 8).unwrap();
         assert_eq!(first.prompt_event_index, 0);
         assert_eq!(first.start_stream_tick, 0);
         assert_eq!(first.next_stream_tick, 2);
@@ -23817,7 +24159,7 @@ mod tests {
         assert_eq!(stream.completed_prompt_event_count(), 1);
 
         let second = stream
-            .run_prompt_event_bounded(&[36_309], 1, None, 8)
+            .run_prompt_event_bounded(&[36_309], 1, &[], 8)
             .unwrap();
         assert_eq!(second.prompt_event_index, 1);
         assert_eq!(second.start_stream_tick, 2);

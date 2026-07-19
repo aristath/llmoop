@@ -197,6 +197,7 @@ pub struct VulkanComputeDevice {
 pub struct VulkanComputeDeviceInfo {
     pub physical_device_index: usize,
     pub physical_device_id: String,
+    pub device_uuid: [u8; vk::UUID_SIZE],
     pub device_name: String,
     pub device_type: String,
     pub vendor_id: u32,
@@ -1004,17 +1005,22 @@ impl VulkanComputeDevice {
     }
 
     pub fn new() -> Result<Self, VulkanError> {
-        Self::new_with_physical_device_index(None)
+        Self::new_with_physical_device_selector(None, None)
     }
 
     pub fn new_for_physical_device_index(
         physical_device_index: usize,
     ) -> Result<Self, VulkanError> {
-        Self::new_with_physical_device_index(Some(physical_device_index))
+        Self::new_with_physical_device_selector(Some(physical_device_index), None)
     }
 
-    fn new_with_physical_device_index(
+    pub fn new_for_device_uuid(device_uuid: [u8; vk::UUID_SIZE]) -> Result<Self, VulkanError> {
+        Self::new_with_physical_device_selector(None, Some(device_uuid))
+    }
+
+    fn new_with_physical_device_selector(
         requested_physical_device_index: Option<usize>,
+        requested_device_uuid: Option<[u8; vk::UUID_SIZE]>,
     ) -> Result<Self, VulkanError> {
         unsafe {
             let entry = Entry::load()
@@ -1024,18 +1030,17 @@ impl VulkanComputeDevice {
             let physical_devices = instance.enumerate_physical_devices().map_err(|error| {
                 VulkanError(format!("failed to enumerate Vulkan devices: {error:?}"))
             })?;
-            let (physical_device, queue_family_index, device_name) =
-                if let Some(physical_device_index) = requested_physical_device_index {
-                    select_compute_device_by_index(
-                        &instance,
-                        &physical_devices,
-                        physical_device_index,
-                    )?
-                } else {
-                    select_compute_device(&instance, &physical_devices).ok_or_else(|| {
-                        VulkanError("no Vulkan device with a compute queue was found".to_string())
-                    })?
-                };
+            let (physical_device, queue_family_index, device_name) = if let Some(device_uuid) =
+                requested_device_uuid
+            {
+                select_compute_device_by_uuid(&instance, &physical_devices, device_uuid)?
+            } else if let Some(physical_device_index) = requested_physical_device_index {
+                select_compute_device_by_index(&instance, &physical_devices, physical_device_index)?
+            } else {
+                select_compute_device(&instance, &physical_devices).ok_or_else(|| {
+                    VulkanError("no Vulkan device with a compute queue was found".to_string())
+                })?
+            };
 
             let queue_priorities = [1.0_f32];
             let queue_info = [vk::DeviceQueueCreateInfo::default()
@@ -2636,6 +2641,53 @@ unsafe fn select_compute_device_by_index(
     Ok((physical_device, queue_family_index, device_name))
 }
 
+unsafe fn select_compute_device_by_uuid(
+    instance: &ash::Instance,
+    physical_devices: &[vk::PhysicalDevice],
+    requested_device_uuid: [u8; vk::UUID_SIZE],
+) -> Result<(vk::PhysicalDevice, u32, String), VulkanError> {
+    for physical_device in physical_devices {
+        if unsafe { physical_device_uuid(instance, *physical_device) } == requested_device_uuid {
+            let properties = unsafe { instance.get_physical_device_properties(*physical_device) };
+            let device_name = unsafe { std::ffi::CStr::from_ptr(properties.device_name.as_ptr()) }
+                .to_string_lossy()
+                .into_owned();
+            let queue_family_index =
+                unsafe { compute_queue_family_indices(instance, *physical_device) }
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| {
+                        VulkanError(format!(
+                            "Vulkan device UUID {} ({device_name}) has no compute queue",
+                            format_device_uuid(&requested_device_uuid)
+                        ))
+                    })?;
+            return Ok((*physical_device, queue_family_index, device_name));
+        }
+    }
+    Err(VulkanError(format!(
+        "Vulkan device UUID {} was not found",
+        format_device_uuid(&requested_device_uuid)
+    )))
+}
+
+unsafe fn physical_device_uuid(
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+) -> [u8; vk::UUID_SIZE] {
+    let mut id_properties = vk::PhysicalDeviceIDProperties::default();
+    let mut properties = vk::PhysicalDeviceProperties2::default().push_next(&mut id_properties);
+    unsafe { instance.get_physical_device_properties2(physical_device, &mut properties) };
+    id_properties.device_uuid
+}
+
+fn format_device_uuid(device_uuid: &[u8; vk::UUID_SIZE]) -> String {
+    device_uuid
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 unsafe fn select_compute_device_index(
     instance: &ash::Instance,
     physical_devices: &[vk::PhysicalDevice],
@@ -2671,6 +2723,7 @@ unsafe fn inspect_compute_device(
         return None;
     }
     let properties = unsafe { instance.get_physical_device_properties(physical_device) };
+    let device_uuid = unsafe { physical_device_uuid(instance, physical_device) };
     let memory_properties =
         unsafe { instance.get_physical_device_memory_properties(physical_device) };
     let device_name = unsafe { std::ffi::CStr::from_ptr(properties.device_name.as_ptr()) }
@@ -2689,7 +2742,8 @@ unsafe fn inspect_compute_device(
 
     Some(VulkanComputeDeviceInfo {
         physical_device_index,
-        physical_device_id: format!("vulkan:{physical_device_index}"),
+        physical_device_id: format!("vulkan-uuid:{}", format_device_uuid(&device_uuid)),
+        device_uuid,
         device_name,
         device_type: vulkan_device_type_label(properties.device_type).to_string(),
         vendor_id: properties.vendor_id,

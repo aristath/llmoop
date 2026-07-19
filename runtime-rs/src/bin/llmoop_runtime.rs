@@ -22,7 +22,8 @@ use llmoop_runtime::{
     RuntimePromptBenchmarkUsizeMetricReport, RuntimePromptTimingReport,
     RuntimeRemoteCableBufferReport, RuntimeSingleDevicePromptRunReport, RuntimeSourcePedal,
     RuntimeTokenizerOptionsReport, RuntimeTopologyReport, VulkanComputeDevice,
-    VulkanPlacedCableTransportStats, VulkanResidentGreedyInProcessPlacedPromptEngine,
+    VulkanComputeDeviceInfo, VulkanPlacedCableTransportStats,
+    VulkanResidentGreedyInProcessPlacedPromptEngine,
     VulkanResidentGreedyInProcessPlacedPromptEngineInputRequest,
     VulkanResidentGreedyInProcessPlacedPromptEventRun,
     VulkanResidentGreedyInProcessPlacedPromptStream, VulkanResidentGreedyModelPackage,
@@ -399,6 +400,7 @@ fn run_single_device_chat(
             )?;
             Ok(RuntimeChatTurn {
                 generated_token_ids: submitted.generated_token_ids,
+                streamed: false,
             })
         },
     )
@@ -584,6 +586,7 @@ fn normalize_chat_template_for_runtime(source: &str) -> String {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct RuntimeChatTurn {
     generated_token_ids: Vec<u32>,
+    streamed: bool,
 }
 
 fn run_chat_repl<C, T, F>(
@@ -607,7 +610,7 @@ where
                 &mut chat_session,
                 codec,
                 transcript_codec,
-                stop_token_ids,
+                &stop_token_ids,
                 &mut submit,
                 turn_index,
                 initial_prompt,
@@ -682,7 +685,11 @@ where
             let assistant_content_ids =
                 assistant_content_token_ids(&turn.generated_token_ids, stop_token_ids);
             let assistant_content = transcript_codec.decode_tokens(assistant_content_ids)?;
-            print_chat_response(&generated_text);
+            if turn.streamed {
+                println!();
+            } else {
+                print_chat_response(&generated_text);
+            }
             chat_session.commit_assistant_turn(input_text, &assistant_content);
             Ok(true)
         }
@@ -922,46 +929,41 @@ fn run_placed_chat(
         codec,
         &transcript_codec,
         &stop_token_ids,
-        |turn_index, token_ids| {
-            let input_event_id = format!("chat_{turn_index}");
-            let input_event = VulkanResidentTokenInputEvent::new(
-                input_event_id.clone(),
-                token_ids.to_vec(),
+        |_turn_index, token_ids| {
+            print!("llm> ");
+            io::stdout().flush()?;
+            let mut decoder = codec.decode_stream();
+            let mut output_error = None;
+            let stream = engine.stream_mut("main").ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "placed chat stream is missing")
+            })?;
+            let run = stream.run_prompt_event_bounded_with_output(
+                token_ids,
                 args.max_new_tokens,
-            )
-            .with_origin("cli_chat");
-            let input_event = if !stop_token_ids.is_empty() {
-                input_event.with_stop_tokens(stop_token_ids.clone())
-            } else {
-                input_event
-            };
-            let batch_run = engine.submit_input_events_until_idle_bounded(
-                vec![
-                    VulkanResidentGreedyInProcessPlacedPromptEngineInputRequest::new(
-                        "main",
-                        input_event,
-                    ),
-                ],
-                1,
+                &stop_token_ids,
                 args.max_scheduler_turns,
+                |token_id| {
+                    if output_error.is_some() {
+                        return;
+                    }
+                    match decoder.step(token_id) {
+                        Ok(Some(text)) => {
+                            print!("{text}");
+                            if let Err(error) = io::stdout().flush() {
+                                output_error = Some(error.to_string());
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(error) => output_error = Some(error.to_string()),
+                    }
+                },
             )?;
-            let generated_token_ids = batch_run
-                .engine_run
-                .input_runs
-                .into_iter()
-                .find(|run| {
-                    run.stream_id == "main" && run.submitted_run.input_event.id == input_event_id
-                })
-                .ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::NotFound,
-                        "placed chat engine loop did not return the submitted input event run",
-                    )
-                })?
-                .submitted_run
-                .generated_token_ids;
+            if let Some(error) = output_error {
+                return Err(Box::new(io::Error::new(io::ErrorKind::InvalidData, error)));
+            }
             Ok(RuntimeChatTurn {
-                generated_token_ids,
+                generated_token_ids: run.run.generated_token_ids,
+                streamed: true,
             })
         },
     )
@@ -1147,7 +1149,8 @@ fn execute_placed_prompt_run(
         execution_mode: "placed_in_process".to_string(),
         package_manifest: package_manifest.to_path_buf(),
         tokenizer_dir: tokenizer_dir.to_path_buf(),
-        boundary_device_id: stream_snapshot.boundary_device_id.clone(),
+        input_device_id: stream_snapshot.input_device_id.clone(),
+        output_device_id: stream_snapshot.output_device_id.clone(),
         device_count: stream_snapshot.device_ids.len(),
         device_ids: stream_snapshot.device_ids.clone(),
         bound_devices: bound_devices_report(&bound_devices),
@@ -2139,7 +2142,26 @@ fn runtime_manifest(
 }
 
 fn runtime_vulkan_device(args: &Args) -> Result<VulkanComputeDevice, Box<dyn Error>> {
-    if let Some(physical_device_index) = runtime_physical_device_index(args)? {
+    let mut selected_device_uuid = BTreeSet::new();
+    for target in args
+        .default_device_id
+        .iter()
+        .chain(args.device_bindings.values())
+    {
+        if let Some(device_uuid) = parse_vulkan_device_uuid_ref(target)? {
+            selected_device_uuid.insert(device_uuid);
+        }
+    }
+    let physical_device_index = runtime_physical_device_index(args)?;
+    if selected_device_uuid.len() > 1 {
+        return Err(Box::new(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "single-device execution cannot bind more than one Vulkan device UUID",
+        )));
+    }
+    if let Some(device_uuid) = selected_device_uuid.first().copied() {
+        Ok(VulkanComputeDevice::new_for_device_uuid(device_uuid)?)
+    } else if let Some(physical_device_index) = physical_device_index {
         Ok(VulkanComputeDevice::new_for_physical_device_index(
             physical_device_index,
         )?)
@@ -2151,16 +2173,28 @@ fn runtime_vulkan_device(args: &Args) -> Result<VulkanComputeDevice, Box<dyn Err
 struct RuntimeBoundVulkanDevices {
     devices: BTreeMap<String, Arc<VulkanComputeDevice>>,
     physical_device_indices: BTreeMap<String, usize>,
+    physical_device_ids: BTreeMap<String, String>,
 }
 
 fn runtime_bound_vulkan_devices(
     args: &Args,
     logical_device_ids: &[String],
 ) -> Result<RuntimeBoundVulkanDevices, Box<dyn Error>> {
+    let available_devices = VulkanComputeDevice::available_compute_devices()?;
     let default_physical_device_index = if let Some(index) = args.vulkan_device_index {
         index
     } else {
-        runtime_default_vulkan_physical_device_index()?
+        available_devices
+            .iter()
+            .find(|device| device.selected_by_default)
+            .or_else(|| available_devices.first())
+            .map(|device| device.physical_device_index)
+            .ok_or_else(|| {
+                Box::new(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "no Vulkan compute-capable physical devices are available",
+                )) as Box<dyn Error>
+            })?
     };
     let mut logical_device_ids = logical_device_ids.to_vec();
     logical_device_ids.sort();
@@ -2168,29 +2202,47 @@ fn runtime_bound_vulkan_devices(
     let mut devices = BTreeMap::new();
     let mut physical_devices: BTreeMap<usize, Arc<VulkanComputeDevice>> = BTreeMap::new();
     let mut physical_device_indices = BTreeMap::new();
+    let mut physical_device_ids = BTreeMap::new();
 
     for logical_device_id in &logical_device_ids {
         let physical_device_index = runtime_mount_physical_device_index(
             args,
             logical_device_id,
             default_physical_device_index,
+            &available_devices,
         )?;
+        let available_device = available_devices
+            .iter()
+            .find(|device| device.physical_device_index == physical_device_index)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!(
+                        "Vulkan physical device index {physical_device_index} is not available"
+                    ),
+                )
+            })?;
         let device = if let Some(device) = physical_devices.get(&physical_device_index) {
             Arc::clone(device)
         } else {
-            let device = Arc::new(VulkanComputeDevice::new_for_physical_device_index(
-                physical_device_index,
+            let device = Arc::new(VulkanComputeDevice::new_for_device_uuid(
+                available_device.device_uuid,
             )?);
             physical_devices.insert(physical_device_index, Arc::clone(&device));
             device
         };
         devices.insert(logical_device_id.clone(), device);
         physical_device_indices.insert(logical_device_id.clone(), physical_device_index);
+        physical_device_ids.insert(
+            logical_device_id.clone(),
+            available_device.physical_device_id.clone(),
+        );
     }
 
     Ok(RuntimeBoundVulkanDevices {
         devices,
         physical_device_indices,
+        physical_device_ids,
     })
 }
 
@@ -2220,7 +2272,10 @@ fn bound_devices_report(bound_devices: &RuntimeBoundVulkanDevices) -> Vec<Runtim
                 .copied();
             RuntimeBoundDevice {
                 device_id: logical_device_id.clone(),
-                target: physical_device_index.map(|index| format!("vulkan:{index}")),
+                target: bound_devices
+                    .physical_device_ids
+                    .get(logical_device_id)
+                    .cloned(),
                 physical_device_index,
                 device_name: device.device_name().to_string(),
             }
@@ -2244,7 +2299,7 @@ fn bound_cable_routes_report(
             .get(device_id)
             .copied();
         RuntimeCableRouteTarget {
-            target: physical_device_index.map(|index| format!("vulkan:{index}")),
+            target: bound_devices.physical_device_ids.get(device_id).cloned(),
             physical_device_index,
             binding_source: "mounted".to_string(),
         }
@@ -2317,9 +2372,10 @@ fn runtime_mount_physical_device_index(
     args: &Args,
     logical_device_id: &str,
     default_physical_device_index: usize,
+    available_devices: &[VulkanComputeDeviceInfo],
 ) -> Result<usize, io::Error> {
     if let Some(target) = args.device_bindings.get(logical_device_id) {
-        return resolve_runtime_vulkan_physical_device_ref(target)
+        return resolve_runtime_vulkan_physical_device_ref_in(target, available_devices)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?
             .ok_or_else(|| {
                 io::Error::new(
@@ -2330,7 +2386,7 @@ fn runtime_mount_physical_device_index(
                 )
             });
     }
-    match resolve_runtime_vulkan_physical_device_ref(logical_device_id)
+    match resolve_runtime_vulkan_physical_device_ref_in(logical_device_id, available_devices)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?
     {
         Some(index) => Ok(index),
@@ -2353,16 +2409,14 @@ fn runtime_target_for_logical_device(
             .ok()
             .flatten();
         return RuntimeCableRouteTarget {
-            target: physical_device_index
-                .map(|index| format!("vulkan:{index}"))
-                .or_else(|| Some(target.clone())),
+            target: Some(target.clone()),
             physical_device_index,
             binding_source: "explicit".to_string(),
         };
     }
     match resolve_runtime_vulkan_physical_device_ref(logical_device_id) {
         Ok(Some(index)) => RuntimeCableRouteTarget {
-            target: Some(format!("vulkan:{index}")),
+            target: Some(logical_device_id.to_string()),
             physical_device_index: Some(index),
             binding_source: "device_id".to_string(),
         },
@@ -2817,13 +2871,52 @@ fn parse_device_binding_assignment(raw: &str) -> Result<(String, String), String
 }
 
 fn resolve_runtime_vulkan_physical_device_ref(raw: &str) -> Result<Option<usize>, String> {
+    let available_devices = VulkanComputeDevice::available_compute_devices()
+        .map_err(|error| format!("failed to discover Vulkan devices: {error}"))?;
+    resolve_runtime_vulkan_physical_device_ref_in(raw, &available_devices)
+}
+
+fn resolve_runtime_vulkan_physical_device_ref_in(
+    raw: &str,
+    available_devices: &[VulkanComputeDeviceInfo],
+) -> Result<Option<usize>, String> {
     if let Some(index) = parse_vulkan_physical_device_ref(raw)? {
         return Ok(Some(index));
     }
+    if let Some(device_uuid) = parse_vulkan_device_uuid_ref(raw)? {
+        return available_devices
+            .iter()
+            .find(|device| device.device_uuid == device_uuid)
+            .map(|device| Some(device.physical_device_index))
+            .ok_or_else(|| format!("Vulkan device reference {raw:?} is not available"));
+    }
     if let Some(cpu_ordinal) = parse_cpu_runtime_device_ref(raw)? {
-        return runtime_cpu_vulkan_physical_device_index(cpu_ordinal).map(Some);
+        return available_devices
+            .iter()
+            .filter(|device| device.device_type == "cpu")
+            .nth(cpu_ordinal)
+            .map(|device| Some(device.physical_device_index))
+            .ok_or_else(|| format!("CPU runtime device cpu{cpu_ordinal} is not available"));
     }
     Ok(None)
+}
+
+fn parse_vulkan_device_uuid_ref(raw: &str) -> Result<Option<[u8; 16]>, String> {
+    let Some(encoded) = raw.strip_prefix("vulkan-uuid:") else {
+        return Ok(None);
+    };
+    if encoded.len() != 32 {
+        return Err(format!(
+            "invalid Vulkan device UUID reference {raw:?}; expected vulkan-uuid followed by 32 hexadecimal digits"
+        ));
+    }
+    let mut device_uuid = [0u8; 16];
+    for (index, byte) in device_uuid.iter_mut().enumerate() {
+        let offset = index * 2;
+        *byte = u8::from_str_radix(&encoded[offset..offset + 2], 16)
+            .map_err(|error| format!("invalid Vulkan device UUID reference {raw:?}: {error}"))?;
+    }
+    Ok(Some(device_uuid))
 }
 
 fn parse_vulkan_physical_device_ref(raw: &str) -> Result<Option<usize>, String> {
@@ -2873,21 +2966,6 @@ fn parse_cpu_runtime_device_ref(raw: &str) -> Result<Option<usize>, String> {
         ));
     }
     Ok(None)
-}
-
-fn runtime_cpu_vulkan_physical_device_index(cpu_ordinal: usize) -> Result<usize, String> {
-    let devices = VulkanComputeDevice::available_compute_devices()
-        .map_err(|error| format!("failed to inspect Vulkan devices for CPU target: {error}"))?;
-    devices
-        .iter()
-        .filter(|device| device.device_type == "cpu")
-        .nth(cpu_ordinal)
-        .map(|device| device.physical_device_index)
-        .ok_or_else(|| {
-            format!(
-                "CPU runtime target cpu{cpu_ordinal} requested, but no matching Vulkan CPU compute device is available"
-            )
-        })
 }
 
 fn parse_duplicate_after_assignment(raw: &str) -> Result<(String, String), String> {
@@ -3056,7 +3134,7 @@ Options:
   --default-device-id <ID>   Alias for --device.
   --place-pedal <PEDAL=DEV>  Assign one runtime pedal instance to a logical device.
   --place <PEDAL=DEV>        Alias for --place-pedal.
-  --bind-device <DEV=TARGET> Bind a logical device to a target, e.g. gpu1=vulkan:5.
+  --bind-device <DEV=TARGET> Bind a logical device to a discovered Vulkan device ID.
   --device-binding <DEV=TARGET>
                              Alias for --bind-device.
   --chain <ITEM[,ITEM...]>    Runtime source chain. ITEM is SOURCE or INSTANCE=SOURCE.
@@ -3100,7 +3178,7 @@ mod tests {
     use super::{
         RuntimeChatFormatter, RuntimeChatMessage, assistant_content_token_ids,
         incremental_chat_token_delta, model_owned_assistant_turn_stop_token_id,
-        normalize_chat_template_for_runtime,
+        normalize_chat_template_for_runtime, parse_vulkan_device_uuid_ref,
     };
 
     fn formatter(template_source: &str) -> RuntimeChatFormatter {
@@ -3112,6 +3190,20 @@ mod tests {
                 .with_ymd_and_hms(2026, 7, 18, 12, 0, 0)
                 .unwrap(),
         }
+    }
+
+    #[test]
+    fn stable_vulkan_device_uuid_references_are_parsed_without_discovery() {
+        assert_eq!(
+            parse_vulkan_device_uuid_ref("vulkan-uuid:000000000a0000000000000000000000").unwrap(),
+            Some([0, 0, 0, 0, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+        );
+        assert!(
+            parse_vulkan_device_uuid_ref("vulkan-uuid:not-a-device")
+                .unwrap_err()
+                .contains("32 hexadecimal digits")
+        );
+        assert_eq!(parse_vulkan_device_uuid_ref("vulkan:3").unwrap(), None);
     }
 
     #[test]
