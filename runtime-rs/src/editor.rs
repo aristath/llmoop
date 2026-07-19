@@ -367,77 +367,7 @@ impl RuntimeModelEditor {
         self.replace_signal_processor_sequence(&source_sequence)
     }
 
-    pub fn replace_source_sequence(
-        &mut self,
-        source_sequence: &[String],
-    ) -> Result<(), RuntimeEditorError> {
-        if source_sequence.is_empty() {
-            return Err(RuntimeEditorError(
-                "source sequence must contain at least one pedal".to_string(),
-            ));
-        }
-        let mut previous_by_source =
-            BTreeMap::<String, VecDeque<StreamCircuitPedalInstance>>::new();
-        for instance in &self.draft.instances {
-            previous_by_source
-                .entry(instance.source_pedal_id.clone())
-                .or_default()
-                .push_back(instance.clone());
-        }
-        let mut occurrence_by_source = BTreeMap::<String, usize>::new();
-        let mut used_instance_ids = BTreeSet::new();
-        let mut instances = Vec::with_capacity(source_sequence.len());
-        for source_id in source_sequence {
-            if !self.source_ids.contains(source_id) {
-                return Err(RuntimeEditorError(format!(
-                    "unknown source pedal {source_id:?}"
-                )));
-            }
-            let occurrence = occurrence_by_source
-                .entry(source_id.clone())
-                .and_modify(|value| *value += 1)
-                .or_insert(1);
-            let previous = previous_by_source
-                .get_mut(source_id)
-                .and_then(VecDeque::pop_front);
-            let instance = if let Some(previous) = previous {
-                used_instance_ids.insert(previous.instance_id.clone());
-                previous
-            } else {
-                let instance_id = allocate_instance_id(source_id, *occurrence, &used_instance_ids);
-                used_instance_ids.insert(instance_id.clone());
-                StreamCircuitPedalInstance {
-                    instance_id,
-                    source_pedal_id: source_id.clone(),
-                    device_id: self.draft.default_device_id.clone(),
-                    enabled: true,
-                    control_values: BTreeMap::new(),
-                    state_policy: StreamCircuitPedalInstanceStatePolicy::Fresh,
-                }
-            };
-            instances.push(instance);
-        }
-        let chain = instances
-            .iter()
-            .map(|instance| {
-                (
-                    instance.instance_id.clone(),
-                    instance.source_pedal_id.clone(),
-                )
-            })
-            .collect::<Vec<_>>();
-        let mut candidate = StreamCircuitRuntimePatch::from_source_chain(
-            &self.source_graph,
-            self.draft.default_device_id.clone(),
-            &chain,
-        )?;
-        candidate.instances = instances;
-        candidate.validate_against_graph(&self.source_graph)?;
-        self.draft = candidate;
-        Ok(())
-    }
-
-    fn replace_signal_processor_sequence(
+    pub fn replace_signal_processor_sequence(
         &mut self,
         source_sequence: &[String],
     ) -> Result<(), RuntimeEditorError> {
@@ -1242,6 +1172,48 @@ mod tests {
         assert_eq!(instances[1].occurrence, 1);
         assert_eq!(instances[2].occurrence, 2);
         assert_ne!(instances[1].instance_id, instances[2].instance_id);
+        assert!(editor.validation().valid);
+    }
+
+    #[test]
+    fn generic_editor_preserves_explicit_system_pedal_placement() {
+        let package = std::env::var("LLMOOP_TEST_PACKAGE_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("..")
+                    .join("packages")
+                    .join("model_7760f415")
+            });
+        if !package.join(RUNTIME_PACKAGE_MANIFEST_FILE).is_file() {
+            return;
+        }
+        let initial = load_runtime_model_editor_without_hardware(&package).unwrap();
+        let mut secondary = initial.available_devices()[0].clone();
+        secondary.device_id = "gpu1".to_string();
+        secondary.runtime_device_id = Some("gpu1".to_string());
+        secondary.physical_device_id = Some("test:1".to_string());
+        secondary.physical_device_index = Some(1);
+        let mut editor = RuntimeModelEditor::load_with_available_devices(
+            &package,
+            vec![initial.available_devices()[0].clone(), secondary],
+        )
+        .unwrap();
+
+        editor
+            .set_instance_device("input_transducer", "gpu1")
+            .unwrap();
+
+        assert_eq!(
+            editor
+                .draft()
+                .instances
+                .iter()
+                .find(|instance| instance.instance_id == "input_transducer")
+                .unwrap()
+                .device_id,
+            "gpu1"
+        );
         assert!(editor.validation().valid);
     }
 

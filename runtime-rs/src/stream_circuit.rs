@@ -4420,9 +4420,18 @@ mod tests {
         assert_eq!(patch.schema, STREAM_CIRCUIT_RUNTIME_PATCH_SCHEMA);
         assert_eq!(patch.wiring, "explicit_graph");
         assert_eq!(patch.instances.len(), resolved.circuits.len());
-        assert_eq!(patch.instances[0].instance_id, "layer_00");
-        assert_eq!(patch.instances[0].source_pedal_id, "layer_00");
+        assert_eq!(patch.instances[0].instance_id, "input_transducer");
+        assert_eq!(patch.instances[0].source_pedal_id, "input_transducer");
         assert_eq!(patch.instances[0].device_id, "gpu0");
+        assert_eq!(
+            patch
+                .instances
+                .iter()
+                .find(|instance| instance.instance_id == "layer_00")
+                .unwrap()
+                .device_id,
+            "gpu0"
+        );
         assert_eq!(
             patch
                 .instances

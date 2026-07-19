@@ -15,10 +15,10 @@ use sha2::{Digest, Sha256};
 use smallvec::SmallVec;
 
 use crate::stream_circuit::{
-    CableTransport, CircuitParamsArtifact, CircuitStateArtifact, LOWERED_PEDALBOARD_SCHEMA,
-    LoweredCircuitRef, LoweredPedalboard, LoweredPedalboardGraph, LoweredPedalboardSource,
-    LoweredPedalboardSummary, PedalCablePlacement, ResolvedCircuitArtifact,
-    ResolvedLoweredPedalboard, StreamCircuit, StreamCircuitGraphBoundary,
+    CableTransport, CircuitParamsArtifact, CircuitRuntimeRole, CircuitStateArtifact,
+    LOWERED_PEDALBOARD_SCHEMA, LoweredCircuitRef, LoweredPedalboard, LoweredPedalboardGraph,
+    LoweredPedalboardSource, LoweredPedalboardSummary, PedalCablePlacement,
+    ResolvedCircuitArtifact, ResolvedLoweredPedalboard, StreamCircuit, StreamCircuitGraphBoundary,
     StreamCircuitPedalInstanceStatePolicy, StreamCircuitPlacementPlan, StreamCircuitPlacementSpec,
     StreamCircuitRuntimePatch,
 };
@@ -7839,6 +7839,8 @@ impl VulkanResidentModelPackageManifest {
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
         validate_pedal_executions_against_graph(&manifest, &source_graph)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+        validate_generation_execution_contract(&manifest)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
         Ok(manifest)
     }
 
@@ -7924,12 +7926,31 @@ impl VulkanResidentModelPackageManifest {
                 .map_err(|error| VulkanResidentTokenModelPackageError::new(error.to_string()))?;
         }
         for (instance_id, device_id) in pedal_devices {
+            let instance = patch
+                .instances
+                .iter()
+                .find(|instance| instance.instance_id == *instance_id)
+                .ok_or_else(|| {
+                    VulkanResidentTokenModelPackageError::new(format!(
+                        "runtime patch has no pedal instance {instance_id:?}"
+                    ))
+                })?;
+            let source = source_graph
+                .circuits
+                .iter()
+                .find(|artifact| artifact.pedal.id == instance.source_pedal_id)
+                .expect("validated runtime patch source must exist");
+            if !source.pedal.runtime_role.is_signal_processor() {
+                return Err(VulkanResidentTokenModelPackageError::new(format!(
+                    "pedal {instance_id:?} is attached to the processor boundary and cannot be placed independently by the Vulkan backend"
+                )));
+            }
             patch = patch
                 .with_instance_device(instance_id, device_id)
                 .map_err(|error| VulkanResidentTokenModelPackageError::new(error.to_string()))?;
         }
-
-        Ok(patch)
+        attach_generation_pedal_devices_for_vulkan(patch, &source_graph)
+            .map_err(|error| VulkanResidentTokenModelPackageError::new(error.to_string()))
     }
 
     pub fn resolved_source_graph(
@@ -7947,6 +7968,8 @@ impl VulkanResidentModelPackageManifest {
         let source_graph = self
             .circuit_graph
             .to_resolved_lowered_pedalboard(PathBuf::from("."))?;
+        let patch = attach_generation_pedal_devices_for_vulkan(patch.clone(), &source_graph)
+            .map_err(|error| VulkanResidentTokenModelPackageError::new(error.to_string()))?;
         patch
             .validate_against_graph(&source_graph)
             .map_err(|error| VulkanResidentTokenModelPackageError::new(error.to_string()))?;
@@ -7988,7 +8011,7 @@ impl VulkanResidentModelPackageManifest {
             let mut pedal = (*source_pedal).clone();
             pedal.pedal_id = instance.instance_id.clone();
             pedal.circuit.source.pedal_id = instance.instance_id.clone();
-            apply_runtime_patch_state_policy(&mut pedal, patch, instance);
+            apply_runtime_patch_state_policy(&mut pedal, &patch, instance);
             pedals.push(pedal);
 
             if source_pedal.runtime_role.is_signal_processor() {
@@ -8019,8 +8042,102 @@ impl VulkanResidentModelPackageManifest {
         self.circuit_graph.boundary = patch.boundary.clone();
         self.circuit_graph.pedals = pedals;
         self.pedal_executions = pedal_executions;
+        validate_generation_execution_contract(&self)?;
         Ok(self)
     }
+}
+
+pub(crate) fn attach_generation_pedal_devices_for_vulkan(
+    mut patch: StreamCircuitRuntimePatch,
+    graph: &ResolvedLoweredPedalboard,
+) -> Result<StreamCircuitRuntimePatch, crate::stream_circuit::CircuitPlacementError> {
+    patch.validate_against_graph(graph)?;
+    let source_by_id = graph
+        .circuits
+        .iter()
+        .map(|artifact| (artifact.pedal.id.as_str(), artifact))
+        .collect::<BTreeMap<_, _>>();
+    let role_for = |instance: &crate::stream_circuit::StreamCircuitPedalInstance| {
+        source_by_id[instance.source_pedal_id.as_str()]
+            .pedal
+            .runtime_role
+    };
+    let instances_with_role = |role: CircuitRuntimeRole| {
+        patch
+            .instances
+            .iter()
+            .filter(|instance| role_for(instance) == role)
+            .map(|instance| instance.instance_id.clone())
+            .collect::<Vec<_>>()
+    };
+    let input_transducer_ids = instances_with_role(CircuitRuntimeRole::InputTransducer);
+    let [input_transducer_id] = input_transducer_ids.as_slice() else {
+        return Err(crate::stream_circuit::CircuitPlacementError(
+            "Vulkan generation placement requires exactly one input transducer".to_string(),
+        ));
+    };
+    let input_transducer_id = input_transducer_id.clone();
+    let output_transducer_ids = instances_with_role(CircuitRuntimeRole::OutputTransducer);
+    let [output_transducer_id] = output_transducer_ids.as_slice() else {
+        return Err(crate::stream_circuit::CircuitPlacementError(
+            "Vulkan generation placement requires exactly one output transducer".to_string(),
+        ));
+    };
+    let output_transducer_id = output_transducer_id.clone();
+    let sampler_ids = instances_with_role(CircuitRuntimeRole::Sampler);
+    let [sampler_id] = sampler_ids.as_slice() else {
+        return Err(crate::stream_circuit::CircuitPlacementError(
+            "Vulkan generation placement requires exactly one sampler".to_string(),
+        ));
+    };
+    let sampler_id = sampler_id.clone();
+    let processor_ids = patch
+        .instances
+        .iter()
+        .filter(|instance| role_for(instance).is_signal_processor())
+        .map(|instance| instance.instance_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let input_edges = patch
+        .cables
+        .iter()
+        .filter(|cable| {
+            cable.connection.is_forward()
+                && cable.source.pedal_id == input_transducer_id
+                && processor_ids.contains(cable.destination.pedal_id.as_str())
+        })
+        .collect::<Vec<_>>();
+    let output_edges = patch
+        .cables
+        .iter()
+        .filter(|cable| {
+            cable.connection.is_forward()
+                && processor_ids.contains(cable.source.pedal_id.as_str())
+                && cable.destination.pedal_id == output_transducer_id
+        })
+        .collect::<Vec<_>>();
+    let ([input_edge], [output_edge]) = (input_edges.as_slice(), output_edges.as_slice()) else {
+        return Err(crate::stream_circuit::CircuitPlacementError(
+            "Vulkan generation placement requires one processor input and output boundary"
+                .to_string(),
+        ));
+    };
+    let device_by_instance = patch
+        .instances
+        .iter()
+        .map(|instance| (instance.instance_id.as_str(), instance.device_id.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let input_device = device_by_instance[input_edge.destination.pedal_id.as_str()].clone();
+    let output_device = device_by_instance[output_edge.source.pedal_id.as_str()].clone();
+    for instance in &mut patch.instances {
+        if instance.instance_id == input_transducer_id {
+            instance.device_id = input_device.clone();
+        } else if instance.instance_id == output_transducer_id || instance.instance_id == sampler_id
+        {
+            instance.device_id = output_device.clone();
+        }
+    }
+    patch.validate_against_graph(graph)?;
+    Ok(patch)
 }
 
 fn apply_runtime_patch_state_policy(
@@ -8739,6 +8856,14 @@ impl VulkanResidentPlacedTokenTickTail {
     }
 }
 
+fn placed_feedback_token_is_resident(
+    input_device_id: &str,
+    output_device_id: &str,
+    input_is_feedback: bool,
+) -> bool {
+    input_is_feedback && input_device_id == output_device_id
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VulkanResidentPromptRequest<'a> {
     pub prompt_token_ids: &'a [u32],
@@ -9241,6 +9366,7 @@ impl VulkanResidentInProcessPlacedModelPackage {
         token_id: u32,
         stream_tick: u64,
         max_scheduler_turns: usize,
+        input_token_is_resident: bool,
         tail: VulkanResidentPlacedTokenTickTail,
     ) -> Result<
         (
@@ -9249,10 +9375,13 @@ impl VulkanResidentInProcessPlacedModelPackage {
         ),
         VulkanResidentInProcessPlacedModelPackageError,
     > {
-        let input_run = self
-            .input_transducer
-            .prepare_token_id(token_id)
-            .map_err(VulkanResidentInProcessPlacedModelPackageError::InputTransducer)?;
+        let input_run = if input_token_is_resident {
+            self.input_transducer.completed_run(token_id)
+        } else {
+            self.input_transducer
+                .prepare_token_id(token_id)
+                .map_err(VulkanResidentInProcessPlacedModelPackageError::InputTransducer)?
+        };
         let placed_run = self.execute_prepared_token_id_stream_tick_in_process_with_transport(
             device,
             transport,
@@ -9363,6 +9492,7 @@ impl VulkanResidentInProcessPlacedModelPackage {
         token_id: u32,
         stream_tick: u64,
         max_scheduler_turns: usize,
+        input_token_is_resident: bool,
         tail: VulkanResidentPlacedTokenTickTail,
     ) -> Result<
         (
@@ -9371,10 +9501,13 @@ impl VulkanResidentInProcessPlacedModelPackage {
         ),
         VulkanResidentInProcessPlacedModelPackageError,
     > {
-        let input_run = self
-            .input_transducer
-            .prepare_token_id(token_id)
-            .map_err(VulkanResidentInProcessPlacedModelPackageError::InputTransducer)?;
+        let input_run = if input_token_is_resident {
+            self.input_transducer.completed_run(token_id)
+        } else {
+            self.input_transducer
+                .prepare_token_id(token_id)
+                .map_err(VulkanResidentInProcessPlacedModelPackageError::InputTransducer)?
+        };
         let placed_run = self
             .execute_prepared_token_id_stream_tick_on_bound_devices_in_process_with_transport(
                 devices,
@@ -9445,6 +9578,7 @@ impl VulkanResidentInProcessPlacedModelPackage {
             token_id,
             stream_tick,
             max_scheduler_turns,
+            false,
             VulkanResidentPlacedTokenTickTail::Logits,
         )
         .map(|(tick_run, _)| tick_run)
@@ -9487,6 +9621,7 @@ impl VulkanResidentInProcessPlacedModelPackage {
             token_id,
             stream_tick,
             max_scheduler_turns,
+            false,
             VulkanResidentPlacedTokenTickTail::Logits,
         )
         .map(|(tick_run, _)| tick_run)
@@ -9530,6 +9665,7 @@ impl VulkanResidentInProcessPlacedModelPackage {
                 token_id,
                 stream_tick,
                 max_scheduler_turns,
+                false,
                 VulkanResidentPlacedTokenTickTail::Sample,
             )?;
         Ok(VulkanResidentInProcessPlacedSingleTokenSampleRun {
@@ -9565,13 +9701,26 @@ impl VulkanResidentInProcessPlacedModelPackage {
                     VulkanResidentInProcessPlacedModelPackageError::StreamTickOverflow
                 })?)
                 .ok_or(VulkanResidentInProcessPlacedModelPackageError::StreamTickOverflow)?;
-            let tick_run = self.sample_token_id_stream_tick_in_process_with_transport(
-                device,
-                &mut transport,
-                input_token_id,
-                stream_tick,
-                max_scheduler_turns_per_tick,
-            )?;
+            let (tick_run, sampler_run) = self
+                .run_prepared_token_id_stream_tick_in_process_with_transport(
+                    device,
+                    &mut transport,
+                    input_token_id,
+                    stream_tick,
+                    max_scheduler_turns_per_tick,
+                    placed_feedback_token_is_resident(
+                        &self.input_device_id,
+                        &self.output_device_id,
+                        tick_index != 0,
+                    ),
+                    VulkanResidentPlacedTokenTickTail::Sample,
+                )?;
+            let tick_run = VulkanResidentInProcessPlacedSingleTokenSampleRun {
+                tick_run,
+                sampler_run: sampler_run.ok_or(
+                    VulkanResidentInProcessPlacedModelPackageError::MissingFusedSamplerRun,
+                )?,
+            };
             let sampled_token_id = tick_run.sampler_run.token_id;
             sampled_token_ids.push(sampled_token_id);
             tick_runs.push(VulkanResidentInProcessPlacedFeedbackTickRun {
@@ -9653,11 +9802,11 @@ impl VulkanResidentInProcessPlacedModelPackage {
         let mut stop_reason = (max_new_tokens == 0).then(|| "max_new_tokens".to_string());
 
         while external_input_index < prompt_token_ids.len() || pending_feedback.is_some() {
-            let (input_token_id, input_feedback_depth, input_closes_loop) =
+            let (input_token_id, input_feedback_depth, input_closes_loop, input_is_feedback) =
                 if external_input_index < prompt_token_ids.len() {
                     let token_id = prompt_token_ids[external_input_index];
                     external_input_index += 1;
-                    (token_id, 0, false)
+                    (token_id, 0, false, false)
                 } else {
                     let feedback = pending_feedback.take().ok_or(
                         VulkanResidentInProcessPlacedModelPackageError::MissingPrivateFeedback,
@@ -9666,6 +9815,7 @@ impl VulkanResidentInProcessPlacedModelPackage {
                         feedback.token_id,
                         feedback.feedback_depth,
                         feedback.closes_loop_after_processing,
+                        true,
                     )
                 };
 
@@ -9682,9 +9832,15 @@ impl VulkanResidentInProcessPlacedModelPackage {
             } else {
                 VulkanResidentPlacedTokenTickTail::None
             };
-            self.input_transducer
-                .prepare_token_id_only(input_token_id)
-                .map_err(VulkanResidentInProcessPlacedModelPackageError::InputTransducer)?;
+            if !placed_feedback_token_is_resident(
+                &self.input_device_id,
+                &self.output_device_id,
+                input_is_feedback,
+            ) {
+                self.input_transducer
+                    .prepare_token_id_only(input_token_id)
+                    .map_err(VulkanResidentInProcessPlacedModelPackageError::InputTransducer)?;
+            }
             let placed_run = self.execute_prepared_token_id_stream_tick_in_process_with_transport(
                 device,
                 transport,
@@ -9826,11 +9982,11 @@ impl VulkanResidentInProcessPlacedModelPackage {
         let mut stop_reason = (max_new_tokens == 0).then(|| "max_new_tokens".to_string());
 
         while external_input_index < prompt_token_ids.len() || pending_feedback.is_some() {
-            let (input_token_id, input_feedback_depth, input_closes_loop) =
+            let (input_token_id, input_feedback_depth, input_closes_loop, input_is_feedback) =
                 if external_input_index < prompt_token_ids.len() {
                     let token_id = prompt_token_ids[external_input_index];
                     external_input_index += 1;
-                    (token_id, 0, false)
+                    (token_id, 0, false, false)
                 } else {
                     let feedback = pending_feedback.take().ok_or(
                         VulkanResidentInProcessPlacedModelPackageError::MissingPrivateFeedback,
@@ -9839,6 +9995,7 @@ impl VulkanResidentInProcessPlacedModelPackage {
                         feedback.token_id,
                         feedback.feedback_depth,
                         feedback.closes_loop_after_processing,
+                        true,
                     )
                 };
 
@@ -9855,9 +10012,15 @@ impl VulkanResidentInProcessPlacedModelPackage {
             } else {
                 VulkanResidentPlacedTokenTickTail::None
             };
-            self.input_transducer
-                .prepare_token_id_only(input_token_id)
-                .map_err(VulkanResidentInProcessPlacedModelPackageError::InputTransducer)?;
+            if !placed_feedback_token_is_resident(
+                &self.input_device_id,
+                &self.output_device_id,
+                input_is_feedback,
+            ) {
+                self.input_transducer
+                    .prepare_token_id_only(input_token_id)
+                    .map_err(VulkanResidentInProcessPlacedModelPackageError::InputTransducer)?;
+            }
             let placed_run = self
                 .execute_prepared_token_id_stream_tick_on_bound_devices_in_process_with_transport(
                     devices,
@@ -11263,6 +11426,276 @@ fn validate_pedal_executions(
         }
     }
 
+    Ok(())
+}
+
+fn validate_generation_execution_contract(
+    manifest: &VulkanResidentModelPackageManifest,
+) -> Result<(), VulkanResidentTokenModelPackageError> {
+    let pedals_with_role = |role: crate::stream_circuit::CircuitRuntimeRole| {
+        manifest
+            .circuit_graph
+            .pedals
+            .iter()
+            .filter(|pedal| pedal.runtime_role == role)
+            .collect::<Vec<_>>()
+    };
+    let inputs = pedals_with_role(crate::stream_circuit::CircuitRuntimeRole::InputTransducer);
+    let outputs = pedals_with_role(crate::stream_circuit::CircuitRuntimeRole::OutputTransducer);
+    let samplers = pedals_with_role(crate::stream_circuit::CircuitRuntimeRole::Sampler);
+    let processors = pedals_with_role(crate::stream_circuit::CircuitRuntimeRole::SignalProcessor);
+    if inputs.len() != 1 || outputs.len() != 1 || samplers.len() != 1 || processors.is_empty() {
+        return Err(VulkanResidentTokenModelPackageError::new(format!(
+            "resident model package {:?} generation graph requires one input transducer, one output transducer, one sampler, and at least one signal processor",
+            manifest.package_id
+        )));
+    }
+    let input = inputs[0];
+    let output = outputs[0];
+    let sampler = samplers[0];
+    let processor_ids = processors
+        .iter()
+        .map(|pedal| pedal.pedal_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let forward = manifest
+        .circuit_graph
+        .cables
+        .iter()
+        .filter(|cable| cable.connection.is_forward())
+        .collect::<Vec<_>>();
+    let input_edges = forward
+        .iter()
+        .copied()
+        .filter(|cable| {
+            cable.source.pedal_id == input.pedal_id
+                && processor_ids.contains(cable.destination.pedal_id.as_str())
+        })
+        .collect::<Vec<_>>();
+    let output_edges = forward
+        .iter()
+        .copied()
+        .filter(|cable| {
+            processor_ids.contains(cable.source.pedal_id.as_str())
+                && cable.destination.pedal_id == output.pedal_id
+        })
+        .collect::<Vec<_>>();
+    let sampler_edges = forward
+        .iter()
+        .copied()
+        .filter(|cable| {
+            cable.source.pedal_id == output.pedal_id
+                && cable.destination.pedal_id == sampler.pedal_id
+        })
+        .collect::<Vec<_>>();
+    let feedback_edges = manifest
+        .circuit_graph
+        .cables
+        .iter()
+        .filter(|cable| {
+            !cable.connection.is_forward()
+                && cable.source.pedal_id == sampler.pedal_id
+                && cable.destination.pedal_id == input.pedal_id
+        })
+        .collect::<Vec<_>>();
+    if [
+        input_edges.len(),
+        output_edges.len(),
+        sampler_edges.len(),
+        feedback_edges.len(),
+    ]
+    .into_iter()
+    .any(|count| count != 1)
+    {
+        return Err(VulkanResidentTokenModelPackageError::new(format!(
+            "resident model package {:?} must wire input transducer -> processors -> output transducer -> sampler with one delayed sampler feedback edge",
+            manifest.package_id
+        )));
+    }
+
+    let input_nodes = &input.circuit.nodes;
+    let output_nodes = &output.circuit.nodes;
+    let sampler_nodes = &sampler.circuit.nodes;
+    if input_nodes.len() != 1
+        || input_nodes[0].inputs.len() != 1
+        || input_nodes[0].outputs.len() != 1
+        || output_nodes.len() != 2
+        || output_nodes[0].inputs.len() != 1
+        || output_nodes[1].outputs.len() != 1
+        || sampler_nodes.len() != 1
+        || sampler_nodes[0].inputs.len() != 2
+        || sampler_nodes[0].outputs.len() != 1
+    {
+        return Err(VulkanResidentTokenModelPackageError::new(format!(
+            "resident model package {:?} generation system pedals have invalid node boundaries",
+            manifest.package_id
+        )));
+    }
+    let input_token_port = input_nodes[0].inputs[0].as_str();
+    let input_frame_port = input_nodes[0].outputs[0].as_str();
+    let output_frame_port = output_nodes[0].inputs[0].as_str();
+    let output_logits_port = output_nodes[1].outputs[0].as_str();
+    let sampler_logits_port = sampler_nodes[0].inputs[0].as_str();
+    let sampler_random_port = sampler_nodes[0].inputs[1].as_str();
+    let sampler_token_port = sampler_nodes[0].outputs[0].as_str();
+    if input_edges[0].source.port_id != input_frame_port
+        || output_edges[0].destination.port_id != output_frame_port
+        || sampler_edges[0].source.port_id != output_logits_port
+        || sampler_edges[0].destination.port_id != sampler_logits_port
+        || feedback_edges[0].source.port_id != sampler_token_port
+        || feedback_edges[0].destination.port_id != input_token_port
+    {
+        return Err(VulkanResidentTokenModelPackageError::new(format!(
+            "resident model package {:?} generation cables do not match system-pedal ports",
+            manifest.package_id
+        )));
+    }
+
+    let external_input_endpoints = manifest
+        .circuit_graph
+        .boundary
+        .external_inputs
+        .iter()
+        .map(|port| {
+            (
+                port.endpoint.pedal_id.as_str(),
+                port.endpoint.port_id.as_str(),
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    let public_output_endpoints = manifest
+        .circuit_graph
+        .boundary
+        .public_outputs
+        .iter()
+        .map(|port| {
+            (
+                port.endpoint.pedal_id.as_str(),
+                port.endpoint.port_id.as_str(),
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    if manifest.circuit_graph.boundary.external_inputs.len() != 2
+        || external_input_endpoints
+            != BTreeSet::from([
+                (input.pedal_id.as_str(), input_token_port),
+                (sampler.pedal_id.as_str(), sampler_random_port),
+            ])
+        || manifest.circuit_graph.boundary.public_outputs.len() != 1
+        || public_output_endpoints
+            != BTreeSet::from([(sampler.pedal_id.as_str(), sampler_token_port)])
+    {
+        return Err(VulkanResidentTokenModelPackageError::new(format!(
+            "resident model package {:?} must expose one input-transducer input, one sampler random seed, and one sampler public output",
+            manifest.package_id
+        )));
+    }
+
+    let input_weight = input
+        .params
+        .refs
+        .get("weight")
+        .and_then(|param| param.tensor.as_deref());
+    if input_nodes.len() != 1
+        || input_nodes[0].op != "embedding_lookup"
+        || input_weight != Some(manifest.input_transducer.spec.parameter_tensor.as_str())
+        || manifest.input_transducer.spec.output_signal_id != input_edges[0].destination.port_id
+        || manifest.input_transducer.shader_path.is_empty()
+    {
+        return Err(VulkanResidentTokenModelPackageError::new(format!(
+            "resident model package {:?} input-transducer execution does not match its circuit pedal",
+            manifest.package_id
+        )));
+    }
+
+    let output_node_ids = output_nodes
+        .iter()
+        .map(|node| node.id.as_str())
+        .collect::<Vec<_>>();
+    let output_ops = output_nodes
+        .iter()
+        .map(|node| node.op.as_str())
+        .collect::<Vec<_>>();
+    let norm_weight = output
+        .params
+        .refs
+        .get("output_norm.weight")
+        .and_then(|param| param.tensor.as_deref());
+    let projection_weight = output
+        .params
+        .refs
+        .get("output_projection.weight")
+        .and_then(|param| param.tensor.as_deref());
+    if output_node_ids
+        != manifest
+            .output_transducer
+            .spec
+            .node_ids
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+        || output_ops != ["rms_norm", "linear_projection"]
+        || norm_weight
+            != Some(
+                manifest
+                    .output_transducer
+                    .spec
+                    .norm_parameter_tensor
+                    .as_str(),
+            )
+        || projection_weight
+            != Some(
+                manifest
+                    .output_transducer
+                    .spec
+                    .projection_parameter_tensor
+                    .as_str(),
+            )
+        || manifest.output_transducer.spec.input_signal_id != output_edges[0].source.port_id
+        || manifest
+            .output_transducer
+            .embedding_norm_shader_path
+            .is_empty()
+        || manifest.output_transducer.projection_shader_path.is_empty()
+    {
+        return Err(VulkanResidentTokenModelPackageError::new(format!(
+            "resident model package {:?} output-transducer execution does not match its circuit pedal",
+            manifest.package_id
+        )));
+    }
+
+    let sampler_attrs = sampler_nodes.first().map(|node| &node.attrs);
+    let sampler_spec = &manifest.sampler.spec;
+    let sampler_matches = sampler_nodes.len() == 1
+        && sampler_nodes[0].op == "sample_token"
+        && sampler_attrs
+            .and_then(|attrs| attrs.get("randomness"))
+            .and_then(Value::as_str)
+            == Some("seed_and_stream_tick")
+        && sampler_attrs
+            .and_then(|attrs| attrs.get("method"))
+            .and_then(Value::as_str)
+            == Some(sampler_spec.method.as_str())
+        && sampler_attrs
+            .and_then(|attrs| attrs.get("temperature"))
+            .and_then(Value::as_f64)
+            .map(|value| value as f32)
+            == Some(sampler_spec.temperature)
+        && sampler_attrs
+            .and_then(|attrs| attrs.get("top_k"))
+            .and_then(Value::as_u64)
+            == Some(u64::from(sampler_spec.top_k))
+        && sampler_attrs
+            .and_then(|attrs| attrs.get("top_p"))
+            .and_then(Value::as_f64)
+            .map(|value| value as f32)
+            == Some(sampler_spec.top_p)
+        && !manifest.sampler.kernels.is_empty();
+    if !sampler_matches {
+        return Err(VulkanResidentTokenModelPackageError::new(format!(
+            "resident model package {:?} sampler execution does not match its circuit pedal",
+            manifest.package_id
+        )));
+    }
     Ok(())
 }
 
@@ -18124,6 +18557,58 @@ mod tests {
             .unwrap()
     }
 
+    fn fixture_model_execution_graph() -> ResolvedLoweredPedalboard {
+        let full = ResolvedLoweredPedalboard::from_index_file(fixture_model_index_path()).unwrap();
+        let processor_ids = full
+            .circuits
+            .iter()
+            .filter(|artifact| artifact.circuit.runtime_role.is_signal_processor())
+            .map(|artifact| artifact.pedal.id.as_str())
+            .collect::<BTreeSet<_>>();
+        let circuits = full
+            .circuits
+            .iter()
+            .filter(|artifact| processor_ids.contains(artifact.pedal.id.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut index = full.index.clone();
+        index.graph.circuits = circuits
+            .iter()
+            .map(|artifact| artifact.pedal.clone())
+            .collect();
+        index.graph.cables = full
+            .index
+            .graph
+            .cables
+            .iter()
+            .filter(|cable| {
+                cable.connection.is_forward()
+                    && processor_ids.contains(cable.source.pedal_id.as_str())
+                    && processor_ids.contains(cable.destination.pedal_id.as_str())
+            })
+            .cloned()
+            .collect();
+        index.graph.boundary = StreamCircuitGraphBoundary {
+            external_inputs: execution_boundary_inputs(&full, &processor_ids),
+            public_outputs: execution_boundary_outputs(&full, &processor_ids),
+        };
+        let mut operator_counts = BTreeMap::new();
+        for artifact in &circuits {
+            *operator_counts
+                .entry(artifact.pedal.operator_type.clone())
+                .or_insert(0) += 1;
+        }
+        index.summary = LoweredPedalboardSummary {
+            circuit_count: circuits.len(),
+            operator_counts,
+        };
+        ResolvedLoweredPedalboard {
+            artifact_root: full.artifact_root,
+            index,
+            circuits,
+        }
+    }
+
     fn copy_package_integrity_artifacts(
         source_root: &Path,
         destination_root: &Path,
@@ -18462,6 +18947,35 @@ mod tests {
     }
 
     #[test]
+    fn fused_generation_pedals_follow_connected_processor_devices() {
+        let resolved = fixture_model_package_manifest()
+            .circuit_graph
+            .to_resolved_lowered_pedalboard(PathBuf::from("."))
+            .unwrap();
+        let patch = resolved
+            .default_runtime_patch("gpu0")
+            .unwrap()
+            .with_instance_device("layer_00", "gpu-input")
+            .unwrap()
+            .with_instance_device("layer_13", "gpu-output")
+            .unwrap();
+        let patch = attach_generation_pedal_devices_for_vulkan(patch, &resolved).unwrap();
+        let device_for = |instance_id: &str| {
+            patch
+                .instances
+                .iter()
+                .find(|instance| instance.instance_id == instance_id)
+                .unwrap()
+                .device_id
+                .as_str()
+        };
+
+        assert_eq!(device_for("input_transducer"), "gpu-input");
+        assert_eq!(device_for("output_transducer"), "gpu-output");
+        assert_eq!(device_for("sampler"), "gpu-output");
+    }
+
+    #[test]
     fn runtime_chain_control_preserves_generation_pedals_and_feedback() {
         let manifest = fixture_model_package_manifest();
         let chain = vec![
@@ -18488,6 +19002,44 @@ mod tests {
                 && cable.destination.pedal_id == "input_transducer"
                 && !cable.connection.is_forward()
         }));
+    }
+
+    #[test]
+    fn generation_contract_rejects_execution_and_graph_drift() {
+        let manifest = fixture_model_package_manifest();
+
+        let mut sampler_drift = manifest.clone();
+        sampler_drift.sampler.spec.top_k += 1;
+        let sampler_error = validate_generation_execution_contract(&sampler_drift)
+            .unwrap_err()
+            .to_string();
+        assert!(sampler_error.contains("sampler execution does not match"));
+
+        let mut wiring_drift = manifest;
+        wiring_drift
+            .circuit_graph
+            .cables
+            .retain(|cable| cable.connection.is_forward());
+        let wiring_error = validate_generation_execution_contract(&wiring_drift)
+            .unwrap_err()
+            .to_string();
+        assert!(wiring_error.contains("delayed sampler feedback"));
+
+        let mut boundary_drift = fixture_model_package_manifest();
+        boundary_drift.circuit_graph.boundary.public_outputs[0]
+            .endpoint
+            .port_id = "random_seed".to_string();
+        let boundary_error = validate_generation_execution_contract(&boundary_drift)
+            .unwrap_err()
+            .to_string();
+        assert!(boundary_error.contains("sampler public output"));
+    }
+
+    #[test]
+    fn placed_feedback_stays_resident_only_across_the_same_device() {
+        assert!(placed_feedback_token_is_resident("gpu0", "gpu0", true));
+        assert!(!placed_feedback_token_is_resident("gpu0", "gpu1", true));
+        assert!(!placed_feedback_token_is_resident("gpu0", "gpu0", false));
     }
 
     #[test]
@@ -18647,7 +19199,7 @@ mod tests {
         VulkanReusableKernelArtifactManifest,
         VulkanMountedPlacedBoundDispatchPlan,
     ) {
-        let graph = ResolvedLoweredPedalboard::from_index_file(fixture_model_index_path()).unwrap();
+        let graph = fixture_model_execution_graph();
         let tensor_index = TensorIndex::from_json_file(fixture_model_tensor_index_path()).unwrap();
         let execution_plan =
             StreamCircuitExecutionPlan::from_graph_with_tensor_index(&graph, &tensor_index)
@@ -18866,7 +19418,7 @@ mod tests {
         device: &VulkanComputeDevice,
         tensor_index: &TensorIndex,
     ) -> VulkanPermanentParameterBuffers {
-        let graph = ResolvedLoweredPedalboard::from_index_file(fixture_model_index_path()).unwrap();
+        let graph = fixture_model_execution_graph();
         let execution_plan =
             StreamCircuitExecutionPlan::from_graph_with_tensor_index(&graph, tensor_index).unwrap();
         let resource_plan =
@@ -18898,7 +19450,7 @@ mod tests {
     #[test]
     fn transducer_parameter_plans_are_isolated_by_host_boundary() {
         let tensor_index = TensorIndex::from_json_file(fixture_model_tensor_index_path()).unwrap();
-        let graph = ResolvedLoweredPedalboard::from_index_file(fixture_model_index_path()).unwrap();
+        let graph = fixture_model_execution_graph();
         let execution_plan =
             StreamCircuitExecutionPlan::from_graph_with_tensor_index(&graph, &tensor_index)
                 .unwrap();
@@ -19456,7 +20008,7 @@ mod tests {
 
     #[test]
     fn plans_fixture_model_vulkan_resident_allocations_from_stream_circuit_resources() {
-        let graph = ResolvedLoweredPedalboard::from_index_file(fixture_model_index_path()).unwrap();
+        let graph = fixture_model_execution_graph();
         let tensor_index = TensorIndex::from_json_file(fixture_model_tensor_index_path()).unwrap();
         let resource_plan =
             StreamCircuitResourcePlan::from_graph_with_tensor_index(&graph, &tensor_index).unwrap();
@@ -19529,7 +20081,7 @@ mod tests {
 
     #[test]
     fn placed_resident_plan_hosts_only_the_pedals_assigned_to_a_device() {
-        let graph = ResolvedLoweredPedalboard::from_index_file(fixture_model_index_path()).unwrap();
+        let graph = fixture_model_execution_graph();
         let tensor_index = TensorIndex::from_json_file(fixture_model_tensor_index_path()).unwrap();
         let execution_plan =
             StreamCircuitExecutionPlan::from_graph_with_tensor_index(&graph, &tensor_index)
@@ -19656,7 +20208,7 @@ mod tests {
 
     #[test]
     fn placed_stream_circuit_plan_dispatches_only_hosted_pedals() {
-        let graph = ResolvedLoweredPedalboard::from_index_file(fixture_model_index_path()).unwrap();
+        let graph = fixture_model_execution_graph();
         let tensor_index = TensorIndex::from_json_file(fixture_model_tensor_index_path()).unwrap();
         let execution_plan =
             StreamCircuitExecutionPlan::from_graph_with_tensor_index(&graph, &tensor_index)
@@ -19870,7 +20422,7 @@ mod tests {
             eprintln!("skipping resident input transducer: no GLSL to SPIR-V compiler found");
             return;
         };
-        let graph = ResolvedLoweredPedalboard::from_index_file(fixture_model_index_path()).unwrap();
+        let graph = fixture_model_execution_graph();
         let execution_plan =
             StreamCircuitExecutionPlan::from_graph_with_tensor_index(&graph, &tensor_index)
                 .unwrap();
@@ -20023,7 +20575,7 @@ mod tests {
             eprintln!("skipping resident output transducer: no GLSL to SPIR-V compiler found");
             return;
         };
-        let graph = ResolvedLoweredPedalboard::from_index_file(fixture_model_index_path()).unwrap();
+        let graph = fixture_model_execution_graph();
         let execution_plan =
             StreamCircuitExecutionPlan::from_graph_with_tensor_index(&graph, &tensor_index)
                 .unwrap();
@@ -23335,7 +23887,7 @@ mod tests {
                 return;
             }
         };
-        let graph = ResolvedLoweredPedalboard::from_index_file(fixture_model_index_path()).unwrap();
+        let graph = fixture_model_execution_graph();
         let tensor_index = TensorIndex::from_json_file(fixture_model_tensor_index_path()).unwrap();
         let execution_plan =
             StreamCircuitExecutionPlan::from_graph_with_tensor_index(&graph, &tensor_index)
@@ -25281,7 +25833,7 @@ mod tests {
                 return;
             }
         };
-        let graph = ResolvedLoweredPedalboard::from_index_file(fixture_model_index_path()).unwrap();
+        let graph = fixture_model_execution_graph();
         let tensor_index = TensorIndex::from_json_file(fixture_model_tensor_index_path()).unwrap();
         let execution_plan =
             StreamCircuitExecutionPlan::from_graph_with_tensor_index(&graph, &tensor_index)
@@ -25713,7 +26265,7 @@ mod tests {
                 return;
             }
         };
-        let graph = ResolvedLoweredPedalboard::from_index_file(fixture_model_index_path()).unwrap();
+        let graph = fixture_model_execution_graph();
         let tensor_index = TensorIndex::from_json_file(fixture_model_tensor_index_path()).unwrap();
         let execution_plan =
             StreamCircuitExecutionPlan::from_graph_with_tensor_index(&graph, &tensor_index)
@@ -25900,7 +26452,7 @@ mod tests {
                 return;
             }
         };
-        let graph = ResolvedLoweredPedalboard::from_index_file(fixture_model_index_path()).unwrap();
+        let graph = fixture_model_execution_graph();
         let tensor_index = TensorIndex::from_json_file(fixture_model_tensor_index_path()).unwrap();
         let execution_plan =
             StreamCircuitExecutionPlan::from_graph_with_tensor_index(&graph, &tensor_index)
@@ -27364,7 +27916,7 @@ mod tests {
 
     #[test]
     fn resident_plan_infers_state_sizes_without_a_tensor_index() {
-        let graph = ResolvedLoweredPedalboard::from_index_file(fixture_model_index_path()).unwrap();
+        let graph = fixture_model_execution_graph();
         let resource_plan = StreamCircuitResourcePlan::from_graph(&graph).unwrap();
 
         let resident_plan =
@@ -27398,7 +27950,7 @@ mod tests {
                 return;
             }
         };
-        let graph = ResolvedLoweredPedalboard::from_index_file(fixture_model_index_path()).unwrap();
+        let graph = fixture_model_execution_graph();
         let tensor_index = TensorIndex::from_json_file(fixture_model_tensor_index_path()).unwrap();
         let resource_plan =
             StreamCircuitResourcePlan::from_graph_with_tensor_index(&graph, &tensor_index).unwrap();
@@ -27461,7 +28013,7 @@ mod tests {
 
     #[test]
     fn binds_fixture_model_nodes_to_vulkan_resident_resources() {
-        let graph = ResolvedLoweredPedalboard::from_index_file(fixture_model_index_path()).unwrap();
+        let graph = fixture_model_execution_graph();
         let tensor_index = TensorIndex::from_json_file(fixture_model_tensor_index_path()).unwrap();
         let execution_plan =
             StreamCircuitExecutionPlan::from_graph_with_tensor_index(&graph, &tensor_index)
@@ -27586,7 +28138,7 @@ mod tests {
 
     #[test]
     fn kernel_interfaces_describe_fixture_model_compiled_pedal_abi() {
-        let graph = ResolvedLoweredPedalboard::from_index_file(fixture_model_index_path()).unwrap();
+        let graph = fixture_model_execution_graph();
         let tensor_index = TensorIndex::from_json_file(fixture_model_tensor_index_path()).unwrap();
         let execution_plan =
             StreamCircuitExecutionPlan::from_graph_with_tensor_index(&graph, &tensor_index)
@@ -27741,7 +28293,7 @@ mod tests {
 
     #[test]
     fn dispatch_plan_orders_fixture_model_kernel_commands_for_stream_ticks() {
-        let graph = ResolvedLoweredPedalboard::from_index_file(fixture_model_index_path()).unwrap();
+        let graph = fixture_model_execution_graph();
         let tensor_index = TensorIndex::from_json_file(fixture_model_tensor_index_path()).unwrap();
         let execution_plan =
             StreamCircuitExecutionPlan::from_graph_with_tensor_index(&graph, &tensor_index)
@@ -27862,7 +28414,7 @@ mod tests {
 
     #[test]
     fn descriptor_resource_plan_resolves_fixture_model_dispatch_patch_bay() {
-        let graph = ResolvedLoweredPedalboard::from_index_file(fixture_model_index_path()).unwrap();
+        let graph = fixture_model_execution_graph();
         let tensor_index = TensorIndex::from_json_file(fixture_model_tensor_index_path()).unwrap();
         let execution_plan =
             StreamCircuitExecutionPlan::from_graph_with_tensor_index(&graph, &tensor_index)
@@ -27970,7 +28522,7 @@ mod tests {
 
     #[test]
     fn descriptor_resource_plan_requires_dynamic_capacity_for_kv_state() {
-        let graph = ResolvedLoweredPedalboard::from_index_file(fixture_model_index_path()).unwrap();
+        let graph = fixture_model_execution_graph();
         let tensor_index = TensorIndex::from_json_file(fixture_model_tensor_index_path()).unwrap();
         let execution_plan =
             StreamCircuitExecutionPlan::from_graph_with_tensor_index(&graph, &tensor_index)
@@ -28051,7 +28603,7 @@ mod tests {
 
     #[test]
     fn reusable_kernel_plan_collapses_fixture_model_dispatches_into_op_families() {
-        let graph = ResolvedLoweredPedalboard::from_index_file(fixture_model_index_path()).unwrap();
+        let graph = fixture_model_execution_graph();
         let tensor_index = TensorIndex::from_json_file(fixture_model_tensor_index_path()).unwrap();
         let execution_plan =
             StreamCircuitExecutionPlan::from_graph_with_tensor_index(&graph, &tensor_index)
@@ -28203,7 +28755,7 @@ mod tests {
 
     #[test]
     fn reusable_kernel_coverage_reports_missing_gpu_pedal_circuits() {
-        let graph = ResolvedLoweredPedalboard::from_index_file(fixture_model_index_path()).unwrap();
+        let graph = fixture_model_execution_graph();
         let tensor_index = TensorIndex::from_json_file(fixture_model_tensor_index_path()).unwrap();
         let execution_plan =
             StreamCircuitExecutionPlan::from_graph_with_tensor_index(&graph, &tensor_index)
@@ -28274,7 +28826,7 @@ mod tests {
 
     #[test]
     fn reusable_kernel_artifact_manifest_links_fixture_model_kernel_families() {
-        let graph = ResolvedLoweredPedalboard::from_index_file(fixture_model_index_path()).unwrap();
+        let graph = fixture_model_execution_graph();
         let tensor_index = TensorIndex::from_json_file(fixture_model_tensor_index_path()).unwrap();
         let execution_plan =
             StreamCircuitExecutionPlan::from_graph_with_tensor_index(&graph, &tensor_index)
@@ -28384,7 +28936,7 @@ mod tests {
 
     #[test]
     fn reusable_kernel_link_plan_reports_partial_and_incompatible_artifacts() {
-        let graph = ResolvedLoweredPedalboard::from_index_file(fixture_model_index_path()).unwrap();
+        let graph = fixture_model_execution_graph();
         let tensor_index = TensorIndex::from_json_file(fixture_model_tensor_index_path()).unwrap();
         let execution_plan =
             StreamCircuitExecutionPlan::from_graph_with_tensor_index(&graph, &tensor_index)
@@ -28476,7 +29028,7 @@ mod tests {
 
     #[test]
     fn prepared_dispatch_plan_links_artifacts_to_descriptor_resources() {
-        let graph = ResolvedLoweredPedalboard::from_index_file(fixture_model_index_path()).unwrap();
+        let graph = fixture_model_execution_graph();
         let tensor_index = TensorIndex::from_json_file(fixture_model_tensor_index_path()).unwrap();
         let execution_plan =
             StreamCircuitExecutionPlan::from_graph_with_tensor_index(&graph, &tensor_index)
@@ -28572,7 +29124,7 @@ mod tests {
 
     #[test]
     fn prepared_dispatch_plan_rejects_unlinked_reusable_kernels() {
-        let graph = ResolvedLoweredPedalboard::from_index_file(fixture_model_index_path()).unwrap();
+        let graph = fixture_model_execution_graph();
         let tensor_index = TensorIndex::from_json_file(fixture_model_tensor_index_path()).unwrap();
         let execution_plan =
             StreamCircuitExecutionPlan::from_graph_with_tensor_index(&graph, &tensor_index)
@@ -28631,7 +29183,7 @@ mod tests {
                 return;
             }
         };
-        let graph = ResolvedLoweredPedalboard::from_index_file(fixture_model_index_path()).unwrap();
+        let graph = fixture_model_execution_graph();
         let tensor_index = TensorIndex::from_json_file(fixture_model_tensor_index_path()).unwrap();
         let execution_plan =
             StreamCircuitExecutionPlan::from_graph_with_tensor_index(&graph, &tensor_index)
@@ -28758,7 +29310,7 @@ mod tests {
                 return;
             }
         };
-        let graph = ResolvedLoweredPedalboard::from_index_file(fixture_model_index_path()).unwrap();
+        let graph = fixture_model_execution_graph();
         let tensor_index = TensorIndex::from_json_file(fixture_model_tensor_index_path()).unwrap();
         let execution_plan =
             StreamCircuitExecutionPlan::from_graph_with_tensor_index(&graph, &tensor_index)
