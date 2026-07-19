@@ -5,6 +5,7 @@ use std::fmt::{Display, Formatter};
 use std::fs;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -6610,22 +6611,23 @@ impl VulkanResidentTokenEngine {
 
     pub fn submit_text_until_idle<C>(
         &mut self,
-        stream_id: &str,
-        input_event_id: impl Into<String>,
-        input_text: impl Into<String>,
-        max_public_tokens: usize,
-        origin: impl Into<String>,
+        request: VulkanResidentTokenEngineTextInputRequest,
         budget: VulkanResidentTokenEngineRunBudget,
         codec: &C,
     ) -> Result<VulkanResidentTokenEngineSubmittedTextRun, VulkanResidentTokenEngineError>
     where
         C: VulkanResidentTokenTextCodec,
     {
-        let input_event_id = input_event_id.into();
-        let input_text = input_text.into();
+        let VulkanResidentTokenEngineTextInputRequest {
+            stream_id,
+            input_event_id,
+            input_text,
+            max_public_tokens,
+            origin,
+        } = request;
         let encoded_token_ids = codec.encode_text(&input_text)?;
         let submitted_tokens = self.submit_tokens_until_idle(
-            stream_id,
+            &stream_id,
             input_event_id.clone(),
             encoded_token_ids.clone(),
             max_public_tokens,
@@ -6635,7 +6637,7 @@ impl VulkanResidentTokenEngine {
         let generated_text = codec.decode_tokens(&submitted_tokens.generated_token_ids)?;
 
         Ok(VulkanResidentTokenEngineSubmittedTextRun {
-            stream_id: stream_id.to_string(),
+            stream_id,
             input_event_id,
             input_text,
             encoded_token_ids,
@@ -6646,20 +6648,22 @@ impl VulkanResidentTokenEngine {
 
     pub fn submit_live_text_turn_until_idle<C>(
         &mut self,
-        stream_id: &str,
-        input_event_id: impl Into<String>,
-        input_text: impl Into<String>,
-        max_public_tokens: usize,
-        origin: impl Into<String>,
+        request: VulkanResidentTokenEngineTextInputRequest,
         budget: VulkanResidentTokenEngineRunBudget,
         codec: &C,
     ) -> Result<VulkanResidentTokenEngineLiveTextTurnRun, VulkanResidentTokenEngineError>
     where
         C: VulkanResidentTokenTextCodec,
     {
-        let input_event_id = input_event_id.into();
-        let queued_input_event = self.enqueue_text_input_event(
+        let VulkanResidentTokenEngineTextInputRequest {
             stream_id,
+            input_event_id,
+            input_text,
+            max_public_tokens,
+            origin,
+        } = request;
+        let queued_input_event = self.enqueue_text_input_event(
+            &stream_id,
             input_event_id.clone(),
             input_text,
             max_public_tokens,
@@ -6716,7 +6720,7 @@ impl VulkanResidentTokenEngine {
         };
 
         Ok(VulkanResidentTokenEngineLiveTextTurnRun {
-            stream_id: stream_id.to_string(),
+            stream_id,
             input_event_id,
             queued_input_event,
             cycles,
@@ -7581,6 +7585,30 @@ impl VulkanResidentPlacedTokenTickTail {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VulkanResidentPromptRequest<'a> {
+    pub prompt_token_ids: &'a [u32],
+    pub max_new_tokens: usize,
+    pub stop_token_ids: &'a [u32],
+    pub max_scheduler_turns_per_tick: usize,
+}
+
+impl<'a> VulkanResidentPromptRequest<'a> {
+    pub fn new(
+        prompt_token_ids: &'a [u32],
+        max_new_tokens: usize,
+        stop_token_ids: &'a [u32],
+        max_scheduler_turns_per_tick: usize,
+    ) -> Self {
+        Self {
+            prompt_token_ids,
+            max_new_tokens,
+            stop_token_ids,
+            max_scheduler_turns_per_tick,
+        }
+    }
+}
+
 impl VulkanResidentInProcessPlacedModelPackage {
     pub fn from_manifest_file(
         device: &VulkanComputeDevice,
@@ -7631,7 +7659,7 @@ impl VulkanResidentInProcessPlacedModelPackage {
     }
 
     pub fn from_manifest_for_bound_devices(
-        devices: &BTreeMap<String, Arc<VulkanComputeDevice>>,
+        devices: &BTreeMap<String, Rc<VulkanComputeDevice>>,
         manifest_dir: impl AsRef<Path>,
         manifest: VulkanResidentModelPackageManifest,
         dynamic_state_capacity_activations: Option<usize>,
@@ -7941,7 +7969,7 @@ impl VulkanResidentInProcessPlacedModelPackage {
 
     pub fn run_stream_tick_on_bound_devices_in_process(
         &self,
-        devices: &BTreeMap<String, Arc<VulkanComputeDevice>>,
+        devices: &BTreeMap<String, Rc<VulkanComputeDevice>>,
         stream_tick: u64,
         max_scheduler_turns: usize,
     ) -> Result<
@@ -7959,7 +7987,7 @@ impl VulkanResidentInProcessPlacedModelPackage {
 
     pub fn run_stream_tick_on_bound_devices_in_process_with_transport(
         &self,
-        devices: &BTreeMap<String, Arc<VulkanComputeDevice>>,
+        devices: &BTreeMap<String, Rc<VulkanComputeDevice>>,
         transport: &mut VulkanInProcessPlacedCableTransport,
         stream_tick: u64,
         max_scheduler_turns: usize,
@@ -8011,9 +8039,10 @@ impl VulkanResidentInProcessPlacedModelPackage {
             [VulkanMountedPlacedResidentInProcessStreamTickSlice<'_>; 4],
         >::with_capacity(self.device_slices.len());
         for slice in &self.device_slices {
-            let mut dispatch_extensions =
-                VulkanMountedPlacedResidentStreamTickDispatchExtensions::default();
-            dispatch_extensions.sequence_variant = tail.sequence_variant();
+            let mut dispatch_extensions = VulkanMountedPlacedResidentStreamTickDispatchExtensions {
+                sequence_variant: tail.sequence_variant(),
+                ..Default::default()
+            };
             if slice.device_id == self.input_device_id {
                 dispatch_extensions
                     .prefix_dispatches
@@ -8111,7 +8140,7 @@ impl VulkanResidentInProcessPlacedModelPackage {
 
     fn execute_prepared_token_id_stream_tick_on_bound_devices_in_process_with_transport(
         &self,
-        devices: &BTreeMap<String, Arc<VulkanComputeDevice>>,
+        devices: &BTreeMap<String, Rc<VulkanComputeDevice>>,
         transport: &mut VulkanInProcessPlacedCableTransport,
         stream_tick: u64,
         max_scheduler_turns: usize,
@@ -8132,9 +8161,10 @@ impl VulkanResidentInProcessPlacedModelPackage {
                         device_id: slice.device_id.clone(),
                     }
                 })?;
-            let mut dispatch_extensions =
-                VulkanMountedPlacedResidentStreamTickDispatchExtensions::default();
-            dispatch_extensions.sequence_variant = tail.sequence_variant();
+            let mut dispatch_extensions = VulkanMountedPlacedResidentStreamTickDispatchExtensions {
+                sequence_variant: tail.sequence_variant(),
+                ..Default::default()
+            };
             if slice.device_id == self.input_device_id {
                 dispatch_extensions
                     .prefix_dispatches
@@ -8181,7 +8211,7 @@ impl VulkanResidentInProcessPlacedModelPackage {
 
     fn run_prepared_token_id_stream_tick_on_bound_devices_in_process_with_transport(
         &self,
-        devices: &BTreeMap<String, Arc<VulkanComputeDevice>>,
+        devices: &BTreeMap<String, Rc<VulkanComputeDevice>>,
         transport: &mut VulkanInProcessPlacedCableTransport,
         token_id: u32,
         stream_tick: u64,
@@ -8275,7 +8305,7 @@ impl VulkanResidentInProcessPlacedModelPackage {
 
     pub fn run_token_id_stream_tick_on_bound_devices_in_process(
         &self,
-        devices: &BTreeMap<String, Arc<VulkanComputeDevice>>,
+        devices: &BTreeMap<String, Rc<VulkanComputeDevice>>,
         token_id: u32,
         stream_tick: u64,
         max_scheduler_turns: usize,
@@ -8295,7 +8325,7 @@ impl VulkanResidentInProcessPlacedModelPackage {
 
     pub fn run_token_id_stream_tick_on_bound_devices_in_process_with_transport(
         &self,
-        devices: &BTreeMap<String, Arc<VulkanComputeDevice>>,
+        devices: &BTreeMap<String, Rc<VulkanComputeDevice>>,
         transport: &mut VulkanInProcessPlacedCableTransport,
         token_id: u32,
         stream_tick: u64,
@@ -8422,24 +8452,15 @@ impl VulkanResidentInProcessPlacedModelPackage {
     pub fn prompt_session_from_stream_tick(
         &self,
         start_stream_tick: u64,
-    ) -> Result<
-        VulkanResidentInProcessPlacedPromptSession,
-        VulkanResidentInProcessPlacedModelPackageError,
-    > {
-        if start_stream_tick != 0 {}
-        Ok(VulkanResidentInProcessPlacedPromptSession::new(
-            start_stream_tick,
-        ))
+    ) -> VulkanResidentInProcessPlacedPromptSession {
+        VulkanResidentInProcessPlacedPromptSession::new(start_stream_tick)
     }
 
     pub fn run_prompt_event_bounded_in_process(
         &self,
         device: &VulkanComputeDevice,
-        prompt_token_ids: &[u32],
+        request: VulkanResidentPromptRequest<'_>,
         start_stream_tick: u64,
-        max_new_tokens: usize,
-        stop_token_ids: &[u32],
-        max_scheduler_turns_per_tick: usize,
     ) -> Result<
         VulkanResidentInProcessPlacedPromptEventRun,
         VulkanResidentInProcessPlacedModelPackageError,
@@ -8448,11 +8469,8 @@ impl VulkanResidentInProcessPlacedModelPackage {
         self.run_prompt_event_bounded_in_process_with_transport(
             device,
             &mut transport,
-            prompt_token_ids,
+            request,
             start_stream_tick,
-            max_new_tokens,
-            stop_token_ids,
-            max_scheduler_turns_per_tick,
         )
     }
 
@@ -8460,18 +8478,21 @@ impl VulkanResidentInProcessPlacedModelPackage {
         &self,
         device: &VulkanComputeDevice,
         transport: &mut VulkanInProcessPlacedCableTransport,
-        prompt_token_ids: &[u32],
+        request: VulkanResidentPromptRequest<'_>,
         start_stream_tick: u64,
-        max_new_tokens: usize,
-        stop_token_ids: &[u32],
-        max_scheduler_turns_per_tick: usize,
     ) -> Result<
         VulkanResidentInProcessPlacedPromptEventRun,
         VulkanResidentInProcessPlacedModelPackageError,
     > {
-        if prompt_token_ids.is_empty() {
+        if request.prompt_token_ids.is_empty() {
             return Err(VulkanResidentInProcessPlacedModelPackageError::EmptyPromptEvent);
         }
+        let VulkanResidentPromptRequest {
+            prompt_token_ids,
+            max_new_tokens,
+            stop_token_ids,
+            max_scheduler_turns_per_tick,
+        } = request;
 
         let mut external_input_index = 0usize;
         let mut pending_feedback: Option<VulkanResidentPendingPrivateFeedback> = None;
@@ -8587,12 +8608,9 @@ impl VulkanResidentInProcessPlacedModelPackage {
 
     pub fn run_prompt_event_bounded_on_bound_devices_in_process(
         &self,
-        devices: &BTreeMap<String, Arc<VulkanComputeDevice>>,
-        prompt_token_ids: &[u32],
+        devices: &BTreeMap<String, Rc<VulkanComputeDevice>>,
+        request: VulkanResidentPromptRequest<'_>,
         start_stream_tick: u64,
-        max_new_tokens: usize,
-        stop_token_ids: &[u32],
-        max_scheduler_turns_per_tick: usize,
     ) -> Result<
         VulkanResidentInProcessPlacedPromptEventRun,
         VulkanResidentInProcessPlacedModelPackageError,
@@ -8601,23 +8619,17 @@ impl VulkanResidentInProcessPlacedModelPackage {
         self.run_prompt_event_bounded_on_bound_devices_in_process_with_transport(
             devices,
             &mut transport,
-            prompt_token_ids,
+            request,
             start_stream_tick,
-            max_new_tokens,
-            stop_token_ids,
-            max_scheduler_turns_per_tick,
         )
     }
 
     pub fn run_prompt_event_bounded_on_bound_devices_in_process_with_transport(
         &self,
-        devices: &BTreeMap<String, Arc<VulkanComputeDevice>>,
+        devices: &BTreeMap<String, Rc<VulkanComputeDevice>>,
         transport: &mut VulkanInProcessPlacedCableTransport,
-        prompt_token_ids: &[u32],
+        request: VulkanResidentPromptRequest<'_>,
         start_stream_tick: u64,
-        max_new_tokens: usize,
-        stop_token_ids: &[u32],
-        max_scheduler_turns_per_tick: usize,
     ) -> Result<
         VulkanResidentInProcessPlacedPromptEventRun,
         VulkanResidentInProcessPlacedModelPackageError,
@@ -8625,24 +8637,18 @@ impl VulkanResidentInProcessPlacedModelPackage {
         self.run_prompt_event_bounded_on_bound_devices_in_process_with_transport_and_output(
             devices,
             transport,
-            prompt_token_ids,
+            request,
             start_stream_tick,
-            max_new_tokens,
-            stop_token_ids,
-            max_scheduler_turns_per_tick,
             |_| {},
         )
     }
 
     pub fn run_prompt_event_bounded_on_bound_devices_in_process_with_transport_and_output<F>(
         &self,
-        devices: &BTreeMap<String, Arc<VulkanComputeDevice>>,
+        devices: &BTreeMap<String, Rc<VulkanComputeDevice>>,
         transport: &mut VulkanInProcessPlacedCableTransport,
-        prompt_token_ids: &[u32],
+        request: VulkanResidentPromptRequest<'_>,
         start_stream_tick: u64,
-        max_new_tokens: usize,
-        stop_token_ids: &[u32],
-        max_scheduler_turns_per_tick: usize,
         mut on_output_token: F,
     ) -> Result<
         VulkanResidentInProcessPlacedPromptEventRun,
@@ -8651,9 +8657,15 @@ impl VulkanResidentInProcessPlacedModelPackage {
     where
         F: FnMut(u32),
     {
-        if prompt_token_ids.is_empty() {
+        if request.prompt_token_ids.is_empty() {
             return Err(VulkanResidentInProcessPlacedModelPackageError::EmptyPromptEvent);
         }
+        let VulkanResidentPromptRequest {
+            prompt_token_ids,
+            max_new_tokens,
+            stop_token_ids,
+            max_scheduler_turns_per_tick,
+        } = request;
 
         let mut external_input_index = 0usize;
         let mut pending_feedback: Option<VulkanResidentPendingPrivateFeedback> = None;
@@ -8850,10 +8862,7 @@ impl VulkanResidentInProcessPlacedPromptSession {
         &mut self,
         package: &VulkanResidentInProcessPlacedModelPackage,
         device: &VulkanComputeDevice,
-        prompt_token_ids: &[u32],
-        max_new_tokens: usize,
-        stop_token_ids: &[u32],
-        max_scheduler_turns_per_tick: usize,
+        request: VulkanResidentPromptRequest<'_>,
     ) -> Result<
         VulkanResidentInProcessPlacedPromptSessionRun,
         VulkanResidentInProcessPlacedModelPackageError,
@@ -8862,11 +8871,8 @@ impl VulkanResidentInProcessPlacedPromptSession {
         let run = package.run_prompt_event_bounded_in_process_with_transport(
             device,
             &mut self.transport,
-            prompt_token_ids,
+            request,
             start_stream_tick,
-            max_new_tokens,
-            stop_token_ids,
-            max_scheduler_turns_per_tick,
         )?;
         self.complete_prompt_event(start_stream_tick, run)
     }
@@ -8874,11 +8880,8 @@ impl VulkanResidentInProcessPlacedPromptSession {
     pub fn run_prompt_event_bounded_on_bound_devices_in_process_with_output<F>(
         &mut self,
         package: &VulkanResidentInProcessPlacedModelPackage,
-        devices: &BTreeMap<String, Arc<VulkanComputeDevice>>,
-        prompt_token_ids: &[u32],
-        max_new_tokens: usize,
-        stop_token_ids: &[u32],
-        max_scheduler_turns_per_tick: usize,
+        devices: &BTreeMap<String, Rc<VulkanComputeDevice>>,
+        request: VulkanResidentPromptRequest<'_>,
         on_output_token: F,
     ) -> Result<
         VulkanResidentInProcessPlacedPromptSessionRun,
@@ -8892,11 +8895,8 @@ impl VulkanResidentInProcessPlacedPromptSession {
             .run_prompt_event_bounded_on_bound_devices_in_process_with_transport_and_output(
                 devices,
                 &mut self.transport,
-                prompt_token_ids,
+                request,
                 start_stream_tick,
-                max_new_tokens,
-                stop_token_ids,
-                max_scheduler_turns_per_tick,
                 on_output_token,
             )?;
         self.complete_prompt_event(start_stream_tick, run)
@@ -8905,11 +8905,8 @@ impl VulkanResidentInProcessPlacedPromptSession {
     pub fn run_prompt_event_bounded_on_bound_devices_in_process(
         &mut self,
         package: &VulkanResidentInProcessPlacedModelPackage,
-        devices: &BTreeMap<String, Arc<VulkanComputeDevice>>,
-        prompt_token_ids: &[u32],
-        max_new_tokens: usize,
-        stop_token_ids: &[u32],
-        max_scheduler_turns_per_tick: usize,
+        devices: &BTreeMap<String, Rc<VulkanComputeDevice>>,
+        request: VulkanResidentPromptRequest<'_>,
     ) -> Result<
         VulkanResidentInProcessPlacedPromptSessionRun,
         VulkanResidentInProcessPlacedModelPackageError,
@@ -8918,11 +8915,8 @@ impl VulkanResidentInProcessPlacedPromptSession {
         let run = package.run_prompt_event_bounded_on_bound_devices_in_process_with_transport(
             devices,
             &mut self.transport,
-            prompt_token_ids,
+            request,
             start_stream_tick,
-            max_new_tokens,
-            stop_token_ids,
-            max_scheduler_turns_per_tick,
         )?;
         self.complete_prompt_event(start_stream_tick, run)
     }
@@ -8973,7 +8967,7 @@ pub struct VulkanResidentInProcessPlacedPromptSessionRun {
 
 pub struct VulkanResidentInProcessPlacedPromptStream {
     package: VulkanResidentInProcessPlacedModelPackage,
-    devices: BTreeMap<String, Arc<VulkanComputeDevice>>,
+    devices: BTreeMap<String, Rc<VulkanComputeDevice>>,
     session: VulkanResidentInProcessPlacedPromptSession,
     pending_input_events: VecDeque<VulkanResidentTokenInputEvent>,
 }
@@ -8981,13 +8975,13 @@ pub struct VulkanResidentInProcessPlacedPromptStream {
 impl VulkanResidentInProcessPlacedPromptStream {
     pub fn new(
         package: VulkanResidentInProcessPlacedModelPackage,
-        devices: BTreeMap<String, Arc<VulkanComputeDevice>>,
+        devices: BTreeMap<String, Rc<VulkanComputeDevice>>,
     ) -> Result<Self, VulkanResidentInProcessPlacedModelPackageError> {
         Self::from_package_devices_and_session(package, devices, 0)
     }
 
     pub fn from_manifest_for_bound_devices(
-        devices: BTreeMap<String, Arc<VulkanComputeDevice>>,
+        devices: BTreeMap<String, Rc<VulkanComputeDevice>>,
         manifest_dir: impl AsRef<Path>,
         manifest: VulkanResidentModelPackageManifest,
         dynamic_state_capacity_activations: Option<usize>,
@@ -9003,7 +8997,7 @@ impl VulkanResidentInProcessPlacedPromptStream {
 
     pub fn from_package_devices_and_session(
         package: VulkanResidentInProcessPlacedModelPackage,
-        devices: BTreeMap<String, Arc<VulkanComputeDevice>>,
+        devices: BTreeMap<String, Rc<VulkanComputeDevice>>,
         start_stream_tick: u64,
     ) -> Result<Self, VulkanResidentInProcessPlacedModelPackageError> {
         for device_id in &package.device_ids {
@@ -9015,7 +9009,7 @@ impl VulkanResidentInProcessPlacedPromptStream {
                 );
             }
         }
-        let session = package.prompt_session_from_stream_tick(start_stream_tick)?;
+        let session = package.prompt_session_from_stream_tick(start_stream_tick);
         Ok(Self {
             package,
             devices,
@@ -9032,7 +9026,7 @@ impl VulkanResidentInProcessPlacedPromptStream {
         &self.session
     }
 
-    pub fn devices(&self) -> &BTreeMap<String, Arc<VulkanComputeDevice>> {
+    pub fn devices(&self) -> &BTreeMap<String, Rc<VulkanComputeDevice>> {
         &self.devices
     }
 
@@ -9178,10 +9172,12 @@ impl VulkanResidentInProcessPlacedPromptStream {
             .run_prompt_event_bounded_on_bound_devices_in_process(
                 &self.package,
                 &self.devices,
-                prompt_token_ids,
-                max_new_tokens,
-                stop_token_ids,
-                max_scheduler_turns_per_tick,
+                VulkanResidentPromptRequest::new(
+                    prompt_token_ids,
+                    max_new_tokens,
+                    stop_token_ids,
+                    max_scheduler_turns_per_tick,
+                ),
             )
     }
 
@@ -9203,10 +9199,12 @@ impl VulkanResidentInProcessPlacedPromptStream {
             .run_prompt_event_bounded_on_bound_devices_in_process_with_output(
                 &self.package,
                 &self.devices,
-                prompt_token_ids,
-                max_new_tokens,
-                stop_token_ids,
-                max_scheduler_turns_per_tick,
+                VulkanResidentPromptRequest::new(
+                    prompt_token_ids,
+                    max_new_tokens,
+                    stop_token_ids,
+                    max_scheduler_turns_per_tick,
+                ),
                 on_output_token,
             )
     }
@@ -12412,20 +12410,36 @@ fn resolve_signal_descriptor_resource(
                 byte_capacity,
             })
         }
+        VulkanSignalResource::StateBuffer { .. } | VulkanSignalResource::StateView { .. } => {
+            resolve_signal_state_descriptor_resource(
+                command,
+                descriptor,
+                &signal.resource,
+                state_index,
+                dynamic_state_capacity_activations,
+            )
+        }
+    }
+}
+
+fn resolve_signal_state_descriptor_resource(
+    command: &VulkanKernelDispatchCommand,
+    descriptor: &VulkanKernelDescriptorBinding,
+    resource: &VulkanSignalResource,
+    state_index: &BTreeMap<(&str, &str), &VulkanResidentStateBuffer>,
+    dynamic_state_capacity_activations: usize,
+) -> Result<VulkanDescriptorResourceAddress, VulkanDescriptorResourcePlanError> {
+    let (pedal_id, state_id, static_bytes, bytes_per_activation, state_view) = match resource {
         VulkanSignalResource::StateBuffer {
             pedal_id,
             state_id,
             static_bytes,
             bytes_per_activation,
-        } => resolve_signal_state_descriptor_resource(
-            command,
-            descriptor,
+        } => (
             pedal_id,
             state_id,
-            *static_bytes,
-            *bytes_per_activation,
-            state_index,
-            dynamic_state_capacity_activations,
+            static_bytes,
+            bytes_per_activation,
             false,
         ),
         VulkanSignalResource::StateView {
@@ -12433,39 +12447,19 @@ fn resolve_signal_descriptor_resource(
             state_id,
             static_bytes,
             bytes_per_activation,
-        } => resolve_signal_state_descriptor_resource(
-            command,
-            descriptor,
-            pedal_id,
-            state_id,
-            *static_bytes,
-            *bytes_per_activation,
-            state_index,
-            dynamic_state_capacity_activations,
-            true,
-        ),
-    }
-}
-
-fn resolve_signal_state_descriptor_resource(
-    command: &VulkanKernelDispatchCommand,
-    descriptor: &VulkanKernelDescriptorBinding,
-    pedal_id: &str,
-    state_id: &str,
-    static_bytes: Option<usize>,
-    bytes_per_activation: Option<usize>,
-    state_index: &BTreeMap<(&str, &str), &VulkanResidentStateBuffer>,
-    dynamic_state_capacity_activations: usize,
-    state_view: bool,
-) -> Result<VulkanDescriptorResourceAddress, VulkanDescriptorResourcePlanError> {
-    let resident = state_index.get(&(pedal_id, state_id)).ok_or_else(|| {
-        VulkanDescriptorResourcePlanError(format!(
-            "{} descriptor {} state {}.{} is not resident",
-            command.kernel_id, descriptor.binding, pedal_id, state_id
-        ))
-    })?;
-    if static_bytes != resident.static_bytes
-        || bytes_per_activation != resident.bytes_per_activation
+        } => (pedal_id, state_id, static_bytes, bytes_per_activation, true),
+        _ => unreachable!("caller only routes state resources"),
+    };
+    let resident = state_index
+        .get(&(pedal_id.as_str(), state_id.as_str()))
+        .ok_or_else(|| {
+            VulkanDescriptorResourcePlanError(format!(
+                "{} descriptor {} state {}.{} is not resident",
+                command.kernel_id, descriptor.binding, pedal_id, state_id
+            ))
+        })?;
+    if *static_bytes != resident.static_bytes
+        || *bytes_per_activation != resident.bytes_per_activation
     {
         return Err(VulkanDescriptorResourcePlanError(format!(
             "{} descriptor {} state {}.{} byte shape {:?}/{:?} does not match resident {:?}/{:?}",
@@ -13201,7 +13195,7 @@ impl VulkanPreparedDispatchPlan {
     ) -> Result<Self, VulkanPreparedDispatchPlanError> {
         let link_plan = reusable_plan.link_artifacts(manifest);
         if !link_plan.is_fully_linked() {
-            return Err(VulkanPreparedDispatchPlanError::Link(link_plan));
+            return Err(VulkanPreparedDispatchPlanError::Link(Box::new(link_plan)));
         }
 
         let descriptor_by_dispatch: BTreeMap<usize, &VulkanDispatchDescriptorResourcePlan> =
@@ -13298,7 +13292,7 @@ pub struct VulkanPreparedDispatch {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum VulkanPreparedDispatchPlanError {
     DescriptorResource(VulkanDescriptorResourcePlanError),
-    Link(VulkanLinkedReusableKernelPlan),
+    Link(Box<VulkanLinkedReusableKernelPlan>),
     MissingDescriptorResources { dispatch_index: usize },
     MissingReusableFamily { dispatch_index: usize },
     MissingLinkedArtifact { family_id: String },
@@ -13898,7 +13892,7 @@ fn bind_local_cable_buffer(
     cable_index: usize,
     cable_io: &VulkanPlacedCableIoBuffers,
 ) -> Result<VulkanPlacedLocalCableBufferBinding, VulkanBoundDispatchPlanError> {
-    let (buffer_index, allocation) = cable_io.local_buffer(cable_index).ok_or_else(|| {
+    let (buffer_index, allocation) = cable_io.local_buffer(cable_index).ok_or({
         VulkanBoundDispatchPlanError::MissingLocalCableBuffer {
             dispatch_index: dispatch.dispatch_index,
             binding: descriptor.binding,
@@ -13931,7 +13925,7 @@ fn bind_cable_endpoint_buffer(
     cable_index: usize,
     cable_io: &VulkanPlacedCableIoBuffers,
 ) -> Result<VulkanPlacedCableEndpointBufferBinding, VulkanBoundDispatchPlanError> {
-    let (buffer_index, allocation) = cable_io.buffer(direction, cable_index).ok_or_else(|| {
+    let (buffer_index, allocation) = cable_io.buffer(direction, cable_index).ok_or({
         VulkanBoundDispatchPlanError::MissingCableEndpointBuffer {
             dispatch_index: dispatch.dispatch_index,
             binding: descriptor.binding,
@@ -14038,20 +14032,18 @@ impl VulkanMountedPlacedStreamTickPlan {
             for descriptor in &dispatch.descriptors {
                 if let VulkanMountedPlacedBoundDescriptorTarget::IncomingCableBuffer { endpoint } =
                     &descriptor.target
-                {
-                    if received_endpoints
+                    && received_endpoints
                         .insert((endpoint.endpoint.cable_index, endpoint.buffer_index))
-                    {
-                        stages.push(VulkanMountedPlacedStreamTickStage::ReceiveCable {
-                            stage_index: stages.len(),
-                            cable_index: endpoint.endpoint.cable_index,
-                            endpoint_id: endpoint.endpoint.endpoint_id.clone(),
-                            buffer_index: endpoint.buffer_index,
-                            byte_capacity: endpoint.byte_capacity,
-                            remote_device_id: endpoint.endpoint.remote_device_id.clone(),
-                            remote_pedal_id: endpoint.endpoint.remote_pedal_id.clone(),
-                        });
-                    }
+                {
+                    stages.push(VulkanMountedPlacedStreamTickStage::ReceiveCable {
+                        stage_index: stages.len(),
+                        cable_index: endpoint.endpoint.cable_index,
+                        endpoint_id: endpoint.endpoint.endpoint_id.clone(),
+                        buffer_index: endpoint.buffer_index,
+                        byte_capacity: endpoint.byte_capacity,
+                        remote_device_id: endpoint.endpoint.remote_device_id.clone(),
+                        remote_pedal_id: endpoint.endpoint.remote_pedal_id.clone(),
+                    });
                 }
             }
 
@@ -14063,20 +14055,18 @@ impl VulkanMountedPlacedStreamTickPlan {
             for descriptor in &dispatch.descriptors {
                 if let VulkanMountedPlacedBoundDescriptorTarget::OutgoingCableBuffer { endpoint } =
                     &descriptor.target
-                {
-                    if published_endpoints
+                    && published_endpoints
                         .insert((endpoint.endpoint.cable_index, endpoint.buffer_index))
-                    {
-                        stages.push(VulkanMountedPlacedStreamTickStage::PublishCable {
-                            stage_index: stages.len(),
-                            cable_index: endpoint.endpoint.cable_index,
-                            endpoint_id: endpoint.endpoint.endpoint_id.clone(),
-                            buffer_index: endpoint.buffer_index,
-                            byte_capacity: endpoint.byte_capacity,
-                            remote_device_id: endpoint.endpoint.remote_device_id.clone(),
-                            remote_pedal_id: endpoint.endpoint.remote_pedal_id.clone(),
-                        });
-                    }
+                {
+                    stages.push(VulkanMountedPlacedStreamTickStage::PublishCable {
+                        stage_index: stages.len(),
+                        cable_index: endpoint.endpoint.cable_index,
+                        endpoint_id: endpoint.endpoint.endpoint_id.clone(),
+                        buffer_index: endpoint.buffer_index,
+                        byte_capacity: endpoint.byte_capacity,
+                        remote_device_id: endpoint.endpoint.remote_device_id.clone(),
+                        remote_pedal_id: endpoint.endpoint.remote_pedal_id.clone(),
+                    });
                 }
             }
         }
@@ -16247,9 +16237,11 @@ fn shared_state_source(sharing: &str) -> Result<Option<(String, String)>, Vulkan
     Ok(Some((pedal_id.to_string(), state_id.to_string())))
 }
 
+type VulkanActivationBindingIndex = BTreeMap<(String, String), (usize, Option<usize>)>;
+
 fn activation_binding_index(
     resident_plan: &VulkanStreamCircuitResidentPlan,
-) -> Result<BTreeMap<(String, String), (usize, Option<usize>)>, VulkanBindingPlanError> {
+) -> Result<VulkanActivationBindingIndex, VulkanBindingPlanError> {
     let mut bindings = BTreeMap::new();
     for bank in &resident_plan.activation_banks {
         for slot in &bank.slots {
@@ -16272,7 +16264,7 @@ fn bind_circuit(
     circuit: &CircuitActivationPlan,
     parameter_bindings: &BTreeMap<(String, String), VulkanParameterBinding>,
     state_bindings: &BTreeMap<(String, String), VulkanStateBinding>,
-    activation_bindings: &BTreeMap<(String, String), (usize, Option<usize>)>,
+    activation_bindings: &VulkanActivationBindingIndex,
 ) -> Result<VulkanCircuitBindingPlan, VulkanBindingPlanError> {
     let nodes = circuit
         .nodes
@@ -16302,7 +16294,7 @@ fn bind_node(
     node: &PlannedNode,
     parameter_bindings: &BTreeMap<(String, String), VulkanParameterBinding>,
     state_bindings: &BTreeMap<(String, String), VulkanStateBinding>,
-    activation_bindings: &BTreeMap<(String, String), (usize, Option<usize>)>,
+    activation_bindings: &VulkanActivationBindingIndex,
 ) -> Result<VulkanNodeBinding, VulkanBindingPlanError> {
     let inputs = node
         .inputs
@@ -16388,7 +16380,7 @@ fn bind_signal(
     node: &PlannedNode,
     signal_id: &str,
     state_bindings: &BTreeMap<(String, String), VulkanStateBinding>,
-    activation_bindings: &BTreeMap<(String, String), (usize, Option<usize>)>,
+    activation_bindings: &VulkanActivationBindingIndex,
 ) -> Result<VulkanSignalBinding, VulkanBindingPlanError> {
     let signal = circuit.signal(signal_id).ok_or_else(|| {
         VulkanBindingPlanError(format!(
@@ -19903,11 +19895,13 @@ mod tests {
 
         let submitted_text = engine
             .submit_text_until_idle(
-                "engine_stream_0",
-                "event_0",
-                "1",
-                2,
-                "test_host",
+                VulkanResidentTokenEngineTextInputRequest::new(
+                    "engine_stream_0",
+                    "event_0",
+                    "1",
+                    2,
+                )
+                .with_origin("test_host"),
                 VulkanResidentTokenEngineRunBudget::new(8, 1, 2),
                 &VulkanResidentTokenIdTextCodec,
             )
@@ -20043,11 +20037,13 @@ mod tests {
 
         let turn = engine
             .submit_live_text_turn_until_idle(
-                "engine_live_text_turn",
-                "event_0",
-                "1",
-                2,
-                "test_host",
+                VulkanResidentTokenEngineTextInputRequest::new(
+                    "engine_live_text_turn",
+                    "event_0",
+                    "1",
+                    2,
+                )
+                .with_origin("test_host"),
                 VulkanResidentTokenEngineRunBudget::new(8, 1, 2),
                 &codec,
             )
@@ -20191,11 +20187,13 @@ mod tests {
 
         let submitted = engine
             .submit_text_until_idle(
-                "engine_text_stream",
-                "hello_event",
-                "Hello",
-                1,
-                "test_host",
+                VulkanResidentTokenEngineTextInputRequest::new(
+                    "engine_text_stream",
+                    "hello_event",
+                    "Hello",
+                    1,
+                )
+                .with_origin("test_host"),
                 VulkanResidentTokenEngineRunBudget::new(8, 1, 3),
                 &codec,
             )
@@ -20410,13 +20408,12 @@ mod tests {
         let first_tick = stream.tick(&device).unwrap();
         assert_eq!(first_tick.stream_tick, Some(0));
         assert!(first_tick.public_output.is_some());
-        assert_eq!(
-            first_tick
+        assert!(
+            !first_tick
                 .private_feedback
                 .as_ref()
                 .unwrap()
-                .closes_loop_after_processing,
-            false
+                .closes_loop_after_processing
         );
         assert_eq!(stream.pending_private_feedback_count(), 1);
         assert_eq!(stream.remaining_public_outputs, 2);
@@ -20436,10 +20433,7 @@ mod tests {
         assert_eq!(stream.pending_private_feedback_count(), 1);
         assert_eq!(stream.remaining_public_outputs, 0);
         assert!(stream.loop_open);
-        assert_eq!(
-            stream.private_feedback_history()[0].closes_loop_after_processing,
-            true
-        );
+        assert!(stream.private_feedback_history()[0].closes_loop_after_processing);
         assert_eq!(
             stream.private_feedback_history()[0].stop_reason.as_deref(),
             Some("user_stop")
@@ -24923,7 +24917,11 @@ mod tests {
         )
         .unwrap();
         let run = placed_package
-            .run_prompt_event_bounded_in_process(&device, &[1, 36_309], 0, 1, &[], 8)
+            .run_prompt_event_bounded_in_process(
+                &device,
+                VulkanResidentPromptRequest::new(&[1, 36_309], 1, &[], 8),
+                0,
+            )
             .unwrap();
 
         assert_eq!(run.input_device_id, "gpu0");
@@ -24970,7 +24968,11 @@ mod tests {
         let mut session = placed_package.prompt_session();
 
         let first = session
-            .run_prompt_event_bounded_in_process(&placed_package, &device, &[1], 1, &[], 8)
+            .run_prompt_event_bounded_in_process(
+                &placed_package,
+                &device,
+                VulkanResidentPromptRequest::new(&[1], 1, &[], 8),
+            )
             .unwrap();
         assert_eq!(first.prompt_event_index, 0);
         assert_eq!(first.start_stream_tick, 0);
@@ -24982,7 +24984,11 @@ mod tests {
         assert_eq!(session.transport_stats().pending_packet_count, 0);
 
         let second = session
-            .run_prompt_event_bounded_in_process(&placed_package, &device, &[36_309], 1, &[], 8)
+            .run_prompt_event_bounded_in_process(
+                &placed_package,
+                &device,
+                VulkanResidentPromptRequest::new(&[36_309], 1, &[], 8),
+            )
             .unwrap();
         assert_eq!(second.prompt_event_index, 1);
         assert_eq!(second.start_stream_tick, 2);
@@ -25010,7 +25016,7 @@ mod tests {
             StreamCircuitPlacementSpec::new("gpu0").with_pedal_device("layer_02", "gpu1");
         let manifest_path = fixture_model_package_manifest_path();
         let manifest_dir = manifest_path.parent().unwrap();
-        let device = Arc::new(device);
+        let device = Rc::new(device);
         let devices = BTreeMap::from([
             ("gpu0".to_string(), device.clone()),
             ("gpu1".to_string(), device.clone()),
@@ -25062,7 +25068,7 @@ mod tests {
             StreamCircuitPlacementSpec::new("gpu0").with_pedal_device("layer_02", "gpu1");
         let manifest_path = fixture_model_package_manifest_path();
         let manifest_dir = manifest_path.parent().unwrap();
-        let device = Arc::new(device);
+        let device = Rc::new(device);
         let devices = BTreeMap::from([
             ("gpu0".to_string(), device.clone()),
             ("gpu1".to_string(), device.clone()),
@@ -25134,7 +25140,7 @@ mod tests {
             StreamCircuitPlacementSpec::new("gpu0").with_pedal_device("layer_02", "gpu1");
         let manifest_path = fixture_model_package_manifest_path();
         let manifest_dir = manifest_path.parent().unwrap();
-        let device = Arc::new(device);
+        let device = Rc::new(device);
         let devices = BTreeMap::from([
             ("gpu0".to_string(), device.clone()),
             ("gpu1".to_string(), device.clone()),
@@ -25187,7 +25193,7 @@ mod tests {
             StreamCircuitPlacementSpec::new("gpu0").with_pedal_device("layer_02", "gpu1");
         let manifest_path = fixture_model_package_manifest_path();
         let manifest_dir = manifest_path.parent().unwrap();
-        let device = Arc::new(device);
+        let device = Rc::new(device);
         let devices = BTreeMap::from([
             ("gpu0".to_string(), device.clone()),
             ("gpu1".to_string(), device.clone()),
@@ -25274,7 +25280,7 @@ mod tests {
             StreamCircuitPlacementSpec::new("gpu0").with_pedal_device("layer_02", "gpu1");
         let manifest_path = fixture_model_package_manifest_path();
         let manifest_dir = manifest_path.parent().unwrap();
-        let device = Arc::new(device);
+        let device = Rc::new(device);
         let devices = BTreeMap::from([
             ("gpu0".to_string(), device.clone()),
             ("gpu1".to_string(), device.clone()),
@@ -25348,7 +25354,7 @@ mod tests {
             StreamCircuitPlacementSpec::new("gpu0").with_pedal_device("layer_02", "gpu1");
         let manifest_path = fixture_model_package_manifest_path();
         let manifest_dir = manifest_path.parent().unwrap();
-        let device = Arc::new(device);
+        let device = Rc::new(device);
         let devices = BTreeMap::from([
             ("gpu0".to_string(), device.clone()),
             ("gpu1".to_string(), device.clone()),
@@ -25446,7 +25452,7 @@ mod tests {
             StreamCircuitPlacementSpec::new("gpu0").with_pedal_device("layer_02", "gpu1");
         let manifest_path = fixture_model_package_manifest_path();
         let manifest_dir = manifest_path.parent().unwrap();
-        let device = Arc::new(device);
+        let device = Rc::new(device);
         let devices = BTreeMap::from([
             ("gpu0".to_string(), device.clone()),
             ("gpu1".to_string(), device.clone()),
@@ -25527,7 +25533,7 @@ mod tests {
             StreamCircuitPlacementSpec::new("gpu0").with_pedal_device("layer_02", "gpu1");
         let manifest_path = fixture_model_package_manifest_path();
         let manifest_dir = manifest_path.parent().unwrap();
-        let device = Arc::new(device);
+        let device = Rc::new(device);
         let devices = BTreeMap::from([
             ("gpu0".to_string(), device.clone()),
             ("gpu1".to_string(), device.clone()),

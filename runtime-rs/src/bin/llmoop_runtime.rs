@@ -3,7 +3,7 @@ use std::error::Error;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::rc::Rc;
 use std::time::Instant;
 
 use chrono::{DateTime, FixedOffset, Local};
@@ -26,8 +26,9 @@ use llmoop_runtime::{
     VulkanResidentInProcessPlacedPromptStream, VulkanResidentModelPackage,
     VulkanResidentModelPackageDeviceSlice, VulkanResidentModelPackageManifest,
     VulkanResidentTokenEngine, VulkanResidentTokenEngineRunBudget,
-    VulkanResidentTokenEngineRunStopCondition, VulkanResidentTokenInputEvent,
-    VulkanResidentTokenTextCodec, VulkanReusableKernelArtifactManifest, discover_runtime_devices,
+    VulkanResidentTokenEngineRunStopCondition, VulkanResidentTokenEngineTextInputRequest,
+    VulkanResidentTokenInputEvent, VulkanResidentTokenTextCodec,
+    VulkanReusableKernelArtifactManifest, discover_runtime_devices,
 };
 use minijinja::{Environment, Error as TemplateError, ErrorKind as TemplateErrorKind};
 use serde::Serialize;
@@ -58,6 +59,18 @@ struct Args {
     profile: bool,
     profile_runs: usize,
     json: bool,
+}
+
+struct PromptRunContext<'a> {
+    args: &'a Args,
+    package_manifest: &'a Path,
+    manifest_dir: &'a Path,
+    tokenizer_dir: &'a Path,
+    prompt: &'a str,
+    prompt_ids: &'a [u32],
+    needed_capacity: usize,
+    capacity: usize,
+    codec: &'a VulkanResidentHfTokenizerTextCodec,
 }
 
 impl Default for Args {
@@ -180,80 +193,58 @@ fn run() -> Result<(), Box<dyn Error>> {
         })?;
     let capacity =
         choose_runtime_context_size(package_manifest, args.context_size, prompt_ids.len())?;
+    let context = PromptRunContext {
+        args: &args,
+        package_manifest,
+        manifest_dir: &manifest_dir,
+        tokenizer_dir: &tokenizer_dir,
+        prompt,
+        prompt_ids: &prompt_ids,
+        needed_capacity,
+        capacity,
+        codec: &codec,
+    };
 
     if manifest.placement_device_ids().len() > 1 {
         if args.profile_runs > 1 {
-            return run_placed_prompt_benchmark(
-                &args,
-                package_manifest,
-                &manifest_dir,
-                &tokenizer_dir,
-                prompt,
-                &prompt_ids,
-                capacity,
-                manifest,
-                &codec,
-            );
+            return run_placed_prompt_benchmark(&context, manifest);
         }
-        return run_placed_prompt(
-            &args,
-            package_manifest,
-            &manifest_dir,
-            &tokenizer_dir,
-            prompt,
-            &prompt_ids,
-            capacity,
-            manifest,
-            &codec,
-        );
+        return run_placed_prompt(&context, manifest);
     }
 
     if args.profile_runs > 1 {
-        return run_single_device_prompt_benchmark(
-            &args,
-            package_manifest,
-            &manifest_dir,
-            &tokenizer_dir,
-            prompt,
-            &prompt_ids,
-            needed_capacity,
-            capacity,
-            manifest,
-            &codec,
-        );
+        return run_single_device_prompt_benchmark(&context, manifest);
     }
 
-    let report = execute_single_device_prompt_run(
-        &args,
-        package_manifest,
-        &manifest_dir,
-        &tokenizer_dir,
-        prompt,
-        needed_capacity,
-        capacity,
-        manifest,
-        &codec,
-    )?;
+    let report = execute_single_device_prompt_run(&context, manifest)?;
     print_single_device_prompt_report(&args, &report)?;
 
     Ok(())
 }
 
 fn execute_single_device_prompt_run(
-    args: &Args,
-    package_manifest: &Path,
-    manifest_dir: &Path,
-    tokenizer_dir: &Path,
-    prompt: &str,
-    needed_capacity: usize,
-    capacity: usize,
+    context: &PromptRunContext<'_>,
     manifest: VulkanResidentModelPackageManifest,
-    codec: &VulkanResidentHfTokenizerTextCodec,
 ) -> Result<RuntimeSingleDevicePromptRunReport, Box<dyn Error>> {
+    let PromptRunContext {
+        args,
+        package_manifest,
+        manifest_dir,
+        tokenizer_dir,
+        prompt,
+        needed_capacity,
+        capacity,
+        codec,
+        ..
+    } = context;
     let setup_start = Instant::now();
     let device = runtime_vulkan_device(args)?;
-    let model =
-        VulkanResidentModelPackage::from_manifest(&device, manifest_dir, manifest, Some(capacity))?;
+    let model = VulkanResidentModelPackage::from_manifest(
+        &device,
+        manifest_dir,
+        manifest,
+        Some(*capacity),
+    )?;
     let mut engine = VulkanResidentTokenEngine::new(device);
     engine.add_model_package("compiled_model", model)?;
     engine.create_stream_from_model("compiled_model", "main")?;
@@ -261,13 +252,15 @@ fn execute_single_device_prompt_run(
 
     let run_start = Instant::now();
     let turn = engine.submit_live_text_turn_until_idle(
-        "main",
-        "prompt",
-        prompt,
-        args.max_new_tokens,
-        "cli",
+        VulkanResidentTokenEngineTextInputRequest::new(
+            "main",
+            "prompt",
+            *prompt,
+            args.max_new_tokens,
+        )
+        .with_origin("cli"),
         VulkanResidentTokenEngineRunBudget::new(args.max_scheduler_turns, 1, args.cycle_ticks),
-        codec,
+        *codec,
     )?;
     let run_time_ns = elapsed_nanos_u64(run_start);
     let stream = engine
@@ -293,13 +286,16 @@ fn execute_single_device_prompt_run(
         device_name: snapshot.device_name,
         device_id: stream.device_id.clone(),
         runtime_patch: runtime_patch_report(args),
-        device_bindings: runtime_device_bindings_report(args, &[stream.device_id.clone()]),
+        device_bindings: runtime_device_bindings_report(
+            args,
+            std::slice::from_ref(&stream.device_id),
+        ),
         pedal_count: stream.pedal_count,
         dispatches_per_tick: stream.per_tick_dispatch_count,
         descriptors_per_tick: stream.per_tick_descriptor_count,
         push_constant_bytes_per_tick: stream.per_tick_push_constant_byte_count,
         context_window_activations: stream.dynamic_state_capacity_activations,
-        scheduled_token_activations: needed_capacity,
+        scheduled_token_activations: *needed_capacity,
         tokenizer: tokenizer_options_report(args),
         prompt_text: prompt.to_string(),
         prompt_ids: turn.queued_input_event.encoded_token_ids.clone(),
@@ -592,21 +588,21 @@ where
 {
     println!("Type a message and press Enter. Type /exit, /quit, exit, or quit to stop.");
     let mut turn_index = 0usize;
-    if let Some(initial_prompt) = initial_prompt {
-        if !initial_prompt.trim().is_empty() {
-            if !submit_chat_turn(
-                &mut chat_session,
-                codec,
-                transcript_codec,
-                &stop_token_ids,
-                &mut submit,
-                turn_index,
-                initial_prompt,
-            )? {
-                return Ok(());
-            }
-            turn_index = turn_index.saturating_add(1);
+    if let Some(initial_prompt) = initial_prompt
+        && !initial_prompt.trim().is_empty()
+    {
+        if !submit_chat_turn(
+            &mut chat_session,
+            codec,
+            transcript_codec,
+            stop_token_ids,
+            &mut submit,
+            turn_index,
+            initial_prompt,
+        )? {
+            return Ok(());
         }
+        turn_index = turn_index.saturating_add(1);
     }
 
     let stdin = io::stdin();
@@ -794,10 +790,10 @@ fn chat_stop_token_ids_from_manifest(
             }
         }
     }
-    if let Some(token_id) = model_owned_assistant_turn_stop_token_id(tokenizer_dir, formatter)? {
-        if !stop_token_ids.contains(&token_id) {
-            stop_token_ids.push(token_id);
-        }
+    if let Some(token_id) = model_owned_assistant_turn_stop_token_id(tokenizer_dir, formatter)?
+        && !stop_token_ids.contains(&token_id)
+    {
+        stop_token_ids.push(token_id);
     }
     Ok(stop_token_ids)
 }
@@ -958,17 +954,18 @@ fn run_placed_chat(
 }
 
 fn run_placed_prompt(
-    args: &Args,
-    package_manifest: &Path,
-    manifest_dir: &Path,
-    tokenizer_dir: &Path,
-    prompt: &str,
-    prompt_ids: &[u32],
-    capacity: usize,
+    context: &PromptRunContext<'_>,
     manifest: VulkanResidentModelPackageManifest,
-    codec: &VulkanResidentHfTokenizerTextCodec,
 ) -> Result<(), Box<dyn Error>> {
-    let report = execute_placed_prompt_run(
+    let report = execute_placed_prompt_run(context, manifest)?;
+    print_placed_prompt_report(context.args, &report)
+}
+
+fn execute_placed_prompt_run(
+    context: &PromptRunContext<'_>,
+    manifest: VulkanResidentModelPackageManifest,
+) -> Result<RuntimePlacedPromptRunReport, Box<dyn Error>> {
+    let PromptRunContext {
         args,
         package_manifest,
         manifest_dir,
@@ -976,23 +973,9 @@ fn run_placed_prompt(
         prompt,
         prompt_ids,
         capacity,
-        manifest,
         codec,
-    )?;
-    print_placed_prompt_report(args, &report)
-}
-
-fn execute_placed_prompt_run(
-    args: &Args,
-    package_manifest: &Path,
-    manifest_dir: &Path,
-    tokenizer_dir: &Path,
-    prompt: &str,
-    prompt_ids: &[u32],
-    capacity: usize,
-    manifest: VulkanResidentModelPackageManifest,
-    codec: &VulkanResidentHfTokenizerTextCodec,
-) -> Result<RuntimePlacedPromptRunReport, Box<dyn Error>> {
+        ..
+    } = context;
     let setup_start = Instant::now();
     let mut logical_device_ids = manifest.placement_device_ids();
     if !logical_device_ids.contains(&manifest.device_id) {
@@ -1004,7 +987,7 @@ fn execute_placed_prompt_run(
         bound_devices.devices.clone(),
         manifest_dir,
         manifest,
-        Some(capacity),
+        Some(*capacity),
     )?;
     let mut engine = VulkanResidentInProcessPlacedPromptEngine::new();
     let stream_snapshot = engine.add_stream("main", stream)?;
@@ -1124,30 +1107,12 @@ fn print_placed_prompt_report(
 }
 
 fn run_single_device_prompt_benchmark(
-    args: &Args,
-    package_manifest: &Path,
-    manifest_dir: &Path,
-    tokenizer_dir: &Path,
-    prompt: &str,
-    prompt_ids: &[u32],
-    needed_capacity: usize,
-    capacity: usize,
+    context: &PromptRunContext<'_>,
     manifest: VulkanResidentModelPackageManifest,
-    codec: &VulkanResidentHfTokenizerTextCodec,
 ) -> Result<(), Box<dyn Error>> {
-    let mut runs = Vec::with_capacity(args.profile_runs);
-    for _ in 0..args.profile_runs {
-        runs.push(execute_single_device_prompt_run(
-            args,
-            package_manifest,
-            manifest_dir,
-            tokenizer_dir,
-            prompt,
-            needed_capacity,
-            capacity,
-            manifest.clone(),
-            codec,
-        )?);
+    let mut runs = Vec::with_capacity(context.args.profile_runs);
+    for _ in 0..context.args.profile_runs {
+        runs.push(execute_single_device_prompt_run(context, manifest.clone())?);
     }
     let first = runs
         .first()
@@ -1158,43 +1123,22 @@ fn run_single_device_prompt_benchmark(
         .map(|(run_index, run)| single_device_benchmark_run_report(run_index, run))
         .collect::<Vec<_>>();
     let benchmark = runtime_prompt_benchmark_report(
-        args,
-        package_manifest,
-        tokenizer_dir,
-        prompt,
-        prompt_ids,
+        context,
         &first.execution_mode,
         vec![first.device_id.clone()],
         first.device_bindings.clone(),
         benchmark_runs,
     );
-    print_prompt_benchmark_report(args, &benchmark)
+    print_prompt_benchmark_report(context.args, &benchmark)
 }
 
 fn run_placed_prompt_benchmark(
-    args: &Args,
-    package_manifest: &Path,
-    manifest_dir: &Path,
-    tokenizer_dir: &Path,
-    prompt: &str,
-    prompt_ids: &[u32],
-    capacity: usize,
+    context: &PromptRunContext<'_>,
     manifest: VulkanResidentModelPackageManifest,
-    codec: &VulkanResidentHfTokenizerTextCodec,
 ) -> Result<(), Box<dyn Error>> {
-    let mut runs = Vec::with_capacity(args.profile_runs);
-    for _ in 0..args.profile_runs {
-        runs.push(execute_placed_prompt_run(
-            args,
-            package_manifest,
-            manifest_dir,
-            tokenizer_dir,
-            prompt,
-            prompt_ids,
-            capacity,
-            manifest.clone(),
-            codec,
-        )?);
+    let mut runs = Vec::with_capacity(context.args.profile_runs);
+    for _ in 0..context.args.profile_runs {
+        runs.push(execute_placed_prompt_run(context, manifest.clone())?);
     }
     let first = runs
         .first()
@@ -1205,17 +1149,13 @@ fn run_placed_prompt_benchmark(
         .map(|(run_index, run)| placed_benchmark_run_report(run_index, run))
         .collect::<Vec<_>>();
     let benchmark = runtime_prompt_benchmark_report(
-        args,
-        package_manifest,
-        tokenizer_dir,
-        prompt,
-        prompt_ids,
+        context,
         &first.execution_mode,
         first.device_ids.clone(),
         first.device_bindings.clone(),
         benchmark_runs,
     );
-    print_prompt_benchmark_report(args, &benchmark)
+    print_prompt_benchmark_report(context.args, &benchmark)
 }
 
 fn single_device_benchmark_run_report(
@@ -1265,16 +1205,20 @@ fn placed_benchmark_run_report(
 }
 
 fn runtime_prompt_benchmark_report(
-    args: &Args,
-    package_manifest: &Path,
-    tokenizer_dir: &Path,
-    prompt: &str,
-    prompt_ids: &[u32],
+    context: &PromptRunContext<'_>,
     execution_mode: &str,
     device_ids: Vec<String>,
     device_bindings: RuntimeDeviceBindings,
     runs: Vec<RuntimePromptBenchmarkRunReport>,
 ) -> RuntimePromptBenchmarkReport {
+    let PromptRunContext {
+        args,
+        package_manifest,
+        tokenizer_dir,
+        prompt,
+        prompt_ids,
+        ..
+    } = context;
     let setup_values = runs.iter().map(|run| run.setup_time_ns).collect::<Vec<_>>();
     let run_values = runs.iter().map(|run| run.run_time_ns).collect::<Vec<_>>();
     let total_values = runs.iter().map(|run| run.total_time_ns).collect::<Vec<_>>();
@@ -2086,7 +2030,7 @@ fn runtime_vulkan_device(args: &Args) -> Result<VulkanComputeDevice, Box<dyn Err
 }
 
 struct RuntimeBoundVulkanDevices {
-    devices: BTreeMap<String, Arc<VulkanComputeDevice>>,
+    devices: BTreeMap<String, Rc<VulkanComputeDevice>>,
     physical_device_indices: BTreeMap<String, usize>,
     physical_device_ids: BTreeMap<String, String>,
 }
@@ -2115,7 +2059,7 @@ fn runtime_bound_vulkan_devices(
     logical_device_ids.sort();
     logical_device_ids.dedup();
     let mut devices = BTreeMap::new();
-    let mut physical_devices: BTreeMap<usize, Arc<VulkanComputeDevice>> = BTreeMap::new();
+    let mut physical_devices: BTreeMap<usize, Rc<VulkanComputeDevice>> = BTreeMap::new();
     let mut physical_device_indices = BTreeMap::new();
     let mut physical_device_ids = BTreeMap::new();
 
@@ -2138,12 +2082,12 @@ fn runtime_bound_vulkan_devices(
                 )
             })?;
         let device = if let Some(device) = physical_devices.get(&physical_device_index) {
-            Arc::clone(device)
+            Rc::clone(device)
         } else {
-            let device = Arc::new(VulkanComputeDevice::new_for_device_uuid(
+            let device = Rc::new(VulkanComputeDevice::new_for_device_uuid(
                 available_device.device_uuid,
             )?);
-            physical_devices.insert(physical_device_index, Arc::clone(&device));
+            physical_devices.insert(physical_device_index, Rc::clone(&device));
             device
         };
         devices.insert(logical_device_id.clone(), device);
@@ -2494,7 +2438,7 @@ fn parse_args() -> Result<Args, String> {
 
     while let Some(arg) = raw.next() {
         match arg.as_str() {
-            "--package" | "--package-manifest" => {
+            "--package" => {
                 parsed.package_manifest = Some(PathBuf::from(next_value(&mut raw, &arg)?));
             }
             "--prompt" => {
@@ -2503,10 +2447,10 @@ fn parse_args() -> Result<Args, String> {
             "--chat" => {
                 parsed.chat = true;
             }
-            "--inspect-runtime" | "--inspect-topology" => {
+            "--inspect-runtime" => {
                 parsed.inspect_runtime = true;
             }
-            "--inspect-package" | "--inspect-pedals" => {
+            "--inspect-package" => {
                 parsed.inspect_package = true;
             }
             "--inspect-patch" => {
@@ -2518,10 +2462,10 @@ fn parse_args() -> Result<Args, String> {
             "--inspect-device-slice" => {
                 parsed.inspect_device_slice = Some(next_value(&mut raw, "--inspect-device-slice")?);
             }
-            "--device" | "--default-device-id" => {
+            "--device" => {
                 parsed.default_device_id = Some(next_value(&mut raw, &arg)?);
             }
-            "--place-pedal" | "--place" => {
+            "--place-pedal" => {
                 let assignment = next_value(&mut raw, &arg)?;
                 let (pedal_id, device_id) = parse_pedal_device_assignment(&assignment)?;
                 if parsed
@@ -2534,7 +2478,7 @@ fn parse_args() -> Result<Args, String> {
                     ));
                 }
             }
-            "--bind-device" | "--device-binding" => {
+            "--bind-device" => {
                 let assignment = next_value(&mut raw, &arg)?;
                 let (device_id, target) = parse_device_binding_assignment(&assignment)?;
                 if parsed
@@ -2553,7 +2497,7 @@ fn parse_args() -> Result<Args, String> {
                     .duplicate_after
                     .push(parse_duplicate_after_assignment(&assignment)?);
             }
-            "--chain" | "--source-chain" => {
+            "--chain" => {
                 let chain = parse_source_chain(&next_value(&mut raw, &arg)?)?;
                 if parsed.source_chain.replace(chain).is_some() {
                     return Err("--chain may only be supplied once".to_string());
@@ -2684,9 +2628,7 @@ fn parse_device_binding_assignment(raw: &str) -> Result<(String, String), String
             "invalid runtime device binding {raw:?}; target must not be empty"
         ));
     }
-    if let Err(error) = resolve_runtime_vulkan_physical_device_ref(target) {
-        return Err(error);
-    }
+    resolve_runtime_vulkan_physical_device_ref(target)?;
     Ok((device_id.to_string(), target.to_string()))
 }
 
@@ -2946,24 +2888,17 @@ fn usage() -> &'static str {
 
 Options:
   --package <PATH>           Compiled resident model package manifest. Required.
-  --package-manifest <PATH>  Alias for --package.
   --prompt <TEXT>            External text event to inject into the resident stream.
                              With --chat, this is the optional first message.
   --chat                     Start an interactive resident text session.
   --device <DEVICE_ID>       Default logical device for this runtime patch.
-  --default-device-id <ID>   Alias for --device.
   --place-pedal <PEDAL=DEV>  Assign one runtime pedal instance to a logical device.
-  --place <PEDAL=DEV>        Alias for --place-pedal.
   --bind-device <DEV=TARGET> Bind a logical device to a discovered Vulkan device ID.
-  --device-binding <DEV=TARGET>
-                             Alias for --bind-device.
   --chain <ITEM[,ITEM...]>    Runtime source chain. ITEM is SOURCE or INSTANCE=SOURCE.
   --duplicate-after <AFTER=NEW>
                              Duplicate runtime pedal instance AFTER with id NEW.
   --inspect-runtime          Preview UI-ready package, patch, placement, device, and route facts.
-  --inspect-topology         Alias for --inspect-runtime.
   --inspect-package          Summarize the compiled source pedal kit and available devices.
-  --inspect-pedals           Alias for --inspect-package.
   --inspect-patch            Preview the effective runtime patch without mounting devices.
   --inspect-placement        Mount and summarize every logical device slice in the runtime patch.
   --inspect-device-slice <DEVICE_ID>

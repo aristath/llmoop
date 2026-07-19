@@ -9,16 +9,6 @@ name = "llmoop_runtime"
 path = "src/lib.rs"
 
 [[bin]]
-name = "resident-token-demo"
-path = "src/bin/resident_token_demo.rs"
-required-features = ["vulkan"]
-
-[[bin]]
-name = "resident-text-demo"
-path = "src/bin/resident_text_demo.rs"
-required-features = ["vulkan", "tokenizers"]
-
-[[bin]]
 name = "llmoop-runtime"
 path = "src/bin/llmoop_runtime.rs"
 required-features = ["vulkan", "tokenizers"]
