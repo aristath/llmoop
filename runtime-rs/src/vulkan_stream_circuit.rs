@@ -11567,7 +11567,7 @@ impl VulkanMountedPlacedResidentDispatchSegmentRunner {
 /// visible to the scheduler, while every uninterrupted dispatch region becomes
 /// one GPU submission.
 pub struct VulkanMountedPlacedResidentStreamTickExecutionPlan {
-    pub tick_plan: VulkanMountedPlacedStreamTickPlan,
+    pub tick_plan: Arc<VulkanMountedPlacedStreamTickPlan>,
     pub dispatch_segment_count: usize,
     pub dispatch_count: usize,
     dispatch_segments: Vec<VulkanMountedPlacedResidentDispatchSegmentRunner>,
@@ -11623,7 +11623,7 @@ impl VulkanMountedPlacedResidentStreamTickExecutionPlan {
             .sum();
         let dispatch_segment_count = dispatch_segments.len();
         Ok(Self {
-            tick_plan,
+            tick_plan: Arc::new(tick_plan),
             dispatch_segment_count,
             dispatch_count,
             dispatch_segments,
@@ -11649,6 +11649,28 @@ impl VulkanMountedPlacedResidentStreamTickExecutionPlan {
         self.dispatch_segments
             .last()
             .map(|segment| segment.start_stage_index)
+    }
+
+    fn resident_stream_tick_cursor(
+        &self,
+        stream_tick: u64,
+    ) -> VulkanMountedPlacedResidentStreamTickCursor {
+        VulkanMountedPlacedResidentStreamTickCursor::new_shared(
+            Arc::clone(&self.tick_plan),
+            stream_tick,
+            true,
+        )
+    }
+
+    fn compact_resident_stream_tick_cursor(
+        &self,
+        stream_tick: u64,
+    ) -> VulkanMountedPlacedResidentStreamTickCursor {
+        VulkanMountedPlacedResidentStreamTickCursor::new_shared(
+            Arc::clone(&self.tick_plan),
+            stream_tick,
+            false,
+        )
     }
 }
 
@@ -14202,18 +14224,11 @@ impl VulkanMountedPlacedStreamTickPlan {
     ) -> VulkanMountedPlacedResidentStreamTickCursor {
         VulkanMountedPlacedResidentStreamTickCursor::new(self.clone(), stream_tick)
     }
-
-    pub fn compact_resident_stream_tick_cursor(
-        &self,
-        stream_tick: u64,
-    ) -> VulkanMountedPlacedResidentStreamTickCursor {
-        VulkanMountedPlacedResidentStreamTickCursor::new_compact(self.clone(), stream_tick)
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VulkanMountedPlacedResidentStreamTickCursor {
-    pub tick_plan: VulkanMountedPlacedStreamTickPlan,
+    pub tick_plan: Arc<VulkanMountedPlacedStreamTickPlan>,
     pub stream_tick: u64,
     pub next_stage_index: usize,
     pub completed_stage_count: usize,
@@ -14224,15 +14239,11 @@ pub struct VulkanMountedPlacedResidentStreamTickCursor {
 
 impl VulkanMountedPlacedResidentStreamTickCursor {
     pub fn new(tick_plan: VulkanMountedPlacedStreamTickPlan, stream_tick: u64) -> Self {
-        Self::new_with_trace(tick_plan, stream_tick, true)
+        Self::new_shared(Arc::new(tick_plan), stream_tick, true)
     }
 
-    pub fn new_compact(tick_plan: VulkanMountedPlacedStreamTickPlan, stream_tick: u64) -> Self {
-        Self::new_with_trace(tick_plan, stream_tick, false)
-    }
-
-    fn new_with_trace(
-        tick_plan: VulkanMountedPlacedStreamTickPlan,
+    fn new_shared(
+        tick_plan: Arc<VulkanMountedPlacedStreamTickPlan>,
         stream_tick: u64,
         capture_execution_trace: bool,
     ) -> Self {
@@ -14267,7 +14278,7 @@ impl VulkanMountedPlacedResidentStreamTickCursor {
             mounted,
             mounted_bound_plan,
             loaded_manifest,
-            self.tick_plan.clone(),
+            self.tick_plan.as_ref().clone(),
         )
         .map_err(VulkanMountedPlacedResidentStreamTickError::Dispatch)?;
         let dispatch_extensions =
@@ -14519,9 +14530,7 @@ impl<'a> VulkanMountedPlacedResidentInProcessStreamTickSlice<'a> {
             mounted,
             execution_plan,
             dispatch_extensions: VulkanMountedPlacedResidentStreamTickDispatchExtensions::default(),
-            cursor: execution_plan
-                .tick_plan
-                .resident_stream_tick_cursor(stream_tick),
+            cursor: execution_plan.resident_stream_tick_cursor(stream_tick),
         }
     }
 
@@ -14537,9 +14546,7 @@ impl<'a> VulkanMountedPlacedResidentInProcessStreamTickSlice<'a> {
             mounted,
             execution_plan,
             dispatch_extensions,
-            cursor: execution_plan
-                .tick_plan
-                .compact_resident_stream_tick_cursor(stream_tick),
+            cursor: execution_plan.compact_resident_stream_tick_cursor(stream_tick),
         }
     }
 
