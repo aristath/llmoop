@@ -196,10 +196,13 @@ impl StreamCircuit {
 
         let mut produced = BTreeSet::new();
         let mut produced_by = BTreeMap::new();
+        let mut input_port_ids = BTreeSet::new();
         for port in &self.boundary.inputs {
-            if !produced.insert(port.id.clone()) {
-                issues.push(format!("duplicate boundary input signal {:?}", port.id));
+            validate_boundary_port(port, "input", &mut issues);
+            if !input_port_ids.insert(port.id.clone()) {
+                issues.push(format!("duplicate boundary input port id {:?}", port.id));
             }
+            produced.insert(port.id.clone());
             produced_by.insert(port.id.clone(), "boundary.input".to_string());
         }
 
@@ -260,7 +263,13 @@ impl StreamCircuit {
             }
         }
 
+        let mut output_port_ids = BTreeSet::new();
         for output in &self.boundary.outputs {
+            validate_boundary_port(output, "output", &mut issues);
+            if !output_port_ids.insert(output.id.clone()) {
+                issues.push(format!("duplicate boundary output port id {:?}", output.id));
+                continue;
+            }
             let source = output.source.as_ref().unwrap_or(&output.id);
             if !produced.contains(source) {
                 issues.push(format!(
@@ -279,6 +288,30 @@ impl StreamCircuit {
                 issues.join("\n- ")
             )))
         }
+    }
+}
+
+fn validate_boundary_port(port: &CircuitPort, direction: &str, issues: &mut Vec<String>) {
+    if port.id.is_empty() {
+        issues.push(format!("boundary {direction} port id must not be empty"));
+    }
+    if port.signal.is_empty() {
+        issues.push(format!(
+            "boundary {direction} port {:?} signal must not be empty",
+            port.id
+        ));
+    }
+    if port.shape.is_empty() || port.shape.contains(&0) {
+        issues.push(format!(
+            "boundary {direction} port {:?} shape must contain positive dimensions",
+            port.id
+        ));
+    }
+    if port.pedal_port.as_deref().is_none_or(str::is_empty) {
+        issues.push(format!(
+            "boundary {direction} port {:?} must map to a non-empty pedal_port",
+            port.id
+        ));
     }
 }
 
@@ -2632,6 +2665,79 @@ mod tests {
             "pedalboard.circuits.json",
         )
         .join("pedalboard.circuits.json")
+    }
+
+    #[test]
+    fn circuit_contract_rejects_ambiguous_boundary_ports() {
+        let circuit: StreamCircuit = serde_json::from_value(serde_json::json!({
+            "schema": STREAM_CIRCUIT_SCHEMA,
+            "id": "fixture_circuit",
+            "source": {
+                "pedal_id": "fixture_pedal",
+                "source_layer_index": 0,
+                "source_operator_type": "fixture"
+            },
+            "behavioral_role": "fixture",
+            "implementation": "fixture",
+            "boundary": {
+                "inputs": [{
+                    "id": "input_frame",
+                    "signal": "frame",
+                    "shape": [8],
+                    "pedal_port": "input"
+                }],
+                "outputs": [{
+                    "id": "output_frame",
+                    "signal": "frame",
+                    "shape": [8],
+                    "source": "output_frame",
+                    "pedal_port": "output"
+                }]
+            },
+            "parameters": {
+                "layout": "row_major",
+                "storage": "safetensors",
+                "refs": {}
+            },
+            "nodes": [{
+                "id": "identity",
+                "op": "identity",
+                "inputs": ["input_frame"],
+                "outputs": ["output_frame"]
+            }]
+        }))
+        .unwrap();
+
+        let mut duplicate_input = circuit.clone();
+        duplicate_input
+            .boundary
+            .inputs
+            .push(duplicate_input.boundary.inputs[0].clone());
+        let input_error = duplicate_input.validate_contract().unwrap_err();
+        assert!(
+            input_error
+                .to_string()
+                .contains("duplicate boundary input port id")
+        );
+
+        let mut duplicate_output = circuit.clone();
+        duplicate_output
+            .boundary
+            .outputs
+            .push(duplicate_output.boundary.outputs[0].clone());
+        let output_error = duplicate_output.validate_contract().unwrap_err();
+        assert!(
+            output_error
+                .to_string()
+                .contains("duplicate boundary output port id")
+        );
+
+        let mut malformed = circuit.clone();
+        malformed.boundary.inputs[0].shape.clear();
+        malformed.boundary.outputs[0].pedal_port = Some(String::new());
+        let malformed_error = malformed.validate_contract().unwrap_err().to_string();
+        assert!(malformed_error.contains("shape must contain positive dimensions"));
+        assert!(malformed_error.contains("must map to a non-empty pedal_port"));
     }
 
     #[test]

@@ -84,9 +84,14 @@ def validate_circuit(circuit: Json) -> CircuitValidationReport:
     _check(isinstance(outputs, list) and bool(outputs), checks, issues, "boundary has outputs", "boundary.outputs must be a non-empty list", "boundary.outputs")
 
     produced: set[str] = set()
+    input_port_ids: set[str] = set()
     for index, port in enumerate(inputs if isinstance(inputs, list) else []):
         path = f"boundary.inputs[{index}]"
         if _port_has_id_signal_shape(port, checks, issues, path):
+            if port["id"] in input_port_ids:
+                issues.append(CircuitIssue("error", f"duplicate boundary input port id {port['id']!r}", f"{path}.id"))
+                continue
+            input_port_ids.add(port["id"])
             produced.add(port["id"])
 
     declared_state = _ids_by_path(circuit.get("state_ports", []), checks, issues, "state_ports")
@@ -158,10 +163,15 @@ def validate_circuit(circuit: Json) -> CircuitValidationReport:
             produced_by[signal] = str(node_id)
             checks.append(f"{node_id} output {signal} is unique")
 
+    output_port_ids: set[str] = set()
     for index, port in enumerate(outputs if isinstance(outputs, list) else []):
         path = f"boundary.outputs[{index}]"
         if not _port_has_id_signal_shape(port, checks, issues, path):
             continue
+        if port["id"] in output_port_ids:
+            issues.append(CircuitIssue("error", f"duplicate boundary output port id {port['id']!r}", f"{path}.id"))
+            continue
+        output_port_ids.add(port["id"])
         source = port.get("source", port["id"])
         if not isinstance(source, str):
             issues.append(CircuitIssue("error", "boundary output source must be a string", f"{path}.source"))
@@ -184,10 +194,8 @@ def validate_circuit_against_pedal(circuit: Json, pedal: Json) -> CircuitValidat
     pedal_inputs = pedal.get("ports", {}).get("inputs", [])
     pedal_outputs = pedal.get("ports", {}).get("outputs", [])
 
-    if circuit_inputs and pedal_inputs:
-        _compare_port(circuit_inputs[0], pedal_inputs[0], checks, issues, "boundary.inputs[0]", "pedal.ports.inputs[0]")
-    if circuit_outputs and pedal_outputs:
-        _compare_port(circuit_outputs[0], pedal_outputs[0], checks, issues, "boundary.outputs[0]", "pedal.ports.outputs[0]")
+    _compare_ports(circuit_inputs, pedal_inputs, checks, issues, "inputs")
+    _compare_ports(circuit_outputs, pedal_outputs, checks, issues, "outputs")
 
     circuit_state = {port.get("id"): port for port in circuit.get("state_ports", []) if isinstance(port, dict)}
     pedal_state = {port.get("id"): port for port in pedal.get("state_ports", []) if isinstance(port, dict)}
@@ -249,8 +257,8 @@ def _port_has_id_signal_shape(port: Any, checks: list[str], issues: list[Circuit
     if not isinstance(port.get("signal"), str) or not port["signal"]:
         issues.append(CircuitIssue("error", "port signal must be a non-empty string", f"{path}.signal"))
         ok = False
-    if not _is_int_list(port.get("shape")):
-        issues.append(CircuitIssue("error", "port shape must be a list of integers", f"{path}.shape"))
+    if not _is_shape(port.get("shape")):
+        issues.append(CircuitIssue("error", "port shape must be a non-empty list of positive integers", f"{path}.shape"))
         ok = False
     if ok:
         checks.append(f"{path} has id/signal/shape")
@@ -265,8 +273,40 @@ def _compare_port(
     circuit_path: str,
     pedal_path: str,
 ) -> None:
+    _check(circuit_port.get("pedal_port") == pedal_port.get("id"), checks, issues, f"{circuit_path} maps to {pedal_path}", f"expected pedal port {pedal_port.get('id')!r}, found {circuit_port.get('pedal_port')!r}", f"{circuit_path}.pedal_port")
     _check(circuit_port.get("signal") == pedal_port.get("signal"), checks, issues, f"{circuit_path} signal matches {pedal_path}", f"expected signal {pedal_port.get('signal')!r}, found {circuit_port.get('signal')!r}", f"{circuit_path}.signal")
     _check(circuit_port.get("shape") == pedal_port.get("shape"), checks, issues, f"{circuit_path} shape matches {pedal_path}", f"expected shape {pedal_port.get('shape')!r}, found {circuit_port.get('shape')!r}", f"{circuit_path}.shape")
+
+
+def _compare_ports(
+    circuit_ports: Any,
+    pedal_ports: Any,
+    checks: list[str],
+    issues: list[CircuitIssue],
+    direction: str,
+) -> None:
+    if not isinstance(circuit_ports, list) or not isinstance(pedal_ports, list):
+        issues.append(CircuitIssue("error", f"circuit and pedal {direction} must be lists", f"boundary.{direction}"))
+        return
+    _check(
+        len(circuit_ports) == len(pedal_ports),
+        checks,
+        issues,
+        f"boundary {direction} count matches pedal contract",
+        f"expected {len(pedal_ports)} {direction}, found {len(circuit_ports)}",
+        f"boundary.{direction}",
+    )
+    for index, (circuit_port, pedal_port) in enumerate(zip(circuit_ports, pedal_ports)):
+        if not isinstance(circuit_port, dict) or not isinstance(pedal_port, dict):
+            continue
+        _compare_port(
+            circuit_port,
+            pedal_port,
+            checks,
+            issues,
+            f"boundary.{direction}[{index}]",
+            f"pedal.ports.{direction}[{index}]",
+        )
 
 
 def _ids_by_path(values: Any, checks: list[str], issues: list[CircuitIssue], path: str) -> set[str]:
@@ -309,5 +349,9 @@ def _string_list(value: Any, issues: list[CircuitIssue], path: str) -> list[str]
     return strings
 
 
-def _is_int_list(value: Any) -> bool:
-    return isinstance(value, list) and all(isinstance(item, int) for item in value)
+def _is_shape(value: Any) -> bool:
+    return (
+        isinstance(value, list)
+        and bool(value)
+        and all(isinstance(item, int) and not isinstance(item, bool) and item > 0 for item in value)
+    )

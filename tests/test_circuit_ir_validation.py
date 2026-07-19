@@ -13,13 +13,21 @@ def valid_circuit() -> dict[str, object]:
         "schema": "llmoop.stream_circuit.v1",
         "id": "test_circuit",
         "boundary": {
-            "inputs": [{"id": "input_frame", "signal": "frame", "shape": [8]}],
+            "inputs": [
+                {
+                    "id": "input_frame",
+                    "signal": "frame",
+                    "shape": [8],
+                    "pedal_port": "input",
+                }
+            ],
             "outputs": [
                 {
                     "id": "output_frame",
                     "signal": "frame",
                     "shape": [8],
                     "source": "output_frame",
+                    "pedal_port": "output",
                 }
             ],
         },
@@ -143,3 +151,86 @@ def test_pedal_contract_validation_catches_interface_state_and_tensor_drift() ->
     assert any(path == "boundary.outputs[0].shape" for path, _message in errors)
     assert any(path == "state_ports.memory.update" for path, _message in errors)
     assert any(path == "parameters.refs.weight.tensor" for path, _message in errors)
+
+
+@pytest.mark.parametrize(
+    ("boundary_side", "shape", "message"),
+    [
+        ("inputs", [], "non-empty list of positive integers"),
+        ("inputs", [0, 8], "non-empty list of positive integers"),
+        ("outputs", [True, 8], "non-empty list of positive integers"),
+    ],
+)
+def test_circuit_validation_rejects_non_tensor_boundary_shapes(
+    boundary_side: str, shape: list[object], message: str
+) -> None:
+    circuit = valid_circuit()
+    circuit["boundary"][boundary_side][0]["shape"] = shape  # type: ignore[index]
+
+    report = validate_circuit(circuit)
+
+    assert not report.ok
+    assert any(
+        issue.path == f"boundary.{boundary_side}[0].shape"
+        and message in issue.message
+        for issue in report.errors
+    )
+
+
+@pytest.mark.parametrize("boundary_side", ["inputs", "outputs"])
+def test_circuit_validation_rejects_duplicate_boundary_port_ids(
+    boundary_side: str,
+) -> None:
+    circuit = valid_circuit()
+    duplicate = deepcopy(circuit["boundary"][boundary_side][0])  # type: ignore[index]
+    circuit["boundary"][boundary_side].append(duplicate)  # type: ignore[index]
+
+    report = validate_circuit(circuit)
+
+    assert not report.ok
+    assert any(
+        issue.path == f"boundary.{boundary_side}[1].id"
+        and "duplicate boundary" in issue.message
+        for issue in report.errors
+    )
+
+
+def test_pedal_contract_validation_checks_every_boundary_port() -> None:
+    circuit = valid_circuit()
+    pedal = matching_pedal()
+    circuit["boundary"]["inputs"].append(  # type: ignore[index]
+        {
+            "id": "sidechain_frame",
+            "signal": "frame",
+            "shape": [4],
+            "pedal_port": "sidechain",
+        }
+    )
+    pedal["ports"]["inputs"].append(  # type: ignore[index]
+        {"id": "sidechain", "signal": "frame", "shape": [8]}
+    )
+
+    report = validate_circuit_against_pedal(circuit, pedal)
+
+    assert not report.ok
+    assert any(
+        issue.path == "boundary.inputs[1].shape" for issue in report.errors
+    )
+
+
+def test_pedal_contract_validation_rejects_missing_and_wrong_port_mappings() -> None:
+    circuit = valid_circuit()
+    del circuit["boundary"]["inputs"][0]["pedal_port"]  # type: ignore[index]
+    circuit["boundary"]["outputs"][0]["pedal_port"] = "input"  # type: ignore[index]
+
+    report = validate_circuit_against_pedal(circuit, matching_pedal())
+
+    assert not report.ok
+    assert {
+        issue.path
+        for issue in report.errors
+        if issue.path and issue.path.endswith(".pedal_port")
+    } == {
+        "boundary.inputs[0].pedal_port",
+        "boundary.outputs[0].pedal_port",
+    }

@@ -253,8 +253,15 @@ def _base_circuit(
     nodes: list[Json],
     behavioral_notes: tuple[str, ...],
 ) -> Json:
-    input_port = pedal["ports"]["inputs"][0]
-    output_port = pedal["ports"]["outputs"][0]
+    input_ports = pedal["ports"]["inputs"]
+    output_ports = pedal["ports"]["outputs"]
+    if len(input_ports) != 1 or len(output_ports) != 1:
+        raise ValueError(
+            f"layer pedal {pedal.get('id')!r} must expose exactly one frame input and "
+            f"one frame output; found {len(input_ports)} inputs and {len(output_ports)} outputs"
+        )
+    input_port = input_ports[0]
+    output_port = output_ports[0]
     params = pedal["parameter_block"]["params"]
     operator_type = pedal["operator_type"]
     return {
