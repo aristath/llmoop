@@ -90,12 +90,6 @@ pub struct StreamCircuitExecutionPlan {
 
 impl StreamCircuitExecutionPlan {
     pub fn from_graph(graph: &ResolvedLoweredPedalboard) -> Result<Self, CircuitPlanError> {
-        if graph.index.graph.wiring != "series" {
-            return Err(CircuitPlanError(format!(
-                "only series wiring can be planned currently, got {:?}",
-                graph.index.graph.wiring
-            )));
-        }
         let mut circuits = Vec::with_capacity(graph.circuits.len());
         for artifact in &graph.circuits {
             circuits.push(CircuitActivationPlan::from_artifact(artifact)?);
@@ -110,12 +104,6 @@ impl StreamCircuitExecutionPlan {
         graph: &ResolvedLoweredPedalboard,
         tensor_index: &TensorIndex,
     ) -> Result<Self, CircuitPlanError> {
-        if graph.index.graph.wiring != "series" {
-            return Err(CircuitPlanError(format!(
-                "only series wiring can be planned currently, got {:?}",
-                graph.index.graph.wiring
-            )));
-        }
         let mut circuits = Vec::with_capacity(graph.circuits.len());
         for artifact in &graph.circuits {
             circuits.push(CircuitActivationPlan::from_artifact_with_tensor_index(
@@ -1586,7 +1574,7 @@ mod tests {
 
         let plan = StreamCircuitExecutionPlan::from_graph(&graph).unwrap();
 
-        assert_eq!(plan.wiring, "series");
+        assert_eq!(plan.wiring, "explicit_graph");
         assert_eq!(plan.circuits.len(), 14);
         assert_eq!(plan.total_node_count(), 242);
         assert_eq!(plan.produced_signal_count(), 264);

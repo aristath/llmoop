@@ -366,12 +366,21 @@ impl RuntimeModelEditor {
             };
             instances.push(instance);
         }
-        let candidate = StreamCircuitRuntimePatch {
-            schema: self.draft.schema.clone(),
-            wiring: self.draft.wiring.clone(),
-            default_device_id: self.draft.default_device_id.clone(),
-            instances,
-        };
+        let chain = instances
+            .iter()
+            .map(|instance| {
+                (
+                    instance.instance_id.clone(),
+                    instance.source_pedal_id.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut candidate = StreamCircuitRuntimePatch::from_source_chain(
+            &self.source_graph,
+            self.draft.default_device_id.clone(),
+            &chain,
+        )?;
+        candidate.instances = instances;
         candidate.validate_against_graph(&self.source_graph)?;
         self.draft = candidate;
         Ok(())

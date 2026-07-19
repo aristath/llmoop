@@ -14,6 +14,8 @@ layout(set = 0, binding = 2) buffer OutputFrame {
     uint words[];
 } output_frame;
 
+const uint WORD_COUNT = ({{ELEMENT_COUNT}}u + 1u) / 2u;
+
 float bf16_to_f32(uint value) {
     return uintBitsToFloat((value & 0xffffu) << 16);
 }
@@ -31,8 +33,11 @@ float rounded_silu(float value) {
 }
 
 void main() {
-    uint word_count = uint(output_frame.words.length());
-    for (uint word_index = gl_LocalInvocationID.x; word_index < word_count; word_index += 64u) {
+    for (
+        uint word_index = gl_LocalInvocationID.x;
+        word_index < WORD_COUNT;
+        word_index += 64u
+    ) {
         uint gate = gate_input.words[word_index];
         uint up = up_input.words[word_index];
         float gate_lo = bf16_to_f32(gate);

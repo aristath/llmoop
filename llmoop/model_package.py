@@ -12,6 +12,7 @@ from typing import Any, Callable
 
 from llmoop.circuit_lowering import lower_pedalboard
 from llmoop.circuit_optimizer import optimize_circuit_for_vulkan
+from llmoop.behavioral_compiler import build_behavioral_validation
 from llmoop.compilation import (
     PACKAGE_SCHEMA,
     CompiledModelReport,
@@ -247,9 +248,11 @@ def build_vulkan_resident_package_manifest(
     )
     norm_shader_file = rms_norm_shader_file(hidden_size, norm_eps, norm_weight_offset)
 
+    source_circuits = {}
     compiled_circuits = {}
     for circuit_ref in lowered_index["graph"]["circuits"]:
         circuit = read_json(lowered_dir / circuit_ref["circuit"])
+        source_circuits[circuit_ref["id"]] = circuit
         compiled_circuits[circuit_ref["id"]] = optimize_circuit_for_vulkan(
             circuit,
             can_fuse_linear_split=lambda node, circuit=circuit: (
@@ -289,6 +292,14 @@ def build_vulkan_resident_package_manifest(
                 )
             ),
         )
+    behavioral_validation = build_behavioral_validation(
+        model_graph=model_graph,
+        tensor_index=tensor_index,
+        lowered_index=lowered_index,
+        source_circuits=source_circuits,
+        candidate_circuits=compiled_circuits,
+    )
+    write_json(package_dir / "behavioral_validation.json", behavioral_validation)
     pedal_executions = pedal_execution_specs(
         lowered_index=lowered_index,
         compiled_circuits=compiled_circuits,
@@ -331,6 +342,7 @@ def build_vulkan_resident_package_manifest(
             lowered_index, lowered_dir, compiled_circuits
         ),
         "tensor_index_path": "tensors.json",
+        "behavioral_validation_path": "behavioral_validation.json",
         "config_path": CONFIG_PACKAGE_FILE,
         "tokenizer": tokenizer_manifest,
         "activation_element_bytes": dtype_bytes,
@@ -437,6 +449,7 @@ def package_circuit_graph(
 
     return {
         "wiring": graph["wiring"],
+        "cables": deepcopy(graph["cables"]),
         "architecture": deepcopy(lowered_index.get("architecture", {})),
         "dimensions": deepcopy(lowered_index.get("dimensions", {})),
         "input_transducer": deepcopy(graph.get("input_transducer", {})),
@@ -879,7 +892,7 @@ def shader_file_for_node(
     if op == "gelu_tanh":
         return f"gelu_tanh_bf16_{int(node['attrs']['element_count'])}.comp"
     if op == "silu_multiply":
-        return "silu_multiply_bf16.comp"
+        return f"silu_multiply_bf16_{int(node['attrs']['element_count'])}.comp"
     if op == "sigmoid_multiply":
         return "sigmoid_multiply_bf16.comp"
     if op == "sigmoid_scalar_multiply":
@@ -1377,6 +1390,11 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
         )
 
     shaped_templates = (
+        (
+            r"silu_multiply_bf16_(\d+)\.comp",
+            "silu_multiply_bf16.comp.template",
+            ("ELEMENT_COUNT",),
+        ),
         (
             r"linear_int4_ct_g(\d+)_(\d+)x(\d+)\.comp",
             "linear_int4_ct.comp.template",
@@ -2188,6 +2206,25 @@ def validate_compiled_package(package_dir: Path, manifest: Json) -> None:
     for path in required_files:
         if not path.is_file():
             raise ModelCompileError(f"compiled package is missing required artifact {path}")
+
+    behavioral_path = package_dir / str(
+        manifest.get("behavioral_validation_path", "")
+    )
+    if not behavioral_path.is_file():
+        raise ModelCompileError(
+            f"compiled package is missing behavioral validation artifact {behavioral_path}"
+        )
+    behavioral = read_json(behavioral_path)
+    if behavioral.get("schema") != "llmoop.behavioral_validation.v1":
+        raise ModelCompileError("compiled package behavioral validation schema is invalid")
+    if behavioral.get("status") != "passed":
+        raise ModelCompileError("compiled package has not passed behavioral validation")
+    if behavioral.get("candidate_kind") != "exact_reference":
+        for mode in ("teacher_forced", "free_running"):
+            if behavioral.get(mode, {}).get("status") != "passed":
+                raise ModelCompileError(
+                    f"compiled approximate candidate lacks passing {mode} validation"
+                )
 
     tokenizer = manifest.get("tokenizer")
     if not isinstance(tokenizer, dict) or not tokenizer.get("path"):

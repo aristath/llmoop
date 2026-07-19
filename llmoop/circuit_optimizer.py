@@ -422,7 +422,14 @@ def _fuse_dual_linear_silu_multiply_regions(
                 "outputs": deepcopy(multiply["outputs"]),
                 "params": deepcopy(projection["params"]),
                 "attrs": {
-                    "compiled_from": [projection["id"], multiply["id"]],
+                    "compiled_from": [
+                        *projection.get("attrs", {}).get(
+                            "compiled_from", [projection["id"]]
+                        ),
+                        *multiply.get("attrs", {}).get(
+                            "compiled_from", [multiply["id"]]
+                        ),
+                    ],
                     "activated_input_index": activated_input_index,
                     "projection": deepcopy(projection.get("attrs", {})),
                     "intermediate_rounding": "BF16",
@@ -656,6 +663,9 @@ def _fuse_silu_multiply(
         return None
     if not _plain_single_input_output_node(activation):
         return None
+    element_count = activation.get("attrs", {}).get("element_count")
+    if not isinstance(element_count, int) or element_count <= 0:
+        return None
     activation_output = activation["outputs"][0]
     multiply_inputs = multiply.get("inputs", [])
     if (
@@ -677,6 +687,7 @@ def _fuse_silu_multiply(
         "attrs": {
             "compiled_from": [activation["id"], multiply["id"]],
             "intermediate_rounding": "BF16",
+            "element_count": element_count,
         },
     }
 

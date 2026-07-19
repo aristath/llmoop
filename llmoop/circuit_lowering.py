@@ -95,8 +95,24 @@ def lower_pedalboard(
         "numerics": model["numerics"],
         "token_ids": model["token_ids"],
         "graph": {
-            "wiring": model["graph"]["pedalboard"]["wiring"],
+            "wiring": "explicit_graph",
             "circuits": lowered,
+            "cables": [
+                {
+                    "id": f"cable_{index:04d}",
+                    "source": {
+                        "pedal_id": source["id"],
+                        "port_id": "output_frame",
+                    },
+                    "destination": {
+                        "pedal_id": destination["id"],
+                        "port_id": "input_frame",
+                    },
+                }
+                for index, (source, destination) in enumerate(
+                    zip(lowered, lowered[1:])
+                )
+            ],
             "input_transducer": model["graph"]["input_transducer"],
             "output_transducer": model["graph"]["output_transducer"],
         },
@@ -1306,4 +1322,3 @@ def _norm_attrs(numerics: Json) -> Json:
         "eps": float(numerics["rms_norm_eps"]),
         "weight_offset": float(numerics["rms_norm_weight_offset"]),
     }
-

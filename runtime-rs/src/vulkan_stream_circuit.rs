@@ -17,8 +17,8 @@ use crate::stream_circuit::{
     CableTransport, CircuitParamsArtifact, CircuitStateArtifact, LOWERED_PEDALBOARD_SCHEMA,
     LoweredCircuitRef, LoweredPedalboard, LoweredPedalboardGraph, LoweredPedalboardSource,
     LoweredPedalboardSummary, PedalCablePlacement, ResolvedCircuitArtifact,
-    ResolvedLoweredPedalboard, StreamCircuit, StreamCircuitPlacementPlan,
-    StreamCircuitPlacementSpec, StreamCircuitRuntimePatch,
+    ResolvedLoweredPedalboard, StreamCircuit, StreamCircuitPedalInstanceStatePolicy,
+    StreamCircuitPlacementPlan, StreamCircuitPlacementSpec, StreamCircuitRuntimePatch,
 };
 use crate::stream_plan::{
     CircuitActivationPlan, PlannedNode, PlannedParameterResource, PlannedPort, SignalProducer,
@@ -40,7 +40,8 @@ pub const VULKAN_RESIDENT_MODEL_PACKAGE_MANIFEST_SCHEMA: &str =
 const VULKAN_STREAM_CONTROL_BYTE_CAPACITY: usize = 5 * std::mem::size_of::<u32>();
 const VULKAN_STREAM_CONTROL_METADATA_OFFSET: usize = std::mem::size_of::<u32>();
 const VULKAN_SAMPLER_HISTORY_RECORD_BYTE_CAPACITY: usize = 4 * std::mem::size_of::<u32>();
-const VULKAN_RESIDENT_FEEDBACK_CYCLE_WIDTH: usize = 4;
+const VULKAN_BACKEND_LOOP_MAX_WINDOW: usize = 64;
+const VULKAN_BACKEND_LOOP_SNAPSHOT_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VulkanStreamCircuitResidentPlan {
@@ -131,6 +132,20 @@ impl VulkanStreamCircuitResidentPlan {
             if !hosts_pedal(&state.pedal_id) {
                 continue;
             }
+            if state
+                .sharing
+                .as_deref()
+                .is_some_and(|sharing| sharing.starts_with("shared_from:"))
+            {
+                continue;
+            }
+            let clone_from = state
+                .sharing
+                .as_deref()
+                .and_then(|sharing| sharing.strip_prefix("clone_from:"))
+                .map(parse_state_source)
+                .transpose()
+                .map_err(|error| VulkanResidentPlanError(error.to_string()))?;
             let static_elements = state.shape.as_ref().and_then(|shape| product(shape));
             if let Some(elements) = static_elements {
                 per_stream_static_state_elements = checked_add(
@@ -174,6 +189,7 @@ impl VulkanStreamCircuitResidentPlan {
                     state.elements_per_activation,
                     state_element_bytes,
                 )?,
+                clone_from,
             });
         }
 
@@ -281,6 +297,7 @@ impl VulkanStreamCircuitResidentPlan {
                 byte_capacity,
                 static_byte_capacity: state.static_bytes,
                 bytes_per_activation: state.bytes_per_activation,
+                clone_from: state.clone_from.clone(),
                 buffer: device.create_resident_buffer(byte_capacity)?,
             });
         }
@@ -1123,6 +1140,7 @@ pub struct VulkanResidentStateBuffer {
     pub elements_per_activation: Option<usize>,
     pub static_bytes: Option<usize>,
     pub bytes_per_activation: Option<usize>,
+    pub clone_from: Option<(String, String)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1155,6 +1173,7 @@ pub struct VulkanStreamStateBufferAllocation {
     pub byte_capacity: usize,
     pub static_byte_capacity: Option<usize>,
     pub bytes_per_activation: Option<usize>,
+    pub clone_from: Option<(String, String)>,
     pub buffer: VulkanResidentBuffer,
 }
 
@@ -1209,6 +1228,57 @@ impl VulkanStreamCircuitStreamBuffers {
                 .ok_or_else(|| VulkanError("state zero byte count overflowed".to_string()))?;
         }
         Ok(total_zeroed)
+    }
+
+    pub fn apply_clone_state_policies(&self) -> Result<usize, VulkanError> {
+        let mut pending = self
+            .state_buffers
+            .iter()
+            .filter_map(|target| target.clone_from.as_ref().map(|source| (target, source)))
+            .collect::<Vec<_>>();
+        let mut copied = BTreeSet::<(String, String)>::new();
+        let clone_targets = pending
+            .iter()
+            .map(|(target, _)| (target.pedal_id.clone(), target.state_id.clone()))
+            .collect::<BTreeSet<_>>();
+        let mut total_copied = 0usize;
+        while !pending.is_empty() {
+            let ready_index = pending
+                .iter()
+                .position(|(_, source)| !clone_targets.contains(source) || copied.contains(source));
+            let Some(ready_index) = ready_index else {
+                return Err(VulkanError(
+                    "clone state policies contain a dependency cycle".to_string(),
+                ));
+            };
+            let (target, source_id) = pending.remove(ready_index);
+            let source = self
+                .state_buffer(&source_id.0, &source_id.1)
+                .ok_or_else(|| {
+                    VulkanError(format!(
+                        "clone state target {}.{} references unavailable source {}.{}",
+                        target.pedal_id, target.state_id, source_id.0, source_id.1
+                    ))
+                })?;
+            if source.byte_capacity != target.byte_capacity {
+                return Err(VulkanError(format!(
+                    "clone state {}.{} byte capacity {} does not match source {}.{} capacity {}",
+                    target.pedal_id,
+                    target.state_id,
+                    target.byte_capacity,
+                    source.pedal_id,
+                    source.state_id,
+                    source.byte_capacity
+                )));
+            }
+            let bytes = source.buffer.read_bytes(source.byte_capacity)?;
+            target.buffer.write_bytes(&bytes)?;
+            total_copied = total_copied
+                .checked_add(bytes.len())
+                .ok_or_else(|| VulkanError("clone state byte count overflowed".to_string()))?;
+            copied.insert((target.pedal_id.clone(), target.state_id.clone()));
+        }
+        Ok(total_copied)
     }
 }
 
@@ -4768,6 +4838,7 @@ pub struct VulkanResidentStreamProcessor {
     _transducer_parameter_buffers: Arc<VulkanPermanentParameterBuffers>,
     loop_runner: VulkanResidentFeedbackLoopRunner,
     static_state_snapshots: VulkanResidentStaticStateSnapshotBank,
+    backend_loop_window: usize,
 }
 
 impl VulkanResidentStreamProcessor {
@@ -4777,10 +4848,20 @@ impl VulkanResidentStreamProcessor {
         transducer_parameter_buffers: Arc<VulkanPermanentParameterBuffers>,
         loop_runner: VulkanResidentFeedbackLoopRunner,
     ) -> Result<Self, VulkanError> {
+        let backend_loop_window = backend_loop_window_for_static_state_bytes(
+            mounted
+                .buffers
+                .state_buffers
+                .iter()
+                .filter_map(|state| state.static_byte_capacity)
+                .try_fold(0usize, |total, bytes| total.checked_add(bytes))
+                .ok_or_else(|| VulkanError("static state snapshot size overflowed".to_string()))?,
+            loop_runner.sampler.history_capacity_activations,
+        );
         let static_state_snapshots = VulkanResidentStaticStateSnapshotBank::new(
             device,
             &mounted.buffers,
-            VULKAN_RESIDENT_FEEDBACK_CYCLE_WIDTH,
+            backend_loop_window,
         )?;
         Ok(Self {
             device_id: loop_runner.device_id.clone(),
@@ -4793,6 +4874,7 @@ impl VulkanResidentStreamProcessor {
             _transducer_parameter_buffers: transducer_parameter_buffers,
             loop_runner,
             static_state_snapshots,
+            backend_loop_window,
         })
     }
 
@@ -4844,6 +4926,24 @@ impl VulkanResidentStreamProcessor {
     pub fn into_token_stream(self, stream_id: impl Into<String>) -> VulkanResidentTokenStream {
         VulkanResidentTokenStream::new(stream_id, self)
     }
+
+    pub fn backend_loop_window(&self) -> usize {
+        self.backend_loop_window
+    }
+}
+
+fn backend_loop_window_for_static_state_bytes(
+    static_state_bytes: usize,
+    sampler_history_capacity: usize,
+) -> usize {
+    let snapshot_limited = if static_state_bytes == 0 {
+        VULKAN_BACKEND_LOOP_MAX_WINDOW
+    } else {
+        (VULKAN_BACKEND_LOOP_SNAPSHOT_BUDGET_BYTES / static_state_bytes).max(1)
+    };
+    VULKAN_BACKEND_LOOP_MAX_WINDOW
+        .min(snapshot_limited)
+        .min(sampler_history_capacity.max(1))
 }
 
 pub struct VulkanResidentRunningStream {
@@ -5190,7 +5290,7 @@ impl VulkanResidentRunningStream {
             )
     }
 
-    fn tick_feedback_cycle(
+    fn drive_backend_loop_window(
         &mut self,
         device: &VulkanComputeDevice,
         max_ticks: usize,
@@ -5341,7 +5441,7 @@ impl VulkanResidentRunningStream {
     ) -> Result<Vec<VulkanResidentRunningStreamTick>, VulkanResidentFeedbackLoopRunnerError> {
         let start = self.ticks.len();
         while !self.external_input_queue.is_empty() || !self.private_feedback_queue.is_empty() {
-            self.tick(device)?;
+            self.drive_backend_loop_window(device, self.processor.backend_loop_window)?;
         }
         self.tick(device)?;
         Ok(self.ticks[start..].to_vec())
@@ -5676,7 +5776,9 @@ impl VulkanResidentTokenStream {
 
         while ticks.len() < max_ticks {
             let remaining_ticks = max_ticks - ticks.len();
-            let running_ticks = self.inner.tick_feedback_cycle(device, remaining_ticks)?;
+            let running_ticks = self
+                .inner
+                .drive_backend_loop_window(device, remaining_ticks)?;
             let mut reached_idle = false;
             for running_tick in running_ticks {
                 let tick = self.public_tick_from_running_tick(running_tick);
@@ -5727,21 +5829,13 @@ impl VulkanResidentTokenStream {
         let mut idle_tick_count = 0usize;
 
         loop {
-            let tick = self.pump_once(device)?;
-            match tick.status {
-                VulkanResidentRunningStreamTickStatus::Processed => {
-                    processed_tick_count += 1;
-                }
-                VulkanResidentRunningStreamTickStatus::Idle => {
-                    idle_tick_count += 1;
-                }
-            }
-            if let Some(output_event) = tick.output_event.clone() {
-                output_events.push(output_event);
-            }
-            let is_idle = tick.status == VulkanResidentRunningStreamTickStatus::Idle;
-            ticks.push(tick);
-            if is_idle {
+            let window = self.inner.processor.backend_loop_window;
+            let run = self.pump_bounded(device, window)?;
+            processed_tick_count += run.processed_tick_count;
+            idle_tick_count += run.idle_tick_count;
+            output_events.extend(run.output_events);
+            ticks.extend(run.ticks);
+            if run.stop_condition == VulkanResidentTokenStreamPumpStopCondition::Idle {
                 break;
             }
         }
@@ -6995,6 +7089,7 @@ pub struct VulkanResidentModelPackageManifest {
     pub placement: StreamCircuitPlacementSpec,
     pub circuit_graph: VulkanResidentPackageCircuitGraph,
     pub tensor_index_path: String,
+    pub behavioral_validation_path: String,
     pub config_path: String,
     pub tokenizer: VulkanResidentTokenizerPackageSpec,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -7006,8 +7101,64 @@ pub struct VulkanResidentModelPackageManifest {
     pub pedal_executions: Vec<VulkanResidentPedalExecutionSpec>,
 }
 
+fn validate_behavioral_validation_artifact(
+    manifest_path: &Path,
+    relative_path: &str,
+) -> io::Result<()> {
+    if relative_path.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "resident model package does not declare behavioral validation evidence",
+        ));
+    }
+    let path = manifest_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(relative_path);
+    let evidence: Value = serde_json::from_slice(&fs::read(&path)?).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "invalid behavioral validation evidence {}: {error}",
+                path.display()
+            ),
+        )
+    })?;
+    if evidence.get("schema").and_then(Value::as_str) != Some("llmoop.behavioral_validation.v1")
+        || evidence.get("status").and_then(Value::as_str) != Some("passed")
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "behavioral validation evidence {} has not passed",
+                path.display()
+            ),
+        ));
+    }
+    if evidence.get("candidate_kind").and_then(Value::as_str) != Some("exact_reference") {
+        for mode in ["teacher_forced", "free_running"] {
+            if evidence
+                .get(mode)
+                .and_then(|value| value.get("status"))
+                .and_then(Value::as_str)
+                != Some("passed")
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "approximate candidate evidence {} lacks passing {mode} validation",
+                        path.display()
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 impl VulkanResidentModelPackageManifest {
     pub fn from_json_file(path: impl AsRef<Path>) -> io::Result<Self> {
+        let path = path.as_ref();
         let bytes = fs::read(path)?;
         let manifest: Self = serde_json::from_slice(&bytes)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
@@ -7020,6 +7171,7 @@ impl VulkanResidentModelPackageManifest {
                 ),
             ));
         }
+        validate_behavioral_validation_artifact(path, &manifest.behavioral_validation_path)?;
         Ok(manifest)
     }
 
@@ -7120,7 +7272,7 @@ impl VulkanResidentModelPackageManifest {
         }
         for (after_instance_id, new_instance_id) in duplicate_after {
             patch = patch
-                .duplicate_after_instance(after_instance_id, new_instance_id)
+                .duplicate_after_instance(&source_graph, after_instance_id, new_instance_id)
                 .map_err(|error| VulkanResidentTokenModelPackageError::new(error.to_string()))?;
         }
         for (instance_id, device_id) in pedal_devices {
@@ -7163,16 +7315,20 @@ impl VulkanResidentModelPackageManifest {
             .map(|execution| (execution.pedal_id.as_str(), execution))
             .collect::<BTreeMap<_, _>>();
 
-        let enabled_instance_count = patch
-            .instances
-            .iter()
-            .filter(|instance| instance.enabled)
-            .count();
+        let ordered_instance_ids = patch
+            .topological_instance_ids(&source_graph)
+            .map_err(|error| VulkanResidentTokenModelPackageError::new(error.to_string()))?;
+        let enabled_instance_count = ordered_instance_ids.len();
         let mut pedals = Vec::with_capacity(enabled_instance_count);
         let mut pedal_executions = Vec::with_capacity(enabled_instance_count);
         let mut placement = StreamCircuitPlacementSpec::new(patch.default_device_id.clone());
 
-        for instance in patch.instances.iter().filter(|instance| instance.enabled) {
+        for instance_id in ordered_instance_ids {
+            let instance = patch
+                .instances
+                .iter()
+                .find(|instance| instance.instance_id == instance_id)
+                .expect("validated topological instance id must exist");
             let source_pedal = source_pedals
                 .get(instance.source_pedal_id.as_str())
                 .ok_or_else(|| {
@@ -7184,6 +7340,7 @@ impl VulkanResidentModelPackageManifest {
             let mut pedal = (*source_pedal).clone();
             pedal.pedal_id = instance.instance_id.clone();
             pedal.circuit.source.pedal_id = instance.instance_id.clone();
+            apply_runtime_patch_state_policy(&mut pedal, patch, instance);
             pedals.push(pedal);
 
             let source_execution = source_executions
@@ -7206,15 +7363,58 @@ impl VulkanResidentModelPackageManifest {
         self.device_id = patch.default_device_id.clone();
         self.placement = placement;
         self.circuit_graph.wiring = patch.wiring.clone();
+        self.circuit_graph.cables = patch
+            .effective_cables()
+            .map_err(|error| VulkanResidentTokenModelPackageError::new(error.to_string()))?;
         self.circuit_graph.pedals = pedals;
         self.pedal_executions = pedal_executions;
         Ok(self)
     }
 }
 
+fn apply_runtime_patch_state_policy(
+    pedal: &mut VulkanResidentPackagePedalCircuit,
+    patch: &StreamCircuitRuntimePatch,
+    instance: &crate::stream_circuit::StreamCircuitPedalInstance,
+) {
+    let (mode, mut source_instance_id) = match &instance.state_policy {
+        StreamCircuitPedalInstanceStatePolicy::Fresh => return,
+        StreamCircuitPedalInstanceStatePolicy::CloneFrom { instance_id } => {
+            ("clone_from", instance_id.as_str())
+        }
+        StreamCircuitPedalInstanceStatePolicy::ShareWith { instance_id } => {
+            ("shared_from", instance_id.as_str())
+        }
+    };
+    if mode == "clone_from" {
+        loop {
+            let source = patch
+                .instances
+                .iter()
+                .find(|candidate| candidate.instance_id == source_instance_id)
+                .expect("validated state source instance must exist");
+            match &source.state_policy {
+                StreamCircuitPedalInstanceStatePolicy::ShareWith { instance_id } => {
+                    source_instance_id = instance_id;
+                }
+                StreamCircuitPedalInstanceStatePolicy::Fresh
+                | StreamCircuitPedalInstanceStatePolicy::CloneFrom { .. } => break,
+            }
+        }
+    }
+    let source_prefix = format!("{mode}:{source_instance_id}.");
+    for state in &mut pedal.state.state_ports {
+        state.sharing = Some(format!("{source_prefix}{}", state.id));
+    }
+    for state in &mut pedal.circuit.state_ports {
+        state.sharing = Some(format!("{source_prefix}{}", state.id));
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct VulkanResidentPackageCircuitGraph {
     pub wiring: String,
+    pub cables: Vec<crate::stream_circuit::StreamCircuitGraphCable>,
     #[serde(default)]
     pub architecture: Value,
     #[serde(default)]
@@ -7276,6 +7476,7 @@ impl VulkanResidentPackageCircuitGraph {
             graph: LoweredPedalboardGraph {
                 wiring: self.wiring.clone(),
                 circuits: circuit_refs,
+                cables: self.cables.clone(),
                 input_transducer: self.input_transducer.clone(),
                 output_transducer: self.output_transducer.clone(),
             },
@@ -7590,6 +7791,83 @@ pub struct VulkanResidentInProcessPlacedModelPackageDevice {
     resident_execution_plan: VulkanMountedPlacedResidentStreamTickExecutionPlan,
 }
 
+fn apply_placed_clone_state_policies(
+    devices: &[VulkanResidentInProcessPlacedModelPackageDevice],
+) -> Result<usize, VulkanError> {
+    let mut state_index = BTreeMap::<(String, String), (usize, usize)>::new();
+    let mut pending = Vec::<((String, String), (String, String))>::new();
+    for (device_index, device) in devices.iter().enumerate() {
+        for (state_index_on_device, state) in
+            device.mounted.buffers.state_buffers.iter().enumerate()
+        {
+            let key = (state.pedal_id.clone(), state.state_id.clone());
+            if state_index
+                .insert(key.clone(), (device_index, state_index_on_device))
+                .is_some()
+            {
+                return Err(VulkanError(format!(
+                    "duplicate placed state buffer {}.{}",
+                    key.0, key.1
+                )));
+            }
+            if let Some(source) = &state.clone_from {
+                pending.push((key, source.clone()));
+            }
+        }
+    }
+
+    let clone_targets = pending
+        .iter()
+        .map(|(target, _)| target.clone())
+        .collect::<BTreeSet<_>>();
+    let mut copied = BTreeSet::new();
+    let mut total_copied = 0usize;
+    while !pending.is_empty() {
+        let ready_index = pending
+            .iter()
+            .position(|(_, source)| !clone_targets.contains(source) || copied.contains(source));
+        let Some(ready_index) = ready_index else {
+            return Err(VulkanError(
+                "placed clone state policies contain a dependency cycle".to_string(),
+            ));
+        };
+        let (target_id, source_id) = pending.remove(ready_index);
+        let (target_device_index, target_state_index) = state_index
+            .get(&target_id)
+            .copied()
+            .expect("clone target was indexed from resident states");
+        let (source_device_index, source_state_index) =
+            state_index.get(&source_id).copied().ok_or_else(|| {
+                VulkanError(format!(
+                    "clone state target {}.{} references unavailable source {}.{}",
+                    target_id.0, target_id.1, source_id.0, source_id.1
+                ))
+            })?;
+        let target =
+            &devices[target_device_index].mounted.buffers.state_buffers[target_state_index];
+        let source =
+            &devices[source_device_index].mounted.buffers.state_buffers[source_state_index];
+        if target.byte_capacity != source.byte_capacity {
+            return Err(VulkanError(format!(
+                "clone state {}.{} capacity {} does not match source {}.{} capacity {}",
+                target_id.0,
+                target_id.1,
+                target.byte_capacity,
+                source_id.0,
+                source_id.1,
+                source.byte_capacity
+            )));
+        }
+        let bytes = source.buffer.read_bytes(source.byte_capacity)?;
+        target.buffer.write_bytes(&bytes)?;
+        total_copied = total_copied
+            .checked_add(bytes.len())
+            .ok_or_else(|| VulkanError("placed clone state byte count overflowed".to_string()))?;
+        copied.insert(target_id);
+    }
+    Ok(total_copied)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum VulkanResidentPlacedTokenTickTail {
     None,
@@ -7858,6 +8136,13 @@ impl VulkanResidentInProcessPlacedModelPackage {
                 resident_execution_plan,
             });
         }
+        apply_placed_clone_state_policies(&device_slices).map_err(|error| {
+            VulkanResidentInProcessPlacedModelPackageError::Package(
+                VulkanResidentTokenModelPackageError::new(format!(
+                    "failed to initialize cloned stream state: {error}"
+                )),
+            )
+        })?;
         let input_slice = device_slices
             .iter()
             .find(|slice| slice.device_id == input_device_id)
@@ -9976,6 +10261,14 @@ impl VulkanResidentModelPackage {
                 "failed to zero stream state buffers: {error}"
             ))
         })?;
+        mounted
+            .buffers
+            .apply_clone_state_policies()
+            .map_err(|error| {
+                VulkanResidentTokenModelPackageError::new(format!(
+                    "failed to initialize cloned stream state: {error}"
+                ))
+            })?;
         let pedal_ids = self
             .placed_plan
             .placed_resident_plan
@@ -16178,12 +16471,17 @@ fn state_binding_index(
         }
     }
 
+    let hosted_pedals = resident_plan
+        .activation_banks
+        .iter()
+        .map(|bank| bank.pedal_id.as_str())
+        .collect::<BTreeSet<_>>();
     let mut aliases = BTreeMap::new();
     for state in &resource_plan.state_allocations {
-        let target = (state.pedal_id.clone(), state.state_id.clone());
-        if !bindings.contains_key(&target) {
+        if !hosted_pedals.contains(state.pedal_id.as_str()) {
             continue;
         }
+        let target = (state.pedal_id.clone(), state.state_id.clone());
         let Some(source) = state
             .sharing
             .as_deref()
@@ -16195,6 +16493,12 @@ fn state_binding_index(
         };
         aliases.insert(target, source);
     }
+
+    let planned = resource_plan
+        .state_allocations
+        .iter()
+        .map(|state| ((state.pedal_id.as_str(), state.state_id.as_str()), state))
+        .collect::<BTreeMap<_, _>>();
 
     for (target, initial_source) in &aliases {
         let mut source = initial_source.clone();
@@ -16215,21 +16519,32 @@ fn state_binding_index(
             )));
         }
 
-        let target_binding = bindings.get(target).cloned().ok_or_else(|| {
-            VulkanBindingPlanError(format!(
-                "shared state target {}.{} is not resident",
-                target.0, target.1
-            ))
-        })?;
+        let target_state = planned
+            .get(&(target.0.as_str(), target.1.as_str()))
+            .ok_or_else(|| {
+                VulkanBindingPlanError(format!(
+                    "shared state target {}.{} is not planned",
+                    target.0, target.1
+                ))
+            })?;
+        let source_state = planned
+            .get(&(source.0.as_str(), source.1.as_str()))
+            .ok_or_else(|| {
+                VulkanBindingPlanError(format!(
+                    "shared state {}.{} references unplanned source {}.{}",
+                    target.0, target.1, source.0, source.1
+                ))
+            })?;
         let source_binding = bindings.get(&source).cloned().ok_or_else(|| {
             VulkanBindingPlanError(format!(
                 "shared state {}.{} references non-resident source {}.{}",
                 target.0, target.1, source.0, source.1
             ))
         })?;
-        if target_binding.state_type != source_binding.state_type
-            || target_binding.static_bytes != source_binding.static_bytes
-            || target_binding.bytes_per_activation != source_binding.bytes_per_activation
+        if target_state.state_type != source_state.state_type
+            || target_state.shape != source_state.shape
+            || target_state.elements_per_activation != source_state.elements_per_activation
+            || target_state.element_bytes != source_state.element_bytes
         {
             return Err(VulkanBindingPlanError(format!(
                 "shared state {}.{} is incompatible with source {}.{}",
@@ -16246,6 +16561,10 @@ fn shared_state_source(sharing: &str) -> Result<Option<(String, String)>, Vulkan
     let Some(source) = sharing.strip_prefix("shared_from:") else {
         return Ok(None);
     };
+    parse_state_source(source).map(Some)
+}
+
+fn parse_state_source(source: &str) -> Result<(String, String), VulkanBindingPlanError> {
     let Some((pedal_id, state_id)) = source.rsplit_once('.') else {
         return Err(VulkanBindingPlanError(format!(
             "shared state source {source:?} must be PEDAL_ID.STATE_ID"
@@ -16256,7 +16575,7 @@ fn shared_state_source(sharing: &str) -> Result<Option<(String, String)>, Vulkan
             "shared state source {source:?} must contain non-empty pedal and state ids"
         )));
     }
-    Ok(Some((pedal_id.to_string(), state_id.to_string())))
+    Ok((pedal_id.to_string(), state_id.to_string()))
 }
 
 type VulkanActivationBindingIndex = BTreeMap<(String, String), (usize, Option<usize>)>;
@@ -16643,6 +16962,20 @@ mod tests {
     const FIXTURE_MODEL_SAMPLER_OUTPUT_BYTES: usize = 16;
     const FIXTURE_MODEL_EMBED_TOKENS_BYTES: usize = 65_536 * FIXTURE_MODEL_FRAME_BYTES;
 
+    #[test]
+    fn backend_loop_window_is_device_owned_and_snapshot_memory_bounded() {
+        assert_eq!(backend_loop_window_for_static_state_bytes(0, 4_096), 64);
+        assert_eq!(
+            backend_loop_window_for_static_state_bytes(2 * 1024 * 1024, 4_096),
+            32
+        );
+        assert_eq!(
+            backend_loop_window_for_static_state_bytes(128 * 1024 * 1024, 4_096),
+            1
+        );
+        assert_eq!(backend_loop_window_for_static_state_bytes(0, 8), 8);
+    }
+
     fn fixture_tick_dispatch_stage(stage_index: usize) -> VulkanMountedPlacedStreamTickStage {
         VulkanMountedPlacedStreamTickStage::Dispatch {
             stage_index,
@@ -16867,7 +17200,7 @@ mod tests {
             .unwrap();
         let patch = StreamCircuitRuntimePatch::from_source_series(&source_graph, "gpu0")
             .unwrap()
-            .duplicate_after_instance("layer_05", "layer_05_repeat")
+            .duplicate_after_instance(&source_graph, "layer_05", "layer_05_repeat")
             .unwrap()
             .with_instance_device("layer_05_repeat", "gpu1")
             .unwrap();
@@ -16921,6 +17254,85 @@ mod tests {
             .find(|execution| execution.pedal_id == "layer_05")
             .unwrap();
         assert_eq!(repeated_execution.kernels, source_execution.kernels);
+    }
+
+    #[test]
+    fn runtime_patch_state_policies_change_resident_state_allocation_and_binding() {
+        let manifest = fixture_model_package_manifest();
+        let source_graph = manifest
+            .circuit_graph
+            .to_resolved_lowered_pedalboard(PathBuf::from("."))
+            .unwrap();
+        let state_id = source_graph
+            .circuits
+            .iter()
+            .find(|artifact| artifact.pedal.id == "layer_05")
+            .and_then(|artifact| artifact.state.state_ports.first())
+            .map(|state| state.id.clone())
+            .unwrap();
+        let mut shared_patch = StreamCircuitRuntimePatch::from_source_series(&source_graph, "gpu0")
+            .unwrap()
+            .duplicate_after_instance(&source_graph, "layer_05", "layer_05_repeat")
+            .unwrap();
+        shared_patch
+            .instances
+            .iter_mut()
+            .find(|instance| instance.instance_id == "layer_05_repeat")
+            .unwrap()
+            .state_policy = StreamCircuitPedalInstanceStatePolicy::ShareWith {
+            instance_id: "layer_05".to_string(),
+        };
+        let shared_manifest = manifest.clone().with_runtime_patch(&shared_patch).unwrap();
+        let shared_graph = shared_manifest
+            .circuit_graph
+            .to_resolved_lowered_pedalboard(PathBuf::from("."))
+            .unwrap();
+        let shared_execution = StreamCircuitExecutionPlan::from_graph(&shared_graph).unwrap();
+        let shared_resources =
+            StreamCircuitResourcePlan::from_graph_and_plan(&shared_graph, &shared_execution)
+                .unwrap();
+        let shared_resident =
+            VulkanStreamCircuitResidentPlan::from_resource_plan(&shared_resources, None, Some(2))
+                .unwrap();
+
+        assert_eq!(shared_resident.stream_state_buffers.len(), 14);
+        let shared_bindings = state_binding_index(&shared_resources, &shared_resident).unwrap();
+        assert_eq!(
+            shared_bindings
+                .get(&("layer_05_repeat".to_string(), state_id.clone()))
+                .unwrap()
+                .pedal_id,
+            "layer_05"
+        );
+
+        let mut cloned_patch = shared_patch;
+        cloned_patch
+            .instances
+            .iter_mut()
+            .find(|instance| instance.instance_id == "layer_05_repeat")
+            .unwrap()
+            .state_policy = StreamCircuitPedalInstanceStatePolicy::CloneFrom {
+            instance_id: "layer_05".to_string(),
+        };
+        let cloned_manifest = manifest.with_runtime_patch(&cloned_patch).unwrap();
+        let cloned_graph = cloned_manifest
+            .circuit_graph
+            .to_resolved_lowered_pedalboard(PathBuf::from("."))
+            .unwrap();
+        let cloned_execution = StreamCircuitExecutionPlan::from_graph(&cloned_graph).unwrap();
+        let cloned_resources =
+            StreamCircuitResourcePlan::from_graph_and_plan(&cloned_graph, &cloned_execution)
+                .unwrap();
+        let cloned_resident =
+            VulkanStreamCircuitResidentPlan::from_resource_plan(&cloned_resources, None, Some(2))
+                .unwrap();
+        let cloned = cloned_resident
+            .stream_state_buffers
+            .iter()
+            .find(|state| state.pedal_id == "layer_05_repeat" && state.state_id == state_id)
+            .unwrap();
+        assert_eq!(cloned.clone_from, Some(("layer_05".to_string(), state_id)));
+        assert_eq!(cloned_resident.stream_state_buffers.len(), 15);
     }
 
     fn fixture_model_input_embedding_transducer_spec() -> VulkanResidentInputEmbeddingTransducerSpec
@@ -25639,7 +26051,7 @@ mod tests {
             .unwrap();
         let patch = StreamCircuitRuntimePatch::from_source_series(&source_graph, "gpu0")
             .unwrap()
-            .duplicate_after_instance("layer_05", "layer_05_repeat")
+            .duplicate_after_instance(&source_graph, "layer_05", "layer_05_repeat")
             .unwrap()
             .with_instance_device("layer_05_repeat", "gpu1")
             .unwrap();

@@ -329,11 +329,25 @@ pub struct LoweredCircuitRef {
     pub behavioral_role: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamCircuitCableEndpoint {
+    pub pedal_id: String,
+    pub port_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamCircuitGraphCable {
+    pub id: String,
+    pub source: StreamCircuitCableEndpoint,
+    pub destination: StreamCircuitCableEndpoint,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct LoweredPedalboardGraph {
     pub wiring: String,
     #[serde(default)]
     pub circuits: Vec<LoweredCircuitRef>,
+    pub cables: Vec<StreamCircuitGraphCable>,
     #[serde(default)]
     pub input_transducer: Value,
     #[serde(default)]
@@ -374,12 +388,6 @@ impl LoweredPedalboard {
                 self.schema
             ));
         }
-        if self.graph.wiring != "series" {
-            issues.push(format!(
-                "only series wiring is currently validated, got {:?}",
-                self.graph.wiring
-            ));
-        }
         if self.graph.circuits.is_empty() {
             issues.push("lowered pedalboard contains no circuits".to_string());
         }
@@ -400,6 +408,28 @@ impl LoweredPedalboard {
                 issues.push(format!(
                     "lowered circuit {} has missing artifact path",
                     circuit.id
+                ));
+            }
+        }
+
+        let mut cable_ids = BTreeSet::new();
+        for cable in &self.graph.cables {
+            if cable.id.is_empty() || !cable_ids.insert(cable.id.clone()) {
+                issues.push(format!(
+                    "invalid or duplicate graph cable id {:?}",
+                    cable.id
+                ));
+            }
+            if !ids.contains(&cable.source.pedal_id) {
+                issues.push(format!(
+                    "graph cable {} references unknown source pedal {:?}",
+                    cable.id, cable.source.pedal_id
+                ));
+            }
+            if !ids.contains(&cable.destination.pedal_id) {
+                issues.push(format!(
+                    "graph cable {} references unknown destination pedal {:?}",
+                    cable.id, cable.destination.pedal_id
                 ));
             }
         }
@@ -639,6 +669,7 @@ pub struct StreamCircuitRuntimePatch {
     pub wiring: String,
     pub default_device_id: String,
     pub instances: Vec<StreamCircuitPedalInstance>,
+    pub cables: Vec<StreamCircuitGraphCable>,
 }
 
 impl StreamCircuitRuntimePatch {
@@ -656,23 +687,26 @@ impl StreamCircuitRuntimePatch {
         chain: &[(String, String)],
     ) -> Result<Self, CircuitPlacementError> {
         validate_runtime_patch_source_graph(graph)?;
+        let instances = chain
+            .iter()
+            .map(
+                |(instance_id, source_pedal_id)| StreamCircuitPedalInstance {
+                    instance_id: instance_id.clone(),
+                    source_pedal_id: source_pedal_id.clone(),
+                    device_id: String::new(),
+                    enabled: true,
+                    control_values: BTreeMap::new(),
+                    state_policy: StreamCircuitPedalInstanceStatePolicy::Fresh,
+                },
+            )
+            .collect::<Vec<_>>();
+        let cables = series_cables_for_instances(graph, &instances)?;
         let patch = Self {
             schema: STREAM_CIRCUIT_RUNTIME_PATCH_SCHEMA.to_string(),
-            wiring: graph.index.graph.wiring.clone(),
+            wiring: "explicit_graph".to_string(),
             default_device_id: default_device_id.into(),
-            instances: chain
-                .iter()
-                .map(
-                    |(instance_id, source_pedal_id)| StreamCircuitPedalInstance {
-                        instance_id: instance_id.clone(),
-                        source_pedal_id: source_pedal_id.clone(),
-                        device_id: String::new(),
-                        enabled: true,
-                        control_values: BTreeMap::new(),
-                        state_policy: StreamCircuitPedalInstanceStatePolicy::Fresh,
-                    },
-                )
-                .collect(),
+            instances,
+            cables,
         };
         patch.with_default_devices().and_then(|patch| {
             patch.validate_against_graph(graph)?;
@@ -688,7 +722,7 @@ impl StreamCircuitRuntimePatch {
         validate_placement_spec_against_graph(graph, spec)?;
         Ok(Self {
             schema: STREAM_CIRCUIT_RUNTIME_PATCH_SCHEMA.to_string(),
-            wiring: graph.index.graph.wiring.clone(),
+            wiring: "explicit_graph".to_string(),
             default_device_id: spec.default_device_id.clone(),
             instances: graph
                 .circuits
@@ -702,6 +736,7 @@ impl StreamCircuitRuntimePatch {
                     state_policy: StreamCircuitPedalInstanceStatePolicy::Fresh,
                 })
                 .collect(),
+            cables: graph.index.graph.cables.clone(),
         })
     }
 
@@ -717,6 +752,7 @@ impl StreamCircuitRuntimePatch {
 
     pub fn duplicate_after_instance(
         mut self,
+        graph: &ResolvedLoweredPedalboard,
         after_instance_id: &str,
         new_instance_id: impl Into<String>,
     ) -> Result<Self, CircuitPlacementError> {
@@ -746,13 +782,80 @@ impl StreamCircuitRuntimePatch {
             })?;
         let source = self.instances[after_index].clone();
         let duplicate = StreamCircuitPedalInstance {
-            instance_id: new_instance_id,
-            source_pedal_id: source.source_pedal_id,
-            device_id: source.device_id,
+            instance_id: new_instance_id.clone(),
+            source_pedal_id: source.source_pedal_id.clone(),
+            device_id: source.device_id.clone(),
             enabled: source.enabled,
             control_values: BTreeMap::new(),
             state_policy: StreamCircuitPedalInstanceStatePolicy::Fresh,
         };
+        let source_by_id = graph
+            .circuits
+            .iter()
+            .map(|artifact| (artifact.pedal.id.as_str(), artifact))
+            .collect::<BTreeMap<_, _>>();
+        let source_artifact = source_by_id
+            .get(source.source_pedal_id.as_str())
+            .ok_or_else(|| {
+                CircuitPlacementError(format!(
+                    "runtime patch instance {} references unknown source pedal {}",
+                    source.instance_id, source.source_pedal_id
+                ))
+            })?;
+        let source_output = source_artifact
+            .circuit
+            .boundary
+            .outputs
+            .first()
+            .ok_or_else(|| {
+                CircuitPlacementError(format!(
+                    "runtime patch instance {} has no output port",
+                    source.instance_id
+                ))
+            })?;
+        let duplicate_input = source_artifact
+            .circuit
+            .boundary
+            .inputs
+            .first()
+            .ok_or_else(|| {
+                CircuitPlacementError(format!(
+                    "runtime patch duplicate {} has no input port",
+                    new_instance_id
+                ))
+            })?;
+        let outgoing = self
+            .cables
+            .iter()
+            .enumerate()
+            .filter(|(_, cable)| cable.source.pedal_id == after_instance_id)
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        if outgoing.len() > 1 {
+            return Err(CircuitPlacementError(format!(
+                "cannot insert duplicate after branching pedal {after_instance_id:?}; wire the explicit graph instead"
+            )));
+        }
+        let inserted_cable = StreamCircuitGraphCable {
+            id: allocate_cable_id(&self.cables, after_instance_id, &new_instance_id),
+            source: StreamCircuitCableEndpoint {
+                pedal_id: after_instance_id.to_string(),
+                port_id: source_output.id.clone(),
+            },
+            destination: StreamCircuitCableEndpoint {
+                pedal_id: new_instance_id.clone(),
+                port_id: duplicate_input.id.clone(),
+            },
+        };
+        if let Some(outgoing_index) = outgoing.first().copied() {
+            self.cables[outgoing_index].source = StreamCircuitCableEndpoint {
+                pedal_id: new_instance_id.clone(),
+                port_id: source_output.id.clone(),
+            };
+            self.cables.insert(outgoing_index, inserted_cable);
+        } else {
+            self.cables.push(inserted_cable);
+        }
         self.instances.insert(after_index + 1, duplicate);
         Ok(self)
     }
@@ -836,7 +939,13 @@ impl StreamCircuitRuntimePatch {
         let mut circuit_refs = Vec::with_capacity(self.instances.len());
         let mut operator_counts = BTreeMap::new();
 
-        for instance in self.instances.iter().filter(|instance| instance.enabled) {
+        let ordered_instance_ids = self.topological_instance_ids(graph)?;
+        for instance_id in ordered_instance_ids {
+            let instance = self
+                .instances
+                .iter()
+                .find(|instance| instance.instance_id == instance_id)
+                .expect("validated topological instance id must exist");
             let source = source_by_id
                 .get(instance.source_pedal_id.as_str())
                 .ok_or_else(|| {
@@ -857,6 +966,7 @@ impl StreamCircuitRuntimePatch {
         let mut index = graph.index.clone();
         index.graph.wiring = self.wiring.clone();
         index.graph.circuits = circuit_refs;
+        index.graph.cables = self.effective_cables()?;
         index.summary = LoweredPedalboardSummary {
             circuit_count: circuits.len(),
             operator_counts,
@@ -880,9 +990,9 @@ impl StreamCircuitRuntimePatch {
                 self.schema
             )));
         }
-        if self.wiring != "series" {
+        if self.wiring != "explicit_graph" {
             return Err(CircuitPlacementError(format!(
-                "only series runtime patches are currently planned, got {:?}",
+                "runtime patch wiring must be explicit_graph, got {:?}",
                 self.wiring
             )));
         }
@@ -932,25 +1042,12 @@ impl StreamCircuitRuntimePatch {
                     instance.instance_id, instance.source_pedal_id
                 )));
             }
+            validate_instance_state_policy(instance, &self.instances, &source_by_id)?;
         }
+        validate_state_policy_dependencies(&self.instances)?;
 
-        let enabled_instances = self
-            .instances
-            .iter()
-            .filter(|instance| instance.enabled)
-            .collect::<Vec<_>>();
-        for pair in enabled_instances.windows(2) {
-            let source_instance = &pair[0];
-            let destination_instance = &pair[1];
-            let source = source_by_id[source_instance.source_pedal_id.as_str()];
-            let destination = source_by_id[destination_instance.source_pedal_id.as_str()];
-            validate_runtime_patch_cable(
-                source_instance,
-                source,
-                destination_instance,
-                destination,
-            )?;
-        }
+        validate_explicit_cables(self, &source_by_id)?;
+        self.topological_instance_ids(graph)?;
 
         Ok(())
     }
@@ -967,6 +1064,17 @@ impl StreamCircuitRuntimePatch {
             }
         }
         Ok(self)
+    }
+
+    pub fn effective_cables(&self) -> Result<Vec<StreamCircuitGraphCable>, CircuitPlacementError> {
+        effective_runtime_patch_cables(&self.instances, &self.cables)
+    }
+
+    pub fn topological_instance_ids(
+        &self,
+        _graph: &ResolvedLoweredPedalboard,
+    ) -> Result<Vec<String>, CircuitPlacementError> {
+        topological_runtime_patch_order(&self.instances, &self.effective_cables()?)
     }
 }
 
@@ -994,15 +1102,482 @@ pub enum StreamCircuitPedalInstanceStatePolicy {
     ShareWith { instance_id: String },
 }
 
+fn series_cables_for_instances(
+    graph: &ResolvedLoweredPedalboard,
+    instances: &[StreamCircuitPedalInstance],
+) -> Result<Vec<StreamCircuitGraphCable>, CircuitPlacementError> {
+    let source_by_id = graph
+        .circuits
+        .iter()
+        .map(|artifact| (artifact.pedal.id.as_str(), artifact))
+        .collect::<BTreeMap<_, _>>();
+    instances
+        .windows(2)
+        .enumerate()
+        .map(|(index, pair)| {
+            let source = source_by_id
+                .get(pair[0].source_pedal_id.as_str())
+                .ok_or_else(|| {
+                    CircuitPlacementError(format!(
+                        "runtime patch instance {} references unknown source pedal {}",
+                        pair[0].instance_id, pair[0].source_pedal_id
+                    ))
+                })?;
+            let destination = source_by_id
+                .get(pair[1].source_pedal_id.as_str())
+                .ok_or_else(|| {
+                    CircuitPlacementError(format!(
+                        "runtime patch instance {} references unknown source pedal {}",
+                        pair[1].instance_id, pair[1].source_pedal_id
+                    ))
+                })?;
+            let output = source.circuit.boundary.outputs.first().ok_or_else(|| {
+                CircuitPlacementError(format!(
+                    "runtime patch instance {} has no output port",
+                    pair[0].instance_id
+                ))
+            })?;
+            let input = destination.circuit.boundary.inputs.first().ok_or_else(|| {
+                CircuitPlacementError(format!(
+                    "runtime patch instance {} has no input port",
+                    pair[1].instance_id
+                ))
+            })?;
+            Ok(StreamCircuitGraphCable {
+                id: format!("cable_{index:04}"),
+                source: StreamCircuitCableEndpoint {
+                    pedal_id: pair[0].instance_id.clone(),
+                    port_id: output.id.clone(),
+                },
+                destination: StreamCircuitCableEndpoint {
+                    pedal_id: pair[1].instance_id.clone(),
+                    port_id: input.id.clone(),
+                },
+            })
+        })
+        .collect()
+}
+
+fn allocate_cable_id(
+    cables: &[StreamCircuitGraphCable],
+    source_id: &str,
+    destination_id: &str,
+) -> String {
+    let base = format!("{source_id}_to_{destination_id}");
+    if !cables.iter().any(|cable| cable.id == base) {
+        return base;
+    }
+    (2..)
+        .map(|suffix| format!("{base}_{suffix}"))
+        .find(|candidate| !cables.iter().any(|cable| cable.id == *candidate))
+        .expect("unbounded cable id suffix space")
+}
+
+fn validate_instance_state_policy(
+    instance: &StreamCircuitPedalInstance,
+    instances: &[StreamCircuitPedalInstance],
+    source_by_id: &BTreeMap<&str, &ResolvedCircuitArtifact>,
+) -> Result<(), CircuitPlacementError> {
+    let target_id = match &instance.state_policy {
+        StreamCircuitPedalInstanceStatePolicy::Fresh => return Ok(()),
+        StreamCircuitPedalInstanceStatePolicy::CloneFrom { instance_id }
+        | StreamCircuitPedalInstanceStatePolicy::ShareWith { instance_id } => instance_id,
+    };
+    if target_id == &instance.instance_id {
+        return Err(CircuitPlacementError(format!(
+            "runtime patch instance {} cannot source state from itself",
+            instance.instance_id
+        )));
+    }
+    let target = instances
+        .iter()
+        .find(|candidate| candidate.instance_id == *target_id)
+        .ok_or_else(|| {
+            CircuitPlacementError(format!(
+                "runtime patch instance {} sources state from unknown instance {}",
+                instance.instance_id, target_id
+            ))
+        })?;
+    if !target.enabled || !instance.enabled {
+        return Err(CircuitPlacementError(format!(
+            "state-linked instances {} and {} must both be enabled",
+            instance.instance_id, target.instance_id
+        )));
+    }
+    let source_state = &source_by_id[instance.source_pedal_id.as_str()]
+        .state
+        .state_ports;
+    let target_state = &source_by_id[target.source_pedal_id.as_str()]
+        .state
+        .state_ports;
+    if source_state != target_state {
+        return Err(CircuitPlacementError(format!(
+            "runtime patch instances {} and {} have incompatible state contracts",
+            instance.instance_id, target.instance_id
+        )));
+    }
+    if matches!(
+        instance.state_policy,
+        StreamCircuitPedalInstanceStatePolicy::ShareWith { .. }
+    ) && instance.device_id != target.device_id
+    {
+        return Err(CircuitPlacementError(format!(
+            "runtime patch instances {} and {} cannot share state across devices {} and {}",
+            instance.instance_id, target.instance_id, instance.device_id, target.device_id
+        )));
+    }
+    Ok(())
+}
+
+fn validate_state_policy_dependencies(
+    instances: &[StreamCircuitPedalInstance],
+) -> Result<(), CircuitPlacementError> {
+    let dependencies = instances
+        .iter()
+        .filter_map(|instance| {
+            let source = match &instance.state_policy {
+                StreamCircuitPedalInstanceStatePolicy::Fresh => return None,
+                StreamCircuitPedalInstanceStatePolicy::CloneFrom { instance_id }
+                | StreamCircuitPedalInstanceStatePolicy::ShareWith { instance_id } => instance_id,
+            };
+            Some((instance.instance_id.as_str(), source.as_str()))
+        })
+        .collect::<BTreeMap<_, _>>();
+    for start in dependencies.keys() {
+        let mut visited = BTreeSet::new();
+        let mut current = *start;
+        while let Some(next) = dependencies.get(current) {
+            if !visited.insert(current) {
+                return Err(CircuitPlacementError(format!(
+                    "runtime patch state policies contain a dependency cycle at {current}"
+                )));
+            }
+            current = next;
+        }
+    }
+    Ok(())
+}
+
+fn validate_explicit_cables(
+    patch: &StreamCircuitRuntimePatch,
+    source_by_id: &BTreeMap<&str, &ResolvedCircuitArtifact>,
+) -> Result<(), CircuitPlacementError> {
+    let instances = patch
+        .instances
+        .iter()
+        .map(|instance| (instance.instance_id.as_str(), instance))
+        .collect::<BTreeMap<_, _>>();
+    let mut ids = BTreeSet::new();
+    let mut source_ports = BTreeSet::new();
+    let mut destination_ports = BTreeSet::new();
+    let mut incoming_count = BTreeMap::<&str, usize>::new();
+    let mut outgoing_count = BTreeMap::<&str, usize>::new();
+    for cable in &patch.cables {
+        if cable.id.is_empty() || !ids.insert(cable.id.as_str()) {
+            return Err(CircuitPlacementError(format!(
+                "runtime patch contains an empty or duplicate cable id {:?}",
+                cable.id
+            )));
+        }
+        let source_instance = instances
+            .get(cable.source.pedal_id.as_str())
+            .ok_or_else(|| {
+                CircuitPlacementError(format!(
+                    "runtime patch cable {} references unknown source instance {}",
+                    cable.id, cable.source.pedal_id
+                ))
+            })?;
+        let destination_instance = instances
+            .get(cable.destination.pedal_id.as_str())
+            .ok_or_else(|| {
+                CircuitPlacementError(format!(
+                    "runtime patch cable {} references unknown destination instance {}",
+                    cable.id, cable.destination.pedal_id
+                ))
+            })?;
+        if source_instance.instance_id == destination_instance.instance_id {
+            return Err(CircuitPlacementError(format!(
+                "runtime patch cable {} creates an un-delayed self-loop on {}",
+                cable.id, source_instance.instance_id
+            )));
+        }
+        if !source_ports.insert((
+            source_instance.instance_id.as_str(),
+            cable.source.port_id.as_str(),
+        )) {
+            return Err(CircuitPlacementError(format!(
+                "runtime patch output {}.{} has more than one cable; use an explicit splitter pedal",
+                source_instance.instance_id, cable.source.port_id
+            )));
+        }
+        if !destination_ports.insert((
+            destination_instance.instance_id.as_str(),
+            cable.destination.port_id.as_str(),
+        )) {
+            return Err(CircuitPlacementError(format!(
+                "runtime patch input {}.{} has more than one cable",
+                destination_instance.instance_id, cable.destination.port_id
+            )));
+        }
+        *incoming_count
+            .entry(destination_instance.instance_id.as_str())
+            .or_default() += 1;
+        *outgoing_count
+            .entry(source_instance.instance_id.as_str())
+            .or_default() += 1;
+        validate_graph_cable_contract(
+            cable,
+            source_instance,
+            source_by_id[source_instance.source_pedal_id.as_str()],
+            destination_instance,
+            source_by_id[destination_instance.source_pedal_id.as_str()],
+        )?;
+    }
+    for instance in patch.instances.iter().filter(|instance| !instance.enabled) {
+        if incoming_count
+            .get(instance.instance_id.as_str())
+            .copied()
+            .unwrap_or(0)
+            > 1
+            || outgoing_count
+                .get(instance.instance_id.as_str())
+                .copied()
+                .unwrap_or(0)
+                > 1
+        {
+            return Err(CircuitPlacementError(format!(
+                "disabled branching or joining pedal {} cannot be bypassed automatically",
+                instance.instance_id
+            )));
+        }
+    }
+    let effective = patch.effective_cables()?;
+    let enabled = patch
+        .instances
+        .iter()
+        .filter(|instance| instance.enabled)
+        .map(|instance| (instance.instance_id.as_str(), instance))
+        .collect::<BTreeMap<_, _>>();
+    for cable in &effective {
+        let source_instance = enabled[cable.source.pedal_id.as_str()];
+        let destination_instance = enabled[cable.destination.pedal_id.as_str()];
+        validate_graph_cable_contract(
+            cable,
+            source_instance,
+            source_by_id[source_instance.source_pedal_id.as_str()],
+            destination_instance,
+            source_by_id[destination_instance.source_pedal_id.as_str()],
+        )?;
+    }
+    let connected_outputs = effective
+        .iter()
+        .map(|cable| {
+            (
+                cable.source.pedal_id.as_str(),
+                cable.source.port_id.as_str(),
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    let connected_inputs = effective
+        .iter()
+        .map(|cable| {
+            (
+                cable.destination.pedal_id.as_str(),
+                cable.destination.port_id.as_str(),
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    let mut open_inputs = Vec::new();
+    let mut open_outputs = Vec::new();
+    for instance in enabled.values() {
+        let artifact = source_by_id[instance.source_pedal_id.as_str()];
+        for port in &artifact.circuit.boundary.inputs {
+            if !connected_inputs.contains(&(instance.instance_id.as_str(), port.id.as_str())) {
+                open_inputs.push(format!("{}.{}", instance.instance_id, port.id));
+            }
+        }
+        for port in &artifact.circuit.boundary.outputs {
+            if !connected_outputs.contains(&(instance.instance_id.as_str(), port.id.as_str())) {
+                open_outputs.push(format!("{}.{}", instance.instance_id, port.id));
+            }
+        }
+    }
+    if open_inputs.len() != 1 || open_outputs.len() != 1 {
+        return Err(CircuitPlacementError(format!(
+            "runtime patch must expose exactly one model input and one model output; open inputs={open_inputs:?}, open outputs={open_outputs:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_graph_cable_contract(
+    cable: &StreamCircuitGraphCable,
+    source_instance: &StreamCircuitPedalInstance,
+    source: &ResolvedCircuitArtifact,
+    destination_instance: &StreamCircuitPedalInstance,
+    destination: &ResolvedCircuitArtifact,
+) -> Result<(), CircuitPlacementError> {
+    let output = source
+        .circuit
+        .boundary
+        .outputs
+        .iter()
+        .find(|port| port.id == cable.source.port_id)
+        .ok_or_else(|| {
+            CircuitPlacementError(format!(
+                "runtime patch cable {} references unknown output {}.{}",
+                cable.id, source_instance.instance_id, cable.source.port_id
+            ))
+        })?;
+    let input = destination
+        .circuit
+        .boundary
+        .inputs
+        .iter()
+        .find(|port| port.id == cable.destination.port_id)
+        .ok_or_else(|| {
+            CircuitPlacementError(format!(
+                "runtime patch cable {} references unknown input {}.{}",
+                cable.id, destination_instance.instance_id, cable.destination.port_id
+            ))
+        })?;
+    if output.signal != input.signal || output.shape != input.shape {
+        return Err(CircuitPlacementError(format!(
+            "cannot patch cable {} ({}.{} -> {}.{}) without an adapter: output {:?}/{:?}, input {:?}/{:?}",
+            cable.id,
+            source_instance.instance_id,
+            output.id,
+            destination_instance.instance_id,
+            input.id,
+            output.signal,
+            output.shape,
+            input.signal,
+            input.shape
+        )));
+    }
+    Ok(())
+}
+
+fn effective_runtime_patch_cables(
+    instances: &[StreamCircuitPedalInstance],
+    cables: &[StreamCircuitGraphCable],
+) -> Result<Vec<StreamCircuitGraphCable>, CircuitPlacementError> {
+    let enabled = instances
+        .iter()
+        .map(|instance| (instance.instance_id.as_str(), instance.enabled))
+        .collect::<BTreeMap<_, _>>();
+    let outgoing = cables.iter().fold(
+        BTreeMap::<&str, Vec<&StreamCircuitGraphCable>>::new(),
+        |mut map, cable| {
+            map.entry(cable.source.pedal_id.as_str())
+                .or_default()
+                .push(cable);
+            map
+        },
+    );
+    let mut effective = Vec::new();
+    for cable in cables {
+        if !enabled
+            .get(cable.source.pedal_id.as_str())
+            .copied()
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let mut destination = cable.destination.clone();
+        let mut visited = BTreeSet::new();
+        while !enabled
+            .get(destination.pedal_id.as_str())
+            .copied()
+            .unwrap_or(false)
+        {
+            if !visited.insert(destination.pedal_id.clone()) {
+                return Err(CircuitPlacementError(format!(
+                    "runtime patch bypass path contains a cycle at {}",
+                    destination.pedal_id
+                )));
+            }
+            let next = outgoing
+                .get(destination.pedal_id.as_str())
+                .and_then(|candidates| candidates.first())
+                .copied();
+            let Some(next) = next else {
+                break;
+            };
+            destination = next.destination.clone();
+        }
+        if enabled
+            .get(destination.pedal_id.as_str())
+            .copied()
+            .unwrap_or(false)
+        {
+            effective.push(StreamCircuitGraphCable {
+                id: cable.id.clone(),
+                source: cable.source.clone(),
+                destination,
+            });
+        }
+    }
+    Ok(effective)
+}
+
+fn topological_runtime_patch_order(
+    instances: &[StreamCircuitPedalInstance],
+    cables: &[StreamCircuitGraphCable],
+) -> Result<Vec<String>, CircuitPlacementError> {
+    let enabled_ids = instances
+        .iter()
+        .filter(|instance| instance.enabled)
+        .map(|instance| instance.instance_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut indegree = enabled_ids
+        .iter()
+        .map(|id| (*id, 0usize))
+        .collect::<BTreeMap<_, _>>();
+    let mut outgoing = BTreeMap::<&str, Vec<&str>>::new();
+    for cable in cables {
+        *indegree
+            .get_mut(cable.destination.pedal_id.as_str())
+            .ok_or_else(|| {
+                CircuitPlacementError(format!(
+                    "effective cable {} has a disabled destination",
+                    cable.id
+                ))
+            })? += 1;
+        outgoing
+            .entry(cable.source.pedal_id.as_str())
+            .or_default()
+            .push(cable.destination.pedal_id.as_str());
+    }
+    let mut remaining = enabled_ids;
+    let mut ordered = Vec::with_capacity(remaining.len());
+    while !remaining.is_empty() {
+        let ready = instances
+            .iter()
+            .filter(|instance| instance.enabled)
+            .map(|instance| instance.instance_id.as_str())
+            .find(|id| remaining.contains(id) && indegree[id] == 0)
+            .ok_or_else(|| {
+                CircuitPlacementError(
+                    "runtime patch graph contains a cycle; feedback requires an explicit stateful delay pedal"
+                        .to_string(),
+                )
+            })?;
+        remaining.remove(ready);
+        ordered.push(ready.to_string());
+        for destination in outgoing.get(ready).into_iter().flatten() {
+            let value = indegree
+                .get_mut(destination)
+                .expect("validated cable destination must have indegree");
+            *value -= 1;
+        }
+    }
+    Ok(ordered)
+}
+
 fn validate_runtime_patch_source_graph(
     graph: &ResolvedLoweredPedalboard,
 ) -> Result<(), CircuitPlacementError> {
-    if graph.index.graph.wiring != "series" {
-        return Err(CircuitPlacementError(format!(
-            "only series runtime patches are currently planned, got {:?}",
-            graph.index.graph.wiring
-        )));
-    }
     if graph.circuits.is_empty() {
         return Err(CircuitPlacementError(
             "cannot create runtime patch for an empty pedalboard".to_string(),
@@ -1041,38 +1616,6 @@ fn validate_placement_spec_against_graph(
     Ok(())
 }
 
-fn validate_runtime_patch_cable(
-    source_instance: &StreamCircuitPedalInstance,
-    source: &ResolvedCircuitArtifact,
-    destination_instance: &StreamCircuitPedalInstance,
-    destination: &ResolvedCircuitArtifact,
-) -> Result<(), CircuitPlacementError> {
-    let output = source.circuit.boundary.outputs.first().ok_or_else(|| {
-        CircuitPlacementError(format!(
-            "{} has no output port for runtime patch cable",
-            source_instance.instance_id
-        ))
-    })?;
-    let input = destination.circuit.boundary.inputs.first().ok_or_else(|| {
-        CircuitPlacementError(format!(
-            "{} has no input port for runtime patch cable",
-            destination_instance.instance_id
-        ))
-    })?;
-    if output.signal != input.signal || output.shape != input.shape {
-        return Err(CircuitPlacementError(format!(
-            "cannot patch cable {} -> {} without an adapter: output {:?}/{:?}, input {:?}/{:?}",
-            source_instance.instance_id,
-            destination_instance.instance_id,
-            output.signal,
-            output.shape,
-            input.signal,
-            input.shape
-        )));
-    }
-    Ok(())
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StreamCircuitPlacementPlan {
     pub schema: String,
@@ -1099,13 +1642,6 @@ impl StreamCircuitPlacementPlan {
                 "placement default_device_id must not be empty".to_string(),
             ));
         }
-        if graph.index.graph.wiring != "series" {
-            return Err(CircuitPlacementError(format!(
-                "only series placement is currently planned, got {:?}",
-                graph.index.graph.wiring
-            )));
-        }
-
         let pedal_ids: BTreeSet<_> = graph
             .circuits
             .iter()
@@ -1132,24 +1668,55 @@ impl StreamCircuitPlacementPlan {
             })
             .collect::<Vec<_>>();
 
-        let mut cables = Vec::with_capacity(graph.circuits.len().saturating_sub(1));
+        let circuit_by_id = graph
+            .circuits
+            .iter()
+            .map(|artifact| (artifact.pedal.id.as_str(), artifact))
+            .collect::<BTreeMap<_, _>>();
+        let mut cables = Vec::with_capacity(graph.index.graph.cables.len());
         let mut local_cable_count = 0usize;
         let mut cross_device_cable_count = 0usize;
-        for (cable_index, pair) in graph.circuits.windows(2).enumerate() {
-            let source = &pair[0];
-            let destination = &pair[1];
-            let output = source.circuit.boundary.outputs.first().ok_or_else(|| {
-                CircuitPlacementError(format!(
-                    "{} has no output port for placement cable",
-                    source.pedal.id
-                ))
-            })?;
-            let input = destination.circuit.boundary.inputs.first().ok_or_else(|| {
-                CircuitPlacementError(format!(
-                    "{} has no input port for placement cable",
-                    destination.pedal.id
-                ))
-            })?;
+        for (cable_index, cable) in graph.index.graph.cables.iter().enumerate() {
+            let source = circuit_by_id
+                .get(cable.source.pedal_id.as_str())
+                .ok_or_else(|| {
+                    CircuitPlacementError(format!(
+                        "placement cable {} references unknown source pedal {}",
+                        cable.id, cable.source.pedal_id
+                    ))
+                })?;
+            let destination = circuit_by_id
+                .get(cable.destination.pedal_id.as_str())
+                .ok_or_else(|| {
+                    CircuitPlacementError(format!(
+                        "placement cable {} references unknown destination pedal {}",
+                        cable.id, cable.destination.pedal_id
+                    ))
+                })?;
+            let output = source
+                .circuit
+                .boundary
+                .outputs
+                .iter()
+                .find(|port| port.id == cable.source.port_id)
+                .ok_or_else(|| {
+                    CircuitPlacementError(format!(
+                        "{} has no output port {} for placement cable {}",
+                        source.pedal.id, cable.source.port_id, cable.id
+                    ))
+                })?;
+            let input = destination
+                .circuit
+                .boundary
+                .inputs
+                .iter()
+                .find(|port| port.id == cable.destination.port_id)
+                .ok_or_else(|| {
+                    CircuitPlacementError(format!(
+                        "{} has no input port {} for placement cable {}",
+                        destination.pedal.id, cable.destination.port_id, cable.id
+                    ))
+                })?;
             if output.signal != input.signal || output.shape != input.shape {
                 return Err(CircuitPlacementError(format!(
                     "cannot place cable {} -> {} without an adapter: output {:?}/{:?}, input {:?}/{:?}",
@@ -2061,7 +2628,7 @@ mod tests {
         let placement = resolved.single_device_placement_plan("gpu0").unwrap();
 
         assert_eq!(placement.schema, STREAM_CIRCUIT_PLACEMENT_SCHEMA);
-        assert_eq!(placement.wiring, "series");
+        assert_eq!(placement.wiring, "explicit_graph");
         assert_eq!(placement.pedals.len(), 14);
         assert_eq!(placement.cables.len(), 13);
         assert_eq!(placement.local_cable_count, 13);
@@ -2545,7 +3112,7 @@ mod tests {
             },
             runtime_patch: StreamCircuitRuntimePatch {
                 schema: STREAM_CIRCUIT_RUNTIME_PATCH_SCHEMA.to_string(),
-                wiring: "series".to_string(),
+                wiring: "explicit_graph".to_string(),
                 default_device_id: "gpu0".to_string(),
                 instances: vec![StreamCircuitPedalInstance {
                     instance_id: "layer_00".to_string(),
@@ -2555,6 +3122,7 @@ mod tests {
                     control_values: BTreeMap::new(),
                     state_policy: StreamCircuitPedalInstanceStatePolicy::Fresh,
                 }],
+                cables: Vec::new(),
             },
             effective: RuntimeEffectivePedalboardTopology {
                 wiring: "series".to_string(),
@@ -2673,7 +3241,7 @@ mod tests {
             },
             runtime_patch: StreamCircuitRuntimePatch {
                 schema: STREAM_CIRCUIT_RUNTIME_PATCH_SCHEMA.to_string(),
-                wiring: "series".to_string(),
+                wiring: "explicit_graph".to_string(),
                 default_device_id: "gpu0".to_string(),
                 instances: vec![StreamCircuitPedalInstance {
                     instance_id: "layer_05_repeat".to_string(),
@@ -2683,6 +3251,7 @@ mod tests {
                     control_values: BTreeMap::new(),
                     state_policy: StreamCircuitPedalInstanceStatePolicy::Fresh,
                 }],
+                cables: Vec::new(),
             },
             device_bindings: RuntimeDeviceBindings::from_vulkan_targets(
                 &["vulkan:5".to_string()],
@@ -3158,7 +3727,7 @@ mod tests {
         let patch = resolved.runtime_patch_from_placement(&spec).unwrap();
 
         assert_eq!(patch.schema, STREAM_CIRCUIT_RUNTIME_PATCH_SCHEMA);
-        assert_eq!(patch.wiring, "series");
+        assert_eq!(patch.wiring, "explicit_graph");
         assert_eq!(patch.instances.len(), resolved.circuits.len());
         assert_eq!(patch.instances[0].instance_id, "layer_00");
         assert_eq!(patch.instances[0].source_pedal_id, "layer_00");
@@ -3191,7 +3760,7 @@ mod tests {
         let patch = resolved
             .default_runtime_patch("gpu0")
             .unwrap()
-            .duplicate_after_instance("layer_05", "layer_05_repeat")
+            .duplicate_after_instance(&resolved, "layer_05", "layer_05_repeat")
             .unwrap()
             .with_instance_device("layer_05_repeat", "gpu1")
             .unwrap();
@@ -3319,5 +3888,112 @@ mod tests {
             "gpu1"
         );
         assert_eq!(placement.cross_device_cable_count, 2);
+    }
+
+    #[test]
+    fn runtime_patch_execution_order_comes_from_cables_not_instance_storage_order() {
+        let resolved =
+            ResolvedLoweredPedalboard::from_index_file(fixture_model_index_path()).unwrap();
+        let chain = vec![
+            ("first".to_string(), "layer_00".to_string()),
+            ("second".to_string(), "layer_01".to_string()),
+            ("third".to_string(), "layer_02".to_string()),
+        ];
+        let mut patch =
+            StreamCircuitRuntimePatch::from_source_chain(&resolved, "gpu0", &chain).unwrap();
+        patch.instances.reverse();
+
+        let instantiated = patch.instantiate_graph(&resolved).unwrap();
+
+        assert_eq!(
+            instantiated
+                .circuits
+                .iter()
+                .map(|artifact| artifact.pedal.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first", "second", "third"]
+        );
+    }
+
+    #[test]
+    fn runtime_patch_validates_state_policy_targets_compatibility_and_cycles() {
+        let resolved =
+            ResolvedLoweredPedalboard::from_index_file(fixture_model_index_path()).unwrap();
+        let mut patch = resolved
+            .default_runtime_patch("gpu0")
+            .unwrap()
+            .duplicate_after_instance(&resolved, "layer_05", "layer_05_repeat")
+            .unwrap();
+        patch
+            .instances
+            .iter_mut()
+            .find(|instance| instance.instance_id == "layer_05_repeat")
+            .unwrap()
+            .state_policy = StreamCircuitPedalInstanceStatePolicy::ShareWith {
+            instance_id: "layer_05".to_string(),
+        };
+        patch.validate_against_graph(&resolved).unwrap();
+
+        let mut cross_device_share = patch.clone();
+        cross_device_share
+            .instances
+            .iter_mut()
+            .find(|instance| instance.instance_id == "layer_05_repeat")
+            .unwrap()
+            .device_id = "gpu1".to_string();
+        assert!(
+            cross_device_share
+                .validate_against_graph(&resolved)
+                .unwrap_err()
+                .0
+                .contains("cannot share state across devices")
+        );
+
+        let mut cycle = patch;
+        cycle
+            .instances
+            .iter_mut()
+            .find(|instance| instance.instance_id == "layer_05")
+            .unwrap()
+            .state_policy = StreamCircuitPedalInstanceStatePolicy::CloneFrom {
+            instance_id: "layer_05_repeat".to_string(),
+        };
+        assert!(
+            cycle
+                .validate_against_graph(&resolved)
+                .unwrap_err()
+                .0
+                .contains("dependency cycle")
+        );
+    }
+
+    #[test]
+    fn runtime_patch_rejects_disconnected_and_implicit_fanout_graphs() {
+        let resolved =
+            ResolvedLoweredPedalboard::from_index_file(fixture_model_index_path()).unwrap();
+        let patch = resolved.default_runtime_patch("gpu0").unwrap();
+
+        let mut disconnected = patch.clone();
+        disconnected.cables.remove(4);
+        assert!(
+            disconnected
+                .validate_against_graph(&resolved)
+                .unwrap_err()
+                .0
+                .contains("exactly one model input and one model output")
+        );
+
+        let mut fanout = patch;
+        let mut duplicate = fanout.cables[0].clone();
+        duplicate.id = "implicit_fanout".to_string();
+        duplicate.destination = fanout.cables[1].destination.clone();
+        fanout.cables.push(duplicate);
+        assert!(
+            fanout
+                .validate_against_graph(&resolved)
+                .unwrap_err()
+                .0
+                .contains("use an explicit splitter pedal")
+        );
     }
 }
