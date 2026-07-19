@@ -1474,29 +1474,11 @@ fn validate_node_dependencies(
 
 #[cfg(test)]
 mod tests {
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
 
     use super::*;
     use crate::stream_circuit::ResolvedLoweredPedalboard;
-
-    fn compiled_artifact_dir(env_var: &str, root_name: &str, marker_file: &str) -> PathBuf {
-        if let Ok(path) = std::env::var(env_var) {
-            return PathBuf::from(path);
-        }
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join(root_name);
-        let mut candidates = std::fs::read_dir(&root)
-            .unwrap_or_else(|_| panic!("set {env_var} or compile a model into {}", root.display()))
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .filter(|path| path.is_dir() && path.join(marker_file).exists())
-            .collect::<Vec<_>>();
-        candidates.sort();
-        candidates
-            .pop()
-            .unwrap_or_else(|| panic!("set {env_var} or compile a model into {}", root.display()))
-    }
+    use crate::test_support::compiled_artifact_dir;
 
     fn fixture_model_index_path() -> PathBuf {
         compiled_artifact_dir(

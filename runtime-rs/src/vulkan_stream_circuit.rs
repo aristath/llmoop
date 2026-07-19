@@ -17523,6 +17523,7 @@ mod tests {
         ResolvedLoweredPedalboard, StreamCircuitPlacementSpec, StreamCircuitRuntimePatch,
     };
     use crate::stream_plan::{StreamCircuitExecutionPlan, StreamCircuitResourcePlan};
+    use crate::test_support::compiled_artifact_dir;
 
     const FIXTURE_MODEL_TOKEN_EMBEDDING_TRANSDUCER_ID: &str = "input_transducer.token_embedding";
     const FIXTURE_MODEL_OUTPUT_EMBEDDING_NORM_TRANSDUCER_ID: &str =
@@ -17706,25 +17707,6 @@ mod tests {
         value = value.wrapping_mul(0x846c_a68b);
         value ^= value >> 16;
         value
-    }
-
-    fn compiled_artifact_dir(env_var: &str, root_name: &str, marker_file: &str) -> PathBuf {
-        if let Ok(path) = std::env::var(env_var) {
-            return PathBuf::from(path);
-        }
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join(root_name);
-        let mut candidates = std::fs::read_dir(&root)
-            .unwrap_or_else(|_| panic!("set {env_var} or compile a model into {}", root.display()))
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .filter(|path| path.is_dir() && path.join(marker_file).exists())
-            .collect::<Vec<_>>();
-        candidates.sort();
-        candidates
-            .pop()
-            .unwrap_or_else(|| panic!("set {env_var} or compile a model into {}", root.display()))
     }
 
     fn fixture_model_index_path() -> PathBuf {

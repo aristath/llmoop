@@ -2,6 +2,8 @@
 pub mod editor;
 pub mod stream_circuit;
 pub mod stream_plan;
+#[cfg(test)]
+pub(crate) mod test_support;
 #[cfg(feature = "tui")]
 pub mod tui;
 pub mod vulkan;
