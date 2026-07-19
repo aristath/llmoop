@@ -3,7 +3,6 @@ from __future__ import annotations
 from pathlib import Path
 from math import prod
 
-from llmoop.circuit_executors import GQAAttentionCircuitPedal
 from llmoop.circuit_lowering import build_pedal_circuit
 from llmoop.model_transpiler import (
     attach_block_quantization_scales,
@@ -297,20 +296,6 @@ def test_discovers_attention_without_optional_query_key_norms() -> None:
     assert nodes["k_rope"]["attrs"]["head_count"] == 5
     assert nodes["q_rope"]["attrs"]["theta"] == 100000.0
     assert nodes["operator_norm"]["attrs"]["eps"] == 1e-5
-
-    class TensorStore:
-        def get(self, name: str) -> str:
-            return name
-
-    implementation = GQAAttentionCircuitPedal.from_tensor_store(
-        tensor_store=TensorStore(),
-        torch=object(),
-        circuit=circuit,
-    )
-    assert "q_norm" not in implementation.weights
-    assert "k_norm" not in implementation.weights
-    assert implementation.norm_eps == 1e-5
-
 
 def test_discovers_nested_hybrid_decoder_by_tensor_structure() -> None:
     root = "model.language_model"

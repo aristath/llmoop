@@ -41,14 +41,8 @@ def main() -> None:
         help="run a compiled model package with the Rust/Vulkan runtime engine",
     )
     parser.add_argument(
-        "--run-model",
-        type=Path,
-        metavar="LOWERED_DIR",
-        help="run lowered compiler/oracle circuits with assets from --package-dir",
-    )
-    parser.add_argument(
         "--prompt",
-        help="prompt text for --run/--run-model",
+        help="prompt text for --run",
     )
     parser.add_argument(
         "--chat",
@@ -59,12 +53,6 @@ def main() -> None:
         "--inspect-runtime",
         action="store_true",
         help="preview UI-ready package, patch, placement, device, and route facts for --run",
-    )
-    parser.add_argument(
-        "--inspect-topology",
-        action="store_true",
-        dest="inspect_runtime",
-        help="alias for --inspect-runtime",
     )
     parser.add_argument(
         "--inspect-device-slice",
@@ -99,7 +87,7 @@ def main() -> None:
     parser.add_argument(
         "--lowered-dir",
         type=Path,
-        help="directory for lowered compiler/oracle artifacts",
+        help="directory for lowered circuit artifacts",
     )
     parser.add_argument(
         "--package-dir",
@@ -107,9 +95,7 @@ def main() -> None:
         help="directory for runtime package artifacts",
     )
     parser.add_argument(
-        "--default-device-id",
         "--device",
-        dest="default_device_id",
         default=None,
         help="default logical device for the runtime pedalboard patch",
     )
@@ -162,30 +148,7 @@ def main() -> None:
         "--max-new-tokens",
         type=int,
         default=65_536,
-        help="generation stop condition for --run/--run-model; independent of context allocation (default: 65536)",
-    )
-    parser.add_argument(
-        "--temperature",
-        type=float,
-        default=None,
-        help="use explicit-random temperature sampling for --run-model instead of greedy sampling",
-    )
-    parser.add_argument(
-        "--top-k",
-        type=int,
-        default=None,
-        help="restrict temperature sampling to the top K logits",
-    )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=0,
-        help="random seed for --run-model temperature sampling",
-    )
-    parser.add_argument(
-        "--ignore-eos",
-        action="store_true",
-        help="do not stop --run-model generation when EOS is produced",
+        help="generation stop condition for --run; independent of context allocation (default: 65536)",
     )
     parser.add_argument(
         "--no-special-tokens",
@@ -200,7 +163,7 @@ def main() -> None:
     parser.add_argument(
         "--generated-only",
         action="store_true",
-        help="print only newly generated text for --run/--run-model",
+        help="print only newly generated text for --run",
     )
     parser.add_argument(
         "--profile",
@@ -235,12 +198,9 @@ def main() -> None:
         args.compile_model is not None,
         args.discover_model is not None,
         args.run is not None,
-        args.run_model is not None,
     ]
     if sum(selected_actions) > 1:
-        parser.error(
-            "--compile-model, --discover-model, --run, and --run-model are mutually exclusive"
-        )
+        parser.error("--compile-model, --discover-model, and --run are mutually exclusive")
     if not any(selected_actions):
         if len(sys.argv) == 1:
             run_tui()
@@ -303,8 +263,8 @@ def main() -> None:
         parser.error("--inspect-placement is only supported with --run")
     elif args.chat:
         parser.error("--chat is only supported with --run")
-    elif args.default_device_id is not None:
-        parser.error("--default-device-id is only supported with --run")
+    elif args.device is not None:
+        parser.error("--device is only supported with --run")
     elif args.place_pedal:
         parser.error("--place-pedal is only supported with --run")
     elif args.bind_device:
@@ -347,14 +307,6 @@ def main() -> None:
             parser.error("--profile-runs is not supported with --chat")
         if args.chat and args.json:
             parser.error("--json is not supported with --chat yet")
-        if args.temperature is not None:
-            parser.error("--temperature is only supported by --run-model")
-        if args.top_k is not None:
-            parser.error("--top-k is only supported by --run-model")
-        if args.seed != 0:
-            parser.error("--seed is only supported by --run-model")
-        if args.ignore_eos:
-            parser.error("--ignore-eos is only supported by --run-model")
         if args.vulkan_device_index is not None and args.vulkan_device_index < 0:
             parser.error("--vulkan-device-index must be non-negative")
         if args.profile_runs < 1:
@@ -369,44 +321,6 @@ def main() -> None:
             parser.error(str(error))
         run_engine(args)
         return
-    if args.run_model is not None:
-        if args.inspect_device_slice is not None:
-            parser.error("--inspect-device-slice is only supported by --run")
-        if args.inspect_runtime:
-            parser.error("--inspect-runtime is only supported by --run")
-        if args.inspect_package:
-            parser.error("--inspect-package is only supported by --run")
-        if args.inspect_patch:
-            parser.error("--inspect-patch is only supported by --run")
-        if args.inspect_placement:
-            parser.error("--inspect-placement is only supported by --run")
-        if args.chat:
-            parser.error("--chat is only supported by --run")
-        if args.default_device_id is not None:
-            parser.error("--default-device-id is only supported by --run")
-        if args.place_pedal:
-            parser.error("--place-pedal is only supported by --run")
-        if args.bind_device:
-            parser.error("--bind-device is only supported by --run")
-        if args.duplicate_after:
-            parser.error("--duplicate-after is only supported by --run")
-        if args.chain is not None:
-            parser.error("--chain is only supported by --run")
-        if args.vulkan_device_index is not None:
-            parser.error("--vulkan-device-index is only supported by --run")
-        if args.context_size is not None:
-            parser.error("--context-size is only supported by --run")
-        if args.profile:
-            parser.error("--profile is only supported by --run")
-        if args.profile_runs != 1:
-            parser.error("--profile-runs is only supported by --run")
-        if args.prompt is None:
-            parser.error("--prompt is required with --run-model")
-        if args.package_dir is None:
-            parser.error("--package-dir is required with --run-model")
-        run_model(args)
-        return
-
     reporter = JsonLineCompileReporter() if args.compiler_events_jsonl else None
     cancel_requested = False
 
@@ -675,8 +589,8 @@ def build_runtime_command(args: argparse.Namespace, package_manifest: Path) -> l
         else:
             runtime_args.extend(["--prompt", args.prompt])
         runtime_args.extend(["--max-new-tokens", str(args.max_new_tokens)])
-    if args.default_device_id is not None:
-        runtime_args.extend(["--device", args.default_device_id])
+    if args.device is not None:
+        runtime_args.extend(["--device", args.device])
     for raw_placement in args.place_pedal:
         runtime_args.extend(["--place-pedal", raw_placement])
     for raw_binding in args.bind_device:
@@ -739,45 +653,6 @@ def build_runtime_command(args: argparse.Namespace, package_manifest: Path) -> l
 def runtime_bin_from_env() -> Path | None:
     raw = os.environ.get("LLMOOP_RUNTIME_BIN")
     return Path(raw).expanduser() if raw else None
-
-
-def run_model(args: argparse.Namespace) -> None:
-    import torch
-
-    from llmoop.circuit_model_runtime import CircuitModelRuntime
-    from llmoop.samplers import TemperatureSamplerPedal
-    from llmoop.text_generation import generate_text, load_tokenizer
-
-    runtime = CircuitModelRuntime.from_dirs(
-        circuit_dir=args.run_model,
-        package_dir=args.package_dir,
-        torch=torch,
-    )
-    tokenizer = load_tokenizer(args.package_dir / "tokenizer")
-    eos_token_id = None if args.ignore_eos else int(runtime.config["eos_token_id"])
-    sampler = None
-    if args.temperature is not None:
-        sampler = TemperatureSamplerPedal(temperature=args.temperature, top_k=args.top_k)
-
-    with torch.no_grad():
-        run = generate_text(
-            runtime=runtime,
-            tokenizer=tokenizer,
-            prompt_text=args.prompt,
-            max_new_tokens=args.max_new_tokens,
-            eos_token_id=eos_token_id,
-            add_special_tokens=not args.no_special_tokens,
-            skip_special_tokens=not args.keep_special_tokens,
-            sampler=sampler,
-            random_seed=args.seed,
-        )
-
-    if args.json:
-        print(json.dumps(run.to_json(), indent=2))
-    elif args.generated_only:
-        print(run.generated_text, end="" if run.generated_text.endswith("\n") else "\n")
-    else:
-        print(run.output_text, end="" if run.output_text.endswith("\n") else "\n")
 
 
 if __name__ == "__main__":

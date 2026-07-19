@@ -1,9 +1,6 @@
 from __future__ import annotations
 
-import importlib.util
 import json
-import subprocess
-import sys
 import tempfile
 import unittest
 from argparse import Namespace
@@ -19,12 +16,6 @@ from llmoop.cli import (
 )
 from llmoop.model_package import copy_shader_templates, package_placement
 from tests.fixtures import compiled_model_or_skip
-
-
-CLI_DEPS_AVAILABLE = all(
-    importlib.util.find_spec(name) is not None
-    for name in ("torch", "transformers", "safetensors", "tokenizers")
-)
 
 
 class RuntimeCliCommandTest(unittest.TestCase):
@@ -62,7 +53,7 @@ class RuntimeCliCommandTest(unittest.TestCase):
             inspect_patch=False,
             inspect_placement=False,
             inspect_device_slice=None,
-            default_device_id=None,
+            device=None,
             place_pedal=[],
             bind_device=[],
             duplicate_after=[],
@@ -106,7 +97,7 @@ class RuntimeCliCommandTest(unittest.TestCase):
             inspect_patch=False,
             inspect_placement=False,
             inspect_device_slice=None,
-            default_device_id=None,
+            device=None,
             place_pedal=[],
             bind_device=[],
             duplicate_after=[],
@@ -144,7 +135,7 @@ class RuntimeCliCommandTest(unittest.TestCase):
             inspect_patch=False,
             inspect_placement=False,
             inspect_device_slice=None,
-            default_device_id=None,
+            device=None,
             place_pedal=[],
             bind_device=[],
             duplicate_after=[],
@@ -183,7 +174,7 @@ class RuntimeCliCommandTest(unittest.TestCase):
             inspect_patch=False,
             inspect_placement=False,
             inspect_device_slice=None,
-            default_device_id=None,
+            device=None,
             place_pedal=[],
             bind_device=[],
             duplicate_after=[],
@@ -225,7 +216,7 @@ class RuntimeCliCommandTest(unittest.TestCase):
             inspect_patch=False,
             inspect_placement=False,
             inspect_device_slice="gpu1",
-            default_device_id=None,
+            device=None,
             place_pedal=[],
             bind_device=[],
             duplicate_after=[],
@@ -263,7 +254,7 @@ class RuntimeCliCommandTest(unittest.TestCase):
             inspect_patch=False,
             inspect_placement=True,
             inspect_device_slice=None,
-            default_device_id=None,
+            device=None,
             place_pedal=[],
             bind_device=[],
             duplicate_after=[],
@@ -300,7 +291,7 @@ class RuntimeCliCommandTest(unittest.TestCase):
             inspect_patch=False,
             inspect_placement=False,
             inspect_device_slice=None,
-            default_device_id=None,
+            device=None,
             place_pedal=[],
             bind_device=[],
             duplicate_after=[],
@@ -337,7 +328,7 @@ class RuntimeCliCommandTest(unittest.TestCase):
             inspect_patch=True,
             inspect_placement=False,
             inspect_device_slice=None,
-            default_device_id=None,
+            device=None,
             place_pedal=["layer_05_repeat=gpu1"],
             bind_device=["gpu1=vulkan:5"],
             duplicate_after=[],
@@ -378,7 +369,7 @@ class RuntimeCliCommandTest(unittest.TestCase):
             inspect_patch=True,
             inspect_placement=False,
             inspect_device_slice=None,
-            default_device_id="gpu0",
+            device="gpu0",
             place_pedal=["layer_01=cpu0"],
             bind_device=[],
             duplicate_after=[],
@@ -419,7 +410,7 @@ class RuntimeCliCommandTest(unittest.TestCase):
             inspect_patch=False,
             inspect_placement=False,
             inspect_device_slice=None,
-            default_device_id="gpu0",
+            device="gpu0",
             place_pedal=["layer_05_repeat=gpu1"],
             bind_device=["gpu0=vulkan:5", "gpu1=vulkan:5"],
             duplicate_after=[],
@@ -464,7 +455,7 @@ class RuntimeCliCommandTest(unittest.TestCase):
             inspect_patch=False,
             inspect_placement=False,
             inspect_device_slice=None,
-            default_device_id="gpu0",
+            device="gpu0",
             place_pedal=["layer_02=gpu1", "layer_07=lan:worker-a"],
             bind_device=["gpu0=vulkan:0", "gpu1=vulkan:5"],
             duplicate_after=["layer_05=layer_05_repeat"],
@@ -749,46 +740,6 @@ class CompiledPackageTest(unittest.TestCase):
         )
         self.assertTrue((fixture.lowered_dir / "pedalboard.circuits.json").is_file())
         self.assertTrue(fixture.package_manifest.is_file())
-
-
-@unittest.skipUnless(CLI_DEPS_AVAILABLE, "CLI generation dependencies are not installed")
-class CliTest(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls) -> None:
-        cls.fixture = compiled_model_or_skip()
-
-    def test_run_model_generates_text_from_compiled_package(self) -> None:
-        result = subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "llmoop",
-                "--run-model",
-                str(self.fixture.lowered_dir),
-                "--package-dir",
-                str(self.fixture.package_dir),
-                "--prompt",
-                "Hello",
-                "--max-new-tokens",
-                "4",
-                "--ignore-eos",
-                "--json",
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        payload = json.loads(result.stdout)
-
-        self.assertEqual("Hello", payload["prompt_text"])
-        self.assertGreaterEqual(len(payload["prompt_ids"]), 1)
-        self.assertEqual(4, len(payload["generated_ids"]))
-        self.assertEqual(payload["prompt_ids"] + payload["generated_ids"], payload["output_ids"])
-        self.assertIsInstance(payload["generated_text"], str)
-        self.assertIsInstance(payload["output_text"], str)
-        self.assertEqual("greedy_sampler", payload["sampler"])
-        self.assertEqual("max_new_tokens", payload["stop_reason"])
-        self.assertEqual(4, payload["generated_count"])
 
 
 if __name__ == "__main__":
