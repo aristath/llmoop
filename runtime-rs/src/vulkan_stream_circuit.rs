@@ -8243,6 +8243,38 @@ impl VulkanResidentPackageCircuitGraph {
                 .collect(),
         }
     }
+
+    fn signal_processor_endpoint_pedal_ids(
+        &self,
+    ) -> Result<(String, String), VulkanResidentTokenModelPackageError> {
+        let graph = self.to_signal_processor_graph(PathBuf::from("."))?;
+        let [input] = graph.index.graph.boundary.external_inputs.as_slice() else {
+            return Err(VulkanResidentTokenModelPackageError::new(format!(
+                "Vulkan generation currently requires exactly one signal-processor input boundary, found {}",
+                graph.index.graph.boundary.external_inputs.len()
+            )));
+        };
+        let [output] = graph.index.graph.boundary.public_outputs.as_slice() else {
+            return Err(VulkanResidentTokenModelPackageError::new(format!(
+                "Vulkan generation currently requires exactly one signal-processor output boundary, found {}",
+                graph.index.graph.boundary.public_outputs.len()
+            )));
+        };
+        Ok((
+            input.endpoint.pedal_id.clone(),
+            output.endpoint.pedal_id.clone(),
+        ))
+    }
+
+    fn signal_processor_device_ids(&self, placement: &StreamCircuitPlacementSpec) -> Vec<String> {
+        self.pedals
+            .iter()
+            .filter(|pedal| pedal.runtime_role.is_signal_processor())
+            .map(|pedal| placement.device_for_pedal(&pedal.pedal_id).to_string())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
 }
 
 fn execution_boundary_inputs(
@@ -8825,40 +8857,18 @@ impl VulkanResidentInProcessPlacedModelPackage {
     {
         let manifest_dir = manifest_dir.as_ref();
         let package_id = manifest.package_id.clone();
+        let (input_processor_id, output_processor_id) = manifest
+            .circuit_graph
+            .signal_processor_endpoint_pedal_ids()
+            .map_err(VulkanResidentInProcessPlacedModelPackageError::Package)?;
         let input_device_id = manifest
-            .circuit_graph
-            .pedals
-            .first()
-            .map(|pedal| {
-                manifest
-                    .placement
-                    .device_for_pedal(&pedal.pedal_id)
-                    .to_string()
-            })
-            .ok_or_else(|| {
-                VulkanResidentInProcessPlacedModelPackageError::Package(
-                    VulkanResidentTokenModelPackageError::new(format!(
-                        "placed package {package_id:?} has no input pedal"
-                    )),
-                )
-            })?;
+            .placement
+            .device_for_pedal(&input_processor_id)
+            .to_string();
         let output_device_id = manifest
-            .circuit_graph
-            .pedals
-            .last()
-            .map(|pedal| {
-                manifest
-                    .placement
-                    .device_for_pedal(&pedal.pedal_id)
-                    .to_string()
-            })
-            .ok_or_else(|| {
-                VulkanResidentInProcessPlacedModelPackageError::Package(
-                    VulkanResidentTokenModelPackageError::new(format!(
-                        "placed package {package_id:?} has no output pedal"
-                    )),
-                )
-            })?;
+            .placement
+            .device_for_pedal(&output_processor_id)
+            .to_string();
         let capacity =
             dynamic_state_capacity_activations.unwrap_or(manifest.max_context_activations);
         let tensor_index_path =
@@ -8903,7 +8913,9 @@ impl VulkanResidentInProcessPlacedModelPackage {
             &manifest.output_transducer.projection_shader_path,
         )?;
         let sampler_kernels = load_resident_sampler_kernels(manifest_dir, &manifest.sampler)?;
-        let device_ids = manifest.placement_device_ids();
+        let device_ids = manifest
+            .circuit_graph
+            .signal_processor_device_ids(&manifest.placement);
         let mut device_slices = Vec::with_capacity(device_ids.len());
         let mut hosted_pedal_count = 0usize;
 
@@ -18419,6 +18431,33 @@ mod tests {
                 .endpoint
                 .pedal_id,
             "layer_13"
+        );
+    }
+
+    #[test]
+    fn placed_generation_endpoints_follow_wiring_not_system_pedal_order() {
+        let manifest = fixture_model_package_manifest();
+        let (input_pedal, output_pedal) = manifest
+            .circuit_graph
+            .signal_processor_endpoint_pedal_ids()
+            .unwrap();
+        let placement = manifest
+            .placement
+            .clone()
+            .with_pedal_device(&input_pedal, "gpu-input")
+            .with_pedal_device(&output_pedal, "gpu-output");
+
+        assert_eq!(input_pedal, "layer_00");
+        assert_eq!(output_pedal, "layer_13");
+        assert_eq!(
+            manifest
+                .circuit_graph
+                .signal_processor_device_ids(&placement),
+            vec![
+                "gpu-input".to_string(),
+                "gpu-output".to_string(),
+                "runtime_default".to_string(),
+            ]
         );
     }
 

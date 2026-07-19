@@ -55,7 +55,7 @@ class PedalboardCircuitLoweringTest(unittest.TestCase):
                 index["graph"]["cables"][-1]["connection"],
             )
             self.assertEqual(
-                ["user_input", "randomness"],
+                ["user_input", "random_seed"],
                 [
                     port["id"]
                     for port in index["graph"]["boundary"]["external_inputs"]

@@ -177,10 +177,10 @@ def lower_pedalboard(
                         },
                     },
                     {
-                        "id": "randomness",
+                        "id": "random_seed",
                         "endpoint": {
                             "pedal_id": sampler_ref["id"],
-                            "port_id": "random_bits",
+                            "port_id": "random_seed",
                         },
                     }
                 ],
@@ -335,7 +335,7 @@ def build_system_circuits(model: Json) -> list[Json]:
         implementation="compiled_sampler_v1",
         inputs=[
             _system_port("input_logits", "logits", [vocab_size], "logits"),
-            _system_port("random_bits", "random_bits", [1], "randomness"),
+            _system_port("random_seed", "random_seed", [1], "randomness"),
         ],
         outputs=[
             _system_port(
@@ -351,7 +351,7 @@ def build_system_circuits(model: Json) -> list[Json]:
             {
                 "id": "sample",
                 "op": "sample_token",
-                "inputs": ["input_logits", "random_bits"],
+                "inputs": ["input_logits", "random_seed"],
                 "outputs": ["sampled_token"],
                 "params": [],
                 "state_reads": [],
