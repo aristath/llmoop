@@ -7492,8 +7492,7 @@ pub struct VulkanResidentInProcessPlacedModelPackageDevice {
     pub dispatch_count: usize,
     package_slice: VulkanResidentModelPackageDeviceSlice,
     mounted: VulkanMountedPlacedStreamCircuit,
-    reusable_manifest: VulkanReusableKernelArtifactManifest,
-    mounted_bound: VulkanMountedPlacedBoundDispatchPlan,
+    resident_execution_plan: VulkanMountedPlacedResidentStreamTickExecutionPlan,
 }
 
 impl VulkanResidentInProcessPlacedModelPackage {
@@ -7691,6 +7690,17 @@ impl VulkanResidentInProcessPlacedModelPackage {
             let mounted_bound = mounted
                 .mounted_placed_bound_dispatch_plan(&reusable_manifest)
                 .map_err(VulkanResidentInProcessPlacedModelPackageError::BoundDispatchPlan)?;
+            let tick_plan =
+                VulkanMountedPlacedStreamTickPlan::from_mounted_bound_plan(&mounted_bound);
+            let resident_execution_plan =
+                VulkanMountedPlacedResidentStreamTickExecutionPlan::from_tick_plan(
+                    slice_device,
+                    &mounted,
+                    &mounted_bound,
+                    package_slice.loaded_manifest(),
+                    tick_plan,
+                )
+                .map_err(VulkanResidentInProcessPlacedModelPackageError::ResidentDispatch)?;
             let dispatch_count = mounted_bound.dispatches.len();
             hosted_pedal_count = hosted_pedal_count
                 .checked_add(package_slice.hosted_pedal_count)
@@ -7709,8 +7719,7 @@ impl VulkanResidentInProcessPlacedModelPackage {
                 dispatch_count,
                 package_slice,
                 mounted,
-                reusable_manifest,
-                mounted_bound,
+                resident_execution_plan,
             });
         }
         let input_slice = device_slices
@@ -7826,16 +7835,10 @@ impl VulkanResidentInProcessPlacedModelPackage {
         let mut tick_slices = Vec::with_capacity(self.device_slices.len());
 
         for slice in &self.device_slices {
-            let tick_plan = slice
-                .mounted
-                .stream_tick_plan(&slice.reusable_manifest)
-                .map_err(VulkanResidentInProcessPlacedModelPackageError::BoundDispatchPlan)?;
             tick_slices.push(VulkanMountedPlacedResidentInProcessStreamTickSlice::new(
                 device,
                 &slice.mounted,
-                &slice.mounted_bound,
-                slice.package_slice.loaded_manifest(),
-                tick_plan,
+                &slice.resident_execution_plan,
                 stream_tick,
             ));
         }
@@ -7887,16 +7890,10 @@ impl VulkanResidentInProcessPlacedModelPackage {
                         device_id: slice.device_id.clone(),
                     }
                 })?;
-            let tick_plan = slice
-                .mounted
-                .stream_tick_plan(&slice.reusable_manifest)
-                .map_err(VulkanResidentInProcessPlacedModelPackageError::BoundDispatchPlan)?;
             tick_slices.push(VulkanMountedPlacedResidentInProcessStreamTickSlice::new(
                 slice_device,
                 &slice.mounted,
-                &slice.mounted_bound,
-                slice.package_slice.loaded_manifest(),
-                tick_plan,
+                &slice.resident_execution_plan,
                 stream_tick,
             ));
         }
@@ -9451,6 +9448,7 @@ pub enum VulkanResidentInProcessPlacedModelPackageError {
     IncompleteTick(VulkanMountedPlacedResidentInProcessStreamTickRunStatus),
     Package(VulkanResidentTokenModelPackageError),
     BoundDispatchPlan(VulkanBoundDispatchPlanError),
+    ResidentDispatch(VulkanMountedPlacedResidentKernelDispatchError),
     Tick(VulkanMountedPlacedResidentInProcessStreamTickError),
     InputTransducer(VulkanResidentInputEmbeddingTransducerRunnerError),
     OutputTransducer(VulkanResidentOutputTransducerRunnerError),
@@ -9479,6 +9477,7 @@ impl Display for VulkanResidentInProcessPlacedModelPackageError {
             ),
             Self::Package(error) => Display::fmt(error, f),
             Self::BoundDispatchPlan(error) => Display::fmt(error, f),
+            Self::ResidentDispatch(error) => Display::fmt(error, f),
             Self::Tick(error) => Display::fmt(error, f),
             Self::InputTransducer(error) => Display::fmt(error, f),
             Self::OutputTransducer(error) => Display::fmt(error, f),
@@ -10859,6 +10858,7 @@ impl VulkanMountedPlacedResidentPedalRunner {
             dispatches.push(VulkanMountedPlacedResidentPedalDispatch {
                 dispatch_index: dispatch.dispatch_index,
                 kernel_id: dispatch.kernel_id.clone(),
+                pedal_id: dispatch.pedal_id.clone(),
                 node_id: dispatch.node_id.clone(),
                 op: dispatch.op.clone(),
                 reusable_family_id: dispatch.reusable_family_id.clone(),
@@ -10983,6 +10983,7 @@ impl VulkanMountedPlacedResidentPedalRunner {
 pub struct VulkanMountedPlacedResidentPedalDispatch {
     pub dispatch_index: usize,
     pub kernel_id: String,
+    pub pedal_id: String,
     pub node_id: String,
     pub op: String,
     pub reusable_family_id: String,
@@ -11158,6 +11159,271 @@ impl VulkanMountedPlacedResidentPedalboardRunner {
                 .collect(),
         }
     }
+}
+
+/// A maximal sequence of dispatch stages that can execute without crossing a
+/// cable transport boundary. The sequence keeps its pipelines, descriptors,
+/// command buffer, and fence resident for the lifetime of the mounted model.
+pub struct VulkanMountedPlacedResidentDispatchSegmentRunner {
+    pub start_stage_index: usize,
+    pub end_stage_index: usize,
+    pub dispatch_count: usize,
+    dispatches: Vec<VulkanMountedPlacedResidentPedalDispatch>,
+    stream_control_buffer: Arc<VulkanResidentBuffer>,
+    sequence: VulkanResidentKernelSequence,
+}
+
+impl VulkanMountedPlacedResidentDispatchSegmentRunner {
+    fn from_dispatch_stages(
+        device: &VulkanComputeDevice,
+        mounted: &VulkanMountedPlacedStreamCircuit,
+        mounted_bound_plan: &VulkanMountedPlacedBoundDispatchPlan,
+        loaded_manifest: &VulkanLoadedReusableKernelArtifactManifest,
+        stages: &[VulkanMountedPlacedStreamTickStage],
+    ) -> Result<Self, VulkanMountedPlacedResidentKernelDispatchError> {
+        let start_stage_index = stages
+            .first()
+            .map(VulkanMountedPlacedStreamTickStage::stage_index)
+            .ok_or_else(|| {
+                VulkanMountedPlacedResidentKernelDispatchError::EmptyDispatchSegment {
+                    device_id: mounted.device_id().to_string(),
+                }
+            })?;
+        let end_stage_index = stages
+            .last()
+            .map(VulkanMountedPlacedStreamTickStage::stage_index)
+            .and_then(|index| index.checked_add(1))
+            .ok_or_else(|| {
+                VulkanMountedPlacedResidentKernelDispatchError::DispatchSegmentStageOverflow {
+                    device_id: mounted.device_id().to_string(),
+                }
+            })?;
+        let mut dispatches = Vec::with_capacity(stages.len());
+
+        for stage in stages {
+            let VulkanMountedPlacedStreamTickStage::Dispatch {
+                stage_index,
+                dispatch,
+            } = stage
+            else {
+                return Err(
+                    VulkanMountedPlacedResidentKernelDispatchError::NonDispatchStageInSegment {
+                        device_id: mounted.device_id().to_string(),
+                        stage_index: stage.stage_index(),
+                    },
+                );
+            };
+            let bound_dispatch = mounted_bound_plan
+                .dispatches
+                .iter()
+                .find(|bound| bound.dispatch_index == dispatch.dispatch_index)
+                .ok_or_else(|| {
+                    VulkanMountedPlacedResidentKernelDispatchError::MissingSegmentDispatch {
+                        device_id: mounted.device_id().to_string(),
+                        stage_index: *stage_index,
+                        dispatch_index: dispatch.dispatch_index,
+                    }
+                })?;
+            let resident_dispatch = mounted.create_resident_kernel_dispatch_for_bound_dispatch(
+                device,
+                bound_dispatch,
+                loaded_manifest,
+            )?;
+            dispatches.push(VulkanMountedPlacedResidentPedalDispatch {
+                dispatch_index: bound_dispatch.dispatch_index,
+                kernel_id: bound_dispatch.kernel_id.clone(),
+                pedal_id: bound_dispatch.pedal_id.clone(),
+                node_id: bound_dispatch.node_id.clone(),
+                op: bound_dispatch.op.clone(),
+                reusable_family_id: bound_dispatch.reusable_family_id.clone(),
+                push_constants: bound_dispatch.push_constants.clone(),
+                resident_dispatch,
+            });
+        }
+
+        Ok(Self {
+            start_stage_index,
+            end_stage_index,
+            dispatch_count: dispatches.len(),
+            dispatches,
+            stream_control_buffer: mounted.stream_control_buffer.clone(),
+            sequence: device
+                .create_resident_kernel_sequence()
+                .map_err(VulkanMountedPlacedResidentKernelDispatchError::Vulkan)?,
+        })
+    }
+
+    fn run_with_stream_control(
+        &self,
+        device: &VulkanComputeDevice,
+        control: VulkanMountedPlacedStreamControl,
+    ) -> Result<
+        Vec<VulkanMountedPlacedResidentPedalRun>,
+        VulkanMountedPlacedResidentKernelDispatchError,
+    > {
+        self.stream_control_buffer
+            .write_bytes_at(
+                VULKAN_STREAM_CONTROL_METADATA_OFFSET,
+                &stream_control_metadata_bytes(control),
+            )
+            .map_err(VulkanMountedPlacedResidentKernelDispatchError::Vulkan)?;
+
+        let push_constants = self
+            .dispatches
+            .iter()
+            .map(|dispatch| stream_control_push_constant_bytes(&dispatch.push_constants, control))
+            .collect::<Result<Vec<_>, _>>()?;
+        let steps = self
+            .dispatches
+            .iter()
+            .zip(&push_constants)
+            .map(|(dispatch, push_constants)| {
+                VulkanResidentKernelSequenceStep::new(&dispatch.resident_dispatch, push_constants)
+            })
+            .collect::<Vec<_>>();
+        let execution_start = Instant::now();
+        device
+            .run_resident_kernel_sequence(&self.sequence, &steps)
+            .map_err(VulkanMountedPlacedResidentKernelDispatchError::Vulkan)?;
+        let execution_time_ns =
+            u64::try_from(execution_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+
+        Ok(self.completed_pedal_runs(execution_time_ns))
+    }
+
+    fn completed_pedal_runs(
+        &self,
+        execution_time_ns: u64,
+    ) -> Vec<VulkanMountedPlacedResidentPedalRun> {
+        let mut pedal_runs = Vec::<VulkanMountedPlacedResidentPedalRun>::new();
+        for (dispatch_offset, dispatch) in self.dispatches.iter().enumerate() {
+            let dispatch_run = VulkanMountedPlacedResidentPedalDispatchRun {
+                dispatch_index: dispatch.dispatch_index,
+                kernel_id: dispatch.kernel_id.clone(),
+                node_id: dispatch.node_id.clone(),
+                op: dispatch.op.clone(),
+                reusable_family_id: dispatch.reusable_family_id.clone(),
+                descriptor_count: dispatch.resident_dispatch.descriptor_count(),
+                workgroup_count_x: dispatch.resident_dispatch.workgroup_count_x(),
+                push_constant_byte_count: dispatch.resident_dispatch.push_constant_byte_count(),
+                // A composed segment has one measurable execution boundary.
+                run_time_ns: if dispatch_offset == 0 {
+                    execution_time_ns
+                } else {
+                    0
+                },
+            };
+            if let Some(pedal_run) = pedal_runs
+                .last_mut()
+                .filter(|run| run.pedal_id == dispatch.pedal_id)
+            {
+                pedal_run.dispatch_runs.push(dispatch_run);
+            } else {
+                pedal_runs.push(VulkanMountedPlacedResidentPedalRun {
+                    pedal_id: dispatch.pedal_id.clone(),
+                    dispatch_runs: vec![dispatch_run],
+                });
+            }
+        }
+        pedal_runs
+    }
+}
+
+/// Resident execution structure for one placed device slice. Cable stages stay
+/// visible to the scheduler, while every uninterrupted dispatch region becomes
+/// one GPU submission.
+pub struct VulkanMountedPlacedResidentStreamTickExecutionPlan {
+    pub tick_plan: VulkanMountedPlacedStreamTickPlan,
+    pub dispatch_segment_count: usize,
+    pub dispatch_count: usize,
+    dispatch_segments: Vec<VulkanMountedPlacedResidentDispatchSegmentRunner>,
+}
+
+impl VulkanMountedPlacedResidentStreamTickExecutionPlan {
+    pub fn from_tick_plan(
+        device: &VulkanComputeDevice,
+        mounted: &VulkanMountedPlacedStreamCircuit,
+        mounted_bound_plan: &VulkanMountedPlacedBoundDispatchPlan,
+        loaded_manifest: &VulkanLoadedReusableKernelArtifactManifest,
+        tick_plan: VulkanMountedPlacedStreamTickPlan,
+    ) -> Result<Self, VulkanMountedPlacedResidentKernelDispatchError> {
+        if tick_plan.device_id != mounted.device_id() {
+            return Err(
+                VulkanMountedPlacedResidentKernelDispatchError::ExecutionPlanDeviceMismatch {
+                    plan_device_id: tick_plan.device_id.clone(),
+                    mounted_device_id: mounted.device_id().to_string(),
+                },
+            );
+        }
+        if tick_plan.device_id != mounted_bound_plan.device_id {
+            return Err(
+                VulkanMountedPlacedResidentKernelDispatchError::ExecutionBoundPlanDeviceMismatch {
+                    plan_device_id: tick_plan.device_id.clone(),
+                    bound_plan_device_id: mounted_bound_plan.device_id.clone(),
+                },
+            );
+        }
+
+        let mut dispatch_segments = Vec::new();
+        for (start, end) in resident_dispatch_segment_stage_ranges(&tick_plan.stages) {
+            dispatch_segments.push(
+                VulkanMountedPlacedResidentDispatchSegmentRunner::from_dispatch_stages(
+                    device,
+                    mounted,
+                    mounted_bound_plan,
+                    loaded_manifest,
+                    &tick_plan.stages[start..end],
+                )?,
+            );
+        }
+        let dispatch_count = dispatch_segments
+            .iter()
+            .map(|segment| segment.dispatch_count)
+            .sum();
+        let dispatch_segment_count = dispatch_segments.len();
+        Ok(Self {
+            tick_plan,
+            dispatch_segment_count,
+            dispatch_count,
+            dispatch_segments,
+        })
+    }
+
+    fn segment_starting_at(
+        &self,
+        stage_index: usize,
+    ) -> Option<&VulkanMountedPlacedResidentDispatchSegmentRunner> {
+        self.dispatch_segments
+            .iter()
+            .find(|segment| segment.start_stage_index == stage_index)
+    }
+}
+
+fn resident_dispatch_segment_stage_ranges(
+    stages: &[VulkanMountedPlacedStreamTickStage],
+) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    let mut stage_index = 0usize;
+    while stage_index < stages.len() {
+        if !matches!(
+            stages[stage_index],
+            VulkanMountedPlacedStreamTickStage::Dispatch { .. }
+        ) {
+            stage_index += 1;
+            continue;
+        }
+        let start = stage_index;
+        while stage_index < stages.len()
+            && matches!(
+                stages[stage_index],
+                VulkanMountedPlacedStreamTickStage::Dispatch { .. }
+            )
+        {
+            stage_index += 1;
+        }
+        ranges.push((start, stage_index));
+    }
+    ranges
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -13692,7 +13958,6 @@ pub struct VulkanMountedPlacedResidentStreamTickCursor {
     pub next_stage_index: usize,
     pub completed_stage_count: usize,
     pub pedal_runs: Vec<VulkanMountedPlacedResidentPedalRun>,
-    pedals_run: BTreeSet<String>,
     last_blocked: Option<(usize, VulkanMountedPlacedStreamTickBlockReason)>,
 }
 
@@ -13704,7 +13969,6 @@ impl VulkanMountedPlacedResidentStreamTickCursor {
             next_stage_index: 0,
             completed_stage_count: 0,
             pedal_runs: Vec::new(),
-            pedals_run: BTreeSet::new(),
             last_blocked: None,
         }
     }
@@ -13724,17 +13988,43 @@ impl VulkanMountedPlacedResidentStreamTickCursor {
         VulkanMountedPlacedResidentStreamTickCursorAdvance,
         VulkanMountedPlacedResidentStreamTickError,
     > {
+        let execution_plan = VulkanMountedPlacedResidentStreamTickExecutionPlan::from_tick_plan(
+            device,
+            mounted,
+            mounted_bound_plan,
+            loaded_manifest,
+            self.tick_plan.clone(),
+        )
+        .map_err(VulkanMountedPlacedResidentStreamTickError::Dispatch)?;
+        self.advance_with_resident_execution_plan_and_in_process_transport(
+            device,
+            mounted,
+            &execution_plan,
+            transport,
+        )
+    }
+
+    pub fn advance_with_resident_execution_plan_and_in_process_transport(
+        &mut self,
+        device: &VulkanComputeDevice,
+        mounted: &VulkanMountedPlacedStreamCircuit,
+        execution_plan: &VulkanMountedPlacedResidentStreamTickExecutionPlan,
+        transport: &mut VulkanInProcessPlacedCableTransport,
+    ) -> Result<
+        VulkanMountedPlacedResidentStreamTickCursorAdvance,
+        VulkanMountedPlacedResidentStreamTickError,
+    > {
         if self.tick_plan.device_id != mounted.device_id() {
             return Err(VulkanMountedPlacedResidentStreamTickError::DeviceMismatch {
                 plan_device_id: self.tick_plan.device_id.clone(),
                 mounted_device_id: mounted.device_id().to_string(),
             });
         }
-        if self.tick_plan.device_id != mounted_bound_plan.device_id {
+        if self.tick_plan.device_id != execution_plan.tick_plan.device_id {
             return Err(
                 VulkanMountedPlacedResidentStreamTickError::BoundPlanDeviceMismatch {
                     plan_device_id: self.tick_plan.device_id.clone(),
-                    bound_plan_device_id: mounted_bound_plan.device_id.clone(),
+                    bound_plan_device_id: execution_plan.tick_plan.device_id.clone(),
                 },
             );
         }
@@ -13773,22 +14063,25 @@ impl VulkanMountedPlacedResidentStreamTickCursor {
                         }
                     }
                 }
-                VulkanMountedPlacedStreamTickStage::Dispatch { dispatch, .. } => {
-                    if self.pedals_run.insert(dispatch.pedal_id.clone()) {
-                        let runner = mounted
-                            .create_resident_pedal_runner(
-                                device,
-                                mounted_bound_plan,
-                                &dispatch.pedal_id,
-                                loaded_manifest,
+                VulkanMountedPlacedStreamTickStage::Dispatch { .. } => {
+                    let segment = execution_plan
+                        .segment_starting_at(self.next_stage_index)
+                        .ok_or_else(|| {
+                            VulkanMountedPlacedResidentStreamTickError::Dispatch(
+                                VulkanMountedPlacedResidentKernelDispatchError::MissingDispatchSegment {
+                                    device_id: mounted.device_id().to_string(),
+                                    stage_index: self.next_stage_index,
+                                },
                             )
-                            .map_err(VulkanMountedPlacedResidentStreamTickError::Dispatch)?;
-                        let pedal_run = runner
+                        })?;
+                    self.pedal_runs.extend(
+                        segment
                             .run_with_stream_control(device, control)
-                            .map_err(VulkanMountedPlacedResidentStreamTickError::Dispatch)?;
-                        self.pedal_runs.push(pedal_run);
+                            .map_err(VulkanMountedPlacedResidentStreamTickError::Dispatch)?,
+                    );
+                    while self.next_stage_index < segment.end_stage_index {
+                        self.complete_current_stage();
                     }
-                    self.complete_current_stage();
                 }
                 VulkanMountedPlacedStreamTickStage::PublishCable { cable_index, .. } => {
                     transport
@@ -13907,8 +14200,7 @@ pub struct VulkanMountedPlacedResidentStreamTickCursorAdvance {
 pub struct VulkanMountedPlacedResidentInProcessStreamTickSlice<'a> {
     pub device: &'a VulkanComputeDevice,
     pub mounted: &'a VulkanMountedPlacedStreamCircuit,
-    pub mounted_bound_plan: &'a VulkanMountedPlacedBoundDispatchPlan,
-    pub loaded_manifest: &'a VulkanLoadedReusableKernelArtifactManifest,
+    pub execution_plan: &'a VulkanMountedPlacedResidentStreamTickExecutionPlan,
     pub cursor: VulkanMountedPlacedResidentStreamTickCursor,
 }
 
@@ -13916,17 +14208,16 @@ impl<'a> VulkanMountedPlacedResidentInProcessStreamTickSlice<'a> {
     pub fn new(
         device: &'a VulkanComputeDevice,
         mounted: &'a VulkanMountedPlacedStreamCircuit,
-        mounted_bound_plan: &'a VulkanMountedPlacedBoundDispatchPlan,
-        loaded_manifest: &'a VulkanLoadedReusableKernelArtifactManifest,
-        tick_plan: VulkanMountedPlacedStreamTickPlan,
+        execution_plan: &'a VulkanMountedPlacedResidentStreamTickExecutionPlan,
         stream_tick: u64,
     ) -> Self {
         Self {
             device,
             mounted,
-            mounted_bound_plan,
-            loaded_manifest,
-            cursor: tick_plan.resident_stream_tick_cursor(stream_tick),
+            execution_plan,
+            cursor: execution_plan
+                .tick_plan
+                .resident_stream_tick_cursor(stream_tick),
         }
     }
 
@@ -14033,11 +14324,10 @@ pub fn run_mounted_placed_resident_stream_tick_slices_in_process(
             }
             let advance = slice
                 .cursor
-                .advance_with_resident_pedals_and_in_process_transport(
+                .advance_with_resident_execution_plan_and_in_process_transport(
                     slice.device,
                     slice.mounted,
-                    slice.mounted_bound_plan,
-                    slice.loaded_manifest,
+                    slice.execution_plan,
                     transport,
                 )?;
             completed_stage_delta += advance.completed_stage_delta;
@@ -14409,6 +14699,33 @@ impl Error for VulkanMountedPlacedResidentStreamTickError {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum VulkanMountedPlacedResidentKernelDispatchError {
+    ExecutionPlanDeviceMismatch {
+        plan_device_id: String,
+        mounted_device_id: String,
+    },
+    ExecutionBoundPlanDeviceMismatch {
+        plan_device_id: String,
+        bound_plan_device_id: String,
+    },
+    EmptyDispatchSegment {
+        device_id: String,
+    },
+    DispatchSegmentStageOverflow {
+        device_id: String,
+    },
+    NonDispatchStageInSegment {
+        device_id: String,
+        stage_index: usize,
+    },
+    MissingSegmentDispatch {
+        device_id: String,
+        stage_index: usize,
+        dispatch_index: usize,
+    },
+    MissingDispatchSegment {
+        device_id: String,
+        stage_index: usize,
+    },
     MissingPedalboardPedals {
         device_id: String,
     },
@@ -14480,6 +14797,50 @@ pub enum VulkanMountedPlacedResidentKernelDispatchError {
 impl Display for VulkanMountedPlacedResidentKernelDispatchError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::ExecutionPlanDeviceMismatch {
+                plan_device_id,
+                mounted_device_id,
+            } => write!(
+                f,
+                "resident execution plan for device {plan_device_id:?} cannot execute mounted device {mounted_device_id:?}"
+            ),
+            Self::ExecutionBoundPlanDeviceMismatch {
+                plan_device_id,
+                bound_plan_device_id,
+            } => write!(
+                f,
+                "resident execution plan for device {plan_device_id:?} cannot use mounted bound plan for device {bound_plan_device_id:?}"
+            ),
+            Self::EmptyDispatchSegment { device_id } => write!(
+                f,
+                "resident execution plan for device {device_id:?} contains an empty dispatch segment"
+            ),
+            Self::DispatchSegmentStageOverflow { device_id } => write!(
+                f,
+                "resident execution plan dispatch segment stage index overflowed for device {device_id:?}"
+            ),
+            Self::NonDispatchStageInSegment {
+                device_id,
+                stage_index,
+            } => write!(
+                f,
+                "resident execution plan for device {device_id:?} contains non-dispatch stage {stage_index} inside a dispatch segment"
+            ),
+            Self::MissingSegmentDispatch {
+                device_id,
+                stage_index,
+                dispatch_index,
+            } => write!(
+                f,
+                "resident execution plan for device {device_id:?} stage {stage_index} references missing bound dispatch {dispatch_index}"
+            ),
+            Self::MissingDispatchSegment {
+                device_id,
+                stage_index,
+            } => write!(
+                f,
+                "resident execution plan for device {device_id:?} has no dispatch segment beginning at stage {stage_index}"
+            ),
             Self::MissingPedalboardPedals { device_id } => {
                 write!(
                     f,
@@ -15851,6 +16212,56 @@ mod tests {
     const FIXTURE_MODEL_LOGITS_BYTES: usize = 65_536 * 4;
     const FIXTURE_MODEL_SAMPLER_OUTPUT_BYTES: usize = 16;
     const FIXTURE_MODEL_EMBED_TOKENS_BYTES: usize = 65_536 * FIXTURE_MODEL_FRAME_BYTES;
+
+    fn fixture_tick_dispatch_stage(stage_index: usize) -> VulkanMountedPlacedStreamTickStage {
+        VulkanMountedPlacedStreamTickStage::Dispatch {
+            stage_index,
+            dispatch: VulkanMountedPlacedStreamTickDispatch {
+                dispatch_index: stage_index,
+                kernel_id: format!("kernel_{stage_index}"),
+                pedal_id: format!("pedal_{stage_index}"),
+                node_id: format!("node_{stage_index}"),
+                op: "fixture".to_string(),
+                descriptor_count: 0,
+                resident_descriptor_count: 0,
+                reads: Vec::new(),
+                writes: Vec::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn resident_dispatch_segments_stop_at_transport_boundaries() {
+        let stages = vec![
+            fixture_tick_dispatch_stage(0),
+            fixture_tick_dispatch_stage(1),
+            VulkanMountedPlacedStreamTickStage::PublishCable {
+                stage_index: 2,
+                cable_index: 0,
+                endpoint_id: "out".to_string(),
+                buffer_index: 0,
+                byte_capacity: 16,
+                remote_device_id: "gpu1".to_string(),
+                remote_pedal_id: "remote".to_string(),
+            },
+            VulkanMountedPlacedStreamTickStage::ReceiveCable {
+                stage_index: 3,
+                cable_index: 1,
+                endpoint_id: "in".to_string(),
+                buffer_index: 0,
+                byte_capacity: 16,
+                remote_device_id: "gpu1".to_string(),
+                remote_pedal_id: "remote".to_string(),
+            },
+            fixture_tick_dispatch_stage(4),
+            fixture_tick_dispatch_stage(5),
+        ];
+
+        assert_eq!(
+            resident_dispatch_segment_stage_ranges(&stages),
+            vec![(0, 2), (4, 6)]
+        );
+    }
 
     fn assert_bf16_bytes_close(actual: &[u8], expected: &[u8], max_absolute_error: f32) {
         assert_eq!(actual.len(), expected.len());
@@ -23783,23 +24194,37 @@ mod tests {
             .mounted_placed_bound_dispatch_plan(&gpu1_reusable_manifest)
             .unwrap();
         let gpu1_tick_plan = gpu1.stream_tick_plan(&gpu1_reusable_manifest).unwrap();
+        let gpu0_execution_plan =
+            VulkanMountedPlacedResidentStreamTickExecutionPlan::from_tick_plan(
+                &device,
+                &gpu0,
+                &gpu0_bound,
+                gpu0_slice.loaded_manifest(),
+                gpu0_tick_plan,
+            )
+            .unwrap();
+        let gpu1_execution_plan =
+            VulkanMountedPlacedResidentStreamTickExecutionPlan::from_tick_plan(
+                &device,
+                &gpu1,
+                &gpu1_bound,
+                gpu1_slice.loaded_manifest(),
+                gpu1_tick_plan,
+            )
+            .unwrap();
 
         let mut transport = VulkanInProcessPlacedCableTransport::new();
         let mut slices = vec![
             VulkanMountedPlacedResidentInProcessStreamTickSlice::new(
                 &device,
                 &gpu0,
-                &gpu0_bound,
-                gpu0_slice.loaded_manifest(),
-                gpu0_tick_plan,
+                &gpu0_execution_plan,
                 0,
             ),
             VulkanMountedPlacedResidentInProcessStreamTickSlice::new(
                 &device,
                 &gpu1,
-                &gpu1_bound,
-                gpu1_slice.loaded_manifest(),
-                gpu1_tick_plan,
+                &gpu1_execution_plan,
                 0,
             ),
         ];
