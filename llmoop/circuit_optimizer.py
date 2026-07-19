@@ -17,9 +17,6 @@ def optimize_circuit_for_vulkan(
     can_fuse_parallel_head_norm_rope: (
         Callable[[list[tuple[Json, Json]]], bool] | None
     ) = None,
-    can_fuse_dual_linear_silu_multiply: (
-        Callable[[Json, Json], bool] | None
-    ) = None,
     can_fuse_multiply_rolling_depthwise: (
         Callable[[Json, Json, Json], bool] | None
     ) = None,
@@ -73,10 +70,6 @@ def optimize_circuit_for_vulkan(
         compiled_nodes.append(deepcopy(current))
         index += 1
 
-    compiled_nodes = _fuse_dual_linear_silu_multiply_regions(
-        compiled_nodes,
-        can_fuse_dual_linear_silu_multiply,
-    )
     compiled_nodes = _fuse_multiply_rolling_depthwise_regions(
         compiled_nodes,
         can_fuse_multiply_rolling_depthwise,
@@ -374,70 +367,6 @@ def _fuse_multiply_rolling_depthwise_regions(
             }
         )
         index += 3
-    return compiled
-
-
-def _fuse_dual_linear_silu_multiply_regions(
-    nodes: list[Json],
-    can_fuse: Callable[[Json, Json], bool] | None,
-) -> list[Json]:
-    if can_fuse is None:
-        return nodes
-    consumer_counts = Counter(
-        signal for node in nodes for signal in node.get("inputs", [])
-    )
-    compiled: list[Json] = []
-    index = 0
-    while index < len(nodes):
-        projection = nodes[index]
-        multiply = nodes[index + 1] if index + 1 < len(nodes) else None
-        if (
-            multiply is None
-            or projection.get("op") != "parallel_linear_2way"
-            or multiply.get("op") != "silu_multiply"
-            or len(projection.get("inputs", [])) != 1
-            or len(projection.get("outputs", [])) != 2
-            or len(projection.get("params", [])) != 2
-            or projection.get("state_reads")
-            or projection.get("state_writes")
-            or len(multiply.get("inputs", [])) != 2
-            or set(multiply["inputs"]) != set(projection["outputs"])
-            or len(multiply.get("outputs", [])) != 1
-            or multiply.get("params")
-            or multiply.get("state_reads")
-            or multiply.get("state_writes")
-            or any(consumer_counts[output] != 1 for output in projection["outputs"])
-            or not can_fuse(projection, multiply)
-        ):
-            compiled.append(deepcopy(projection))
-            index += 1
-            continue
-
-        activated_input_index = projection["outputs"].index(multiply["inputs"][0])
-        compiled.append(
-            {
-                "id": f"{projection['id']}__{multiply['id']}",
-                "op": "dual_linear_silu_multiply",
-                "inputs": deepcopy(projection["inputs"]),
-                "outputs": deepcopy(multiply["outputs"]),
-                "params": deepcopy(projection["params"]),
-                "attrs": {
-                    "compiled_from": [
-                        *projection.get("attrs", {}).get(
-                            "compiled_from", [projection["id"]]
-                        ),
-                        *multiply.get("attrs", {}).get(
-                            "compiled_from", [multiply["id"]]
-                        ),
-                    ],
-                    "activated_input_index": activated_input_index,
-                    "projection": deepcopy(projection.get("attrs", {})),
-                    "intermediate_rounding": "BF16",
-                    "activation_rounding": "BF16",
-                },
-            }
-        )
-        index += 2
     return compiled
 
 

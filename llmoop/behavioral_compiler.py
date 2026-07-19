@@ -11,7 +11,6 @@ from llmoop.compilation import Json, ModelCompileError
 BEHAVIORAL_VALIDATION_SCHEMA = "llmoop.behavioral_validation.v1"
 EXACT_REWRITE_CONTRACTS = {
     "append_scaled_dot_product_attention": "append_attention_exact_bf16.v1",
-    "dual_linear_silu_multiply": "dual_linear_silu_multiply_exact_bf16.v1",
     "linear_residual": "linear_residual_exact_bf16.v1",
     "linear_split_3way": "linear_split_exact_bf16.v1",
     "linear_split_recurrent_depthwise_gate": "linear_recurrent_exact_bf16.v1",
@@ -25,9 +24,6 @@ EXACT_REWRITE_CONTRACTS = {
 EXACT_REWRITE_SOURCE_OPS = {
     "append_scaled_dot_product_attention": {
         ("append_state_update", "scaled_dot_product_attention")
-    },
-    "dual_linear_silu_multiply": {
-        ("linear", "linear", "silu", "multiply")
     },
     "linear_residual": {("linear", "residual_add")},
     "linear_split_3way": {("linear", "split")},

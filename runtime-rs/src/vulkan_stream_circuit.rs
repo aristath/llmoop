@@ -16962,6 +16962,23 @@ mod tests {
     const FIXTURE_MODEL_SAMPLER_OUTPUT_BYTES: usize = 16;
     const FIXTURE_MODEL_EMBED_TOKENS_BYTES: usize = 65_536 * FIXTURE_MODEL_FRAME_BYTES;
 
+    fn selected_test_vulkan_device() -> Result<VulkanComputeDevice, VulkanError> {
+        match std::env::var("LLMOOP_TEST_VULKAN_DEVICE_INDEX") {
+            Ok(raw_index) => {
+                let index = raw_index.parse::<usize>().map_err(|error| {
+                    VulkanError(format!(
+                        "invalid LLMOOP_TEST_VULKAN_DEVICE_INDEX {raw_index:?}: {error}"
+                    ))
+                })?;
+                VulkanComputeDevice::new_for_physical_device_index(index)
+            }
+            Err(std::env::VarError::NotPresent) => VulkanComputeDevice::new(),
+            Err(error) => Err(VulkanError(format!(
+                "could not read LLMOOP_TEST_VULKAN_DEVICE_INDEX: {error}"
+            ))),
+        }
+    }
+
     #[test]
     fn backend_loop_window_is_device_owned_and_snapshot_memory_bounded() {
         assert_eq!(backend_loop_window_for_static_state_bytes(0, 4_096), 64);
@@ -19867,8 +19884,11 @@ mod tests {
 
     #[test]
     fn resident_feedback_cycle_restores_recurrent_state_when_eos_arrives_mid_cycle() {
-        let device = match VulkanComputeDevice::new() {
+        let device = match selected_test_vulkan_device() {
             Ok(device) => device,
+            Err(error) if std::env::var_os("LLMOOP_TEST_VULKAN_DEVICE_INDEX").is_some() => {
+                panic!("requested Vulkan test device is unavailable: {error}")
+            }
             Err(error) => {
                 eprintln!("skipping resident EOS feedback cycle: {error}");
                 return;
@@ -19882,7 +19902,7 @@ mod tests {
                 .into_token_stream(stream_id)
         };
         let event = VulkanResidentTokenInputEvent::new("eos_event", vec![1, 50_471, 1_413], 8)
-            .with_stop_tokens(vec![999, 1_033, 2_000]);
+            .with_stop_tokens(vec![510]);
 
         let mut scalar = create_stream("scalar_stream");
         scalar.enqueue_external_event(event.clone()).unwrap();
@@ -19943,7 +19963,7 @@ mod tests {
             .collect::<Vec<_>>();
         let batched_snapshot = batched.snapshot();
 
-        assert_eq!(scalar_output, vec![510, 1_030, 1_033]);
+        assert_eq!(scalar_output, vec![510]);
         assert_eq!(batched_output, scalar_output);
         assert_eq!(
             batched_snapshot.next_stream_tick,

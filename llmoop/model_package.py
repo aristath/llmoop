@@ -266,11 +266,6 @@ def build_vulkan_resident_package_manifest(
                     circuit, branches, tensor_index
                 )
             ),
-            can_fuse_dual_linear_silu_multiply=lambda projection, multiply, circuit=circuit: (
-                can_fuse_bf16_dual_linear_silu_multiply(
-                    circuit, projection, multiply, tensor_index
-                )
-            ),
             can_fuse_multiply_rolling_depthwise=lambda multiply, rolling, depthwise, circuit=circuit: (
                 can_fuse_bf16_multiply_rolling_depthwise(
                     circuit, multiply, rolling, depthwise, tensor_index
@@ -621,55 +616,6 @@ def shader_file_for_node(
             f"parallel_linear_{branch_count}way_{layout_token}_bf16_{input_width}x"
             + "_".join(map(str, output_widths))
             + ".comp"
-        )
-    if op == "dual_linear_silu_multiply":
-        if (
-            len(node.get("inputs", [])) != 1
-            or len(node.get("params", [])) != 2
-            or len(node.get("outputs", [])) != 1
-        ):
-            raise ModelCompileError(
-                f"dual-linear SiLU node {node['id']!r} has invalid bindings"
-            )
-        shapes = [
-            parameter_shape_for_id(circuit, parameter_id, tensor_index)
-            for parameter_id in node["params"]
-        ]
-        dtypes = {
-            parameter_dtype_for_id(circuit, parameter_id, tensor_index)
-            for parameter_id in node["params"]
-        }
-        layouts = {
-            parameter_layout_for_id(circuit, parameter_id, tensor_index)
-            for parameter_id in node["params"]
-        }
-        supported_layouts = {ROW_MAJOR_LAYOUT, VULKAN_BF16_ROW_PAIR_LAYOUT}
-        activated_input_index = int(node["attrs"]["activated_input_index"])
-        if (
-            len(shapes) != 2
-            or shapes[0] != shapes[1]
-            or len(shapes[0]) != 2
-            or any(
-                int(dimension) <= 0 or int(dimension) % 2
-                for dimension in shapes[0]
-            )
-            or dtypes != {"BF16"}
-            or len(layouts) != 1
-            or not layouts <= supported_layouts
-            or activated_input_index not in {0, 1}
-        ):
-            raise ModelCompileError(
-                f"dual-linear SiLU node {node['id']!r} has incompatible projections"
-            )
-        output_width, input_width = map(int, shapes[0])
-        layout_token = (
-            "paired"
-            if layouts == {VULKAN_BF16_ROW_PAIR_LAYOUT}
-            else "row_major"
-        )
-        return (
-            f"dual_linear_silu_multiply_{layout_token}_bf16_"
-            f"{input_width}x{output_width}_a{activated_input_index}.comp"
         )
     if op == "linear_split_3way":
         parameter_shape = parameter_shape_for_node(circuit, node, tensor_index)
@@ -1113,11 +1059,6 @@ def workgroup_count_x_for_node(circuit: Json, node: Json, tensor_index: Json) ->
             state_port(circuit, node["state_reads"][0])["shape"][1]
         )
         return hidden_size // 2
-    if node["op"] == "dual_linear_silu_multiply":
-        output_width = int(
-            parameter_shape_for_id(circuit, node["params"][0], tensor_index)[0]
-        )
-        return (output_width + 1) // 2
     if node["op"] == "parallel_head_norm_rope_2way":
         return sum(
             int(branch["norm"]["head_count"])
@@ -1464,17 +1405,6 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
                 "PART_A_WIDTH",
                 "PART_B_WIDTH",
                 "PART_C_WIDTH",
-            ),
-        ),
-        (
-            r"dual_linear_silu_multiply_(paired|row_major)_bf16_"
-            r"(\d+)x(\d+)_a([01])\.comp",
-            "dual_linear_silu_multiply_bf16.comp.template",
-            (
-                "WEIGHT_LAYOUT",
-                "INPUT_SIZE",
-                "OUTPUT_SIZE",
-                "ACTIVATED_INPUT_INDEX",
             ),
         ),
         (
@@ -2527,39 +2457,6 @@ def can_fuse_bf16_parallel_head_norm_rope(
             parameter_layout_for_node(circuit, norm, tensor_index) == ROW_MAJOR_LAYOUT
             for norm in norms
         )
-    )
-
-
-def can_fuse_bf16_dual_linear_silu_multiply(
-    circuit: Json,
-    projection: Json,
-    multiply: Json,
-    tensor_index: Json,
-) -> bool:
-    if multiply.get("inputs") is None or len(projection.get("params", [])) != 2:
-        return False
-    shapes = [
-        parameter_shape_for_id(circuit, parameter_id, tensor_index)
-        for parameter_id in projection["params"]
-    ]
-    layouts = {
-        parameter_layout_for_id(circuit, parameter_id, tensor_index)
-        for parameter_id in projection["params"]
-    }
-    return (
-        len(shapes) == 2
-        and shapes[0] == shapes[1]
-        and len(shapes[0]) == 2
-        and all(
-            int(dimension) > 0 and int(dimension) % 2 == 0
-            for dimension in shapes[0]
-        )
-        and all(
-            parameter_dtype_for_id(circuit, parameter_id, tensor_index) == "BF16"
-            for parameter_id in projection["params"]
-        )
-        and len(layouts) == 1
-        and layouts <= {ROW_MAJOR_LAYOUT, VULKAN_BF16_ROW_PAIR_LAYOUT}
     )
 
 
