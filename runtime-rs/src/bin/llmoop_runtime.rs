@@ -2410,37 +2410,50 @@ fn runtime_device_bindings_report(
     )
 }
 
-const DEFAULT_RUNTIME_CONTEXT_SIZE: usize = 4_096;
-
 fn choose_runtime_context_size(
     package_manifest: &Path,
     requested_context_size: Option<usize>,
-    prompt_token_count: usize,
+    minimum_context_size: usize,
 ) -> Result<usize, Box<dyn Error>> {
     let manifest = VulkanResidentModelPackageManifest::from_json_file(package_manifest)?;
-    let max_context_size = manifest.max_context_activations;
+    Ok(resolve_runtime_context_size(
+        manifest.max_context_activations,
+        requested_context_size,
+        minimum_context_size,
+    )?)
+}
+
+fn resolve_runtime_context_size(
+    max_context_size: usize,
+    requested_context_size: Option<usize>,
+    minimum_context_size: usize,
+) -> io::Result<usize> {
     if max_context_size == 0 {
-        return Err(Box::new(io::Error::new(
+        return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "compiled package declares a zero maximum context size",
-        )));
+        ));
     }
 
-    if let Some(context_size) = requested_context_size {
-        if context_size > max_context_size {
-            return Err(Box::new(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "requested context size {context_size} exceeds the model maximum ({max_context_size})"
-                ),
-            )));
-        }
-        return Ok(context_size);
+    let context_size = requested_context_size.unwrap_or(max_context_size);
+    if context_size > max_context_size {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "requested context size {context_size} exceeds the model maximum ({max_context_size})"
+            ),
+        ));
+    }
+    if context_size < minimum_context_size {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "context size {context_size} cannot hold the {minimum_context_size}-token prompt"
+            ),
+        ));
     }
 
-    Ok(DEFAULT_RUNTIME_CONTEXT_SIZE
-        .max(prompt_token_count)
-        .min(max_context_size))
+    Ok(context_size)
 }
 
 fn choose_chat_runtime_context_size(
@@ -2640,11 +2653,34 @@ fn parse_device_binding_assignment(raw: &str) -> Result<(String, String), String
             "invalid runtime device binding {raw:?}; target must not be empty"
         ));
     }
-    resolve_runtime_vulkan_physical_device_ref(target)?;
+    validate_runtime_device_target_syntax(target)?;
     Ok((device_id.to_string(), target.to_string()))
 }
 
+fn validate_runtime_device_target_syntax(raw: &str) -> Result<(), String> {
+    if raw.starts_with("vulkan-uuid:") {
+        parse_vulkan_device_uuid_ref(raw)?;
+    } else if raw.starts_with("vulkan") {
+        if parse_vulkan_physical_device_ref(raw)?.is_none() {
+            return Err(format!(
+                "invalid Vulkan physical device reference {raw:?}; expected vulkan:N"
+            ));
+        }
+    } else if raw.starts_with("cpu") {
+        parse_cpu_runtime_device_ref(raw)?;
+    }
+    Ok(())
+}
+
 fn resolve_runtime_vulkan_physical_device_ref(raw: &str) -> Result<Option<usize>, String> {
+    if let Some(index) = parse_vulkan_physical_device_ref(raw)? {
+        return Ok(Some(index));
+    }
+    let device_uuid = parse_vulkan_device_uuid_ref(raw)?;
+    let cpu_ordinal = parse_cpu_runtime_device_ref(raw)?;
+    if device_uuid.is_none() && cpu_ordinal.is_none() {
+        return Ok(None);
+    }
     let available_devices = VulkanComputeDevice::available_compute_devices()
         .map_err(|error| format!("failed to discover Vulkan devices: {error}"))?;
     resolve_runtime_vulkan_physical_device_ref_in(raw, &available_devices)
@@ -2944,8 +2980,9 @@ mod tests {
     use super::{
         RuntimeChatFormatter, RuntimeChatMessage, assistant_content_token_ids,
         incremental_chat_token_delta, model_owned_assistant_turn_stop_token_id,
-        normalize_chat_template_for_runtime, parse_vulkan_device_uuid_ref,
-        placed_scheduler_turn_budget, token_scheduler_turn_budget,
+        normalize_chat_template_for_runtime, parse_device_binding_assignment, parse_source_chain,
+        parse_vulkan_device_uuid_ref, placed_scheduler_turn_budget, resolve_runtime_context_size,
+        resolve_runtime_vulkan_physical_device_ref, token_scheduler_turn_budget,
     };
 
     fn formatter(template_source: &str) -> RuntimeChatFormatter {
@@ -2964,6 +3001,73 @@ mod tests {
         assert_eq!(token_scheduler_turn_budget(65_536, 4), 16_385);
         assert_eq!(token_scheduler_turn_budget(0, 4), 1);
         assert_eq!(placed_scheduler_turn_budget(40, 3), 43);
+    }
+
+    #[test]
+    fn context_defaults_to_model_capacity_and_rejects_impossible_requests() {
+        assert_eq!(
+            resolve_runtime_context_size(131_072, None, 65_536).unwrap(),
+            131_072
+        );
+        assert_eq!(
+            resolve_runtime_context_size(131_072, Some(8_192), 4_096).unwrap(),
+            8_192
+        );
+
+        let too_small = resolve_runtime_context_size(131_072, Some(4_096), 4_097).unwrap_err();
+        assert_eq!(too_small.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(too_small.to_string().contains("cannot hold"));
+
+        let too_large = resolve_runtime_context_size(32_768, Some(65_536), 1).unwrap_err();
+        assert_eq!(too_large.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(too_large.to_string().contains("exceeds the model maximum"));
+
+        let zero_model = resolve_runtime_context_size(0, None, 0).unwrap_err();
+        assert_eq!(zero_model.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn runtime_device_binding_parser_validates_syntax_without_device_discovery() {
+        assert_eq!(
+            parse_device_binding_assignment("gpu0 = vulkan:5").unwrap(),
+            ("gpu0".to_string(), "vulkan:5".to_string())
+        );
+        assert_eq!(
+            parse_device_binding_assignment("remote = lan:worker-a").unwrap(),
+            ("remote".to_string(), "lan:worker-a".to_string())
+        );
+        assert_eq!(
+            resolve_runtime_vulkan_physical_device_ref("vulkan:7").unwrap(),
+            Some(7)
+        );
+
+        for invalid in [
+            "gpu0=vulkan:",
+            "gpu0=vulkan-latest",
+            "cpu0=cpu:",
+            "cpu0=cpuish",
+            "gpu0=vulkan-uuid:abcd",
+        ] {
+            assert!(
+                parse_device_binding_assignment(invalid).is_err(),
+                "accepted invalid binding {invalid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_source_chain_parser_preserves_duplicates_only_with_unique_instances() {
+        assert_eq!(
+            parse_source_chain("layer_0 -> repeat=layer_0 -> layer_1").unwrap(),
+            vec![
+                ("layer_0".to_string(), "layer_0".to_string()),
+                ("repeat".to_string(), "layer_0".to_string()),
+                ("layer_1".to_string(), "layer_1".to_string()),
+            ]
+        );
+        assert!(parse_source_chain("layer_0,layer_0").is_err());
+        assert!(parse_source_chain("layer_0,,layer_1").is_err());
+        assert!(parse_source_chain("repeat=").is_err());
     }
 
     #[test]
