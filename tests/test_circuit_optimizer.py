@@ -79,6 +79,32 @@ class VulkanCircuitOptimizerTest(unittest.TestCase):
 
         self.assertEqual(circuit, optimized)
 
+    def test_fuses_block_scaled_fp8_linear_with_residual(self) -> None:
+        circuit = {
+            "nodes": [
+                {
+                    "id": "projection",
+                    "op": "linear",
+                    "inputs": ["hidden"],
+                    "outputs": ["projected"],
+                    "params": ["weight", "weight_scale_inv"],
+                },
+                {
+                    "id": "skip",
+                    "op": "residual_add",
+                    "inputs": ["residual", "projected"],
+                    "outputs": ["output"],
+                },
+            ]
+        }
+
+        optimized = optimize_circuit_for_vulkan(circuit)
+
+        self.assertEqual("linear_residual", optimized["nodes"][0]["op"])
+        self.assertEqual(
+            ["weight", "weight_scale_inv"], optimized["nodes"][0]["params"]
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

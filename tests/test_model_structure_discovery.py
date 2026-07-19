@@ -1,14 +1,78 @@
 from __future__ import annotations
 
 from pathlib import Path
+from math import prod
 
 from llmoop.circuit_executors import GQAAttentionCircuitPedal
 from llmoop.circuit_lowering import build_pedal_circuit
-from llmoop.model_transpiler import discover_model_structure, make_layer
+from llmoop.model_transpiler import (
+    attach_block_quantization_scales,
+    discover_model_structure,
+    make_layer,
+    synthesize_packed_expert_tensors,
+)
 
 
 def _tensor(shape: list[int], dtype: str = "BF16") -> dict[str, object]:
     return {"dtype": dtype, "shape": shape}
+
+
+def test_attaches_block_scale_to_fp8_parameter_by_tensor_structure() -> None:
+    tensors = {
+        "projection.weight": _tensor([256, 512], "F8_E4M3"),
+        "projection.weight_scale_inv": _tensor([2, 4]),
+    }
+    parameters = {"projection": "projection.weight"}
+
+    attach_block_quantization_scales(tensors, parameters)
+
+    assert parameters == {
+        "projection": "projection.weight",
+        "projection_scale_inv": "projection.weight_scale_inv",
+    }
+
+
+def test_synthesizes_separate_experts_as_packed_circuit_parameters() -> None:
+    tensors: dict[str, dict[str, object]] = {}
+
+    def source_tensor(name: str, shape: list[int], dtype: str) -> None:
+        byte_count = prod(shape) * (1 if dtype == "F8_E4M3" else 2)
+        tensors[name] = {
+            "dtype": dtype,
+            "shape": shape,
+            "data_offsets": [0, byte_count],
+            "parameter_count": prod(shape),
+            "byte_count": byte_count,
+            "source_file": "/tmp/source.safetensors",
+            "source_header_bytes": 0,
+        }
+
+    prefix = "decoder.layers.0"
+    for expert in range(2):
+        base = f"{prefix}.mlp.experts.{expert}"
+        for projection, shape in (
+            ("gate_proj", [4, 8]),
+            ("up_proj", [4, 8]),
+            ("down_proj", [8, 4]),
+        ):
+            weight = f"{base}.{projection}.weight"
+            source_tensor(weight, shape, "F8_E4M3")
+            source_tensor(
+                f"{weight}_scale_inv",
+                [shape[0] // 2, shape[1] // 2],
+                "BF16",
+            )
+
+    synthesize_packed_expert_tensors(tensors, prefix)
+
+    assert tensors[f"{prefix}.mlp.experts.gate_up_proj"]["shape"] == [2, 8, 8]
+    assert tensors[f"{prefix}.mlp.experts.down_proj"]["shape"] == [2, 8, 4]
+    assert tensors[f"{prefix}.mlp.experts.gate_up_proj_scale_inv"]["shape"] == [
+        2,
+        4,
+        4,
+    ]
+    assert len(tensors[f"{prefix}.mlp.experts.gate_up_proj"]["source_parts"]) == 4
 
 
 def test_discovers_attention_without_optional_query_key_norms() -> None:

@@ -316,7 +316,7 @@ def _conv_nodes(
             "op": "linear",
             "inputs": ["operator_norm_out"],
             "outputs": ["conv_projected"],
-            "params": ["conv_in_projection"],
+            "params": _linear_params("conv_in_projection", parameters),
         },
         {
             "id": "split_b_c_x",
@@ -363,7 +363,7 @@ def _conv_nodes(
             "op": "linear",
             "inputs": ["gated_conv_out"],
             "outputs": ["operator_out"],
-            "params": ["conv_out_projection"],
+            "params": _linear_params("conv_out_projection", parameters),
         },
         *_ffn_tail(
             operator_output="operator_out",
@@ -617,28 +617,28 @@ def _gated_delta_nodes(
             "op": "linear",
             "inputs": ["operator_norm_out"],
             "outputs": ["delta_qkv_projected"],
-            "params": ["delta_qkv_projection"],
+            "params": _linear_params("delta_qkv_projection", parameters),
         },
         {
             "id": "delta_z_projection",
             "op": "linear",
             "inputs": ["operator_norm_out"],
             "outputs": ["delta_z"],
-            "params": ["delta_z_projection"],
+            "params": _linear_params("delta_z_projection", parameters),
         },
         {
             "id": "delta_b_projection",
             "op": "linear",
             "inputs": ["operator_norm_out"],
             "outputs": ["delta_b"],
-            "params": ["delta_b_projection"],
+            "params": _linear_params("delta_b_projection", parameters),
         },
         {
             "id": "delta_a_projection",
             "op": "linear",
             "inputs": ["operator_norm_out"],
             "outputs": ["delta_a"],
-            "params": ["delta_a_projection"],
+            "params": _linear_params("delta_a_projection", parameters),
         },
         {
             "id": "delta_causal_conv",
@@ -674,7 +674,7 @@ def _gated_delta_nodes(
             "op": "linear",
             "inputs": ["delta_mixed"],
             "outputs": ["operator_out"],
-            "params": ["delta_out_projection"],
+            "params": _linear_params("delta_out_projection", parameters),
         },
         *_ffn_tail(
             operator_output="operator_out",
@@ -806,7 +806,7 @@ def _ffn_tail(
                 "op": "linear",
                 "inputs": ["ffn_norm_out"],
                 "outputs": ["moe_router_logits"],
-                "params": ["moe_router"],
+                "params": _linear_params("moe_router", parameters),
             },
             {
                 "id": "moe_topk",
@@ -823,7 +823,20 @@ def _ffn_tail(
                 "op": "sparse_moe_experts",
                 "inputs": ["ffn_norm_out", "moe_routing_weights"],
                 "outputs": ["moe_expert_outputs"],
-                "params": ["moe_input", "moe_output"],
+                "params": [
+                    "moe_input",
+                    *(
+                        ["moe_input_scale_inv"]
+                        if "moe_input_scale_inv" in parameters
+                        else []
+                    ),
+                    "moe_output",
+                    *(
+                        ["moe_output_scale_inv"]
+                        if "moe_output_scale_inv" in parameters
+                        else []
+                    ),
+                ],
                 "attrs": {
                     "hidden_size": int(feed_forward.get("hidden_size", 0)),
                     "intermediate_size": int(feed_forward["intermediate_size"]),
@@ -851,7 +864,7 @@ def _ffn_tail(
                         "op": "linear",
                         "inputs": ["ffn_norm_out"],
                         "outputs": ["shared_gate_up"],
-                        "params": ["shared_mlp_input"],
+                        "params": _linear_params("shared_mlp_input", parameters),
                     },
                     {
                         "id": "shared_mlp_split",
@@ -871,12 +884,40 @@ def _ffn_tail(
                         "op": "linear",
                         "inputs": ["shared_hidden"],
                         "outputs": ["shared_out"],
-                        "params": ["shared_mlp_output"],
+                        "params": _linear_params("shared_mlp_output", parameters),
                     },
+                    *(
+                        [
+                            {
+                                "id": "shared_expert_gate_projection",
+                                "op": "linear",
+                                "inputs": ["ffn_norm_out"],
+                                "outputs": ["shared_gate_logit"],
+                                "params": _linear_params(
+                                    "shared_mlp_gate", parameters
+                                ),
+                            },
+                            {
+                                "id": "shared_expert_gate",
+                                "op": "sigmoid_scalar_multiply",
+                                "inputs": ["shared_out", "shared_gate_logit"],
+                                "outputs": ["gated_shared_out"],
+                            },
+                        ]
+                        if "shared_mlp_gate" in parameters
+                        else []
+                    ),
                     {
                         "id": "shared_and_sparse_expert_add",
                         "op": "residual_add",
-                        "inputs": ["moe_out", "shared_out"],
+                        "inputs": [
+                            "moe_out",
+                            (
+                                "gated_shared_out"
+                                if "shared_mlp_gate" in parameters
+                                else "shared_out"
+                            ),
+                        ],
                         "outputs": ["ffn_out"],
                     },
                 ]
@@ -1077,6 +1118,9 @@ def _residual_node(
 
 def _linear_params(weight_id: str, parameters: Json) -> list[str]:
     result = [weight_id]
+    scale_id = f"{weight_id}_scale_inv"
+    if scale_id in parameters:
+        result.append(scale_id)
     bias_id = f"{weight_id}_bias"
     if bias_id in parameters:
         result.append(bias_id)
@@ -1144,6 +1188,7 @@ def _param_role(name: str) -> str:
         "moe_output": "mixture_of_experts_down_weights",
         "shared_mlp_input": "shared_expert_gate_up_projection",
         "shared_mlp_output": "shared_expert_down_projection",
+        "shared_mlp_gate": "shared_expert_output_gate_projection",
         "conv_in_projection": "short_convolution_input_projection",
         "conv_depthwise_kernel": "short_convolution_depthwise_temporal_kernel",
         "conv_out_projection": "short_convolution_output_projection",
@@ -1191,6 +1236,9 @@ def _param_role(name: str) -> str:
         "rg_lru_recurrent_gate_bias": "real_gated_recurrence_recurrent_gate_bias",
         "rg_lru_recurrent_param": "real_gated_recurrence_parameter",
     }
+    if name.endswith("_scale_inv"):
+        weight_id = name.removesuffix("_scale_inv")
+        return f"{roles[weight_id]}_block_scale_inverse"
     return roles[name]
 
 

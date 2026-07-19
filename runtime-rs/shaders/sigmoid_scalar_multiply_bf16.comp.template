@@ -1,0 +1,28 @@
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer InputFrame { uint words[]; } input_frame;
+layout(set = 0, binding = 1) readonly buffer GateLogit { uint words[]; } gate_logit;
+layout(set = 0, binding = 2) buffer OutputFrame { uint words[]; } output_frame;
+
+const uint HIDDEN_SIZE = {{HIDDEN_SIZE}}u;
+const uint HIDDEN_WORDS = (HIDDEN_SIZE + 1u) / 2u;
+
+float bf16_to_f32(uint value) { return uintBitsToFloat((value & 0xffffu) << 16); }
+
+uint f32_to_bf16(float value) {
+    uint bits = floatBitsToUint(value);
+    uint lsb = (bits >> 16) & 1u;
+    return (bits + 0x7fffu + lsb) >> 16;
+}
+
+void main() {
+    float gate = 1.0 / (1.0 + exp(-bf16_to_f32(gate_logit.words[0])));
+    for (uint word = gl_LocalInvocationID.x; word < HIDDEN_WORDS; word += 64u) {
+        uint packed = input_frame.words[word];
+        float lo = bf16_to_f32(packed) * gate;
+        float hi = bf16_to_f32(packed >> 16u) * gate;
+        output_frame.words[word] = (f32_to_bf16(hi) << 16u) | f32_to_bf16(lo);
+    }
+}

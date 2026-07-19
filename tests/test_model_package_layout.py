@@ -5,6 +5,7 @@ import struct
 from pathlib import Path
 
 from llmoop.model_package import (
+    ROW_MAJOR_LAYOUT,
     VULKAN_BF16_ROW_PAIR_LAYOUT,
     compiled_tensor_layout,
     copy_shader_templates,
@@ -16,6 +17,16 @@ def test_bf16_matrix_layout_is_compiled_as_interleaved_row_pairs() -> None:
     assert (
         compiled_tensor_layout({"dtype": "BF16", "shape": [4, 4]})
         == VULKAN_BF16_ROW_PAIR_LAYOUT
+    )
+
+
+def test_fp8_block_scales_remain_row_major() -> None:
+    assert (
+        compiled_tensor_layout(
+            {"dtype": "BF16", "shape": [4, 4]},
+            tensor_name="projection.weight_scale_inv",
+        )
+        == ROW_MAJOR_LAYOUT
     )
 
 
@@ -111,6 +122,59 @@ def test_compiler_renders_paired_matrix_and_transducer_shaders(tmp_path: Path) -
             tmp_path
             / "tied_output_projection_paired_bf16_32000x768_scale0.166666667_to_f32.comp"
         ).read_text()
+    )
+
+
+def test_compiler_renders_native_block_scaled_fp8_linear_shaders(
+    tmp_path: Path,
+) -> None:
+    shader_source_dir = Path(__file__).parents[1] / "runtime-rs" / "shaders"
+    shader_files = {
+        "linear_fp8_e4m3_b128x128_5120x17408.comp",
+        "linear_bias_fp8_e4m3_b128x128_5120x17408.comp",
+        "linear_residual_fp8_e4m3_b128x128_17408x5120.comp",
+    }
+
+    copy_shader_templates(shader_source_dir, tmp_path, shader_files)
+
+    for shader_file in shader_files:
+        shader = (tmp_path / shader_file).read_text()
+        assert "const uint BLOCK_ROWS = 128u;" in shader
+        assert "const uint BLOCK_COLUMNS = 128u;" in shader
+        assert "fp8_e4m3_to_f32" in shader
+        assert "WeightScaleInv" in shader
+        assert "{{" not in shader
+    assert (
+        "binding = 4) readonly buffer Bias"
+        in (tmp_path / "linear_bias_fp8_e4m3_b128x128_5120x17408.comp").read_text()
+    )
+
+
+def test_compiler_renders_native_block_scaled_fp8_sparse_experts(
+    tmp_path: Path,
+) -> None:
+    shader_source_dir = Path(__file__).parents[1] / "runtime-rs" / "shaders"
+    shader_files = {
+        "moe_topk_bf16_e256_k8.comp",
+        "sparse_moe_experts_fp8_e4m3_b128x128_h2048_i512_e256_k8.comp",
+        "moe_reduce_bf16_h2048_e256.comp",
+        "sigmoid_scalar_multiply_bf16_2048.comp",
+    }
+
+    copy_shader_templates(shader_source_dir, tmp_path, shader_files)
+
+    expert_shader = (
+        tmp_path
+        / "sparse_moe_experts_fp8_e4m3_b128x128_h2048_i512_e256_k8.comp"
+    ).read_text()
+    assert "const uint NUM_EXPERTS = 256u;" in expert_shader
+    assert "const uint EXPERTS_PER_TOKEN = 8u;" in expert_shader
+    assert "ExpertInputScaleInv" in expert_shader
+    assert "ExpertOutputScaleInv" in expert_shader
+    assert "{{" not in expert_shader
+    assert (
+        "const uint HIDDEN_SIZE = 2048u;"
+        in (tmp_path / "sigmoid_scalar_multiply_bf16_2048.comp").read_text()
     )
 
 

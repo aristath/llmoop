@@ -83,7 +83,7 @@ def _fuse_linear_residual(
     if (
         len(linear.get("inputs", [])) != 1
         or len(linear.get("outputs", [])) != 1
-        or len(linear.get("params", [])) != 1
+        or not _linear_params_are_fusible(linear.get("params", []))
         or linear.get("state_reads")
         or linear.get("state_writes")
     ):
@@ -121,4 +121,10 @@ def _plain_single_input_output_node(node: Json) -> bool:
         and not node.get("params")
         and not node.get("state_reads")
         and not node.get("state_writes")
+    )
+
+
+def _linear_params_are_fusible(parameters: list[str]) -> bool:
+    return len(parameters) == 1 or (
+        len(parameters) == 2 and parameters[1] == f"{parameters[0]}_scale_inv"
     )

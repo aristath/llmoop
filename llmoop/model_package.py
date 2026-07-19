@@ -197,6 +197,16 @@ def build_vulkan_resident_greedy_package_manifest(
         for component in output_components
         if component["type"] == "linear_projection"
     )
+    for role, tensor in (
+        ("input embedding", embed_tensor),
+        ("output normalization", norm_tensor),
+        ("output projection", projection_tensor),
+    ):
+        actual_dtype = tensor_dtype(tensor_index, tensor)
+        if actual_dtype != dtype:
+            raise ModelCompileError(
+                f"{role} tensor {tensor!r} has dtype {actual_dtype}; expected {dtype}"
+            )
     embedding_layout = tensor_layout(tensor_index, embed_tensor)
     projection_layout = tensor_layout(tensor_index, projection_tensor)
     embedding_shader_file = (
@@ -438,6 +448,22 @@ def shader_file_for_node(
     if op == "linear":
         parameter_shape = parameter_shape_for_node(circuit, node, tensor_index)
         out_features, in_features = parameter_shape
+        parameter_dtype = parameter_dtype_for_node(circuit, node, tensor_index)
+        if parameter_dtype == "F8_E4M3":
+            block_rows, block_columns = fp8_block_shape_for_node(
+                circuit, node, tensor_index
+            )
+            has_bias = len(node.get("params", [])) == 3
+            prefix = "linear_bias" if has_bias else "linear"
+            return (
+                f"{prefix}_fp8_e4m3_b{block_rows}x{block_columns}_"
+                f"{in_features}x{out_features}.comp"
+            )
+        if parameter_dtype != "BF16":
+            raise ModelCompileError(
+                f"linear node {node['id']!r} has unsupported weight dtype "
+                f"{parameter_dtype}"
+            )
         layout = parameter_layout_for_node(circuit, node, tensor_index)
         has_bias = len(node.get("params", [])) == 2
         prefix = "linear"
@@ -450,6 +476,20 @@ def shader_file_for_node(
     if op == "linear_residual":
         parameter_shape = parameter_shape_for_node(circuit, node, tensor_index)
         out_features, in_features = parameter_shape
+        parameter_dtype = parameter_dtype_for_node(circuit, node, tensor_index)
+        if parameter_dtype == "F8_E4M3":
+            block_rows, block_columns = fp8_block_shape_for_node(
+                circuit, node, tensor_index
+            )
+            return (
+                f"linear_residual_fp8_e4m3_b{block_rows}x{block_columns}_"
+                f"{in_features}x{out_features}.comp"
+            )
+        if parameter_dtype != "BF16":
+            raise ModelCompileError(
+                f"linear-residual node {node['id']!r} has unsupported weight dtype "
+                f"{parameter_dtype}"
+            )
         layout = parameter_layout_for_node(circuit, node, tensor_index)
         prefix = (
             "linear_residual_paired_bf16"
@@ -505,6 +545,8 @@ def shader_file_for_node(
         return "silu_multiply_bf16.comp"
     if op == "sigmoid_multiply":
         return "sigmoid_multiply_bf16.comp"
+    if op == "sigmoid_scalar_multiply":
+        return f"sigmoid_scalar_multiply_bf16_{hidden_size}.comp"
     if op == "rms_norm_per_head":
         heads = (
             node["attrs"]["query_heads"]
@@ -613,6 +655,21 @@ def shader_file_for_node(
         )
     if op == "sparse_moe_experts":
         attrs = node["attrs"]
+        parameter_dtype = parameter_dtype_for_node(circuit, node, tensor_index)
+        if parameter_dtype == "F8_E4M3":
+            block_rows, block_columns = fp8_moe_block_shape_for_node(
+                circuit, node, tensor_index
+            )
+            return (
+                f"sparse_moe_experts_fp8_e4m3_b{block_rows}x{block_columns}_"
+                f"h{attrs['hidden_size']}_i{attrs['intermediate_size']}_"
+                f"e{attrs['num_experts']}_k{attrs['experts_per_token']}.comp"
+            )
+        if parameter_dtype != "BF16":
+            raise ModelCompileError(
+                f"sparse MoE node {node['id']!r} has unsupported expert dtype "
+                f"{parameter_dtype}"
+            )
         return (
             f"sparse_moe_experts_bf16_h{attrs['hidden_size']}_i{attrs['intermediate_size']}"
             f"_e{attrs['num_experts']}_k{attrs['experts_per_token']}.comp"
@@ -738,6 +795,26 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
         return rendered
 
     shaped_templates = (
+        (
+            r"linear_fp8_e4m3_b(\d+)x(\d+)_(\d+)x(\d+)\.comp",
+            "linear_fp8_e4m3.comp.template",
+            ("BLOCK_ROWS", "BLOCK_COLUMNS", "INPUT_SIZE", "OUTPUT_SIZE"),
+        ),
+        (
+            r"linear_bias_fp8_e4m3_b(\d+)x(\d+)_(\d+)x(\d+)\.comp",
+            "linear_bias_fp8_e4m3.comp.template",
+            ("BLOCK_ROWS", "BLOCK_COLUMNS", "INPUT_SIZE", "OUTPUT_SIZE"),
+        ),
+        (
+            r"linear_residual_fp8_e4m3_b(\d+)x(\d+)_(\d+)x(\d+)\.comp",
+            "linear_residual_fp8_e4m3.comp.template",
+            ("BLOCK_ROWS", "BLOCK_COLUMNS", "INPUT_SIZE", "OUTPUT_SIZE"),
+        ),
+        (
+            r"sigmoid_scalar_multiply_bf16_(\d+)\.comp",
+            "sigmoid_scalar_multiply_bf16.comp.template",
+            ("HIDDEN_SIZE",),
+        ),
         (
             r"linear_bf16_(\d+)x(\d+)\.comp",
             "linear_bf16.comp.template",
@@ -1017,7 +1094,7 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
     moe_topk_shape = re.fullmatch(r"moe_topk_bf16_e(\d+)_k(\d+)\.comp", shader_file)
     if moe_topk_shape is not None:
         num_experts, experts_per_token = map(int, moe_topk_shape.groups())
-        if not 0 < experts_per_token <= num_experts <= 64:
+        if not 0 < experts_per_token <= num_experts <= 4096:
             raise ModelCompileError(
                 f"invalid sparse expert routing e{num_experts} k{experts_per_token}"
             )
@@ -1025,6 +1102,40 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
             source_dir,
             "moe_topk_bf16.comp.template",
             {
+                "NUM_EXPERTS": str(num_experts),
+                "EXPERTS_PER_TOKEN": str(experts_per_token),
+            },
+        )
+
+    sparse_moe_fp8_shape = re.fullmatch(
+        r"sparse_moe_experts_fp8_e4m3_b(\d+)x(\d+)_h(\d+)_i(\d+)_e(\d+)_k(\d+)\.comp",
+        shader_file,
+    )
+    if sparse_moe_fp8_shape is not None:
+        (
+            block_rows,
+            block_columns,
+            hidden_size,
+            intermediate_size,
+            num_experts,
+            experts_per_token,
+        ) = map(int, sparse_moe_fp8_shape.groups())
+        if hidden_size % 2 or intermediate_size % 2:
+            raise ModelCompileError(
+                "packed BF16 activations for FP8 sparse experts require even dimensions"
+            )
+        if not 0 < experts_per_token <= num_experts <= 4096:
+            raise ModelCompileError(
+                f"invalid sparse expert routing e{num_experts} k{experts_per_token}"
+            )
+        return render_shader_template(
+            source_dir,
+            "sparse_moe_experts_fp8_e4m3.comp.template",
+            {
+                "BLOCK_ROWS": str(block_rows),
+                "BLOCK_COLUMNS": str(block_columns),
+                "HIDDEN_SIZE": str(hidden_size),
+                "INTERMEDIATE_SIZE": str(intermediate_size),
                 "NUM_EXPERTS": str(num_experts),
                 "EXPERTS_PER_TOKEN": str(experts_per_token),
             },
@@ -1042,7 +1153,7 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
             raise ModelCompileError(
                 "packed BF16 sparse experts require even dimensions"
             )
-        if not 0 < experts_per_token <= num_experts <= 64:
+        if not 0 < experts_per_token <= num_experts <= 4096:
             raise ModelCompileError(
                 f"invalid sparse expert routing e{num_experts} k{experts_per_token}"
             )
@@ -1277,23 +1388,34 @@ def copy_tensor_package(
         check_compile_cancelled(cancel_requested)
         if progress is not None:
             progress(index, total, tensor_name)
-        source = Path(info["source_file"])
-        if not source.is_file():
-            raise ModelCompileError(f"tensor source file does not exist: {source}")
-        layout = compiled_tensor_layout(info)
+        layout = compiled_tensor_layout(info, tensor_name=tensor_name)
         digest = blake2s(tensor_name.encode("utf-8"), digest_size=8).hexdigest()
         destination = weights_dir / f"tensor_{digest}.safetensors"
-        header_bytes = write_compiled_tensor(
-            tensor_name=tensor_name,
-            info=info,
-            source=source,
-            destination=destination,
-            layout=layout,
-        )
+        if info.get("source_parts"):
+            header_bytes = write_compiled_composite_tensor(
+                tensor_name=tensor_name,
+                info=info,
+                destination=destination,
+                layout=layout,
+            )
+        else:
+            source = Path(info["source_file"])
+            if not source.is_file():
+                raise ModelCompileError(f"tensor source file does not exist: {source}")
+            header_bytes = write_compiled_tensor(
+                tensor_name=tensor_name,
+                info=info,
+                source=source,
+                destination=destination,
+                layout=layout,
+            )
         relative_destination = relative_json_path(package_dir, destination)
         info["source_file"] = relative_destination
         info["data_offsets"] = [0, int(info["byte_count"])]
         info["layout"] = layout
+        info.pop("source_parts", None)
+        info.pop("source_header_bytes", None)
+        info.pop("layout_hint", None)
         compiled_sources.append(
             {
                 "path": relative_destination,
@@ -1372,10 +1494,13 @@ def validate_compiled_package(package_dir: Path, manifest: Json) -> None:
             raise ModelCompileError(f"compiled package shader is not valid SPIR-V: {shader}")
 
 
-def compiled_tensor_layout(info: Json) -> str:
+def compiled_tensor_layout(info: Json, *, tensor_name: str | None = None) -> str:
     shape = [int(value) for value in info.get("shape", [])]
+    if info.get("layout_hint") == ROW_MAJOR_LAYOUT:
+        return ROW_MAJOR_LAYOUT
     if (
         info.get("dtype") == "BF16"
+        and not (tensor_name or "").endswith(".weight_scale_inv")
         and len(shape) == 2
         and shape[0] % 2 == 0
         and shape[1] % 2 == 0
@@ -1403,7 +1528,9 @@ def write_compiled_tensor(
     }
     header_payload = json.dumps(header, separators=(",", ":")).encode("utf-8")
     header_payload += b" " * (-len(header_payload) % 8)
-    source_header_bytes, _source_header = read_safetensors_header(source)
+    source_header_bytes = int(
+        info.get("source_header_bytes") or read_safetensors_header(source)[0]
+    )
     source_start = 8 + source_header_bytes + int(info["data_offsets"][0])
 
     with (
@@ -1422,6 +1549,57 @@ def write_compiled_tensor(
             )
         else:
             copy_exact_bytes(source_handle, destination_handle, byte_count)
+    return len(header_payload)
+
+
+def write_compiled_composite_tensor(
+    *,
+    tensor_name: str,
+    info: Json,
+    destination: Path,
+    layout: str,
+) -> int:
+    if layout != ROW_MAJOR_LAYOUT:
+        raise ModelCompileError(
+            f"composite tensor {tensor_name!r} requires unsupported layout {layout!r}"
+        )
+    byte_count = int(info["byte_count"])
+    header = {
+        "__metadata__": {"format": "llmoop", "layout": layout},
+        tensor_name: {
+            "dtype": info["dtype"],
+            "shape": info["shape"],
+            "data_offsets": [0, byte_count],
+        },
+    }
+    header_payload = json.dumps(header, separators=(",", ":")).encode("utf-8")
+    header_payload += b" " * (-len(header_payload) % 8)
+    written = 0
+    with destination.open("wb") as destination_handle:
+        destination_handle.write(struct.pack("<Q", len(header_payload)))
+        destination_handle.write(header_payload)
+        for part in info["source_parts"]:
+            source = Path(part["source_file"])
+            if not source.is_file():
+                raise ModelCompileError(
+                    f"composite tensor {tensor_name!r} source does not exist: {source}"
+                )
+            source_header_bytes = int(part["source_header_bytes"])
+            offsets = [int(value) for value in part["data_offsets"]]
+            part_bytes = int(part["byte_count"])
+            if offsets[1] - offsets[0] != part_bytes:
+                raise ModelCompileError(
+                    f"composite tensor {tensor_name!r} part {part['tensor']!r} "
+                    "has inconsistent byte offsets"
+                )
+            with source.open("rb") as source_handle:
+                source_handle.seek(8 + source_header_bytes + offsets[0])
+                copy_exact_bytes(source_handle, destination_handle, part_bytes)
+            written += part_bytes
+    if written != byte_count:
+        raise ModelCompileError(
+            f"composite tensor {tensor_name!r} wrote {written} bytes; expected {byte_count}"
+        )
     return len(header_payload)
 
 
@@ -1485,8 +1663,17 @@ def parameter_shape_for_id(
     return tensor_shape(tensor_index, parameter["tensor"])
 
 
+def parameter_dtype_for_node(circuit: Json, node: Json, tensor_index: Json) -> str:
+    return parameter_dtype_for_id(circuit, node["params"][0], tensor_index)
+
+
 def parameter_layout_for_node(circuit: Json, node: Json, tensor_index: Json) -> str:
     parameter_id = node["params"][0]
+    parameter = circuit["parameters"]["refs"][parameter_id]
+    return tensor_layout(tensor_index, parameter["tensor"])
+
+
+def parameter_layout_for_id(circuit: Json, parameter_id: str, tensor_index: Json) -> str:
     parameter = circuit["parameters"]["refs"][parameter_id]
     return tensor_layout(tensor_index, parameter["tensor"])
 
@@ -1494,6 +1681,132 @@ def parameter_layout_for_node(circuit: Json, node: Json, tensor_index: Json) -> 
 def parameter_dtype_for_id(circuit: Json, parameter_id: str, tensor_index: Json) -> str:
     parameter = circuit["parameters"]["refs"][parameter_id]
     return str(tensor_index["tensors"][parameter["tensor"]]["dtype"])
+
+
+def fp8_block_shape_for_node(
+    circuit: Json, node: Json, tensor_index: Json
+) -> tuple[int, int]:
+    weight_id = str(node["params"][0])
+    scale_id = f"{weight_id}_scale_inv"
+    if len(node.get("params", [])) < 2 or node["params"][1] != scale_id:
+        raise ModelCompileError(
+            f"FP8 linear node {node['id']!r} does not bind {scale_id!r} "
+            "immediately after its weight"
+        )
+    out_features, in_features = parameter_shape_for_id(
+        circuit, weight_id, tensor_index
+    )
+    scale_shape = parameter_shape_for_id(circuit, scale_id, tensor_index)
+    if len(scale_shape) != 2 or any(value <= 0 for value in scale_shape):
+        raise ModelCompileError(
+            f"FP8 linear node {node['id']!r} has invalid scale shape {scale_shape}"
+        )
+    if parameter_dtype_for_id(circuit, scale_id, tensor_index) != "BF16":
+        raise ModelCompileError(
+            f"FP8 linear node {node['id']!r} requires a BF16 block scale"
+        )
+    if parameter_layout_for_id(circuit, scale_id, tensor_index) != ROW_MAJOR_LAYOUT:
+        raise ModelCompileError(
+            f"FP8 linear node {node['id']!r} requires row-major block scales"
+        )
+    block_rows = (out_features + scale_shape[0] - 1) // scale_shape[0]
+    block_columns = (in_features + scale_shape[1] - 1) // scale_shape[1]
+    expected_scale_shape = [
+        (out_features + block_rows - 1) // block_rows,
+        (in_features + block_columns - 1) // block_columns,
+    ]
+    if scale_shape != expected_scale_shape:
+        raise ModelCompileError(
+            f"FP8 linear node {node['id']!r} scale shape {scale_shape} is not "
+            f"a regular block grid for weight shape {[out_features, in_features]}"
+        )
+    return block_rows, block_columns
+
+
+def fp8_moe_block_shape_for_node(
+    circuit: Json, node: Json, tensor_index: Json
+) -> tuple[int, int]:
+    expected_params = [
+        "moe_input",
+        "moe_input_scale_inv",
+        "moe_output",
+        "moe_output_scale_inv",
+    ]
+    if node.get("params") != expected_params:
+        raise ModelCompileError(
+            f"FP8 sparse MoE node {node['id']!r} must bind {expected_params}; "
+            f"got {node.get('params')}"
+        )
+    attrs = node["attrs"]
+    experts = int(attrs["num_experts"])
+    hidden = int(attrs["hidden_size"])
+    intermediate = int(attrs["intermediate_size"])
+    input_shape = parameter_shape_for_id(circuit, "moe_input", tensor_index)
+    output_shape = parameter_shape_for_id(circuit, "moe_output", tensor_index)
+    input_scale_shape = parameter_shape_for_id(
+        circuit, "moe_input_scale_inv", tensor_index
+    )
+    output_scale_shape = parameter_shape_for_id(
+        circuit, "moe_output_scale_inv", tensor_index
+    )
+    if input_shape != [experts, intermediate * 2, hidden]:
+        raise ModelCompileError(
+            f"FP8 sparse MoE input shape {input_shape} does not match "
+            f"{[experts, intermediate * 2, hidden]}"
+        )
+    if output_shape != [experts, hidden, intermediate]:
+        raise ModelCompileError(
+            f"FP8 sparse MoE output shape {output_shape} does not match "
+            f"{[experts, hidden, intermediate]}"
+        )
+    for parameter_id in ("moe_input_scale_inv", "moe_output_scale_inv"):
+        if parameter_dtype_for_id(circuit, parameter_id, tensor_index) != "BF16":
+            raise ModelCompileError(
+                f"FP8 sparse MoE scale {parameter_id!r} must be BF16"
+            )
+        if parameter_layout_for_id(circuit, parameter_id, tensor_index) != ROW_MAJOR_LAYOUT:
+            raise ModelCompileError(
+                f"FP8 sparse MoE scale {parameter_id!r} must be row-major"
+            )
+    if len(input_scale_shape) != 3 or input_scale_shape[0] != experts:
+        raise ModelCompileError(
+            f"FP8 sparse MoE input scale shape is invalid: {input_scale_shape}"
+        )
+    block_rows, block_columns = regular_block_shape(
+        [intermediate * 2, hidden], input_scale_shape[1:]
+    )
+    expected_output_scale = [
+        experts,
+        (hidden + block_rows - 1) // block_rows,
+        (intermediate + block_columns - 1) // block_columns,
+    ]
+    if output_scale_shape != expected_output_scale:
+        raise ModelCompileError(
+            f"FP8 sparse MoE output scale shape {output_scale_shape} does not "
+            f"match {expected_output_scale}"
+        )
+    return block_rows, block_columns
+
+
+def regular_block_shape(matrix_shape: list[int], scale_shape: list[int]) -> tuple[int, int]:
+    if len(matrix_shape) != 2 or len(scale_shape) != 2 or any(
+        value <= 0 for value in scale_shape
+    ):
+        raise ModelCompileError(
+            f"invalid block-scaled matrix shape {matrix_shape} / {scale_shape}"
+        )
+    rows, columns = matrix_shape
+    block_rows = (rows + scale_shape[0] - 1) // scale_shape[0]
+    block_columns = (columns + scale_shape[1] - 1) // scale_shape[1]
+    expected_scale_shape = [
+        (rows + block_rows - 1) // block_rows,
+        (columns + block_columns - 1) // block_columns,
+    ]
+    if scale_shape != expected_scale_shape:
+        raise ModelCompileError(
+            f"scale shape {scale_shape} is not a regular block grid for {matrix_shape}"
+        )
+    return block_rows, block_columns
 
 
 def state_port(circuit: Json, state_id: str) -> Json:
@@ -1505,6 +1818,10 @@ def state_port(circuit: Json, state_id: str) -> Json:
 
 def tensor_shape(tensor_index: Json, tensor: str) -> list[int]:
     return [int(dim) for dim in tensor_index["tensors"][tensor]["shape"]]
+
+
+def tensor_dtype(tensor_index: Json, tensor: str) -> str:
+    return str(tensor_index["tensors"][tensor]["dtype"])
 
 
 def tensor_byte_count(tensor_index: Json, tensor: str) -> int:

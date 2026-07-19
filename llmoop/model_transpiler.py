@@ -147,19 +147,29 @@ FFN_FUSED_GATE_UP_SUFFIXES = ("mlp.gate_up_proj.weight",)
 MOE_INPUT_SUFFIXES = (
     "block_sparse_moe.input_linear.weight",
     "block_sparse_moe.experts.gate_up_proj",
+    "mlp.experts.gate_up_proj",
 )
 MOE_OUTPUT_SUFFIXES = (
     "block_sparse_moe.output_linear.weight",
     "block_sparse_moe.experts.down_proj",
+    "mlp.experts.down_proj",
 )
 MOE_ROUTER_SUFFIXES = (
     "block_sparse_moe.router.layer.weight",
     "block_sparse_moe.router.weight",
     "block_sparse_moe.gate.weight",
+    "mlp.gate.weight",
 )
 
-SHARED_MLP_INPUT_SUFFIXES = ("shared_mlp.input_linear.weight",)
-SHARED_MLP_OUTPUT_SUFFIXES = ("shared_mlp.output_linear.weight",)
+SHARED_MLP_INPUT_SUFFIXES = (
+    "shared_mlp.input_linear.weight",
+    "mlp.shared_expert.gate_up_proj",
+)
+SHARED_MLP_OUTPUT_SUFFIXES = (
+    "shared_mlp.output_linear.weight",
+    "mlp.shared_expert.down_proj.weight",
+)
+SHARED_MLP_GATE_SUFFIXES = ("mlp.shared_expert_gate.weight",)
 
 CONV_IN_PROJECTION_SUFFIXES = ("conv.in_proj.weight",)
 CONV_KERNEL_SUFFIXES = ("conv.conv.weight", "conv.depthwise.weight")
@@ -546,6 +556,7 @@ def discover_layer_structure(
                 ),
             }
         )
+    synthesize_packed_expert_tensors(tensors, prefix)
     dense_gate = find_optional_layer_tensor(tensors, prefix, FFN_GATE_SUFFIXES)
     fused_gate_up = find_optional_layer_tensor(
         tensors, prefix, FFN_FUSED_GATE_UP_SUFFIXES
@@ -622,6 +633,11 @@ def discover_layer_structure(
         if shared_input is not None and shared_output is not None:
             layer_tensors["shared_mlp_input"] = shared_input
             layer_tensors["shared_mlp_output"] = shared_output
+            shared_gate = find_optional_layer_tensor(
+                tensors, prefix, SHARED_MLP_GATE_SUFFIXES
+            )
+            if shared_gate is not None:
+                layer_tensors["shared_mlp_gate"] = shared_gate
     else:
         raise ModelTranspileError(
             f"could not discover feed-forward structure for layer prefix {prefix!r}"
@@ -924,6 +940,8 @@ def discover_layer_structure(
             decoder_config.get("attention_multiplier", configured_head_width**-0.5)
         )
         value_head_norm = False
+
+    attach_block_quantization_scales(tensors, layer_tensors)
 
     return LayerStructure(
         index=layer_index,
@@ -1684,6 +1702,8 @@ def make_ffn_component(structure: ModelStructure, layer: LayerStructure) -> Json
                     "shared_output": tensor_ref(layer.tensors["shared_mlp_output"]),
                 }
             )
+            if "shared_mlp_gate" in layer.tensors:
+                params["shared_gate"] = tensor_ref(layer.tensors["shared_mlp_gate"])
         return {
             "id": "feed_forward",
             "type": "sparse_moe_feed_forward",
@@ -2146,6 +2166,7 @@ def make_tensor_index(model_dir: Path) -> Json:
                 "parameter_count": params,
                 "byte_count": byte_count,
                 "source_file": str(weights_file),
+                "source_header_bytes": header_len,
             }
 
     return {
@@ -2235,6 +2256,241 @@ def find_bias_for_weight(tensors: dict[str, Json], weight: str) -> str | None:
         return None
     bias = f"{weight[: -len('.weight')]}.bias"
     return bias if bias in tensors else None
+
+
+def synthesize_packed_expert_tensors(
+    tensors: dict[str, Json], layer_prefix: str
+) -> None:
+    """Describe separately stored experts as packed executable tensors.
+
+    The compiler package owns the physical packing.  The model graph only sees
+    the common [expert, row, column] circuit parameters used by every sparse
+    MoE pedal, regardless of how the source checkpoint sharded its experts.
+    """
+    packed_input = f"{layer_prefix}.mlp.experts.gate_up_proj"
+    packed_output = f"{layer_prefix}.mlp.experts.down_proj"
+    if packed_input in tensors or packed_output in tensors:
+        return
+
+    expert_pattern = re.compile(
+        rf"^{re.escape(layer_prefix)}\.mlp\.experts\.(\d+)\.gate_proj\.weight$"
+    )
+    expert_indices = sorted(
+        int(match.group(1))
+        for tensor_name in tensors
+        if (match := expert_pattern.fullmatch(tensor_name)) is not None
+    )
+    if not expert_indices:
+        return
+    if expert_indices != list(range(len(expert_indices))):
+        raise ModelTranspileError(
+            f"layer prefix {layer_prefix!r} has non-contiguous expert indices"
+        )
+
+    gate_weights: list[str] = []
+    up_weights: list[str] = []
+    down_weights: list[str] = []
+    gate_scales: list[str] = []
+    up_scales: list[str] = []
+    down_scales: list[str] = []
+    for expert in expert_indices:
+        base = f"{layer_prefix}.mlp.experts.{expert}"
+        gate = f"{base}.gate_proj.weight"
+        up = f"{base}.up_proj.weight"
+        down = f"{base}.down_proj.weight"
+        required = (gate, up, down)
+        missing = [name for name in required if name not in tensors]
+        if missing:
+            raise ModelTranspileError(
+                f"layer prefix {layer_prefix!r} expert {expert} is missing {missing}"
+            )
+        gate_weights.append(gate)
+        up_weights.append(up)
+        down_weights.append(down)
+        if tensors[gate].get("dtype") == "F8_E4M3":
+            scales = tuple(f"{name}_scale_inv" for name in required)
+            missing_scales = [name for name in scales if name not in tensors]
+            if missing_scales:
+                raise ModelTranspileError(
+                    f"layer prefix {layer_prefix!r} expert {expert} is missing "
+                    f"FP8 scales {missing_scales}"
+                )
+            gate_scales.append(scales[0])
+            up_scales.append(scales[1])
+            down_scales.append(scales[2])
+
+    gate_shape = tensor_matrix_shape(tensors, gate_weights[0])
+    up_shape = tensor_matrix_shape(tensors, up_weights[0])
+    down_shape = tensor_matrix_shape(tensors, down_weights[0])
+    if gate_shape != up_shape or down_shape != [gate_shape[1], gate_shape[0]]:
+        raise ModelTranspileError(
+            f"layer prefix {layer_prefix!r} has incompatible expert projection "
+            f"shapes gate={gate_shape}, up={up_shape}, down={down_shape}"
+        )
+    input_parts = [
+        tensor_name
+        for gate, up in zip(gate_weights, up_weights, strict=True)
+        for tensor_name in (gate, up)
+    ]
+    tensors[packed_input] = composite_tensor(
+        tensors,
+        input_parts,
+        [len(expert_indices), gate_shape[0] * 2, gate_shape[1]],
+    )
+    tensors[packed_output] = composite_tensor(
+        tensors,
+        down_weights,
+        [len(expert_indices), down_shape[0], down_shape[1]],
+    )
+
+    if gate_scales:
+        gate_scale_shape = tensor_matrix_shape(tensors, gate_scales[0])
+        up_scale_shape = tensor_matrix_shape(tensors, up_scales[0])
+        down_scale_shape = tensor_matrix_shape(tensors, down_scales[0])
+        if gate_scale_shape != up_scale_shape:
+            raise ModelTranspileError(
+                f"layer prefix {layer_prefix!r} has incompatible gate/up scale grids"
+            )
+        input_scale_parts = [
+            tensor_name
+            for gate, up in zip(gate_scales, up_scales, strict=True)
+            for tensor_name in (gate, up)
+        ]
+        tensors[f"{packed_input}_scale_inv"] = composite_tensor(
+            tensors,
+            input_scale_parts,
+            [
+                len(expert_indices),
+                gate_scale_shape[0] * 2,
+                gate_scale_shape[1],
+            ],
+        )
+        tensors[f"{packed_output}_scale_inv"] = composite_tensor(
+            tensors,
+            down_scales,
+            [len(expert_indices), *down_scale_shape],
+        )
+
+    synthesize_shared_expert_input(tensors, layer_prefix)
+
+
+def synthesize_shared_expert_input(
+    tensors: dict[str, Json], layer_prefix: str
+) -> None:
+    base = f"{layer_prefix}.mlp.shared_expert"
+    packed = f"{base}.gate_up_proj"
+    gate = f"{base}.gate_proj.weight"
+    up = f"{base}.up_proj.weight"
+    if packed in tensors or gate not in tensors or up not in tensors:
+        return
+    gate_shape = tensor_matrix_shape(tensors, gate)
+    if tensor_matrix_shape(tensors, up) != gate_shape:
+        raise ModelTranspileError(
+            f"layer prefix {layer_prefix!r} has incompatible shared expert gate/up shapes"
+        )
+    tensors[packed] = composite_tensor(
+        tensors, [gate, up], [gate_shape[0] * 2, gate_shape[1]]
+    )
+    if tensors[gate].get("dtype") == "F8_E4M3":
+        gate_scale = f"{gate}_scale_inv"
+        up_scale = f"{up}_scale_inv"
+        if gate_scale not in tensors or up_scale not in tensors:
+            raise ModelTranspileError(
+                f"layer prefix {layer_prefix!r} shared FP8 expert is missing scales"
+            )
+        scale_shape = tensor_matrix_shape(tensors, gate_scale)
+        if tensor_matrix_shape(tensors, up_scale) != scale_shape:
+            raise ModelTranspileError(
+                f"layer prefix {layer_prefix!r} has incompatible shared expert scale grids"
+            )
+        tensors[f"{packed}_scale_inv"] = composite_tensor(
+            tensors,
+            [gate_scale, up_scale],
+            [scale_shape[0] * 2, scale_shape[1]],
+        )
+
+
+def tensor_matrix_shape(tensors: dict[str, Json], tensor_name: str) -> list[int]:
+    shape = [int(value) for value in tensors[tensor_name].get("shape", [])]
+    if len(shape) != 2:
+        raise ModelTranspileError(
+            f"tensor {tensor_name!r} is not a matrix: shape {shape}"
+        )
+    return shape
+
+
+def composite_tensor(
+    tensors: dict[str, Json], part_names: Iterable[str], shape: list[int]
+) -> Json:
+    names = list(part_names)
+    if not names:
+        raise ModelTranspileError("cannot create an empty composite tensor")
+    dtype = tensors[names[0]].get("dtype")
+    if any(tensors[name].get("dtype") != dtype for name in names):
+        raise ModelTranspileError(
+            f"composite tensor parts have mixed dtypes: {names}"
+        )
+    byte_count = sum(int(tensors[name]["byte_count"]) for name in names)
+    return {
+        "dtype": dtype,
+        "shape": shape,
+        "data_offsets": [0, byte_count],
+        "parameter_count": math.prod(shape),
+        "byte_count": byte_count,
+        "layout_hint": "row_major",
+        "source_parts": [
+            {
+                "tensor": name,
+                "source_file": tensors[name]["source_file"],
+                "source_header_bytes": int(tensors[name]["source_header_bytes"]),
+                "data_offsets": list(tensors[name]["data_offsets"]),
+                "byte_count": int(tensors[name]["byte_count"]),
+            }
+            for name in names
+        ],
+    }
+
+
+def attach_block_quantization_scales(
+    tensors: dict[str, Json], layer_tensors: dict[str, str]
+) -> None:
+    """Attach scale tensors to quantized parameters by tensor structure.
+
+    Safetensors FP8 checkpoints store a block scale beside each quantized
+    matrix.  Keeping the scale as an explicit circuit parameter lets the
+    backend execute the source representation directly instead of silently
+    treating one-byte FP8 values as two-byte BF16 values.
+    """
+    additions: dict[str, str] = {}
+    for parameter_id, tensor_name in tuple(layer_tensors.items()):
+        tensor = tensors[tensor_name]
+        if tensor.get("dtype") != "F8_E4M3":
+            continue
+        shape = [int(value) for value in tensor.get("shape", [])]
+        if len(shape) not in (2, 3):
+            raise ModelTranspileError(
+                f"FP8 parameter {tensor_name!r} has unsupported shape {shape}; "
+                "only block-scaled matrices and expert stacks are executable"
+            )
+        scale_name = f"{tensor_name}_scale_inv"
+        scale = tensors.get(scale_name)
+        if scale is None:
+            raise ModelTranspileError(
+                f"FP8 parameter {tensor_name!r} is missing block scale tensor "
+                f"{scale_name!r}"
+            )
+        scale_shape = [int(value) for value in scale.get("shape", [])]
+        if scale.get("dtype") != "BF16" or len(scale_shape) != len(shape):
+            raise ModelTranspileError(
+                f"FP8 parameter {tensor_name!r} has incompatible block scale "
+                f"dtype {scale.get('dtype')!r} and shape {scale_shape}"
+            )
+        if any(value <= 0 for value in scale_shape):
+            raise ModelTranspileError(
+                f"FP8 parameter {tensor_name!r} has empty block scale shape {scale_shape}"
+            )
+        additions[f"{parameter_id}_scale_inv"] = scale_name
+    layer_tensors.update(additions)
 
 
 def add_optional_linear_biases(

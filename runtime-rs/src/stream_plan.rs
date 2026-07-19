@@ -976,6 +976,7 @@ fn infer_node_output_shapes(
             compatible_input_shape(pedal_id, node, signals)?,
             outputs,
         )),
+        "sigmoid_scalar_multiply" => Ok(repeat_shape(first_input_shape(node, signals), outputs)),
         "linear" | "linear_residual" => {
             infer_linear_output_shapes(pedal_id, node, signals, params, tensor_index)
         }
