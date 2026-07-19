@@ -1238,8 +1238,23 @@ def local_size_x_for_node(node: Json) -> int:
 
 def attention_workgroup_shape(head_width: int) -> tuple[int, int]:
     padded_head_width = ((head_width + 63) // 64) * 64
-    tile_tokens = 1024 // padded_head_width
-    return padded_head_width * tile_tokens, tile_tokens
+    physical_tile_tokens = 1024 // padded_head_width
+    if physical_tile_tokens == 0:
+        return 0, 0
+    # Keep attention scratch below the 32 KiB Vulkan floor while amortizing the
+    # four workgroup barriers over more KV tokens than the physical tile holds.
+    shared_float_budget = (32 * 1024) // 4
+    fixed_shared_floats = 2 * head_width + 4
+    tile_shared_floats = head_width + ((head_width + 31) // 32) + 3
+    max_token_batches = (
+        (shared_float_budget - fixed_shared_floats)
+        // (physical_tile_tokens * tile_shared_floats)
+    )
+    token_batches = max(1, min(7, max_token_batches))
+    return (
+        padded_head_width * physical_tile_tokens,
+        physical_tile_tokens * token_batches,
+    )
 
 
 def required_shader_files(

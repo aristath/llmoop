@@ -10,11 +10,36 @@ from llmoop.compilation import ModelCompileError
 from llmoop.model_package import (
     ROW_MAJOR_LAYOUT,
     VULKAN_BF16_ROW_PAIR_LAYOUT,
+    attention_workgroup_shape,
     compiled_tensor_layout,
     copy_shader_templates,
     shader_file_for_node,
     write_compiled_tensor,
 )
+
+
+@pytest.mark.parametrize(
+    "head_width",
+    [32, 64, 80, 96, 128, 192, 256, 320, 384, 512, 768, 1024],
+)
+def test_attention_tile_stays_within_portable_shared_memory_budget(
+    head_width: int,
+) -> None:
+    local_size, tile_tokens = attention_workgroup_shape(head_width)
+    padded_head_width = ((head_width + 63) // 64) * 64
+    physical_tile_tokens = 1024 // padded_head_width
+    shared_floats = (
+        2 * head_width
+        + tile_tokens * ((head_width + 31) // 32)
+        + 3 * tile_tokens
+        + tile_tokens * head_width
+        + 4
+    )
+
+    assert local_size == padded_head_width * physical_tile_tokens
+    assert local_size <= 1024
+    assert tile_tokens > physical_tile_tokens
+    assert shared_floats * 4 <= 32 * 1024
 
 
 def test_bf16_matrix_layout_is_compiled_as_interleaved_row_pairs() -> None:
@@ -579,12 +604,16 @@ def test_compiler_renders_fused_kv_append_attention_variants(
     assert "binding = 7) readonly buffer StreamControl" in plain
     assert "token_index + 1u == tokens" in plain
     assert "query_head % QUERY_GROUPS_PER_KV_HEAD == 0u" in plain
+    assert "const uint TOKEN_BATCHES = TILE_TOKENS / PHYSICAL_TILE_TOKENS;" in plain
+    assert "for (uint batch = 0u; batch < TOKEN_BATCHES; batch++)" in plain
+    assert "tile_token * subgroups_per_token + subgroup_part" in plain
     assert "binding = 5) readonly buffer AttentionSinks" in sinks
     assert "binding = 6) readonly buffer KvStateRead" in sinks
     assert "binding = 7) buffer KvStateWrite" in sinks
     assert "binding = 8) readonly buffer StreamControl" in sinks
     assert "const uint ATTENTION_WINDOW = 128u;" in sinks
     assert "float logsumexp = maximum + log(denominator);" in sinks
+    assert "for (uint batch = 0u; batch < TOKEN_BATCHES; batch++)" in sinks
     assert "{{" not in plain
     assert "{{" not in sinks
 
@@ -602,8 +631,9 @@ def test_compiler_renders_subgroup_padded_attention_and_unequal_qkv_split(
     split = (tmp_path / split_file).read_text()
     assert "layout(local_size_x = 1024" in attention
     assert "const uint HEAD_WIDTH = 96u;" in attention
-    assert "const uint TILE_TOKENS = 8u;" in attention
-    assert "local_index < TILE_TOKENS * HEAD_WIDTH" in attention
+    assert "const uint TILE_TOKENS = 56u;" in attention
+    assert "const uint TOKEN_BATCHES = TILE_TOKENS / PHYSICAL_TILE_TOKENS;" in attention
+    assert "value_contributions[56 * 96]" in attention
     assert "const uint PART_A_WORDS = 16u / 2u;" in split
     assert "const uint PART_B_WORDS = 8u / 2u;" in split
     assert "{{" not in attention
