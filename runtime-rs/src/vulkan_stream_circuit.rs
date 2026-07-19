@@ -3973,7 +3973,7 @@ impl VulkanResidentSingleTokenTickRunner {
         token_id: u32,
         control: VulkanMountedPlacedStreamControl,
     ) -> Result<VulkanResidentSingleTokenTickRun, VulkanResidentSingleTokenTickRunnerError> {
-        self.run_token_id_with_stream_control_and_tail(device, token_id, control, false, None)
+        self.run_token_id_with_stream_control_and_tail(device, token_id, control, false, true, None)
     }
 
     fn run_token_id_with_stream_control_and_tail(
@@ -3982,6 +3982,7 @@ impl VulkanResidentSingleTokenTickRunner {
         token_id: u32,
         control: VulkanMountedPlacedStreamControl,
         input_token_is_resident: bool,
+        emit_output: bool,
         tail_dispatch: Option<&VulkanResidentKernelDispatch>,
     ) -> Result<VulkanResidentSingleTokenTickRun, VulkanResidentSingleTokenTickRunnerError> {
         if !input_token_is_resident {
@@ -4014,14 +4015,16 @@ impl VulkanResidentSingleTokenTickRunner {
                 pedal_push_constant_index += 1;
             }
         }
-        sequence_steps.push(VulkanResidentKernelSequenceStep::new(
-            &self.output_transducer.embedding_norm_dispatch,
-            &[],
-        ));
-        sequence_steps.push(VulkanResidentKernelSequenceStep::new(
-            &self.output_transducer.tied_projection_dispatch,
-            &[],
-        ));
+        if emit_output {
+            sequence_steps.push(VulkanResidentKernelSequenceStep::new(
+                &self.output_transducer.embedding_norm_dispatch,
+                &[],
+            ));
+            sequence_steps.push(VulkanResidentKernelSequenceStep::new(
+                &self.output_transducer.tied_projection_dispatch,
+                &[],
+            ));
+        }
         if let Some(tail_dispatch) = tail_dispatch {
             sequence_steps.push(VulkanResidentKernelSequenceStep::new(tail_dispatch, &[]));
         }
@@ -4032,15 +4035,31 @@ impl VulkanResidentSingleTokenTickRunner {
             u64::try_from(execution_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
 
         let input_run = self.input_transducer.completed_run(token_id);
+        let dispatch_count = if emit_output {
+            self.dispatch_count
+        } else {
+            self.dispatch_count - self.output_transducer.dispatch_count
+        };
+        let total_descriptor_count = if emit_output {
+            self.total_descriptor_count
+        } else {
+            self.total_descriptor_count - self.output_transducer.total_descriptor_count
+        };
+        let total_push_constant_byte_count = if emit_output {
+            self.total_push_constant_byte_count
+        } else {
+            self.total_push_constant_byte_count
+                - self.output_transducer.total_push_constant_byte_count
+        };
         Ok(VulkanResidentSingleTokenTickRun {
             device_id: self.device_id.clone(),
             token_id,
             input_run,
             pedalboard_run: self.completed_pedalboard_run.clone(),
-            output_run: self.completed_output_run.clone(),
-            dispatch_count: self.dispatch_count,
-            total_descriptor_count: self.total_descriptor_count,
-            total_push_constant_byte_count: self.total_push_constant_byte_count,
+            output_run: emit_output.then(|| self.completed_output_run.clone()),
+            dispatch_count,
+            total_descriptor_count,
+            total_push_constant_byte_count,
             execution_time_ns,
         })
     }
@@ -4060,7 +4079,7 @@ pub struct VulkanResidentSingleTokenTickRun {
     pub token_id: u32,
     pub input_run: VulkanResidentInputEmbeddingTransducerRun,
     pub pedalboard_run: Arc<VulkanMountedPlacedResidentPedalboardRun>,
-    pub output_run: Arc<VulkanResidentOutputTransducerRun>,
+    pub output_run: Option<Arc<VulkanResidentOutputTransducerRun>>,
     pub dispatch_count: usize,
     pub total_descriptor_count: usize,
     pub total_push_constant_byte_count: u32,
@@ -4199,6 +4218,7 @@ impl VulkanResidentFeedbackLoopRunner {
                     dynamic_state_capacity_activations,
                 },
                 tick_index != 0,
+                true,
                 Some(&self.sampler.resident_dispatch),
             )?;
             let sampler_run = self.sampler.completed_run()?;
@@ -4320,7 +4340,7 @@ impl VulkanResidentFeedbackLoopRunner {
                     .input_transducer
                     .completed_run(input_token_id),
                 pedalboard_run: self.tick_runner.completed_pedalboard_run.clone(),
-                output_run: self.tick_runner.completed_output_run.clone(),
+                output_run: Some(self.tick_runner.completed_output_run.clone()),
                 dispatch_count: self.tick_runner.dispatch_count,
                 total_descriptor_count: self.tick_runner.total_descriptor_count,
                 total_push_constant_byte_count: self.tick_runner.total_push_constant_byte_count,
@@ -4412,6 +4432,7 @@ impl VulkanResidentFeedbackLoopRunner {
                     input_route,
                     VulkanResidentPromptEventInputRoute::PrivateFeedback
                 ),
+                should_emit_public_output,
                 should_emit_public_output.then_some(&self.sampler.resident_dispatch),
             )?;
 
@@ -5061,6 +5082,7 @@ impl VulkanResidentRunningStream {
                     &input_signal,
                     VulkanResidentRunningStreamInputSignal::PrivateFeedback(_)
                 ),
+                should_emit_public_output,
                 should_emit_public_output
                     .then_some(&self.processor.loop_runner.sampler.resident_dispatch),
             )?;
@@ -18721,9 +18743,9 @@ mod tests {
             FIXTURE_MODEL_INPUT_FRAME_SIGNAL
         );
         assert_fixture_model_resident_prefix_run(&run.pedalboard_run, &pedal_ids, 242);
-        assert_eq!(run.output_run.dispatch_count, 2);
+        assert_eq!(run.output_run.as_ref().unwrap().dispatch_count, 2);
         assert_eq!(
-            run.output_run.logits_byte_capacity,
+            run.output_run.as_ref().unwrap().logits_byte_capacity,
             FIXTURE_MODEL_LOGITS_BYTES
         );
 
@@ -18973,6 +18995,8 @@ mod tests {
         assert_eq!(run.tick_runs[0].public_output_token_id, None);
         assert_eq!(run.tick_runs[0].private_feedback_token_id, None);
         assert!(run.tick_runs[0].sampler_run.is_none());
+        assert_eq!(run.tick_runs[0].tick_run.dispatch_count, 243);
+        assert!(run.tick_runs[0].tick_run.output_run.is_none());
 
         assert_eq!(run.tick_runs[1].stream_tick, 1);
         assert_eq!(run.tick_runs[1].input_token_id, 36_309);
@@ -18996,6 +19020,8 @@ mod tests {
             run.tick_runs[1].sampler_run.as_ref().unwrap().token_id,
             run.generated_token_ids[0]
         );
+        assert_eq!(run.tick_runs[1].tick_run.dispatch_count, 245);
+        assert!(run.tick_runs[1].tick_run.output_run.is_some());
 
         assert_eq!(run.tick_runs[2].stream_tick, 2);
         assert_eq!(run.tick_runs[2].input_token_id, run.generated_token_ids[0]);
@@ -19008,6 +19034,8 @@ mod tests {
         assert_eq!(run.tick_runs[2].public_output_token_id, None);
         assert_eq!(run.tick_runs[2].private_feedback_token_id, None);
         assert!(run.tick_runs[2].sampler_run.is_none());
+        assert_eq!(run.tick_runs[2].tick_run.dispatch_count, 243);
+        assert!(run.tick_runs[2].tick_run.output_run.is_none());
     }
 
     #[test]
