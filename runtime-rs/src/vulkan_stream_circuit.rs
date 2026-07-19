@@ -14334,8 +14334,8 @@ impl VulkanMountedPlacedResidentStreamTickCursor {
         let completed_before = self.completed_stage_count;
 
         while self.next_stage_index < self.tick_plan.stages.len() {
-            let stage = self.tick_plan.stages[self.next_stage_index].clone();
-            match &stage {
+            let stage = &self.tick_plan.stages[self.next_stage_index];
+            match stage {
                 VulkanMountedPlacedStreamTickStage::ReceiveCable { cable_index, .. } => {
                     match transport.receive_incoming_cable(mounted, *cable_index) {
                         Ok(_) => self.complete_current_stage(),
