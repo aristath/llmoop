@@ -18,8 +18,9 @@ use crate::stream_circuit::{
     CableTransport, CircuitParamsArtifact, CircuitStateArtifact, LOWERED_PEDALBOARD_SCHEMA,
     LoweredCircuitRef, LoweredPedalboard, LoweredPedalboardGraph, LoweredPedalboardSource,
     LoweredPedalboardSummary, PedalCablePlacement, ResolvedCircuitArtifact,
-    ResolvedLoweredPedalboard, StreamCircuit, StreamCircuitPedalInstanceStatePolicy,
-    StreamCircuitPlacementPlan, StreamCircuitPlacementSpec, StreamCircuitRuntimePatch,
+    ResolvedLoweredPedalboard, StreamCircuit, StreamCircuitGraphBoundary,
+    StreamCircuitPedalInstanceStatePolicy, StreamCircuitPlacementPlan, StreamCircuitPlacementSpec,
+    StreamCircuitRuntimePatch,
 };
 use crate::stream_plan::{
     CircuitActivationPlan, PlannedNode, PlannedParameterResource, PlannedPort, SignalProducer,
@@ -1104,7 +1105,9 @@ impl VulkanPlacedStreamCircuitResidentPlan {
             .cables
             .iter()
             .filter(|cable| {
-                cable.source_device_id == device_id && cable.destination_device_id == device_id
+                cable.connection.is_forward()
+                    && cable.source_device_id == device_id
+                    && cable.destination_device_id == device_id
             })
             .cloned()
             .collect();
@@ -1112,7 +1115,9 @@ impl VulkanPlacedStreamCircuitResidentPlan {
             .cables
             .iter()
             .filter(|cable| {
-                cable.source_device_id != device_id && cable.destination_device_id == device_id
+                cable.connection.is_forward()
+                    && cable.source_device_id != device_id
+                    && cable.destination_device_id == device_id
             })
             .cloned()
             .collect();
@@ -1120,7 +1125,9 @@ impl VulkanPlacedStreamCircuitResidentPlan {
             .cables
             .iter()
             .filter(|cable| {
-                cable.source_device_id == device_id && cable.destination_device_id != device_id
+                cable.connection.is_forward()
+                    && cable.source_device_id == device_id
+                    && cable.destination_device_id != device_id
             })
             .cloned()
             .collect();
@@ -8012,6 +8019,7 @@ impl VulkanResidentModelPackageManifest {
         self.circuit_graph.cables = patch
             .effective_cables()
             .map_err(|error| VulkanResidentTokenModelPackageError::new(error.to_string()))?;
+        self.circuit_graph.boundary = patch.boundary.clone();
         self.circuit_graph.pedals = pedals;
         self.pedal_executions = pedal_executions;
         Ok(self)
@@ -8061,6 +8069,7 @@ fn apply_runtime_patch_state_policy(
 pub struct VulkanResidentPackageCircuitGraph {
     pub wiring: String,
     pub cables: Vec<crate::stream_circuit::StreamCircuitGraphCable>,
+    pub boundary: StreamCircuitGraphBoundary,
     #[serde(default)]
     pub architecture: Value,
     #[serde(default)]
@@ -8123,6 +8132,7 @@ impl VulkanResidentPackageCircuitGraph {
                 wiring: self.wiring.clone(),
                 circuits: circuit_refs,
                 cables: self.cables.clone(),
+                boundary: self.boundary.clone(),
                 input_transducer: self.input_transducer.clone(),
                 output_transducer: self.output_transducer.clone(),
             },

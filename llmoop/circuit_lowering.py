@@ -84,6 +84,9 @@ def lower_pedalboard(
             }
         )
 
+    if not lowered:
+        raise ValueError("cannot lower an empty pedalboard")
+
     index = {
         "schema": "llmoop.lowered_pedalboard.v1",
         "source": {
@@ -100,6 +103,7 @@ def lower_pedalboard(
             "cables": [
                 {
                     "id": f"cable_{index:04d}",
+                    "connection": {"kind": "forward"},
                     "source": {
                         "pedal_id": source["id"],
                         "port_id": "output_frame",
@@ -113,6 +117,26 @@ def lower_pedalboard(
                     zip(lowered, lowered[1:])
                 )
             ],
+            "boundary": {
+                "external_inputs": [
+                    {
+                        "id": "model_input",
+                        "endpoint": {
+                            "pedal_id": lowered[0]["id"],
+                            "port_id": "input_frame",
+                        },
+                    }
+                ],
+                "public_outputs": [
+                    {
+                        "id": "model_output",
+                        "endpoint": {
+                            "pedal_id": lowered[-1]["id"],
+                            "port_id": "output_frame",
+                        },
+                    }
+                ],
+            },
             "input_transducer": model["graph"]["input_transducer"],
             "output_transducer": model["graph"]["output_transducer"],
         },

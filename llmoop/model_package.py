@@ -502,6 +502,7 @@ def package_circuit_graph(
     return {
         "wiring": graph["wiring"],
         "cables": deepcopy(graph["cables"]),
+        "boundary": deepcopy(graph["boundary"]),
         "architecture": deepcopy(lowered_index.get("architecture", {})),
         "dimensions": deepcopy(lowered_index.get("dimensions", {})),
         "input_transducer": deepcopy(graph.get("input_transducer", {})),

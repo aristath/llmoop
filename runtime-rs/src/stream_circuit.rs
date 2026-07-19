@@ -67,7 +67,8 @@ pub struct CircuitBoundary {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CircuitSource {
     pub pedal_id: String,
-    pub source_layer_index: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_layer_index: Option<usize>,
     pub source_operator_type: String,
 }
 
@@ -373,6 +374,49 @@ pub struct StreamCircuitGraphCable {
     pub id: String,
     pub source: StreamCircuitCableEndpoint,
     pub destination: StreamCircuitCableEndpoint,
+    pub connection: StreamCircuitConnection,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamCircuitGraphBoundaryPort {
+    pub id: String,
+    pub endpoint: StreamCircuitCableEndpoint,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamCircuitGraphBoundary {
+    pub external_inputs: Vec<StreamCircuitGraphBoundaryPort>,
+    pub public_outputs: Vec<StreamCircuitGraphBoundaryPort>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum StreamCircuitConnection {
+    Forward,
+    TemporalFeedback { delay_activations: usize },
+}
+
+impl Default for StreamCircuitConnection {
+    fn default() -> Self {
+        Self::Forward
+    }
+}
+
+impl StreamCircuitConnection {
+    pub fn is_forward(&self) -> bool {
+        matches!(self, Self::Forward)
+    }
+
+    pub fn validate(&self, cable_id: &str) -> Result<(), CircuitPlacementError> {
+        if let Self::TemporalFeedback { delay_activations } = self
+            && *delay_activations == 0
+        {
+            return Err(CircuitPlacementError(format!(
+                "runtime patch temporal feedback cable {cable_id} must delay at least one activation"
+            )));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -381,6 +425,7 @@ pub struct LoweredPedalboardGraph {
     #[serde(default)]
     pub circuits: Vec<LoweredCircuitRef>,
     pub cables: Vec<StreamCircuitGraphCable>,
+    pub boundary: StreamCircuitGraphBoundary,
     #[serde(default)]
     pub input_transducer: Value,
     #[serde(default)]
@@ -445,6 +490,19 @@ impl LoweredPedalboard {
             }
         }
 
+        validate_index_boundary_ports(
+            "external input",
+            &self.graph.boundary.external_inputs,
+            &ids,
+            &mut issues,
+        );
+        validate_index_boundary_ports(
+            "public output",
+            &self.graph.boundary.public_outputs,
+            &ids,
+            &mut issues,
+        );
+
         let mut cable_ids = BTreeSet::new();
         for cable in &self.graph.cables {
             if cable.id.is_empty() || !cable_ids.insert(cable.id.clone()) {
@@ -465,6 +523,17 @@ impl LoweredPedalboard {
                     cable.id, cable.destination.pedal_id
                 ));
             }
+            if matches!(
+                cable.connection,
+                StreamCircuitConnection::TemporalFeedback {
+                    delay_activations: 0
+                }
+            ) {
+                issues.push(format!(
+                    "graph temporal feedback cable {} must delay at least one activation",
+                    cable.id
+                ));
+            }
         }
 
         if issues.is_empty() {
@@ -474,6 +543,42 @@ impl LoweredPedalboard {
                 "lowered pedalboard validation failed:\n- {}",
                 issues.join("\n- ")
             )))
+        }
+    }
+}
+
+fn validate_index_boundary_ports(
+    kind: &str,
+    ports: &[StreamCircuitGraphBoundaryPort],
+    circuit_ids: &BTreeSet<String>,
+    issues: &mut Vec<String>,
+) {
+    if ports.is_empty() {
+        issues.push(format!("lowered pedalboard declares no {kind}s"));
+        return;
+    }
+    let mut ids = BTreeSet::new();
+    let mut endpoints = BTreeSet::new();
+    for port in ports {
+        if port.id.is_empty() || !ids.insert(port.id.as_str()) {
+            issues.push(format!("invalid or duplicate {kind} id {:?}", port.id));
+        }
+        if !circuit_ids.contains(&port.endpoint.pedal_id) {
+            issues.push(format!(
+                "{kind} {} references unknown pedal {:?}",
+                port.id, port.endpoint.pedal_id
+            ));
+        }
+        if port.endpoint.port_id.is_empty()
+            || !endpoints.insert((
+                port.endpoint.pedal_id.as_str(),
+                port.endpoint.port_id.as_str(),
+            ))
+        {
+            issues.push(format!(
+                "{kind} {} has an empty or duplicate endpoint {}.{}",
+                port.id, port.endpoint.pedal_id, port.endpoint.port_id
+            ));
         }
     }
 }
@@ -703,6 +808,7 @@ pub struct StreamCircuitRuntimePatch {
     pub default_device_id: String,
     pub instances: Vec<StreamCircuitPedalInstance>,
     pub cables: Vec<StreamCircuitGraphCable>,
+    pub boundary: StreamCircuitGraphBoundary,
 }
 
 impl StreamCircuitRuntimePatch {
@@ -734,12 +840,14 @@ impl StreamCircuitRuntimePatch {
             )
             .collect::<Vec<_>>();
         let cables = series_cables_for_instances(graph, &instances)?;
+        let boundary = series_boundary_for_instances(graph, &instances)?;
         let patch = Self {
             schema: STREAM_CIRCUIT_RUNTIME_PATCH_SCHEMA.to_string(),
             wiring: "explicit_graph".to_string(),
             default_device_id: default_device_id.into(),
             instances,
             cables,
+            boundary,
         };
         patch.with_default_devices().and_then(|patch| {
             patch.validate_against_graph(graph)?;
@@ -770,6 +878,7 @@ impl StreamCircuitRuntimePatch {
                 })
                 .collect(),
             cables: graph.index.graph.cables.clone(),
+            boundary: graph.index.graph.boundary.clone(),
         })
     }
 
@@ -849,7 +958,9 @@ impl StreamCircuitRuntimePatch {
             .cables
             .iter()
             .enumerate()
-            .filter(|(_, cable)| cable.source.pedal_id == after_instance_id)
+            .filter(|(_, cable)| {
+                cable.source.pedal_id == after_instance_id && cable.connection.is_forward()
+            })
             .map(|(index, _)| index)
             .collect::<Vec<_>>();
         if outgoing.len() > 1 {
@@ -875,6 +986,7 @@ impl StreamCircuitRuntimePatch {
                 pedal_id: new_instance_id.clone(),
                 port_id: duplicate_input.id.clone(),
             },
+            connection: StreamCircuitConnection::Forward,
         };
         if let Some(outgoing_index) = outgoing.first().copied() {
             self.cables[outgoing_index].source = StreamCircuitCableEndpoint {
@@ -883,6 +995,16 @@ impl StreamCircuitRuntimePatch {
             };
             self.cables.insert(outgoing_index, inserted_cable);
         } else {
+            for output in &mut self.boundary.public_outputs {
+                if output.endpoint.pedal_id == source.instance_id
+                    && output.endpoint.port_id == source_output.id
+                {
+                    output.endpoint = StreamCircuitCableEndpoint {
+                        pedal_id: new_instance_id.clone(),
+                        port_id: source_output.id.clone(),
+                    };
+                }
+            }
             self.cables.push(inserted_cable);
         }
         self.instances.insert(after_index + 1, duplicate);
@@ -996,6 +1118,7 @@ impl StreamCircuitRuntimePatch {
         index.graph.wiring = self.wiring.clone();
         index.graph.circuits = circuit_refs;
         index.graph.cables = self.effective_cables()?;
+        index.graph.boundary = self.boundary.clone();
         index.summary = LoweredPedalboardSummary {
             circuit_count: circuits.len(),
             operator_counts,
@@ -1186,9 +1309,69 @@ fn series_cables_for_instances(
                     pedal_id: pair[1].instance_id.clone(),
                     port_id: input.id.clone(),
                 },
+                connection: StreamCircuitConnection::Forward,
             })
         })
         .collect()
+}
+
+fn series_boundary_for_instances(
+    graph: &ResolvedLoweredPedalboard,
+    instances: &[StreamCircuitPedalInstance],
+) -> Result<StreamCircuitGraphBoundary, CircuitPlacementError> {
+    let source_by_id = graph
+        .circuits
+        .iter()
+        .map(|artifact| (artifact.pedal.id.as_str(), artifact))
+        .collect::<BTreeMap<_, _>>();
+    let first = instances.first().ok_or_else(|| {
+        CircuitPlacementError("runtime source sequence must contain at least one pedal".to_string())
+    })?;
+    let last = instances
+        .last()
+        .expect("non-empty source sequence must have a last pedal");
+    let first_source = source_by_id
+        .get(first.source_pedal_id.as_str())
+        .ok_or_else(|| {
+            CircuitPlacementError(format!(
+                "runtime patch instance {} references unknown source pedal {}",
+                first.instance_id, first.source_pedal_id
+            ))
+        })?;
+    let last_source = source_by_id
+        .get(last.source_pedal_id.as_str())
+        .ok_or_else(|| {
+            CircuitPlacementError(format!(
+                "runtime patch instance {} references unknown source pedal {}",
+                last.instance_id, last.source_pedal_id
+            ))
+        })?;
+    let input = single_series_port(
+        &first_source.circuit.boundary.inputs,
+        &first.instance_id,
+        "input",
+    )?;
+    let output = single_series_port(
+        &last_source.circuit.boundary.outputs,
+        &last.instance_id,
+        "output",
+    )?;
+    Ok(StreamCircuitGraphBoundary {
+        external_inputs: vec![StreamCircuitGraphBoundaryPort {
+            id: "model_input".to_string(),
+            endpoint: StreamCircuitCableEndpoint {
+                pedal_id: first.instance_id.clone(),
+                port_id: input.id.clone(),
+            },
+        }],
+        public_outputs: vec![StreamCircuitGraphBoundaryPort {
+            id: "model_output".to_string(),
+            endpoint: StreamCircuitCableEndpoint {
+                pedal_id: last.instance_id.clone(),
+                port_id: output.id.clone(),
+            },
+        }],
+    })
 }
 
 fn single_series_port<'a>(
@@ -1315,8 +1498,8 @@ fn validate_explicit_cables(
         .map(|instance| (instance.instance_id.as_str(), instance))
         .collect::<BTreeMap<_, _>>();
     let mut ids = BTreeSet::new();
-    let mut source_ports = BTreeSet::new();
-    let mut destination_ports = BTreeSet::new();
+    let mut forward_destination_ports = BTreeSet::new();
+    let mut feedback_destination_ports = BTreeSet::new();
     let mut incoming_count = BTreeMap::<&str, usize>::new();
     let mut outgoing_count = BTreeMap::<&str, usize>::new();
     for cable in &patch.cables {
@@ -1342,28 +1525,33 @@ fn validate_explicit_cables(
                     cable.id, cable.destination.pedal_id
                 ))
             })?;
-        if source_instance.instance_id == destination_instance.instance_id {
+        cable.connection.validate(&cable.id)?;
+        if source_instance.instance_id == destination_instance.instance_id
+            && cable.connection.is_forward()
+        {
             return Err(CircuitPlacementError(format!(
                 "runtime patch cable {} creates an un-delayed self-loop on {}",
                 cable.id, source_instance.instance_id
             )));
         }
-        if !source_ports.insert((
-            source_instance.instance_id.as_str(),
-            cable.source.port_id.as_str(),
-        )) {
-            return Err(CircuitPlacementError(format!(
-                "runtime patch output {}.{} has more than one cable; use an explicit splitter pedal",
-                source_instance.instance_id, cable.source.port_id
-            )));
-        }
+        let destination_ports = if cable.connection.is_forward() {
+            &mut forward_destination_ports
+        } else {
+            &mut feedback_destination_ports
+        };
         if !destination_ports.insert((
             destination_instance.instance_id.as_str(),
             cable.destination.port_id.as_str(),
         )) {
             return Err(CircuitPlacementError(format!(
-                "runtime patch input {}.{} has more than one cable",
-                destination_instance.instance_id, cable.destination.port_id
+                "runtime patch input {}.{} has more than one {} cable",
+                destination_instance.instance_id,
+                cable.destination.port_id,
+                if cable.connection.is_forward() {
+                    "forward"
+                } else {
+                    "temporal feedback"
+                }
             )));
         }
         *incoming_count
@@ -1416,6 +1604,30 @@ fn validate_explicit_cables(
             source_by_id[destination_instance.source_pedal_id.as_str()],
         )?;
     }
+    if patch.boundary.external_inputs.is_empty() {
+        return Err(CircuitPlacementError(
+            "runtime patch must declare at least one external input".to_string(),
+        ));
+    }
+    if patch.boundary.public_outputs.is_empty() {
+        return Err(CircuitPlacementError(
+            "runtime patch must declare at least one public output".to_string(),
+        ));
+    }
+    let external_inputs = validate_runtime_boundary_ports(
+        "external input",
+        &patch.boundary.external_inputs,
+        &enabled,
+        source_by_id,
+        true,
+    )?;
+    let public_outputs = validate_runtime_boundary_ports(
+        "public output",
+        &patch.boundary.public_outputs,
+        &enabled,
+        source_by_id,
+        false,
+    )?;
     let connected_outputs = effective
         .iter()
         .map(|cable| {
@@ -1434,27 +1646,84 @@ fn validate_explicit_cables(
             )
         })
         .collect::<BTreeSet<_>>();
-    let mut open_inputs = Vec::new();
-    let mut open_outputs = Vec::new();
+    let mut unrouted_inputs = Vec::new();
+    let mut unrouted_outputs = Vec::new();
     for instance in enabled.values() {
         let artifact = source_by_id[instance.source_pedal_id.as_str()];
         for port in &artifact.circuit.boundary.inputs {
-            if !connected_inputs.contains(&(instance.instance_id.as_str(), port.id.as_str())) {
-                open_inputs.push(format!("{}.{}", instance.instance_id, port.id));
+            let endpoint = (instance.instance_id.as_str(), port.id.as_str());
+            if !connected_inputs.contains(&endpoint) && !external_inputs.contains(&endpoint) {
+                unrouted_inputs.push(format!("{}.{}", instance.instance_id, port.id));
             }
         }
         for port in &artifact.circuit.boundary.outputs {
-            if !connected_outputs.contains(&(instance.instance_id.as_str(), port.id.as_str())) {
-                open_outputs.push(format!("{}.{}", instance.instance_id, port.id));
+            let endpoint = (instance.instance_id.as_str(), port.id.as_str());
+            if !connected_outputs.contains(&endpoint) && !public_outputs.contains(&endpoint) {
+                unrouted_outputs.push(format!("{}.{}", instance.instance_id, port.id));
             }
         }
     }
-    if open_inputs.len() != 1 || open_outputs.len() != 1 {
+    if !unrouted_inputs.is_empty() || !unrouted_outputs.is_empty() {
         return Err(CircuitPlacementError(format!(
-            "runtime patch must expose exactly one model input and one model output; open inputs={open_inputs:?}, open outputs={open_outputs:?}"
+            "runtime patch has unrouted ports; inputs={unrouted_inputs:?}, outputs={unrouted_outputs:?}"
         )));
     }
     Ok(())
+}
+
+fn validate_runtime_boundary_ports<'a>(
+    kind: &str,
+    ports: &'a [StreamCircuitGraphBoundaryPort],
+    enabled: &BTreeMap<&'a str, &'a StreamCircuitPedalInstance>,
+    source_by_id: &BTreeMap<&str, &ResolvedCircuitArtifact>,
+    input: bool,
+) -> Result<BTreeSet<(&'a str, &'a str)>, CircuitPlacementError> {
+    let mut ids = BTreeSet::new();
+    let mut endpoints = BTreeSet::new();
+    for port in ports {
+        if port.id.is_empty() || !ids.insert(port.id.as_str()) {
+            return Err(CircuitPlacementError(format!(
+                "runtime patch contains an empty or duplicate {kind} id {:?}",
+                port.id
+            )));
+        }
+        let instance = enabled
+            .get(port.endpoint.pedal_id.as_str())
+            .ok_or_else(|| {
+                CircuitPlacementError(format!(
+                    "runtime patch {kind} {} references missing or disabled instance {}",
+                    port.id, port.endpoint.pedal_id
+                ))
+            })?;
+        let artifact = source_by_id[instance.source_pedal_id.as_str()];
+        let declared = if input {
+            &artifact.circuit.boundary.inputs
+        } else {
+            &artifact.circuit.boundary.outputs
+        };
+        if !declared
+            .iter()
+            .any(|candidate| candidate.id == port.endpoint.port_id)
+        {
+            return Err(CircuitPlacementError(format!(
+                "runtime patch {kind} {} references unknown {} port {}.{}",
+                port.id,
+                if input { "input" } else { "output" },
+                port.endpoint.pedal_id,
+                port.endpoint.port_id
+            )));
+        }
+        if !endpoints.insert((
+            port.endpoint.pedal_id.as_str(),
+            port.endpoint.port_id.as_str(),
+        )) {
+            return Err(CircuitPlacementError(format!(
+                "runtime patch declares {}.{} as more than one {kind}",
+                port.endpoint.pedal_id, port.endpoint.port_id
+            )));
+        }
+    }
+    Ok(endpoints)
 }
 
 fn validate_graph_cable_contract(
@@ -1513,17 +1782,34 @@ fn effective_runtime_patch_cables(
         .iter()
         .map(|instance| (instance.instance_id.as_str(), instance.enabled))
         .collect::<BTreeMap<_, _>>();
-    let outgoing = cables.iter().fold(
-        BTreeMap::<&str, Vec<&StreamCircuitGraphCable>>::new(),
-        |mut map, cable| {
-            map.entry(cable.source.pedal_id.as_str())
-                .or_default()
-                .push(cable);
-            map
-        },
-    );
-    let mut effective = Vec::new();
-    for cable in cables {
+    let outgoing = cables
+        .iter()
+        .filter(|cable| cable.connection.is_forward())
+        .fold(
+            BTreeMap::<&str, Vec<&StreamCircuitGraphCable>>::new(),
+            |mut map, cable| {
+                map.entry(cable.source.pedal_id.as_str())
+                    .or_default()
+                    .push(cable);
+                map
+            },
+        );
+    let mut effective = cables
+        .iter()
+        .filter(|cable| {
+            !cable.connection.is_forward()
+                && enabled
+                    .get(cable.source.pedal_id.as_str())
+                    .copied()
+                    .unwrap_or(false)
+                && enabled
+                    .get(cable.destination.pedal_id.as_str())
+                    .copied()
+                    .unwrap_or(false)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    for cable in cables.iter().filter(|cable| cable.connection.is_forward()) {
         if !enabled
             .get(cable.source.pedal_id.as_str())
             .copied()
@@ -1562,6 +1848,7 @@ fn effective_runtime_patch_cables(
                 id: cable.id.clone(),
                 source: cable.source.clone(),
                 destination,
+                connection: StreamCircuitConnection::Forward,
             });
         }
     }
@@ -1582,7 +1869,7 @@ fn topological_runtime_patch_order(
         .map(|id| (*id, 0usize))
         .collect::<BTreeMap<_, _>>();
     let mut outgoing = BTreeMap::<&str, Vec<&str>>::new();
-    for cable in cables {
+    for cable in cables.iter().filter(|cable| cable.connection.is_forward()) {
         *indegree
             .get_mut(cable.destination.pedal_id.as_str())
             .ok_or_else(|| {
@@ -1606,7 +1893,7 @@ fn topological_runtime_patch_order(
             .find(|id| remaining.contains(id) && indegree[id] == 0)
             .ok_or_else(|| {
                 CircuitPlacementError(
-                    "runtime patch graph contains a cycle; feedback requires an explicit stateful delay pedal"
+                    "runtime patch graph contains an instantaneous cycle; use a temporal feedback connection with a positive delay"
                         .to_string(),
                 )
             })?;
@@ -1793,6 +2080,7 @@ impl StreamCircuitPlacementPlan {
 
             cables.push(PedalCablePlacement {
                 cable_index,
+                connection: cable.connection.clone(),
                 signal: output.signal.clone(),
                 shape: output.shape.clone(),
                 source_pedal_id: source.pedal.id.clone(),
@@ -1848,6 +2136,7 @@ pub struct PedalPlacement {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PedalCablePlacement {
     pub cable_index: usize,
+    pub connection: StreamCircuitConnection,
     pub signal: String,
     pub shape: Vec<usize>,
     pub source_pedal_id: String,
@@ -2206,7 +2495,7 @@ pub struct RuntimeSourcePedal {
     pub operator_type: String,
     pub implementation: String,
     pub behavioral_role: String,
-    pub source_layer_index: usize,
+    pub source_layer_index: Option<usize>,
     pub circuit_id: String,
     pub input_ports: Vec<RuntimePedalPortSummary>,
     pub output_ports: Vec<RuntimePedalPortSummary>,
@@ -3100,7 +3389,7 @@ mod tests {
             operator_type: "attention".to_string(),
             implementation: "vulkan_resident".to_string(),
             behavioral_role: "transformer_layer".to_string(),
-            source_layer_index: 5,
+            source_layer_index: Some(5),
             circuit_id: "layer_05_circuit_v1".to_string(),
             input_ports: vec![RuntimePedalPortSummary {
                 id: "input_frame".to_string(),
@@ -3155,7 +3444,7 @@ mod tests {
             operator_type: "layer".to_string(),
             implementation: "vulkan_resident".to_string(),
             behavioral_role: "transformer_layer".to_string(),
-            source_layer_index: 0,
+            source_layer_index: Some(0),
             circuit_id: "layer_00_circuit_v1".to_string(),
             input_ports: Vec::new(),
             output_ports: Vec::new(),
@@ -3225,6 +3514,22 @@ mod tests {
                     state_policy: StreamCircuitPedalInstanceStatePolicy::Fresh,
                 }],
                 cables: Vec::new(),
+                boundary: StreamCircuitGraphBoundary {
+                    external_inputs: vec![StreamCircuitGraphBoundaryPort {
+                        id: "model_input".to_string(),
+                        endpoint: StreamCircuitCableEndpoint {
+                            pedal_id: "layer_00".to_string(),
+                            port_id: "input_frame".to_string(),
+                        },
+                    }],
+                    public_outputs: vec![StreamCircuitGraphBoundaryPort {
+                        id: "model_output".to_string(),
+                        endpoint: StreamCircuitCableEndpoint {
+                            pedal_id: "layer_00".to_string(),
+                            port_id: "output_frame".to_string(),
+                        },
+                    }],
+                },
             },
             effective: RuntimeEffectivePedalboardTopology {
                 wiring: "series".to_string(),
@@ -3354,6 +3659,22 @@ mod tests {
                     state_policy: StreamCircuitPedalInstanceStatePolicy::Fresh,
                 }],
                 cables: Vec::new(),
+                boundary: StreamCircuitGraphBoundary {
+                    external_inputs: vec![StreamCircuitGraphBoundaryPort {
+                        id: "model_input".to_string(),
+                        endpoint: StreamCircuitCableEndpoint {
+                            pedal_id: "layer_05_repeat".to_string(),
+                            port_id: "input_frame".to_string(),
+                        },
+                    }],
+                    public_outputs: vec![StreamCircuitGraphBoundaryPort {
+                        id: "model_output".to_string(),
+                        endpoint: StreamCircuitCableEndpoint {
+                            pedal_id: "layer_05_repeat".to_string(),
+                            port_id: "output_frame".to_string(),
+                        },
+                    }],
+                },
             },
             device_bindings: RuntimeDeviceBindings::from_vulkan_targets(
                 &["vulkan:5".to_string()],
@@ -4111,7 +4432,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_patch_rejects_disconnected_and_implicit_fanout_graphs() {
+    fn runtime_patch_rejects_unrouted_ports_and_multiple_writers_to_one_input() {
         let resolved =
             ResolvedLoweredPedalboard::from_index_file(fixture_model_index_path()).unwrap();
         let patch = resolved.default_runtime_patch("gpu0").unwrap();
@@ -4123,20 +4444,119 @@ mod tests {
                 .validate_against_graph(&resolved)
                 .unwrap_err()
                 .0
-                .contains("exactly one model input and one model output")
+                .contains("unrouted ports")
         );
 
-        let mut fanout = patch;
-        let mut duplicate = fanout.cables[0].clone();
-        duplicate.id = "implicit_fanout".to_string();
-        duplicate.destination = fanout.cables[1].destination.clone();
-        fanout.cables.push(duplicate);
+        let mut multiple_writers = patch;
+        let mut duplicate = multiple_writers.cables[0].clone();
+        duplicate.id = "second_writer".to_string();
+        duplicate.destination = multiple_writers.cables[1].destination.clone();
+        multiple_writers.cables.push(duplicate);
         assert!(
-            fanout
+            multiple_writers
                 .validate_against_graph(&resolved)
                 .unwrap_err()
                 .0
-                .contains("use an explicit splitter pedal")
+                .contains("more than one forward cable")
+        );
+    }
+
+    #[test]
+    fn runtime_patch_supports_fanout_to_distinct_inputs() {
+        let resolved =
+            ResolvedLoweredPedalboard::from_index_file(fixture_model_index_path()).unwrap();
+        let mut patch = resolved.default_runtime_patch("gpu0").unwrap();
+        patch.instances.push(StreamCircuitPedalInstance {
+            instance_id: "branch".to_string(),
+            source_pedal_id: "layer_01".to_string(),
+            device_id: "gpu0".to_string(),
+            enabled: true,
+            control_values: BTreeMap::new(),
+            state_policy: StreamCircuitPedalInstanceStatePolicy::Fresh,
+        });
+        patch.cables.push(StreamCircuitGraphCable {
+            id: "layer_00_to_branch".to_string(),
+            source: StreamCircuitCableEndpoint {
+                pedal_id: "layer_00".to_string(),
+                port_id: "output_frame".to_string(),
+            },
+            destination: StreamCircuitCableEndpoint {
+                pedal_id: "branch".to_string(),
+                port_id: "input_frame".to_string(),
+            },
+            connection: StreamCircuitConnection::Forward,
+        });
+        patch
+            .boundary
+            .public_outputs
+            .push(StreamCircuitGraphBoundaryPort {
+                id: "branch_output".to_string(),
+                endpoint: StreamCircuitCableEndpoint {
+                    pedal_id: "branch".to_string(),
+                    port_id: "output_frame".to_string(),
+                },
+            });
+
+        patch.validate_against_graph(&resolved).unwrap();
+        assert_eq!(
+            patch
+                .effective_cables()
+                .unwrap()
+                .iter()
+                .filter(|cable| cable.source.pedal_id == "layer_00")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn runtime_patch_accepts_delayed_feedback_and_rejects_instantaneous_cycles() {
+        let resolved =
+            ResolvedLoweredPedalboard::from_index_file(fixture_model_index_path()).unwrap();
+        let patch = resolved.default_runtime_patch("gpu0").unwrap();
+        let feedback = StreamCircuitGraphCable {
+            id: "generation_feedback".to_string(),
+            source: patch.boundary.public_outputs[0].endpoint.clone(),
+            destination: patch.boundary.external_inputs[0].endpoint.clone(),
+            connection: StreamCircuitConnection::TemporalFeedback {
+                delay_activations: 1,
+            },
+        };
+
+        let mut delayed = patch.clone();
+        delayed.cables.push(feedback.clone());
+        delayed.validate_against_graph(&resolved).unwrap();
+        assert_eq!(
+            delayed.topological_instance_ids(&resolved).unwrap().len(),
+            resolved.circuits.len()
+        );
+
+        let mut instantaneous = patch.clone();
+        instantaneous.cables.push(StreamCircuitGraphCable {
+            connection: StreamCircuitConnection::Forward,
+            ..feedback.clone()
+        });
+        assert!(
+            instantaneous
+                .validate_against_graph(&resolved)
+                .unwrap_err()
+                .0
+                .contains("instantaneous cycle")
+        );
+
+        let mut zero_delay = patch;
+        zero_delay.cables.push(StreamCircuitGraphCable {
+            connection: StreamCircuitConnection::TemporalFeedback {
+                delay_activations: 0,
+            },
+            ..feedback
+        });
+        assert!(
+            zero_delay
+                .validate_against_graph(&resolved)
+                .unwrap_err()
+                .0
+                .contains("must delay at least one activation")
         );
     }
 }

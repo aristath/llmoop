@@ -85,7 +85,7 @@ pub fn classify_runtime_model_path(
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RuntimeEditorSourcePedal {
     pub source_id: String,
-    pub layer_index: usize,
+    pub layer_index: Option<usize>,
     pub operator_type: String,
     pub implementation: String,
     pub behavioral_role: String,
@@ -145,7 +145,7 @@ pub struct RuntimeEditorControlSchema {
 pub struct RuntimeEditorInstance {
     pub instance_id: String,
     pub source_id: String,
-    pub layer_index: usize,
+    pub layer_index: Option<usize>,
     pub occurrence: usize,
     pub device_id: String,
     pub enabled: bool,
@@ -168,7 +168,8 @@ pub struct RuntimeModelEditor {
     manifest: VulkanResidentModelPackageManifest,
     source_graph: ResolvedLoweredPedalboard,
     source_pedals: Vec<RuntimeEditorSourcePedal>,
-    source_by_layer: BTreeMap<usize, String>,
+    source_by_layer: BTreeMap<usize, Vec<String>>,
+    source_ids: BTreeSet<String>,
     available_devices: Vec<RuntimeAvailableDevice>,
     draft: StreamCircuitRuntimePatch,
 }
@@ -213,14 +214,22 @@ impl RuntimeModelEditor {
         let source_pedals = source_pedals(&manifest);
         let source_by_layer = source_pedals
             .iter()
-            .map(|pedal| (pedal.layer_index, pedal.source_id.clone()))
-            .collect::<BTreeMap<_, _>>();
-        if source_by_layer.len() != source_pedals.len() {
-            return Err(RuntimeEditorError(
-                "compiled package contains more than one source pedal for a layer index"
-                    .to_string(),
-            ));
-        }
+            .filter_map(|pedal| {
+                pedal
+                    .layer_index
+                    .map(|layer_index| (layer_index, pedal.source_id.clone()))
+            })
+            .fold(
+                BTreeMap::<usize, Vec<String>>::new(),
+                |mut by_layer, entry| {
+                    by_layer.entry(entry.0).or_default().push(entry.1);
+                    by_layer
+                },
+            );
+        let source_ids = source_pedals
+            .iter()
+            .map(|pedal| pedal.source_id.clone())
+            .collect();
         let available_devices = devices(&manifest.placement.default_device_id);
         Ok(Self {
             package_manifest_path: manifest_path,
@@ -229,6 +238,7 @@ impl RuntimeModelEditor {
             source_graph,
             source_pedals,
             source_by_layer,
+            source_ids,
             available_devices,
             draft,
         })
@@ -270,7 +280,11 @@ impl RuntimeModelEditor {
         let layer_by_source = self
             .source_pedals
             .iter()
-            .map(|pedal| (pedal.source_id.as_str(), pedal.layer_index))
+            .filter_map(|pedal| {
+                pedal
+                    .layer_index
+                    .map(|layer_index| (pedal.source_id.as_str(), layer_index))
+            })
             .collect::<BTreeMap<_, _>>();
         self.draft
             .instances
@@ -280,6 +294,15 @@ impl RuntimeModelEditor {
                     .get(instance.source_pedal_id.as_str())
                     .copied()
             })
+            .collect()
+    }
+
+    pub fn source_sequence(&self) -> Vec<String> {
+        self.draft
+            .instances
+            .iter()
+            .filter(|instance| instance.enabled)
+            .map(|instance| instance.source_pedal_id.clone())
             .collect()
     }
 
@@ -294,9 +317,7 @@ impl RuntimeModelEditor {
             .instances
             .iter()
             .filter_map(|instance| {
-                let layer_index = layer_by_source
-                    .get(instance.source_pedal_id.as_str())
-                    .copied()?;
+                let layer_index = *layer_by_source.get(instance.source_pedal_id.as_str())?;
                 let occurrence = occurrences
                     .entry(instance.source_pedal_id.as_str())
                     .and_modify(|value| *value += 1)
@@ -324,6 +345,36 @@ impl RuntimeModelEditor {
                 "layer sequence must contain at least one layer".to_string(),
             ));
         }
+        let source_sequence = layer_sequence
+            .iter()
+            .map(|layer_index| {
+                let sources = self.source_by_layer.get(layer_index).ok_or_else(|| {
+                    RuntimeEditorError(format!(
+                        "unknown layer {layer_index}; available layers: {}",
+                        available_layer_range(&self.source_by_layer)
+                    ))
+                })?;
+                if sources.len() != 1 {
+                    return Err(RuntimeEditorError(format!(
+                        "layer {layer_index} has {} source pedals; edit the source sequence by id",
+                        sources.len()
+                    )));
+                }
+                Ok(sources[0].clone())
+            })
+            .collect::<Result<Vec<_>, RuntimeEditorError>>()?;
+        self.replace_source_sequence(&source_sequence)
+    }
+
+    pub fn replace_source_sequence(
+        &mut self,
+        source_sequence: &[String],
+    ) -> Result<(), RuntimeEditorError> {
+        if source_sequence.is_empty() {
+            return Err(RuntimeEditorError(
+                "source sequence must contain at least one pedal".to_string(),
+            ));
+        }
         let mut previous_by_source =
             BTreeMap::<String, VecDeque<StreamCircuitPedalInstance>>::new();
         for instance in &self.draft.instances {
@@ -334,14 +385,13 @@ impl RuntimeModelEditor {
         }
         let mut occurrence_by_source = BTreeMap::<String, usize>::new();
         let mut used_instance_ids = BTreeSet::new();
-        let mut instances = Vec::with_capacity(layer_sequence.len());
-        for layer_index in layer_sequence {
-            let source_id = self.source_by_layer.get(layer_index).ok_or_else(|| {
-                RuntimeEditorError(format!(
-                    "unknown layer {layer_index}; available layers: {}",
-                    available_layer_range(&self.source_by_layer)
-                ))
-            })?;
+        let mut instances = Vec::with_capacity(source_sequence.len());
+        for source_id in source_sequence {
+            if !self.source_ids.contains(source_id) {
+                return Err(RuntimeEditorError(format!(
+                    "unknown source pedal {source_id:?}"
+                )));
+            }
             let occurrence = occurrence_by_source
                 .entry(source_id.clone())
                 .and_modify(|value| *value += 1)
@@ -895,7 +945,7 @@ fn allocate_instance_id(
     }
 }
 
-fn available_layer_range(source_by_layer: &BTreeMap<usize, String>) -> String {
+fn available_layer_range(source_by_layer: &BTreeMap<usize, Vec<String>>) -> String {
     match (
         source_by_layer.keys().next().copied(),
         source_by_layer.keys().next_back().copied(),
