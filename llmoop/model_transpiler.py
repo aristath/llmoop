@@ -1539,7 +1539,7 @@ def make_layer(structure: ModelStructure, layer: LayerStructure) -> Json:
         "ports": {
             "inputs": [{"id": "input", "signal": "frame", "shape": [hidden_size]}],
             "outputs": [{"id": "output", "signal": "frame", "shape": [hidden_size]}],
-            "controls": [{"id": "control", "type": "pedal_control", "optional": True}],
+            "controls": [],
         },
         "state_ports": make_state_ports(structure, layer),
         "parameter_block": make_parameter_block(
@@ -2758,4 +2758,3 @@ def add_optional_linear_biases(
 
 def tensor_ref(name: str) -> dict[str, str]:
     return {"tensor": name}
-

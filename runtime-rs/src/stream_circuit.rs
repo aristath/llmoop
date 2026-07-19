@@ -802,28 +802,16 @@ impl StreamCircuitRuntimePatch {
                     source.instance_id, source.source_pedal_id
                 ))
             })?;
-        let source_output = source_artifact
-            .circuit
-            .boundary
-            .outputs
-            .first()
-            .ok_or_else(|| {
-                CircuitPlacementError(format!(
-                    "runtime patch instance {} has no output port",
-                    source.instance_id
-                ))
-            })?;
-        let duplicate_input = source_artifact
-            .circuit
-            .boundary
-            .inputs
-            .first()
-            .ok_or_else(|| {
-                CircuitPlacementError(format!(
-                    "runtime patch duplicate {} has no input port",
-                    new_instance_id
-                ))
-            })?;
+        let source_output = single_series_port(
+            &source_artifact.circuit.boundary.outputs,
+            &source.instance_id,
+            "output",
+        )?;
+        let duplicate_input = single_series_port(
+            &source_artifact.circuit.boundary.inputs,
+            &new_instance_id,
+            "input",
+        )?;
         let outgoing = self
             .cables
             .iter()
@@ -834,6 +822,14 @@ impl StreamCircuitRuntimePatch {
         if outgoing.len() > 1 {
             return Err(CircuitPlacementError(format!(
                 "cannot insert duplicate after branching pedal {after_instance_id:?}; wire the explicit graph instead"
+            )));
+        }
+        if outgoing
+            .first()
+            .is_some_and(|index| self.cables[*index].source.port_id != source_output.id)
+        {
+            return Err(CircuitPlacementError(format!(
+                "cannot insert duplicate after pedal {after_instance_id:?}: its outgoing cable does not use the sole series output"
             )));
         }
         let inserted_cable = StreamCircuitGraphCable {
@@ -1042,6 +1038,12 @@ impl StreamCircuitRuntimePatch {
                     instance.instance_id, instance.source_pedal_id
                 )));
             }
+            if !instance.control_values.is_empty() {
+                return Err(CircuitPlacementError(format!(
+                    "runtime patch instance {} supplies control values, but executable pedal controls are not implemented",
+                    instance.instance_id
+                )));
+            }
             validate_instance_state_policy(instance, &self.instances, &source_by_id)?;
         }
         validate_state_policy_dependencies(&self.instances)?;
@@ -1131,18 +1133,16 @@ fn series_cables_for_instances(
                         pair[1].instance_id, pair[1].source_pedal_id
                     ))
                 })?;
-            let output = source.circuit.boundary.outputs.first().ok_or_else(|| {
-                CircuitPlacementError(format!(
-                    "runtime patch instance {} has no output port",
-                    pair[0].instance_id
-                ))
-            })?;
-            let input = destination.circuit.boundary.inputs.first().ok_or_else(|| {
-                CircuitPlacementError(format!(
-                    "runtime patch instance {} has no input port",
-                    pair[1].instance_id
-                ))
-            })?;
+            let output = single_series_port(
+                &source.circuit.boundary.outputs,
+                &pair[0].instance_id,
+                "output",
+            )?;
+            let input = single_series_port(
+                &destination.circuit.boundary.inputs,
+                &pair[1].instance_id,
+                "input",
+            )?;
             Ok(StreamCircuitGraphCable {
                 id: format!("cable_{index:04}"),
                 source: StreamCircuitCableEndpoint {
@@ -1156,6 +1156,20 @@ fn series_cables_for_instances(
             })
         })
         .collect()
+}
+
+fn single_series_port<'a>(
+    ports: &'a [CircuitPort],
+    instance_id: &str,
+    direction: &str,
+) -> Result<&'a CircuitPort, CircuitPlacementError> {
+    if ports.len() != 1 {
+        return Err(CircuitPlacementError(format!(
+            "runtime series wiring requires instance {instance_id} to expose exactly one {direction} port, found {}",
+            ports.len()
+        )));
+    }
+    Ok(&ports[0])
 }
 
 fn allocate_cable_id(
@@ -3888,6 +3902,47 @@ mod tests {
             "gpu1"
         );
         assert_eq!(placement.cross_device_cable_count, 2);
+    }
+
+    #[test]
+    fn runtime_series_wiring_rejects_ambiguous_multiport_pedals() {
+        let mut resolved =
+            ResolvedLoweredPedalboard::from_index_file(fixture_model_index_path()).unwrap();
+        let source = resolved
+            .circuits
+            .iter_mut()
+            .find(|artifact| artifact.pedal.id == "layer_00")
+            .unwrap();
+        let mut auxiliary = source.circuit.boundary.outputs[0].clone();
+        auxiliary.id = "auxiliary_output".to_string();
+        source.circuit.boundary.outputs.push(auxiliary);
+        let chain = vec![
+            ("first".to_string(), "layer_00".to_string()),
+            ("second".to_string(), "layer_01".to_string()),
+        ];
+
+        let error =
+            StreamCircuitRuntimePatch::from_source_chain(&resolved, "gpu0", &chain).unwrap_err();
+
+        assert!(error.0.contains("exactly one output port"));
+    }
+
+    #[test]
+    fn runtime_patch_rejects_control_values_that_execution_would_ignore() {
+        let resolved =
+            ResolvedLoweredPedalboard::from_index_file(fixture_model_index_path()).unwrap();
+        let mut patch = resolved.default_runtime_patch("gpu0").unwrap();
+        patch.instances[0]
+            .control_values
+            .insert("unused".to_string(), serde_json::json!(true));
+
+        let error = patch.validate_against_graph(&resolved).unwrap_err();
+
+        assert!(
+            error
+                .0
+                .contains("executable pedal controls are not implemented")
+        );
     }
 
     #[test]
