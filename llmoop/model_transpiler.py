@@ -1354,7 +1354,6 @@ def discover_outer_norm_weight_offset(
     stores_offset_weights = output_norm.endswith(offset_norm_suffixes) or any(
         layer.tensors["operator_norm"].endswith(offset_norm_suffixes)
         or layer.tensors["ffn_norm"].endswith(offset_norm_suffixes)
-        or "layer_scalar" in layer.tensors
         for layer in layers
     )
     return (

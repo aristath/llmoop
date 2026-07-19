@@ -173,10 +173,13 @@ def test_discovers_attention_with_values_derived_from_keys() -> None:
     assert layer.num_key_value_heads == 2
     assert layer.attention_scale == 1.0
     assert layer.value_head_norm
-    assert structure.rms_norm_weight_offset == 1.0
+    assert structure.rms_norm_weight_offset == 0.0
     assert "v_projection" not in nodes
     assert nodes["v_head_norm"]["inputs"] == ["k_projected"]
     assert nodes["kv_memory_append"]["inputs"][:2] == ["k_positioned", "v_normed"]
+    assert nodes["ffn_residual"]["outputs"] == ["ffn_residual_out"]
+    assert nodes["layer_scale"]["inputs"] == ["ffn_residual_out"]
+    assert nodes["layer_scale"]["outputs"] == ["output_frame"]
 
 
 def test_synthesizes_separate_experts_as_packed_circuit_parameters() -> None:

@@ -1008,6 +1008,13 @@ def _ffn_tail(
         ]
         ffn_residual_update = "ffn_post_norm_out"
 
+    per_layer_width = numerics.get("per_layer_input_width")
+    has_layer_scalar = "layer_scalar" in parameters
+    ffn_residual_output = (
+        "ffn_residual_out"
+        if per_layer_width is not None or has_layer_scalar
+        else "output_frame"
+    )
     tail: list[Json] = [
         *prefix,
         *body,
@@ -1016,101 +1023,108 @@ def _ffn_tail(
             node_id="ffn_residual",
             residual="operator_residual_out",
             update=ffn_residual_update,
-            output=(
-                "ffn_residual_out"
-                if numerics.get("per_layer_input_width") is not None
-                else "output_frame"
-            ),
+            output=ffn_residual_output,
             scale=residual_scale,
         ),
     ]
-    per_layer_width = numerics.get("per_layer_input_width")
-    if per_layer_width is None:
+    if per_layer_width is None and not has_layer_scalar:
         return tail
 
-    width = int(per_layer_width)
     hidden_size = int(feed_forward["hidden_size"])
-    tail.extend(
-        [
-            {
-                "id": "per_layer_embedding",
-                "op": "per_layer_embedding",
-                "inputs": [],
-                "outputs": ["per_layer_input"],
-                "params": [
-                    "token_embedding",
-                    "per_layer_embedding",
-                    "per_layer_model_projection",
-                    "per_layer_projection_norm",
-                ],
-                "attrs": {
-                    "hidden_size": hidden_size,
-                    "per_layer_width": width,
-                    "layer_index": int(numerics["per_layer_input_layer_index"]),
-                    "layer_count": int(numerics["per_layer_input_layer_count"]),
-                    "norm_eps": float(numerics["rms_norm_eps"]),
-                    "token_embedding_scale": float(numerics["token_embedding_scale"]),
-                    "per_layer_embedding_scale": float(
-                        numerics["per_layer_embedding_scale"]
-                    ),
-                    "model_projection_scale": float(
-                        numerics["per_layer_model_projection_scale"]
-                    ),
-                    "combination_scale": float(numerics["per_layer_input_scale"]),
+    if per_layer_width is not None:
+        width = int(per_layer_width)
+        tail.extend(
+            [
+                {
+                    "id": "per_layer_embedding",
+                    "op": "per_layer_embedding",
+                    "inputs": [],
+                    "outputs": ["per_layer_input"],
+                    "params": [
+                        "token_embedding",
+                        "per_layer_embedding",
+                        "per_layer_model_projection",
+                        "per_layer_projection_norm",
+                    ],
+                    "attrs": {
+                        "hidden_size": hidden_size,
+                        "per_layer_width": width,
+                        "layer_index": int(numerics["per_layer_input_layer_index"]),
+                        "layer_count": int(numerics["per_layer_input_layer_count"]),
+                        "norm_eps": float(numerics["rms_norm_eps"]),
+                        "token_embedding_scale": float(
+                            numerics["token_embedding_scale"]
+                        ),
+                        "per_layer_embedding_scale": float(
+                            numerics["per_layer_embedding_scale"]
+                        ),
+                        "model_projection_scale": float(
+                            numerics["per_layer_model_projection_scale"]
+                        ),
+                        "combination_scale": float(numerics["per_layer_input_scale"]),
+                    },
                 },
-            },
-            {
-                "id": "per_layer_input_gate",
-                "op": "linear",
-                "inputs": ["ffn_residual_out"],
-                "outputs": ["per_layer_gate"],
-                "params": ["per_layer_input_gate"],
-            },
-            {
-                "id": "per_layer_gate_activation",
-                "op": str(feed_forward["activation"]),
-                "inputs": ["per_layer_gate"],
-                "outputs": ["per_layer_gate_activated"],
-                "attrs": {"element_count": width},
-            },
-            {
-                "id": "per_layer_gate_multiply",
-                "op": "multiply",
-                "inputs": ["per_layer_gate_activated", "per_layer_input"],
-                "outputs": ["per_layer_gated"],
-                "attrs": {"element_count": width},
-            },
-            {
-                "id": "per_layer_projection",
-                "op": "linear",
-                "inputs": ["per_layer_gated"],
-                "outputs": ["per_layer_projected"],
-                "params": ["per_layer_projection"],
-            },
-            {
-                "id": "per_layer_post_norm",
-                "op": "rms_norm",
-                "inputs": ["per_layer_projected"],
-                "outputs": ["per_layer_normed"],
-                "params": ["per_layer_post_norm"],
-                "attrs": _norm_attrs(numerics),
-            },
-            {
-                "id": "per_layer_residual",
-                "op": "residual_add",
-                "inputs": ["ffn_residual_out", "per_layer_normed"],
-                "outputs": ["per_layer_residual_out"],
-            },
+                {
+                    "id": "per_layer_input_gate",
+                    "op": "linear",
+                    "inputs": ["ffn_residual_out"],
+                    "outputs": ["per_layer_gate"],
+                    "params": ["per_layer_input_gate"],
+                },
+                {
+                    "id": "per_layer_gate_activation",
+                    "op": str(feed_forward["activation"]),
+                    "inputs": ["per_layer_gate"],
+                    "outputs": ["per_layer_gate_activated"],
+                    "attrs": {"element_count": width},
+                },
+                {
+                    "id": "per_layer_gate_multiply",
+                    "op": "multiply",
+                    "inputs": ["per_layer_gate_activated", "per_layer_input"],
+                    "outputs": ["per_layer_gated"],
+                    "attrs": {"element_count": width},
+                },
+                {
+                    "id": "per_layer_projection",
+                    "op": "linear",
+                    "inputs": ["per_layer_gated"],
+                    "outputs": ["per_layer_projected"],
+                    "params": ["per_layer_projection"],
+                },
+                {
+                    "id": "per_layer_post_norm",
+                    "op": "rms_norm",
+                    "inputs": ["per_layer_projected"],
+                    "outputs": ["per_layer_normed"],
+                    "params": ["per_layer_post_norm"],
+                    "attrs": _norm_attrs(numerics),
+                },
+                {
+                    "id": "per_layer_residual",
+                    "op": "residual_add",
+                    "inputs": ["ffn_residual_out", "per_layer_normed"],
+                    "outputs": [
+                        "per_layer_residual_out" if has_layer_scalar else "output_frame"
+                    ],
+                },
+            ]
+        )
+    if has_layer_scalar:
+        tail.append(
             {
                 "id": "layer_scale",
                 "op": "scalar_multiply",
-                "inputs": ["per_layer_residual_out"],
+                "inputs": [
+                    "per_layer_residual_out"
+                    if per_layer_width is not None
+                    else "ffn_residual_out"
+                ],
                 "outputs": ["output_frame"],
                 "params": ["layer_scalar"],
                 "attrs": {"element_count": hidden_size},
-            },
-        ]
-    )
+            }
+        )
     return tail
 
 
