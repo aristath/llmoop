@@ -1029,6 +1029,12 @@ impl Drop for VulkanResidentKernelSequence {
     }
 }
 
+impl VulkanResidentKernelSequence {
+    pub fn has_recorded_commands(&self) -> bool {
+        self.recorded_steps.borrow().is_some() && self.recorded_snapshot_copies.borrow().is_some()
+    }
+}
+
 impl VulkanComputeDevice {
     pub fn available_compute_devices() -> Result<Vec<VulkanComputeDeviceInfo>, VulkanError> {
         unsafe {
@@ -1884,6 +1890,50 @@ impl VulkanComputeDevice {
         self.run_resident_kernel_sequence_with_snapshot_copies(sequence, steps, &[])
     }
 
+    pub fn run_recorded_resident_kernel_sequence(
+        &self,
+        sequence: &VulkanResidentKernelSequence,
+    ) -> Result<(), VulkanError> {
+        if !sequence.has_recorded_commands() {
+            return Err(VulkanError(
+                "resident kernel sequence has no recorded commands".to_string(),
+            ));
+        }
+        self.submit_resident_kernel_sequence_and_wait(sequence)
+    }
+
+    fn submit_resident_kernel_sequence_and_wait(
+        &self,
+        sequence: &VulkanResidentKernelSequence,
+    ) -> Result<(), VulkanError> {
+        unsafe {
+            let command_buffers = [sequence.command_buffer];
+            let submit_info = [vk::SubmitInfo::default().command_buffers(&command_buffers)];
+            self.device
+                .reset_fences(&[sequence.completion_fence])
+                .map_err(|error| {
+                    VulkanError(format!(
+                        "failed to reset resident kernel sequence completion fence: {error:?}"
+                    ))
+                })?;
+            self.device
+                .queue_submit(self.queue, &submit_info, sequence.completion_fence)
+                .map_err(|error| {
+                    VulkanError(format!(
+                        "failed to submit resident kernel sequence: {error:?}"
+                    ))
+                })?;
+            self.device
+                .wait_for_fences(&[sequence.completion_fence], true, u64::MAX)
+                .map_err(|error| {
+                    VulkanError(format!(
+                        "failed waiting for resident kernel sequence: {error:?}"
+                    ))
+                })?;
+        }
+        Ok(())
+    }
+
     pub fn run_resident_kernel_sequence_with_snapshot_copies(
         &self,
         sequence: &VulkanResidentKernelSequence,
@@ -2198,29 +2248,7 @@ impl VulkanComputeDevice {
                 }
             }
 
-            let command_buffers = [sequence.command_buffer];
-            let submit_info = [vk::SubmitInfo::default().command_buffers(&command_buffers)];
-            self.device
-                .reset_fences(&[sequence.completion_fence])
-                .map_err(|error| {
-                    VulkanError(format!(
-                        "failed to reset resident kernel sequence completion fence: {error:?}"
-                    ))
-                })?;
-            self.device
-                .queue_submit(self.queue, &submit_info, sequence.completion_fence)
-                .map_err(|error| {
-                    VulkanError(format!(
-                        "failed to submit resident kernel sequence: {error:?}"
-                    ))
-                })?;
-            self.device
-                .wait_for_fences(&[sequence.completion_fence], true, u64::MAX)
-                .map_err(|error| {
-                    VulkanError(format!(
-                        "failed waiting for resident kernel sequence: {error:?}"
-                    ))
-                })?;
+            self.submit_resident_kernel_sequence_and_wait(sequence)?;
             let host_submit_wait_ns = host_start
                 .map(|start| start.elapsed().as_nanos())
                 .unwrap_or_default();
@@ -3461,7 +3489,7 @@ mod tests {
     }
 
     #[test]
-    fn resident_kernel_sequence_composes_dispatches_in_one_submission() {
+    fn resident_kernel_sequence_records_and_replays_composed_dispatches() {
         let Some(spirv_words) = compile_test_shader_words() else {
             eprintln!("skipping Vulkan smoke: no GLSL to SPIR-V compiler found");
             return;
@@ -3480,6 +3508,12 @@ mod tests {
             .create_resident_kernel_dispatch(&spirv_words, &[binding], 1, 64, 0)
             .unwrap();
         let sequence = device.create_resident_kernel_sequence().unwrap();
+        assert!(!sequence.has_recorded_commands());
+        assert!(
+            device
+                .run_recorded_resident_kernel_sequence(&sequence)
+                .is_err()
+        );
 
         device
             .run_resident_kernel_sequence(
@@ -3490,10 +3524,19 @@ mod tests {
                 ],
             )
             .unwrap();
+        assert!(sequence.has_recorded_commands());
 
         assert_eq!(
             bytes_to_u32(&buffer.read_bytes(12).unwrap()),
             vec![3, 4, 43]
+        );
+
+        device
+            .run_recorded_resident_kernel_sequence(&sequence)
+            .unwrap();
+        assert_eq!(
+            bytes_to_u32(&buffer.read_bytes(12).unwrap()),
+            vec![5, 6, 45]
         );
     }
 

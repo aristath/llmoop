@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
@@ -7555,6 +7556,16 @@ enum VulkanResidentPlacedTokenTickTail {
     Sample,
 }
 
+impl VulkanResidentPlacedTokenTickTail {
+    fn sequence_variant(self) -> u8 {
+        match self {
+            Self::None => 0,
+            Self::Logits => 1,
+            Self::Sample => 2,
+        }
+    }
+}
+
 impl VulkanResidentInProcessPlacedModelPackage {
     pub fn from_manifest_file(
         device: &VulkanComputeDevice,
@@ -7989,6 +8000,7 @@ impl VulkanResidentInProcessPlacedModelPackage {
         for slice in &self.device_slices {
             let mut dispatch_extensions =
                 VulkanMountedPlacedResidentStreamTickDispatchExtensions::default();
+            dispatch_extensions.sequence_variant = tail.sequence_variant();
             if slice.device_id == self.input_device_id {
                 dispatch_extensions
                     .prefix_dispatches
@@ -8086,6 +8098,7 @@ impl VulkanResidentInProcessPlacedModelPackage {
                 })?;
             let mut dispatch_extensions =
                 VulkanMountedPlacedResidentStreamTickDispatchExtensions::default();
+            dispatch_extensions.sequence_variant = tail.sequence_variant();
             if slice.device_id == self.input_device_id {
                 dispatch_extensions
                     .prefix_dispatches
@@ -11331,7 +11344,7 @@ pub struct VulkanMountedPlacedResidentDispatchSegmentRunner {
     pub dispatch_count: usize,
     dispatches: Vec<VulkanMountedPlacedResidentPedalDispatch>,
     stream_control_buffer: Arc<VulkanResidentBuffer>,
-    sequence: VulkanResidentKernelSequence,
+    sequences: RefCell<BTreeMap<u8, VulkanResidentKernelSequence>>,
 }
 
 impl VulkanMountedPlacedResidentDispatchSegmentRunner {
@@ -11408,9 +11421,12 @@ impl VulkanMountedPlacedResidentDispatchSegmentRunner {
             dispatch_count: dispatches.len(),
             dispatches,
             stream_control_buffer: mounted.stream_control_buffer.clone(),
-            sequence: device
-                .create_resident_kernel_sequence()
-                .map_err(VulkanMountedPlacedResidentKernelDispatchError::Vulkan)?,
+            sequences: RefCell::new(BTreeMap::from([(
+                0,
+                device
+                    .create_resident_kernel_sequence()
+                    .map_err(VulkanMountedPlacedResidentKernelDispatchError::Vulkan)?,
+            )])),
         })
     }
 
@@ -11420,6 +11436,7 @@ impl VulkanMountedPlacedResidentDispatchSegmentRunner {
         control: VulkanMountedPlacedStreamControl,
         prefix_dispatches: &[&VulkanResidentKernelDispatch],
         suffix_dispatches: &[&VulkanResidentKernelDispatch],
+        sequence_variant: u8,
         capture_execution_trace: bool,
     ) -> Result<
         Vec<VulkanMountedPlacedResidentPedalRun>,
@@ -11431,6 +11448,47 @@ impl VulkanMountedPlacedResidentDispatchSegmentRunner {
                 &stream_control_metadata_bytes(control),
             )
             .map_err(VulkanMountedPlacedResidentKernelDispatchError::Vulkan)?;
+
+        if !self.sequences.borrow().contains_key(&sequence_variant) {
+            let sequence = device
+                .create_resident_kernel_sequence()
+                .map_err(VulkanMountedPlacedResidentKernelDispatchError::Vulkan)?;
+            self.sequences
+                .borrow_mut()
+                .entry(sequence_variant)
+                .or_insert(sequence);
+        }
+        let sequences = self.sequences.borrow();
+        let sequence = sequences
+            .get(&sequence_variant)
+            .expect("resident sequence variant was initialized");
+
+        let can_replay_recorded_commands = std::env::var_os("LLMOOP_VK_PERF_LOGGER").is_none()
+            && sequence.has_recorded_commands()
+            && self
+                .dispatches
+                .iter()
+                .all(|dispatch| dispatch.push_constants.is_empty())
+            && prefix_dispatches
+                .iter()
+                .all(|dispatch| dispatch.push_constant_byte_count() == 0)
+            && suffix_dispatches
+                .iter()
+                .all(|dispatch| dispatch.push_constant_byte_count() == 0);
+
+        let execution_start = capture_execution_trace.then(Instant::now);
+        if can_replay_recorded_commands {
+            device
+                .run_recorded_resident_kernel_sequence(sequence)
+                .map_err(VulkanMountedPlacedResidentKernelDispatchError::Vulkan)?;
+            return Ok(execution_start
+                .map(|start| {
+                    let execution_time_ns =
+                        u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                    self.completed_pedal_runs(execution_time_ns)
+                })
+                .unwrap_or_default());
+        }
 
         let push_constants = self
             .dispatches
@@ -11455,9 +11513,8 @@ impl VulkanMountedPlacedResidentDispatchSegmentRunner {
                 .iter()
                 .map(|dispatch| VulkanResidentKernelSequenceStep::new(dispatch, &[])),
         );
-        let execution_start = capture_execution_trace.then(Instant::now);
         device
-            .run_resident_kernel_sequence(&self.sequence, &steps)
+            .run_resident_kernel_sequence(sequence, &steps)
             .map_err(VulkanMountedPlacedResidentKernelDispatchError::Vulkan)?;
         Ok(execution_start
             .map(|start| {
@@ -14314,6 +14371,7 @@ impl VulkanMountedPlacedResidentStreamTickCursor {
                                 } else {
                                     &[]
                                 },
+                                dispatch_extensions.sequence_variant,
                                 self.capture_execution_trace,
                             )
                             .map_err(VulkanMountedPlacedResidentStreamTickError::Dispatch)?,
@@ -14438,6 +14496,7 @@ pub struct VulkanMountedPlacedResidentStreamTickCursorAdvance {
 pub struct VulkanMountedPlacedResidentStreamTickDispatchExtensions<'a> {
     pub prefix_dispatches: Vec<&'a VulkanResidentKernelDispatch>,
     pub suffix_dispatches: Vec<&'a VulkanResidentKernelDispatch>,
+    sequence_variant: u8,
 }
 
 pub struct VulkanMountedPlacedResidentInProcessStreamTickSlice<'a> {
