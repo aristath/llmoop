@@ -7103,12 +7103,29 @@ pub struct VulkanResidentModelPackageManifest {
 
 fn validate_behavioral_validation_artifact(
     manifest_path: &Path,
-    relative_path: &str,
+    manifest: &VulkanResidentModelPackageManifest,
 ) -> io::Result<()> {
+    let relative_path = &manifest.behavioral_validation_path;
     if relative_path.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "resident model package does not declare behavioral validation evidence",
+        ));
+    }
+    let relative = Path::new(relative_path);
+    if relative.is_absolute()
+        || relative.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("behavioral validation path {relative_path:?} must stay inside the package"),
         ));
     }
     let path = manifest_path
@@ -7135,22 +7152,265 @@ fn validate_behavioral_validation_artifact(
             ),
         ));
     }
-    if evidence.get("candidate_kind").and_then(Value::as_str) != Some("exact_reference") {
-        for mode in ["teacher_forced", "free_running"] {
-            if evidence
-                .get(mode)
-                .and_then(|value| value.get("status"))
-                .and_then(Value::as_str)
-                != Some("passed")
-            {
+    let candidate_kind = evidence
+        .get("candidate_kind")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "behavioral validation evidence {} has no candidate kind",
+                    path.display()
+                ),
+            )
+        })?;
+    if candidate_kind != "exact_reference" && candidate_kind != "approximate" {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "behavioral validation evidence {} has unsupported candidate kind {candidate_kind:?}",
+                path.display()
+            ),
+        ));
+    }
+    let source_oracle = evidence
+        .get("source_oracle")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "behavioral validation evidence {} has no source oracle contract",
+                    path.display()
+                ),
+            )
+        })?;
+    if source_oracle
+        .get("model_contract_digest")
+        .and_then(Value::as_str)
+        .is_none_or(|digest| !is_lower_hex_sha256(digest))
+        || ["tensor_count", "parameter_count", "byte_count"]
+            .iter()
+            .any(|field| source_oracle.get(*field).and_then(Value::as_u64).is_none())
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "behavioral validation evidence {} has an incomplete source oracle contract",
+                path.display()
+            ),
+        ));
+    }
+
+    for mode in ["teacher_forced", "free_running"] {
+        let mode_evidence = evidence
+            .get(mode)
+            .and_then(Value::as_object)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "behavioral validation evidence {} lacks {mode} validation",
+                        path.display()
+                    ),
+                )
+            })?;
+        if candidate_kind == "exact_reference" {
+            if mode_evidence.get("status").and_then(Value::as_str) != Some("not_required") {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(
-                        "approximate candidate evidence {} lacks passing {mode} validation",
+                        "exact candidate evidence {} must mark {mode} validation not_required",
                         path.display()
                     ),
                 ));
             }
+        } else if mode_evidence.get("status").and_then(Value::as_str) != Some("passed")
+            || mode_evidence
+                .get("sample_count")
+                .and_then(Value::as_u64)
+                .is_none_or(|count| count == 0)
+            || mode_evidence
+                .get("metrics")
+                .and_then(Value::as_object)
+                .is_none_or(|metrics| {
+                    metrics.is_empty()
+                        || metrics
+                            .values()
+                            .any(|value| value.as_f64().is_none_or(|number| !number.is_finite()))
+                })
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "approximate candidate evidence {} lacks measured passing {mode} validation",
+                    path.display()
+                ),
+            ));
+        }
+    }
+
+    let expected_pedals = manifest
+        .circuit_graph
+        .pedals
+        .iter()
+        .map(|pedal| (pedal.pedal_id.as_str(), pedal.circuit.nodes.len()))
+        .collect::<BTreeMap<_, _>>();
+    let circuits = evidence
+        .get("circuits")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "behavioral validation evidence {} has no circuit proofs",
+                    path.display()
+                ),
+            )
+        })?;
+    let mut proven_pedals = BTreeSet::new();
+    for circuit in circuits {
+        let pedal_id = circuit
+            .get("pedal_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "behavioral validation evidence {} contains a proof without a pedal id",
+                        path.display()
+                    ),
+                )
+            })?;
+        if !proven_pedals.insert(pedal_id) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "behavioral validation evidence {} repeats pedal {pedal_id:?}",
+                    path.display()
+                ),
+            ));
+        }
+        let expected_node_count = expected_pedals.get(pedal_id).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "behavioral validation evidence {} proves unknown pedal {pedal_id:?}",
+                    path.display()
+                ),
+            )
+        })?;
+        let candidate_node_count = circuit
+            .get("candidate_node_count")
+            .and_then(Value::as_u64)
+            .and_then(|count| usize::try_from(count).ok());
+        if circuit.get("status").and_then(Value::as_str) != Some("passed")
+            || circuit.get("candidate_kind").and_then(Value::as_str) != Some(candidate_kind)
+            || candidate_node_count != Some(*expected_node_count)
+            || circuit
+                .get("candidate_contract_digest")
+                .and_then(Value::as_str)
+                .is_none_or(|digest| !is_lower_hex_sha256(digest))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "behavioral validation evidence {} has an incomplete or stale proof for pedal {pedal_id:?}",
+                    path.display()
+                ),
+            ));
+        }
+        if candidate_kind == "exact_reference"
+            && (circuit.get("source_node_count").and_then(Value::as_u64)
+                != circuit
+                    .get("covered_source_node_count")
+                    .and_then(Value::as_u64))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "behavioral validation evidence {} does not completely cover pedal {pedal_id:?}",
+                    path.display()
+                ),
+            ));
+        }
+    }
+    if proven_pedals != expected_pedals.keys().copied().collect() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "behavioral validation evidence {} does not prove every packaged pedal",
+                path.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn is_lower_hex_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn validate_resident_package_relative_path(label: &str, value: &str) -> io::Result<()> {
+    let path = Path::new(value);
+    if value.is_empty()
+        || path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("resident model package {label} path {value:?} must stay inside the package"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_resident_package_paths(
+    manifest: &VulkanResidentModelPackageManifest,
+) -> io::Result<()> {
+    for (label, path) in [
+        ("tensor index", manifest.tensor_index_path.as_str()),
+        (
+            "behavioral validation",
+            manifest.behavioral_validation_path.as_str(),
+        ),
+        ("config", manifest.config_path.as_str()),
+        ("tokenizer", manifest.tokenizer.path.as_str()),
+        (
+            "input transducer shader",
+            manifest.input_transducer.shader_path.as_str(),
+        ),
+        (
+            "output embedding norm shader",
+            manifest
+                .output_transducer
+                .embedding_norm_shader_path
+                .as_str(),
+        ),
+        (
+            "output projection shader",
+            manifest.output_transducer.projection_shader_path.as_str(),
+        ),
+        ("sampler shader", manifest.sampler.shader_path.as_str()),
+    ] {
+        validate_resident_package_relative_path(label, path)?;
+    }
+    for path in &manifest.tokenizer.files {
+        validate_resident_package_relative_path("tokenizer file", path)?;
+    }
+    for execution in &manifest.pedal_executions {
+        for kernel in &execution.kernels {
+            validate_resident_package_relative_path("pedal kernel shader", &kernel.shader_path)?;
         }
     }
     Ok(())
@@ -7171,7 +7431,20 @@ impl VulkanResidentModelPackageManifest {
                 ),
             ));
         }
-        validate_behavioral_validation_artifact(path, &manifest.behavioral_validation_path)?;
+        validate_resident_package_paths(&manifest)?;
+        validate_behavioral_validation_artifact(path, &manifest)?;
+        let package_root = path.parent().unwrap_or_else(|| Path::new("."));
+        let source_graph = manifest
+            .resolved_source_graph(package_root)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+        let patch =
+            StreamCircuitRuntimePatch::from_placement_spec(&source_graph, &manifest.placement)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+        patch
+            .validate_against_graph(&source_graph)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+        validate_pedal_executions_against_graph(&manifest, &source_graph)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
         Ok(manifest)
     }
 
@@ -7189,23 +7462,6 @@ impl VulkanResidentModelPackageManifest {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect()
-    }
-
-    pub fn with_runtime_placement(
-        mut self,
-        default_device_id: Option<&str>,
-        pedal_devices: &BTreeMap<String, String>,
-    ) -> Self {
-        if let Some(default_device_id) = default_device_id {
-            self.placement.default_device_id = default_device_id.to_string();
-            self.device_id = default_device_id.to_string();
-        }
-        for (pedal_id, device_id) in pedal_devices {
-            self.placement
-                .pedal_devices
-                .insert(pedal_id.clone(), device_id.clone());
-        }
-        self
     }
 
     pub fn with_runtime_patch_controls(
@@ -10421,6 +10677,64 @@ fn validate_pedal_executions(
         }
     }
 
+    Ok(())
+}
+
+fn validate_pedal_executions_against_graph(
+    manifest: &VulkanResidentModelPackageManifest,
+    graph: &ResolvedLoweredPedalboard,
+) -> Result<(), VulkanResidentTokenModelPackageError> {
+    validate_pedal_executions(manifest)?;
+    let execution_by_pedal = manifest
+        .pedal_executions
+        .iter()
+        .map(|execution| (execution.pedal_id.as_str(), execution))
+        .collect::<BTreeMap<_, _>>();
+    let graph_pedals = graph
+        .circuits
+        .iter()
+        .map(|artifact| artifact.pedal.id.as_str())
+        .collect::<BTreeSet<_>>();
+    if execution_by_pedal.keys().copied().collect::<BTreeSet<_>>() != graph_pedals {
+        return Err(VulkanResidentTokenModelPackageError::new(format!(
+            "resident model package {:?} pedal executions do not match its circuit graph",
+            manifest.package_id
+        )));
+    }
+    for artifact in &graph.circuits {
+        let execution = execution_by_pedal[artifact.pedal.id.as_str()];
+        if execution.operator_type != artifact.pedal.operator_type
+            || execution.implementation != artifact.pedal.implementation
+        {
+            return Err(VulkanResidentTokenModelPackageError::new(format!(
+                "resident model package {:?} execution identity for pedal {} does not match its circuit",
+                manifest.package_id, artifact.pedal.id
+            )));
+        }
+        if execution.kernels.len() != artifact.circuit.nodes.len() {
+            return Err(VulkanResidentTokenModelPackageError::new(format!(
+                "resident model package {:?} pedal {} execution does not cover every circuit node",
+                manifest.package_id, artifact.pedal.id
+            )));
+        }
+        for (expected_index, (kernel, node)) in execution
+            .kernels
+            .iter()
+            .zip(&artifact.circuit.nodes)
+            .enumerate()
+        {
+            if kernel.execution_index != expected_index
+                || kernel.node_id != node.id
+                || kernel.op != node.op
+                || kernel.shader_path.is_empty()
+            {
+                return Err(VulkanResidentTokenModelPackageError::new(format!(
+                    "resident model package {:?} pedal {} kernel {} does not match its circuit node",
+                    manifest.package_id, artifact.pedal.id, expected_index
+                )));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -16940,6 +17254,7 @@ fn checked_mul(left: usize, right: usize, label: &str) -> Result<usize, VulkanRe
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
     use crate::stream_circuit::{
@@ -17179,33 +17494,74 @@ mod tests {
     }
 
     #[test]
-    fn runtime_placement_overrides_package_manifest_in_memory() {
-        let manifest = fixture_model_package_manifest();
-        assert_eq!(manifest.placement.default_device_id, "runtime_default");
-        assert!(manifest.placement.pedal_devices.is_empty());
+    fn package_loader_rejects_shallow_and_stale_behavioral_evidence() {
+        let source_manifest_path = fixture_model_package_manifest_path();
+        let source_manifest = fixture_model_package_manifest();
+        let source_root = source_manifest_path.parent().unwrap();
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "llmoop-behavioral-evidence-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let manifest_path = root.join("vulkan_resident_package.json");
+        let evidence_path = root.join("behavioral_validation.json");
+        source_manifest.write_json_file(&manifest_path).unwrap();
 
-        let mut pedal_devices = BTreeMap::new();
-        pedal_devices.insert("layer_02".to_string(), "gpu1".to_string());
-        let split = manifest
-            .clone()
-            .with_runtime_placement(None, &pedal_devices);
+        std::fs::write(
+            &evidence_path,
+            br#"{"schema":"llmoop.behavioral_validation.v1","status":"passed","candidate_kind":"exact_reference"}"#,
+        )
+        .unwrap();
+        let shallow_error = VulkanResidentModelPackageManifest::from_json_file(&manifest_path)
+            .unwrap_err()
+            .to_string();
+        assert!(shallow_error.contains("source oracle contract"));
 
-        assert!(manifest.placement.pedal_devices.is_empty());
-        assert_eq!(split.device_id, "runtime_default");
-        assert_eq!(
-            split.placement.device_for_pedal("layer_00"),
-            "runtime_default"
-        );
-        assert_eq!(split.placement.device_for_pedal("layer_02"), "gpu1");
-        assert_eq!(
-            split.placement_device_ids(),
-            vec!["gpu1", "runtime_default"]
-        );
+        let mut evidence: Value = serde_json::from_slice(
+            &std::fs::read(source_root.join(&source_manifest.behavioral_validation_path)).unwrap(),
+        )
+        .unwrap();
+        evidence["circuits"][0]["candidate_node_count"] = Value::from(u64::MAX);
+        std::fs::write(
+            &evidence_path,
+            serde_json::to_vec_pretty(&evidence).unwrap(),
+        )
+        .unwrap();
+        let stale_error = VulkanResidentModelPackageManifest::from_json_file(&manifest_path)
+            .unwrap_err()
+            .to_string();
+        assert!(stale_error.contains("incomplete or stale proof"));
 
-        let moved = manifest.with_runtime_placement(Some("gpu1"), &BTreeMap::new());
-        assert_eq!(moved.device_id, "gpu1");
-        assert_eq!(moved.placement.default_device_id, "gpu1");
-        assert_eq!(moved.placement_device_ids(), vec!["gpu1"]);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn package_loader_rejects_paths_outside_the_package() {
+        let mut manifest = fixture_model_package_manifest();
+        manifest.config_path = "../config.json".to_string();
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "llmoop-package-path-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let manifest_path = root.join("vulkan_resident_package.json");
+        manifest.write_json_file(&manifest_path).unwrap();
+
+        let error = VulkanResidentModelPackageManifest::from_json_file(&manifest_path)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("config path"));
+        assert!(error.contains("must stay inside the package"));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

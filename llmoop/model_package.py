@@ -10,9 +10,13 @@ from hashlib import blake2s
 from pathlib import Path
 from typing import Any, Callable
 
+from llmoop.behavioral_compiler import (
+    build_behavioral_validation,
+    validate_behavioral_validation_artifact,
+)
+from llmoop.circuit_ir import validate_circuit
 from llmoop.circuit_lowering import lower_pedalboard
 from llmoop.circuit_optimizer import optimize_circuit_for_vulkan
-from llmoop.behavioral_compiler import build_behavioral_validation
 from llmoop.compilation import (
     PACKAGE_SCHEMA,
     CompiledModelReport,
@@ -2129,45 +2133,74 @@ def validate_compiled_package(package_dir: Path, manifest: Json) -> None:
         raise ModelCompileError(
             f"compiled package has unsupported schema {manifest.get('schema')!r}"
         )
+    if not isinstance(manifest.get("package_id"), str) or not manifest["package_id"]:
+        raise ModelCompileError("compiled package has no package id")
+    if (
+        not isinstance(manifest.get("max_context_activations"), int)
+        or isinstance(manifest.get("max_context_activations"), bool)
+        or manifest["max_context_activations"] <= 0
+    ):
+        raise ModelCompileError(
+            "compiled package max context activation capacity must be positive"
+        )
     required_files = (
-        package_dir / str(manifest.get("config_path", "")),
-        package_dir / str(manifest.get("tensor_index_path", "")),
+        package_artifact_path(package_dir, manifest.get("config_path"), "config"),
+        package_artifact_path(
+            package_dir, manifest.get("tensor_index_path"), "tensor index"
+        ),
     )
     for path in required_files:
         if not path.is_file():
             raise ModelCompileError(f"compiled package is missing required artifact {path}")
 
-    behavioral_path = package_dir / str(
-        manifest.get("behavioral_validation_path", "")
+    behavioral_path = package_artifact_path(
+        package_dir,
+        manifest.get("behavioral_validation_path"),
+        "behavioral validation",
     )
     if not behavioral_path.is_file():
         raise ModelCompileError(
             f"compiled package is missing behavioral validation artifact {behavioral_path}"
         )
     behavioral = read_json(behavioral_path)
-    if behavioral.get("schema") != "llmoop.behavioral_validation.v1":
-        raise ModelCompileError("compiled package behavioral validation schema is invalid")
-    if behavioral.get("status") != "passed":
-        raise ModelCompileError("compiled package has not passed behavioral validation")
-    if behavioral.get("candidate_kind") != "exact_reference":
-        for mode in ("teacher_forced", "free_running"):
-            if behavioral.get(mode, {}).get("status") != "passed":
-                raise ModelCompileError(
-                    f"compiled approximate candidate lacks passing {mode} validation"
-                )
+    candidate_circuits = validate_compiled_circuit_graph(manifest)
+    validate_behavioral_validation_artifact(behavioral, candidate_circuits)
+    validate_compiled_pedal_executions(manifest, candidate_circuits)
 
     tokenizer = manifest.get("tokenizer")
     if not isinstance(tokenizer, dict) or not tokenizer.get("path"):
         raise ModelCompileError("compiled package does not declare tokenizer artifacts")
-    tokenizer_dir = package_dir / str(tokenizer["path"])
-    for filename in tokenizer.get("files", []):
-        path = tokenizer_dir / str(filename)
+    tokenizer_dir = package_artifact_path(
+        package_dir, tokenizer["path"], "tokenizer directory"
+    )
+    tokenizer_files = tokenizer.get("files")
+    if (
+        not isinstance(tokenizer_files, list)
+        or not tokenizer_files
+        or any(not isinstance(filename, str) or not filename for filename in tokenizer_files)
+    ):
+        raise ModelCompileError(
+            "compiled package tokenizer must declare at least one artifact"
+        )
+    for filename in tokenizer_files:
+        path = package_artifact_path(tokenizer_dir, filename, "tokenizer artifact")
         if not path.is_file():
             raise ModelCompileError(f"compiled package is missing tokenizer artifact {path}")
 
-    tensor_index = read_json(package_dir / str(manifest["tensor_index_path"]))
-    for tensor_name, info in tensor_index.get("tensors", {}).items():
-        source = package_dir / str(info.get("source_file", ""))
+    tensor_index = read_json(required_files[1])
+    if tensor_index.get("schema") != "llmoop.tensor_index.v1":
+        raise ModelCompileError("compiled package tensor index schema is invalid")
+    tensors = tensor_index.get("tensors")
+    if not isinstance(tensors, dict) or not tensors:
+        raise ModelCompileError("compiled package tensor index contains no tensors")
+    for tensor_name, info in tensors.items():
+        if not isinstance(tensor_name, str) or not tensor_name or not isinstance(info, dict):
+            raise ModelCompileError("compiled package tensor index contains an invalid tensor")
+        source = package_artifact_path(
+            package_dir,
+            info.get("source_file"),
+            f"tensor {tensor_name!r} source",
+        )
         if not source.is_file():
             raise ModelCompileError(
                 f"compiled tensor {tensor_name!r} references missing artifact {source}"
@@ -2190,12 +2223,262 @@ def validate_compiled_package(package_dir: Path, manifest: Json) -> None:
     if not shader_paths:
         raise ModelCompileError("compiled package does not reference any shader artifacts")
     for relative_path in sorted(shader_paths):
-        shader = package_dir / relative_path
+        shader = package_artifact_path(package_dir, relative_path, "shader")
         if not shader.is_file():
             raise ModelCompileError(f"compiled package references missing shader {shader}")
         payload = shader.read_bytes()
         if len(payload) < 4 or payload[:4] != b"\x03\x02#\x07":
             raise ModelCompileError(f"compiled package shader is not valid SPIR-V: {shader}")
+
+
+def package_artifact_path(package_dir: Path, value: Any, label: str) -> Path:
+    if not isinstance(value, str) or not value:
+        raise ModelCompileError(f"compiled package has no {label} path")
+    relative = Path(value)
+    if relative.is_absolute() or ".." in relative.parts:
+        raise ModelCompileError(
+            f"compiled package {label} path must stay inside the package: {value!r}"
+        )
+    return package_dir / relative
+
+
+def validate_compiled_circuit_graph(manifest: Json) -> dict[str, Json]:
+    graph = manifest.get("circuit_graph")
+    if not isinstance(graph, dict) or graph.get("wiring") != "explicit_graph":
+        raise ModelCompileError(
+            "compiled package must contain an explicit circuit graph"
+        )
+    pedals = graph.get("pedals")
+    if not isinstance(pedals, list) or not pedals:
+        raise ModelCompileError("compiled package circuit graph contains no pedals")
+
+    candidates: dict[str, Json] = {}
+    position_by_id: dict[str, int] = {}
+    for position, pedal in enumerate(pedals):
+        pedal_id = pedal.get("pedal_id") if isinstance(pedal, dict) else None
+        if not isinstance(pedal_id, str) or not pedal_id:
+            raise ModelCompileError(
+                "compiled package circuit graph contains a pedal without an id"
+            )
+        if pedal_id in candidates:
+            raise ModelCompileError(
+                f"compiled package circuit graph repeats pedal {pedal_id!r}"
+            )
+        circuit = pedal.get("circuit")
+        if not isinstance(circuit, dict):
+            raise ModelCompileError(
+                f"compiled package pedal {pedal_id!r} has no circuit"
+            )
+        report = validate_circuit(circuit)
+        if not report.ok:
+            try:
+                report.raise_for_errors()
+            except ValueError as error:
+                raise ModelCompileError(str(error)) from error
+        source = circuit.get("source")
+        if not isinstance(source, dict) or source.get("pedal_id") != pedal_id:
+            raise ModelCompileError(
+                f"compiled package pedal {pedal_id!r} circuit identity does not match"
+            )
+        if pedal.get("operator_type") != source.get("source_operator_type"):
+            raise ModelCompileError(
+                f"compiled package pedal {pedal_id!r} operator identity does not match"
+            )
+        if pedal.get("implementation") != circuit.get("implementation"):
+            raise ModelCompileError(
+                f"compiled package pedal {pedal_id!r} implementation does not match"
+            )
+        if pedal.get("behavioral_role") != circuit.get("behavioral_role"):
+            raise ModelCompileError(
+                f"compiled package pedal {pedal_id!r} behavioral role does not match"
+            )
+        params = pedal.get("params")
+        state = pedal.get("state")
+        if (
+            not isinstance(params, dict)
+            or params.get("schema") != "llmoop.circuit_params.v1"
+            or params.get("circuit") != circuit.get("id")
+            or params.get("layout") != circuit.get("parameters", {}).get("layout")
+            or params.get("storage") != circuit.get("parameters", {}).get("storage")
+            or params.get("refs") != circuit.get("parameters", {}).get("refs")
+        ):
+            raise ModelCompileError(
+                f"compiled package pedal {pedal_id!r} parameter artifact does not match its circuit"
+            )
+        if (
+            not isinstance(state, dict)
+            or state.get("schema") != "llmoop.circuit_state.v1"
+            or state.get("circuit") != circuit.get("id")
+            or state.get("state_ports", []) != circuit.get("state_ports", [])
+        ):
+            raise ModelCompileError(
+                f"compiled package pedal {pedal_id!r} state artifact does not match its circuit"
+            )
+        candidates[pedal_id] = circuit
+        position_by_id[pedal_id] = position
+
+    placement = manifest.get("placement")
+    if (
+        not isinstance(placement, dict)
+        or placement.get("schema") != "llmoop.stream_circuit_placement.v1"
+        or not isinstance(placement.get("default_device_id"), str)
+        or not placement["default_device_id"]
+        or not isinstance(placement.get("pedal_devices", {}), dict)
+    ):
+        raise ModelCompileError("compiled package placement contract is invalid")
+    pedal_devices = placement.get("pedal_devices", {})
+    if any(
+        not isinstance(device_id, str) or not device_id
+        for device_id in pedal_devices.values()
+    ):
+        raise ModelCompileError(
+            "compiled package placement contains an invalid device id"
+        )
+    if manifest.get("device_id") != placement["default_device_id"]:
+        raise ModelCompileError(
+            "compiled package default device identity does not match its placement"
+        )
+    unknown_placements = set(pedal_devices) - set(candidates)
+    if unknown_placements:
+        raise ModelCompileError(
+            f"compiled package placement references unknown pedals {sorted(unknown_placements)}"
+        )
+
+    cables = graph.get("cables")
+    if not isinstance(cables, list):
+        raise ModelCompileError("compiled package circuit graph cables must be a list")
+    cable_ids: set[str] = set()
+    connected_outputs: set[tuple[str, str]] = set()
+    connected_inputs: set[tuple[str, str]] = set()
+    for cable in cables:
+        cable_id = cable.get("id") if isinstance(cable, dict) else None
+        source = cable.get("source") if isinstance(cable, dict) else None
+        destination = cable.get("destination") if isinstance(cable, dict) else None
+        if not isinstance(cable_id, str) or not cable_id or cable_id in cable_ids:
+            raise ModelCompileError(
+                f"compiled package circuit graph contains invalid cable id {cable_id!r}"
+            )
+        cable_ids.add(cable_id)
+        if not isinstance(source, dict) or not isinstance(destination, dict):
+            raise ModelCompileError(
+                f"compiled package cable {cable_id!r} has invalid endpoints"
+            )
+        source_id = source.get("pedal_id")
+        destination_id = destination.get("pedal_id")
+        if source_id not in candidates or destination_id not in candidates:
+            raise ModelCompileError(
+                f"compiled package cable {cable_id!r} references an unknown pedal"
+            )
+        if source_id == destination_id:
+            raise ModelCompileError(
+                f"compiled package cable {cable_id!r} creates an instantaneous self-loop"
+            )
+        if position_by_id[source_id] >= position_by_id[destination_id]:
+            raise ModelCompileError(
+                f"compiled package cable {cable_id!r} is not in executable topological order"
+            )
+        output = _port_by_id(
+            candidates[source_id]["boundary"]["outputs"], source.get("port_id")
+        )
+        input_port = _port_by_id(
+            candidates[destination_id]["boundary"]["inputs"],
+            destination.get("port_id"),
+        )
+        if output is None or input_port is None:
+            raise ModelCompileError(
+                f"compiled package cable {cable_id!r} references an unknown port"
+            )
+        if output.get("signal") != input_port.get("signal") or output.get(
+            "shape"
+        ) != input_port.get("shape"):
+            raise ModelCompileError(
+                f"compiled package cable {cable_id!r} connects incompatible ports"
+            )
+        source_endpoint = (source_id, source["port_id"])
+        destination_endpoint = (destination_id, destination["port_id"])
+        if source_endpoint in connected_outputs:
+            raise ModelCompileError(
+                f"compiled package output {source_id}.{source['port_id']} requires an explicit splitter"
+            )
+        if destination_endpoint in connected_inputs:
+            raise ModelCompileError(
+                f"compiled package input {destination_id}.{destination['port_id']} has multiple cables"
+            )
+        connected_outputs.add(source_endpoint)
+        connected_inputs.add(destination_endpoint)
+
+    open_inputs = []
+    open_outputs = []
+    for pedal_id, circuit in candidates.items():
+        open_inputs.extend(
+            (pedal_id, port["id"])
+            for port in circuit["boundary"]["inputs"]
+            if (pedal_id, port["id"]) not in connected_inputs
+        )
+        open_outputs.extend(
+            (pedal_id, port["id"])
+            for port in circuit["boundary"]["outputs"]
+            if (pedal_id, port["id"]) not in connected_outputs
+        )
+    if len(open_inputs) != 1 or len(open_outputs) != 1:
+        raise ModelCompileError(
+            "compiled package circuit graph must expose exactly one model input and output; "
+            f"open inputs={open_inputs}, open outputs={open_outputs}"
+        )
+    return candidates
+
+
+def _port_by_id(ports: list[Json], port_id: Any) -> Json | None:
+    return next((port for port in ports if port.get("id") == port_id), None)
+
+
+def validate_compiled_pedal_executions(
+    manifest: Json,
+    candidate_circuits: dict[str, Json],
+) -> None:
+    executions = manifest.get("pedal_executions")
+    if not isinstance(executions, list):
+        raise ModelCompileError("compiled package has no pedal execution list")
+    execution_by_pedal: dict[str, Json] = {}
+    for execution in executions:
+        pedal_id = execution.get("pedal_id") if isinstance(execution, dict) else None
+        if not isinstance(pedal_id, str) or not pedal_id or pedal_id in execution_by_pedal:
+            raise ModelCompileError(
+                f"compiled package contains invalid or duplicate pedal execution {pedal_id!r}"
+            )
+        execution_by_pedal[pedal_id] = execution
+    if set(execution_by_pedal) != set(candidate_circuits):
+        raise ModelCompileError(
+            "compiled package pedal executions do not match its circuit graph"
+        )
+    for pedal_id, circuit in candidate_circuits.items():
+        execution = execution_by_pedal[pedal_id]
+        source = circuit.get("source", {})
+        if (
+            execution.get("operator_type") != source.get("source_operator_type")
+            or execution.get("implementation") != circuit.get("implementation")
+        ):
+            raise ModelCompileError(
+                f"compiled package pedal {pedal_id!r} execution identity does not match its circuit"
+            )
+        kernels = execution.get("kernels")
+        nodes = circuit.get("nodes", [])
+        if not isinstance(kernels, list) or len(kernels) != len(nodes):
+            raise ModelCompileError(
+                f"compiled package pedal {pedal_id!r} execution does not cover every circuit node"
+            )
+        for index, (kernel, node) in enumerate(zip(kernels, nodes, strict=True)):
+            if (
+                not isinstance(kernel, dict)
+                or kernel.get("execution_index") != index
+                or kernel.get("node_id") != node.get("id")
+                or kernel.get("op") != node.get("op")
+                or not isinstance(kernel.get("shader_path"), str)
+                or not kernel["shader_path"]
+            ):
+                raise ModelCompileError(
+                    f"compiled package pedal {pedal_id!r} kernel {index} does not match its circuit node"
+                )
 
 
 def compiled_tensor_layout(info: Json, *, tensor_name: str | None = None) -> str:

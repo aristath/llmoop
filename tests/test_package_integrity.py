@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from llmoop.compilation import PACKAGE_SCHEMA, ModelCompileError
+from llmoop.behavioral_compiler import json_contract_digest
 from llmoop.model_package import (
     compile_shader_artifacts,
     copy_exact_bytes,
@@ -27,28 +28,138 @@ def minimal_package(root: Path) -> dict[str, object]:
     (root / "tensors.json").write_text(
         json.dumps(
             {
+                "schema": "llmoop.tensor_index.v1",
                 "tensors": {
                     "weight": {"source_file": "weights/model.safetensors"}
                 }
             }
         )
     )
+    circuit = {
+        "schema": "llmoop.stream_circuit.v1",
+        "id": "fixture_circuit",
+        "source": {
+            "pedal_id": "fixture_pedal",
+            "source_layer_index": 0,
+            "source_operator_type": "fixture",
+        },
+        "behavioral_role": "fixture",
+        "implementation": "exact_reference",
+        "boundary": {
+            "inputs": [
+                {"id": "input_frame", "signal": "frame", "shape": [4]}
+            ],
+            "outputs": [
+                {
+                    "id": "output_frame",
+                    "signal": "frame",
+                    "shape": [4],
+                    "source": "output_frame",
+                }
+            ],
+            "controls": [],
+        },
+        "state_ports": [],
+        "parameters": {
+            "layout": "row_major",
+            "storage": "safetensors",
+            "refs": {"weight": {"tensor": "weight"}},
+        },
+        "nodes": [
+            {
+                "id": "project",
+                "op": "linear",
+                "inputs": ["input_frame"],
+                "outputs": ["output_frame"],
+                "params": ["weight"],
+            }
+        ],
+        "behavioral_error_contract": {"mode": "source_reference_circuit"},
+    }
     (root / "behavioral_validation.json").write_text(
         json.dumps(
             {
                 "schema": "llmoop.behavioral_validation.v1",
                 "status": "passed",
                 "candidate_kind": "exact_reference",
+                "source_oracle": {
+                    "model_contract_digest": "a" * 64,
+                    "tensor_count": 1,
+                    "parameter_count": 1,
+                    "byte_count": 7,
+                },
+                "teacher_forced": {"status": "not_required"},
+                "free_running": {"status": "not_required"},
+                "circuits": [
+                    {
+                        "pedal_id": "fixture_pedal",
+                        "candidate_kind": "exact_reference",
+                        "status": "passed",
+                        "source_node_count": 1,
+                        "candidate_node_count": 1,
+                        "covered_source_node_count": 1,
+                        "candidate_contract_digest": json_contract_digest(circuit),
+                        "rewrite_count": 0,
+                        "rewrites": [],
+                    }
+                ],
             }
         )
     )
     return {
         "schema": PACKAGE_SCHEMA,
+        "package_id": "fixture_package",
+        "device_id": "runtime_default",
+        "max_context_activations": 1024,
+        "placement": {
+            "schema": "llmoop.stream_circuit_placement.v1",
+            "default_device_id": "runtime_default",
+            "pedal_devices": {},
+        },
+        "circuit_graph": {
+            "wiring": "explicit_graph",
+            "cables": [],
+            "pedals": [
+                {
+                    "pedal_id": "fixture_pedal",
+                    "operator_type": "fixture",
+                    "implementation": "exact_reference",
+                    "behavioral_role": "fixture",
+                    "circuit": circuit,
+                    "params": {
+                        "schema": "llmoop.circuit_params.v1",
+                        "circuit": "fixture_circuit",
+                        "layout": "row_major",
+                        "storage": "safetensors",
+                        "refs": {"weight": {"tensor": "weight"}},
+                    },
+                    "state": {
+                        "schema": "llmoop.circuit_state.v1",
+                        "circuit": "fixture_circuit",
+                        "state_ports": [],
+                    },
+                }
+            ],
+        },
         "config_path": "config.json",
         "tensor_index_path": "tensors.json",
         "behavioral_validation_path": "behavioral_validation.json",
         "tokenizer": {"path": "tokenizer", "files": ["tokenizer.json"]},
-        "pedals": [{"kernels": [{"shader_path": "shaders/kernel.spv"}]}],
+        "pedal_executions": [
+            {
+                "pedal_id": "fixture_pedal",
+                "operator_type": "fixture",
+                "implementation": "exact_reference",
+                "kernels": [
+                    {
+                        "execution_index": 0,
+                        "node_id": "project",
+                        "op": "linear",
+                        "shader_path": "shaders/kernel.spv",
+                    }
+                ],
+            }
+        ],
     }
 
 
@@ -67,7 +178,12 @@ def test_package_integrity_accepts_a_complete_compiler_boundary(tmp_path: Path) 
         ("tokenizer", "missing tokenizer artifact"),
         ("tensor", "references missing artifact"),
         ("shader", "not valid SPIR-V"),
-        ("shader_reference", "does not reference any shader"),
+        ("behavioral_shallow", "incomplete source oracle"),
+        ("stale_proof", "incomplete or stale proof"),
+        ("kernel", "kernel 0 does not match"),
+        ("execution_identity", "execution identity does not match"),
+        ("placement_device", "invalid device id"),
+        ("path_escape", "must stay inside the package"),
     ],
 )
 def test_package_integrity_rejects_corrupt_or_incomplete_artifacts(
@@ -86,8 +202,28 @@ def test_package_integrity_rejects_corrupt_or_incomplete_artifacts(
         (tmp_path / "weights" / "model.safetensors").unlink()
     elif corruption == "shader":
         (tmp_path / "shaders" / "kernel.spv").write_bytes(b"not spirv")
-    elif corruption == "shader_reference":
-        manifest["pedals"] = []
+    elif corruption == "behavioral_shallow":
+        (tmp_path / "behavioral_validation.json").write_text(
+            json.dumps(
+                {
+                    "schema": "llmoop.behavioral_validation.v1",
+                    "status": "passed",
+                    "candidate_kind": "exact_reference",
+                }
+            )
+        )
+    elif corruption == "stale_proof":
+        evidence = json.loads((tmp_path / "behavioral_validation.json").read_text())
+        evidence["circuits"][0]["candidate_node_count"] = 2
+        (tmp_path / "behavioral_validation.json").write_text(json.dumps(evidence))
+    elif corruption == "kernel":
+        manifest["pedal_executions"][0]["kernels"][0]["op"] = "multiply"
+    elif corruption == "execution_identity":
+        manifest["pedal_executions"][0]["implementation"] = "wrong"
+    elif corruption == "placement_device":
+        manifest["placement"]["pedal_devices"]["fixture_pedal"] = ""
+    elif corruption == "path_escape":
+        manifest["config_path"] = "../config.json"
 
     with pytest.raises(ModelCompileError, match=message):
         validate_compiled_package(tmp_path, manifest)
