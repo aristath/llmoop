@@ -1929,27 +1929,71 @@ mod tests {
 
     #[test]
     fn activation_frame_plan_reuses_temporary_signal_slots_by_liveness() {
-        let graph = ResolvedLoweredPedalboard::from_index_file(fixture_model_index_path()).unwrap();
-        let plan = StreamCircuitExecutionPlan::from_graph(&graph).unwrap();
-        let frame = plan.circuits[0].activation_frame_plan();
+        let node = |index: usize, id: &str, outputs: &[&str]| PlannedNode {
+            index,
+            id: id.to_string(),
+            op: "test".to_string(),
+            specialization: String::new(),
+            inputs: Vec::new(),
+            outputs: outputs.iter().map(|output| (*output).to_string()).collect(),
+            params: Vec::new(),
+            state_reads: Vec::new(),
+            state_writes: Vec::new(),
+        };
+        let signal = |id: &str, producer: &str, consumers: &[&str]| PlannedSignal {
+            id: id.to_string(),
+            producer: SignalProducer::Node {
+                node_id: producer.to_string(),
+            },
+            consumers: consumers
+                .iter()
+                .map(|consumer| (*consumer).to_string())
+                .collect(),
+            shape: Some(vec![8]),
+            storage: SignalStorage::Activation,
+            is_boundary_output: false,
+        };
+        let plan = CircuitActivationPlan {
+            pedal_id: "pedal".to_string(),
+            circuit_id: "circuit".to_string(),
+            input_ports: Vec::new(),
+            output_ports: Vec::new(),
+            state_ports: Vec::new(),
+            parameter_refs: Vec::new(),
+            nodes: vec![
+                node(0, "node_0", &["a"]),
+                node(1, "node_1", &["b"]),
+                node(2, "node_2", &["c"]),
+                node(3, "node_3", &["d"]),
+            ],
+            signals: BTreeMap::from([
+                ("a".to_string(), signal("a", "node_0", &["node_2"])),
+                ("b".to_string(), signal("b", "node_1", &["node_2"])),
+                ("c".to_string(), signal("c", "node_2", &["node_3"])),
+                ("d".to_string(), signal("d", "node_3", &[])),
+            ]),
+            temporary_signals: vec![
+                "a".to_string(),
+                "b".to_string(),
+                "c".to_string(),
+                "d".to_string(),
+            ],
+            state_view_signals: Vec::new(),
+        };
+        let frame = plan.activation_frame_plan();
 
-        assert_eq!(frame.liveness.len(), 16);
-        assert_eq!(frame.slot_count, 4);
-        assert_eq!(frame.slot_for("operator_norm_out"), Some(0));
-        assert_eq!(frame.slot_for("gate_b"), Some(0));
-        assert_eq!(frame.slot_for("gate_c"), Some(2));
-        assert_eq!(frame.slot_for("projected_x"), Some(3));
-        assert_eq!(frame.slot_for("operator_residual_out"), Some(1));
-        assert_eq!(frame.slot_for("temporal_window"), None);
+        assert_eq!(frame.liveness.len(), 4);
+        assert_eq!(frame.slot_count, 3);
+        assert_eq!(frame.slot_for("a"), Some(0));
+        assert_eq!(frame.slot_for("b"), Some(1));
+        assert_eq!(frame.slot_for("c"), Some(2));
+        assert_eq!(frame.slot_for("d"), Some(0));
 
-        let residual = frame.liveness_for("operator_residual_out").unwrap();
-        assert_eq!(residual.produced_by, "operator_residual");
-        assert_eq!(residual.produced_at, 8);
-        assert_eq!(residual.last_consumed_at, 15);
-        assert_eq!(
-            residual.consumers,
-            vec!["ffn_norm".to_string(), "ffn_residual".to_string()]
-        );
+        let a = frame.liveness_for("a").unwrap();
+        assert_eq!(a.produced_by, "node_0");
+        assert_eq!(a.produced_at, 0);
+        assert_eq!(a.last_consumed_at, 2);
+        assert_eq!(a.consumers, vec!["node_2".to_string()]);
     }
 
     #[test]
