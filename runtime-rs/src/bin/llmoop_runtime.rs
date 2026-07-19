@@ -19,9 +19,9 @@ use llmoop_runtime::{
     RuntimePromptBenchmarkRunReport, RuntimePromptBenchmarkTransportTotalsReport,
     RuntimePromptBenchmarkU64MetricReport, RuntimePromptBenchmarkUsizeMetricReport,
     RuntimePromptTimingReport, RuntimeRemoteCableBufferReport, RuntimeSingleDevicePromptRunReport,
-    RuntimeSourcePedal, RuntimeTokenizerOptionsReport, RuntimeTopologyReport, VulkanComputeDevice,
-    VulkanComputeDeviceInfo, VulkanResidentHfTokenizerTextCodec,
-    VulkanResidentInProcessPlacedPromptEngine,
+    RuntimeSourcePedal, RuntimeTokenizerOptionsReport, RuntimeTopologyReport,
+    VULKAN_BACKEND_LOOP_MAX_WINDOW, VulkanComputeDevice, VulkanComputeDeviceInfo,
+    VulkanResidentHfTokenizerTextCodec, VulkanResidentInProcessPlacedPromptEngine,
     VulkanResidentInProcessPlacedPromptEngineInputRequest,
     VulkanResidentInProcessPlacedPromptStream, VulkanResidentModelPackage,
     VulkanResidentModelPackageDeviceSlice, VulkanResidentModelPackageManifest,
@@ -91,7 +91,7 @@ impl Default for Args {
             max_new_tokens: 65_536,
             context_size: None,
             vulkan_device_index: None,
-            cycle_ticks: 4,
+            cycle_ticks: VULKAN_BACKEND_LOOP_MAX_WINDOW,
             add_special_tokens: true,
             skip_special_tokens: true,
             generated_only: false,
@@ -2978,7 +2978,7 @@ Options:
   --max-new-tokens <N>       Generation stop condition, independent of context size. Default: 65536
   --context-size <N>         Runtime transient-state window. Default: auto, up to the model maximum.
   --vulkan-device-index <N>  Use Vulkan physical device index N as the default local target.
-  --cycle-ticks <N>          Max runtime ticks per always-on cycle. Default: 4
+  --cycle-ticks <N>          Max runtime ticks per always-on cycle. Default: 64
   --no-special-tokens        Do not add tokenizer special tokens to raw --prompt input.
                              Chat templates always own their complete special-token framing.
   --keep-special-tokens      Keep tokenizer special tokens in decoded output text.
@@ -3005,13 +3005,13 @@ mod tests {
     use tokenizers::{AddedToken, Tokenizer};
 
     use llmoop_runtime::{
-        VulkanResidentHfTokenizerTextCodec, VulkanResidentTokenTextCodec,
-        VulkanResidentTokenTextCodecError,
+        VULKAN_BACKEND_LOOP_MAX_WINDOW, VulkanResidentHfTokenizerTextCodec,
+        VulkanResidentTokenTextCodec, VulkanResidentTokenTextCodecError,
     };
 
     use super::{
-        RuntimeChatFormatter, RuntimeChatMessage, RuntimeChatSession, assistant_content_token_ids,
-        chat_transcript_codec, incremental_chat_token_delta,
+        Args, RuntimeChatFormatter, RuntimeChatMessage, RuntimeChatSession,
+        assistant_content_token_ids, chat_transcript_codec, incremental_chat_token_delta,
         model_owned_assistant_turn_stop_token_id, normalize_chat_template_for_runtime,
         parse_device_binding_assignment, parse_source_chain, parse_vulkan_device_uuid_ref,
         placed_scheduler_turn_budget, resolve_runtime_context_size,
@@ -3052,6 +3052,11 @@ mod tests {
                 })
                 .collect()
         }
+    }
+
+    #[test]
+    fn runtime_default_uses_full_resident_backend_cycle_window() {
+        assert_eq!(Args::default().cycle_ticks, VULKAN_BACKEND_LOOP_MAX_WINDOW);
     }
 
     #[test]

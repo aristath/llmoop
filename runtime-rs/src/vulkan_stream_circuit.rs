@@ -42,7 +42,7 @@ const CONTRACT_DIGEST_ALGORITHM: &str = "llmoop.json_tree_sha256.v1";
 const VULKAN_STREAM_CONTROL_BYTE_CAPACITY: usize = 5 * std::mem::size_of::<u32>();
 const VULKAN_STREAM_CONTROL_METADATA_OFFSET: usize = std::mem::size_of::<u32>();
 const VULKAN_SAMPLER_HISTORY_RECORD_BYTE_CAPACITY: usize = 4 * std::mem::size_of::<u32>();
-const VULKAN_BACKEND_LOOP_MAX_WINDOW: usize = 64;
+pub const VULKAN_BACKEND_LOOP_MAX_WINDOW: usize = 64;
 const VULKAN_BACKEND_LOOP_SNAPSHOT_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
