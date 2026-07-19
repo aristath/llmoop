@@ -311,14 +311,6 @@ def main() -> None:
             parser.error("--vulkan-device-index must be non-negative")
         if args.profile_runs < 1:
             parser.error("--profile-runs must be at least 1")
-        try:
-            parse_pedal_device_overrides(args.place_pedal)
-            parse_device_bindings(args.bind_device)
-            parse_duplicate_after_overrides(args.duplicate_after)
-            if args.chain is not None:
-                parse_source_chain(args.chain)
-        except ValueError as error:
-            parser.error(str(error))
         run_engine(args)
         return
     reporter = JsonLineCompileReporter() if args.compiler_events_jsonl else None
@@ -442,130 +434,6 @@ def resolve_runtime_package_manifest(path: Path) -> Path:
     raise SystemExit(f"compiled model package path does not exist: {path}")
 
 
-def parse_pedal_device_overrides(raw_overrides: list[str]) -> dict[str, str]:
-    pedal_devices: dict[str, str] = {}
-    for raw_override in raw_overrides:
-        if "=" not in raw_override:
-            raise ValueError(f"invalid --place-pedal value {raw_override!r}; expected PEDAL=DEVICE")
-        pedal_id, device_id = (part.strip() for part in raw_override.split("=", 1))
-        if not pedal_id:
-            raise ValueError(f"invalid --place-pedal value {raw_override!r}; pedal id is empty")
-        if not device_id:
-            raise ValueError(f"invalid --place-pedal value {raw_override!r}; device id is empty")
-        if pedal_id in pedal_devices:
-            raise ValueError(f"duplicate --place-pedal assignment for {pedal_id!r}")
-        pedal_devices[pedal_id] = device_id
-    return pedal_devices
-
-
-def parse_device_bindings(raw_bindings: list[str]) -> dict[str, str]:
-    bindings: dict[str, str] = {}
-    for raw_binding in raw_bindings:
-        if "=" not in raw_binding:
-            raise ValueError(
-                f"invalid --bind-device value {raw_binding!r}; expected DEVICE=TARGET"
-            )
-        device_id, target = (part.strip() for part in raw_binding.split("=", 1))
-        if not device_id:
-            raise ValueError(
-                f"invalid --bind-device value {raw_binding!r}; device id is empty"
-            )
-        if not target:
-            raise ValueError(
-                f"invalid --bind-device value {raw_binding!r}; target is empty"
-            )
-        if target == "vulkan:":
-            raise ValueError(
-                f"invalid --bind-device value {raw_binding!r}; expected vulkan:N"
-            )
-        if target.startswith("vulkan:"):
-            try:
-                int(target.split(":", 1)[1])
-            except ValueError as error:
-                raise ValueError(
-                    f"invalid --bind-device value {raw_binding!r}; {error}"
-                ) from error
-        if target == "cpu:" or (target.startswith("cpu:") and not target.split(":", 1)[1]):
-            raise ValueError(
-                f"invalid --bind-device value {raw_binding!r}; expected cpuN or cpu:N"
-            )
-        if target.startswith("cpu:"):
-            try:
-                int(target.split(":", 1)[1])
-            except ValueError as error:
-                raise ValueError(
-                    f"invalid --bind-device value {raw_binding!r}; {error}"
-                ) from error
-        if target.startswith("cpu") and not target.startswith("cpu:") and target != "cpu":
-            suffix = target[3:]
-            if suffix and not suffix.isdigit():
-                raise ValueError(
-                    f"invalid --bind-device value {raw_binding!r}; expected cpuN or cpu:N"
-                )
-        if device_id in bindings:
-            raise ValueError(f"duplicate --bind-device assignment for {device_id!r}")
-        bindings[device_id] = target
-    return bindings
-
-
-def parse_duplicate_after_overrides(raw_overrides: list[str]) -> dict[str, str]:
-    duplicates: dict[str, str] = {}
-    new_instance_ids: set[str] = set()
-    for raw_override in raw_overrides:
-        if "=" not in raw_override:
-            raise ValueError(
-                f"invalid --duplicate-after value {raw_override!r}; expected AFTER=NEW"
-            )
-        after_instance_id, new_instance_id = (
-            part.strip() for part in raw_override.split("=", 1)
-        )
-        if not after_instance_id:
-            raise ValueError(
-                f"invalid --duplicate-after value {raw_override!r}; source instance id is empty"
-            )
-        if not new_instance_id:
-            raise ValueError(
-                f"invalid --duplicate-after value {raw_override!r}; new instance id is empty"
-            )
-        if new_instance_id in new_instance_ids:
-            raise ValueError(f"duplicate --duplicate-after new instance {new_instance_id!r}")
-        duplicates[after_instance_id] = new_instance_id
-        new_instance_ids.add(new_instance_id)
-    return duplicates
-
-
-def parse_source_chain(raw_chain: str) -> list[tuple[str, str]]:
-    separator = "->" if "->" in raw_chain else ","
-    chain: list[tuple[str, str]] = []
-    instance_ids: set[str] = set()
-    for raw_item in raw_chain.split(separator):
-        raw_item = raw_item.strip()
-        if not raw_item:
-            raise ValueError(
-                f"invalid --chain value {raw_chain!r}; chain items must not be empty"
-            )
-        if "=" in raw_item:
-            instance_id, source_pedal_id = (part.strip() for part in raw_item.split("=", 1))
-        else:
-            instance_id = raw_item
-            source_pedal_id = raw_item
-        if not instance_id:
-            raise ValueError(
-                f"invalid --chain item {raw_item!r}; instance id is empty"
-            )
-        if not source_pedal_id:
-            raise ValueError(
-                f"invalid --chain item {raw_item!r}; source pedal id is empty"
-            )
-        if instance_id in instance_ids:
-            raise ValueError(f"duplicate --chain instance id {instance_id!r}")
-        instance_ids.add(instance_id)
-        chain.append((instance_id, source_pedal_id))
-    if not chain:
-        raise ValueError("--chain must contain at least one pedal")
-    return chain
-
-
 def build_runtime_command(args: argparse.Namespace, package_manifest: Path) -> list[str]:
     runtime_args = [
         "--package",
@@ -582,7 +450,7 @@ def build_runtime_command(args: argparse.Namespace, package_manifest: Path) -> l
     elif args.inspect_device_slice is not None:
         runtime_args.extend(["--inspect-device-slice", args.inspect_device_slice])
     else:
-        if getattr(args, "chat", False):
+        if args.chat:
             runtime_args.append("--chat")
             if args.prompt is not None:
                 runtime_args.extend(["--prompt", args.prompt])
@@ -609,11 +477,10 @@ def build_runtime_command(args: argparse.Namespace, package_manifest: Path) -> l
         runtime_args.append("--keep-special-tokens")
     if args.generated_only:
         runtime_args.append("--generated-only")
-    if getattr(args, "profile", False):
+    if args.profile:
         runtime_args.append("--profile")
-    profile_runs = getattr(args, "profile_runs", 1)
-    if profile_runs != 1:
-        runtime_args.extend(["--profile-runs", str(profile_runs)])
+    if args.profile_runs != 1:
+        runtime_args.extend(["--profile-runs", str(args.profile_runs)])
     if args.json:
         runtime_args.append("--json")
 

@@ -8,14 +8,39 @@ from pathlib import Path
 
 from llmoop.cli import (
     build_runtime_command,
-    parse_device_bindings,
-    parse_duplicate_after_overrides,
-    parse_pedal_device_overrides,
-    parse_source_chain,
     resolve_runtime_package_manifest,
 )
 from llmoop.model_package import copy_shader_templates, package_placement
 from tests.fixtures import compiled_model_or_skip
+
+
+def runtime_args(**overrides: object) -> Namespace:
+    values: dict[str, object] = {
+        "prompt": None,
+        "chat": False,
+        "inspect_runtime": False,
+        "inspect_package": False,
+        "inspect_patch": False,
+        "inspect_placement": False,
+        "inspect_device_slice": None,
+        "device": None,
+        "place_pedal": [],
+        "bind_device": [],
+        "duplicate_after": [],
+        "chain": None,
+        "max_new_tokens": 4,
+        "context_size": None,
+        "vulkan_device_index": None,
+        "no_special_tokens": False,
+        "keep_special_tokens": False,
+        "generated_only": False,
+        "profile": False,
+        "profile_runs": 1,
+        "json": False,
+        "runtime_bin": Path("/tmp/llmoop-runtime"),
+    }
+    values.update(overrides)
+    return Namespace(**values)
 
 
 class RuntimeCliCommandTest(unittest.TestCase):
@@ -46,7 +71,7 @@ class RuntimeCliCommandTest(unittest.TestCase):
 
     def test_build_runtime_command_prefers_explicit_runtime_binary(self) -> None:
         package = Path("packages/model_x/vulkan_resident_package.json")
-        args = Namespace(
+        args = runtime_args(
             prompt="Hello",
             inspect_runtime=False,
             inspect_package=False,
@@ -89,7 +114,7 @@ class RuntimeCliCommandTest(unittest.TestCase):
 
     def test_build_runtime_command_forwards_chat_mode_without_prompt(self) -> None:
         package = Path("packages/model_x/vulkan_resident_package.json")
-        args = Namespace(
+        args = runtime_args(
             prompt=None,
             chat=True,
             inspect_runtime=False,
@@ -128,7 +153,7 @@ class RuntimeCliCommandTest(unittest.TestCase):
 
     def test_build_runtime_command_forwards_profile_flag(self) -> None:
         package = Path("packages/model_x/vulkan_resident_package.json")
-        args = Namespace(
+        args = runtime_args(
             prompt="Hello",
             inspect_runtime=False,
             inspect_package=False,
@@ -167,7 +192,7 @@ class RuntimeCliCommandTest(unittest.TestCase):
 
     def test_build_runtime_command_forwards_profile_runs(self) -> None:
         package = Path("packages/model_x/vulkan_resident_package.json")
-        args = Namespace(
+        args = runtime_args(
             prompt="Hello",
             inspect_runtime=False,
             inspect_package=False,
@@ -209,7 +234,7 @@ class RuntimeCliCommandTest(unittest.TestCase):
 
     def test_build_runtime_command_can_inspect_device_slice_without_prompt(self) -> None:
         package = Path("packages/model_x/vulkan_resident_package.json")
-        args = Namespace(
+        args = runtime_args(
             prompt=None,
             inspect_runtime=False,
             inspect_package=False,
@@ -247,7 +272,7 @@ class RuntimeCliCommandTest(unittest.TestCase):
 
     def test_build_runtime_command_can_inspect_placement_without_prompt(self) -> None:
         package = Path("packages/model_x/vulkan_resident_package.json")
-        args = Namespace(
+        args = runtime_args(
             prompt=None,
             inspect_runtime=False,
             inspect_package=False,
@@ -284,7 +309,7 @@ class RuntimeCliCommandTest(unittest.TestCase):
 
     def test_build_runtime_command_can_inspect_package_without_prompt(self) -> None:
         package = Path("packages/model_x/vulkan_resident_package.json")
-        args = Namespace(
+        args = runtime_args(
             prompt=None,
             inspect_runtime=False,
             inspect_package=True,
@@ -321,7 +346,7 @@ class RuntimeCliCommandTest(unittest.TestCase):
 
     def test_build_runtime_command_can_inspect_patch_without_prompt(self) -> None:
         package = Path("packages/model_x/vulkan_resident_package.json")
-        args = Namespace(
+        args = runtime_args(
             prompt=None,
             inspect_runtime=False,
             inspect_package=False,
@@ -362,7 +387,7 @@ class RuntimeCliCommandTest(unittest.TestCase):
 
     def test_build_runtime_command_preserves_cpu_logical_placement(self) -> None:
         package = Path("packages/model_x/vulkan_resident_package.json")
-        args = Namespace(
+        args = runtime_args(
             prompt=None,
             inspect_runtime=False,
             inspect_package=False,
@@ -403,7 +428,7 @@ class RuntimeCliCommandTest(unittest.TestCase):
 
     def test_build_runtime_command_can_inspect_runtime_topology_without_prompt(self) -> None:
         package = Path("packages/model_x/vulkan_resident_package.json")
-        args = Namespace(
+        args = runtime_args(
             prompt=None,
             inspect_runtime=True,
             inspect_package=False,
@@ -448,7 +473,7 @@ class RuntimeCliCommandTest(unittest.TestCase):
 
     def test_build_runtime_command_forwards_runtime_patch_overrides(self) -> None:
         package = Path("packages/model_x/vulkan_resident_package.json")
-        args = Namespace(
+        args = runtime_args(
             prompt="Hello",
             inspect_runtime=False,
             inspect_package=False,
@@ -497,87 +522,6 @@ class RuntimeCliCommandTest(unittest.TestCase):
             ],
             build_runtime_command(args, package),
         )
-
-    def test_parse_pedal_device_overrides_requires_explicit_pedal_device_pairs(self) -> None:
-        self.assertEqual(
-            {"layer_02": "gpu1", "layer_03": "lan:worker-a"},
-            parse_pedal_device_overrides(["layer_02=gpu1", " layer_03 = lan:worker-a "]),
-        )
-
-        with self.assertRaisesRegex(ValueError, "expected PEDAL=DEVICE"):
-            parse_pedal_device_overrides(["layer_02"])
-        with self.assertRaisesRegex(ValueError, "duplicate"):
-            parse_pedal_device_overrides(["layer_02=gpu1", "layer_02=gpu2"])
-
-    def test_parse_device_bindings_requires_explicit_device_targets(self) -> None:
-        self.assertEqual(
-            {
-                "gpu0": "vulkan:0",
-                "gpu1": "vulkan:5",
-                "cpu0": "cpu0",
-                "cpu1": "cpu:1",
-                "lan0": "lan:worker-a",
-            },
-            parse_device_bindings(
-                [
-                    "gpu0=vulkan:0",
-                    " gpu1 = vulkan:5 ",
-                    "cpu0=cpu0",
-                    "cpu1=cpu:1",
-                    "lan0=lan:worker-a",
-                ]
-            ),
-        )
-
-        with self.assertRaisesRegex(ValueError, "expected DEVICE=TARGET"):
-            parse_device_bindings(["gpu0"])
-        with self.assertRaisesRegex(ValueError, "expected vulkan:N"):
-            parse_device_bindings(["gpu0=vulkan:"])
-        with self.assertRaisesRegex(ValueError, "expected cpuN"):
-            parse_device_bindings(["cpu0=cpu:"])
-        with self.assertRaisesRegex(ValueError, "expected cpuN"):
-            parse_device_bindings(["cpu0=cpuish"])
-        with self.assertRaisesRegex(ValueError, "duplicate"):
-            parse_device_bindings(["gpu0=vulkan:0", "gpu0=vulkan:1"])
-
-    def test_parse_duplicate_after_overrides_requires_explicit_instance_pairs(self) -> None:
-        self.assertEqual(
-            {"layer_05": "layer_05_repeat", "layer_07": "layer_07_repeat"},
-            parse_duplicate_after_overrides(
-                ["layer_05=layer_05_repeat", " layer_07 = layer_07_repeat "]
-            ),
-        )
-
-        with self.assertRaisesRegex(ValueError, "expected AFTER=NEW"):
-            parse_duplicate_after_overrides(["layer_05"])
-        with self.assertRaisesRegex(ValueError, "duplicate"):
-            parse_duplicate_after_overrides(
-                ["layer_05=layer_repeat", "layer_07=layer_repeat"]
-            )
-
-    def test_parse_source_chain_accepts_sources_and_explicit_instances(self) -> None:
-        self.assertEqual(
-            [
-                ("layer_00", "layer_00"),
-                ("layer_05_repeat", "layer_05"),
-                ("layer_06", "layer_06"),
-            ],
-            parse_source_chain("layer_00, layer_05_repeat = layer_05, layer_06"),
-        )
-        self.assertEqual(
-            [
-                ("layer_00", "layer_00"),
-                ("layer_05_repeat", "layer_05"),
-                ("layer_06", "layer_06"),
-            ],
-            parse_source_chain("layer_00 -> layer_05_repeat=layer_05 -> layer_06"),
-        )
-
-        with self.assertRaisesRegex(ValueError, "items must not be empty"):
-            parse_source_chain("layer_00,,layer_01")
-        with self.assertRaisesRegex(ValueError, "duplicate"):
-            parse_source_chain("layer_05,layer_05")
-
 
 class PackagePlacementTest(unittest.TestCase):
     def test_package_placement_is_neutral_default_patch(self) -> None:
