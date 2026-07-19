@@ -307,6 +307,11 @@ def build_vulkan_resident_package_manifest(
             can_fuse_parallel_linears=lambda nodes, circuit=circuit: (
                 can_fuse_bf16_parallel_linears(circuit, nodes, tensor_index)
             ),
+            can_fuse_parallel_linear_silu_multiply=lambda projection, activation, circuit=circuit: (
+                can_fuse_bf16_parallel_linear_silu_multiply(
+                    circuit, projection, activation, tensor_index
+                )
+            ),
             can_fuse_parallel_head_norm_rope=lambda branches, circuit=circuit: (
                 can_fuse_bf16_parallel_head_norm_rope(
                     circuit, branches, tensor_index
@@ -668,6 +673,59 @@ def shader_file_for_node(
             f"parallel_linear_{branch_count}way_{layout_token}_bf16_{input_width}x"
             + "_".join(map(str, output_widths))
             + ".comp"
+        )
+    if op == "parallel_linear_silu_multiply":
+        if (
+            len(node.get("inputs", [])) != 1
+            or len(node.get("outputs", [])) != 1
+            or len(node.get("params", [])) != 2
+            or int(node.get("attrs", {}).get("branch_count", 0)) != 2
+        ):
+            raise ModelCompileError(
+                f"fused FFN projection node {node['id']!r} has invalid bindings"
+            )
+        shapes = [
+            parameter_shape_for_id(circuit, parameter_id, tensor_index)
+            for parameter_id in node["params"]
+        ]
+        dtypes = {
+            parameter_dtype_for_id(circuit, parameter_id, tensor_index)
+            for parameter_id in node["params"]
+        }
+        layouts = {
+            parameter_layout_for_id(circuit, parameter_id, tensor_index)
+            for parameter_id in node["params"]
+        }
+        if (
+            len(shapes) != 2
+            or shapes[0] != shapes[1]
+            or len(shapes[0]) != 2
+            or dtypes != {"BF16"}
+            or len(layouts) != 1
+            or not layouts <= {ROW_MAJOR_LAYOUT, VULKAN_BF16_ROW_PAIR_LAYOUT}
+        ):
+            raise ModelCompileError(
+                f"fused FFN projection node {node['id']!r} has incompatible "
+                f"parameters {shapes}"
+            )
+        output_width, input_width = map(int, shapes[0])
+        if (
+            input_width <= 0
+            or input_width % 2
+            or output_width <= 0
+            or output_width % 2
+            or int(node["attrs"].get("element_count", 0)) != output_width
+            or node["attrs"].get("intermediate_rounding") != "BF16"
+        ):
+            raise ModelCompileError(
+                f"fused FFN projection node {node['id']!r} has invalid geometry"
+            )
+        layout_token = (
+            "paired" if layouts == {VULKAN_BF16_ROW_PAIR_LAYOUT} else "row_major"
+        )
+        return (
+            f"parallel_linear_silu_multiply_{layout_token}_bf16_"
+            f"{input_width}x{output_width}.comp"
         )
     if op == "linear_split_3way":
         parameter_shape = parameter_shape_for_node(circuit, node, tensor_index)
@@ -1122,6 +1180,11 @@ def workgroup_count_x_for_node(circuit: Json, node: Json, tensor_index: Json) ->
             // 2
             for parameter_id in node["params"]
         )
+    if node["op"] == "parallel_linear_silu_multiply":
+        out_features, _ = parameter_shape_for_id(
+            circuit, node["params"][0], tensor_index
+        )
+        return (int(out_features) + 1) // 2
     if node["op"] in {"linear", "linear_residual", "linear_split_3way"}:
         out_features, _ = parameter_shape_for_node(circuit, node, tensor_index)
         # One workgroup collaboratively computes and packs two BF16 output rows.
@@ -1332,6 +1395,35 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
                 "BRANCH_SELECTION": "\n".join(branch_lines),
                 "WEIGHT_READS": weight_reads,
                 "OUTPUT_WRITES": output_writes,
+            },
+        )
+
+    fused_ffn_projection = re.fullmatch(
+        r"parallel_linear_silu_multiply_(paired|row_major)_bf16_(\d+)x(\d+)\.comp",
+        shader_file,
+    )
+    if fused_ffn_projection is not None:
+        weight_layout = fused_ffn_projection.group(1)
+        input_size = int(fused_ffn_projection.group(2))
+        output_size = int(fused_ffn_projection.group(3))
+        if (
+            input_size <= 0
+            or input_size % 2
+            or output_size <= 0
+            or output_size % 2
+        ):
+            raise ModelCompileError(
+                f"invalid fused FFN projection shader shape {shader_file!r}"
+            )
+        return render_shader_template(
+            source_dir,
+            "parallel_linear_silu_multiply_bf16.comp.template",
+            {
+                "INPUT_SIZE": str(input_size),
+                "OUTPUT_SIZE": str(output_size),
+                "PAIRED_WEIGHT_LAYOUT": (
+                    "true" if weight_layout == "paired" else "false"
+                ),
             },
         )
 
@@ -2836,6 +2928,50 @@ def can_fuse_bf16_parallel_linears(
             parameter_dtype_for_node(circuit, node, tensor_index) == "BF16"
             for node in nodes
         )
+        and len(layouts) == 1
+        and layouts <= {ROW_MAJOR_LAYOUT, VULKAN_BF16_ROW_PAIR_LAYOUT}
+    )
+
+
+def can_fuse_bf16_parallel_linear_silu_multiply(
+    circuit: Json,
+    projection: Json,
+    activation: Json,
+    tensor_index: Json,
+) -> bool:
+    if (
+        projection.get("op") != "parallel_linear_2way"
+        or activation.get("op") != "silu_multiply"
+        or len(projection.get("params", [])) != 2
+    ):
+        return False
+    try:
+        shapes = [
+            parameter_shape_for_id(circuit, parameter_id, tensor_index)
+            for parameter_id in projection["params"]
+        ]
+        layouts = {
+            parameter_layout_for_id(circuit, parameter_id, tensor_index)
+            for parameter_id in projection["params"]
+        }
+        dtypes = {
+            parameter_dtype_for_id(circuit, parameter_id, tensor_index)
+            for parameter_id in projection["params"]
+        }
+        element_count = int(activation.get("attrs", {})["element_count"])
+    except (KeyError, TypeError, ValueError, ModelCompileError):
+        return False
+    return (
+        len(shapes) == 2
+        and shapes[0] == shapes[1]
+        and len(shapes[0]) == 2
+        and all(
+            int(dimension) > 0 and int(dimension) % 2 == 0
+            for dimension in shapes[0]
+        )
+        and element_count == int(shapes[0][0])
+        and activation.get("attrs", {}).get("intermediate_rounding") == "BF16"
+        and dtypes == {"BF16"}
         and len(layouts) == 1
         and layouts <= {ROW_MAJOR_LAYOUT, VULKAN_BF16_ROW_PAIR_LAYOUT}
     )

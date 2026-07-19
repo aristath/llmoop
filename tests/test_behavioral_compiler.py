@@ -91,6 +91,81 @@ def test_exact_candidate_gate_proves_complete_fusion_coverage() -> None:
     assert evidence["rewrites"][0]["proof_contract"] == "silu_multiply_exact_bf16.v1"
 
 
+def test_exact_candidate_gate_proves_fused_parallel_ffn_projection() -> None:
+    source = {
+        "schema": "llmoop.stream_circuit.v1",
+        "source": {"pedal_id": "layer_00"},
+        "boundary": {
+            "inputs": [{"id": "input", "source": "x"}],
+            "outputs": [{"id": "output", "source": "y"}],
+        },
+        "state_ports": [],
+        "parameters": {
+            "refs": {
+                "gate_weight": {"tensor": "gate.weight"},
+                "up_weight": {"tensor": "up.weight"},
+            }
+        },
+        "behavioral_error_contract": {"mode": "source_reference_circuit"},
+        "nodes": [
+            {
+                "id": "gate",
+                "op": "linear",
+                "inputs": ["x"],
+                "outputs": ["gate_projection"],
+                "params": ["gate_weight"],
+            },
+            {
+                "id": "up",
+                "op": "linear",
+                "inputs": ["x"],
+                "outputs": ["up_projection"],
+                "params": ["up_weight"],
+            },
+            {
+                "id": "activation",
+                "op": "silu",
+                "inputs": ["gate_projection"],
+                "outputs": ["activated"],
+                "attrs": {"element_count": 4},
+            },
+            {
+                "id": "multiply",
+                "op": "multiply",
+                "inputs": ["activated", "up_projection"],
+                "outputs": ["y"],
+            },
+        ],
+    }
+    candidate = deepcopy(source)
+    candidate["nodes"] = [
+        {
+            "id": "fused_ffn",
+            "op": "parallel_linear_silu_multiply",
+            "inputs": ["x"],
+            "outputs": ["y"],
+            "params": ["gate_weight", "up_weight"],
+            "attrs": {
+                "compiled_from": ["gate", "up", "activation", "multiply"],
+                "branch_count": 2,
+                "intermediate_rounding": "BF16",
+                "element_count": 4,
+            },
+        }
+    ]
+
+    evidence = prove_exact_circuit_candidate(
+        pedal_id="layer_00", source=source, candidate=candidate
+    )
+
+    assert evidence["status"] == "passed"
+    assert evidence["candidate_kind"] == "exact_reference"
+    assert (
+        evidence["rewrites"][0]["proof_contract"]
+        == "parallel_linear_silu_multiply_exact_bf16.v1"
+    )
+
+
 def test_exact_candidate_gate_rejects_dropped_source_behavior() -> None:
     source = source_circuit()
     candidate = deepcopy(source)

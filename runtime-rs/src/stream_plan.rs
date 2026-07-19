@@ -1031,7 +1031,7 @@ fn infer_node_output_shapes(
         "parallel_linear_2way" | "parallel_linear_3way" => {
             infer_parallel_linear_output_shapes(pedal_id, node, signals, params, tensor_index)
         }
-        "linear" | "linear_residual" => {
+        "linear" | "linear_residual" | "parallel_linear_silu_multiply" => {
             infer_linear_output_shapes(pedal_id, node, signals, params, tensor_index)
         }
         "linear_split_3way" => {
@@ -1645,6 +1645,90 @@ mod tests {
         .unwrap_err();
 
         assert!(error.0.contains("expected 3"), "{}", error.0);
+    }
+
+    #[test]
+    fn infers_fused_parallel_ffn_projection_output_shape() {
+        let node = crate::stream_circuit::CircuitNode {
+            id: "fused_ffn".to_string(),
+            op: "parallel_linear_silu_multiply".to_string(),
+            inputs: vec!["hidden".to_string()],
+            outputs: vec!["ffn_hidden".to_string()],
+            params: vec!["gate_weight".to_string(), "up_weight".to_string()],
+            state_reads: Vec::new(),
+            state_writes: Vec::new(),
+            attrs: serde_json::json!({
+                "branch_count": 2,
+                "element_count": 2560,
+                "intermediate_rounding": "BF16"
+            }),
+        };
+        let signals = BTreeMap::from([(
+            "hidden".to_string(),
+            PlannedSignal {
+                id: "hidden".to_string(),
+                producer: SignalProducer::BoundaryInput,
+                consumers: vec!["fused_ffn".to_string()],
+                shape: Some(vec![1024]),
+                storage: SignalStorage::Boundary,
+                is_boundary_output: false,
+            },
+        )]);
+        let params = BTreeMap::from([
+            (
+                "gate_weight".to_string(),
+                ParameterRef {
+                    tensor: Some("gate.weight".to_string()),
+                    role: None,
+                    extra: serde_json::Map::new(),
+                },
+            ),
+            (
+                "up_weight".to_string(),
+                ParameterRef {
+                    tensor: Some("up.weight".to_string()),
+                    role: None,
+                    extra: serde_json::Map::new(),
+                },
+            ),
+        ]);
+        let tensor_index = TensorIndex {
+            schema: TENSOR_INDEX_SCHEMA.to_string(),
+            tensors: BTreeMap::from([
+                (
+                    "gate.weight".to_string(),
+                    TensorMetadata {
+                        dtype: "BF16".to_string(),
+                        shape: vec![2560, 1024],
+                        logical_shape: None,
+                        parameter_count: None,
+                        byte_count: None,
+                        data_offsets: None,
+                        source_file: None,
+                        data_sha256: None,
+                    },
+                ),
+                (
+                    "up.weight".to_string(),
+                    TensorMetadata {
+                        dtype: "BF16".to_string(),
+                        shape: vec![2560, 1024],
+                        logical_shape: None,
+                        parameter_count: None,
+                        byte_count: None,
+                        data_offsets: None,
+                        source_file: None,
+                        data_sha256: None,
+                    },
+                ),
+            ]),
+        };
+
+        assert_eq!(
+            infer_node_output_shapes("layer_00", &node, &signals, &params, Some(&tensor_index),)
+                .unwrap(),
+            vec![Some(vec![2560])]
+        );
     }
 
     #[test]

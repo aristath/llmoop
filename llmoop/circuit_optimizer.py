@@ -14,6 +14,9 @@ def optimize_circuit_for_vulkan(
     *,
     can_fuse_linear_split: Callable[[Json], bool] | None = None,
     can_fuse_parallel_linears: Callable[[list[Json]], bool] | None = None,
+    can_fuse_parallel_linear_silu_multiply: (
+        Callable[[Json, Json], bool] | None
+    ) = None,
     can_fuse_parallel_head_norm_rope: (
         Callable[[list[tuple[Json, Json]]], bool] | None
     ) = None,
@@ -78,6 +81,14 @@ def optimize_circuit_for_vulkan(
         compiled_nodes,
         can_fuse_recurrent_output_gate,
     )
+    compiled_nodes = _fuse_parallel_linear_silu_multiply_regions(
+        compiled_nodes,
+        can_fuse_parallel_linear_silu_multiply,
+        {
+            output.get("source", output["id"])
+            for output in optimized.get("boundary", {}).get("outputs", [])
+        },
+    )
     compiled_nodes = _fuse_linear_split_recurrent_regions(
         compiled_nodes,
         can_fuse_linear_split_recurrent,
@@ -91,6 +102,73 @@ def optimize_circuit_for_vulkan(
         },
     )
     return optimized
+
+
+def _fuse_parallel_linear_silu_multiply_regions(
+    nodes: list[Json],
+    can_fuse: Callable[[Json, Json], bool] | None,
+    protected_signals: set[str],
+) -> list[Json]:
+    if can_fuse is None:
+        return nodes
+    consumer_counts = Counter(
+        signal for node in nodes for signal in node.get("inputs", [])
+    )
+    compiled: list[Json] = []
+    index = 0
+    while index < len(nodes):
+        projection = nodes[index]
+        activation = nodes[index + 1] if index + 1 < len(nodes) else None
+        outputs = projection.get("outputs", [])
+        if (
+            activation is None
+            or projection.get("op") != "parallel_linear_2way"
+            or activation.get("op") != "silu_multiply"
+            or len(projection.get("inputs", [])) != 1
+            or len(outputs) != 2
+            or len(projection.get("params", [])) != 2
+            or projection.get("state_reads")
+            or projection.get("state_writes")
+            or activation.get("inputs") != outputs
+            or len(activation.get("outputs", [])) != 1
+            or activation.get("params")
+            or activation.get("state_reads")
+            or activation.get("state_writes")
+            or any(consumer_counts[output] != 1 for output in outputs)
+            or any(output in protected_signals for output in outputs)
+            or not can_fuse(projection, activation)
+        ):
+            compiled.append(deepcopy(projection))
+            index += 1
+            continue
+
+        projection_sources = projection.get("attrs", {}).get("compiled_from")
+        activation_sources = activation.get("attrs", {}).get("compiled_from")
+        if not isinstance(projection_sources, list) or not isinstance(
+            activation_sources, list
+        ):
+            compiled.append(deepcopy(projection))
+            index += 1
+            continue
+        compiled.append(
+            {
+                "id": f"{projection['id']}__{activation['id']}",
+                "op": "parallel_linear_silu_multiply",
+                "inputs": deepcopy(projection["inputs"]),
+                "outputs": deepcopy(activation["outputs"]),
+                "params": deepcopy(projection["params"]),
+                "attrs": {
+                    "compiled_from": [*projection_sources, *activation_sources],
+                    "branch_count": 2,
+                    "intermediate_rounding": "BF16",
+                    "element_count": activation.get("attrs", {}).get(
+                        "element_count"
+                    ),
+                },
+            }
+        )
+        index += 2
+    return compiled
 
 
 def _fuse_append_attention_regions(

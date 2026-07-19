@@ -178,6 +178,26 @@ def test_compiler_renders_parallel_linear_shaders(tmp_path: Path) -> None:
     assert "{{" not in triple_source
 
 
+def test_compiler_renders_fused_parallel_ffn_projection_shader(
+    tmp_path: Path,
+) -> None:
+    shader_source_dir = Path(__file__).parents[1] / "runtime-rs" / "shaders"
+    shader_file = (
+        "parallel_linear_silu_multiply_paired_bf16_1024x2560.comp"
+    )
+
+    copy_shader_templates(shader_source_dir, tmp_path, {shader_file})
+
+    source = (tmp_path / shader_file).read_text()
+    assert "binding = 2) readonly buffer GateWeight" in source
+    assert "binding = 3) readonly buffer UpWeight" in source
+    assert "const uint INPUT_SIZE = 1024u;" in source
+    assert "const uint OUTPUT_SIZE = 2560u;" in source
+    assert "const bool PAIRED_WEIGHT_LAYOUT = true;" in source
+    assert "rounded_silu" in source
+    assert "{{" not in source
+
+
 def test_compiler_renders_parallel_head_norm_rope_shader(tmp_path: Path) -> None:
     shader_source_dir = Path(__file__).parents[1] / "runtime-rs" / "shaders"
     shader_file = (

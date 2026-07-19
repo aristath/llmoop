@@ -24,6 +24,7 @@ EXACT_REWRITE_CONTRACTS = {
     "parallel_head_norm_rope_2way": "parallel_head_norm_rope_exact_bf16.v1",
     "parallel_linear_2way": "parallel_linear_exact_bf16.v1",
     "parallel_linear_3way": "parallel_linear_exact_bf16.v1",
+    "parallel_linear_silu_multiply": "parallel_linear_silu_multiply_exact_bf16.v1",
     "silu_multiply": "silu_multiply_exact_bf16.v1",
 }
 EXACT_REWRITE_SOURCE_OPS = {
@@ -58,6 +59,7 @@ EXACT_REWRITE_SOURCE_OPS = {
     },
     "parallel_linear_2way": {("linear", "linear")},
     "parallel_linear_3way": {("linear", "linear", "linear")},
+    "parallel_linear_silu_multiply": {("linear", "linear", "silu", "multiply")},
     "silu_multiply": {("silu", "multiply")},
 }
 
@@ -480,6 +482,26 @@ def _validate_exact_rewrite_semantics(
             )
         expected_attrs = {
             "compiled_from": source_ids,
+            "intermediate_rounding": "BF16",
+            "element_count": element_count,
+        }
+    elif op == "parallel_linear_silu_multiply":
+        _require_empty_attrs(pedal_id, op, region[:2])
+        activation_attrs = region[2].get("attrs", {})
+        element_count = activation_attrs.get("element_count")
+        if (
+            not isinstance(element_count, int)
+            or element_count <= 0
+            or set(activation_attrs) != {"element_count"}
+            or region[3].get("attrs", {})
+        ):
+            raise ModelCompileError(
+                f"candidate circuit {pedal_id!r} rewrite {candidate_node['id']!r} "
+                "cannot prove the fused FFN source attributes"
+            )
+        expected_attrs = {
+            "compiled_from": source_ids,
+            "branch_count": 2,
             "intermediate_rounding": "BF16",
             "element_count": element_count,
         }
