@@ -37,6 +37,23 @@ def source_circuit() -> dict:
     }
 
 
+def empirical_evidence(*, free_running_status: str = "passed") -> dict:
+    return {
+        "schema": "llmoop.behavioral_empirical_evidence.v1",
+        "model_contract_digest": "a" * 64,
+        "teacher_forced": {
+            "status": "passed",
+            "sample_count": 128,
+            "metrics": {"maximum_logit_error": 0.01},
+        },
+        "free_running": {
+            "status": free_running_status,
+            "sample_count": 64,
+            "metrics": {"distribution_similarity": 0.99},
+        },
+    }
+
+
 def test_exact_candidate_gate_proves_complete_fusion_coverage() -> None:
     source = source_circuit()
     candidate = deepcopy(source)
@@ -48,6 +65,7 @@ def test_exact_candidate_gate_proves_complete_fusion_coverage() -> None:
             "outputs": ["y"],
             "attrs": {
                 "compiled_from": ["activation", "multiply"],
+                "intermediate_rounding": "BF16",
                 "element_count": 4,
             },
         }
@@ -74,6 +92,35 @@ def test_exact_candidate_gate_rejects_dropped_source_behavior() -> None:
         )
 
 
+def test_exact_candidate_gate_rejects_reordered_interface_and_specialization() -> None:
+    source = source_circuit()
+    candidate = deepcopy(source)
+    candidate["nodes"] = [
+        {
+            "id": "activation__multiply",
+            "op": "silu_multiply",
+            "inputs": ["gate", "x"],
+            "outputs": ["y"],
+            "attrs": {
+                "compiled_from": ["activation", "multiply"],
+                "intermediate_rounding": "BF16",
+                "element_count": 4,
+            },
+        }
+    ]
+    with pytest.raises(ModelCompileError, match="observable region interface"):
+        prove_exact_circuit_candidate(
+            pedal_id="layer_00", source=source, candidate=candidate
+        )
+
+    candidate["nodes"][0]["inputs"] = ["x", "gate"]
+    candidate["nodes"][0]["attrs"]["intermediate_rounding"] = "F32"
+    with pytest.raises(ModelCompileError, match="exact rewrite attributes"):
+        prove_exact_circuit_candidate(
+            pedal_id="layer_00", source=source, candidate=candidate
+        )
+
+
 def test_approximate_candidate_requires_both_closed_loop_evidence_modes() -> None:
     source = source_circuit()
     candidate = deepcopy(source)
@@ -83,7 +130,7 @@ def test_approximate_candidate_requires_both_closed_loop_evidence_modes() -> Non
         prove_exact_circuit_candidate(
             pedal_id="layer_00", source=source, candidate=candidate
         )
-    with pytest.raises(ModelCompileError, match="free-running"):
+    with pytest.raises(ModelCompileError, match="versioned source-oracle"):
         prove_exact_circuit_candidate(
             pedal_id="layer_00",
             source=source,
@@ -94,13 +141,19 @@ def test_approximate_candidate_requires_both_closed_loop_evidence_modes() -> Non
             },
         )
 
+    with pytest.raises(ModelCompileError, match="free-running"):
+        prove_exact_circuit_candidate(
+            pedal_id="layer_00",
+            source=source,
+            candidate=candidate,
+            empirical_evidence=empirical_evidence(free_running_status="failed"),
+        )
+
     evidence = prove_exact_circuit_candidate(
         pedal_id="layer_00",
         source=source,
         candidate=candidate,
-        empirical_evidence={
-            "teacher_forced": {"status": "passed"},
-            "free_running": {"status": "passed"},
-        },
+        empirical_evidence=empirical_evidence(),
     )
     assert evidence["candidate_kind"] == "approximate"
+    assert len(evidence["candidate_contract_digest"]) == 64

@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from collections import Counter
+from copy import deepcopy
 from typing import Any
 
 from llmoop.compilation import Json, ModelCompileError
 
 
 BEHAVIORAL_VALIDATION_SCHEMA = "llmoop.behavioral_validation.v1"
+BEHAVIORAL_EMPIRICAL_EVIDENCE_SCHEMA = "llmoop.behavioral_empirical_evidence.v1"
 EXACT_REWRITE_CONTRACTS = {
     "append_scaled_dot_product_attention": "append_attention_exact_bf16.v1",
     "linear_residual": "linear_residual_exact_bf16.v1",
@@ -66,6 +69,7 @@ def build_behavioral_validation(
     candidate_circuits: dict[str, Json],
     empirical_evidence: Json | None = None,
 ) -> Json:
+    oracle_digest = model_contract_digest(model_graph, tensor_index)
     circuit_evidence = []
     for circuit_ref in lowered_index["graph"]["circuits"]:
         pedal_id = circuit_ref["id"]
@@ -82,6 +86,7 @@ def build_behavioral_validation(
                 source=source,
                 candidate=candidate,
                 empirical_evidence=empirical_evidence,
+                expected_model_contract_digest=oracle_digest,
             )
         )
 
@@ -94,7 +99,7 @@ def build_behavioral_validation(
         "candidate_kind": "exact_reference" if exact else "approximate",
         "source_oracle": {
             "kind": "source_checkpoint_contract",
-            "model_contract_digest": model_contract_digest(model_graph, tensor_index),
+            "model_contract_digest": oracle_digest,
             "tensor_count": len(tensor_index["tensors"]),
             "parameter_count": int(tensor_index["totals"]["parameter_count"]),
             "byte_count": int(tensor_index["totals"]["byte_count"]),
@@ -126,7 +131,9 @@ def prove_exact_circuit_candidate(
     source: Json,
     candidate: Json,
     empirical_evidence: Json | None = None,
+    expected_model_contract_digest: str | None = None,
 ) -> Json:
+    candidate_digest = json_contract_digest(candidate)
     contract_fields = (
         "schema",
         "source",
@@ -137,8 +144,12 @@ def prove_exact_circuit_candidate(
     )
     drift = [field for field in contract_fields if source.get(field) != candidate.get(field)]
     if drift:
-        _require_closed_loop_evidence(empirical_evidence)
-        return _approximate_candidate_evidence(pedal_id, drift)
+        _require_closed_loop_evidence(
+            empirical_evidence, expected_model_contract_digest
+        )
+        return _approximate_candidate_evidence(
+            pedal_id, drift, candidate_digest, len(candidate.get("nodes", []))
+        )
 
     source_nodes = source.get("nodes", [])
     candidate_nodes = candidate.get("nodes", [])
@@ -158,17 +169,32 @@ def prove_exact_circuit_candidate(
         compiled_from = node.get("attrs", {}).get("compiled_from")
         if source_node is not None and compiled_from is None:
             if node != source_node:
-                _require_closed_loop_evidence(empirical_evidence)
+                _require_closed_loop_evidence(
+                    empirical_evidence, expected_model_contract_digest
+                )
                 return _approximate_candidate_evidence(
-                    pedal_id, [f"node:{node['id']}"]
+                    pedal_id,
+                    [f"node:{node['id']}"],
+                    candidate_digest,
+                    len(candidate_nodes),
                 )
             covered.append(node["id"])
             continue
 
         if not isinstance(compiled_from, list) or not compiled_from:
-            _require_closed_loop_evidence(empirical_evidence)
+            _require_closed_loop_evidence(
+                empirical_evidence, expected_model_contract_digest
+            )
             return _approximate_candidate_evidence(
-                pedal_id, [f"unproven_node:{node.get('id', '<missing>')}"]
+                pedal_id,
+                [f"unproven_node:{node.get('id', '<missing>')}"],
+                candidate_digest,
+                len(candidate_nodes),
+            )
+        if len(set(compiled_from)) != len(compiled_from):
+            raise ModelCompileError(
+                f"candidate circuit {pedal_id!r} rewrite {node['id']!r} repeats "
+                "a source node in compiled_from"
             )
         if any(source_id not in source_by_id for source_id in compiled_from):
             unknown = [source_id for source_id in compiled_from if source_id not in source_by_id]
@@ -178,9 +204,14 @@ def prove_exact_circuit_candidate(
             )
         proof_contract = EXACT_REWRITE_CONTRACTS.get(node.get("op"))
         if proof_contract is None:
-            _require_closed_loop_evidence(empirical_evidence)
+            _require_closed_loop_evidence(
+                empirical_evidence, expected_model_contract_digest
+            )
             return _approximate_candidate_evidence(
-                pedal_id, [f"unproven_rewrite:{node.get('op', '<missing>')}"]
+                pedal_id,
+                [f"unproven_rewrite:{node.get('op', '<missing>')}"],
+                candidate_digest,
+                len(candidate_nodes),
             )
         region = [source_by_id[source_id] for source_id in compiled_from]
         source_ops = tuple(node["op"] for node in region)
@@ -189,17 +220,11 @@ def prove_exact_circuit_candidate(
                 f"candidate circuit {pedal_id!r} rewrite {node['id']!r} cannot use "
                 f"proof contract {proof_contract} for source ops {source_ops}"
             )
-        if node["op"] == "silu_multiply":
-            source_element_count = region[0].get("attrs", {}).get("element_count")
-            if (
-                not isinstance(source_element_count, int)
-                or source_element_count <= 0
-                or node.get("attrs", {}).get("element_count") != source_element_count
-            ):
-                raise ModelCompileError(
-                    f"candidate circuit {pedal_id!r} rewrite {node['id']!r} does not "
-                    "preserve the SiLU signal extent"
-                )
+        _validate_exact_rewrite_semantics(
+            pedal_id=pedal_id,
+            candidate_node=node,
+            region=region,
+        )
         _validate_rewrite_interface(
             pedal_id=pedal_id,
             candidate_node=node,
@@ -232,6 +257,7 @@ def prove_exact_circuit_candidate(
         "status": "passed",
         "source_node_count": len(source_nodes),
         "candidate_node_count": len(candidate_nodes),
+        "candidate_contract_digest": candidate_digest,
         "covered_source_node_count": len(covered),
         "rewrite_count": len(rewrites),
         "rewrites": rewrites,
@@ -257,6 +283,291 @@ def model_contract_digest(model_graph: Json, tensor_index: Json) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def json_contract_digest(value: Any) -> str:
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def validate_behavioral_validation_artifact(
+    evidence: Json,
+    candidate_circuits: dict[str, Json],
+) -> None:
+    if (
+        evidence.get("schema") != BEHAVIORAL_VALIDATION_SCHEMA
+        or evidence.get("status") != "passed"
+    ):
+        raise ModelCompileError("behavioral validation artifact has not passed")
+    candidate_kind = evidence.get("candidate_kind")
+    if candidate_kind not in {"exact_reference", "approximate"}:
+        raise ModelCompileError(
+            f"behavioral validation artifact has unsupported candidate kind {candidate_kind!r}"
+        )
+    source_oracle = evidence.get("source_oracle")
+    if (
+        not isinstance(source_oracle, dict)
+        or not _is_sha256_digest(source_oracle.get("model_contract_digest"))
+        or any(
+            not isinstance(source_oracle.get(field), int)
+            or isinstance(source_oracle.get(field), bool)
+            or source_oracle[field] < 0
+            for field in ("tensor_count", "parameter_count", "byte_count")
+        )
+    ):
+        raise ModelCompileError(
+            "behavioral validation artifact has an incomplete source oracle contract"
+        )
+
+    for mode in ("teacher_forced", "free_running"):
+        result = evidence.get(mode)
+        if candidate_kind == "exact_reference":
+            if not isinstance(result, dict) or result.get("status") != "not_required":
+                raise ModelCompileError(
+                    f"exact behavioral validation must mark {mode} evidence not_required"
+                )
+        elif (
+            not isinstance(result, dict)
+            or result.get("status") != "passed"
+            or not isinstance(result.get("sample_count"), int)
+            or isinstance(result.get("sample_count"), bool)
+            or result["sample_count"] <= 0
+            or not isinstance(result.get("metrics"), dict)
+            or not result["metrics"]
+            or any(
+                not isinstance(value, (int, float))
+                or isinstance(value, bool)
+                or not math.isfinite(float(value))
+                for value in result["metrics"].values()
+            )
+        ):
+            raise ModelCompileError(
+                f"approximate behavioral validation lacks measured passing {mode} evidence"
+            )
+
+    circuits = evidence.get("circuits")
+    if not isinstance(circuits, list):
+        raise ModelCompileError("behavioral validation artifact has no circuit proofs")
+    proof_by_pedal: dict[str, Json] = {}
+    for proof in circuits:
+        pedal_id = proof.get("pedal_id") if isinstance(proof, dict) else None
+        if not isinstance(pedal_id, str) or not pedal_id:
+            raise ModelCompileError(
+                "behavioral validation artifact contains a proof without a pedal id"
+            )
+        if pedal_id in proof_by_pedal:
+            raise ModelCompileError(
+                f"behavioral validation artifact repeats pedal {pedal_id!r}"
+            )
+        proof_by_pedal[pedal_id] = proof
+    if set(proof_by_pedal) != set(candidate_circuits):
+        raise ModelCompileError(
+            "behavioral validation artifact does not prove every packaged pedal"
+        )
+    for pedal_id, candidate in candidate_circuits.items():
+        proof = proof_by_pedal[pedal_id]
+        if (
+            proof.get("status") != "passed"
+            or proof.get("candidate_kind") != candidate_kind
+            or proof.get("candidate_node_count") != len(candidate.get("nodes", []))
+            or proof.get("candidate_contract_digest")
+            != json_contract_digest(candidate)
+        ):
+            raise ModelCompileError(
+                f"behavioral validation artifact has an incomplete or stale proof for pedal {pedal_id!r}"
+            )
+        if candidate_kind == "exact_reference" and (
+            proof.get("source_node_count")
+            != proof.get("covered_source_node_count")
+        ):
+            raise ModelCompileError(
+                f"behavioral validation artifact does not completely cover pedal {pedal_id!r}"
+            )
+
+
+def _validate_exact_rewrite_semantics(
+    *,
+    pedal_id: str,
+    candidate_node: Json,
+    region: list[Json],
+) -> None:
+    op = candidate_node["op"]
+    source_ids = [node["id"] for node in region]
+    attrs = candidate_node.get("attrs", {})
+    expected_attrs: Json
+
+    if op in {"parallel_linear_2way", "parallel_linear_3way"}:
+        _require_empty_attrs(pedal_id, op, region)
+        expected_attrs = {
+            "compiled_from": source_ids,
+            "branch_count": len(region),
+        }
+    elif op == "linear_residual":
+        _require_empty_attrs(pedal_id, op, region)
+        expected_attrs = {
+            "compiled_from": source_ids,
+            "intermediate_rounding": "BF16",
+        }
+    elif op == "silu_multiply":
+        activation_attrs = region[0].get("attrs", {})
+        element_count = activation_attrs.get("element_count")
+        if (
+            not isinstance(element_count, int)
+            or element_count <= 0
+            or set(activation_attrs) != {"element_count"}
+            or region[1].get("attrs", {})
+        ):
+            raise ModelCompileError(
+                f"candidate circuit {pedal_id!r} rewrite {candidate_node['id']!r} "
+                "cannot prove the SiLU/multiply source attributes"
+            )
+        expected_attrs = {
+            "compiled_from": source_ids,
+            "intermediate_rounding": "BF16",
+            "element_count": element_count,
+        }
+    elif op == "linear_split_3way":
+        _require_empty_attrs(pedal_id, op, region[:1])
+        split_attrs = deepcopy(region[1].get("attrs", {}))
+        part_widths = split_attrs.get("part_widths")
+        if part_widths is None:
+            part_width = split_attrs.get("part_width")
+            if not isinstance(part_width, int):
+                raise ModelCompileError(
+                    f"candidate circuit {pedal_id!r} rewrite {candidate_node['id']!r} "
+                    "does not preserve a provable split width"
+                )
+            part_widths = [part_width] * 3
+        if (
+            not isinstance(part_widths, list)
+            or len(part_widths) != 3
+            or any(not isinstance(width, int) or width <= 0 for width in part_widths)
+        ):
+            raise ModelCompileError(
+                f"candidate circuit {pedal_id!r} rewrite {candidate_node['id']!r} "
+                "does not preserve provable split widths"
+            )
+        split_attrs["part_widths"] = part_widths
+        expected_attrs = {
+            **split_attrs,
+            "compiled_from": source_ids,
+            "intermediate_rounding": "BF16",
+        }
+    elif op in {"multiply_rolling_depthwise", "multiply_rolling_depthwise_gate"}:
+        multiply, rolling, depthwise = region[:3]
+        expected_attrs = {
+            "compiled_from": source_ids,
+            "multiply": deepcopy(multiply.get("attrs", {})),
+            "rolling": deepcopy(rolling.get("attrs", {})),
+            "depthwise": deepcopy(depthwise.get("attrs", {})),
+            "intermediate_rounding": "BF16",
+        }
+        if op == "multiply_rolling_depthwise_gate":
+            if region[3].get("attrs", {}):
+                raise ModelCompileError(
+                    f"candidate circuit {pedal_id!r} rewrite {candidate_node['id']!r} "
+                    "drops output-gate attributes"
+                )
+            expected_attrs["output_gate_rounding"] = "BF16"
+    elif op == "parallel_head_norm_rope_2way":
+        expected_attrs = {
+            "compiled_from": source_ids,
+            "branches": [
+                {
+                    "norm": deepcopy(region[0].get("attrs", {})),
+                    "rope": deepcopy(region[1].get("attrs", {})),
+                },
+                {
+                    "norm": deepcopy(region[2].get("attrs", {})),
+                    "rope": deepcopy(region[3].get("attrs", {})),
+                },
+            ],
+            "intermediate_rounding": "BF16",
+        }
+    elif op == "append_scaled_dot_product_attention":
+        expected_attrs = {
+            "compiled_from": source_ids,
+            "append": deepcopy(region[0].get("attrs", {})),
+            "attention": deepcopy(region[1].get("attrs", {})),
+            "current_kv_source": "direct_bf16_input",
+        }
+    elif op == "linear_split_recurrent_depthwise_gate":
+        linear, split, multiply, rolling, depthwise, output_gate = region
+        _require_empty_attrs(pedal_id, op, [linear, output_gate])
+        split_attrs = deepcopy(split.get("attrs", {}))
+        part_widths = split_attrs.get("part_widths")
+        if part_widths is None:
+            part_width = split_attrs.get("part_width")
+            if not isinstance(part_width, int):
+                raise ModelCompileError(
+                    f"candidate circuit {pedal_id!r} rewrite {candidate_node['id']!r} "
+                    "does not preserve a provable projection split width"
+                )
+            part_widths = [part_width] * 3
+        split_attrs["part_widths"] = part_widths
+        projection_attrs = {
+            **split_attrs,
+            "compiled_from": [linear["id"], split["id"]],
+            "intermediate_rounding": "BF16",
+        }
+        recurrent_attrs = {
+            "compiled_from": [
+                multiply["id"],
+                rolling["id"],
+                depthwise["id"],
+                output_gate["id"],
+            ],
+            "multiply": deepcopy(multiply.get("attrs", {})),
+            "rolling": deepcopy(rolling.get("attrs", {})),
+            "depthwise": deepcopy(depthwise.get("attrs", {})),
+            "intermediate_rounding": "BF16",
+            "output_gate_rounding": "BF16",
+        }
+        projection_outputs = split.get("outputs", [])
+        recurrent_inputs = [*multiply.get("inputs", []), *rolling.get("inputs", [])]
+        try:
+            input_gate_indices = [
+                projection_outputs.index(multiply["inputs"][0]),
+                projection_outputs.index(multiply["inputs"][1]),
+            ]
+            recurrent_output = depthwise["outputs"][0]
+            output_gate_signal = next(
+                signal for signal in output_gate["inputs"] if signal != recurrent_output
+            )
+            output_gate_index = projection_outputs.index(output_gate_signal)
+        except (IndexError, KeyError, StopIteration, ValueError) as error:
+            raise ModelCompileError(
+                f"candidate circuit {pedal_id!r} rewrite {candidate_node['id']!r} "
+                f"has an unprovable recurrent branch mapping: {recurrent_inputs}"
+            ) from error
+        expected_attrs = {
+            "compiled_from": source_ids,
+            "projection": projection_attrs,
+            "recurrent": recurrent_attrs,
+            "input_gate_branch_indices": input_gate_indices,
+            "output_gate_branch_index": output_gate_index,
+            "projection_rounding": "BF16",
+        }
+    else:
+        raise ModelCompileError(
+            f"candidate circuit {pedal_id!r} rewrite {candidate_node['id']!r} "
+            f"has no semantic proof implementation for {op!r}"
+        )
+
+    if attrs != expected_attrs:
+        raise ModelCompileError(
+            f"candidate circuit {pedal_id!r} rewrite {candidate_node['id']!r} "
+            f"changes exact rewrite attributes: expected={expected_attrs!r}, candidate={attrs!r}"
+        )
+
+
+def _require_empty_attrs(pedal_id: str, op: str, nodes: list[Json]) -> None:
+    with_attrs = [node["id"] for node in nodes if node.get("attrs", {})]
+    if with_attrs:
+        raise ModelCompileError(
+            f"candidate circuit {pedal_id!r} rewrite {op!r} drops source attributes "
+            f"from {with_attrs}"
+        )
+
+
 def _validate_rewrite_interface(
     *,
     pedal_id: str,
@@ -267,31 +578,37 @@ def _validate_rewrite_interface(
     boundary_outputs: set[str],
 ) -> None:
     produced = {signal for node in region for signal in node.get("outputs", [])}
-    inputs = {
+    inputs = _ordered_unique(
         signal
         for node in region
         for signal in node.get("inputs", [])
         if signal not in produced
-    }
-    outputs = {
+    )
+    if candidate_node["op"] == "append_scaled_dot_product_attention":
+        inputs = [region[1]["inputs"][0], *region[0]["inputs"]]
+    outputs = _ordered_unique(
         signal
         for node in region
         for signal in node.get("outputs", [])
         if signal in boundary_outputs
         or any(consumer not in region_ids for consumer in consumers.get(signal, set()))
-    }
-    params = {param for node in region for param in node.get("params", [])}
-    state_reads = {state for node in region for state in node.get("state_reads", [])}
-    state_writes = {state for node in region for state in node.get("state_writes", [])}
+    )
+    params = [param for node in region for param in node.get("params", [])]
+    state_reads = _ordered_unique(
+        state for node in region for state in node.get("state_reads", [])
+    )
+    state_writes = _ordered_unique(
+        state for node in region for state in node.get("state_writes", [])
+    )
     comparisons = {
-        "inputs": (inputs, set(candidate_node.get("inputs", []))),
-        "outputs": (outputs, set(candidate_node.get("outputs", []))),
-        "params": (params, set(candidate_node.get("params", []))),
-        "state_reads": (state_reads, set(candidate_node.get("state_reads", []))),
-        "state_writes": (state_writes, set(candidate_node.get("state_writes", []))),
+        "inputs": (inputs, candidate_node.get("inputs", [])),
+        "outputs": (outputs, candidate_node.get("outputs", [])),
+        "params": (params, candidate_node.get("params", [])),
+        "state_reads": (state_reads, candidate_node.get("state_reads", [])),
+        "state_writes": (state_writes, candidate_node.get("state_writes", [])),
     }
     drift = {
-        name: {"source": sorted(source), "candidate": sorted(candidate)}
+        name: {"source": source, "candidate": candidate}
         for name, (source, candidate) in comparisons.items()
         if source != candidate
     }
@@ -310,10 +627,36 @@ def _signal_consumers(nodes: list[Json]) -> dict[str, set[str]]:
     return consumers
 
 
-def _require_closed_loop_evidence(evidence: Json | None) -> None:
+def _ordered_unique(values: Any) -> list[str]:
+    result = []
+    seen = set()
+    for value in values:
+        if value not in seen:
+            seen.add(value)
+            result.append(value)
+    return result
+
+
+def _require_closed_loop_evidence(
+    evidence: Json | None,
+    expected_model_contract_digest: str | None = None,
+) -> None:
     if evidence is None:
         raise ModelCompileError(
             "behavioral compiler rejected a non-exact candidate without source-oracle evidence"
+        )
+    if evidence.get("schema") != BEHAVIORAL_EMPIRICAL_EVIDENCE_SCHEMA:
+        raise ModelCompileError(
+            "behavioral compiler requires versioned source-oracle evidence"
+        )
+    digest = evidence.get("model_contract_digest")
+    if not _is_sha256_digest(digest):
+        raise ModelCompileError(
+            "behavioral compiler evidence lacks a valid model contract digest"
+        )
+    if expected_model_contract_digest is not None and digest != expected_model_contract_digest:
+        raise ModelCompileError(
+            "behavioral compiler evidence targets a different source model contract"
         )
     for mode in ("teacher_forced", "free_running"):
         result = evidence.get(mode)
@@ -321,12 +664,46 @@ def _require_closed_loop_evidence(evidence: Json | None) -> None:
             raise ModelCompileError(
                 f"behavioral compiler requires passing {mode.replace('_', '-')} oracle evidence"
             )
+        sample_count = result.get("sample_count")
+        metrics = result.get("metrics")
+        if not isinstance(sample_count, int) or isinstance(sample_count, bool) or sample_count <= 0:
+            raise ModelCompileError(
+                f"behavioral compiler requires positive {mode.replace('_', '-')} sample evidence"
+            )
+        if (
+            not isinstance(metrics, dict)
+            or not metrics
+            or any(
+                not isinstance(value, (int, float))
+                or isinstance(value, bool)
+                or not math.isfinite(float(value))
+                for value in metrics.values()
+            )
+        ):
+            raise ModelCompileError(
+                f"behavioral compiler requires finite {mode.replace('_', '-')} validation metrics"
+            )
 
 
-def _approximate_candidate_evidence(pedal_id: str, drift: list[str]) -> Json:
+def _is_sha256_digest(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _approximate_candidate_evidence(
+    pedal_id: str,
+    drift: list[str],
+    candidate_digest: str,
+    candidate_node_count: int,
+) -> Json:
     return {
         "pedal_id": pedal_id,
         "candidate_kind": "approximate",
         "status": "passed",
         "drift": drift,
+        "candidate_contract_digest": candidate_digest,
+        "candidate_node_count": candidate_node_count,
     }
