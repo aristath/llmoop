@@ -406,17 +406,14 @@ pub struct StreamCircuitGraphBoundary {
     pub public_outputs: Vec<StreamCircuitGraphBoundaryPort>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum StreamCircuitConnection {
+    #[default]
     Forward,
-    TemporalFeedback { delay_activations: usize },
-}
-
-impl Default for StreamCircuitConnection {
-    fn default() -> Self {
-        Self::Forward
-    }
+    TemporalFeedback {
+        delay_activations: usize,
+    },
 }
 
 impl StreamCircuitConnection {

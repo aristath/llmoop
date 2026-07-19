@@ -3775,6 +3775,12 @@ pub struct VulkanResidentSamplerKernelArtifact {
     pub workgroup_count_x: u32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VulkanResidentSamplerStreamConfig {
+    pub history_capacity_activations: usize,
+    pub random_seed: u32,
+}
+
 impl VulkanResidentSamplerRunner {
     pub fn from_output_transducer_with_spec(
         device: &VulkanComputeDevice,
@@ -3791,8 +3797,10 @@ impl VulkanResidentSamplerRunner {
             output_transducer.logits_byte_capacity,
             kernels,
             spec,
-            mounted.buffers.dynamic_state_capacity_activations,
-            random_seed,
+            VulkanResidentSamplerStreamConfig {
+                history_capacity_activations: mounted.buffers.dynamic_state_capacity_activations,
+                random_seed,
+            },
         )
     }
 
@@ -3803,9 +3811,12 @@ impl VulkanResidentSamplerRunner {
         logits_byte_capacity: usize,
         kernels: &[VulkanResidentSamplerKernelArtifact],
         spec: &VulkanResidentSamplerSpec,
-        history_capacity_activations: usize,
-        random_seed: u32,
+        stream: VulkanResidentSamplerStreamConfig,
     ) -> Result<Self, VulkanResidentSamplerRunnerError> {
+        let VulkanResidentSamplerStreamConfig {
+            history_capacity_activations,
+            random_seed,
+        } = stream;
         if logits_byte_capacity != spec.logits_byte_capacity {
             return Err(
                 VulkanResidentSamplerRunnerError::InvalidLogitsByteCapacity {
@@ -5078,11 +5089,10 @@ fn backend_loop_window_for_static_state_bytes(
     static_state_bytes: usize,
     sampler_history_capacity: usize,
 ) -> usize {
-    let snapshot_limited = if static_state_bytes == 0 {
-        VULKAN_BACKEND_LOOP_MAX_WINDOW
-    } else {
-        (VULKAN_BACKEND_LOOP_SNAPSHOT_BUDGET_BYTES / static_state_bytes).max(1)
-    };
+    let snapshot_limited = VULKAN_BACKEND_LOOP_SNAPSHOT_BUDGET_BYTES
+        .checked_div(static_state_bytes)
+        .unwrap_or(VULKAN_BACKEND_LOOP_MAX_WINDOW)
+        .max(1);
     VULKAN_BACKEND_LOOP_MAX_WINDOW
         .min(snapshot_limited)
         .min(sampler_history_capacity.max(1))
@@ -8865,6 +8875,32 @@ fn placed_feedback_token_is_resident(
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VulkanResidentPlacedTokenInput {
+    HostSupplied(u32),
+    ResidentFeedback(u32),
+}
+
+impl VulkanResidentPlacedTokenInput {
+    fn from_residency(token_id: u32, resident: bool) -> Self {
+        if resident {
+            Self::ResidentFeedback(token_id)
+        } else {
+            Self::HostSupplied(token_id)
+        }
+    }
+
+    fn token_id(self) -> u32 {
+        match self {
+            Self::HostSupplied(token_id) | Self::ResidentFeedback(token_id) => token_id,
+        }
+    }
+
+    fn is_resident(self) -> bool {
+        matches!(self, Self::ResidentFeedback(_))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VulkanResidentPromptRequest<'a> {
     pub prompt_token_ids: &'a [u32],
     pub max_new_tokens: usize,
@@ -9363,10 +9399,9 @@ impl VulkanResidentInProcessPlacedModelPackage {
         &self,
         device: &VulkanComputeDevice,
         transport: &mut VulkanInProcessPlacedCableTransport,
-        token_id: u32,
+        input: VulkanResidentPlacedTokenInput,
         stream_tick: u64,
         max_scheduler_turns: usize,
-        input_token_is_resident: bool,
         tail: VulkanResidentPlacedTokenTickTail,
     ) -> Result<
         (
@@ -9375,7 +9410,8 @@ impl VulkanResidentInProcessPlacedModelPackage {
         ),
         VulkanResidentInProcessPlacedModelPackageError,
     > {
-        let input_run = if input_token_is_resident {
+        let token_id = input.token_id();
+        let input_run = if input.is_resident() {
             self.input_transducer.completed_run(token_id)
         } else {
             self.input_transducer
@@ -9489,10 +9525,9 @@ impl VulkanResidentInProcessPlacedModelPackage {
         &self,
         devices: &BTreeMap<String, Rc<VulkanComputeDevice>>,
         transport: &mut VulkanInProcessPlacedCableTransport,
-        token_id: u32,
+        input: VulkanResidentPlacedTokenInput,
         stream_tick: u64,
         max_scheduler_turns: usize,
-        input_token_is_resident: bool,
         tail: VulkanResidentPlacedTokenTickTail,
     ) -> Result<
         (
@@ -9501,7 +9536,8 @@ impl VulkanResidentInProcessPlacedModelPackage {
         ),
         VulkanResidentInProcessPlacedModelPackageError,
     > {
-        let input_run = if input_token_is_resident {
+        let token_id = input.token_id();
+        let input_run = if input.is_resident() {
             self.input_transducer.completed_run(token_id)
         } else {
             self.input_transducer
@@ -9575,10 +9611,9 @@ impl VulkanResidentInProcessPlacedModelPackage {
         self.run_prepared_token_id_stream_tick_in_process_with_transport(
             device,
             transport,
-            token_id,
+            VulkanResidentPlacedTokenInput::HostSupplied(token_id),
             stream_tick,
             max_scheduler_turns,
-            false,
             VulkanResidentPlacedTokenTickTail::Logits,
         )
         .map(|(tick_run, _)| tick_run)
@@ -9618,10 +9653,9 @@ impl VulkanResidentInProcessPlacedModelPackage {
         self.run_prepared_token_id_stream_tick_on_bound_devices_in_process_with_transport(
             devices,
             transport,
-            token_id,
+            VulkanResidentPlacedTokenInput::HostSupplied(token_id),
             stream_tick,
             max_scheduler_turns,
-            false,
             VulkanResidentPlacedTokenTickTail::Logits,
         )
         .map(|(tick_run, _)| tick_run)
@@ -9662,10 +9696,9 @@ impl VulkanResidentInProcessPlacedModelPackage {
             .run_prepared_token_id_stream_tick_in_process_with_transport(
                 device,
                 transport,
-                token_id,
+                VulkanResidentPlacedTokenInput::HostSupplied(token_id),
                 stream_tick,
                 max_scheduler_turns,
-                false,
                 VulkanResidentPlacedTokenTickTail::Sample,
             )?;
         Ok(VulkanResidentInProcessPlacedSingleTokenSampleRun {
@@ -9705,14 +9738,16 @@ impl VulkanResidentInProcessPlacedModelPackage {
                 .run_prepared_token_id_stream_tick_in_process_with_transport(
                     device,
                     &mut transport,
-                    input_token_id,
+                    VulkanResidentPlacedTokenInput::from_residency(
+                        input_token_id,
+                        placed_feedback_token_is_resident(
+                            &self.input_device_id,
+                            &self.output_device_id,
+                            tick_index != 0,
+                        ),
+                    ),
                     stream_tick,
                     max_scheduler_turns_per_tick,
-                    placed_feedback_token_is_resident(
-                        &self.input_device_id,
-                        &self.output_device_id,
-                        tick_index != 0,
-                    ),
                     VulkanResidentPlacedTokenTickTail::Sample,
                 )?;
             let tick_run = VulkanResidentInProcessPlacedSingleTokenSampleRun {
@@ -19040,6 +19075,14 @@ mod tests {
         assert!(placed_feedback_token_is_resident("gpu0", "gpu0", true));
         assert!(!placed_feedback_token_is_resident("gpu0", "gpu1", true));
         assert!(!placed_feedback_token_is_resident("gpu0", "gpu0", false));
+        assert_eq!(
+            VulkanResidentPlacedTokenInput::from_residency(7, false),
+            VulkanResidentPlacedTokenInput::HostSupplied(7)
+        );
+        assert_eq!(
+            VulkanResidentPlacedTokenInput::from_residency(11, true),
+            VulkanResidentPlacedTokenInput::ResidentFeedback(11)
+        );
     }
 
     #[test]
@@ -20697,8 +20740,10 @@ mod tests {
             FIXTURE_MODEL_LOGITS_BYTES,
             &sampler_kernels,
             &fixture_model_greedy_sampler_spec(),
-            8,
-            0,
+            VulkanResidentSamplerStreamConfig {
+                history_capacity_activations: 8,
+                random_seed: 0,
+            },
         )
         .unwrap();
         assert_eq!(runner.sampler_id, FIXTURE_MODEL_GREEDY_SAMPLER_PEDAL_ID);
@@ -20809,8 +20854,10 @@ mod tests {
             LOGITS_BYTE_CAPACITY,
             &sampler_kernels,
             &invalid_spec,
-            32,
-            SEED,
+            VulkanResidentSamplerStreamConfig {
+                history_capacity_activations: 32,
+                random_seed: SEED,
+            },
         )
         .err()
         .expect("undersized sampler scratch must be rejected");
@@ -20826,8 +20873,10 @@ mod tests {
             LOGITS_BYTE_CAPACITY,
             &sampler_kernels,
             &spec,
-            32,
-            SEED,
+            VulkanResidentSamplerStreamConfig {
+                history_capacity_activations: 32,
+                random_seed: SEED,
+            },
         )
         .unwrap();
 
