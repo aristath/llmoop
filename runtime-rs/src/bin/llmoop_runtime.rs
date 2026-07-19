@@ -14,23 +14,20 @@ use llmoop_runtime::{
     RuntimeDeviceTickPlanReport, RuntimeEffectivePedalboardTopology, RuntimeLocalCableBufferReport,
     RuntimePackageInspectionReport, RuntimePatchControls, RuntimePatchDuplicateAfterControl,
     RuntimePatchInspectionReport, RuntimePatchPlacementReport, RuntimePatchSourceChainEntry,
-    RuntimePedalPortSummary, RuntimePlacedPedalDispatchTimingReport,
-    RuntimePlacedPedalTimingReport, RuntimePlacedPedalTimingSummaryReport,
-    RuntimePlacedPromptRunReport, RuntimePlacedTransportReport, RuntimePlacedTransportStatsReport,
-    RuntimePlacementReport, RuntimePromptBenchmarkReport, RuntimePromptBenchmarkRunReport,
-    RuntimePromptBenchmarkTransportTotalsReport, RuntimePromptBenchmarkU64MetricReport,
-    RuntimePromptBenchmarkUsizeMetricReport, RuntimePromptTimingReport,
-    RuntimeRemoteCableBufferReport, RuntimeSingleDevicePromptRunReport, RuntimeSourcePedal,
-    RuntimeTokenizerOptionsReport, RuntimeTopologyReport, VulkanComputeDevice,
-    VulkanComputeDeviceInfo, VulkanPlacedCableTransportStats, VulkanResidentHfTokenizerTextCodec,
+    RuntimePedalPortSummary, RuntimePlacedPedalTimingSummaryReport, RuntimePlacedPromptRunReport,
+    RuntimePlacedTransportReport, RuntimePlacementReport, RuntimePromptBenchmarkReport,
+    RuntimePromptBenchmarkRunReport, RuntimePromptBenchmarkTransportTotalsReport,
+    RuntimePromptBenchmarkU64MetricReport, RuntimePromptBenchmarkUsizeMetricReport,
+    RuntimePromptTimingReport, RuntimeRemoteCableBufferReport, RuntimeSingleDevicePromptRunReport,
+    RuntimeSourcePedal, RuntimeTokenizerOptionsReport, RuntimeTopologyReport, VulkanComputeDevice,
+    VulkanComputeDeviceInfo, VulkanResidentHfTokenizerTextCodec,
     VulkanResidentInProcessPlacedPromptEngine,
     VulkanResidentInProcessPlacedPromptEngineInputRequest,
-    VulkanResidentInProcessPlacedPromptEventRun, VulkanResidentInProcessPlacedPromptStream,
-    VulkanResidentModelPackage, VulkanResidentModelPackageDeviceSlice,
-    VulkanResidentModelPackageManifest, VulkanResidentTokenEngine,
-    VulkanResidentTokenEngineRunBudget, VulkanResidentTokenEngineRunStopCondition,
-    VulkanResidentTokenInputEvent, VulkanResidentTokenTextCodec,
-    VulkanReusableKernelArtifactManifest, discover_runtime_devices,
+    VulkanResidentInProcessPlacedPromptStream, VulkanResidentModelPackage,
+    VulkanResidentModelPackageDeviceSlice, VulkanResidentModelPackageManifest,
+    VulkanResidentTokenEngine, VulkanResidentTokenEngineRunBudget,
+    VulkanResidentTokenEngineRunStopCondition, VulkanResidentTokenInputEvent,
+    VulkanResidentTokenTextCodec, VulkanReusableKernelArtifactManifest, discover_runtime_devices,
 };
 use minijinja::{Environment, Error as TemplateError, ErrorKind as TemplateErrorKind};
 use serde::Serialize;
@@ -1041,17 +1038,9 @@ fn execute_placed_prompt_run(
         .run;
     let generated_text = codec.decode_tokens(&run.generated_token_ids)?;
     let output_text = codec.decode_tokens(&run.output_token_ids)?;
-    let total_scheduler_turns = run
-        .tick_runs
-        .iter()
-        .map(|tick| tick.tick_run.placed_run.scheduler_turn_count)
-        .sum::<usize>();
-    let completed_stage_deltas = run
-        .tick_runs
-        .iter()
-        .map(|tick| tick.tick_run.placed_run.completed_stage_delta)
-        .collect::<Vec<_>>();
-    let tick_count = run.tick_runs.len();
+    let total_scheduler_turns = run.scheduler_turn_count;
+    let completed_stage_deltas = vec![run.completed_stage_count];
+    let tick_count = run.tick_count;
     let generated_token_count = run.generated_token_ids.len();
     let timing = runtime_prompt_timing_report(
         setup_time_ns,
@@ -1060,83 +1049,17 @@ fn execute_placed_prompt_run(
         tick_count,
         total_scheduler_turns,
     );
-    let pedal_timings = runtime_placed_pedal_timings_report(&run);
-    let pedal_timing_summaries = runtime_placed_pedal_timing_summaries_report(&pedal_timings);
-    let transport_stats_by_tick = run
-        .tick_runs
-        .iter()
-        .map(|tick| runtime_transport_stats_report(&tick.tick_run.placed_run.transport_stats))
-        .collect::<Vec<_>>();
-    let transport_published_packet_count = run
-        .tick_runs
-        .iter()
-        .map(|tick| {
-            tick.tick_run
-                .placed_run
-                .transport_stats
-                .published_packet_count
-        })
-        .sum::<usize>();
-    let transport_published_byte_count = run
-        .tick_runs
-        .iter()
-        .map(|tick| {
-            tick.tick_run
-                .placed_run
-                .transport_stats
-                .published_byte_count
-        })
-        .sum::<usize>();
-    let transport_received_packet_count = run
-        .tick_runs
-        .iter()
-        .map(|tick| {
-            tick.tick_run
-                .placed_run
-                .transport_stats
-                .received_packet_count
-        })
-        .sum::<usize>();
-    let transport_received_byte_count = run
-        .tick_runs
-        .iter()
-        .map(|tick| tick.tick_run.placed_run.transport_stats.received_byte_count)
-        .sum::<usize>();
-    let transport_direct_copy_count = run
-        .tick_runs
-        .iter()
-        .map(|tick| tick.tick_run.placed_run.transport_stats.direct_copy_count)
-        .sum::<usize>();
-    let transport_direct_copy_byte_count = run
-        .tick_runs
-        .iter()
-        .map(|tick| {
-            tick.tick_run
-                .placed_run
-                .transport_stats
-                .direct_copy_byte_count
-        })
-        .sum::<usize>();
-    let transport_direct_receive_count = run
-        .tick_runs
-        .iter()
-        .map(|tick| {
-            tick.tick_run
-                .placed_run
-                .transport_stats
-                .direct_receive_count
-        })
-        .sum::<usize>();
-    let transport_direct_receive_byte_count = run
-        .tick_runs
-        .iter()
-        .map(|tick| {
-            tick.tick_run
-                .placed_run
-                .transport_stats
-                .direct_receive_byte_count
-        })
-        .sum::<usize>();
+    let pedal_timings = Vec::new();
+    let pedal_timing_summaries = Vec::new();
+    let transport_stats_by_tick = Vec::new();
+    let transport_published_packet_count = run.transport_stats.published_packet_count;
+    let transport_published_byte_count = run.transport_stats.published_byte_count;
+    let transport_received_packet_count = run.transport_stats.received_packet_count;
+    let transport_received_byte_count = run.transport_stats.received_byte_count;
+    let transport_direct_copy_count = run.transport_stats.direct_copy_count;
+    let transport_direct_copy_byte_count = run.transport_stats.direct_copy_byte_count;
+    let transport_direct_receive_count = run.transport_stats.direct_receive_count;
+    let transport_direct_receive_byte_count = run.transport_stats.direct_receive_byte_count;
 
     Ok(RuntimePlacedPromptRunReport {
         ok: true,
@@ -2478,105 +2401,10 @@ fn runtime_prompt_timing_report(
     }
 }
 
-fn runtime_placed_pedal_timings_report(
-    run: &VulkanResidentInProcessPlacedPromptEventRun,
-) -> Vec<RuntimePlacedPedalTimingReport> {
-    let mut timings = Vec::new();
-    for tick in &run.tick_runs {
-        for device_run in &tick.tick_run.placed_run.device_runs {
-            let Some(pedalboard_run) = &device_run.pedalboard_run else {
-                continue;
-            };
-            for pedal_run in &pedalboard_run.pedal_runs {
-                let run_time_ns = pedal_run.run_time_ns();
-                let dispatch_count = pedal_run.dispatch_count();
-                let dispatches = pedal_run
-                    .dispatch_runs
-                    .iter()
-                    .map(|dispatch| RuntimePlacedPedalDispatchTimingReport {
-                        dispatch_index: dispatch.dispatch_index,
-                        kernel_id: dispatch.kernel_id.clone(),
-                        node_id: dispatch.node_id.clone(),
-                        op: dispatch.op.clone(),
-                        reusable_family_id: dispatch.reusable_family_id.clone(),
-                        run_time_ns: dispatch.run_time_ns,
-                    })
-                    .collect::<Vec<_>>();
-                timings.push(RuntimePlacedPedalTimingReport {
-                    stream_tick: tick.stream_tick,
-                    device_id: pedalboard_run.device_id.clone(),
-                    pedal_id: pedal_run.pedal_id.clone(),
-                    dispatch_count,
-                    run_time_ns,
-                    average_dispatch_time_ns: average_nanos(run_time_ns, dispatch_count),
-                    dispatches,
-                });
-            }
-        }
-    }
-    timings
-}
-
-fn runtime_placed_pedal_timing_summaries_report(
-    pedal_timings: &[RuntimePlacedPedalTimingReport],
-) -> Vec<RuntimePlacedPedalTimingSummaryReport> {
-    let mut summaries = BTreeMap::<(String, String), RuntimePlacedPedalTimingSummaryReport>::new();
-    for timing in pedal_timings {
-        let entry = summaries
-            .entry((timing.device_id.clone(), timing.pedal_id.clone()))
-            .or_insert_with(|| RuntimePlacedPedalTimingSummaryReport {
-                device_id: timing.device_id.clone(),
-                pedal_id: timing.pedal_id.clone(),
-                tick_count: 0,
-                dispatch_count: 0,
-                total_run_time_ns: 0,
-                average_tick_time_ns: None,
-                average_dispatch_time_ns: None,
-            });
-        entry.tick_count += 1;
-        entry.dispatch_count += timing.dispatch_count;
-        entry.total_run_time_ns = entry.total_run_time_ns.saturating_add(timing.run_time_ns);
-    }
-
-    let mut summaries = summaries.into_values().collect::<Vec<_>>();
-    for summary in &mut summaries {
-        summary.average_tick_time_ns = average_nanos(summary.total_run_time_ns, summary.tick_count);
-        summary.average_dispatch_time_ns =
-            average_nanos(summary.total_run_time_ns, summary.dispatch_count);
-    }
-    summaries.sort_by(|left, right| {
-        right
-            .total_run_time_ns
-            .cmp(&left.total_run_time_ns)
-            .then_with(|| left.device_id.cmp(&right.device_id))
-            .then_with(|| left.pedal_id.cmp(&right.pedal_id))
-    });
-    summaries
-}
-
 fn tokenizer_options_report(args: &Args) -> RuntimeTokenizerOptionsReport {
     RuntimeTokenizerOptionsReport {
         add_special_tokens: args.add_special_tokens,
         skip_special_tokens: args.skip_special_tokens,
-    }
-}
-
-fn runtime_transport_stats_report(
-    stats: &VulkanPlacedCableTransportStats,
-) -> RuntimePlacedTransportStatsReport {
-    RuntimePlacedTransportStatsReport {
-        pending_packet_count: stats.pending_packet_count,
-        pending_byte_count: stats.pending_byte_count,
-        pending_direct_cable_count: stats.pending_direct_cable_count,
-        pending_direct_byte_count: stats.pending_direct_byte_count,
-        published_packet_count: stats.published_packet_count,
-        published_byte_count: stats.published_byte_count,
-        received_packet_count: stats.received_packet_count,
-        received_byte_count: stats.received_byte_count,
-        direct_copy_count: stats.direct_copy_count,
-        direct_copy_byte_count: stats.direct_copy_byte_count,
-        direct_receive_count: stats.direct_receive_count,
-        direct_receive_byte_count: stats.direct_receive_byte_count,
     }
 }
 

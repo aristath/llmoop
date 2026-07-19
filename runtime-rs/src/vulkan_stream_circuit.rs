@@ -1759,6 +1759,39 @@ pub struct VulkanPlacedCableTransportStats {
     pub direct_receive_byte_count: usize,
 }
 
+impl VulkanPlacedCableTransportStats {
+    fn accumulate(&mut self, tick: &Self) {
+        self.pending_packet_count = tick.pending_packet_count;
+        self.pending_byte_count = tick.pending_byte_count;
+        self.pending_direct_cable_count = tick.pending_direct_cable_count;
+        self.pending_direct_byte_count = tick.pending_direct_byte_count;
+        self.published_packet_count = self
+            .published_packet_count
+            .saturating_add(tick.published_packet_count);
+        self.published_byte_count = self
+            .published_byte_count
+            .saturating_add(tick.published_byte_count);
+        self.received_packet_count = self
+            .received_packet_count
+            .saturating_add(tick.received_packet_count);
+        self.received_byte_count = self
+            .received_byte_count
+            .saturating_add(tick.received_byte_count);
+        self.direct_copy_count = self
+            .direct_copy_count
+            .saturating_add(tick.direct_copy_count);
+        self.direct_copy_byte_count = self
+            .direct_copy_byte_count
+            .saturating_add(tick.direct_copy_byte_count);
+        self.direct_receive_count = self
+            .direct_receive_count
+            .saturating_add(tick.direct_receive_count);
+        self.direct_receive_byte_count = self
+            .direct_receive_byte_count
+            .saturating_add(tick.direct_receive_byte_count);
+    }
+}
+
 #[derive(Default)]
 pub struct VulkanInProcessPlacedCableTransport {
     packets: BTreeMap<VulkanPlacedCablePacketKey, VulkanPlacedCablePacket>,
@@ -8363,36 +8396,34 @@ impl VulkanResidentInProcessPlacedModelPackage {
 
         let mut external_input_index = 0usize;
         let mut pending_feedback: Option<VulkanResidentPendingPrivateFeedback> = None;
-        let mut tick_runs = Vec::new();
+        let mut tick_count = 0usize;
+        let mut scheduler_turn_count = 0usize;
+        let mut completed_stage_count = 0usize;
+        let mut transport_stats = VulkanPlacedCableTransportStats::default();
+        let mut output_source_stream_ticks = Vec::with_capacity(max_new_tokens);
         let mut generated_token_ids = Vec::with_capacity(max_new_tokens);
         let mut remaining_public_outputs = max_new_tokens;
         let mut stop_reason = (max_new_tokens == 0).then(|| "max_new_tokens".to_string());
 
         while external_input_index < prompt_token_ids.len() || pending_feedback.is_some() {
-            let (input_token_id, input_route, input_feedback_depth, input_closes_loop) =
+            let (input_token_id, input_feedback_depth, input_closes_loop) =
                 if external_input_index < prompt_token_ids.len() {
                     let token_id = prompt_token_ids[external_input_index];
                     external_input_index += 1;
-                    (
-                        token_id,
-                        VulkanResidentPromptEventInputRoute::ExternalInput,
-                        0,
-                        false,
-                    )
+                    (token_id, 0, false)
                 } else {
                     let feedback = pending_feedback.take().ok_or(
                         VulkanResidentInProcessPlacedModelPackageError::MissingPrivateFeedback,
                     )?;
                     (
                         feedback.token_id,
-                        VulkanResidentPromptEventInputRoute::PrivateFeedback,
                         feedback.feedback_depth,
                         feedback.closes_loop_after_processing,
                     )
                 };
 
             let stream_tick = start_stream_tick
-                .checked_add(u64::try_from(tick_runs.len()).map_err(|_| {
+                .checked_add(u64::try_from(tick_count).map_err(|_| {
                     VulkanResidentInProcessPlacedModelPackageError::StreamTickOverflow
                 })?)
                 .ok_or(VulkanResidentInProcessPlacedModelPackageError::StreamTickOverflow)?;
@@ -8412,9 +8443,12 @@ impl VulkanResidentInProcessPlacedModelPackage {
                         VulkanResidentPlacedTokenTickTail::None
                     },
                 )?;
-            let mut public_output_token_id = None;
-            let mut private_feedback_token_id = None;
-            let mut private_feedback_closes_loop_after_processing = None;
+            scheduler_turn_count =
+                scheduler_turn_count.saturating_add(tick_run.placed_run.scheduler_turn_count);
+            completed_stage_count =
+                completed_stage_count.saturating_add(tick_run.placed_run.completed_stage_delta);
+            transport_stats.accumulate(&tick_run.placed_run.transport_stats);
+            tick_count = tick_count.saturating_add(1);
 
             if should_emit_public_output {
                 let run = sampler_run.take().ok_or(
@@ -8422,7 +8456,7 @@ impl VulkanResidentInProcessPlacedModelPackage {
                 )?;
                 let sampled_token_id = run.token_id;
                 generated_token_ids.push(sampled_token_id);
-                public_output_token_id = Some(sampled_token_id);
+                output_source_stream_ticks.push(stream_tick);
                 remaining_public_outputs -= 1;
 
                 let close_after_feedback = if stop_token_ids.contains(&sampled_token_id) {
@@ -8435,8 +8469,6 @@ impl VulkanResidentInProcessPlacedModelPackage {
                 } else {
                     false
                 };
-                private_feedback_token_id = Some(sampled_token_id);
-                private_feedback_closes_loop_after_processing = Some(close_after_feedback);
                 pending_feedback = Some(VulkanResidentPendingPrivateFeedback {
                     token_id: sampled_token_id,
                     feedback_depth: input_feedback_depth.checked_add(1).ok_or(
@@ -8444,21 +8476,7 @@ impl VulkanResidentInProcessPlacedModelPackage {
                     )?,
                     closes_loop_after_processing: close_after_feedback,
                 });
-                sampler_run = Some(run);
             }
-
-            tick_runs.push(VulkanResidentInProcessPlacedPromptEventTickRun {
-                stream_tick,
-                input_token_id,
-                input_route,
-                input_feedback_depth,
-                input_closes_loop_after_processing: input_closes_loop,
-                public_output_token_id,
-                private_feedback_token_id,
-                private_feedback_closes_loop_after_processing,
-                tick_run,
-                sampler_run,
-            });
 
             if input_closes_loop {
                 pending_feedback = None;
@@ -8478,7 +8496,11 @@ impl VulkanResidentInProcessPlacedModelPackage {
             generated_token_ids,
             output_token_ids,
             stop_reason: stop_reason.unwrap_or_else(|| "max_new_tokens".to_string()),
-            tick_runs,
+            tick_count,
+            scheduler_turn_count,
+            completed_stage_count,
+            transport_stats,
+            output_source_stream_ticks,
         })
     }
 
@@ -8554,36 +8576,34 @@ impl VulkanResidentInProcessPlacedModelPackage {
 
         let mut external_input_index = 0usize;
         let mut pending_feedback: Option<VulkanResidentPendingPrivateFeedback> = None;
-        let mut tick_runs = Vec::new();
+        let mut tick_count = 0usize;
+        let mut scheduler_turn_count = 0usize;
+        let mut completed_stage_count = 0usize;
+        let mut transport_stats = VulkanPlacedCableTransportStats::default();
+        let mut output_source_stream_ticks = Vec::with_capacity(max_new_tokens);
         let mut generated_token_ids = Vec::with_capacity(max_new_tokens);
         let mut remaining_public_outputs = max_new_tokens;
         let mut stop_reason = (max_new_tokens == 0).then(|| "max_new_tokens".to_string());
 
         while external_input_index < prompt_token_ids.len() || pending_feedback.is_some() {
-            let (input_token_id, input_route, input_feedback_depth, input_closes_loop) =
+            let (input_token_id, input_feedback_depth, input_closes_loop) =
                 if external_input_index < prompt_token_ids.len() {
                     let token_id = prompt_token_ids[external_input_index];
                     external_input_index += 1;
-                    (
-                        token_id,
-                        VulkanResidentPromptEventInputRoute::ExternalInput,
-                        0,
-                        false,
-                    )
+                    (token_id, 0, false)
                 } else {
                     let feedback = pending_feedback.take().ok_or(
                         VulkanResidentInProcessPlacedModelPackageError::MissingPrivateFeedback,
                     )?;
                     (
                         feedback.token_id,
-                        VulkanResidentPromptEventInputRoute::PrivateFeedback,
                         feedback.feedback_depth,
                         feedback.closes_loop_after_processing,
                     )
                 };
 
             let stream_tick = start_stream_tick
-                .checked_add(u64::try_from(tick_runs.len()).map_err(|_| {
+                .checked_add(u64::try_from(tick_count).map_err(|_| {
                     VulkanResidentInProcessPlacedModelPackageError::StreamTickOverflow
                 })?)
                 .ok_or(VulkanResidentInProcessPlacedModelPackageError::StreamTickOverflow)?;
@@ -8603,9 +8623,12 @@ impl VulkanResidentInProcessPlacedModelPackage {
                         VulkanResidentPlacedTokenTickTail::None
                     },
                 )?;
-            let mut public_output_token_id = None;
-            let mut private_feedback_token_id = None;
-            let mut private_feedback_closes_loop_after_processing = None;
+            scheduler_turn_count =
+                scheduler_turn_count.saturating_add(tick_run.placed_run.scheduler_turn_count);
+            completed_stage_count =
+                completed_stage_count.saturating_add(tick_run.placed_run.completed_stage_delta);
+            transport_stats.accumulate(&tick_run.placed_run.transport_stats);
+            tick_count = tick_count.saturating_add(1);
 
             if should_emit_public_output {
                 let run = sampler_run.take().ok_or(
@@ -8614,7 +8637,7 @@ impl VulkanResidentInProcessPlacedModelPackage {
                 let sampled_token_id = run.token_id;
                 generated_token_ids.push(sampled_token_id);
                 on_output_token(sampled_token_id);
-                public_output_token_id = Some(sampled_token_id);
+                output_source_stream_ticks.push(stream_tick);
                 remaining_public_outputs -= 1;
 
                 let close_after_feedback = if stop_token_ids.contains(&sampled_token_id) {
@@ -8627,8 +8650,6 @@ impl VulkanResidentInProcessPlacedModelPackage {
                 } else {
                     false
                 };
-                private_feedback_token_id = Some(sampled_token_id);
-                private_feedback_closes_loop_after_processing = Some(close_after_feedback);
                 pending_feedback = Some(VulkanResidentPendingPrivateFeedback {
                     token_id: sampled_token_id,
                     feedback_depth: input_feedback_depth.checked_add(1).ok_or(
@@ -8636,21 +8657,7 @@ impl VulkanResidentInProcessPlacedModelPackage {
                     )?,
                     closes_loop_after_processing: close_after_feedback,
                 });
-                sampler_run = Some(run);
             }
-
-            tick_runs.push(VulkanResidentInProcessPlacedPromptEventTickRun {
-                stream_tick,
-                input_token_id,
-                input_route,
-                input_feedback_depth,
-                input_closes_loop_after_processing: input_closes_loop,
-                public_output_token_id,
-                private_feedback_token_id,
-                private_feedback_closes_loop_after_processing,
-                tick_run,
-                sampler_run,
-            });
 
             if input_closes_loop {
                 pending_feedback = None;
@@ -8670,7 +8677,11 @@ impl VulkanResidentInProcessPlacedModelPackage {
             generated_token_ids,
             output_token_ids,
             stop_reason: stop_reason.unwrap_or_else(|| "max_new_tokens".to_string()),
-            tick_runs,
+            tick_count,
+            scheduler_turn_count,
+            completed_stage_count,
+            transport_stats,
+            output_source_stream_ticks,
         })
     }
 }
@@ -8717,7 +8728,11 @@ pub struct VulkanResidentInProcessPlacedPromptEventRun {
     pub generated_token_ids: Vec<u32>,
     pub output_token_ids: Vec<u32>,
     pub stop_reason: String,
-    pub tick_runs: Vec<VulkanResidentInProcessPlacedPromptEventTickRun>,
+    pub tick_count: usize,
+    pub scheduler_turn_count: usize,
+    pub completed_stage_count: usize,
+    pub transport_stats: VulkanPlacedCableTransportStats,
+    pub output_source_stream_ticks: Vec<u64>,
 }
 
 pub struct VulkanResidentInProcessPlacedPromptSession {
@@ -8836,7 +8851,7 @@ impl VulkanResidentInProcessPlacedPromptSession {
         VulkanResidentInProcessPlacedPromptSessionRun,
         VulkanResidentInProcessPlacedModelPackageError,
     > {
-        let tick_count = run.tick_runs.len();
+        let tick_count = run.tick_count;
         let tick_delta = u64::try_from(tick_count)
             .map_err(|_| VulkanResidentInProcessPlacedModelPackageError::StreamTickOverflow)?;
         let next_stream_tick = start_stream_tick
@@ -9146,17 +9161,18 @@ fn placed_prompt_stream_output_events_for(
 ) -> Vec<VulkanResidentTokenOutputEvent> {
     session_run
         .run
-        .tick_runs
+        .generated_token_ids
         .iter()
-        .filter_map(|tick| tick.public_output_token_id.map(|token_id| (tick, token_id)))
+        .copied()
+        .zip(session_run.run.output_source_stream_ticks.iter().copied())
         .enumerate()
         .map(
-            |(output_index, (tick, token_id))| VulkanResidentTokenOutputEvent {
+            |(output_index, (token_id, source_stream_tick))| VulkanResidentTokenOutputEvent {
                 id: format!("{}.{}", event.id, output_index),
                 input_event_id: event.id.clone(),
                 output_index,
                 token_id,
-                source_stream_tick: tick.stream_tick,
+                source_stream_tick,
             },
         )
         .collect()
@@ -9566,20 +9582,6 @@ fn placed_prompt_engine_stream_snapshot(
         completed_prompt_event_count: stream.completed_prompt_event_count(),
         idle: stream.is_idle(),
     }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct VulkanResidentInProcessPlacedPromptEventTickRun {
-    pub stream_tick: u64,
-    pub input_token_id: u32,
-    pub input_route: VulkanResidentPromptEventInputRoute,
-    pub input_feedback_depth: u32,
-    pub input_closes_loop_after_processing: bool,
-    pub public_output_token_id: Option<u32>,
-    pub private_feedback_token_id: Option<u32>,
-    pub private_feedback_closes_loop_after_processing: Option<bool>,
-    pub tick_run: VulkanResidentInProcessPlacedSingleTokenTickRun,
-    pub sampler_run: Option<VulkanResidentSamplerRun>,
 }
 
 impl VulkanResidentInProcessPlacedModelPackageDevice {
@@ -11418,6 +11420,7 @@ impl VulkanMountedPlacedResidentDispatchSegmentRunner {
         control: VulkanMountedPlacedStreamControl,
         prefix_dispatches: &[&VulkanResidentKernelDispatch],
         suffix_dispatches: &[&VulkanResidentKernelDispatch],
+        capture_execution_trace: bool,
     ) -> Result<
         Vec<VulkanMountedPlacedResidentPedalRun>,
         VulkanMountedPlacedResidentKernelDispatchError,
@@ -11452,14 +11455,17 @@ impl VulkanMountedPlacedResidentDispatchSegmentRunner {
                 .iter()
                 .map(|dispatch| VulkanResidentKernelSequenceStep::new(dispatch, &[])),
         );
-        let execution_start = Instant::now();
+        let execution_start = capture_execution_trace.then(Instant::now);
         device
             .run_resident_kernel_sequence(&self.sequence, &steps)
             .map_err(VulkanMountedPlacedResidentKernelDispatchError::Vulkan)?;
-        let execution_time_ns =
-            u64::try_from(execution_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
-
-        Ok(self.completed_pedal_runs(execution_time_ns))
+        Ok(execution_start
+            .map(|start| {
+                let execution_time_ns =
+                    u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                self.completed_pedal_runs(execution_time_ns)
+            })
+            .unwrap_or_default())
     }
 
     fn completed_pedal_runs(
@@ -14123,14 +14129,14 @@ impl VulkanMountedPlacedStreamTickPlan {
     ) -> Result<VulkanMountedPlacedResidentStreamTickRun, VulkanMountedPlacedResidentStreamTickError>
     {
         let mut cursor = self.resident_stream_tick_cursor(stream_tick);
-        let advance = cursor.advance_with_resident_pedals_and_in_process_transport(
+        cursor.advance_with_resident_pedals_and_in_process_transport(
             device,
             mounted,
             mounted_bound_plan,
             loaded_manifest,
             transport,
         )?;
-        Ok(advance.run)
+        Ok(cursor.snapshot())
     }
 
     pub fn resident_stream_tick_cursor(
@@ -14138,6 +14144,13 @@ impl VulkanMountedPlacedStreamTickPlan {
         stream_tick: u64,
     ) -> VulkanMountedPlacedResidentStreamTickCursor {
         VulkanMountedPlacedResidentStreamTickCursor::new(self.clone(), stream_tick)
+    }
+
+    pub fn compact_resident_stream_tick_cursor(
+        &self,
+        stream_tick: u64,
+    ) -> VulkanMountedPlacedResidentStreamTickCursor {
+        VulkanMountedPlacedResidentStreamTickCursor::new_compact(self.clone(), stream_tick)
     }
 }
 
@@ -14148,17 +14161,31 @@ pub struct VulkanMountedPlacedResidentStreamTickCursor {
     pub next_stage_index: usize,
     pub completed_stage_count: usize,
     pub pedal_runs: Vec<VulkanMountedPlacedResidentPedalRun>,
+    capture_execution_trace: bool,
     last_blocked: Option<(usize, VulkanMountedPlacedStreamTickBlockReason)>,
 }
 
 impl VulkanMountedPlacedResidentStreamTickCursor {
     pub fn new(tick_plan: VulkanMountedPlacedStreamTickPlan, stream_tick: u64) -> Self {
+        Self::new_with_trace(tick_plan, stream_tick, true)
+    }
+
+    pub fn new_compact(tick_plan: VulkanMountedPlacedStreamTickPlan, stream_tick: u64) -> Self {
+        Self::new_with_trace(tick_plan, stream_tick, false)
+    }
+
+    fn new_with_trace(
+        tick_plan: VulkanMountedPlacedStreamTickPlan,
+        stream_tick: u64,
+        capture_execution_trace: bool,
+    ) -> Self {
         Self {
             tick_plan,
             stream_tick,
             next_stage_index: 0,
             completed_stage_count: 0,
             pedal_runs: Vec::new(),
+            capture_execution_trace,
             last_blocked: None,
         }
     }
@@ -14287,6 +14314,7 @@ impl VulkanMountedPlacedResidentStreamTickCursor {
                                 } else {
                                     &[]
                                 },
+                                self.capture_execution_trace,
                             )
                             .map_err(VulkanMountedPlacedResidentStreamTickError::Dispatch)?,
                     );
@@ -14318,42 +14346,41 @@ impl VulkanMountedPlacedResidentStreamTickCursor {
         VulkanMountedPlacedResidentStreamTickCursorAdvance {
             completed_stage_delta: self.completed_stage_count - completed_before,
             completed: self.is_completed(),
-            run: self.snapshot(),
         }
     }
 
     pub fn snapshot(&self) -> VulkanMountedPlacedResidentStreamTickRun {
-        let mut stages = Vec::with_capacity(self.tick_plan.stages.len());
-        for (index, stage) in self.tick_plan.stages.iter().enumerate() {
-            let status = if index < self.next_stage_index {
-                VulkanMountedPlacedStreamTickStageStatus::Completed
-            } else if self
-                .last_blocked
-                .as_ref()
-                .is_some_and(|(stage_index, _)| *stage_index == index)
-            {
-                VulkanMountedPlacedStreamTickStageStatus::Blocked {
-                    reason: self.last_blocked.as_ref().unwrap().1.clone(),
-                }
-            } else {
-                VulkanMountedPlacedStreamTickStageStatus::Pending
-            };
-            stages.push(VulkanMountedPlacedStreamTickStageRun {
-                stage_index: stage.stage_index(),
-                stage: stage.clone(),
-                status,
-            });
-        }
-
-        let pending_stage_count = stages
-            .iter()
-            .filter(|stage| {
-                matches!(
-                    stage.status,
+        let stages = if self.capture_execution_trace {
+            let mut stages = Vec::with_capacity(self.tick_plan.stages.len());
+            for (index, stage) in self.tick_plan.stages.iter().enumerate() {
+                let status = if index < self.next_stage_index {
+                    VulkanMountedPlacedStreamTickStageStatus::Completed
+                } else if self
+                    .last_blocked
+                    .as_ref()
+                    .is_some_and(|(stage_index, _)| *stage_index == index)
+                {
+                    VulkanMountedPlacedStreamTickStageStatus::Blocked {
+                        reason: self.last_blocked.as_ref().unwrap().1.clone(),
+                    }
+                } else {
                     VulkanMountedPlacedStreamTickStageStatus::Pending
-                )
-            })
-            .count();
+                };
+                stages.push(VulkanMountedPlacedStreamTickStageRun {
+                    stage_index: stage.stage_index(),
+                    stage: stage.clone(),
+                    status,
+                });
+            }
+            stages
+        } else {
+            Vec::new()
+        };
+        let blocked_stage_count = usize::from(self.last_blocked.is_some());
+        let pending_stage_count = self.tick_plan.stage_count.saturating_sub(
+            self.completed_stage_count
+                .saturating_add(blocked_stage_count),
+        );
         let status = self
             .last_blocked
             .clone()
@@ -14389,7 +14416,7 @@ impl VulkanMountedPlacedResidentStreamTickCursor {
                 status,
                 can_execute: true,
             },
-            pedalboard_run: if self.pedal_runs.is_empty() {
+            pedalboard_run: if !self.capture_execution_trace || self.pedal_runs.is_empty() {
                 None
             } else {
                 Some(VulkanMountedPlacedResidentPedalboardRun {
@@ -14405,7 +14432,6 @@ impl VulkanMountedPlacedResidentStreamTickCursor {
 pub struct VulkanMountedPlacedResidentStreamTickCursorAdvance {
     pub completed_stage_delta: usize,
     pub completed: bool,
-    pub run: VulkanMountedPlacedResidentStreamTickRun,
 }
 
 #[derive(Default)]
@@ -14429,13 +14455,15 @@ impl<'a> VulkanMountedPlacedResidentInProcessStreamTickSlice<'a> {
         execution_plan: &'a VulkanMountedPlacedResidentStreamTickExecutionPlan,
         stream_tick: u64,
     ) -> Self {
-        Self::new_with_dispatch_extensions(
+        Self {
             device,
             mounted,
             execution_plan,
-            VulkanMountedPlacedResidentStreamTickDispatchExtensions::default(),
-            stream_tick,
-        )
+            dispatch_extensions: VulkanMountedPlacedResidentStreamTickDispatchExtensions::default(),
+            cursor: execution_plan
+                .tick_plan
+                .resident_stream_tick_cursor(stream_tick),
+        }
     }
 
     pub fn new_with_dispatch_extensions(
@@ -14452,7 +14480,7 @@ impl<'a> VulkanMountedPlacedResidentInProcessStreamTickSlice<'a> {
             dispatch_extensions,
             cursor: execution_plan
                 .tick_plan
-                .resident_stream_tick_cursor(stream_tick),
+                .compact_resident_stream_tick_cursor(stream_tick),
         }
     }
 
@@ -14637,7 +14665,14 @@ fn in_process_stream_tick_run_snapshot(
         completed_slice_count,
         pending_slice_count: slices.len() - completed_slice_count,
         transport_stats: transport.stats(),
-        device_runs: slices.iter().map(|slice| slice.cursor.snapshot()).collect(),
+        device_runs: if slices
+            .iter()
+            .any(|slice| slice.cursor.capture_execution_trace)
+        {
+            slices.iter().map(|slice| slice.cursor.snapshot()).collect()
+        } else {
+            Vec::new()
+        },
     }
 }
 
@@ -24295,7 +24330,8 @@ mod tests {
                 &mut transport,
             )
             .unwrap();
-        let blocked_stage_index = match &gpu0_prefix.run.tick_run.status {
+        let gpu0_prefix_run = gpu0_cursor.snapshot();
+        let blocked_stage_index = match &gpu0_prefix_run.tick_run.status {
             VulkanMountedPlacedStreamTickRunStatus::Blocked {
                 stage_index,
                 reason,
@@ -24309,9 +24345,9 @@ mod tests {
             ref status => panic!("expected gpu0 prefix to block on remote return, got {status:?}"),
         };
         assert_eq!(gpu0_prefix.completed_stage_delta, 27);
-        assert_eq!(gpu0_prefix.run.pedalboard_dispatch_count(), 26);
+        assert_eq!(gpu0_prefix_run.pedalboard_dispatch_count(), 26);
         assert!(matches!(
-            gpu0_prefix.run.tick_run.stages[blocked_stage_index].stage,
+            gpu0_prefix_run.tick_run.stages[blocked_stage_index].stage,
             VulkanMountedPlacedStreamTickStage::ReceiveCable {
                 cable_index: 2,
                 ref remote_device_id,
@@ -24335,8 +24371,9 @@ mod tests {
                 &mut transport,
             )
             .unwrap();
+        let gpu1_remote_run = gpu1_cursor.snapshot();
         assert!(gpu1_remote.completed);
-        assert_eq!(gpu1_remote.run.pedalboard_dispatch_count(), 16);
+        assert_eq!(gpu1_remote_run.pedalboard_dispatch_count(), 16);
         assert_eq!(transport.packet_count(), 1);
         assert!(transport.contains_packet(&VulkanPlacedCablePacketKey {
             cable_index: 2,
@@ -24353,13 +24390,14 @@ mod tests {
                 &mut transport,
             )
             .unwrap();
+        let gpu0_suffix_run = gpu0_cursor.snapshot();
         assert!(gpu0_suffix.completed);
         assert_eq!(
-            gpu0_suffix.run.tick_run.status,
+            gpu0_suffix_run.tick_run.status,
             VulkanMountedPlacedStreamTickRunStatus::Completed
         );
-        assert_eq!(gpu0_suffix.run.tick_run.completed_stage_count, 186);
-        assert_eq!(gpu0_suffix.run.pedalboard_dispatch_count(), 184);
+        assert_eq!(gpu0_suffix_run.tick_run.completed_stage_count, 186);
+        assert_eq!(gpu0_suffix_run.pedalboard_dispatch_count(), 184);
         assert_eq!(transport.packet_count(), 0);
         assert_eq!(
             gpu0_cursor
@@ -24758,60 +24796,16 @@ mod tests {
             vec![1, 36_309, run.generated_token_ids[0]]
         );
         assert_eq!(run.stop_reason, "max_new_tokens");
-        assert_eq!(run.tick_runs.len(), 3);
-
-        assert_eq!(run.tick_runs[0].stream_tick, 0);
-        assert_eq!(run.tick_runs[0].input_token_id, 1);
-        assert_eq!(
-            run.tick_runs[0].input_route,
-            VulkanResidentPromptEventInputRoute::ExternalInput
-        );
-        assert_eq!(run.tick_runs[0].public_output_token_id, None);
-        assert!(run.tick_runs[0].sampler_run.is_none());
-        assert!(run.tick_runs[0].tick_run.output_run.is_none());
-
-        assert_eq!(run.tick_runs[1].stream_tick, 1);
-        assert_eq!(run.tick_runs[1].input_token_id, 36_309);
-        assert_eq!(
-            run.tick_runs[1].input_route,
-            VulkanResidentPromptEventInputRoute::ExternalInput
-        );
-        assert_eq!(
-            run.tick_runs[1].public_output_token_id,
-            Some(run.generated_token_ids[0])
-        );
-        assert_eq!(
-            run.tick_runs[1].private_feedback_token_id,
-            Some(run.generated_token_ids[0])
-        );
-        assert_eq!(
-            run.tick_runs[1].private_feedback_closes_loop_after_processing,
-            Some(true)
-        );
-        assert_eq!(
-            run.tick_runs[1].sampler_run.as_ref().unwrap().token_id,
-            run.generated_token_ids[0]
-        );
-        assert!(run.tick_runs[1].tick_run.output_run.is_some());
-
-        assert_eq!(run.tick_runs[2].stream_tick, 2);
-        assert_eq!(run.tick_runs[2].input_token_id, run.generated_token_ids[0]);
-        assert_eq!(
-            run.tick_runs[2].input_route,
-            VulkanResidentPromptEventInputRoute::PrivateFeedback
-        );
-        assert_eq!(run.tick_runs[2].input_feedback_depth, 1);
-        assert!(run.tick_runs[2].input_closes_loop_after_processing);
-        assert_eq!(run.tick_runs[2].public_output_token_id, None);
-        assert!(run.tick_runs[2].sampler_run.is_none());
-        assert!(run.tick_runs[2].tick_run.output_run.is_none());
-        assert_eq!(
-            run.tick_runs
-                .iter()
-                .map(|tick| tick.tick_run.placed_run.completed_stage_delta)
-                .collect::<Vec<_>>(),
-            vec![204, 204, 204]
-        );
+        assert_eq!(run.tick_count, 3);
+        assert_eq!(run.scheduler_turn_count, 6);
+        assert_eq!(run.completed_stage_count, 612);
+        assert_eq!(run.output_source_stream_ticks, vec![1]);
+        assert_eq!(run.transport_stats.pending_packet_count, 0);
+        assert_eq!(run.transport_stats.pending_direct_cable_count, 0);
+        assert_eq!(run.transport_stats.direct_copy_count, 6);
+        assert_eq!(run.transport_stats.direct_copy_byte_count, 12_288);
+        assert_eq!(run.transport_stats.direct_receive_count, 6);
+        assert_eq!(run.transport_stats.direct_receive_byte_count, 12_288);
     }
 
     #[test]
@@ -24843,15 +24837,7 @@ mod tests {
         assert_eq!(first.start_stream_tick, 0);
         assert_eq!(first.tick_count, 2);
         assert_eq!(first.next_stream_tick, 2);
-        assert_eq!(
-            first
-                .run
-                .tick_runs
-                .iter()
-                .map(|tick| tick.stream_tick)
-                .collect::<Vec<_>>(),
-            vec![0, 1]
-        );
+        assert_eq!(first.run.output_source_stream_ticks, vec![0]);
         assert_eq!(session.next_stream_tick, 2);
         assert_eq!(session.completed_prompt_event_count, 1);
         assert_eq!(session.transport_stats().pending_packet_count, 0);
@@ -24863,15 +24849,7 @@ mod tests {
         assert_eq!(second.start_stream_tick, 2);
         assert_eq!(second.tick_count, 2);
         assert_eq!(second.next_stream_tick, 4);
-        assert_eq!(
-            second
-                .run
-                .tick_runs
-                .iter()
-                .map(|tick| tick.stream_tick)
-                .collect::<Vec<_>>(),
-            vec![2, 3]
-        );
+        assert_eq!(second.run.output_source_stream_ticks, vec![2]);
         assert_eq!(session.next_stream_tick, 4);
         assert_eq!(session.completed_prompt_event_count, 2);
         assert_eq!(session.generated_token_count, 2);
@@ -24928,15 +24906,7 @@ mod tests {
         assert_eq!(second.next_stream_tick, 4);
         assert_eq!(stream.next_stream_tick(), 4);
         assert_eq!(stream.completed_prompt_event_count(), 2);
-        assert_eq!(
-            second
-                .run
-                .tick_runs
-                .iter()
-                .map(|tick| tick.stream_tick)
-                .collect::<Vec<_>>(),
-            vec![2, 3]
-        );
+        assert_eq!(second.run.output_source_stream_ticks, vec![2]);
     }
 
     #[test]
