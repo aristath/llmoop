@@ -1022,7 +1022,7 @@ fn infer_node_output_shapes(
                 });
             Ok(repeat_shape(output_shape, outputs))
         }
-        "multiply_rolling_depthwise" => {
+        "multiply_rolling_depthwise" | "multiply_rolling_depthwise_gate" => {
             let output_shape = node
                 .attrs
                 .get("depthwise")

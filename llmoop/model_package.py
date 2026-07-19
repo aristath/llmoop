@@ -275,6 +275,11 @@ def build_vulkan_resident_package_manifest(
                     circuit, multiply, rolling, depthwise, tensor_index
                 )
             ),
+            can_fuse_recurrent_output_gate=lambda recurrent, gate, circuit=circuit: (
+                can_fuse_bf16_recurrent_output_gate(
+                    circuit, recurrent, gate, tensor_index
+                )
+            ),
         )
     pedal_executions = pedal_execution_specs(
         lowered_index=lowered_index,
@@ -751,9 +756,10 @@ def shader_file_for_node(
         temporal_memory = state_port(circuit, "temporal_memory")
         frames, state_hidden = temporal_memory["shape"]
         return f"depthwise_conv1d_bf16_{frames}x{state_hidden}.comp"
-    if op == "multiply_rolling_depthwise":
+    if op in {"multiply_rolling_depthwise", "multiply_rolling_depthwise_gate"}:
+        expected_input_count = 4 if op.endswith("_gate") else 3
         if (
-            len(node.get("inputs", [])) != 3
+            len(node.get("inputs", [])) != expected_input_count
             or len(node.get("outputs", [])) != 1
             or len(node.get("params", [])) != 1
             or len(node.get("state_reads", [])) != 1
@@ -780,7 +786,12 @@ def shader_file_for_node(
                 f"fused recurrent convolution node {node['id']!r} has incompatible "
                 f"state {temporal_memory.get('shape')} or kernel {kernel_shape}"
             )
-        return f"multiply_rolling_depthwise_bf16_{frames}x{state_hidden}.comp"
+        shader_prefix = (
+            "multiply_rolling_depthwise_gate"
+            if op.endswith("_gate")
+            else "multiply_rolling_depthwise"
+        )
+        return f"{shader_prefix}_bf16_{frames}x{state_hidden}.comp"
     if op == "residual_add":
         return f"add_bf16_{hidden_size}.comp"
     if op == "scaled_residual_add":
@@ -1209,6 +1220,53 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
             },
         )
 
+    recurrent_depthwise = re.fullmatch(
+        r"multiply_rolling_depthwise(_gate)?_bf16_(\d+)x(\d+)\.comp",
+        shader_file,
+    )
+    if recurrent_depthwise is not None:
+        has_output_gate = recurrent_depthwise.group(1) is not None
+        output_gate_binding = (
+            "layout(set = 0, binding = 3) readonly buffer OutputGate {\n"
+            "    uint words[];\n"
+            "} output_gate;"
+            if has_output_gate
+            else ""
+        )
+        finalize_output = (
+            "uint finalize_output(uint word_index, uint conv_pair) {\n"
+            "    uint gate_pair = output_gate.words[word_index];\n"
+            "    uint lo = f32_to_bf16(\n"
+            "        bf16_to_f32(conv_pair) * bf16_to_f32(gate_pair)\n"
+            "    );\n"
+            "    uint hi = f32_to_bf16(\n"
+            "        bf16_to_f32(conv_pair >> 16) * bf16_to_f32(gate_pair >> 16)\n"
+            "    );\n"
+            "    return (hi << 16) | lo;\n"
+            "}"
+            if has_output_gate
+            else (
+                "uint finalize_output(uint word_index, uint conv_pair) {\n"
+                "    return conv_pair;\n"
+                "}"
+            )
+        )
+        binding_offset = 1 if has_output_gate else 0
+        return render_shader_template(
+            source_dir,
+            "multiply_rolling_depthwise_bf16.comp.template",
+            {
+                "OUTPUT_GATE_BINDING": output_gate_binding,
+                "OUTPUT_BINDING": str(3 + binding_offset),
+                "KERNEL_BINDING": str(4 + binding_offset),
+                "STATE_READ_BINDING": str(5 + binding_offset),
+                "STATE_WRITE_BINDING": str(6 + binding_offset),
+                "FRAME_COUNT": recurrent_depthwise.group(2),
+                "HIDDEN_SIZE": recurrent_depthwise.group(3),
+                "FINALIZE_OUTPUT_FUNCTION": finalize_output,
+            },
+        )
+
     shaped_templates = (
         (
             r"linear_int4_ct_g(\d+)_(\d+)x(\d+)\.comp",
@@ -1407,11 +1465,6 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
             r"causal_conv1d_silu_bf16_c(\d+)_k(\d+)\.comp",
             "causal_conv1d_silu_bf16.comp.template",
             ("CHANNELS", "KERNEL_WIDTH"),
-        ),
-        (
-            r"multiply_rolling_depthwise_bf16_(\d+)x(\d+)\.comp",
-            "multiply_rolling_depthwise_bf16.comp.template",
-            ("FRAME_COUNT", "HIDDEN_SIZE"),
         ),
         (
             r"scaled_add_bf16_(\d+)_scale([0-9eE+.-]+)\.comp",
@@ -2329,6 +2382,39 @@ def can_fuse_bf16_multiply_rolling_depthwise(
         and kernel_shape in ([hidden_size, frames], [hidden_size, 1, frames])
         and parameter_dtype_for_node(circuit, depthwise, tensor_index) == "BF16"
         and parameter_layout_for_node(circuit, depthwise, tensor_index)
+        == ROW_MAJOR_LAYOUT
+    )
+
+
+def can_fuse_bf16_recurrent_output_gate(
+    circuit: Json,
+    recurrent: Json,
+    gate: Json,
+    tensor_index: Json,
+) -> bool:
+    if (
+        recurrent.get("op") != "multiply_rolling_depthwise"
+        or gate.get("op") != "multiply"
+        or len(recurrent.get("state_reads", [])) != 1
+        or recurrent.get("state_reads") != recurrent.get("state_writes")
+        or len(recurrent.get("params", [])) != 1
+    ):
+        return False
+    temporal_memory = state_port(circuit, recurrent["state_reads"][0])
+    state_shape = list(map(int, temporal_memory.get("shape", [])))
+    if len(state_shape) != 2:
+        return False
+    frames, hidden_size = state_shape
+    kernel_shape = parameter_shape_for_node(circuit, recurrent, tensor_index)
+    return (
+        temporal_memory.get("dtype") == "BF16"
+        and temporal_memory.get("update") == "shift_append"
+        and frames >= 2
+        and hidden_size > 0
+        and hidden_size % 2 == 0
+        and kernel_shape in ([hidden_size, frames], [hidden_size, 1, frames])
+        and parameter_dtype_for_node(circuit, recurrent, tensor_index) == "BF16"
+        and parameter_layout_for_node(circuit, recurrent, tensor_index)
         == ROW_MAJOR_LAYOUT
     )
 

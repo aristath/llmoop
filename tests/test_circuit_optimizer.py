@@ -6,6 +6,84 @@ from llmoop.circuit_optimizer import optimize_circuit_for_vulkan
 
 
 class VulkanCircuitOptimizerTest(unittest.TestCase):
+    def test_fuses_recurrent_depthwise_result_into_output_gate(self) -> None:
+        circuit = {
+            "nodes": [
+                {
+                    "id": "recurrent",
+                    "op": "multiply_rolling_depthwise",
+                    "inputs": ["gate_b", "projected", "memory"],
+                    "outputs": ["conv_out"],
+                    "params": ["kernel"],
+                    "state_reads": ["memory"],
+                    "state_writes": ["memory"],
+                    "attrs": {"compiled_from": ["multiply", "shift", "conv"]},
+                },
+                {
+                    "id": "output_gate",
+                    "op": "multiply",
+                    "inputs": ["gate_c", "conv_out"],
+                    "outputs": ["gated_conv"],
+                },
+            ]
+        }
+
+        optimized = optimize_circuit_for_vulkan(
+            circuit,
+            can_fuse_recurrent_output_gate=lambda recurrent, gate: (
+                recurrent["outputs"][0] in gate["inputs"]
+            ),
+        )
+
+        self.assertEqual(1, len(optimized["nodes"]))
+        fused = optimized["nodes"][0]
+        self.assertEqual("multiply_rolling_depthwise_gate", fused["op"])
+        self.assertEqual(
+            ["gate_b", "projected", "memory", "gate_c"], fused["inputs"]
+        )
+        self.assertEqual(["gated_conv"], fused["outputs"])
+        self.assertEqual(["kernel"], fused["params"])
+        self.assertEqual(["memory"], fused["state_reads"])
+        self.assertEqual("BF16", fused["attrs"]["output_gate_rounding"])
+        self.assertEqual(
+            ["multiply", "shift", "conv", "output_gate"],
+            fused["attrs"]["compiled_from"],
+        )
+
+    def test_does_not_fuse_shared_recurrent_output_into_gate(self) -> None:
+        circuit = {
+            "nodes": [
+                {
+                    "id": "recurrent",
+                    "op": "multiply_rolling_depthwise",
+                    "inputs": ["gate_b", "projected", "memory"],
+                    "outputs": ["conv_out"],
+                    "params": ["kernel"],
+                    "state_reads": ["memory"],
+                    "state_writes": ["memory"],
+                },
+                {
+                    "id": "output_gate",
+                    "op": "multiply",
+                    "inputs": ["gate_c", "conv_out"],
+                    "outputs": ["gated_conv"],
+                },
+                {
+                    "id": "extra",
+                    "op": "silu",
+                    "inputs": ["conv_out"],
+                    "outputs": ["extra_out"],
+                },
+            ]
+        }
+
+        optimized = optimize_circuit_for_vulkan(
+            circuit,
+            can_fuse_recurrent_output_gate=lambda _recurrent, _gate: True,
+        )
+
+        self.assertEqual(circuit, optimized)
+
     def test_fuses_multiply_rolling_state_and_depthwise_convolution(self) -> None:
         circuit = {
             "nodes": [

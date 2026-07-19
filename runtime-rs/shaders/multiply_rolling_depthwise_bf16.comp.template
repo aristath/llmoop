@@ -14,19 +14,21 @@ layout(set = 0, binding = 2) readonly buffer InputState {
     uint words[];
 } input_state;
 
-layout(set = 0, binding = 3) buffer ConvOutput {
+{{OUTPUT_GATE_BINDING}}
+
+layout(set = 0, binding = {{OUTPUT_BINDING}}) buffer ConvOutput {
     uint words[];
 } conv_output;
 
-layout(set = 0, binding = 4) readonly buffer ConvKernel {
+layout(set = 0, binding = {{KERNEL_BINDING}}) readonly buffer ConvKernel {
     uint words[];
 } conv_kernel;
 
-layout(set = 0, binding = 5) readonly buffer StateRead {
+layout(set = 0, binding = {{STATE_READ_BINDING}}) readonly buffer StateRead {
     uint words[];
 } state_read;
 
-layout(set = 0, binding = 6) buffer StateWrite {
+layout(set = 0, binding = {{STATE_WRITE_BINDING}}) buffer StateWrite {
     uint words[];
 } state_write;
 
@@ -57,6 +59,8 @@ uint multiply_pair(uint left, uint right) {
     );
     return (hi << 16) | lo;
 }
+
+{{FINALIZE_OUTPUT_FUNCTION}}
 
 void main() {
     for (
@@ -94,7 +98,7 @@ void main() {
                 bf16_to_f32(temporal_pair >> 16) * bf16_to_f32(hi_weight)
             );
         }
-        conv_output.words[word_index] =
-            (f32_to_bf16(hi) << 16) | f32_to_bf16(lo);
+        uint conv_pair = (f32_to_bf16(hi) << 16) | f32_to_bf16(lo);
+        conv_output.words[word_index] = finalize_output(word_index, conv_pair);
     }
 }

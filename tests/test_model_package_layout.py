@@ -233,6 +233,25 @@ def test_compiler_renders_fused_recurrent_depthwise_shader(tmp_path: Path) -> No
     assert "{{" not in source
 
 
+def test_compiler_renders_output_gated_recurrent_depthwise_shader(
+    tmp_path: Path,
+) -> None:
+    shader_source_dir = Path(__file__).parents[1] / "runtime-rs" / "shaders"
+    shader_file = "multiply_rolling_depthwise_gate_bf16_3x1024.comp"
+
+    copy_shader_templates(shader_source_dir, tmp_path, {shader_file})
+
+    source = (tmp_path / shader_file).read_text()
+    assert "binding = 3) readonly buffer OutputGate" in source
+    assert "binding = 4) buffer ConvOutput" in source
+    assert "binding = 5) readonly buffer ConvKernel" in source
+    assert "binding = 6) readonly buffer StateRead" in source
+    assert "binding = 7) buffer StateWrite" in source
+    assert "bf16_to_f32(conv_pair) * bf16_to_f32(gate_pair)" in source
+    assert "finalize_output(word_index, conv_pair)" in source
+    assert "{{" not in source
+
+
 def test_parallel_linear_shader_selector_rejects_invalid_metadata_and_layout() -> None:
     node = {
         "id": "qkv",

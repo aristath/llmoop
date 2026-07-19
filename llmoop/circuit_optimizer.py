@@ -23,6 +23,7 @@ def optimize_circuit_for_vulkan(
     can_fuse_multiply_rolling_depthwise: (
         Callable[[Json, Json, Json], bool] | None
     ) = None,
+    can_fuse_recurrent_output_gate: Callable[[Json, Json], bool] | None = None,
 ) -> Json:
     """Compile discoverable node regions without changing the pedal boundary."""
     optimized = deepcopy(circuit)
@@ -74,11 +75,77 @@ def optimize_circuit_for_vulkan(
         compiled_nodes,
         can_fuse_dual_linear_silu_multiply,
     )
-    optimized["nodes"] = _fuse_multiply_rolling_depthwise_regions(
+    compiled_nodes = _fuse_multiply_rolling_depthwise_regions(
         compiled_nodes,
         can_fuse_multiply_rolling_depthwise,
     )
+    optimized["nodes"] = _fuse_recurrent_output_gate_regions(
+        compiled_nodes,
+        can_fuse_recurrent_output_gate,
+    )
     return optimized
+
+
+def _fuse_recurrent_output_gate_regions(
+    nodes: list[Json],
+    can_fuse: Callable[[Json, Json], bool] | None,
+) -> list[Json]:
+    if can_fuse is None:
+        return nodes
+    consumer_counts = Counter(
+        signal for node in nodes for signal in node.get("inputs", [])
+    )
+    compiled: list[Json] = []
+    index = 0
+    while index < len(nodes):
+        recurrent = nodes[index]
+        gate = nodes[index + 1] if index + 1 < len(nodes) else None
+        recurrent_outputs = recurrent.get("outputs", [])
+        if (
+            gate is None
+            or recurrent.get("op") != "multiply_rolling_depthwise"
+            or gate.get("op") != "multiply"
+            or len(recurrent.get("inputs", [])) != 3
+            or len(recurrent_outputs) != 1
+            or len(recurrent.get("params", [])) != 1
+            or len(recurrent.get("state_reads", [])) != 1
+            or recurrent.get("state_reads") != recurrent.get("state_writes")
+            or len(gate.get("inputs", [])) != 2
+            or gate["inputs"].count(recurrent_outputs[0]) != 1
+            or len(gate.get("outputs", [])) != 1
+            or gate.get("params")
+            or gate.get("state_reads")
+            or gate.get("state_writes")
+            or consumer_counts[recurrent_outputs[0]] != 1
+            or not can_fuse(recurrent, gate)
+        ):
+            compiled.append(deepcopy(recurrent))
+            index += 1
+            continue
+
+        output_gate = next(
+            signal for signal in gate["inputs"] if signal != recurrent_outputs[0]
+        )
+        attrs = deepcopy(recurrent.get("attrs", {}))
+        attrs["compiled_from"] = [
+            *attrs.get("compiled_from", [recurrent["id"]]),
+            gate["id"],
+        ]
+        attrs["output_gate_rounding"] = "BF16"
+        compiled.append(
+            {
+                "id": f"{recurrent['id']}__{gate['id']}",
+                "op": "multiply_rolling_depthwise_gate",
+                "inputs": [*deepcopy(recurrent["inputs"]), output_gate],
+                "outputs": deepcopy(gate["outputs"]),
+                "params": deepcopy(recurrent["params"]),
+                "state_reads": deepcopy(recurrent["state_reads"]),
+                "state_writes": deepcopy(recurrent["state_writes"]),
+                "attrs": attrs,
+            }
+        )
+        index += 2
+    return compiled
 
 
 def _fuse_multiply_rolling_depthwise_regions(
