@@ -712,6 +712,7 @@ fn load_parameter_allocation_from_tensor_index(
             "failed to read tensor {tensor:?} from safetensors source {source_file:?}: {error}"
         ))
     })?;
+    validate_tensor_data_sha256(tensor, metadata.data_sha256.as_deref(), &bytes)?;
     allocation.buffer.write_bytes(&bytes)?;
 
     Ok(VulkanPermanentParameterLoadRecord {
@@ -722,6 +723,26 @@ fn load_parameter_allocation_from_tensor_index(
         data_end,
         byte_count,
     })
+}
+
+fn validate_tensor_data_sha256(
+    tensor: &str,
+    expected: Option<&str>,
+    bytes: &[u8],
+) -> Result<(), VulkanPermanentParameterLoadError> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    let actual = Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    if actual != expected {
+        return Err(VulkanPermanentParameterLoadError(format!(
+            "tensor {tensor:?} data SHA-256 does not match its compiled package contract"
+        )));
+    }
+    Ok(())
 }
 
 fn safetensors_data_start(path: &Path) -> Result<u64, VulkanPermanentParameterLoadError> {
@@ -7101,6 +7122,20 @@ pub struct VulkanResidentModelPackageManifest {
     pub output_transducer: VulkanResidentOutputTransducerPackageSpec,
     pub sampler: VulkanResidentSamplerPackageSpec,
     pub pedal_executions: Vec<VulkanResidentPedalExecutionSpec>,
+    pub artifact_integrity: VulkanResidentPackageArtifactIntegrity,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VulkanResidentPackageArtifactIntegrity {
+    pub schema: String,
+    pub algorithm: String,
+    pub files: BTreeMap<String, VulkanResidentPackageArtifactDigest>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VulkanResidentPackageArtifactDigest {
+    pub byte_count: usize,
+    pub sha256: String,
 }
 
 fn validate_behavioral_validation_artifact(
@@ -7556,6 +7591,90 @@ fn validate_resident_package_paths(
     Ok(())
 }
 
+fn validate_resident_package_artifact_integrity(
+    manifest_path: &Path,
+    manifest: &VulkanResidentModelPackageManifest,
+) -> io::Result<()> {
+    let integrity = &manifest.artifact_integrity;
+    if integrity.schema != "llmoop.package_artifact_integrity.v1"
+        || integrity.algorithm != "sha256"
+        || integrity.files.is_empty()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "resident model package artifact integrity contract is invalid",
+        ));
+    }
+    let tokenizer_files = manifest.tokenizer.files.iter().map(|file| {
+        Path::new(&manifest.tokenizer.path)
+            .join(file)
+            .to_string_lossy()
+            .into_owned()
+    });
+    let kernel_shaders = manifest.pedal_executions.iter().flat_map(|execution| {
+        execution
+            .kernels
+            .iter()
+            .map(|kernel| kernel.shader_path.clone())
+    });
+    let required = [
+        manifest.tensor_index_path.clone(),
+        manifest.behavioral_validation_path.clone(),
+        manifest.config_path.clone(),
+        manifest.input_transducer.shader_path.clone(),
+        manifest
+            .output_transducer
+            .embedding_norm_shader_path
+            .clone(),
+        manifest.output_transducer.projection_shader_path.clone(),
+        manifest.sampler.shader_path.clone(),
+    ]
+    .into_iter()
+    .chain(tokenizer_files)
+    .chain(kernel_shaders)
+    .collect::<BTreeSet<_>>();
+    if integrity.files.keys().cloned().collect::<BTreeSet<_>>() != required {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "resident model package artifact integrity contract does not cover its declared non-weight artifacts",
+        ));
+    }
+
+    let package_root = manifest_path.parent().unwrap_or_else(|| Path::new("."));
+    for (relative_path, contract) in &integrity.files {
+        validate_resident_package_relative_path("integrity artifact", relative_path)?;
+        if !is_lower_hex_sha256(&contract.sha256) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("resident model package artifact {relative_path:?} has an invalid SHA-256"),
+            ));
+        }
+        let path = package_root.join(relative_path);
+        let payload = fs::read(&path).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "failed to read resident model package integrity artifact {}: {error}",
+                    path.display()
+                ),
+            )
+        })?;
+        let actual_sha256 = Sha256::digest(&payload)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        if payload.len() != contract.byte_count || actual_sha256 != contract.sha256 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "resident model package artifact {relative_path:?} does not match its integrity contract"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
 impl VulkanResidentModelPackageManifest {
     pub fn from_json_file(path: impl AsRef<Path>) -> io::Result<Self> {
         let path = path.as_ref();
@@ -7575,6 +7694,7 @@ impl VulkanResidentModelPackageManifest {
         }
         validate_resident_package_paths(&manifest)?;
         validate_behavioral_validation_artifact(path, &manifest, &raw_manifest)?;
+        validate_resident_package_artifact_integrity(path, &manifest)?;
         let package_root = path.parent().unwrap_or_else(|| Path::new("."));
         let source_graph = manifest
             .resolved_source_graph(package_root)
@@ -11126,7 +11246,7 @@ fn plan_resident_package_placed_stream_circuit(
     VulkanResidentTokenModelPackageError,
 > {
     let graph = circuit_graph.to_resolved_lowered_pedalboard(manifest_dir.to_path_buf())?;
-    let tensor_index = TensorIndex::from_json_file(tensor_index_path).map_err(|error| {
+    let tensor_index = TensorIndex::from_package_json_file(tensor_index_path).map_err(|error| {
         VulkanResidentTokenModelPackageError::new(format!(
             "failed to load tensor index {:?}: {error}",
             tensor_index_path
@@ -17635,6 +17755,30 @@ mod tests {
             .unwrap()
     }
 
+    fn copy_package_integrity_artifacts(
+        source_root: &Path,
+        destination_root: &Path,
+        manifest: &VulkanResidentModelPackageManifest,
+    ) {
+        for relative_path in manifest.artifact_integrity.files.keys() {
+            let destination = destination_root.join(relative_path);
+            std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+            std::fs::copy(source_root.join(relative_path), destination).unwrap();
+        }
+    }
+
+    #[test]
+    fn tensor_data_digest_rejects_same_length_parameter_corruption() {
+        let expected = "9a129038d9a00aed0cf6a7ea059ca50a813449061ab87848cf1a13eafdf33b2c";
+
+        validate_tensor_data_sha256("weight", Some(expected), b"weights").unwrap();
+        let error = validate_tensor_data_sha256("weight", Some(expected), b"WeightS")
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("does not match its compiled package contract"));
+    }
+
     #[test]
     fn package_loader_rejects_shallow_and_stale_behavioral_evidence() {
         let source_manifest_path = fixture_model_package_manifest_path();
@@ -17731,6 +17875,36 @@ mod tests {
     }
 
     #[test]
+    fn package_loader_rejects_same_length_shader_corruption() {
+        let source_manifest_path = fixture_model_package_manifest_path();
+        let source_manifest = fixture_model_package_manifest();
+        let source_root = source_manifest_path.parent().unwrap();
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "llmoop-package-integrity-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        copy_package_integrity_artifacts(source_root, &root, &source_manifest);
+        let manifest_path = root.join("vulkan_resident_package.json");
+        std::fs::copy(&source_manifest_path, &manifest_path).unwrap();
+        let shader_path = root.join(&source_manifest.sampler.shader_path);
+        let mut shader = std::fs::read(&shader_path).unwrap();
+        *shader.last_mut().unwrap() ^= 0x01;
+        std::fs::write(&shader_path, shader).unwrap();
+
+        let error = VulkanResidentModelPackageManifest::from_json_file(&manifest_path)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("does not match its integrity contract"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn package_loader_accepts_mixed_exact_and_approximate_pedal_proofs() {
         let source_manifest_path = fixture_model_package_manifest_path();
         let source_manifest = fixture_model_package_manifest();
@@ -17762,10 +17936,21 @@ mod tests {
         ));
         std::fs::create_dir_all(&root).unwrap();
         let manifest_path = root.join("vulkan_resident_package.json");
-        std::fs::copy(&source_manifest_path, &manifest_path).unwrap();
+        copy_package_integrity_artifacts(source_root, &root, &source_manifest);
+        let evidence_payload = serde_json::to_vec_pretty(&evidence).unwrap();
+        std::fs::write(root.join("behavioral_validation.json"), &evidence_payload).unwrap();
+        let mut raw_manifest: Value =
+            serde_json::from_slice(&std::fs::read(&source_manifest_path).unwrap()).unwrap();
+        raw_manifest["artifact_integrity"]["files"]["behavioral_validation.json"] = serde_json::json!({
+            "byte_count": evidence_payload.len(),
+            "sha256": Sha256::digest(&evidence_payload)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        });
         std::fs::write(
-            root.join("behavioral_validation.json"),
-            serde_json::to_vec_pretty(&evidence).unwrap(),
+            &manifest_path,
+            serde_json::to_vec_pretty(&raw_manifest).unwrap(),
         )
         .unwrap();
 

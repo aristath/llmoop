@@ -33,6 +33,17 @@ pub struct TensorIndex {
 
 impl TensorIndex {
     pub fn from_json_file(path: impl AsRef<Path>) -> Result<Self, CircuitPlanError> {
+        Self::from_json_file_with_package_containment(path, false)
+    }
+
+    pub fn from_package_json_file(path: impl AsRef<Path>) -> Result<Self, CircuitPlanError> {
+        Self::from_json_file_with_package_containment(path, true)
+    }
+
+    fn from_json_file_with_package_containment(
+        path: impl AsRef<Path>,
+        require_package_containment: bool,
+    ) -> Result<Self, CircuitPlanError> {
         let path = path.as_ref();
         let bytes = fs::read(path).map_err(|error| CircuitPlanError(error.to_string()))?;
         let mut index: Self =
@@ -44,13 +55,45 @@ impl TensorIndex {
             )));
         }
         let root = path.parent().unwrap_or_else(|| Path::new("."));
-        for metadata in index.tensors.values_mut() {
+        for (tensor, metadata) in &mut index.tensors {
             if let Some(source_file) = &metadata.source_file {
                 let source_path = Path::new(source_file);
+                if require_package_containment
+                    && (source_file.is_empty()
+                        || source_path.is_absolute()
+                        || source_path.components().any(|component| {
+                            matches!(
+                                component,
+                                std::path::Component::ParentDir
+                                    | std::path::Component::RootDir
+                                    | std::path::Component::Prefix(_)
+                            )
+                        }))
+                {
+                    return Err(CircuitPlanError(format!(
+                        "package tensor {tensor:?} source path {source_file:?} must stay inside the package"
+                    )));
+                }
                 if !source_path.is_absolute() {
                     metadata.source_file =
                         Some(root.join(source_path).to_string_lossy().into_owned());
                 }
+            } else if require_package_containment {
+                return Err(CircuitPlanError(format!(
+                    "package tensor {tensor:?} has no source file"
+                )));
+            }
+            if require_package_containment
+                && metadata.data_sha256.as_deref().is_none_or(|digest| {
+                    digest.len() != 64
+                        || !digest
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                })
+            {
+                return Err(CircuitPlanError(format!(
+                    "package tensor {tensor:?} has no valid data SHA-256"
+                )));
             }
         }
         Ok(index)
@@ -80,6 +123,8 @@ pub struct TensorMetadata {
     pub data_offsets: Option<Vec<usize>>,
     #[serde(default)]
     pub source_file: Option<String>,
+    #[serde(default)]
+    pub data_sha256: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1465,6 +1510,58 @@ mod tests {
     fn fixture_model_tensor_index_path() -> PathBuf {
         compiled_artifact_dir("LLMOOP_TEST_TRANSPILED_DIR", "transpiled", "tensors.json")
             .join("tensors.json")
+    }
+
+    #[test]
+    fn package_tensor_index_rejects_sources_outside_the_package() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "llmoop-package-tensor-index-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let index_path = root.join("tensors.json");
+        std::fs::write(
+            &index_path,
+            serde_json::to_vec(&serde_json::json!({
+                "schema": TENSOR_INDEX_SCHEMA,
+                "tensors": {
+                    "weight": {
+                        "dtype": "BF16",
+                        "shape": [4, 4],
+                        "source_file": "../outside.safetensors"
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let error = TensorIndex::from_package_json_file(&index_path).unwrap_err();
+
+        assert!(error.0.contains("must stay inside the package"));
+
+        std::fs::write(
+            &index_path,
+            serde_json::to_vec(&serde_json::json!({
+                "schema": TENSOR_INDEX_SCHEMA,
+                "tensors": {
+                    "weight": {
+                        "dtype": "BF16",
+                        "shape": [4, 4],
+                        "source_file": "weights/weight.safetensors"
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let error = TensorIndex::from_package_json_file(&index_path).unwrap_err();
+        assert!(error.0.contains("no valid data SHA-256"));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

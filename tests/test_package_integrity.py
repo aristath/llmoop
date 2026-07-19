@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from hashlib import sha256
 from io import BytesIO
 from pathlib import Path
 
@@ -12,6 +13,7 @@ from llmoop.behavioral_compiler import (
     json_contract_digest,
 )
 from llmoop.model_package import (
+    build_package_artifact_integrity,
     compile_shader_artifacts,
     copy_exact_bytes,
     copy_shader_templates,
@@ -33,7 +35,10 @@ def minimal_package(root: Path) -> dict[str, object]:
             {
                 "schema": "llmoop.tensor_index.v1",
                 "tensors": {
-                    "weight": {"source_file": "weights/model.safetensors"}
+                    "weight": {
+                        "source_file": "weights/model.safetensors",
+                        "data_sha256": sha256(b"weights").hexdigest(),
+                    }
                 }
             }
         )
@@ -110,7 +115,7 @@ def minimal_package(root: Path) -> dict[str, object]:
             }
         )
     )
-    return {
+    manifest = {
         "schema": PACKAGE_SCHEMA,
         "package_id": "fixture_package",
         "device_id": "runtime_default",
@@ -165,6 +170,8 @@ def minimal_package(root: Path) -> dict[str, object]:
             }
         ],
     }
+    manifest["artifact_integrity"] = build_package_artifact_integrity(root)
+    return manifest
 
 
 def test_package_integrity_accepts_a_complete_compiler_boundary(tmp_path: Path) -> None:
@@ -181,7 +188,9 @@ def test_package_integrity_accepts_a_complete_compiler_boundary(tmp_path: Path) 
         ("behavioral", "missing behavioral validation artifact"),
         ("tokenizer", "missing tokenizer artifact"),
         ("tensor", "references missing artifact"),
+        ("tensor_digest", "has no valid data SHA-256"),
         ("shader", "not valid SPIR-V"),
+        ("shader_digest", "does not match its integrity contract"),
         ("behavioral_shallow", "incomplete source oracle"),
         ("stale_proof", "incomplete or stale proof"),
         ("kernel", "kernel 0 does not match"),
@@ -204,8 +213,16 @@ def test_package_integrity_rejects_corrupt_or_incomplete_artifacts(
         (tmp_path / "tokenizer" / "tokenizer.json").unlink()
     elif corruption == "tensor":
         (tmp_path / "weights" / "model.safetensors").unlink()
+    elif corruption == "tensor_digest":
+        tensor_index = json.loads((tmp_path / "tensors.json").read_text())
+        tensor_index["tensors"]["weight"]["data_sha256"] = "not-a-digest"
+        (tmp_path / "tensors.json").write_text(json.dumps(tensor_index))
     elif corruption == "shader":
         (tmp_path / "shaders" / "kernel.spv").write_bytes(b"not spirv")
+    elif corruption == "shader_digest":
+        (tmp_path / "shaders" / "kernel.spv").write_bytes(
+            b"\x03\x02#\x07changed payload"
+        )
     elif corruption == "behavioral_shallow":
         (tmp_path / "behavioral_validation.json").write_text(
             json.dumps(

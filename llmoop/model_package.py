@@ -6,7 +6,7 @@ import shutil
 import struct
 import subprocess
 from copy import deepcopy
-from hashlib import blake2s
+from hashlib import blake2s, sha256
 from pathlib import Path
 from typing import Any, Callable
 
@@ -33,6 +33,7 @@ from llmoop.model_transpiler import read_safetensors_header, transpile_model
 
 TOKENIZER_PACKAGE_DIR = "tokenizer"
 WEIGHTS_PACKAGE_DIR = "weights"
+PACKAGE_ARTIFACT_INTEGRITY_SCHEMA = "llmoop.package_artifact_integrity.v1"
 VULKAN_BF16_ROW_PAIR_LAYOUT = "vulkan_bf16_row_pair_u32"
 ROW_MAJOR_LAYOUT = "row_major"
 CONFIG_PACKAGE_FILE = "config.json"
@@ -134,6 +135,9 @@ def compile_model_package(
         tokenizer_manifest=tokenizer_manifest,
         event_sink=event_sink,
         cancel_requested=cancel_requested,
+    )
+    package_manifest["artifact_integrity"] = build_package_artifact_integrity(
+        package_dir
     )
     package_manifest_path = package_dir / "vulkan_resident_package.json"
     write_json(package_manifest_path, package_manifest)
@@ -2081,7 +2085,7 @@ def copy_tensor_package(
         digest = blake2s(tensor_name.encode("utf-8"), digest_size=8).hexdigest()
         destination = weights_dir / f"tensor_{digest}.safetensors"
         if info.get("source_parts"):
-            header_bytes = write_compiled_composite_tensor(
+            header_bytes, data_sha256 = write_compiled_composite_tensor(
                 tensor_name=tensor_name,
                 info=info,
                 destination=destination,
@@ -2091,7 +2095,7 @@ def copy_tensor_package(
             source = Path(info["source_file"])
             if not source.is_file():
                 raise ModelCompileError(f"tensor source file does not exist: {source}")
-            header_bytes = write_compiled_tensor(
+            header_bytes, data_sha256 = write_compiled_tensor(
                 tensor_name=tensor_name,
                 info=info,
                 source=source,
@@ -2101,6 +2105,7 @@ def copy_tensor_package(
         relative_destination = relative_json_path(package_dir, destination)
         info["source_file"] = relative_destination
         info["data_offsets"] = [0, int(info["byte_count"])]
+        info["data_sha256"] = data_sha256
         info["layout"] = layout
         info.pop("source_parts", None)
         info.pop("source_header_bytes", None)
@@ -2205,6 +2210,15 @@ def validate_compiled_package(package_dir: Path, manifest: Json) -> None:
             raise ModelCompileError(
                 f"compiled tensor {tensor_name!r} references missing artifact {source}"
             )
+        data_digest = info.get("data_sha256")
+        if (
+            not isinstance(data_digest, str)
+            or len(data_digest) != 64
+            or any(character not in "0123456789abcdef" for character in data_digest)
+        ):
+            raise ModelCompileError(
+                f"compiled tensor {tensor_name!r} has no valid data SHA-256"
+            )
 
     shader_paths: set[str] = set()
 
@@ -2229,6 +2243,81 @@ def validate_compiled_package(package_dir: Path, manifest: Json) -> None:
         payload = shader.read_bytes()
         if len(payload) < 4 or payload[:4] != b"\x03\x02#\x07":
             raise ModelCompileError(f"compiled package shader is not valid SPIR-V: {shader}")
+    validate_package_artifact_integrity(package_dir, manifest)
+
+
+def build_package_artifact_integrity(package_dir: Path) -> Json:
+    files = {}
+    for path in sorted(package_dir.rglob("*")):
+        if not path.is_file():
+            continue
+        relative = path.relative_to(package_dir)
+        if (
+            relative.parts[0] == WEIGHTS_PACKAGE_DIR
+            or relative.name == "vulkan_resident_package.json"
+        ):
+            continue
+        payload = path.read_bytes()
+        files[relative.as_posix()] = {
+            "byte_count": len(payload),
+            "sha256": sha256(payload).hexdigest(),
+        }
+    return {
+        "schema": PACKAGE_ARTIFACT_INTEGRITY_SCHEMA,
+        "algorithm": "sha256",
+        "files": files,
+    }
+
+
+def validate_package_artifact_integrity(package_dir: Path, manifest: Json) -> None:
+    integrity = manifest.get("artifact_integrity")
+    if (
+        not isinstance(integrity, dict)
+        or integrity.get("schema") != PACKAGE_ARTIFACT_INTEGRITY_SCHEMA
+        or integrity.get("algorithm") != "sha256"
+        or not isinstance(integrity.get("files"), dict)
+        or not integrity["files"]
+    ):
+        raise ModelCompileError("compiled package artifact integrity contract is invalid")
+
+    actual_files = {
+        path.relative_to(package_dir).as_posix()
+        for path in package_dir.rglob("*")
+        if path.is_file()
+        and path.relative_to(package_dir).parts[0] != WEIGHTS_PACKAGE_DIR
+        and path.name != "vulkan_resident_package.json"
+    }
+    if set(integrity["files"]) != actual_files:
+        raise ModelCompileError(
+            "compiled package artifact integrity contract does not cover every non-weight artifact"
+        )
+    for relative_path, contract in integrity["files"].items():
+        path = package_artifact_path(
+            package_dir, relative_path, "integrity artifact"
+        )
+        if (
+            not isinstance(contract, dict)
+            or not isinstance(contract.get("byte_count"), int)
+            or isinstance(contract.get("byte_count"), bool)
+            or contract["byte_count"] < 0
+            or not isinstance(contract.get("sha256"), str)
+            or len(contract["sha256"]) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in contract["sha256"]
+            )
+        ):
+            raise ModelCompileError(
+                f"compiled package artifact integrity entry for {relative_path!r} is invalid"
+            )
+        payload = path.read_bytes()
+        if (
+            len(payload) != contract["byte_count"]
+            or sha256(payload).hexdigest() != contract["sha256"]
+        ):
+            raise ModelCompileError(
+                f"compiled package artifact {relative_path!r} does not match its integrity contract"
+            )
 
 
 def package_artifact_path(package_dir: Path, value: Any, label: str) -> Path:
@@ -2505,7 +2594,7 @@ def write_compiled_tensor(
     source: Path,
     destination: Path,
     layout: str,
-) -> int:
+) -> tuple[int, str]:
     byte_count = int(info["byte_count"])
     header = {
         "__metadata__": {"format": "llmoop", "layout": layout},
@@ -2521,6 +2610,7 @@ def write_compiled_tensor(
         info.get("source_header_bytes") or read_safetensors_header(source)[0]
     )
     source_start = 8 + source_header_bytes + int(info["data_offsets"][0])
+    data_digest = sha256()
 
     with (
         source.open("rb") as source_handle,
@@ -2535,10 +2625,13 @@ def write_compiled_tensor(
                 destination_handle,
                 rows=int(info["shape"][0]),
                 columns=int(info["shape"][1]),
+                digest=data_digest,
             )
         else:
-            copy_exact_bytes(source_handle, destination_handle, byte_count)
-    return len(header_payload)
+            copy_exact_bytes(
+                source_handle, destination_handle, byte_count, digest=data_digest
+            )
+    return len(header_payload), data_digest.hexdigest()
 
 
 def write_compiled_composite_tensor(
@@ -2547,7 +2640,7 @@ def write_compiled_composite_tensor(
     info: Json,
     destination: Path,
     layout: str,
-) -> int:
+) -> tuple[int, str]:
     if layout != ROW_MAJOR_LAYOUT:
         raise ModelCompileError(
             f"composite tensor {tensor_name!r} requires unsupported layout {layout!r}"
@@ -2564,6 +2657,7 @@ def write_compiled_composite_tensor(
     header_payload = json.dumps(header, separators=(",", ":")).encode("utf-8")
     header_payload += b" " * (-len(header_payload) % 8)
     written = 0
+    data_digest = sha256()
     with destination.open("wb") as destination_handle:
         destination_handle.write(struct.pack("<Q", len(header_payload)))
         destination_handle.write(header_payload)
@@ -2583,13 +2677,18 @@ def write_compiled_composite_tensor(
                 )
             with source.open("rb") as source_handle:
                 source_handle.seek(8 + source_header_bytes + offsets[0])
-                copy_exact_bytes(source_handle, destination_handle, part_bytes)
+                copy_exact_bytes(
+                    source_handle,
+                    destination_handle,
+                    part_bytes,
+                    digest=data_digest,
+                )
             written += part_bytes
     if written != byte_count:
         raise ModelCompileError(
             f"composite tensor {tensor_name!r} wrote {written} bytes; expected {byte_count}"
         )
-    return len(header_payload)
+    return len(header_payload), data_digest.hexdigest()
 
 
 def write_bf16_row_pair_tensor(
@@ -2598,6 +2697,7 @@ def write_bf16_row_pair_tensor(
     *,
     rows: int,
     columns: int,
+    digest: Any | None = None,
 ) -> None:
     try:
         import numpy
@@ -2620,11 +2720,18 @@ def write_bf16_row_pair_tensor(
         paired = numpy.empty((word_count, 2), dtype="<u4")
         paired[:, 0] = words_0
         paired[:, 1] = words_1
-        destination_handle.write(paired.tobytes())
+        payload = paired.tobytes()
+        destination_handle.write(payload)
+        if digest is not None:
+            digest.update(payload)
 
 
 def copy_exact_bytes(
-    source_handle: Any, destination_handle: Any, byte_count: int
+    source_handle: Any,
+    destination_handle: Any,
+    byte_count: int,
+    *,
+    digest: Any | None = None,
 ) -> None:
     remaining = byte_count
     while remaining:
@@ -2634,6 +2741,8 @@ def copy_exact_bytes(
                 "unexpected end of tensor source while compiling package"
             )
         destination_handle.write(chunk)
+        if digest is not None:
+            digest.update(chunk)
         remaining -= len(chunk)
 
 
