@@ -252,6 +252,30 @@ def test_compiler_renders_output_gated_recurrent_depthwise_shader(
     assert "{{" not in source
 
 
+def test_compiler_renders_projected_recurrent_depthwise_shader(
+    tmp_path: Path,
+) -> None:
+    shader_source_dir = Path(__file__).parents[1] / "runtime-rs" / "shaders"
+    shader_file = (
+        "linear_split_recurrent_depthwise_gate_paired_bf16_"
+        "1024x1024_k3_ig0_2_og1.comp"
+    )
+
+    copy_shader_templates(shader_source_dir, tmp_path, {shader_file})
+
+    source = (tmp_path / shader_file).read_text()
+    assert "binding = 3) readonly buffer ProjectionWeight" in source
+    assert "binding = 4) readonly buffer ConvKernel" in source
+    assert "const uint INPUT_SIZE = 1024u;" in source
+    assert "const uint HIDDEN_SIZE = 1024u;" in source
+    assert "const uint FRAME_COUNT = 3u;" in source
+    assert "const uint INPUT_GATE_A_INDEX = 0u;" in source
+    assert "const uint INPUT_GATE_B_INDEX = 2u;" in source
+    assert "const uint OUTPUT_GATE_INDEX = 1u;" in source
+    assert "const bool PAIRED_WEIGHT_LAYOUT = true;" in source
+    assert "{{" not in source
+
+
 def test_parallel_linear_shader_selector_rejects_invalid_metadata_and_layout() -> None:
     node = {
         "id": "qkv",

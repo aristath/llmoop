@@ -1032,6 +1032,17 @@ fn infer_node_output_shapes(
                 .map(|groups| vec![groups]);
             Ok(repeat_shape(output_shape, outputs))
         }
+        "linear_split_recurrent_depthwise_gate" => {
+            let output_shape = node
+                .attrs
+                .get("recurrent")
+                .and_then(|attrs| attrs.get("depthwise"))
+                .and_then(|attrs| attrs.get("groups"))
+                .and_then(|value| value.as_u64())
+                .and_then(|value| usize::try_from(value).ok())
+                .map(|groups| vec![groups]);
+            Ok(repeat_shape(output_shape, outputs))
+        }
         "causal_conv1d_silu" => Ok(repeat_shape(first_input_shape(node, signals), outputs)),
         "gated_delta_step" => {
             let output_shape = attr_usize(node, "value_heads")

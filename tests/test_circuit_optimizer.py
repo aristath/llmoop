@@ -6,6 +6,87 @@ from llmoop.circuit_optimizer import optimize_circuit_for_vulkan
 
 
 class VulkanCircuitOptimizerTest(unittest.TestCase):
+    def test_fuses_three_way_projection_into_recurrent_depthwise_gate(self) -> None:
+        circuit = {
+            "nodes": [
+                {
+                    "id": "project__split",
+                    "op": "linear_split_3way",
+                    "inputs": ["normalized"],
+                    "outputs": ["gate_b", "gate_c", "projected"],
+                    "params": ["projection_weight"],
+                    "attrs": {
+                        "part_widths": [16, 16, 16],
+                        "compiled_from": ["project", "split"],
+                    },
+                },
+                {
+                    "id": "recurrent",
+                    "op": "multiply_rolling_depthwise_gate",
+                    "inputs": ["gate_b", "projected", "memory", "gate_c"],
+                    "outputs": ["gated_conv"],
+                    "params": ["conv_kernel"],
+                    "state_reads": ["memory"],
+                    "state_writes": ["memory"],
+                    "attrs": {"compiled_from": ["gate", "shift", "conv"]},
+                },
+            ]
+        }
+
+        optimized = optimize_circuit_for_vulkan(
+            circuit,
+            can_fuse_linear_split_recurrent=lambda projection, recurrent: (
+                set(projection["outputs"]).issubset(recurrent["inputs"])
+            ),
+        )
+
+        self.assertEqual(1, len(optimized["nodes"]))
+        fused = optimized["nodes"][0]
+        self.assertEqual("linear_split_recurrent_depthwise_gate", fused["op"])
+        self.assertEqual(["normalized", "memory"], fused["inputs"])
+        self.assertEqual(["gated_conv"], fused["outputs"])
+        self.assertEqual(
+            ["projection_weight", "conv_kernel"], fused["params"]
+        )
+        self.assertEqual([0, 2], fused["attrs"]["input_gate_branch_indices"])
+        self.assertEqual(1, fused["attrs"]["output_gate_branch_index"])
+        self.assertEqual("BF16", fused["attrs"]["projection_rounding"])
+
+    def test_does_not_fuse_three_way_projection_with_shared_branch(self) -> None:
+        circuit = {
+            "nodes": [
+                {
+                    "id": "project__split",
+                    "op": "linear_split_3way",
+                    "inputs": ["normalized"],
+                    "outputs": ["gate_b", "gate_c", "projected"],
+                    "params": ["projection_weight"],
+                },
+                {
+                    "id": "recurrent",
+                    "op": "multiply_rolling_depthwise_gate",
+                    "inputs": ["gate_b", "projected", "memory", "gate_c"],
+                    "outputs": ["gated_conv"],
+                    "params": ["conv_kernel"],
+                    "state_reads": ["memory"],
+                    "state_writes": ["memory"],
+                },
+                {
+                    "id": "extra",
+                    "op": "silu",
+                    "inputs": ["gate_c"],
+                    "outputs": ["extra_out"],
+                },
+            ]
+        }
+
+        optimized = optimize_circuit_for_vulkan(
+            circuit,
+            can_fuse_linear_split_recurrent=lambda _projection, _recurrent: True,
+        )
+
+        self.assertEqual(circuit, optimized)
+
     def test_fuses_recurrent_depthwise_result_into_output_gate(self) -> None:
         circuit = {
             "nodes": [

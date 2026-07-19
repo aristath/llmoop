@@ -1,0 +1,265 @@
+#version 450
+
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer InputFrame {
+    uint words[];
+} input_frame;
+
+layout(set = 0, binding = 1) readonly buffer InputState {
+    uint words[];
+} input_state;
+
+layout(set = 0, binding = 2) buffer OutputFrame {
+    uint words[];
+} output_frame;
+
+layout(set = 0, binding = 3) readonly buffer ProjectionWeight {
+    uint words[];
+} projection_weight;
+
+layout(set = 0, binding = 4) readonly buffer ConvKernel {
+    uint words[];
+} conv_kernel;
+
+layout(set = 0, binding = 5) readonly buffer StateRead {
+    uint words[];
+} state_read;
+
+layout(set = 0, binding = 6) buffer StateWrite {
+    uint words[];
+} state_write;
+
+const uint INPUT_SIZE = {{INPUT_SIZE}}u;
+const uint HIDDEN_SIZE = {{HIDDEN_SIZE}}u;
+const uint FRAME_COUNT = {{FRAME_COUNT}}u;
+const uint INPUT_GATE_A_INDEX = {{INPUT_GATE_A_INDEX}}u;
+const uint INPUT_GATE_B_INDEX = {{INPUT_GATE_B_INDEX}}u;
+const uint OUTPUT_GATE_INDEX = {{OUTPUT_GATE_INDEX}}u;
+const uint INPUT_WORDS = INPUT_SIZE / 2u;
+const uint OUTPUT_WORDS = HIDDEN_SIZE / 2u;
+const bool PAIRED_WEIGHT_LAYOUT = {{PAIRED_WEIGHT_LAYOUT}};
+
+shared float subgroup_lo[3][64];
+shared float subgroup_hi[3][64];
+
+float bf16_to_f32(uint value) {
+    return uintBitsToFloat((value & 0xffffu) << 16);
+}
+
+uint f32_to_bf16(float value) {
+    uint bits = floatBitsToUint(value);
+    uint lsb = (bits >> 16) & 1u;
+    uint rounding_bias = 0x7fffu + lsb;
+    return (bits + rounding_bias) >> 16;
+}
+
+uint read_projection_weight(
+    uint branch,
+    uint word_index,
+    uint column_word,
+    uint row_offset
+) {
+    uint combined_word = (branch * OUTPUT_WORDS) + word_index;
+    uint weight_index;
+    if (PAIRED_WEIGHT_LAYOUT) {
+        weight_index =
+            (2u * ((combined_word * INPUT_WORDS) + column_word)) + row_offset;
+    } else {
+        uint row = (combined_word * 2u) + row_offset;
+        weight_index = (row * INPUT_WORDS) + column_word;
+    }
+    return projection_weight.words[weight_index];
+}
+
+uint bf16_at_kernel(uint element_index) {
+    uint packed = conv_kernel.words[element_index >> 1u];
+    return (element_index & 1u) == 0u ? packed & 0xffffu : packed >> 16;
+}
+
+uint multiply_pair(uint left, uint right) {
+    uint lo = f32_to_bf16(bf16_to_f32(left) * bf16_to_f32(right));
+    uint hi = f32_to_bf16(
+        bf16_to_f32(left >> 16) * bf16_to_f32(right >> 16)
+    );
+    return (hi << 16) | lo;
+}
+
+uint select_branch(uint index, uint branch_0, uint branch_1, uint branch_2) {
+    if (index == 0u) {
+        return branch_0;
+    }
+    return index == 1u ? branch_1 : branch_2;
+}
+
+void finalize_output(
+    uint word_index,
+    float branch_0_lo,
+    float branch_0_hi,
+    float branch_1_lo,
+    float branch_1_hi,
+    float branch_2_lo,
+    float branch_2_hi
+) {
+    uint branch_0 =
+        (f32_to_bf16(branch_0_hi) << 16) | f32_to_bf16(branch_0_lo);
+    uint branch_1 =
+        (f32_to_bf16(branch_1_hi) << 16) | f32_to_bf16(branch_1_lo);
+    uint branch_2 =
+        (f32_to_bf16(branch_2_hi) << 16) | f32_to_bf16(branch_2_lo);
+    uint input_gate_a = select_branch(
+        INPUT_GATE_A_INDEX,
+        branch_0,
+        branch_1,
+        branch_2
+    );
+    uint input_gate_b = select_branch(
+        INPUT_GATE_B_INDEX,
+        branch_0,
+        branch_1,
+        branch_2
+    );
+    uint output_gate = select_branch(
+        OUTPUT_GATE_INDEX,
+        branch_0,
+        branch_1,
+        branch_2
+    );
+
+    uint temporal_words[FRAME_COUNT];
+    for (uint tap = 0u; tap + 1u < FRAME_COUNT; tap++) {
+        temporal_words[tap] =
+            state_read.words[((tap + 1u) * OUTPUT_WORDS) + word_index];
+    }
+    temporal_words[FRAME_COUNT - 1u] = multiply_pair(
+        input_gate_a,
+        input_gate_b
+    );
+    for (uint tap = 0u; tap < FRAME_COUNT; tap++) {
+        state_write.words[(tap * OUTPUT_WORDS) + word_index] =
+            temporal_words[tap];
+    }
+
+    uint channel_lo = word_index * 2u;
+    uint channel_hi = channel_lo + 1u;
+    float conv_lo = 0.0;
+    float conv_hi = 0.0;
+    for (uint tap = 0u; tap < FRAME_COUNT; tap++) {
+        uint temporal_pair = temporal_words[tap];
+        uint lo_weight = bf16_at_kernel((channel_lo * FRAME_COUNT) + tap);
+        uint hi_weight = bf16_at_kernel((channel_hi * FRAME_COUNT) + tap);
+        conv_lo = conv_lo + (
+            bf16_to_f32(temporal_pair) * bf16_to_f32(lo_weight)
+        );
+        conv_hi = conv_hi + (
+            bf16_to_f32(temporal_pair >> 16) * bf16_to_f32(hi_weight)
+        );
+    }
+    uint conv_pair =
+        (f32_to_bf16(conv_hi) << 16) | f32_to_bf16(conv_lo);
+    output_frame.words[word_index] = multiply_pair(conv_pair, output_gate);
+}
+
+void main() {
+    uint word_index = gl_WorkGroupID.x;
+    uint lane = gl_LocalInvocationID.x;
+    if (word_index >= OUTPUT_WORDS) {
+        return;
+    }
+
+    float lo_sum[3];
+    float hi_sum[3];
+    for (uint branch = 0u; branch < 3u; branch++) {
+        lo_sum[branch] = 0.0;
+        hi_sum[branch] = 0.0;
+    }
+    for (uint column_word = lane; column_word < INPUT_WORDS; column_word += 64u) {
+        uint input_pair = input_frame.words[column_word];
+        float input_lo = bf16_to_f32(input_pair);
+        float input_hi = bf16_to_f32(input_pair >> 16);
+        for (uint branch = 0u; branch < 3u; branch++) {
+            uint lo_weight = read_projection_weight(
+                branch,
+                word_index,
+                column_word,
+                0u
+            );
+            uint hi_weight = read_projection_weight(
+                branch,
+                word_index,
+                column_word,
+                1u
+            );
+            lo_sum[branch] = fma(
+                input_lo,
+                bf16_to_f32(lo_weight),
+                lo_sum[branch]
+            );
+            lo_sum[branch] = fma(
+                input_hi,
+                bf16_to_f32(lo_weight >> 16),
+                lo_sum[branch]
+            );
+            hi_sum[branch] = fma(
+                input_lo,
+                bf16_to_f32(hi_weight),
+                hi_sum[branch]
+            );
+            hi_sum[branch] = fma(
+                input_hi,
+                bf16_to_f32(hi_weight >> 16),
+                hi_sum[branch]
+            );
+        }
+    }
+
+    for (uint branch = 0u; branch < 3u; branch++) {
+        lo_sum[branch] = subgroupAdd(lo_sum[branch]);
+        hi_sum[branch] = subgroupAdd(hi_sum[branch]);
+    }
+    if (gl_NumSubgroups == 1u) {
+        if (gl_SubgroupInvocationID == 0u) {
+            finalize_output(
+                word_index,
+                lo_sum[0],
+                hi_sum[0],
+                lo_sum[1],
+                hi_sum[1],
+                lo_sum[2],
+                hi_sum[2]
+            );
+        }
+        return;
+    }
+
+    if (gl_SubgroupInvocationID == 0u) {
+        for (uint branch = 0u; branch < 3u; branch++) {
+            subgroup_lo[branch][gl_SubgroupID] = lo_sum[branch];
+            subgroup_hi[branch][gl_SubgroupID] = hi_sum[branch];
+        }
+    }
+    barrier();
+
+    if (lane == 0u) {
+        for (uint branch = 0u; branch < 3u; branch++) {
+            lo_sum[branch] = 0.0;
+            hi_sum[branch] = 0.0;
+            for (uint subgroup = 0u; subgroup < gl_NumSubgroups; subgroup++) {
+                lo_sum[branch] += subgroup_lo[branch][subgroup];
+                hi_sum[branch] += subgroup_hi[branch][subgroup];
+            }
+        }
+        finalize_output(
+            word_index,
+            lo_sum[0],
+            hi_sum[0],
+            lo_sum[1],
+            hi_sum[1],
+            lo_sum[2],
+            hi_sum[2]
+        );
+    }
+}

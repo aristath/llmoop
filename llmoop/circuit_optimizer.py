@@ -24,6 +24,7 @@ def optimize_circuit_for_vulkan(
         Callable[[Json, Json, Json], bool] | None
     ) = None,
     can_fuse_recurrent_output_gate: Callable[[Json, Json], bool] | None = None,
+    can_fuse_linear_split_recurrent: Callable[[Json, Json], bool] | None = None,
 ) -> Json:
     """Compile discoverable node regions without changing the pedal boundary."""
     optimized = deepcopy(circuit)
@@ -79,11 +80,89 @@ def optimize_circuit_for_vulkan(
         compiled_nodes,
         can_fuse_multiply_rolling_depthwise,
     )
-    optimized["nodes"] = _fuse_recurrent_output_gate_regions(
+    compiled_nodes = _fuse_recurrent_output_gate_regions(
         compiled_nodes,
         can_fuse_recurrent_output_gate,
     )
+    optimized["nodes"] = _fuse_linear_split_recurrent_regions(
+        compiled_nodes,
+        can_fuse_linear_split_recurrent,
+    )
     return optimized
+
+
+def _fuse_linear_split_recurrent_regions(
+    nodes: list[Json],
+    can_fuse: Callable[[Json, Json], bool] | None,
+) -> list[Json]:
+    if can_fuse is None:
+        return nodes
+    consumer_counts = Counter(
+        signal for node in nodes for signal in node.get("inputs", [])
+    )
+    compiled: list[Json] = []
+    index = 0
+    while index < len(nodes):
+        projection = nodes[index]
+        recurrent = nodes[index + 1] if index + 1 < len(nodes) else None
+        projection_outputs = projection.get("outputs", [])
+        recurrent_inputs = recurrent.get("inputs", []) if recurrent is not None else []
+        state_reads = recurrent.get("state_reads", []) if recurrent is not None else []
+        if (
+            recurrent is None
+            or projection.get("op") != "linear_split_3way"
+            or recurrent.get("op") != "multiply_rolling_depthwise_gate"
+            or len(projection.get("inputs", [])) != 1
+            or len(projection_outputs) != 3
+            or len(projection.get("params", [])) != 1
+            or projection.get("state_reads")
+            or projection.get("state_writes")
+            or len(recurrent_inputs) != 4
+            or len(recurrent.get("outputs", [])) != 1
+            or len(recurrent.get("params", [])) != 1
+            or len(state_reads) != 1
+            or recurrent.get("state_writes") != state_reads
+            or recurrent_inputs[2] != state_reads[0]
+            or set([recurrent_inputs[0], recurrent_inputs[1], recurrent_inputs[3]])
+            != set(projection_outputs)
+            or any(consumer_counts[output] != 1 for output in projection_outputs)
+            or not can_fuse(projection, recurrent)
+        ):
+            compiled.append(deepcopy(projection))
+            index += 1
+            continue
+
+        input_gate_indices = [
+            projection_outputs.index(recurrent_inputs[0]),
+            projection_outputs.index(recurrent_inputs[1]),
+        ]
+        output_gate_index = projection_outputs.index(recurrent_inputs[3])
+        projection_attrs = deepcopy(projection.get("attrs", {}))
+        recurrent_attrs = deepcopy(recurrent.get("attrs", {}))
+        compiled.append(
+            {
+                "id": f"{projection['id']}__{recurrent['id']}",
+                "op": "linear_split_recurrent_depthwise_gate",
+                "inputs": [projection["inputs"][0], state_reads[0]],
+                "outputs": deepcopy(recurrent["outputs"]),
+                "params": [projection["params"][0], recurrent["params"][0]],
+                "state_reads": deepcopy(state_reads),
+                "state_writes": deepcopy(state_reads),
+                "attrs": {
+                    "compiled_from": [
+                        *projection_attrs.get("compiled_from", [projection["id"]]),
+                        *recurrent_attrs.get("compiled_from", [recurrent["id"]]),
+                    ],
+                    "projection": projection_attrs,
+                    "recurrent": recurrent_attrs,
+                    "input_gate_branch_indices": input_gate_indices,
+                    "output_gate_branch_index": output_gate_index,
+                    "projection_rounding": "BF16",
+                },
+            }
+        )
+        index += 2
+    return compiled
 
 
 def _fuse_recurrent_output_gate_regions(

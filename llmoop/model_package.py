@@ -280,6 +280,11 @@ def build_vulkan_resident_package_manifest(
                     circuit, recurrent, gate, tensor_index
                 )
             ),
+            can_fuse_linear_split_recurrent=lambda projection, recurrent, circuit=circuit: (
+                can_fuse_bf16_linear_split_recurrent(
+                    circuit, projection, recurrent, tensor_index
+                )
+            ),
         )
     pedal_executions = pedal_execution_specs(
         lowered_index=lowered_index,
@@ -792,6 +797,73 @@ def shader_file_for_node(
             else "multiply_rolling_depthwise"
         )
         return f"{shader_prefix}_bf16_{frames}x{state_hidden}.comp"
+    if op == "linear_split_recurrent_depthwise_gate":
+        if (
+            len(node.get("inputs", [])) != 2
+            or len(node.get("outputs", [])) != 1
+            or len(node.get("params", [])) != 2
+            or len(node.get("state_reads", [])) != 1
+            or node.get("state_reads") != node.get("state_writes")
+        ):
+            raise ModelCompileError(
+                f"projected recurrent convolution node {node['id']!r} has invalid bindings"
+            )
+        temporal_memory = state_port(circuit, node["state_reads"][0])
+        frames, hidden_size = map(int, temporal_memory["shape"])
+        projection_shape = parameter_shape_for_id(
+            circuit, node["params"][0], tensor_index
+        )
+        kernel_shape = parameter_shape_for_id(
+            circuit, node["params"][1], tensor_index
+        )
+        part_widths = [
+            int(width) for width in node["attrs"]["projection"]["part_widths"]
+        ]
+        input_gate_indices = [
+            int(index) for index in node["attrs"]["input_gate_branch_indices"]
+        ]
+        output_gate_index = int(node["attrs"]["output_gate_branch_index"])
+        projection_layout = parameter_layout_for_id(
+            circuit, node["params"][0], tensor_index
+        )
+        if (
+            temporal_memory.get("dtype") != "BF16"
+            or frames < 2
+            or hidden_size <= 0
+            or hidden_size % 2
+            or len(projection_shape) != 2
+            or projection_shape[0] != 3 * hidden_size
+            or projection_shape[1] <= 0
+            or projection_shape[1] % 2
+            or part_widths != [hidden_size] * 3
+            or sorted([*input_gate_indices, output_gate_index]) != [0, 1, 2]
+            or kernel_shape not in ([hidden_size, frames], [hidden_size, 1, frames])
+            or any(
+                parameter_dtype_for_id(circuit, parameter_id, tensor_index)
+                != "BF16"
+                for parameter_id in node["params"]
+            )
+            or projection_layout
+            not in {ROW_MAJOR_LAYOUT, VULKAN_BF16_ROW_PAIR_LAYOUT}
+            or parameter_layout_for_id(circuit, node["params"][1], tensor_index)
+            != ROW_MAJOR_LAYOUT
+        ):
+            raise ModelCompileError(
+                f"projected recurrent convolution node {node['id']!r} has "
+                f"incompatible projection {projection_shape}, state "
+                f"{temporal_memory.get('shape')}, or kernel {kernel_shape}"
+            )
+        layout_token = (
+            "paired"
+            if projection_layout == VULKAN_BF16_ROW_PAIR_LAYOUT
+            else "row_major"
+        )
+        return (
+            f"linear_split_recurrent_depthwise_gate_{layout_token}_bf16_"
+            f"{projection_shape[1]}x{hidden_size}_k{frames}"
+            f"_ig{input_gate_indices[0]}_{input_gate_indices[1]}"
+            f"_og{output_gate_index}.comp"
+        )
     if op == "residual_add":
         return f"add_bf16_{hidden_size}.comp"
     if op == "scaled_residual_add":
@@ -1007,6 +1079,11 @@ def shader_file_for_node(
 
 
 def workgroup_count_x_for_node(circuit: Json, node: Json, tensor_index: Json) -> int:
+    if node["op"] == "linear_split_recurrent_depthwise_gate":
+        hidden_size = int(
+            state_port(circuit, node["state_reads"][0])["shape"][1]
+        )
+        return hidden_size // 2
     if node["op"] == "dual_linear_silu_multiply":
         output_width = int(
             parameter_shape_for_id(circuit, node["params"][0], tensor_index)[0]
@@ -1348,6 +1425,20 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
                 "INPUT_SIZE",
                 "OUTPUT_SIZE",
                 "ACTIVATED_INPUT_INDEX",
+            ),
+        ),
+        (
+            r"linear_split_recurrent_depthwise_gate_(paired|row_major)_bf16_"
+            r"(\d+)x(\d+)_k(\d+)_ig([012])_([012])_og([012])\.comp",
+            "linear_split_recurrent_depthwise_gate_bf16.comp.template",
+            (
+                "WEIGHT_LAYOUT",
+                "INPUT_SIZE",
+                "HIDDEN_SIZE",
+                "FRAME_COUNT",
+                "INPUT_GATE_A_INDEX",
+                "INPUT_GATE_B_INDEX",
+                "OUTPUT_GATE_INDEX",
             ),
         ),
         (
@@ -2413,6 +2504,50 @@ def can_fuse_bf16_recurrent_output_gate(
         and hidden_size > 0
         and hidden_size % 2 == 0
         and kernel_shape in ([hidden_size, frames], [hidden_size, 1, frames])
+        and parameter_dtype_for_node(circuit, recurrent, tensor_index) == "BF16"
+        and parameter_layout_for_node(circuit, recurrent, tensor_index)
+        == ROW_MAJOR_LAYOUT
+    )
+
+
+def can_fuse_bf16_linear_split_recurrent(
+    circuit: Json,
+    projection: Json,
+    recurrent: Json,
+    tensor_index: Json,
+) -> bool:
+    if (
+        len(projection.get("params", [])) != 1
+        or len(recurrent.get("params", [])) != 1
+        or len(recurrent.get("state_reads", [])) != 1
+        or recurrent.get("state_reads") != recurrent.get("state_writes")
+    ):
+        return False
+    temporal_memory = state_port(circuit, recurrent["state_reads"][0])
+    state_shape = list(map(int, temporal_memory.get("shape", [])))
+    if len(state_shape) != 2:
+        return False
+    frames, hidden_size = state_shape
+    projection_shape = parameter_shape_for_node(circuit, projection, tensor_index)
+    kernel_shape = parameter_shape_for_node(circuit, recurrent, tensor_index)
+    part_widths = [
+        int(width) for width in projection.get("attrs", {}).get("part_widths", [])
+    ]
+    return (
+        temporal_memory.get("dtype") == "BF16"
+        and temporal_memory.get("update") == "shift_append"
+        and frames >= 2
+        and hidden_size > 0
+        and hidden_size % 2 == 0
+        and len(projection_shape) == 2
+        and projection_shape[0] == 3 * hidden_size
+        and projection_shape[1] > 0
+        and projection_shape[1] % 2 == 0
+        and part_widths == [hidden_size] * 3
+        and kernel_shape in ([hidden_size, frames], [hidden_size, 1, frames])
+        and parameter_dtype_for_node(circuit, projection, tensor_index) == "BF16"
+        and parameter_layout_for_node(circuit, projection, tensor_index)
+        in {ROW_MAJOR_LAYOUT, VULKAN_BF16_ROW_PAIR_LAYOUT}
         and parameter_dtype_for_node(circuit, recurrent, tensor_index) == "BF16"
         and parameter_layout_for_node(circuit, recurrent, tensor_index)
         == ROW_MAJOR_LAYOUT
