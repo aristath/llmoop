@@ -6,6 +6,111 @@ from llmoop.circuit_optimizer import optimize_circuit_for_vulkan
 
 
 class VulkanCircuitOptimizerTest(unittest.TestCase):
+    def test_fuses_kv_append_into_attention_read(self) -> None:
+        circuit = {
+            "nodes": [
+                {
+                    "id": "append",
+                    "op": "append_state_update",
+                    "inputs": ["k", "v", "kv_memory"],
+                    "outputs": ["k_memory", "v_memory"],
+                    "state_reads": ["kv_memory"],
+                    "state_writes": ["kv_memory"],
+                    "attrs": {"growth": "per_activation"},
+                },
+                {
+                    "id": "attention",
+                    "op": "scaled_dot_product_attention",
+                    "inputs": ["q", "k_memory", "v_memory"],
+                    "outputs": ["attention_out"],
+                    "params": ["attention_sinks"],
+                    "attrs": {"causal": True},
+                },
+            ]
+        }
+
+        optimized = optimize_circuit_for_vulkan(
+            circuit,
+            can_fuse_append_attention=lambda append, attention: (
+                append["outputs"] == attention["inputs"][1:]
+            ),
+        )
+
+        self.assertEqual(1, len(optimized["nodes"]))
+        fused = optimized["nodes"][0]
+        self.assertEqual("append_scaled_dot_product_attention", fused["op"])
+        self.assertEqual(["q", "k", "v", "kv_memory"], fused["inputs"])
+        self.assertEqual(["attention_out"], fused["outputs"])
+        self.assertEqual(["attention_sinks"], fused["params"])
+        self.assertEqual(["kv_memory"], fused["state_reads"])
+        self.assertEqual(["kv_memory"], fused["state_writes"])
+        self.assertEqual("direct_bf16_input", fused["attrs"]["current_kv_source"])
+
+    def test_does_not_fuse_kv_append_with_shared_state_view(self) -> None:
+        circuit = {
+            "nodes": [
+                {
+                    "id": "append",
+                    "op": "append_state_update",
+                    "inputs": ["k", "v", "kv_memory"],
+                    "outputs": ["k_memory", "v_memory"],
+                    "state_reads": ["kv_memory"],
+                    "state_writes": ["kv_memory"],
+                },
+                {
+                    "id": "attention",
+                    "op": "scaled_dot_product_attention",
+                    "inputs": ["q", "k_memory", "v_memory"],
+                    "outputs": ["attention_out"],
+                },
+                {
+                    "id": "extra",
+                    "op": "silu",
+                    "inputs": ["k_memory"],
+                    "outputs": ["extra_out"],
+                },
+            ]
+        }
+
+        optimized = optimize_circuit_for_vulkan(
+            circuit,
+            can_fuse_append_attention=lambda _append, _attention: True,
+        )
+
+        self.assertEqual(circuit, optimized)
+
+    def test_does_not_fuse_kv_append_exposed_at_circuit_boundary(self) -> None:
+        circuit = {
+            "boundary": {
+                "outputs": [
+                    {"id": "exported_k", "source": "k_memory"},
+                ]
+            },
+            "nodes": [
+                {
+                    "id": "append",
+                    "op": "append_state_update",
+                    "inputs": ["k", "v", "kv_memory"],
+                    "outputs": ["k_memory", "v_memory"],
+                    "state_reads": ["kv_memory"],
+                    "state_writes": ["kv_memory"],
+                },
+                {
+                    "id": "attention",
+                    "op": "scaled_dot_product_attention",
+                    "inputs": ["q", "k_memory", "v_memory"],
+                    "outputs": ["attention_out"],
+                },
+            ],
+        }
+
+        optimized = optimize_circuit_for_vulkan(
+            circuit,
+            can_fuse_append_attention=lambda _append, _attention: True,
+        )
+
+        self.assertEqual(circuit, optimized)
+
     def test_fuses_three_way_projection_into_recurrent_depthwise_gate(self) -> None:
         circuit = {
             "nodes": [

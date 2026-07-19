@@ -25,6 +25,7 @@ def optimize_circuit_for_vulkan(
     ) = None,
     can_fuse_recurrent_output_gate: Callable[[Json, Json], bool] | None = None,
     can_fuse_linear_split_recurrent: Callable[[Json, Json], bool] | None = None,
+    can_fuse_append_attention: Callable[[Json, Json], bool] | None = None,
 ) -> Json:
     """Compile discoverable node regions without changing the pedal boundary."""
     optimized = deepcopy(circuit)
@@ -84,11 +85,83 @@ def optimize_circuit_for_vulkan(
         compiled_nodes,
         can_fuse_recurrent_output_gate,
     )
-    optimized["nodes"] = _fuse_linear_split_recurrent_regions(
+    compiled_nodes = _fuse_linear_split_recurrent_regions(
         compiled_nodes,
         can_fuse_linear_split_recurrent,
     )
+    optimized["nodes"] = _fuse_append_attention_regions(
+        compiled_nodes,
+        can_fuse_append_attention,
+        {
+            output.get("source", output["id"])
+            for output in optimized.get("boundary", {}).get("outputs", [])
+        },
+    )
     return optimized
+
+
+def _fuse_append_attention_regions(
+    nodes: list[Json],
+    can_fuse: Callable[[Json, Json], bool] | None,
+    protected_signals: set[str],
+) -> list[Json]:
+    if can_fuse is None:
+        return nodes
+    consumer_counts = Counter(
+        signal for node in nodes for signal in node.get("inputs", [])
+    )
+    compiled: list[Json] = []
+    index = 0
+    while index < len(nodes):
+        append = nodes[index]
+        attention = nodes[index + 1] if index + 1 < len(nodes) else None
+        append_outputs = append.get("outputs", [])
+        if (
+            attention is None
+            or append.get("op") != "append_state_update"
+            or attention.get("op") != "scaled_dot_product_attention"
+            or len(append.get("inputs", [])) != 3
+            or len(append_outputs) != 2
+            or append.get("params")
+            or len(append.get("state_reads", [])) != 1
+            or append.get("state_reads") != append.get("state_writes")
+            or len(attention.get("inputs", [])) != 3
+            or attention["inputs"][1:] != append_outputs
+            or len(attention.get("outputs", [])) != 1
+            or attention.get("state_reads")
+            or attention.get("state_writes")
+            or any(consumer_counts[output] != 1 for output in append_outputs)
+            or any(output in protected_signals for output in append_outputs)
+            or not can_fuse(append, attention)
+        ):
+            compiled.append(deepcopy(append))
+            index += 1
+            continue
+
+        compiled.append(
+            {
+                "id": f"{append['id']}__{attention['id']}",
+                "op": "append_scaled_dot_product_attention",
+                "inputs": [
+                    attention["inputs"][0],
+                    append["inputs"][0],
+                    append["inputs"][1],
+                    append["inputs"][2],
+                ],
+                "outputs": deepcopy(attention["outputs"]),
+                "params": deepcopy(attention.get("params", [])),
+                "state_reads": deepcopy(append["state_reads"]),
+                "state_writes": deepcopy(append["state_writes"]),
+                "attrs": {
+                    "compiled_from": [append["id"], attention["id"]],
+                    "append": deepcopy(append.get("attrs", {})),
+                    "attention": deepcopy(attention.get("attrs", {})),
+                    "current_kv_source": "direct_bf16_input",
+                },
+            }
+        )
+        index += 2
+    return compiled
 
 
 def _fuse_linear_split_recurrent_regions(

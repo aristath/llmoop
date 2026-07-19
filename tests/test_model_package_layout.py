@@ -523,6 +523,36 @@ def test_compiler_renders_windowed_attention_with_learned_sink_logits(
     assert "{{" not in attention
 
 
+def test_compiler_renders_fused_kv_append_attention_variants(
+    tmp_path: Path,
+) -> None:
+    shader_source_dir = Path(__file__).parents[1] / "runtime-rs" / "shaders"
+    plain_file = "append_gqa_attention_bf16_q16_kv8_d64_scale0.125__sc7.comp"
+    sinks_file = (
+        "append_gqa_attention_bf16_q20_kv4_d64_scale0.015625_w128_sinks__sc8.comp"
+    )
+
+    copy_shader_templates(shader_source_dir, tmp_path, {plain_file, sinks_file})
+
+    plain = (tmp_path / plain_file).read_text()
+    sinks = (tmp_path / sinks_file).read_text()
+    assert "const uint QUERY_HEADS = 16u;" in plain
+    assert "const uint QUERY_GROUPS_PER_KV_HEAD = 2u;" in plain
+    assert "binding = 5) readonly buffer KvStateRead" in plain
+    assert "binding = 6) buffer KvStateWrite" in plain
+    assert "binding = 7) readonly buffer StreamControl" in plain
+    assert "token_index + 1u == tokens" in plain
+    assert "query_head % QUERY_GROUPS_PER_KV_HEAD == 0u" in plain
+    assert "binding = 5) readonly buffer AttentionSinks" in sinks
+    assert "binding = 6) readonly buffer KvStateRead" in sinks
+    assert "binding = 7) buffer KvStateWrite" in sinks
+    assert "binding = 8) readonly buffer StreamControl" in sinks
+    assert "const uint ATTENTION_WINDOW = 128u;" in sinks
+    assert "float logsumexp = maximum + log(denominator);" in sinks
+    assert "{{" not in plain
+    assert "{{" not in sinks
+
+
 def test_compiler_renders_subgroup_padded_attention_and_unequal_qkv_split(
     tmp_path: Path,
 ) -> None:

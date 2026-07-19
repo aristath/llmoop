@@ -285,6 +285,11 @@ def build_vulkan_resident_package_manifest(
                     circuit, projection, recurrent, tensor_index
                 )
             ),
+            can_fuse_append_attention=lambda append, attention, circuit=circuit: (
+                can_fuse_bf16_append_attention(
+                    circuit, append, attention, tensor_index
+                )
+            ),
         )
     pedal_executions = pedal_execution_specs(
         lowered_index=lowered_index,
@@ -1011,6 +1016,19 @@ def shader_file_for_node(
         if attrs.get("attention_sinks"):
             name += "_sinks"
         return f"{name}__sc{binding}.comp"
+    if op == "append_scaled_dot_product_attention":
+        attrs = node["attrs"]["attention"]
+        binding = stream_control_binding_for_node(circuit, node)
+        name = (
+            "append_gqa_attention_bf16_"
+            f"q{attrs['query_heads']}_kv{attrs['key_value_heads']}_d{attrs['head_width']}"
+            f"_scale{shader_float_token(float(attrs['scale']))}"
+        )
+        if attrs.get("window_size") is not None:
+            name += f"_w{int(attrs['window_size'])}"
+        if attrs.get("attention_sinks"):
+            name += "_sinks"
+        return f"{name}__sc{binding}.comp"
     if op == "causal_conv1d_silu":
         return (
             f"causal_conv1d_silu_bf16_c{node['attrs']['channels']}"
@@ -1104,8 +1122,16 @@ def workgroup_count_x_for_node(circuit: Json, node: Json, tensor_index: Json) ->
         out_features, _ = parameter_shape_for_node(circuit, node, tensor_index)
         # One workgroup collaboratively computes and packs two BF16 output rows.
         return (int(out_features) + 1) // 2
-    if node["op"] == "scaled_dot_product_attention":
-        return int(node["attrs"]["query_heads"])
+    if node["op"] in {
+        "scaled_dot_product_attention",
+        "append_scaled_dot_product_attention",
+    }:
+        attrs = (
+            node["attrs"]["attention"]
+            if node["op"] == "append_scaled_dot_product_attention"
+            else node["attrs"]
+        )
+        return int(attrs["query_heads"])
     if node["op"] == "gated_delta_step":
         return int(node["attrs"]["value_heads"])
     if node["op"] == "rg_lru_step":
@@ -1124,8 +1150,16 @@ def workgroup_count_x_for_node(circuit: Json, node: Json, tensor_index: Json) ->
 def local_size_x_for_node(node: Json) -> int:
     # The tiled attention kernel maps sixteen 64-wide head reductions onto one
     # workgroup. This execution geometry belongs to the compiled pedal package.
-    if node["op"] == "scaled_dot_product_attention":
-        return attention_workgroup_shape(int(node["attrs"]["head_width"]))[0]
+    if node["op"] in {
+        "scaled_dot_product_attention",
+        "append_scaled_dot_product_attention",
+    }:
+        attrs = (
+            node["attrs"]["attention"]
+            if node["op"] == "append_scaled_dot_product_attention"
+            else node["attrs"]
+        )
+        return attention_workgroup_shape(int(attrs["head_width"]))[0]
     if node["op"] == "gated_delta_step":
         return int(node["attrs"]["value_head_width"])
     if node["op"] == "rg_lru_step":
@@ -1677,6 +1711,44 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
                 "ATTENTION_SCALE": attention_shape.group(4),
                 "ATTENTION_WINDOW": attention_shape.group(5) or "0",
                 "HAS_SINKS": "1" if attention_shape.group(6) else "0",
+            },
+        )
+
+    append_attention_shape = re.fullmatch(
+        r"append_gqa_attention_bf16_q(\d+)_kv(\d+)_d(\d+)_scale([0-9eE+.-]+)"
+        r"(?:_w(\d+))?(_sinks)?\.comp",
+        shader_file,
+    )
+    if append_attention_shape is not None:
+        query_heads, kv_heads, head_width = map(
+            int, append_attention_shape.groups()[:3]
+        )
+        if query_heads % kv_heads != 0:
+            raise ModelCompileError(
+                f"query head count {query_heads} is not divisible by KV head count {kv_heads}"
+            )
+        local_size, tile_tokens = attention_workgroup_shape(head_width)
+        if head_width < 2 or head_width % 2 != 0 or tile_tokens == 0:
+            raise ModelCompileError(
+                f"attention head width {head_width} cannot be tiled into a Vulkan workgroup"
+            )
+        has_sinks = append_attention_shape.group(6) is not None
+        return render_shader_template(
+            source_dir,
+            "append_gqa_attention_bf16.comp.template",
+            {
+                "QUERY_HEADS": str(query_heads),
+                "KV_HEADS": str(kv_heads),
+                "QUERY_GROUPS_PER_KV_HEAD": str(query_heads // kv_heads),
+                "HEAD_WIDTH": str(head_width),
+                "LOCAL_SIZE": str(local_size),
+                "TILE_TOKENS": str(tile_tokens),
+                "ATTENTION_SCALE": append_attention_shape.group(4),
+                "ATTENTION_WINDOW": append_attention_shape.group(5) or "0",
+                "HAS_SINKS": "1" if has_sinks else "0",
+                "ATTENTION_SINK_BINDING": "5",
+                "STATE_READ_BINDING": "6" if has_sinks else "5",
+                "STATE_WRITE_BINDING": "7" if has_sinks else "6",
             },
         )
 
@@ -2551,6 +2623,84 @@ def can_fuse_bf16_linear_split_recurrent(
         and parameter_dtype_for_node(circuit, recurrent, tensor_index) == "BF16"
         and parameter_layout_for_node(circuit, recurrent, tensor_index)
         == ROW_MAJOR_LAYOUT
+    )
+
+
+def can_fuse_bf16_append_attention(
+    circuit: Json,
+    append: Json,
+    attention: Json,
+    tensor_index: Json,
+) -> bool:
+    if (
+        append.get("op") != "append_state_update"
+        or attention.get("op") != "scaled_dot_product_attention"
+        or len(append.get("inputs", [])) != 3
+        or len(append.get("state_reads", [])) != 1
+        or append.get("state_reads") != append.get("state_writes")
+        or append["inputs"][2] != append["state_reads"][0]
+        or attention.get("attrs", {}).get("causal") is not True
+    ):
+        return False
+    append_attrs = append.get("attrs", {})
+    attention_attrs = attention.get("attrs", {})
+    geometry_keys = (
+        "query_heads",
+        "key_value_heads",
+        "head_width",
+        "query_groups_per_kv_head",
+    )
+    try:
+        append_geometry = tuple(int(append_attrs[key]) for key in geometry_keys)
+        attention_geometry = tuple(
+            int(attention_attrs[key]) for key in geometry_keys
+        )
+        query_heads, kv_heads, head_width, query_groups = attention_geometry
+        memory = state_port(circuit, append["state_reads"][0])
+        key_shape = list(map(int, memory.get("key_shape_per_token", [])))
+        value_shape = list(map(int, memory.get("value_shape_per_token", [])))
+        window_size = attention_attrs.get("window_size")
+        if window_size is not None:
+            window_size = int(window_size)
+        scale = float(attention_attrs["scale"])
+    except (KeyError, TypeError, ValueError, ModelCompileError):
+        return False
+    params = attention.get("params", [])
+    has_sinks = bool(attention_attrs.get("attention_sinks"))
+    if len(params) != int(has_sinks):
+        return False
+    if params:
+        try:
+            sink_shape = parameter_shape_for_id(circuit, params[0], tensor_index)
+            sink_dtype = parameter_dtype_for_id(circuit, params[0], tensor_index)
+            sink_layout = parameter_layout_for_id(circuit, params[0], tensor_index)
+        except (KeyError, ModelCompileError):
+            return False
+        if (
+            sink_shape != [query_heads]
+            or sink_dtype != "BF16"
+            or sink_layout != ROW_MAJOR_LAYOUT
+        ):
+            return False
+    return (
+        append_geometry == attention_geometry
+        and append_attrs.get("growth") == "per_activation"
+        and query_heads > 0
+        and kv_heads > 0
+        and query_heads % kv_heads == 0
+        and query_groups == query_heads // kv_heads
+        and head_width >= 2
+        and head_width % 2 == 0
+        and attention_workgroup_shape(head_width)[1] > 0
+        and scale > 0.0
+        and (window_size is None or window_size > 0)
+        and memory.get("type") == "append_only_attention_memory"
+        and memory.get("dtype") == "BF16"
+        and memory.get("growth") == "per_activation"
+        and memory.get("layout") == "append_only_kv"
+        and memory.get("source_layout") == "batch_kvheads_seq_headdim"
+        and key_shape == [kv_heads, head_width]
+        and value_shape == [kv_heads, head_width]
     )
 
 

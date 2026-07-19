@@ -1069,7 +1069,7 @@ fn infer_node_output_shapes(
             Ok(repeat_shape(output_shape, outputs))
         }
         "append_state_update" => unknown(),
-        "scaled_dot_product_attention" => {
+        "scaled_dot_product_attention" | "append_scaled_dot_product_attention" => {
             Ok(repeat_shape(first_input_shape(node, signals), outputs))
         }
         _ => unknown(),
@@ -1506,6 +1506,48 @@ mod tests {
         assert_eq!(
             infer_split_output_shapes("layer_00", &node, &signals).unwrap(),
             vec![Some(vec![16]), Some(vec![8]), Some(vec![8])]
+        );
+    }
+
+    #[test]
+    fn infers_fused_append_attention_output_shape_from_query_frame() {
+        let node = crate::stream_circuit::CircuitNode {
+            id: "append_attention".to_string(),
+            op: "append_scaled_dot_product_attention".to_string(),
+            inputs: vec![
+                "q".to_string(),
+                "k".to_string(),
+                "v".to_string(),
+                "kv_memory".to_string(),
+            ],
+            outputs: vec!["attention_out".to_string()],
+            params: Vec::new(),
+            state_reads: vec!["kv_memory".to_string()],
+            state_writes: vec!["kv_memory".to_string()],
+            attrs: serde_json::json!({
+                "attention": {
+                    "query_heads": 16,
+                    "key_value_heads": 8,
+                    "head_width": 64
+                }
+            }),
+        };
+        let signals = BTreeMap::from([(
+            "q".to_string(),
+            PlannedSignal {
+                id: "q".to_string(),
+                producer: SignalProducer::BoundaryInput,
+                consumers: vec!["append_attention".to_string()],
+                shape: Some(vec![1024]),
+                storage: SignalStorage::Boundary,
+                is_boundary_output: false,
+            },
+        )]);
+
+        assert_eq!(
+            infer_node_output_shapes("attention", &node, &signals, &BTreeMap::new(), None,)
+                .unwrap(),
+            vec![Some(vec![1024])]
         );
     }
 
