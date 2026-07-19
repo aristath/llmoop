@@ -33,6 +33,7 @@ class LayerStructure:
     rope_theta: float
     rope_type: str
     attention_scale: float
+    attention_key_equals_value: bool
     value_head_norm: bool
     shared_kv_source_layer: int | None
     per_layer_input_width: int | None
@@ -436,7 +437,8 @@ def discover_model_structure(
         embedding_scale=discover_embedding_scale(
             decoder_config,
             hidden_size,
-            scaled_by_structure=per_layer_input is not None,
+            scaled_by_structure=per_layer_input is not None
+            or any("layer_scalar" in layer.tensors for layer in layers),
         ),
         residual_scale=float(decoder_config.get("residual_multiplier", 1.0)),
         attention_scale=(
@@ -556,6 +558,12 @@ def discover_layer_structure(
                 ),
             }
         )
+    else:
+        optional_layer_scalar = find_optional_layer_tensor(
+            tensors, prefix, LAYER_SCALAR_SUFFIXES
+        )
+        if optional_layer_scalar is not None:
+            layer_tensors["layer_scalar"] = optional_layer_scalar
     synthesize_packed_expert_tensors(tensors, prefix)
     dense_gate = find_optional_layer_tensor(tensors, prefix, FFN_GATE_SUFFIXES)
     fused_gate_up = find_optional_layer_tensor(
@@ -663,6 +671,7 @@ def discover_layer_structure(
     else:
         layer_attention_window_size = None
 
+    attention_key_equals_value = False
     if operator_type == "conv":
         layer_tensors.update(
             {
@@ -705,22 +714,23 @@ def discover_layer_structure(
                 role="attention query projection",
             )
             if shared_kv_source_layer is None:
-                layer_tensors.update(
-                    {
-                    "k_projection": find_layer_tensor(
-                        tensors,
-                        prefix,
-                        ATTENTION_K_PROJECTION_SUFFIXES,
-                        role="attention key projection",
-                    ),
-                    "v_projection": find_layer_tensor(
-                        tensors,
-                        prefix,
-                        ATTENTION_V_PROJECTION_SUFFIXES,
-                        role="attention value projection",
-                    ),
-                    }
+                layer_tensors["k_projection"] = find_layer_tensor(
+                    tensors,
+                    prefix,
+                    ATTENTION_K_PROJECTION_SUFFIXES,
+                    role="attention key projection",
                 )
+                value_projection = find_optional_layer_tensor(
+                    tensors, prefix, ATTENTION_V_PROJECTION_SUFFIXES
+                )
+                if value_projection is None:
+                    if not bool(decoder_config.get("attention_k_eq_v", False)):
+                        raise ModelTranspileError(
+                            f"attention layer prefix {prefix!r} has no value projection"
+                        )
+                    attention_key_equals_value = True
+                else:
+                    layer_tensors["v_projection"] = value_projection
         layer_tensors["attention_out_projection"] = find_layer_tensor(
             tensors,
             prefix,
@@ -749,11 +759,15 @@ def discover_layer_structure(
             if fused_qkv is not None
             else ("q_projection", "attention_out_projection")
             if shared_kv_source_layer is not None
-            else (
-                "q_projection",
-                "k_projection",
-                "v_projection",
-                "attention_out_projection",
+            else tuple(
+                parameter_id
+                for parameter_id in (
+                    "q_projection",
+                    "k_projection",
+                    "v_projection",
+                    "attention_out_projection",
+                )
+                if parameter_id in layer_tensors
             )
         )
         add_optional_linear_biases(tensors, layer_tensors, attention_linear_ids)
@@ -923,11 +937,13 @@ def discover_layer_structure(
         attention_scale = float(
             decoder_config.get(
                 "attention_multiplier",
-                1.0 if per_layer_input is not None else head_width**-0.5,
+                1.0
+                if per_layer_input is not None or "attention_k_eq_v" in decoder_config
+                else head_width**-0.5,
             )
         )
         value_head_norm = (
-            per_layer_input is not None
+            (per_layer_input is not None or "attention_k_eq_v" in decoder_config)
             and shared_kv_source_layer is None
             and "q_norm" in layer_tensors
             and "k_norm" in layer_tensors
@@ -958,6 +974,7 @@ def discover_layer_structure(
         rope_theta=rope_theta,
         rope_type=rope_type,
         attention_scale=attention_scale,
+        attention_key_equals_value=attention_key_equals_value,
         value_head_norm=value_head_norm,
         shared_kv_source_layer=shared_kv_source_layer,
         per_layer_input_width=per_layer_input_width,
@@ -1337,6 +1354,7 @@ def discover_outer_norm_weight_offset(
     stores_offset_weights = output_norm.endswith(offset_norm_suffixes) or any(
         layer.tensors["operator_norm"].endswith(offset_norm_suffixes)
         or layer.tensors["ffn_norm"].endswith(offset_norm_suffixes)
+        or "layer_scalar" in layer.tensors
         for layer in layers
     )
     return (
@@ -1474,6 +1492,7 @@ def make_layer(structure: ModelStructure, layer: LayerStructure) -> Json:
             "rotary_width": layer.rotary_width,
             "rms_norm_weight_offset": structure.rms_norm_weight_offset,
             "attention_output_gate": structure.attention_output_gate,
+            "attention_key_equals_value": layer.attention_key_equals_value,
             "residual_scale": structure.residual_scale,
             "attention_scale": layer.attention_scale,
             "attention_window_size": layer.attention_window_size,
@@ -1807,12 +1826,9 @@ def make_attention_operator(structure: ModelStructure, layer: LayerStructure) ->
             "out_projection": tensor_ref(layer.tensors["attention_out_projection"]),
         }
         if layer.shared_kv_source_layer is None:
-            params.update(
-                {
-                    "k_projection": tensor_ref(layer.tensors["k_projection"]),
-                    "v_projection": tensor_ref(layer.tensors["v_projection"]),
-                }
-            )
+            params["k_projection"] = tensor_ref(layer.tensors["k_projection"])
+            if "v_projection" in layer.tensors:
+                params["v_projection"] = tensor_ref(layer.tensors["v_projection"])
     for source_id, target_id in (
         ("q_projection_bias", "q_projection_bias"),
         ("k_projection_bias", "k_projection_bias"),
@@ -1832,7 +1848,11 @@ def make_attention_operator(structure: ModelStructure, layer: LayerStructure) ->
             *(
                 [
                     {"id": "k_projection", "type": "linear"},
-                    {"id": "v_projection", "type": "linear"},
+                    *(
+                        [{"id": "v_projection", "type": "linear"}]
+                        if "v_projection" in layer.tensors
+                        else []
+                    ),
                 ]
                 if layer.shared_kv_source_layer is None
                 else []
@@ -2246,9 +2266,10 @@ def find_first_existing_tensor(
         if name in tensors:
             return name
         if name.endswith(".weight"):
-            packed_name = f"{name[: -len('.weight')]}.qweight"
-            if packed_name in tensors and tensors[packed_name].get("quantization"):
-                return packed_name
+            base = name[: -len(".weight")]
+            for packed_name in (f"{base}.qweight", f"{base}.weight_packed"):
+                if packed_name in tensors and tensors[packed_name].get("quantization"):
+                    return packed_name
     return None
 
 
@@ -2273,7 +2294,13 @@ def find_optional_layer_tensor(
 
 
 def find_bias_for_weight(tensors: dict[str, Json], weight: str) -> str | None:
-    suffix = ".qweight" if weight.endswith(".qweight") else ".weight"
+    suffix = (
+        ".qweight"
+        if weight.endswith(".qweight")
+        else ".weight_packed"
+        if weight.endswith(".weight_packed")
+        else ".weight"
+    )
     if not weight.endswith(suffix):
         return None
     bias = f"{weight[: -len(suffix)]}.bias"
@@ -2452,7 +2479,12 @@ def annotate_packed_linear_tensors(
     quantization = config.get("quantization_config")
     if not isinstance(quantization, dict):
         return
-    packing_format = str(quantization.get("packing_format") or "")
+    packing_format = str(
+        quantization.get("packing_format") or quantization.get("format") or ""
+    )
+    if packing_format == "pack-quantized":
+        annotate_compressed_tensors_packed_linears(quantization, tensors)
+        return
     if packing_format not in {"auto_round:auto_gptq", "auto_round:gptq"}:
         return
     bits = int(quantization.get("bits") or 0)
@@ -2525,6 +2557,78 @@ def annotate_packed_linear_tensors(
         }
 
 
+def annotate_compressed_tensors_packed_linears(
+    quantization: Json, tensors: dict[str, Json]
+) -> None:
+    config_groups = quantization.get("config_groups")
+    if not isinstance(config_groups, dict):
+        raise ModelTranspileError(
+            "compressed-tensors pack-quantized format has no config groups"
+        )
+    schemes = [
+        group.get("weights")
+        for group in config_groups.values()
+        if isinstance(group, dict)
+        and (group.get("format") or quantization.get("format")) == "pack-quantized"
+        and isinstance(group.get("weights"), dict)
+    ]
+    if len(schemes) != 1:
+        raise ModelTranspileError(
+            "compressed-tensors pack-quantized format requires one structural weight scheme"
+        )
+    scheme = schemes[0]
+    bits = int(scheme.get("num_bits") or 0)
+    group_size = int(scheme.get("group_size") or 0)
+    symmetric = bool(scheme.get("symmetric", True))
+    if bits <= 0 or 32 % bits or group_size <= 0:
+        raise ModelTranspileError(
+            f"compressed-tensors packed linear has invalid {bits}-bit group size {group_size}"
+        )
+    pack_factor = 32 // bits
+
+    for name, info in tuple(tensors.items()):
+        if not name.endswith(".weight_packed"):
+            continue
+        base = name[: -len(".weight_packed")]
+        scale_name = f"{base}.weight_scale"
+        scale = tensors.get(scale_name)
+        if scale is None:
+            raise ModelTranspileError(
+                f"compressed packed linear tensor {name!r} is missing {scale_name!r}"
+            )
+        packed_shape = [int(value) for value in info.get("shape", [])]
+        scale_shape = [int(value) for value in scale.get("shape", [])]
+        if info.get("dtype") != "I32" or len(packed_shape) != 2:
+            raise ModelTranspileError(
+                f"compressed packed linear tensor {name!r} must be an I32 matrix"
+            )
+        if scale.get("dtype") not in {"F16", "BF16"} or len(scale_shape) != 2:
+            raise ModelTranspileError(
+                f"compressed packed linear tensor {name!r} has incompatible scales"
+            )
+        output_features = packed_shape[0]
+        input_features = scale_shape[1] * group_size
+        expected_packed_shape = [
+            output_features,
+            (input_features + pack_factor - 1) // pack_factor,
+        ]
+        expected_scale_shape = [output_features, input_features // group_size]
+        if packed_shape != expected_packed_shape or scale_shape != expected_scale_shape:
+            raise ModelTranspileError(
+                f"compressed packed linear tensor {name!r} has incompatible packed "
+                f"shape {packed_shape} or scale shape {scale_shape}"
+            )
+        info["logical_shape"] = [output_features, input_features]
+        info["quantization"] = {
+            "format": "compressed_tensors_pack_quantized",
+            "bits": bits,
+            "group_size": group_size,
+            "symmetric": symmetric,
+            "signed_offset": 1 << (bits - 1),
+            "scales": scale_name,
+        }
+
+
 def attach_packed_linear_quantization(
     tensors: dict[str, Json], layer_tensors: dict[str, str]
 ) -> None:
@@ -2533,7 +2637,8 @@ def attach_packed_linear_quantization(
         quantization = tensors[tensor_name].get("quantization")
         if not isinstance(quantization, dict):
             continue
-        additions[f"{parameter_id}_qzeros"] = str(quantization["qzeros"])
+        if "qzeros" in quantization:
+            additions[f"{parameter_id}_qzeros"] = str(quantization["qzeros"])
         additions[f"{parameter_id}_scales"] = str(quantization["scales"])
     layer_tensors.update(additions)
 

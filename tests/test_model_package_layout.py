@@ -30,6 +30,16 @@ def test_fp8_block_scales_remain_row_major() -> None:
     )
 
 
+def test_quantization_scale_grids_remain_row_major() -> None:
+    assert (
+        compiled_tensor_layout(
+            {"dtype": "BF16", "shape": [768, 16]},
+            tensor_name="projection.weight_scale",
+        )
+        == ROW_MAJOR_LAYOUT
+    )
+
+
 def test_write_compiled_tensor_interleaves_bf16_row_pairs(tmp_path: Path) -> None:
     tensor_name = "matrix.weight"
     values = tuple(range(16))
@@ -173,6 +183,31 @@ def test_compiler_renders_native_auto_gptq_int4_linear_variants(
     assert "& 15u) + 1u" in linear
     assert "unpackHalf2x16" in linear
     assert "readonly buffer Bias" in bias
+    assert "readonly buffer ResidualFrame" in residual
+    assert all("{{" not in source for source in (linear, bias, residual))
+
+
+def test_compiler_renders_native_compressed_tensors_int4_linear_variants(
+    tmp_path: Path,
+) -> None:
+    shader_source_dir = Path(__file__).parents[1] / "runtime-rs" / "shaders"
+    shader_files = {
+        "linear_int4_ct_g32_512x768.comp",
+        "linear_bias_int4_ct_g32_512x768.comp",
+        "linear_residual_int4_ct_g32_512x768.comp",
+    }
+
+    copy_shader_templates(shader_source_dir, tmp_path, shader_files)
+
+    linear = (tmp_path / "linear_int4_ct_g32_512x768.comp").read_text()
+    bias = (tmp_path / "linear_bias_int4_ct_g32_512x768.comp").read_text()
+    residual = (
+        tmp_path / "linear_residual_int4_ct_g32_512x768.comp"
+    ).read_text()
+    assert "const uint GROUP_SIZE = 32u;" in linear
+    assert "row * PACKED_COLUMNS" in linear
+    assert "int(quantized) - 8" in linear
+    assert "read_scale(row * SCALE_COLUMNS" in bias
     assert "readonly buffer ResidualFrame" in residual
     assert all("{{" not in source for source in (linear, bias, residual))
 

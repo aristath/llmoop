@@ -74,6 +74,111 @@ def test_annotates_auto_gptq_storage_as_logical_packed_linear(
     }
 
 
+def test_annotates_compressed_tensors_int4_storage_by_structure(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "config.json").write_text(
+        """{
+          "quantization_config": {
+            "format": "pack-quantized",
+            "config_groups": {
+              "linear": {
+                "format": "pack-quantized",
+                "weights": {
+                  "type": "int",
+                  "num_bits": 4,
+                  "group_size": 32,
+                  "symmetric": true
+                }
+              }
+            }
+          }
+        }"""
+    )
+    tensors = {
+        "projection.weight_packed": _tensor([768, 64], "I32"),
+        "projection.weight_scale": _tensor([768, 16], "BF16"),
+        "projection.weight_shape": _tensor([2], "I64"),
+    }
+
+    annotate_packed_linear_tensors(tmp_path, tensors)
+    parameters = {"projection": "projection.weight_packed"}
+    attach_packed_linear_quantization(tensors, parameters)
+
+    assert tensors["projection.weight_packed"]["logical_shape"] == [768, 512]
+    assert tensors["projection.weight_packed"]["quantization"] == {
+        "format": "compressed_tensors_pack_quantized",
+        "bits": 4,
+        "group_size": 32,
+        "symmetric": True,
+        "signed_offset": 8,
+        "scales": "projection.weight_scale",
+    }
+    assert parameters == {
+        "projection": "projection.weight_packed",
+        "projection_scales": "projection.weight_scale",
+    }
+
+
+def test_discovers_attention_with_values_derived_from_keys() -> None:
+    prefix = "model.layers.0"
+    tensors = {
+        "model.embed_tokens.weight": _tensor([1024, 512]),
+        "model.norm.weight": _tensor([512]),
+        f"{prefix}.input_layernorm.weight": _tensor([512]),
+        f"{prefix}.post_attention_layernorm.weight": _tensor([512]),
+        f"{prefix}.pre_feedforward_layernorm.weight": _tensor([512]),
+        f"{prefix}.post_feedforward_layernorm.weight": _tensor([512]),
+        f"{prefix}.layer_scalar": _tensor([1]),
+        f"{prefix}.self_attn.q_proj.weight": _tensor([1024, 512]),
+        f"{prefix}.self_attn.k_proj.weight": _tensor([256, 512]),
+        f"{prefix}.self_attn.o_proj.weight": _tensor([512, 1024]),
+        f"{prefix}.self_attn.q_norm.weight": _tensor([128]),
+        f"{prefix}.self_attn.k_norm.weight": _tensor([128]),
+        f"{prefix}.mlp.gate_proj.weight": _tensor([2048, 512]),
+        f"{prefix}.mlp.up_proj.weight": _tensor([2048, 512]),
+        f"{prefix}.mlp.down_proj.weight": _tensor([512, 2048]),
+    }
+    config = {
+        "model_type": "synthetic_key_value_attention",
+        "hidden_size": 512,
+        "intermediate_size": 2048,
+        "num_hidden_layers": 1,
+        "num_attention_heads": 8,
+        "num_key_value_heads": 4,
+        "global_head_dim": 128,
+        "layer_types": ["full_attention"],
+        "attention_k_eq_v": True,
+        "vocab_size": 1024,
+        "max_position_embeddings": 4096,
+        "rms_norm_eps": 1e-6,
+        "rope_parameters": {
+            "full_attention": {
+                "rope_theta": 1_000_000.0,
+                "rope_type": "proportional",
+                "partial_rotary_factor": 0.25,
+            }
+        },
+    }
+
+    structure = discover_model_structure(Path("synthetic"), config, tensors)
+    layer = structure.layers[0]
+    circuit = build_pedal_circuit(
+        make_layer(structure, layer), Path("layer_00.json")
+    )
+    nodes = {node["id"]: node for node in circuit["nodes"]}
+
+    assert layer.attention_key_equals_value
+    assert layer.head_width == 128
+    assert layer.num_key_value_heads == 2
+    assert layer.attention_scale == 1.0
+    assert layer.value_head_norm
+    assert structure.rms_norm_weight_offset == 1.0
+    assert "v_projection" not in nodes
+    assert nodes["v_head_norm"]["inputs"] == ["k_projected"]
+    assert nodes["kv_memory_append"]["inputs"][:2] == ["k_positioned", "v_normed"]
+
+
 def test_synthesizes_separate_experts_as_packed_circuit_parameters() -> None:
     tensors: dict[str, dict[str, object]] = {}
 

@@ -441,13 +441,21 @@ def _attention_nodes(
                             "outputs": ["k_projected"],
                             "params": _linear_params("k_projection", parameters),
                         },
-                        {
-                            "id": "v_projection",
-                            "op": "linear",
-                            "inputs": ["operator_norm_out"],
-                            "outputs": ["v_projected"],
-                            "params": _linear_params("v_projection", parameters),
-                        },
+                        *(
+                            [
+                                {
+                                    "id": "v_projection",
+                                    "op": "linear",
+                                    "inputs": ["operator_norm_out"],
+                                    "outputs": ["v_projected"],
+                                    "params": _linear_params(
+                                        "v_projection", parameters
+                                    ),
+                                }
+                            ]
+                            if "v_projection" in parameters
+                            else []
+                        ),
                     ]
                     if "k_projection" in parameters
                     else []
@@ -500,13 +508,17 @@ def _attention_nodes(
             }
         )
         k_rope_input = "k_normed"
-    value_input = "v_projected"
+    value_input = (
+        "k_projected"
+        if numerics.get("attention_key_equals_value")
+        else "v_projected"
+    )
     if has_value_norm:
         nodes.append(
             {
                 "id": "v_head_norm",
                 "op": "rms_norm_per_head_unscaled",
-                "inputs": ["v_projected"],
+                "inputs": [value_input],
                 "outputs": ["v_normed"],
                 "attrs": {**_norm_attrs(numerics), **heads},
             }
@@ -1123,12 +1135,14 @@ def _linear_params(weight_id: str, parameters: Json) -> list[str]:
         result.append(scale_id)
     qzeros_id = f"{weight_id}_qzeros"
     scales_id = f"{weight_id}_scales"
-    if qzeros_id in parameters or scales_id in parameters:
-        if qzeros_id not in parameters or scales_id not in parameters:
+    if qzeros_id in parameters:
+        if scales_id not in parameters:
             raise CircuitLoweringError(
                 f"packed linear parameter {weight_id!r} has incomplete quantization metadata"
             )
         result.extend((qzeros_id, scales_id))
+    elif scales_id in parameters:
+        result.append(scales_id)
     bias_id = f"{weight_id}_bias"
     if bias_id in parameters:
         result.append(bias_id)

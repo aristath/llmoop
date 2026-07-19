@@ -450,13 +450,29 @@ def shader_file_for_node(
         out_features, in_features = parameter_shape
         parameter_dtype = parameter_dtype_for_node(circuit, node, tensor_index)
         if parameter_dtype == "I32":
-            group_size = packed_int4_linear_group_size_for_node(
+            quantization_format = packed_linear_quantization_format_for_node(
                 circuit, node, tensor_index
             )
-            has_bias = len(node.get("params", [])) == 4
+            if quantization_format == "auto_gptq":
+                group_size = packed_int4_linear_group_size_for_node(
+                    circuit, node, tensor_index
+                )
+                format_token = "gptq"
+                has_bias = len(node.get("params", [])) == 4
+            elif quantization_format == "compressed_tensors_pack_quantized":
+                group_size = compressed_tensors_int4_group_size_for_node(
+                    circuit, node, tensor_index
+                )
+                format_token = "ct"
+                has_bias = len(node.get("params", [])) == 3
+            else:
+                raise ModelCompileError(
+                    f"linear node {node['id']!r} has unsupported packed format "
+                    f"{quantization_format!r}"
+                )
             prefix = "linear_bias" if has_bias else "linear"
             return (
-                f"{prefix}_int4_gptq_g{group_size}_"
+                f"{prefix}_int4_{format_token}_g{group_size}_"
                 f"{in_features}x{out_features}.comp"
             )
         if parameter_dtype == "F8_E4M3":
@@ -488,11 +504,26 @@ def shader_file_for_node(
         out_features, in_features = parameter_shape
         parameter_dtype = parameter_dtype_for_node(circuit, node, tensor_index)
         if parameter_dtype == "I32":
-            group_size = packed_int4_linear_group_size_for_node(
+            quantization_format = packed_linear_quantization_format_for_node(
                 circuit, node, tensor_index
             )
+            if quantization_format == "auto_gptq":
+                group_size = packed_int4_linear_group_size_for_node(
+                    circuit, node, tensor_index
+                )
+                format_token = "gptq"
+            elif quantization_format == "compressed_tensors_pack_quantized":
+                group_size = compressed_tensors_int4_group_size_for_node(
+                    circuit, node, tensor_index
+                )
+                format_token = "ct"
+            else:
+                raise ModelCompileError(
+                    f"linear-residual node {node['id']!r} has unsupported packed "
+                    f"format {quantization_format!r}"
+                )
             return (
-                f"linear_residual_int4_gptq_g{group_size}_"
+                f"linear_residual_int4_{format_token}_g{group_size}_"
                 f"{in_features}x{out_features}.comp"
             )
         if parameter_dtype == "F8_E4M3":
@@ -814,6 +845,21 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
         return rendered
 
     shaped_templates = (
+        (
+            r"linear_int4_ct_g(\d+)_(\d+)x(\d+)\.comp",
+            "linear_int4_ct.comp.template",
+            ("GROUP_SIZE", "INPUT_SIZE", "OUTPUT_SIZE"),
+        ),
+        (
+            r"linear_bias_int4_ct_g(\d+)_(\d+)x(\d+)\.comp",
+            "linear_bias_int4_ct.comp.template",
+            ("GROUP_SIZE", "INPUT_SIZE", "OUTPUT_SIZE"),
+        ),
+        (
+            r"linear_residual_int4_ct_g(\d+)_(\d+)x(\d+)\.comp",
+            "linear_residual_int4_ct.comp.template",
+            ("GROUP_SIZE", "INPUT_SIZE", "OUTPUT_SIZE"),
+        ),
         (
             r"linear_int4_gptq_g(\d+)_(\d+)x(\d+)\.comp",
             "linear_int4_gptq.comp.template",
@@ -1544,7 +1590,9 @@ def compiled_tensor_layout(info: Json, *, tensor_name: str | None = None) -> str
         return ROW_MAJOR_LAYOUT
     if (
         info.get("dtype") == "BF16"
-        and not (tensor_name or "").endswith(".weight_scale_inv")
+        and not (tensor_name or "").endswith(
+            (".weight_scale_inv", ".weight_scale", ".scales")
+        )
         and len(shape) == 2
         and shape[0] % 2 == 0
         and shape[1] % 2 == 0
@@ -1805,6 +1853,87 @@ def packed_int4_linear_group_size_for_node(
         circuit, actual_params[3], tensor_index
     ) != "BF16":
         raise ModelCompileError("packed INT4 linear bias must use BF16 storage")
+    return group_size
+
+
+def packed_linear_quantization_format_for_node(
+    circuit: Json, node: Json, tensor_index: Json
+) -> str:
+    weight_id = str(node["params"][0])
+    weight_ref = circuit["parameters"]["refs"][weight_id]
+    quantization = tensor_index["tensors"][weight_ref["tensor"]].get(
+        "quantization"
+    )
+    if not isinstance(quantization, dict) or not quantization.get("format"):
+        raise ModelCompileError(
+            f"packed linear node {node['id']!r} has no quantization format"
+        )
+    return str(quantization["format"])
+
+
+def compressed_tensors_int4_group_size_for_node(
+    circuit: Json, node: Json, tensor_index: Json
+) -> int:
+    weight_id = str(node["params"][0])
+    scales_id = f"{weight_id}_scales"
+    expected_params = [weight_id, scales_id]
+    actual_params = list(node.get("params", []))
+    if node["op"] == "linear" and len(actual_params) == 3:
+        expected_params.append(f"{weight_id}_bias")
+    if actual_params != expected_params:
+        raise ModelCompileError(
+            f"compressed-tensors INT4 node {node['id']!r} must bind "
+            f"{expected_params}; got {actual_params}"
+        )
+    weight_ref = circuit["parameters"]["refs"][weight_id]
+    weight_info = tensor_index["tensors"][weight_ref["tensor"]]
+    quantization = weight_info.get("quantization")
+    if (
+        not isinstance(quantization, dict)
+        or quantization.get("format") != "compressed_tensors_pack_quantized"
+        or int(quantization.get("bits") or 0) != 4
+        or int(quantization.get("signed_offset") or 0) != 8
+        or not bool(quantization.get("symmetric"))
+    ):
+        raise ModelCompileError(
+            f"compressed-tensors INT4 node {node['id']!r} has unsupported "
+            f"quantization {quantization}"
+        )
+    out_features, in_features = parameter_shape_for_id(
+        circuit, weight_id, tensor_index
+    )
+    packed_shape = [int(value) for value in weight_info.get("shape", [])]
+    scales_shape = parameter_shape_for_id(circuit, scales_id, tensor_index)
+    group_size = int(quantization.get("group_size") or 0)
+    if packed_shape != [out_features, (in_features + 7) // 8]:
+        raise ModelCompileError(
+            f"compressed-tensors INT4 weight shape {packed_shape} does not encode "
+            f"{[out_features, in_features]}"
+        )
+    if group_size <= 0 or scales_shape != [
+        out_features,
+        (in_features + group_size - 1) // group_size,
+    ]:
+        raise ModelCompileError(
+            f"compressed-tensors INT4 scale shape {scales_shape} is incompatible "
+            f"with {[out_features, in_features]}"
+        )
+    if parameter_dtype_for_id(circuit, scales_id, tensor_index) != "BF16":
+        raise ModelCompileError("compressed-tensors INT4 scales must use BF16 storage")
+    if any(
+        parameter_layout_for_id(circuit, parameter_id, tensor_index)
+        != ROW_MAJOR_LAYOUT
+        for parameter_id in (weight_id, scales_id)
+    ):
+        raise ModelCompileError(
+            "compressed-tensors INT4 parameters must use row-major storage"
+        )
+    if len(actual_params) == 3 and parameter_dtype_for_id(
+        circuit, actual_params[2], tensor_index
+    ) != "BF16":
+        raise ModelCompileError(
+            "compressed-tensors INT4 linear bias must use BF16 storage"
+        )
     return group_size
 
 
