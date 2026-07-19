@@ -3107,9 +3107,20 @@ impl VulkanResidentInputEmbeddingTransducerRunner {
         VulkanResidentInputEmbeddingTransducerRun,
         VulkanResidentInputEmbeddingTransducerRunnerError,
     > {
+        let run = self.prepare_token_id(token_id)?;
+        device.run_resident_kernel_dispatch(&self.resident_dispatch, &[])?;
+        Ok(run)
+    }
+
+    fn prepare_token_id(
+        &self,
+        token_id: u32,
+    ) -> Result<
+        VulkanResidentInputEmbeddingTransducerRun,
+        VulkanResidentInputEmbeddingTransducerRunnerError,
+    > {
         self.stream_control_buffer
             .write_bytes(&token_id.to_le_bytes())?;
-        device.run_resident_kernel_dispatch(&self.resident_dispatch, &[])?;
         Ok(self.completed_run(token_id))
     }
 
@@ -7502,6 +7513,13 @@ pub struct VulkanResidentInProcessPlacedModelPackageDevice {
     resident_execution_plan: VulkanMountedPlacedResidentStreamTickExecutionPlan,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VulkanResidentPlacedTokenTickTail {
+    None,
+    Logits,
+    Sample,
+}
+
 impl VulkanResidentInProcessPlacedModelPackage {
     pub fn from_manifest_file(
         device: &VulkanComputeDevice,
@@ -7913,6 +7931,192 @@ impl VulkanResidentInProcessPlacedModelPackage {
         .map_err(VulkanResidentInProcessPlacedModelPackageError::Tick)
     }
 
+    fn run_prepared_token_id_stream_tick_in_process_with_transport(
+        &self,
+        device: &VulkanComputeDevice,
+        transport: &mut VulkanInProcessPlacedCableTransport,
+        token_id: u32,
+        stream_tick: u64,
+        max_scheduler_turns: usize,
+        tail: VulkanResidentPlacedTokenTickTail,
+    ) -> Result<
+        (
+            VulkanResidentInProcessPlacedSingleTokenTickRun,
+            Option<VulkanResidentSamplerRun>,
+        ),
+        VulkanResidentInProcessPlacedModelPackageError,
+    > {
+        let input_run = self
+            .input_transducer
+            .prepare_token_id(token_id)
+            .map_err(VulkanResidentInProcessPlacedModelPackageError::InputTransducer)?;
+        let mut tick_slices = Vec::with_capacity(self.device_slices.len());
+        for slice in &self.device_slices {
+            let mut dispatch_extensions =
+                VulkanMountedPlacedResidentStreamTickDispatchExtensions::default();
+            if slice.device_id == self.input_device_id {
+                dispatch_extensions
+                    .prefix_dispatches
+                    .push(&self.input_transducer.resident_dispatch);
+            }
+            if slice.device_id == self.output_device_id
+                && tail != VulkanResidentPlacedTokenTickTail::None
+            {
+                dispatch_extensions
+                    .suffix_dispatches
+                    .push(&self.output_transducer.embedding_norm_dispatch);
+                dispatch_extensions
+                    .suffix_dispatches
+                    .push(&self.output_transducer.tied_projection_dispatch);
+                if tail == VulkanResidentPlacedTokenTickTail::Sample {
+                    dispatch_extensions
+                        .suffix_dispatches
+                        .push(&self.sampler.resident_dispatch);
+                }
+            }
+            tick_slices.push(
+                VulkanMountedPlacedResidentInProcessStreamTickSlice::new_with_dispatch_extensions(
+                    device,
+                    &slice.mounted,
+                    &slice.resident_execution_plan,
+                    dispatch_extensions,
+                    stream_tick,
+                ),
+            );
+        }
+        let placed_run = run_mounted_placed_resident_stream_tick_slices_in_process(
+            &mut tick_slices,
+            transport,
+            max_scheduler_turns,
+        )
+        .map_err(VulkanResidentInProcessPlacedModelPackageError::Tick)?;
+        if placed_run.status != VulkanMountedPlacedResidentInProcessStreamTickRunStatus::Completed {
+            return Err(
+                VulkanResidentInProcessPlacedModelPackageError::IncompleteTick(placed_run.status),
+            );
+        }
+        let output_run = (tail != VulkanResidentPlacedTokenTickTail::None)
+            .then(|| self.output_transducer.completed_run());
+        let sampler_run = if tail == VulkanResidentPlacedTokenTickTail::Sample {
+            Some(
+                self.sampler
+                    .completed_run()
+                    .map_err(VulkanResidentInProcessPlacedModelPackageError::Sampler)?,
+            )
+        } else {
+            None
+        };
+        Ok((
+            VulkanResidentInProcessPlacedSingleTokenTickRun {
+                input_device_id: self.input_device_id.clone(),
+                output_device_id: self.output_device_id.clone(),
+                token_id,
+                stream_tick,
+                input_run,
+                placed_run,
+                output_run,
+            },
+            sampler_run,
+        ))
+    }
+
+    fn run_prepared_token_id_stream_tick_on_bound_devices_in_process_with_transport(
+        &self,
+        devices: &BTreeMap<String, Arc<VulkanComputeDevice>>,
+        transport: &mut VulkanInProcessPlacedCableTransport,
+        token_id: u32,
+        stream_tick: u64,
+        max_scheduler_turns: usize,
+        tail: VulkanResidentPlacedTokenTickTail,
+    ) -> Result<
+        (
+            VulkanResidentInProcessPlacedSingleTokenTickRun,
+            Option<VulkanResidentSamplerRun>,
+        ),
+        VulkanResidentInProcessPlacedModelPackageError,
+    > {
+        let input_run = self
+            .input_transducer
+            .prepare_token_id(token_id)
+            .map_err(VulkanResidentInProcessPlacedModelPackageError::InputTransducer)?;
+        let mut tick_slices = Vec::with_capacity(self.device_slices.len());
+        for slice in &self.device_slices {
+            let slice_device = devices
+                .get(&slice.device_id)
+                .map(|device| device.as_ref())
+                .ok_or_else(|| {
+                    VulkanResidentInProcessPlacedModelPackageError::MissingBoundDevice {
+                        device_id: slice.device_id.clone(),
+                    }
+                })?;
+            let mut dispatch_extensions =
+                VulkanMountedPlacedResidentStreamTickDispatchExtensions::default();
+            if slice.device_id == self.input_device_id {
+                dispatch_extensions
+                    .prefix_dispatches
+                    .push(&self.input_transducer.resident_dispatch);
+            }
+            if slice.device_id == self.output_device_id
+                && tail != VulkanResidentPlacedTokenTickTail::None
+            {
+                dispatch_extensions
+                    .suffix_dispatches
+                    .push(&self.output_transducer.embedding_norm_dispatch);
+                dispatch_extensions
+                    .suffix_dispatches
+                    .push(&self.output_transducer.tied_projection_dispatch);
+                if tail == VulkanResidentPlacedTokenTickTail::Sample {
+                    dispatch_extensions
+                        .suffix_dispatches
+                        .push(&self.sampler.resident_dispatch);
+                }
+            }
+            tick_slices.push(
+                VulkanMountedPlacedResidentInProcessStreamTickSlice::new_with_dispatch_extensions(
+                    slice_device,
+                    &slice.mounted,
+                    &slice.resident_execution_plan,
+                    dispatch_extensions,
+                    stream_tick,
+                ),
+            );
+        }
+        let placed_run = run_mounted_placed_resident_stream_tick_slices_in_process(
+            &mut tick_slices,
+            transport,
+            max_scheduler_turns,
+        )
+        .map_err(VulkanResidentInProcessPlacedModelPackageError::Tick)?;
+        if placed_run.status != VulkanMountedPlacedResidentInProcessStreamTickRunStatus::Completed {
+            return Err(
+                VulkanResidentInProcessPlacedModelPackageError::IncompleteTick(placed_run.status),
+            );
+        }
+        let output_run = (tail != VulkanResidentPlacedTokenTickTail::None)
+            .then(|| self.output_transducer.completed_run());
+        let sampler_run = if tail == VulkanResidentPlacedTokenTickTail::Sample {
+            Some(
+                self.sampler
+                    .completed_run()
+                    .map_err(VulkanResidentInProcessPlacedModelPackageError::Sampler)?,
+            )
+        } else {
+            None
+        };
+        Ok((
+            VulkanResidentInProcessPlacedSingleTokenTickRun {
+                input_device_id: self.input_device_id.clone(),
+                output_device_id: self.output_device_id.clone(),
+                token_id,
+                stream_tick,
+                input_run,
+                placed_run,
+                output_run,
+            },
+            sampler_run,
+        ))
+    }
+
     pub fn run_token_id_stream_tick_in_process(
         &self,
         device: &VulkanComputeDevice,
@@ -7944,34 +8148,15 @@ impl VulkanResidentInProcessPlacedModelPackage {
         VulkanResidentInProcessPlacedSingleTokenTickRun,
         VulkanResidentInProcessPlacedModelPackageError,
     > {
-        let input_run = self
-            .input_transducer
-            .run_token_id(device, token_id)
-            .map_err(VulkanResidentInProcessPlacedModelPackageError::InputTransducer)?;
-        let placed_run = self.run_stream_tick_in_process_with_transport(
+        self.run_prepared_token_id_stream_tick_in_process_with_transport(
             device,
             transport,
-            stream_tick,
-            max_scheduler_turns,
-        )?;
-        if placed_run.status != VulkanMountedPlacedResidentInProcessStreamTickRunStatus::Completed {
-            return Err(
-                VulkanResidentInProcessPlacedModelPackageError::IncompleteTick(placed_run.status),
-            );
-        }
-        let output_run = self
-            .output_transducer
-            .run(device)
-            .map_err(VulkanResidentInProcessPlacedModelPackageError::OutputTransducer)?;
-        Ok(VulkanResidentInProcessPlacedSingleTokenTickRun {
-            input_device_id: self.input_device_id.clone(),
-            output_device_id: self.output_device_id.clone(),
             token_id,
             stream_tick,
-            input_run,
-            placed_run,
-            output_run,
-        })
+            max_scheduler_turns,
+            VulkanResidentPlacedTokenTickTail::Logits,
+        )
+        .map(|(tick_run, _)| tick_run)
     }
 
     pub fn run_token_id_stream_tick_on_bound_devices_in_process(
@@ -8005,50 +8190,15 @@ impl VulkanResidentInProcessPlacedModelPackage {
         VulkanResidentInProcessPlacedSingleTokenTickRun,
         VulkanResidentInProcessPlacedModelPackageError,
     > {
-        let input_device = devices
-            .get(&self.input_device_id)
-            .map(|device| device.as_ref())
-            .ok_or_else(
-                || VulkanResidentInProcessPlacedModelPackageError::MissingBoundDevice {
-                    device_id: self.input_device_id.clone(),
-                },
-            )?;
-        let output_device = devices
-            .get(&self.output_device_id)
-            .map(|device| device.as_ref())
-            .ok_or_else(
-                || VulkanResidentInProcessPlacedModelPackageError::MissingBoundDevice {
-                    device_id: self.output_device_id.clone(),
-                },
-            )?;
-        let input_run = self
-            .input_transducer
-            .run_token_id(input_device, token_id)
-            .map_err(VulkanResidentInProcessPlacedModelPackageError::InputTransducer)?;
-        let placed_run = self.run_stream_tick_on_bound_devices_in_process_with_transport(
+        self.run_prepared_token_id_stream_tick_on_bound_devices_in_process_with_transport(
             devices,
             transport,
-            stream_tick,
-            max_scheduler_turns,
-        )?;
-        if placed_run.status != VulkanMountedPlacedResidentInProcessStreamTickRunStatus::Completed {
-            return Err(
-                VulkanResidentInProcessPlacedModelPackageError::IncompleteTick(placed_run.status),
-            );
-        }
-        let output_run = self
-            .output_transducer
-            .run(output_device)
-            .map_err(VulkanResidentInProcessPlacedModelPackageError::OutputTransducer)?;
-        Ok(VulkanResidentInProcessPlacedSingleTokenTickRun {
-            input_device_id: self.input_device_id.clone(),
-            output_device_id: self.output_device_id.clone(),
             token_id,
             stream_tick,
-            input_run,
-            placed_run,
-            output_run,
-        })
+            max_scheduler_turns,
+            VulkanResidentPlacedTokenTickTail::Logits,
+        )
+        .map(|(tick_run, _)| tick_run)
     }
 
     pub fn sample_token_id_stream_tick_in_process(
@@ -8082,20 +8232,19 @@ impl VulkanResidentInProcessPlacedModelPackage {
         VulkanResidentInProcessPlacedSingleTokenSampleRun,
         VulkanResidentInProcessPlacedModelPackageError,
     > {
-        let tick_run = self.run_token_id_stream_tick_in_process_with_transport(
-            device,
-            transport,
-            token_id,
-            stream_tick,
-            max_scheduler_turns,
-        )?;
-        let sampler_run = self
-            .sampler
-            .run(device)
-            .map_err(VulkanResidentInProcessPlacedModelPackageError::Sampler)?;
+        let (tick_run, sampler_run) = self
+            .run_prepared_token_id_stream_tick_in_process_with_transport(
+                device,
+                transport,
+                token_id,
+                stream_tick,
+                max_scheduler_turns,
+                VulkanResidentPlacedTokenTickTail::Sample,
+            )?;
         Ok(VulkanResidentInProcessPlacedSingleTokenSampleRun {
             tick_run,
-            sampler_run,
+            sampler_run: sampler_run
+                .ok_or(VulkanResidentInProcessPlacedModelPackageError::MissingFusedSamplerRun)?,
         })
     }
 
@@ -8245,27 +8394,30 @@ impl VulkanResidentInProcessPlacedModelPackage {
                     VulkanResidentInProcessPlacedModelPackageError::StreamTickOverflow
                 })?)
                 .ok_or(VulkanResidentInProcessPlacedModelPackageError::StreamTickOverflow)?;
-            let tick_run = self.run_token_id_stream_tick_in_process_with_transport(
-                device,
-                transport,
-                input_token_id,
-                stream_tick,
-                max_scheduler_turns_per_tick,
-            )?;
-
             let external_inputs_remaining = prompt_token_ids.len() - external_input_index;
             let should_emit_public_output =
                 remaining_public_outputs > 0 && external_inputs_remaining == 0;
+            let (tick_run, mut sampler_run) = self
+                .run_prepared_token_id_stream_tick_in_process_with_transport(
+                    device,
+                    transport,
+                    input_token_id,
+                    stream_tick,
+                    max_scheduler_turns_per_tick,
+                    if should_emit_public_output {
+                        VulkanResidentPlacedTokenTickTail::Sample
+                    } else {
+                        VulkanResidentPlacedTokenTickTail::None
+                    },
+                )?;
             let mut public_output_token_id = None;
             let mut private_feedback_token_id = None;
             let mut private_feedback_closes_loop_after_processing = None;
-            let mut sampler_run = None;
 
             if should_emit_public_output {
-                let run = self
-                    .sampler
-                    .run(device)
-                    .map_err(VulkanResidentInProcessPlacedModelPackageError::Sampler)?;
+                let run = sampler_run.take().ok_or(
+                    VulkanResidentInProcessPlacedModelPackageError::MissingFusedSamplerRun,
+                )?;
                 let sampled_token_id = run.token_id;
                 generated_token_ids.push(sampled_token_id);
                 public_output_token_id = Some(sampled_token_id);
@@ -8397,14 +8549,6 @@ impl VulkanResidentInProcessPlacedModelPackage {
         if prompt_token_ids.is_empty() {
             return Err(VulkanResidentInProcessPlacedModelPackageError::EmptyPromptEvent);
         }
-        let output_device = devices
-            .get(&self.output_device_id)
-            .map(|device| device.as_ref())
-            .ok_or_else(
-                || VulkanResidentInProcessPlacedModelPackageError::MissingBoundDevice {
-                    device_id: self.output_device_id.clone(),
-                },
-            )?;
 
         let mut external_input_index = 0usize;
         let mut pending_feedback: Option<VulkanResidentPendingPrivateFeedback> = None;
@@ -8441,28 +8585,30 @@ impl VulkanResidentInProcessPlacedModelPackage {
                     VulkanResidentInProcessPlacedModelPackageError::StreamTickOverflow
                 })?)
                 .ok_or(VulkanResidentInProcessPlacedModelPackageError::StreamTickOverflow)?;
-            let tick_run = self
-                .run_token_id_stream_tick_on_bound_devices_in_process_with_transport(
+            let external_inputs_remaining = prompt_token_ids.len() - external_input_index;
+            let should_emit_public_output =
+                remaining_public_outputs > 0 && external_inputs_remaining == 0;
+            let (tick_run, mut sampler_run) = self
+                .run_prepared_token_id_stream_tick_on_bound_devices_in_process_with_transport(
                     devices,
                     transport,
                     input_token_id,
                     stream_tick,
                     max_scheduler_turns_per_tick,
+                    if should_emit_public_output {
+                        VulkanResidentPlacedTokenTickTail::Sample
+                    } else {
+                        VulkanResidentPlacedTokenTickTail::None
+                    },
                 )?;
-
-            let external_inputs_remaining = prompt_token_ids.len() - external_input_index;
-            let should_emit_public_output =
-                remaining_public_outputs > 0 && external_inputs_remaining == 0;
             let mut public_output_token_id = None;
             let mut private_feedback_token_id = None;
             let mut private_feedback_closes_loop_after_processing = None;
-            let mut sampler_run = None;
 
             if should_emit_public_output {
-                let run = self
-                    .sampler
-                    .run(output_device)
-                    .map_err(VulkanResidentInProcessPlacedModelPackageError::Sampler)?;
+                let run = sampler_run.take().ok_or(
+                    VulkanResidentInProcessPlacedModelPackageError::MissingFusedSamplerRun,
+                )?;
                 let sampled_token_id = run.token_id;
                 generated_token_ids.push(sampled_token_id);
                 on_output_token(sampled_token_id);
@@ -8535,7 +8681,7 @@ pub struct VulkanResidentInProcessPlacedSingleTokenTickRun {
     pub stream_tick: u64,
     pub input_run: VulkanResidentInputEmbeddingTransducerRun,
     pub placed_run: VulkanMountedPlacedResidentInProcessStreamTickRun,
-    pub output_run: VulkanResidentOutputTransducerRun,
+    pub output_run: Option<VulkanResidentOutputTransducerRun>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -9449,6 +9595,7 @@ pub enum VulkanResidentInProcessPlacedModelPackageError {
     ZeroTickBudget,
     EmptyPromptEvent,
     MissingPrivateFeedback,
+    MissingFusedSamplerRun,
     MissingBoundDevice { device_id: String },
     StreamTickOverflow,
     FeedbackDepthOverflow,
@@ -9471,6 +9618,9 @@ impl Display for VulkanResidentInProcessPlacedModelPackageError {
             Self::EmptyPromptEvent => f.write_str("placed prompt event must not be empty"),
             Self::MissingPrivateFeedback => {
                 f.write_str("placed feedback loop is missing private feedback")
+            }
+            Self::MissingFusedSamplerRun => {
+                f.write_str("placed token tick completed without its fused sampler result")
             }
             Self::MissingBoundDevice { device_id } => write!(
                 f,
@@ -11264,6 +11414,8 @@ impl VulkanMountedPlacedResidentDispatchSegmentRunner {
         &self,
         device: &VulkanComputeDevice,
         control: VulkanMountedPlacedStreamControl,
+        prefix_dispatches: &[&VulkanResidentKernelDispatch],
+        suffix_dispatches: &[&VulkanResidentKernelDispatch],
     ) -> Result<
         Vec<VulkanMountedPlacedResidentPedalRun>,
         VulkanMountedPlacedResidentKernelDispatchError,
@@ -11280,14 +11432,24 @@ impl VulkanMountedPlacedResidentDispatchSegmentRunner {
             .iter()
             .map(|dispatch| stream_control_push_constant_bytes(&dispatch.push_constants, control))
             .collect::<Result<Vec<_>, _>>()?;
-        let steps = self
-            .dispatches
-            .iter()
-            .zip(&push_constants)
-            .map(|(dispatch, push_constants)| {
+        let mut steps = Vec::with_capacity(
+            prefix_dispatches.len() + self.dispatches.len() + suffix_dispatches.len(),
+        );
+        steps.extend(
+            prefix_dispatches
+                .iter()
+                .map(|dispatch| VulkanResidentKernelSequenceStep::new(dispatch, &[])),
+        );
+        steps.extend(self.dispatches.iter().zip(&push_constants).map(
+            |(dispatch, push_constants)| {
                 VulkanResidentKernelSequenceStep::new(&dispatch.resident_dispatch, push_constants)
-            })
-            .collect::<Vec<_>>();
+            },
+        ));
+        steps.extend(
+            suffix_dispatches
+                .iter()
+                .map(|dispatch| VulkanResidentKernelSequenceStep::new(dispatch, &[])),
+        );
         let execution_start = Instant::now();
         device
             .run_resident_kernel_sequence(&self.sequence, &steps)
@@ -11383,6 +11545,13 @@ impl VulkanMountedPlacedResidentStreamTickExecutionPlan {
                 )?,
             );
         }
+        if dispatch_segments.is_empty() {
+            return Err(
+                VulkanMountedPlacedResidentKernelDispatchError::MissingExecutionDispatchSegments {
+                    device_id: tick_plan.device_id.clone(),
+                },
+            );
+        }
         let dispatch_count = dispatch_segments
             .iter()
             .map(|segment| segment.dispatch_count)
@@ -11403,6 +11572,18 @@ impl VulkanMountedPlacedResidentStreamTickExecutionPlan {
         self.dispatch_segments
             .iter()
             .find(|segment| segment.start_stage_index == stage_index)
+    }
+
+    fn first_dispatch_segment_stage_index(&self) -> Option<usize> {
+        self.dispatch_segments
+            .first()
+            .map(|segment| segment.start_stage_index)
+    }
+
+    fn last_dispatch_segment_stage_index(&self) -> Option<usize> {
+        self.dispatch_segments
+            .last()
+            .map(|segment| segment.start_stage_index)
     }
 }
 
@@ -14003,10 +14184,13 @@ impl VulkanMountedPlacedResidentStreamTickCursor {
             self.tick_plan.clone(),
         )
         .map_err(VulkanMountedPlacedResidentStreamTickError::Dispatch)?;
+        let dispatch_extensions =
+            VulkanMountedPlacedResidentStreamTickDispatchExtensions::default();
         self.advance_with_resident_execution_plan_and_in_process_transport(
             device,
             mounted,
             &execution_plan,
+            &dispatch_extensions,
             transport,
         )
     }
@@ -14016,6 +14200,7 @@ impl VulkanMountedPlacedResidentStreamTickCursor {
         device: &VulkanComputeDevice,
         mounted: &VulkanMountedPlacedStreamCircuit,
         execution_plan: &VulkanMountedPlacedResidentStreamTickExecutionPlan,
+        dispatch_extensions: &VulkanMountedPlacedResidentStreamTickDispatchExtensions<'_>,
         transport: &mut VulkanInProcessPlacedCableTransport,
     ) -> Result<
         VulkanMountedPlacedResidentStreamTickCursorAdvance,
@@ -14083,7 +14268,24 @@ impl VulkanMountedPlacedResidentStreamTickCursor {
                         })?;
                     self.pedal_runs.extend(
                         segment
-                            .run_with_stream_control(device, control)
+                            .run_with_stream_control(
+                                device,
+                                control,
+                                if execution_plan.first_dispatch_segment_stage_index()
+                                    == Some(segment.start_stage_index)
+                                {
+                                    &dispatch_extensions.prefix_dispatches
+                                } else {
+                                    &[]
+                                },
+                                if execution_plan.last_dispatch_segment_stage_index()
+                                    == Some(segment.start_stage_index)
+                                {
+                                    &dispatch_extensions.suffix_dispatches
+                                } else {
+                                    &[]
+                                },
+                            )
                             .map_err(VulkanMountedPlacedResidentStreamTickError::Dispatch)?,
                     );
                     while self.next_stage_index < segment.end_stage_index {
@@ -14204,10 +14406,17 @@ pub struct VulkanMountedPlacedResidentStreamTickCursorAdvance {
     pub run: VulkanMountedPlacedResidentStreamTickRun,
 }
 
+#[derive(Default)]
+pub struct VulkanMountedPlacedResidentStreamTickDispatchExtensions<'a> {
+    pub prefix_dispatches: Vec<&'a VulkanResidentKernelDispatch>,
+    pub suffix_dispatches: Vec<&'a VulkanResidentKernelDispatch>,
+}
+
 pub struct VulkanMountedPlacedResidentInProcessStreamTickSlice<'a> {
     pub device: &'a VulkanComputeDevice,
     pub mounted: &'a VulkanMountedPlacedStreamCircuit,
     pub execution_plan: &'a VulkanMountedPlacedResidentStreamTickExecutionPlan,
+    pub dispatch_extensions: VulkanMountedPlacedResidentStreamTickDispatchExtensions<'a>,
     pub cursor: VulkanMountedPlacedResidentStreamTickCursor,
 }
 
@@ -14218,10 +14427,27 @@ impl<'a> VulkanMountedPlacedResidentInProcessStreamTickSlice<'a> {
         execution_plan: &'a VulkanMountedPlacedResidentStreamTickExecutionPlan,
         stream_tick: u64,
     ) -> Self {
+        Self::new_with_dispatch_extensions(
+            device,
+            mounted,
+            execution_plan,
+            VulkanMountedPlacedResidentStreamTickDispatchExtensions::default(),
+            stream_tick,
+        )
+    }
+
+    pub fn new_with_dispatch_extensions(
+        device: &'a VulkanComputeDevice,
+        mounted: &'a VulkanMountedPlacedStreamCircuit,
+        execution_plan: &'a VulkanMountedPlacedResidentStreamTickExecutionPlan,
+        dispatch_extensions: VulkanMountedPlacedResidentStreamTickDispatchExtensions<'a>,
+        stream_tick: u64,
+    ) -> Self {
         Self {
             device,
             mounted,
             execution_plan,
+            dispatch_extensions,
             cursor: execution_plan
                 .tick_plan
                 .resident_stream_tick_cursor(stream_tick),
@@ -14335,6 +14561,7 @@ pub fn run_mounted_placed_resident_stream_tick_slices_in_process(
                     slice.device,
                     slice.mounted,
                     slice.execution_plan,
+                    &slice.dispatch_extensions,
                     transport,
                 )?;
             completed_stage_delta += advance.completed_stage_delta;
@@ -14733,6 +14960,9 @@ pub enum VulkanMountedPlacedResidentKernelDispatchError {
         device_id: String,
         stage_index: usize,
     },
+    MissingExecutionDispatchSegments {
+        device_id: String,
+    },
     MissingPedalboardPedals {
         device_id: String,
     },
@@ -14847,6 +15077,10 @@ impl Display for VulkanMountedPlacedResidentKernelDispatchError {
             } => write!(
                 f,
                 "resident execution plan for device {device_id:?} has no dispatch segment beginning at stage {stage_index}"
+            ),
+            Self::MissingExecutionDispatchSegments { device_id } => write!(
+                f,
+                "resident execution plan for device {device_id:?} has no dispatch segments"
             ),
             Self::MissingPedalboardPedals { device_id } => {
                 write!(
@@ -24413,7 +24647,7 @@ mod tests {
             VulkanMountedPlacedResidentInProcessStreamTickRunStatus::Completed
         );
         assert_eq!(run.tick_run.placed_run.completed_stage_delta, 204);
-        assert_eq!(run.tick_run.output_run.dispatch_count, 2);
+        assert_eq!(run.tick_run.output_run.as_ref().unwrap().dispatch_count, 2);
         assert_eq!(run.sampler_run.descriptor_count, 3);
         assert_eq!(run.sampler_run.token_id, 1);
         assert_eq!(run.sampler_run.selected_logit_bits, 1_100_541_195);
@@ -24531,6 +24765,7 @@ mod tests {
         );
         assert_eq!(run.tick_runs[0].public_output_token_id, None);
         assert!(run.tick_runs[0].sampler_run.is_none());
+        assert!(run.tick_runs[0].tick_run.output_run.is_none());
 
         assert_eq!(run.tick_runs[1].stream_tick, 1);
         assert_eq!(run.tick_runs[1].input_token_id, 36_309);
@@ -24554,6 +24789,7 @@ mod tests {
             run.tick_runs[1].sampler_run.as_ref().unwrap().token_id,
             run.generated_token_ids[0]
         );
+        assert!(run.tick_runs[1].tick_run.output_run.is_some());
 
         assert_eq!(run.tick_runs[2].stream_tick, 2);
         assert_eq!(run.tick_runs[2].input_token_id, run.generated_token_ids[0]);
@@ -24565,6 +24801,7 @@ mod tests {
         assert!(run.tick_runs[2].input_closes_loop_after_processing);
         assert_eq!(run.tick_runs[2].public_output_token_id, None);
         assert!(run.tick_runs[2].sampler_run.is_none());
+        assert!(run.tick_runs[2].tick_run.output_run.is_none());
         assert_eq!(
             run.tick_runs
                 .iter()
