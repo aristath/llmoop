@@ -107,7 +107,9 @@ def compile_model_package(
     if package_dir.exists():
         shutil.rmtree(package_dir)
     package_dir.mkdir(parents=True, exist_ok=True)
-    emit_compile_event(event_sink, "ArtifactWritingStarted", package_dir=str(package_dir))
+    emit_compile_event(
+        event_sink, "ArtifactWritingStarted", package_dir=str(package_dir)
+    )
     write_runtime_config_package(model_graph, package_dir)
     tokenizer_manifest = copy_tokenizer_package(
         model_dir, package_dir / TOKENIZER_PACKAGE_DIR
@@ -201,9 +203,7 @@ def build_vulkan_resident_package_manifest(
         sampler_kernels = [
             {
                 "role": "sample_logits",
-                "shader_path": compiled_shader_path(
-                    f"shaders/{sampler_shader_file}"
-                ),
+                "shader_path": compiled_shader_path(f"shaders/{sampler_shader_file}"),
                 "local_size_x": 1024,
                 "workgroup_count_x": 1,
             }
@@ -216,9 +216,7 @@ def build_vulkan_resident_package_manifest(
         sampler_partition_count = 128
         sampler_candidate_local_size_x = 256
         sampler_merge_local_size_x = 256
-        sampler_scratch_byte_capacity = (
-            sampler_partition_count * sampler_top_k * 8
-        )
+        sampler_scratch_byte_capacity = sampler_partition_count * sampler_top_k * 8
         sampler_candidate_shader_file = (
             f"temperature_top_k_candidates_f32_{vocab_size}"
             f"_k{sampler_top_k}_g{sampler_partition_count}"
@@ -241,9 +239,7 @@ def build_vulkan_resident_package_manifest(
             },
             {
                 "role": "sample_candidates",
-                "shader_path": compiled_shader_path(
-                    f"shaders/{sampler_shader_file}"
-                ),
+                "shader_path": compiled_shader_path(f"shaders/{sampler_shader_file}"),
                 "local_size_x": sampler_merge_local_size_x,
                 "workgroup_count_x": 1,
             },
@@ -313,9 +309,7 @@ def build_vulkan_resident_package_manifest(
                 )
             ),
             can_fuse_parallel_head_norm_rope=lambda branches, circuit=circuit: (
-                can_fuse_bf16_parallel_head_norm_rope(
-                    circuit, branches, tensor_index
-                )
+                can_fuse_bf16_parallel_head_norm_rope(circuit, branches, tensor_index)
             ),
             can_fuse_multiply_rolling_depthwise=lambda multiply, rolling, depthwise, circuit=circuit: (
                 can_fuse_bf16_multiply_rolling_depthwise(
@@ -333,9 +327,7 @@ def build_vulkan_resident_package_manifest(
                 )
             ),
             can_fuse_append_attention=lambda append, attention, circuit=circuit: (
-                can_fuse_bf16_append_attention(
-                    circuit, append, attention, tensor_index
-                )
+                can_fuse_bf16_append_attention(circuit, append, attention, tensor_index)
             ),
         )
     behavioral_validation = build_behavioral_validation(
@@ -361,9 +353,7 @@ def build_vulkan_resident_package_manifest(
             projection_shader_file=projection_shader_file,
             norm_shader_file=norm_shader_file,
             sampler_shader_files={
-                kernel["shader_path"]
-                .removeprefix("shaders/")
-                .removesuffix(".spv")
+                kernel["shader_path"].removeprefix("shaders/").removesuffix(".spv")
                 + ".comp"
                 for kernel in sampler_kernels
             },
@@ -420,8 +410,8 @@ def build_vulkan_resident_package_manifest(
                 "transducer_id": "output_transducer",
                 "input_signal_id": "output_frame",
                 "node_ids": [
-                    "output_transducer.embedding_norm",
-                    "output_transducer.tied_output_projection",
+                    "output_norm",
+                    "output_projection",
                 ],
                 "norm_parameter_tensor": norm_tensor,
                 "norm_parameter_dtype": dtype,
@@ -668,9 +658,7 @@ def shader_file_for_node(
                 f"{sorted(layouts)}"
             )
         layout_token = (
-            "paired"
-            if layouts == {VULKAN_BF16_ROW_PAIR_LAYOUT}
-            else "row_major"
+            "paired" if layouts == {VULKAN_BF16_ROW_PAIR_LAYOUT} else "row_major"
         )
         input_width = input_widths.pop()
         return (
@@ -889,9 +877,7 @@ def shader_file_for_node(
         projection_shape = parameter_shape_for_id(
             circuit, node["params"][0], tensor_index
         )
-        kernel_shape = parameter_shape_for_id(
-            circuit, node["params"][1], tensor_index
-        )
+        kernel_shape = parameter_shape_for_id(circuit, node["params"][1], tensor_index)
         part_widths = [
             int(width) for width in node["attrs"]["projection"]["part_widths"]
         ]
@@ -915,12 +901,10 @@ def shader_file_for_node(
             or sorted([*input_gate_indices, output_gate_index]) != [0, 1, 2]
             or kernel_shape not in ([hidden_size, frames], [hidden_size, 1, frames])
             or any(
-                parameter_dtype_for_id(circuit, parameter_id, tensor_index)
-                != "BF16"
+                parameter_dtype_for_id(circuit, parameter_id, tensor_index) != "BF16"
                 for parameter_id in node["params"]
             )
-            or projection_layout
-            not in {ROW_MAJOR_LAYOUT, VULKAN_BF16_ROW_PAIR_LAYOUT}
+            or projection_layout not in {ROW_MAJOR_LAYOUT, VULKAN_BF16_ROW_PAIR_LAYOUT}
             or parameter_layout_for_id(circuit, node["params"][1], tensor_index)
             != ROW_MAJOR_LAYOUT
         ):
@@ -994,12 +978,9 @@ def shader_file_for_node(
             "rope_type": {str(rope.get("rope_type", "default")) for rope in ropes},
             "interleaved": {bool(rope["interleaved"]) for rope in ropes},
         }
-        if (
-            any(len(values) != 1 for values in common_fields.values())
-            or any(
-                int(norm["head_count"]) != int(rope["head_count"])
-                for norm, rope in zip(norms, ropes, strict=True)
-            )
+        if any(len(values) != 1 for values in common_fields.values()) or any(
+            int(norm["head_count"]) != int(rope["head_count"])
+            for norm, rope in zip(norms, ropes, strict=True)
         ):
             raise ModelCompileError(
                 f"parallel head-norm/rope node {node['id']!r} mixes incompatible branch geometry"
@@ -1169,14 +1150,11 @@ def shader_file_for_node(
 
 def workgroup_count_x_for_node(circuit: Json, node: Json, tensor_index: Json) -> int:
     if node["op"] == "linear_split_recurrent_depthwise_gate":
-        hidden_size = int(
-            state_port(circuit, node["state_reads"][0])["shape"][1]
-        )
+        hidden_size = int(state_port(circuit, node["state_reads"][0])["shape"][1])
         return hidden_size // 2
     if node["op"] == "parallel_head_norm_rope_2way":
         return sum(
-            int(branch["norm"]["head_count"])
-            for branch in node["attrs"]["branches"]
+            int(branch["norm"]["head_count"]) for branch in node["attrs"]["branches"]
         )
     if node["op"] in {"parallel_linear_2way", "parallel_linear_3way"}:
         return sum(
@@ -1250,9 +1228,8 @@ def attention_workgroup_shape(head_width: int) -> tuple[int, int]:
     shared_float_budget = (32 * 1024) // 4
     fixed_shared_floats = 2 * head_width + 4
     tile_shared_floats = head_width + ((head_width + 31) // 32) + 3
-    max_token_batches = (
-        (shared_float_budget - fixed_shared_floats)
-        // (physical_tile_tokens * tile_shared_floats)
+    max_token_batches = (shared_float_budget - fixed_shared_floats) // (
+        physical_tile_tokens * tile_shared_floats
     )
     token_batches = max(1, min(7, max_token_batches))
     return (
@@ -1333,9 +1310,7 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
         weight_layout = parallel_linear.group(2)
         input_size = int(parallel_linear.group(3))
         output_widths = [
-            int(width)
-            for width in parallel_linear.groups()[3:]
-            if width is not None
+            int(width) for width in parallel_linear.groups()[3:] if width is not None
         ]
         if (
             len(output_widths) != branch_count
@@ -1368,9 +1343,7 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
         consumed_words = []
         for index, label in enumerate(labels):
             prefix = "if" if index == 0 else "else if"
-            threshold = " + ".join(
-                [*consumed_words, f"OUTPUT_{label}_WORDS"]
-            )
+            threshold = " + ".join([*consumed_words, f"OUTPUT_{label}_WORDS"])
             offset = " + ".join(consumed_words) or "0u"
             branch_lines.append(
                 f"    {prefix} (word_index < {threshold}) {{\n"
@@ -1384,18 +1357,14 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
             for index, label in enumerate(labels[:-1])
         )
         weight_reads += (
-            "\n    return weight_"
-            + labels[-1].lower()
-            + ".words[weight_index];"
+            "\n    return weight_" + labels[-1].lower() + ".words[weight_index];"
         )
         output_writes = "\n".join(
             f"    if (branch == {index}u) {{ output_{label.lower()}.words[local_word_index] = packed; return; }}"
             for index, label in enumerate(labels[:-1])
         )
         output_writes += (
-            "\n    output_"
-            + labels[-1].lower()
-            + ".words[local_word_index] = packed;"
+            "\n    output_" + labels[-1].lower() + ".words[local_word_index] = packed;"
         )
         return render_shader_template(
             source_dir,
@@ -1425,12 +1394,7 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
         weight_layout = fused_ffn_projection.group(1)
         input_size = int(fused_ffn_projection.group(2))
         output_size = int(fused_ffn_projection.group(3))
-        if (
-            input_size <= 0
-            or input_size % 2
-            or output_size <= 0
-            or output_size % 2
-        ):
+        if input_size <= 0 or input_size % 2 or output_size <= 0 or output_size % 2:
             raise ModelCompileError(
                 f"invalid fused FFN projection shader shape {shader_file!r}"
             )
@@ -2316,7 +2280,9 @@ def validate_compiled_package(package_dir: Path, manifest: Json) -> None:
     )
     for path in required_files:
         if not path.is_file():
-            raise ModelCompileError(f"compiled package is missing required artifact {path}")
+            raise ModelCompileError(
+                f"compiled package is missing required artifact {path}"
+            )
 
     behavioral_path = package_artifact_path(
         package_dir,
@@ -2329,6 +2295,7 @@ def validate_compiled_package(package_dir: Path, manifest: Json) -> None:
         )
     behavioral = read_json(behavioral_path)
     candidate_circuits = validate_compiled_circuit_graph(manifest)
+    validate_compiled_generation_contract(manifest, candidate_circuits)
     validate_behavioral_validation_artifact(behavioral, candidate_circuits)
     validate_compiled_pedal_executions(manifest, candidate_circuits)
 
@@ -2342,7 +2309,10 @@ def validate_compiled_package(package_dir: Path, manifest: Json) -> None:
     if (
         not isinstance(tokenizer_files, list)
         or not tokenizer_files
-        or any(not isinstance(filename, str) or not filename for filename in tokenizer_files)
+        or any(
+            not isinstance(filename, str) or not filename
+            for filename in tokenizer_files
+        )
     ):
         raise ModelCompileError(
             "compiled package tokenizer must declare at least one artifact"
@@ -2350,7 +2320,9 @@ def validate_compiled_package(package_dir: Path, manifest: Json) -> None:
     for filename in tokenizer_files:
         path = package_artifact_path(tokenizer_dir, filename, "tokenizer artifact")
         if not path.is_file():
-            raise ModelCompileError(f"compiled package is missing tokenizer artifact {path}")
+            raise ModelCompileError(
+                f"compiled package is missing tokenizer artifact {path}"
+            )
 
     tensor_index = read_json(required_files[1])
     if tensor_index.get("schema") != "llmoop.tensor_index.v1":
@@ -2359,8 +2331,14 @@ def validate_compiled_package(package_dir: Path, manifest: Json) -> None:
     if not isinstance(tensors, dict) or not tensors:
         raise ModelCompileError("compiled package tensor index contains no tensors")
     for tensor_name, info in tensors.items():
-        if not isinstance(tensor_name, str) or not tensor_name or not isinstance(info, dict):
-            raise ModelCompileError("compiled package tensor index contains an invalid tensor")
+        if (
+            not isinstance(tensor_name, str)
+            or not tensor_name
+            or not isinstance(info, dict)
+        ):
+            raise ModelCompileError(
+                "compiled package tensor index contains an invalid tensor"
+            )
         source = package_artifact_path(
             package_dir,
             info.get("source_file"),
@@ -2395,14 +2373,20 @@ def validate_compiled_package(package_dir: Path, manifest: Json) -> None:
 
     collect_shader_paths(manifest)
     if not shader_paths:
-        raise ModelCompileError("compiled package does not reference any shader artifacts")
+        raise ModelCompileError(
+            "compiled package does not reference any shader artifacts"
+        )
     for relative_path in sorted(shader_paths):
         shader = package_artifact_path(package_dir, relative_path, "shader")
         if not shader.is_file():
-            raise ModelCompileError(f"compiled package references missing shader {shader}")
+            raise ModelCompileError(
+                f"compiled package references missing shader {shader}"
+            )
         payload = shader.read_bytes()
         if len(payload) < 4 or payload[:4] != b"\x03\x02#\x07":
-            raise ModelCompileError(f"compiled package shader is not valid SPIR-V: {shader}")
+            raise ModelCompileError(
+                f"compiled package shader is not valid SPIR-V: {shader}"
+            )
     validate_package_artifact_integrity(package_dir, manifest)
 
 
@@ -2438,7 +2422,9 @@ def validate_package_artifact_integrity(package_dir: Path, manifest: Json) -> No
         or not isinstance(integrity.get("files"), dict)
         or not integrity["files"]
     ):
-        raise ModelCompileError("compiled package artifact integrity contract is invalid")
+        raise ModelCompileError(
+            "compiled package artifact integrity contract is invalid"
+        )
 
     actual_files = {
         path.relative_to(package_dir).as_posix()
@@ -2452,9 +2438,7 @@ def validate_package_artifact_integrity(package_dir: Path, manifest: Json) -> No
             "compiled package artifact integrity contract does not cover every non-weight artifact"
         )
     for relative_path, contract in integrity["files"].items():
-        path = package_artifact_path(
-            package_dir, relative_path, "integrity artifact"
-        )
+        path = package_artifact_path(package_dir, relative_path, "integrity artifact")
         if (
             not isinstance(contract, dict)
             or not isinstance(contract.get("byte_count"), int)
@@ -2463,8 +2447,7 @@ def validate_package_artifact_integrity(package_dir: Path, manifest: Json) -> No
             or not isinstance(contract.get("sha256"), str)
             or len(contract["sha256"]) != 64
             or any(
-                character not in "0123456789abcdef"
-                for character in contract["sha256"]
+                character not in "0123456789abcdef" for character in contract["sha256"]
             )
         ):
             raise ModelCompileError(
@@ -2666,9 +2649,7 @@ def validate_compiled_circuit_graph(manifest: Json) -> dict[str, Json]:
         source_endpoint = (source_id, source["port_id"])
         destination_endpoint = (destination_id, destination["port_id"])
         destination_set = (
-            forward_inputs
-            if connection_kind == "forward"
-            else feedback_inputs
+            forward_inputs if connection_kind == "forward" else feedback_inputs
         )
         if destination_endpoint in destination_set:
             raise ModelCompileError(
@@ -2684,7 +2665,11 @@ def validate_compiled_circuit_graph(manifest: Json) -> dict[str, Json]:
     remaining = set(candidates)
     while remaining:
         ready = next(
-            (pedal_id for pedal_id in candidates if pedal_id in remaining and forward_indegree[pedal_id] == 0),
+            (
+                pedal_id
+                for pedal_id in candidates
+                if pedal_id in remaining and forward_indegree[pedal_id] == 0
+            ),
             None,
         )
         if ready is None:
@@ -2762,9 +2747,10 @@ def _validate_package_graph_boundary_ports(
         pedal_id = endpoint.get("pedal_id")
         endpoint_port_id = endpoint.get("port_id")
         circuit = candidates.get(pedal_id)
-        if circuit is None or _port_by_id(
-            circuit["boundary"][direction], endpoint_port_id
-        ) is None:
+        if (
+            circuit is None
+            or _port_by_id(circuit["boundary"][direction], endpoint_port_id) is None
+        ):
             raise ModelCompileError(
                 f"compiled package circuit graph {kind} {port_id!r} references an unknown {direction[:-1]}"
             )
@@ -2791,7 +2777,11 @@ def validate_compiled_pedal_executions(
     execution_by_pedal: dict[str, Json] = {}
     for execution in executions:
         pedal_id = execution.get("pedal_id") if isinstance(execution, dict) else None
-        if not isinstance(pedal_id, str) or not pedal_id or pedal_id in execution_by_pedal:
+        if (
+            not isinstance(pedal_id, str)
+            or not pedal_id
+            or pedal_id in execution_by_pedal
+        ):
             raise ModelCompileError(
                 f"compiled package contains invalid or duplicate pedal execution {pedal_id!r}"
             )
@@ -2808,10 +2798,9 @@ def validate_compiled_pedal_executions(
     for pedal_id, circuit in executable_circuits.items():
         execution = execution_by_pedal[pedal_id]
         source = circuit.get("source", {})
-        if (
-            execution.get("operator_type") != source.get("source_operator_type")
-            or execution.get("implementation") != circuit.get("implementation")
-        ):
+        if execution.get("operator_type") != source.get(
+            "source_operator_type"
+        ) or execution.get("implementation") != circuit.get("implementation"):
             raise ModelCompileError(
                 f"compiled package pedal {pedal_id!r} execution identity does not match its circuit"
             )
@@ -2833,6 +2822,201 @@ def validate_compiled_pedal_executions(
                 raise ModelCompileError(
                     f"compiled package pedal {pedal_id!r} kernel {index} does not match its circuit node"
                 )
+
+
+def validate_compiled_generation_contract(
+    manifest: Json,
+    candidate_circuits: dict[str, Json],
+) -> None:
+    role_ids: dict[str, list[str]] = {}
+    for pedal_id, circuit in candidate_circuits.items():
+        role_ids.setdefault(str(circuit.get("runtime_role")), []).append(pedal_id)
+    for role in ("input_transducer", "output_transducer", "sampler"):
+        if len(role_ids.get(role, [])) != 1:
+            raise ModelCompileError(
+                f"compiled generation graph must contain exactly one {role} pedal"
+            )
+    if not role_ids.get("signal_processor"):
+        raise ModelCompileError(
+            "compiled generation graph must contain at least one signal processor"
+        )
+
+    input_id = role_ids["input_transducer"][0]
+    output_id = role_ids["output_transducer"][0]
+    sampler_id = role_ids["sampler"][0]
+    processor_ids = set(role_ids["signal_processor"])
+    graph = manifest["circuit_graph"]
+    forward = [
+        cable for cable in graph["cables"] if cable["connection"]["kind"] == "forward"
+    ]
+    feedback = [
+        cable
+        for cable in graph["cables"]
+        if cable["connection"]["kind"] == "temporal_feedback"
+    ]
+    input_edges = [
+        cable
+        for cable in forward
+        if cable["source"]["pedal_id"] == input_id
+        and cable["destination"]["pedal_id"] in processor_ids
+    ]
+    output_edges = [
+        cable
+        for cable in forward
+        if cable["source"]["pedal_id"] in processor_ids
+        and cable["destination"]["pedal_id"] == output_id
+    ]
+    sampler_edges = [
+        cable
+        for cable in forward
+        if cable["source"]["pedal_id"] == output_id
+        and cable["destination"]["pedal_id"] == sampler_id
+    ]
+    generation_feedback = [
+        cable
+        for cable in feedback
+        if cable["source"]["pedal_id"] == sampler_id
+        and cable["destination"]["pedal_id"] == input_id
+    ]
+    if any(
+        len(edges) != 1
+        for edges in (
+            input_edges,
+            output_edges,
+            sampler_edges,
+            generation_feedback,
+        )
+    ):
+        raise ModelCompileError(
+            "compiled generation graph must wire input transducer -> processors -> "
+            "output transducer -> sampler with one delayed sampler feedback edge"
+        )
+
+    input_circuit = candidate_circuits[input_id]
+    output_circuit = candidate_circuits[output_id]
+    sampler_circuit = candidate_circuits[sampler_id]
+    input_nodes = input_circuit.get("nodes", [])
+    output_nodes = output_circuit.get("nodes", [])
+    sampler_nodes = sampler_circuit.get("nodes", [])
+    if (
+        len(input_nodes) != 1
+        or len(input_nodes[0].get("inputs", [])) != 1
+        or len(input_nodes[0].get("outputs", [])) != 1
+        or len(output_nodes) != 2
+        or len(output_nodes[0].get("inputs", [])) != 1
+        or len(output_nodes[-1].get("outputs", [])) != 1
+        or len(sampler_nodes) != 1
+        or len(sampler_nodes[0].get("inputs", [])) != 2
+        or len(sampler_nodes[0].get("outputs", [])) != 1
+    ):
+        raise ModelCompileError(
+            "compiled generation system pedals have invalid node boundaries"
+        )
+    input_token_port = input_nodes[0]["inputs"][0]
+    input_frame_port = input_nodes[0]["outputs"][0]
+    output_frame_port = output_nodes[0]["inputs"][0]
+    output_logits_port = output_nodes[-1]["outputs"][0]
+    sampler_logits_port, sampler_random_port = sampler_nodes[0]["inputs"]
+    sampler_token_port = sampler_nodes[0]["outputs"][0]
+    if (
+        input_edges[0]["source"]["port_id"] != input_frame_port
+        or output_edges[0]["destination"]["port_id"] != output_frame_port
+        or sampler_edges[0]["source"]["port_id"] != output_logits_port
+        or sampler_edges[0]["destination"]["port_id"] != sampler_logits_port
+        or generation_feedback[0]["source"]["port_id"] != sampler_token_port
+        or generation_feedback[0]["destination"]["port_id"] != input_token_port
+    ):
+        raise ModelCompileError(
+            "compiled generation graph cables do not match system-pedal ports"
+        )
+
+    boundary = graph["boundary"]
+    external_endpoints = {
+        (port["endpoint"]["pedal_id"], port["endpoint"]["port_id"])
+        for port in boundary["external_inputs"]
+    }
+    public_endpoints = {
+        (port["endpoint"]["pedal_id"], port["endpoint"]["port_id"])
+        for port in boundary["public_outputs"]
+    }
+    if (
+        len(boundary["external_inputs"]) != 2
+        or external_endpoints
+        != {(input_id, input_token_port), (sampler_id, sampler_random_port)}
+        or len(boundary["public_outputs"]) != 1
+        or public_endpoints != {(sampler_id, sampler_token_port)}
+    ):
+        raise ModelCompileError(
+            "compiled generation graph boundaries must expose one user input, one "
+            "sampler random seed, and one sampler public output"
+        )
+
+    input_package = manifest.get("input_transducer")
+    output_package = manifest.get("output_transducer")
+    sampler_package = manifest.get("sampler")
+    if not all(
+        isinstance(value, dict)
+        for value in (input_package, output_package, sampler_package)
+    ):
+        raise ModelCompileError(
+            "compiled generation package is missing a system-pedal execution spec"
+        )
+
+    input_spec = input_package.get("spec")
+    input_refs = input_circuit.get("parameters", {}).get("refs", {})
+    if (
+        not isinstance(input_spec, dict)
+        or len(input_nodes) != 1
+        or input_nodes[0].get("op") != "embedding_lookup"
+        or input_spec.get("parameter_tensor")
+        != input_refs.get("weight", {}).get("tensor")
+        or input_spec.get("output_signal_id")
+        != input_edges[0]["destination"]["port_id"]
+        or not isinstance(input_package.get("shader_path"), str)
+        or not input_package["shader_path"]
+    ):
+        raise ModelCompileError(
+            "compiled input-transducer execution does not match its circuit pedal"
+        )
+
+    output_spec = output_package.get("spec")
+    output_refs = output_circuit.get("parameters", {}).get("refs", {})
+    if (
+        not isinstance(output_spec, dict)
+        or [node.get("id") for node in output_nodes] != output_spec.get("node_ids")
+        or [node.get("op") for node in output_nodes]
+        != ["rms_norm", "linear_projection"]
+        or output_spec.get("norm_parameter_tensor")
+        != output_refs.get("output_norm.weight", {}).get("tensor")
+        or output_spec.get("projection_parameter_tensor")
+        != output_refs.get("output_projection.weight", {}).get("tensor")
+        or output_spec.get("input_signal_id") != output_edges[0]["source"]["port_id"]
+        or any(
+            not isinstance(output_package.get(field), str) or not output_package[field]
+            for field in ("embedding_norm_shader_path", "projection_shader_path")
+        )
+    ):
+        raise ModelCompileError(
+            "compiled output-transducer execution does not match its circuit pedal"
+        )
+
+    sampler_spec = sampler_package.get("spec")
+    sampler_attrs = sampler_nodes[0].get("attrs", {}) if len(sampler_nodes) == 1 else {}
+    if (
+        not isinstance(sampler_spec, dict)
+        or len(sampler_nodes) != 1
+        or sampler_nodes[0].get("op") != "sample_token"
+        or sampler_attrs.get("randomness") != "seed_and_stream_tick"
+        or any(
+            sampler_spec.get(field) != sampler_attrs.get(field)
+            for field in ("method", "temperature", "top_k", "top_p")
+        )
+        or not isinstance(sampler_package.get("kernels"), list)
+        or not sampler_package["kernels"]
+    ):
+        raise ModelCompileError(
+            "compiled sampler execution does not match its circuit pedal"
+        )
 
 
 def compiled_tensor_layout(info: Json, *, tensor_name: str | None = None) -> str:
@@ -3034,16 +3218,13 @@ def can_fuse_bf16_parallel_linears(
     circuit: Json, nodes: list[Json], tensor_index: Json
 ) -> bool:
     shapes = [parameter_shape_for_node(circuit, node, tensor_index) for node in nodes]
-    layouts = {
-        parameter_layout_for_node(circuit, node, tensor_index) for node in nodes
-    }
+    layouts = {parameter_layout_for_node(circuit, node, tensor_index) for node in nodes}
     return (
         len(nodes) in {2, 3}
         and all(
             len(shape) == 2
             and all(
-                int(dimension) > 0 and int(dimension) % 2 == 0
-                for dimension in shape
+                int(dimension) > 0 and int(dimension) % 2 == 0 for dimension in shape
             )
             for shape in shapes
         )
@@ -3090,8 +3271,7 @@ def can_fuse_bf16_parallel_linear_silu_multiply(
         and shapes[0] == shapes[1]
         and len(shapes[0]) == 2
         and all(
-            int(dimension) > 0 and int(dimension) % 2 == 0
-            for dimension in shapes[0]
+            int(dimension) > 0 and int(dimension) % 2 == 0 for dimension in shapes[0]
         )
         and element_count == int(shapes[0][0])
         and activation.get("attrs", {}).get("intermediate_rounding") == "BF16"
@@ -3113,9 +3293,7 @@ def can_fuse_bf16_parallel_head_norm_rope(
     try:
         head_counts = [int(norm["attrs"]["head_count"]) for norm in norms]
         head_widths = {
-            int(node["attrs"]["head_width"])
-            for branch in branches
-            for node in branch
+            int(node["attrs"]["head_width"]) for branch in branches for node in branch
         }
         rotary_widths = {int(rope["attrs"]["rotary_width"]) for rope in ropes}
         common_values = (
@@ -3145,8 +3323,7 @@ def can_fuse_bf16_parallel_head_norm_rope(
         and all(len(values) == 1 for values in common_values)
         and common_values[-1] == {"stream_tick"}
         and all(
-            int(norm["attrs"]["head_count"])
-            == int(rope["attrs"]["head_count"])
+            int(norm["attrs"]["head_count"]) == int(rope["attrs"]["head_count"])
             for norm, rope in branches
         )
         and all(shape == [head_width] for shape in parameter_shapes)
@@ -3300,9 +3477,7 @@ def can_fuse_bf16_append_attention(
     )
     try:
         append_geometry = tuple(int(append_attrs[key]) for key in geometry_keys)
-        attention_geometry = tuple(
-            int(attention_attrs[key]) for key in geometry_keys
-        )
+        attention_geometry = tuple(int(attention_attrs[key]) for key in geometry_keys)
         query_heads, kv_heads, head_width, query_groups = attention_geometry
         memory = state_port(circuit, append["state_reads"][0])
         key_shape = list(map(int, memory.get("key_shape_per_token", [])))
@@ -3369,7 +3544,9 @@ def parameter_layout_for_node(circuit: Json, node: Json, tensor_index: Json) -> 
     return tensor_layout(tensor_index, parameter["tensor"])
 
 
-def parameter_layout_for_id(circuit: Json, parameter_id: str, tensor_index: Json) -> str:
+def parameter_layout_for_id(
+    circuit: Json, parameter_id: str, tensor_index: Json
+) -> str:
     parameter = circuit["parameters"]["refs"][parameter_id]
     return tensor_layout(tensor_index, parameter["tensor"])
 
@@ -3420,9 +3597,7 @@ def packed_int4_linear_group_size_for_node(
             f"packed INT4 linear node {node['id']!r} has unsupported quantization "
             f"{quantization}"
         )
-    out_features, in_features = parameter_shape_for_id(
-        circuit, weight_id, tensor_index
-    )
+    out_features, in_features = parameter_shape_for_id(circuit, weight_id, tensor_index)
     packed_shape = [int(value) for value in weight_info.get("shape", [])]
     qzeros_shape = parameter_shape_for_id(circuit, qzeros_id, tensor_index)
     scales_shape = parameter_shape_for_id(circuit, scales_id, tensor_index)
@@ -3448,14 +3623,14 @@ def packed_int4_linear_group_size_for_node(
     if parameter_dtype_for_id(circuit, scales_id, tensor_index) != "F16":
         raise ModelCompileError("packed INT4 scales must use F16 storage")
     if any(
-        parameter_layout_for_id(circuit, parameter_id, tensor_index)
-        != ROW_MAJOR_LAYOUT
+        parameter_layout_for_id(circuit, parameter_id, tensor_index) != ROW_MAJOR_LAYOUT
         for parameter_id in (weight_id, qzeros_id, scales_id)
     ):
         raise ModelCompileError("packed INT4 parameters must use row-major storage")
-    if len(actual_params) == 4 and parameter_dtype_for_id(
-        circuit, actual_params[3], tensor_index
-    ) != "BF16":
+    if (
+        len(actual_params) == 4
+        and parameter_dtype_for_id(circuit, actual_params[3], tensor_index) != "BF16"
+    ):
         raise ModelCompileError("packed INT4 linear bias must use BF16 storage")
     return group_size
 
@@ -3465,9 +3640,7 @@ def packed_linear_quantization_format_for_node(
 ) -> str:
     weight_id = str(node["params"][0])
     weight_ref = circuit["parameters"]["refs"][weight_id]
-    quantization = tensor_index["tensors"][weight_ref["tensor"]].get(
-        "quantization"
-    )
+    quantization = tensor_index["tensors"][weight_ref["tensor"]].get("quantization")
     if not isinstance(quantization, dict) or not quantization.get("format"):
         raise ModelCompileError(
             f"packed linear node {node['id']!r} has no quantization format"
@@ -3503,9 +3676,7 @@ def compressed_tensors_int4_group_size_for_node(
             f"compressed-tensors INT4 node {node['id']!r} has unsupported "
             f"quantization {quantization}"
         )
-    out_features, in_features = parameter_shape_for_id(
-        circuit, weight_id, tensor_index
-    )
+    out_features, in_features = parameter_shape_for_id(circuit, weight_id, tensor_index)
     packed_shape = [int(value) for value in weight_info.get("shape", [])]
     scales_shape = parameter_shape_for_id(circuit, scales_id, tensor_index)
     group_size = int(quantization.get("group_size") or 0)
@@ -3525,16 +3696,16 @@ def compressed_tensors_int4_group_size_for_node(
     if parameter_dtype_for_id(circuit, scales_id, tensor_index) != "BF16":
         raise ModelCompileError("compressed-tensors INT4 scales must use BF16 storage")
     if any(
-        parameter_layout_for_id(circuit, parameter_id, tensor_index)
-        != ROW_MAJOR_LAYOUT
+        parameter_layout_for_id(circuit, parameter_id, tensor_index) != ROW_MAJOR_LAYOUT
         for parameter_id in (weight_id, scales_id)
     ):
         raise ModelCompileError(
             "compressed-tensors INT4 parameters must use row-major storage"
         )
-    if len(actual_params) == 3 and parameter_dtype_for_id(
-        circuit, actual_params[2], tensor_index
-    ) != "BF16":
+    if (
+        len(actual_params) == 3
+        and parameter_dtype_for_id(circuit, actual_params[2], tensor_index) != "BF16"
+    ):
         raise ModelCompileError(
             "compressed-tensors INT4 linear bias must use BF16 storage"
         )
@@ -3551,9 +3722,7 @@ def fp8_block_shape_for_node(
             f"FP8 linear node {node['id']!r} does not bind {scale_id!r} "
             "immediately after its weight"
         )
-    out_features, in_features = parameter_shape_for_id(
-        circuit, weight_id, tensor_index
-    )
+    out_features, in_features = parameter_shape_for_id(circuit, weight_id, tensor_index)
     scale_shape = parameter_shape_for_id(circuit, scale_id, tensor_index)
     if len(scale_shape) != 2 or any(value <= 0 for value in scale_shape):
         raise ModelCompileError(
@@ -3622,7 +3791,10 @@ def fp8_moe_block_shape_for_node(
             raise ModelCompileError(
                 f"FP8 sparse MoE scale {parameter_id!r} must be BF16"
             )
-        if parameter_layout_for_id(circuit, parameter_id, tensor_index) != ROW_MAJOR_LAYOUT:
+        if (
+            parameter_layout_for_id(circuit, parameter_id, tensor_index)
+            != ROW_MAJOR_LAYOUT
+        ):
             raise ModelCompileError(
                 f"FP8 sparse MoE scale {parameter_id!r} must be row-major"
             )
@@ -3646,9 +3818,13 @@ def fp8_moe_block_shape_for_node(
     return block_rows, block_columns
 
 
-def regular_block_shape(matrix_shape: list[int], scale_shape: list[int]) -> tuple[int, int]:
-    if len(matrix_shape) != 2 or len(scale_shape) != 2 or any(
-        value <= 0 for value in scale_shape
+def regular_block_shape(
+    matrix_shape: list[int], scale_shape: list[int]
+) -> tuple[int, int]:
+    if (
+        len(matrix_shape) != 2
+        or len(scale_shape) != 2
+        or any(value <= 0 for value in scale_shape)
     ):
         raise ModelCompileError(
             f"invalid block-scaled matrix shape {matrix_shape} / {scale_shape}"
@@ -3676,9 +3852,7 @@ def state_port(circuit: Json, state_id: str) -> Json:
 
 def tensor_shape(tensor_index: Json, tensor: str) -> list[int]:
     info = tensor_index["tensors"][tensor]
-    return [
-        int(dim) for dim in info.get("logical_shape", info["shape"])
-    ]
+    return [int(dim) for dim in info.get("logical_shape", info["shape"])]
 
 
 def tensor_dtype(tensor_index: Json, tensor: str) -> str:

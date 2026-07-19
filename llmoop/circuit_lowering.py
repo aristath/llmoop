@@ -182,7 +182,7 @@ def lower_pedalboard(
                             "pedal_id": sampler_ref["id"],
                             "port_id": "random_seed",
                         },
-                    }
+                    },
                 ],
                 "public_outputs": [
                     {
@@ -328,6 +328,16 @@ def build_system_circuits(model: Json) -> list[Json]:
         nodes=output_nodes,
     )
 
+    sampling = model["sampling"]
+    sampler_method = sampling["method"]
+    if sampler_method == "greedy":
+        sampler_temperature = 1.0
+        sampler_top_k = 1
+        sampler_top_p = 1.0
+    else:
+        sampler_temperature = sampling["temperature"]
+        sampler_top_k = sampling["top_k"]
+        sampler_top_p = sampling["top_p"]
     sampler_circuit = _system_circuit(
         pedal_id="sampler",
         operator_type="sampler",
@@ -356,7 +366,13 @@ def build_system_circuits(model: Json) -> list[Json]:
                 "params": [],
                 "state_reads": [],
                 "state_writes": [],
-                "attrs": {"selection": "runtime_configured"},
+                "attrs": {
+                    "method": sampler_method,
+                    "temperature": sampler_temperature,
+                    "top_k": sampler_top_k,
+                    "top_p": sampler_top_p,
+                    "randomness": "seed_and_stream_tick",
+                },
             }
         ],
     )
@@ -830,9 +846,7 @@ def _attention_nodes(
         )
         k_rope_input = "k_normed"
     value_input = (
-        "k_projected"
-        if numerics.get("attention_key_equals_value")
-        else "v_projected"
+        "k_projected" if numerics.get("attention_key_equals_value") else "v_projected"
     )
     if has_value_norm:
         nodes.append(
@@ -1236,9 +1250,7 @@ def _ffn_tail(
                                 "op": "linear",
                                 "inputs": ["ffn_norm_out"],
                                 "outputs": ["shared_gate_logit"],
-                                "params": _linear_params(
-                                    "shared_mlp_gate", parameters
-                                ),
+                                "params": _linear_params("shared_mlp_gate", parameters),
                             },
                             {
                                 "id": "shared_expert_gate",

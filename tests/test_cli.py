@@ -73,7 +73,9 @@ class RuntimeCliCommandTest(unittest.TestCase):
         self.assertIn("uint word_index = gl_WorkGroupID.x;", shader)
         self.assertNotIn("{{INPUT_SIZE}}", shader)
 
-    def test_resolve_runtime_package_manifest_accepts_package_dir_or_manifest(self) -> None:
+    def test_resolve_runtime_package_manifest_accepts_package_dir_or_manifest(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as raw_root:
             root = Path(raw_root)
             manifest = root / "vulkan_resident_package.json"
@@ -245,7 +247,9 @@ class RuntimeCliCommandTest(unittest.TestCase):
             build_runtime_command(args, package),
         )
 
-    def test_build_runtime_command_can_inspect_device_slice_without_prompt(self) -> None:
+    def test_build_runtime_command_can_inspect_device_slice_without_prompt(
+        self,
+    ) -> None:
         package = Path("packages/model_x/vulkan_resident_package.json")
         args = runtime_args(
             prompt=None,
@@ -439,7 +443,9 @@ class RuntimeCliCommandTest(unittest.TestCase):
             build_runtime_command(args, package),
         )
 
-    def test_build_runtime_command_can_inspect_runtime_topology_without_prompt(self) -> None:
+    def test_build_runtime_command_can_inspect_runtime_topology_without_prompt(
+        self,
+    ) -> None:
         package = Path("packages/model_x/vulkan_resident_package.json")
         args = runtime_args(
             prompt=None,
@@ -536,6 +542,7 @@ class RuntimeCliCommandTest(unittest.TestCase):
             build_runtime_command(args, package),
         )
 
+
 class PackagePlacementTest(unittest.TestCase):
     def test_package_placement_is_neutral_default_patch(self) -> None:
         self.assertEqual(
@@ -557,9 +564,13 @@ class CompiledPackageTest(unittest.TestCase):
         self.assertEqual("config.json", manifest["config_path"])
         self.assertTrue((fixture.package_dir / "config.json").is_file())
         self.assertIn("tokenizer.json", manifest["tokenizer"]["files"])
-        self.assertTrue((fixture.package_dir / "tokenizer" / "tokenizer.json").is_file())
+        self.assertTrue(
+            (fixture.package_dir / "tokenizer" / "tokenizer.json").is_file()
+        )
 
-    def test_compiled_package_contains_weight_files_and_local_tensor_index(self) -> None:
+    def test_compiled_package_contains_weight_files_and_local_tensor_index(
+        self,
+    ) -> None:
         fixture = compiled_model_or_skip()
         manifest = json.loads(fixture.package_manifest.read_text())
         tensor_index_path = fixture.package_dir / manifest["tensor_index_path"]
@@ -584,46 +595,57 @@ class CompiledPackageTest(unittest.TestCase):
 
         self.assertNotIn("reusable_kernel_shaders", manifest)
         executions = manifest["pedal_executions"]
-        self.assertEqual(14, len(executions))
-        layer_00 = executions[0]
-        self.assertEqual("layer_00", layer_00["pedal_id"])
-        self.assertEqual("conv", layer_00["operator_type"])
-        compiled_layer_00 = next(
+        processor_pedals = [
             pedal
             for pedal in manifest["circuit_graph"]["pedals"]
-            if pedal["pedal_id"] == "layer_00"
-        )["circuit"]
+            if pedal["runtime_role"] == "signal_processor"
+        ]
+        self.assertTrue(executions)
+        self.assertEqual(len(processor_pedals), len(executions))
+        execution_by_pedal = {
+            execution["pedal_id"]: execution for execution in executions
+        }
         self.assertEqual(
-            [node["id"] for node in compiled_layer_00["nodes"]],
-            [kernel["node_id"] for kernel in layer_00["kernels"]],
+            {pedal["pedal_id"] for pedal in processor_pedals},
+            set(execution_by_pedal),
         )
-        self.assertEqual(
-            list(range(len(layer_00["kernels"]))),
-            [kernel["execution_index"] for kernel in layer_00["kernels"]],
-        )
-        self.assertEqual(
-            [node["op"] for node in compiled_layer_00["nodes"]],
-            [kernel["op"] for kernel in layer_00["kernels"]],
-        )
-        self.assertTrue(
-            any(
-                len(node.get("attrs", {}).get("compiled_from", [])) > 2
-                for node in compiled_layer_00["nodes"]
+        for pedal in processor_pedals:
+            execution = execution_by_pedal[pedal["pedal_id"]]
+            nodes = pedal["circuit"]["nodes"]
+            self.assertEqual(
+                [node["id"] for node in nodes],
+                [kernel["node_id"] for kernel in execution["kernels"]],
             )
-        )
+            self.assertEqual(
+                list(range(len(execution["kernels"]))),
+                [kernel["execution_index"] for kernel in execution["kernels"]],
+            )
+            self.assertEqual(
+                [node["op"] for node in nodes],
+                [kernel["op"] for kernel in execution["kernels"]],
+            )
+            for node, kernel in zip(nodes, execution["kernels"], strict=True):
+                if node["op"] in {
+                    "scaled_dot_product_attention",
+                    "append_scaled_dot_product_attention",
+                }:
+                    attrs = (
+                        node["attrs"]["attention"]
+                        if node["op"] == "append_scaled_dot_product_attention"
+                        else node["attrs"]
+                    )
+                    self.assertEqual(
+                        int(attrs["query_heads"]), kernel["workgroup_count_x"]
+                    )
+                    self.assertNotIn("_cap", kernel["shader_path"])
         self.assertNotIn("capacity_profiles", manifest)
         self.assertTrue(
-            all(kernel["workgroup_count_x"] >= 1 for execution in executions for kernel in execution["kernels"])
+            all(
+                kernel["workgroup_count_x"] >= 1
+                for execution in executions
+                for kernel in execution["kernels"]
+            )
         )
-        attention = next(
-            kernel
-            for execution in executions
-            for kernel in execution["kernels"]
-            if kernel["op"]
-            in {"scaled_dot_product_attention", "append_scaled_dot_product_attention"}
-        )
-        self.assertEqual(16, attention["workgroup_count_x"])
-        self.assertNotIn("_cap", attention["shader_path"])
 
     def test_compiled_package_contains_only_precompiled_spirv_shaders(self) -> None:
         fixture = compiled_model_or_skip()
@@ -662,22 +684,32 @@ class CompiledPackageTest(unittest.TestCase):
         self.assertEqual("runtime_default", manifest["device_id"])
         circuit_graph = manifest["circuit_graph"]
         self.assertEqual("explicit_graph", circuit_graph["wiring"])
-        self.assertEqual(13, len(circuit_graph["cables"]))
-        self.assertEqual(14, len(circuit_graph["pedals"]))
-        layer_00 = circuit_graph["pedals"][0]
-        self.assertEqual("layer_00", layer_00["pedal_id"])
-        self.assertEqual("conv", layer_00["operator_type"])
-        self.assertEqual("layer_00_shortconv_circuit_v1", layer_00["circuit"]["id"])
-        self.assertEqual("llmoop.circuit_params.v1", layer_00["params"]["schema"])
-        self.assertEqual("llmoop.circuit_state.v1", layer_00["state"]["schema"])
+        roles = [pedal["runtime_role"] for pedal in circuit_graph["pedals"]]
+        self.assertEqual(1, roles.count("input_transducer"))
+        self.assertEqual(1, roles.count("output_transducer"))
+        self.assertEqual(1, roles.count("sampler"))
+        self.assertGreaterEqual(roles.count("signal_processor"), 1)
+        self.assertEqual(len(circuit_graph["pedals"]), len(circuit_graph["cables"]))
+        self.assertEqual(
+            1,
+            sum(
+                cable["connection"]["kind"] == "temporal_feedback"
+                for cable in circuit_graph["cables"]
+            ),
+        )
+        for pedal in circuit_graph["pedals"]:
+            self.assertEqual("llmoop.circuit_params.v1", pedal["params"]["schema"])
+            self.assertEqual("llmoop.circuit_state.v1", pedal["state"]["schema"])
         behavioral = json.loads(
             (fixture.package_dir / manifest["behavioral_validation_path"]).read_text()
         )
         self.assertEqual("passed", behavioral["status"])
         self.assertEqual("exact_reference", behavioral["candidate_kind"])
-        self.assertEqual(14, len(behavioral["circuits"]))
+        self.assertEqual(len(circuit_graph["pedals"]), len(behavioral["circuits"]))
 
-    def test_compiled_package_does_not_reference_source_or_transpiled_paths(self) -> None:
+    def test_compiled_package_does_not_reference_source_or_transpiled_paths(
+        self,
+    ) -> None:
         fixture = compiled_model_or_skip()
 
         for root in (fixture.lowered_dir, fixture.package_dir):
@@ -692,7 +724,9 @@ class CompiledPackageTest(unittest.TestCase):
 
         self.assertEqual(fixture.package_dir, fixture.package_manifest.parent)
         self.assertNotEqual(fixture.lowered_dir, fixture.package_dir)
-        self.assertFalse((fixture.lowered_dir / "vulkan_resident_package.json").exists())
+        self.assertFalse(
+            (fixture.lowered_dir / "vulkan_resident_package.json").exists()
+        )
         self.assertFalse(
             any(
                 artifact.name == "vulkan_resident_package.json"

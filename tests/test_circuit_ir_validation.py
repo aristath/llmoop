@@ -12,6 +12,7 @@ def valid_circuit() -> dict[str, object]:
     return {
         "schema": "llmoop.stream_circuit.v1",
         "id": "test_circuit",
+        "runtime_role": "signal_processor",
         "boundary": {
             "inputs": [
                 {
@@ -77,9 +78,7 @@ def matching_pedal() -> dict[str, object]:
                 "update": "replace",
             }
         ],
-        "parameter_block": {
-            "params": {"weight": {"tensor": "layer.weight"}}
-        },
+        "parameter_block": {"params": {"weight": {"tensor": "layer.weight"}}},
     }
 
 
@@ -127,7 +126,9 @@ def test_circuit_validation_rejects_broken_dataflow_contracts(
     report = validate_circuit(circuit)
 
     assert not report.ok
-    assert any(message in issue.message and issue.path == path for issue in report.errors)
+    assert any(
+        message in issue.message and issue.path == path for issue in report.errors
+    )
     with pytest.raises(ValueError, match=message):
         report.raise_for_errors()
 
@@ -171,8 +172,7 @@ def test_circuit_validation_rejects_non_tensor_boundary_shapes(
 
     assert not report.ok
     assert any(
-        issue.path == f"boundary.{boundary_side}[0].shape"
-        and message in issue.message
+        issue.path == f"boundary.{boundary_side}[0].shape" and message in issue.message
         for issue in report.errors
     )
 
@@ -213,9 +213,7 @@ def test_pedal_contract_validation_checks_every_boundary_port() -> None:
     report = validate_circuit_against_pedal(circuit, pedal)
 
     assert not report.ok
-    assert any(
-        issue.path == "boundary.inputs[1].shape" for issue in report.errors
-    )
+    assert any(issue.path == "boundary.inputs[1].shape" for issue in report.errors)
 
 
 def test_pedal_contract_validation_rejects_missing_and_wrong_port_mappings() -> None:

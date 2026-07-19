@@ -39,7 +39,7 @@ def minimal_package(root: Path) -> dict[str, object]:
                         "source_file": "weights/model.safetensors",
                         "data_sha256": sha256(b"weights").hexdigest(),
                     }
-                }
+                },
             }
         )
     )
@@ -55,9 +55,7 @@ def minimal_package(root: Path) -> dict[str, object]:
         "behavioral_role": "fixture",
         "implementation": "exact_reference",
         "boundary": {
-            "inputs": [
-                {"id": "input_frame", "signal": "frame", "shape": [4]}
-            ],
+            "inputs": [{"id": "input_frame", "signal": "frame", "shape": [4]}],
             "outputs": [
                 {
                     "id": "output_frame",
@@ -85,6 +83,152 @@ def minimal_package(root: Path) -> dict[str, object]:
         ],
         "behavioral_error_contract": {"mode": "source_reference_circuit"},
     }
+    input_circuit = {
+        "schema": "llmoop.stream_circuit.v1",
+        "id": "input_circuit",
+        "source": {
+            "pedal_id": "input",
+            "source_layer_index": None,
+            "source_operator_type": "input_transducer",
+        },
+        "runtime_role": "input_transducer",
+        "behavioral_role": "token_to_frame",
+        "implementation": "compiled_input_transducer_v1",
+        "boundary": {
+            "inputs": [{"id": "token", "signal": "token_id", "shape": [1]}],
+            "outputs": [
+                {
+                    "id": "frame",
+                    "signal": "frame",
+                    "shape": [4],
+                    "source": "frame",
+                }
+            ],
+            "controls": [],
+        },
+        "state_ports": [],
+        "parameters": {
+            "layout": "row_major",
+            "storage": "safetensors",
+            "refs": {"weight": {"tensor": "weight"}},
+        },
+        "nodes": [
+            {
+                "id": "lookup",
+                "op": "embedding_lookup",
+                "inputs": ["token"],
+                "outputs": ["frame"],
+                "params": ["weight"],
+            }
+        ],
+        "behavioral_error_contract": {"mode": "source_reference_circuit"},
+    }
+    output_circuit = {
+        "schema": "llmoop.stream_circuit.v1",
+        "id": "output_circuit",
+        "source": {
+            "pedal_id": "output",
+            "source_layer_index": None,
+            "source_operator_type": "output_transducer",
+        },
+        "runtime_role": "output_transducer",
+        "behavioral_role": "frame_to_logits",
+        "implementation": "compiled_output_transducer_v1",
+        "boundary": {
+            "inputs": [{"id": "frame", "signal": "frame", "shape": [4]}],
+            "outputs": [
+                {
+                    "id": "logits",
+                    "signal": "logits",
+                    "shape": [4],
+                    "source": "logits",
+                }
+            ],
+            "controls": [],
+        },
+        "state_ports": [],
+        "parameters": {
+            "layout": "row_major",
+            "storage": "safetensors",
+            "refs": {
+                "output_norm.weight": {"tensor": "weight"},
+                "output_projection.weight": {"tensor": "weight"},
+            },
+        },
+        "nodes": [
+            {
+                "id": "norm",
+                "op": "rms_norm",
+                "inputs": ["frame"],
+                "outputs": ["normalized"],
+                "params": ["output_norm.weight"],
+            },
+            {
+                "id": "project",
+                "op": "linear_projection",
+                "inputs": ["normalized"],
+                "outputs": ["logits"],
+                "params": ["output_projection.weight"],
+            },
+        ],
+        "behavioral_error_contract": {"mode": "source_reference_circuit"},
+    }
+    sampler_circuit = {
+        "schema": "llmoop.stream_circuit.v1",
+        "id": "sampler_circuit",
+        "source": {
+            "pedal_id": "sampler",
+            "source_layer_index": None,
+            "source_operator_type": "sampler",
+        },
+        "runtime_role": "sampler",
+        "behavioral_role": "logits_to_token",
+        "implementation": "compiled_sampler_v1",
+        "boundary": {
+            "inputs": [
+                {"id": "logits", "signal": "logits", "shape": [4]},
+                {"id": "random_seed", "signal": "random_seed", "shape": [1]},
+            ],
+            "outputs": [
+                {
+                    "id": "token",
+                    "signal": "token_id",
+                    "shape": [1],
+                    "source": "token",
+                }
+            ],
+            "controls": [],
+        },
+        "state_ports": [],
+        "parameters": {
+            "layout": "row_major",
+            "storage": "safetensors",
+            "refs": {},
+        },
+        "nodes": [
+            {
+                "id": "sample",
+                "op": "sample_token",
+                "inputs": ["logits", "random_seed"],
+                "outputs": ["token"],
+                "params": [],
+                "attrs": {
+                    "method": "greedy",
+                    "temperature": 1.0,
+                    "top_k": 1,
+                    "top_p": 1.0,
+                    "randomness": "seed_and_stream_tick",
+                },
+            }
+        ],
+        "behavioral_error_contract": {"mode": "source_reference_circuit"},
+    }
+    circuits = {
+        "input": input_circuit,
+        "fixture_pedal": circuit,
+        "output": output_circuit,
+        "sampler": sampler_circuit,
+    }
     (root / "behavioral_validation.json").write_text(
         json.dumps(
             {
@@ -102,16 +246,17 @@ def minimal_package(root: Path) -> dict[str, object]:
                 "free_running": {"status": "not_required"},
                 "circuits": [
                     {
-                        "pedal_id": "fixture_pedal",
+                        "pedal_id": pedal_id,
                         "candidate_kind": "exact_reference",
                         "status": "passed",
-                        "source_node_count": 1,
-                        "candidate_node_count": 1,
-                        "covered_source_node_count": 1,
-                        "candidate_contract_digest": json_contract_digest(circuit),
+                        "source_node_count": len(candidate["nodes"]),
+                        "candidate_node_count": len(candidate["nodes"]),
+                        "covered_source_node_count": len(candidate["nodes"]),
+                        "candidate_contract_digest": json_contract_digest(candidate),
                         "rewrite_count": 0,
                         "rewrites": [],
                     }
+                    for pedal_id, candidate in circuits.items()
                 ],
             }
         )
@@ -128,54 +273,122 @@ def minimal_package(root: Path) -> dict[str, object]:
         },
         "circuit_graph": {
             "wiring": "explicit_graph",
-            "cables": [],
+            "cables": [
+                {
+                    "id": "input_to_processor",
+                    "connection": {"kind": "forward"},
+                    "source": {"pedal_id": "input", "port_id": "frame"},
+                    "destination": {
+                        "pedal_id": "fixture_pedal",
+                        "port_id": "input_frame",
+                    },
+                },
+                {
+                    "id": "processor_to_output",
+                    "connection": {"kind": "forward"},
+                    "source": {
+                        "pedal_id": "fixture_pedal",
+                        "port_id": "output_frame",
+                    },
+                    "destination": {"pedal_id": "output", "port_id": "frame"},
+                },
+                {
+                    "id": "output_to_sampler",
+                    "connection": {"kind": "forward"},
+                    "source": {"pedal_id": "output", "port_id": "logits"},
+                    "destination": {"pedal_id": "sampler", "port_id": "logits"},
+                },
+                {
+                    "id": "feedback",
+                    "connection": {
+                        "kind": "temporal_feedback",
+                        "delay_activations": 1,
+                    },
+                    "source": {"pedal_id": "sampler", "port_id": "token"},
+                    "destination": {"pedal_id": "input", "port_id": "token"},
+                },
+            ],
             "boundary": {
                 "external_inputs": [
                     {
                         "id": "model_input",
                         "endpoint": {
-                            "pedal_id": "fixture_pedal",
-                            "port_id": "input_frame",
+                            "pedal_id": "input",
+                            "port_id": "token",
                         },
-                    }
+                    },
+                    {
+                        "id": "random_seed",
+                        "endpoint": {
+                            "pedal_id": "sampler",
+                            "port_id": "random_seed",
+                        },
+                    },
                 ],
                 "public_outputs": [
                     {
                         "id": "model_output",
                         "endpoint": {
-                            "pedal_id": "fixture_pedal",
-                            "port_id": "output_frame",
+                            "pedal_id": "sampler",
+                            "port_id": "token",
                         },
                     }
                 ],
             },
             "pedals": [
                 {
-                    "pedal_id": "fixture_pedal",
-                    "operator_type": "fixture",
-                    "runtime_role": "signal_processor",
-                    "implementation": "exact_reference",
-                    "behavioral_role": "fixture",
-                    "circuit": circuit,
+                    "pedal_id": pedal_id,
+                    "operator_type": candidate["source"]["source_operator_type"],
+                    "runtime_role": candidate["runtime_role"],
+                    "implementation": candidate["implementation"],
+                    "behavioral_role": candidate["behavioral_role"],
+                    "circuit": candidate,
                     "params": {
                         "schema": "llmoop.circuit_params.v1",
-                        "circuit": "fixture_circuit",
-                        "layout": "row_major",
-                        "storage": "safetensors",
-                        "refs": {"weight": {"tensor": "weight"}},
+                        "circuit": candidate["id"],
+                        "layout": candidate["parameters"]["layout"],
+                        "storage": candidate["parameters"]["storage"],
+                        "refs": candidate["parameters"]["refs"],
                     },
                     "state": {
                         "schema": "llmoop.circuit_state.v1",
-                        "circuit": "fixture_circuit",
+                        "circuit": candidate["id"],
                         "state_ports": [],
                     },
                 }
+                for pedal_id, candidate in circuits.items()
             ],
         },
         "config_path": "config.json",
         "tensor_index_path": "tensors.json",
         "behavioral_validation_path": "behavioral_validation.json",
         "tokenizer": {"path": "tokenizer", "files": ["tokenizer.json"]},
+        "input_transducer": {
+            "spec": {
+                "parameter_tensor": "weight",
+                "output_signal_id": "input_frame",
+            },
+            "shader_path": "shaders/kernel.spv",
+        },
+        "output_transducer": {
+            "spec": {
+                "node_ids": ["norm", "project"],
+                "norm_parameter_tensor": "weight",
+                "projection_parameter_tensor": "weight",
+                "input_signal_id": "output_frame",
+            },
+            "embedding_norm_shader_path": "shaders/kernel.spv",
+            "projection_shader_path": "shaders/kernel.spv",
+        },
+        "sampler": {
+            "spec": {
+                "method": "greedy",
+                "temperature": 1.0,
+                "top_k": 1,
+                "top_p": 1.0,
+            },
+            "kernels": [{"shader_path": "shaders/kernel.spv"}],
+        },
         "pedal_executions": [
             {
                 "pedal_id": "fixture_pedal",
@@ -217,6 +430,8 @@ def test_package_integrity_accepts_a_complete_compiler_boundary(tmp_path: Path) 
         ("stale_proof", "incomplete or stale proof"),
         ("kernel", "kernel 0 does not match"),
         ("execution_identity", "execution identity does not match"),
+        ("sampler_contract", "sampler execution does not match"),
+        ("generation_boundary", "boundaries must expose"),
         ("placement_device", "invalid device id"),
         ("path_escape", "must stay inside the package"),
     ],
@@ -249,11 +464,11 @@ def test_package_integrity_rejects_corrupt_or_incomplete_artifacts(
         (tmp_path / "behavioral_validation.json").write_text(
             json.dumps(
                 {
-                        "schema": "llmoop.behavioral_validation.v1",
-                        "status": "passed",
-                        "candidate_kind": "exact_reference",
-                        "candidate_contract_digest_algorithm": CONTRACT_DIGEST_ALGORITHM,
-                    }
+                    "schema": "llmoop.behavioral_validation.v1",
+                    "status": "passed",
+                    "candidate_kind": "exact_reference",
+                    "candidate_contract_digest_algorithm": CONTRACT_DIGEST_ALGORITHM,
+                }
             )
         )
     elif corruption == "stale_proof":
@@ -264,6 +479,13 @@ def test_package_integrity_rejects_corrupt_or_incomplete_artifacts(
         manifest["pedal_executions"][0]["kernels"][0]["op"] = "multiply"
     elif corruption == "execution_identity":
         manifest["pedal_executions"][0]["implementation"] = "wrong"
+    elif corruption == "sampler_contract":
+        manifest["sampler"]["spec"]["top_k"] = 2
+    elif corruption == "generation_boundary":
+        manifest["circuit_graph"]["boundary"]["public_outputs"][0]["endpoint"] = {
+            "pedal_id": "output",
+            "port_id": "logits",
+        }
     elif corruption == "placement_device":
         manifest["placement"]["pedal_devices"]["fixture_pedal"] = ""
     elif corruption == "path_escape":
