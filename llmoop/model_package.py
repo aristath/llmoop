@@ -270,6 +270,11 @@ def build_vulkan_resident_package_manifest(
                     circuit, projection, multiply, tensor_index
                 )
             ),
+            can_fuse_multiply_rolling_depthwise=lambda multiply, rolling, depthwise, circuit=circuit: (
+                can_fuse_bf16_multiply_rolling_depthwise(
+                    circuit, multiply, rolling, depthwise, tensor_index
+                )
+            ),
         )
     pedal_executions = pedal_execution_specs(
         lowered_index=lowered_index,
@@ -746,6 +751,36 @@ def shader_file_for_node(
         temporal_memory = state_port(circuit, "temporal_memory")
         frames, state_hidden = temporal_memory["shape"]
         return f"depthwise_conv1d_bf16_{frames}x{state_hidden}.comp"
+    if op == "multiply_rolling_depthwise":
+        if (
+            len(node.get("inputs", [])) != 3
+            or len(node.get("outputs", [])) != 1
+            or len(node.get("params", [])) != 1
+            or len(node.get("state_reads", [])) != 1
+            or node.get("state_reads") != node.get("state_writes")
+        ):
+            raise ModelCompileError(
+                f"fused recurrent convolution node {node['id']!r} has invalid bindings"
+            )
+        temporal_memory = state_port(circuit, node["state_reads"][0])
+        frames, state_hidden = map(int, temporal_memory["shape"])
+        kernel_shape = parameter_shape_for_node(circuit, node, tensor_index)
+        supported_kernel_shapes = ([state_hidden, frames], [state_hidden, 1, frames])
+        if (
+            temporal_memory.get("dtype") != "BF16"
+            or frames < 2
+            or state_hidden <= 0
+            or state_hidden % 2
+            or kernel_shape not in supported_kernel_shapes
+            or parameter_dtype_for_node(circuit, node, tensor_index) != "BF16"
+            or parameter_layout_for_node(circuit, node, tensor_index)
+            != ROW_MAJOR_LAYOUT
+        ):
+            raise ModelCompileError(
+                f"fused recurrent convolution node {node['id']!r} has incompatible "
+                f"state {temporal_memory.get('shape')} or kernel {kernel_shape}"
+            )
+        return f"multiply_rolling_depthwise_bf16_{frames}x{state_hidden}.comp"
     if op == "residual_add":
         return f"add_bf16_{hidden_size}.comp"
     if op == "scaled_residual_add":
@@ -1372,6 +1407,11 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
             r"causal_conv1d_silu_bf16_c(\d+)_k(\d+)\.comp",
             "causal_conv1d_silu_bf16.comp.template",
             ("CHANNELS", "KERNEL_WIDTH"),
+        ),
+        (
+            r"multiply_rolling_depthwise_bf16_(\d+)x(\d+)\.comp",
+            "multiply_rolling_depthwise_bf16.comp.template",
+            ("FRAME_COUNT", "HIDDEN_SIZE"),
         ),
         (
             r"scaled_add_bf16_(\d+)_scale([0-9eE+.-]+)\.comp",
@@ -2254,6 +2294,42 @@ def can_fuse_bf16_dual_linear_silu_multiply(
         )
         and len(layouts) == 1
         and layouts <= {ROW_MAJOR_LAYOUT, VULKAN_BF16_ROW_PAIR_LAYOUT}
+    )
+
+
+def can_fuse_bf16_multiply_rolling_depthwise(
+    circuit: Json,
+    multiply: Json,
+    rolling: Json,
+    depthwise: Json,
+    tensor_index: Json,
+) -> bool:
+    if (
+        multiply.get("op") != "multiply"
+        or len(multiply.get("inputs", [])) != 2
+        or rolling.get("attrs", {}).get("update") != "shift_append"
+        or len(rolling.get("state_reads", [])) != 1
+        or rolling.get("state_reads") != rolling.get("state_writes")
+        or len(depthwise.get("params", [])) != 1
+    ):
+        return False
+    temporal_memory = state_port(circuit, rolling["state_reads"][0])
+    state_shape = list(map(int, temporal_memory.get("shape", [])))
+    if len(state_shape) != 2:
+        return False
+    frames, hidden_size = state_shape
+    kernel_shape = parameter_shape_for_node(circuit, depthwise, tensor_index)
+    return (
+        temporal_memory.get("dtype") == "BF16"
+        and temporal_memory.get("update") == "shift_append"
+        and frames >= 2
+        and hidden_size > 0
+        and hidden_size % 2 == 0
+        and depthwise.get("attrs", {}).get("groups") == hidden_size
+        and kernel_shape in ([hidden_size, frames], [hidden_size, 1, frames])
+        and parameter_dtype_for_node(circuit, depthwise, tensor_index) == "BF16"
+        and parameter_layout_for_node(circuit, depthwise, tensor_index)
+        == ROW_MAJOR_LAYOUT
     )
 
 

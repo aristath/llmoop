@@ -1,0 +1,100 @@
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer GateInput {
+    uint words[];
+} gate_input;
+
+layout(set = 0, binding = 1) readonly buffer ProjectedInput {
+    uint words[];
+} projected_input;
+
+layout(set = 0, binding = 2) readonly buffer InputState {
+    uint words[];
+} input_state;
+
+layout(set = 0, binding = 3) buffer ConvOutput {
+    uint words[];
+} conv_output;
+
+layout(set = 0, binding = 4) readonly buffer ConvKernel {
+    uint words[];
+} conv_kernel;
+
+layout(set = 0, binding = 5) readonly buffer StateRead {
+    uint words[];
+} state_read;
+
+layout(set = 0, binding = 6) buffer StateWrite {
+    uint words[];
+} state_write;
+
+const uint FRAME_COUNT = {{FRAME_COUNT}}u;
+const uint HIDDEN_SIZE = {{HIDDEN_SIZE}}u;
+const uint FRAME_WORD_COUNT = HIDDEN_SIZE / 2u;
+
+float bf16_to_f32(uint value) {
+    return uintBitsToFloat((value & 0xffffu) << 16);
+}
+
+uint f32_to_bf16(float value) {
+    uint bits = floatBitsToUint(value);
+    uint lsb = (bits >> 16) & 1u;
+    uint rounding_bias = 0x7fffu + lsb;
+    return (bits + rounding_bias) >> 16;
+}
+
+uint bf16_at_kernel(uint element_index) {
+    uint packed = conv_kernel.words[element_index >> 1u];
+    return (element_index & 1u) == 0u ? packed & 0xffffu : packed >> 16;
+}
+
+uint multiply_pair(uint left, uint right) {
+    uint lo = f32_to_bf16(bf16_to_f32(left) * bf16_to_f32(right));
+    uint hi = f32_to_bf16(
+        bf16_to_f32(left >> 16) * bf16_to_f32(right >> 16)
+    );
+    return (hi << 16) | lo;
+}
+
+void main() {
+    for (
+        uint word_index = gl_LocalInvocationID.x;
+        word_index < FRAME_WORD_COUNT;
+        word_index += 64u
+    ) {
+        uint temporal_words[FRAME_COUNT];
+        for (uint tap = 0u; tap + 1u < FRAME_COUNT; tap++) {
+            temporal_words[tap] =
+                state_read.words[((tap + 1u) * FRAME_WORD_COUNT) + word_index];
+        }
+        temporal_words[FRAME_COUNT - 1u] = multiply_pair(
+            gate_input.words[word_index],
+            projected_input.words[word_index]
+        );
+
+        for (uint tap = 0u; tap < FRAME_COUNT; tap++) {
+            state_write.words[(tap * FRAME_WORD_COUNT) + word_index] =
+                temporal_words[tap];
+        }
+
+        uint channel_lo = word_index * 2u;
+        uint channel_hi = channel_lo + 1u;
+        float lo = 0.0;
+        float hi = 0.0;
+        for (uint tap = 0u; tap < FRAME_COUNT; tap++) {
+            uint temporal_pair = temporal_words[tap];
+            uint lo_weight = bf16_at_kernel((channel_lo * FRAME_COUNT) + tap);
+            uint hi_weight = bf16_at_kernel((channel_hi * FRAME_COUNT) + tap);
+            lo = lo + (
+                bf16_to_f32(temporal_pair) * bf16_to_f32(lo_weight)
+            );
+            hi = hi + (
+                bf16_to_f32(temporal_pair >> 16) * bf16_to_f32(hi_weight)
+            );
+        }
+        conv_output.words[word_index] =
+            (f32_to_bf16(hi) << 16) | f32_to_bf16(lo);
+    }
+}

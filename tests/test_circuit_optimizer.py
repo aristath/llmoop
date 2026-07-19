@@ -6,6 +6,93 @@ from llmoop.circuit_optimizer import optimize_circuit_for_vulkan
 
 
 class VulkanCircuitOptimizerTest(unittest.TestCase):
+    def test_fuses_multiply_rolling_state_and_depthwise_convolution(self) -> None:
+        circuit = {
+            "nodes": [
+                {
+                    "id": "gate",
+                    "op": "multiply",
+                    "inputs": ["gate_value", "projected"],
+                    "outputs": ["gated"],
+                },
+                {
+                    "id": "shift",
+                    "op": "rolling_state_update",
+                    "inputs": ["gated", "temporal_memory"],
+                    "outputs": ["window"],
+                    "state_reads": ["temporal_memory"],
+                    "state_writes": ["temporal_memory"],
+                },
+                {
+                    "id": "convolve",
+                    "op": "depthwise_conv1d",
+                    "inputs": ["window"],
+                    "outputs": ["convolved"],
+                    "params": ["kernel"],
+                },
+            ]
+        }
+
+        optimized = optimize_circuit_for_vulkan(
+            circuit,
+            can_fuse_multiply_rolling_depthwise=lambda multiply, rolling, depthwise: (
+                multiply["outputs"] == rolling["inputs"][:1]
+                and rolling["outputs"] == depthwise["inputs"]
+            ),
+        )
+
+        self.assertEqual(1, len(optimized["nodes"]))
+        fused = optimized["nodes"][0]
+        self.assertEqual("multiply_rolling_depthwise", fused["op"])
+        self.assertEqual(
+            ["gate_value", "projected", "temporal_memory"], fused["inputs"]
+        )
+        self.assertEqual(["convolved"], fused["outputs"])
+        self.assertEqual(["kernel"], fused["params"])
+        self.assertEqual(["temporal_memory"], fused["state_reads"])
+        self.assertEqual(["temporal_memory"], fused["state_writes"])
+        self.assertEqual("BF16", fused["attrs"]["intermediate_rounding"])
+
+    def test_does_not_fuse_multiply_rolling_state_with_shared_window(self) -> None:
+        circuit = {
+            "nodes": [
+                {
+                    "id": "gate",
+                    "op": "multiply",
+                    "inputs": ["gate_value", "projected"],
+                    "outputs": ["gated"],
+                },
+                {
+                    "id": "shift",
+                    "op": "rolling_state_update",
+                    "inputs": ["gated", "temporal_memory"],
+                    "outputs": ["window"],
+                    "state_reads": ["temporal_memory"],
+                    "state_writes": ["temporal_memory"],
+                },
+                {
+                    "id": "convolve",
+                    "op": "depthwise_conv1d",
+                    "inputs": ["window"],
+                    "outputs": ["convolved"],
+                    "params": ["kernel"],
+                },
+                {
+                    "id": "extra",
+                    "op": "silu",
+                    "inputs": ["window"],
+                    "outputs": ["extra_out"],
+                },
+            ]
+        }
+
+        optimized = optimize_circuit_for_vulkan(
+            circuit,
+            can_fuse_multiply_rolling_depthwise=lambda _multiply, _rolling, _depthwise: True,
+        )
+
+        self.assertEqual(circuit, optimized)
+
     def test_fuses_dual_linear_projection_into_silu_multiply(self) -> None:
         circuit = {
             "nodes": [

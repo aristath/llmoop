@@ -215,6 +215,24 @@ def test_compiler_renders_dual_linear_silu_multiply_shader(tmp_path: Path) -> No
     assert "{{" not in source
 
 
+def test_compiler_renders_fused_recurrent_depthwise_shader(tmp_path: Path) -> None:
+    shader_source_dir = Path(__file__).parents[1] / "runtime-rs" / "shaders"
+    shader_file = "multiply_rolling_depthwise_bf16_3x1024.comp"
+
+    copy_shader_templates(shader_source_dir, tmp_path, {shader_file})
+
+    source = (tmp_path / shader_file).read_text()
+    assert "binding = 0) readonly buffer GateInput" in source
+    assert "binding = 4) readonly buffer ConvKernel" in source
+    assert "binding = 5) readonly buffer StateRead" in source
+    assert "binding = 6) buffer StateWrite" in source
+    assert "const uint FRAME_COUNT = 3u;" in source
+    assert "const uint HIDDEN_SIZE = 1024u;" in source
+    assert "uint temporal_words[FRAME_COUNT];" in source
+    assert "multiply_pair(" in source
+    assert "{{" not in source
+
+
 def test_parallel_linear_shader_selector_rejects_invalid_metadata_and_layout() -> None:
     node = {
         "id": "qkv",

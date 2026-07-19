@@ -20,6 +20,9 @@ def optimize_circuit_for_vulkan(
     can_fuse_dual_linear_silu_multiply: (
         Callable[[Json, Json], bool] | None
     ) = None,
+    can_fuse_multiply_rolling_depthwise: (
+        Callable[[Json, Json, Json], bool] | None
+    ) = None,
 ) -> Json:
     """Compile discoverable node regions without changing the pedal boundary."""
     optimized = deepcopy(circuit)
@@ -67,11 +70,92 @@ def optimize_circuit_for_vulkan(
         compiled_nodes.append(deepcopy(current))
         index += 1
 
-    optimized["nodes"] = _fuse_dual_linear_silu_multiply_regions(
+    compiled_nodes = _fuse_dual_linear_silu_multiply_regions(
         compiled_nodes,
         can_fuse_dual_linear_silu_multiply,
     )
+    optimized["nodes"] = _fuse_multiply_rolling_depthwise_regions(
+        compiled_nodes,
+        can_fuse_multiply_rolling_depthwise,
+    )
     return optimized
+
+
+def _fuse_multiply_rolling_depthwise_regions(
+    nodes: list[Json],
+    can_fuse: Callable[[Json, Json, Json], bool] | None,
+) -> list[Json]:
+    if can_fuse is None:
+        return nodes
+    consumer_counts = Counter(
+        signal for node in nodes for signal in node.get("inputs", [])
+    )
+    compiled: list[Json] = []
+    index = 0
+    while index < len(nodes):
+        multiply = nodes[index]
+        rolling = nodes[index + 1] if index + 1 < len(nodes) else None
+        depthwise = nodes[index + 2] if index + 2 < len(nodes) else None
+        multiply_outputs = multiply.get("outputs", [])
+        rolling_outputs = rolling.get("outputs", []) if rolling is not None else []
+        if (
+            rolling is None
+            or depthwise is None
+            or multiply.get("op") != "multiply"
+            or rolling.get("op") != "rolling_state_update"
+            or depthwise.get("op") != "depthwise_conv1d"
+            or len(multiply.get("inputs", [])) != 2
+            or len(multiply_outputs) != 1
+            or multiply.get("params")
+            or multiply.get("state_reads")
+            or multiply.get("state_writes")
+            or len(rolling.get("inputs", [])) != 2
+            or rolling["inputs"].count(multiply_outputs[0]) != 1
+            or len(rolling_outputs) != 1
+            or rolling.get("params")
+            or len(rolling.get("state_reads", [])) != 1
+            or len(rolling.get("state_writes", [])) != 1
+            or rolling["state_reads"] != rolling["state_writes"]
+            or depthwise.get("inputs") != rolling_outputs
+            or len(depthwise.get("outputs", [])) != 1
+            or len(depthwise.get("params", [])) != 1
+            or depthwise.get("state_reads")
+            or depthwise.get("state_writes")
+            or consumer_counts[multiply_outputs[0]] != 1
+            or consumer_counts[rolling_outputs[0]] != 1
+            or not can_fuse(multiply, rolling, depthwise)
+        ):
+            compiled.append(deepcopy(multiply))
+            index += 1
+            continue
+
+        state_input = next(
+            signal for signal in rolling["inputs"] if signal != multiply_outputs[0]
+        )
+        compiled.append(
+            {
+                "id": f"{multiply['id']}__{rolling['id']}__{depthwise['id']}",
+                "op": "multiply_rolling_depthwise",
+                "inputs": [*deepcopy(multiply["inputs"]), state_input],
+                "outputs": deepcopy(depthwise["outputs"]),
+                "params": deepcopy(depthwise["params"]),
+                "state_reads": deepcopy(rolling["state_reads"]),
+                "state_writes": deepcopy(rolling["state_writes"]),
+                "attrs": {
+                    "compiled_from": [
+                        multiply["id"],
+                        rolling["id"],
+                        depthwise["id"],
+                    ],
+                    "multiply": deepcopy(multiply.get("attrs", {})),
+                    "rolling": deepcopy(rolling.get("attrs", {})),
+                    "depthwise": deepcopy(depthwise.get("attrs", {})),
+                    "intermediate_rounding": "BF16",
+                },
+            }
+        )
+        index += 3
+    return compiled
 
 
 def _fuse_dual_linear_silu_multiply_regions(
