@@ -11,6 +11,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use smallvec::SmallVec;
 
 use crate::stream_circuit::{
@@ -37,6 +38,7 @@ pub const VULKAN_REUSABLE_KERNEL_ARTIFACT_MANIFEST_SCHEMA: &str =
     "llmoop.vulkan_reusable_kernel_artifacts.v1";
 pub const VULKAN_RESIDENT_MODEL_PACKAGE_MANIFEST_SCHEMA: &str =
     "llmoop.vulkan_resident_model_package.v1";
+const CONTRACT_DIGEST_ALGORITHM: &str = "llmoop.json_tree_sha256.v1";
 const VULKAN_STREAM_CONTROL_BYTE_CAPACITY: usize = 5 * std::mem::size_of::<u32>();
 const VULKAN_STREAM_CONTROL_METADATA_OFFSET: usize = std::mem::size_of::<u32>();
 const VULKAN_SAMPLER_HISTORY_RECORD_BYTE_CAPACITY: usize = 4 * std::mem::size_of::<u32>();
@@ -7104,6 +7106,7 @@ pub struct VulkanResidentModelPackageManifest {
 fn validate_behavioral_validation_artifact(
     manifest_path: &Path,
     manifest: &VulkanResidentModelPackageManifest,
+    raw_manifest: &Value,
 ) -> io::Result<()> {
     let relative_path = &manifest.behavioral_validation_path;
     if relative_path.is_empty() {
@@ -7169,6 +7172,19 @@ fn validate_behavioral_validation_artifact(
             io::ErrorKind::InvalidData,
             format!(
                 "behavioral validation evidence {} has unsupported candidate kind {candidate_kind:?}",
+                path.display()
+            ),
+        ));
+    }
+    if evidence
+        .get("candidate_contract_digest_algorithm")
+        .and_then(Value::as_str)
+        != Some(CONTRACT_DIGEST_ALGORITHM)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "behavioral validation evidence {} uses an unsupported candidate contract digest algorithm",
                 path.display()
             ),
         ));
@@ -7250,12 +7266,52 @@ fn validate_behavioral_validation_artifact(
         }
     }
 
-    let expected_pedals = manifest
-        .circuit_graph
-        .pedals
-        .iter()
-        .map(|pedal| (pedal.pedal_id.as_str(), pedal.circuit.nodes.len()))
-        .collect::<BTreeMap<_, _>>();
+    let raw_pedals = raw_manifest
+        .pointer("/circuit_graph/pedals")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "resident model package has no raw circuit graph pedals",
+            )
+        })?;
+    let mut expected_pedals = BTreeMap::new();
+    for pedal in raw_pedals {
+        let pedal_id = pedal
+            .get("pedal_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "resident model package contains a raw circuit without a pedal id",
+                )
+            })?;
+        let circuit = pedal.get("circuit").ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("resident model package pedal {pedal_id:?} has no raw circuit"),
+            )
+        })?;
+        let node_count = circuit
+            .get("nodes")
+            .and_then(Value::as_array)
+            .map(Vec::len)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("resident model package pedal {pedal_id:?} has no raw circuit nodes"),
+                )
+            })?;
+        if expected_pedals
+            .insert(pedal_id, (node_count, circuit))
+            .is_some()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("resident model package repeats raw pedal {pedal_id:?}"),
+            ));
+        }
+    }
     let circuits = evidence
         .get("circuits")
         .and_then(Value::as_array)
@@ -7269,6 +7325,7 @@ fn validate_behavioral_validation_artifact(
             )
         })?;
     let mut proven_pedals = BTreeSet::new();
+    let mut approximate_proof_count = 0usize;
     for circuit in circuits {
         let pedal_id = circuit
             .get("pedal_id")
@@ -7291,26 +7348,30 @@ fn validate_behavioral_validation_artifact(
                 ),
             ));
         }
-        let expected_node_count = expected_pedals.get(pedal_id).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "behavioral validation evidence {} proves unknown pedal {pedal_id:?}",
-                    path.display()
-                ),
-            )
-        })?;
+        let (expected_node_count, candidate_circuit) =
+            expected_pedals.get(pedal_id).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "behavioral validation evidence {} proves unknown pedal {pedal_id:?}",
+                        path.display()
+                    ),
+                )
+            })?;
+        let expected_contract_digest = json_tree_sha256(candidate_circuit)?;
         let candidate_node_count = circuit
             .get("candidate_node_count")
             .and_then(Value::as_u64)
             .and_then(|count| usize::try_from(count).ok());
+        let proof_kind = circuit.get("candidate_kind").and_then(Value::as_str);
         if circuit.get("status").and_then(Value::as_str) != Some("passed")
-            || circuit.get("candidate_kind").and_then(Value::as_str) != Some(candidate_kind)
+            || !matches!(proof_kind, Some("exact_reference" | "approximate"))
+            || (candidate_kind == "exact_reference" && proof_kind != Some("exact_reference"))
             || candidate_node_count != Some(*expected_node_count)
             || circuit
                 .get("candidate_contract_digest")
                 .and_then(Value::as_str)
-                .is_none_or(|digest| !is_lower_hex_sha256(digest))
+                != Some(expected_contract_digest.as_str())
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -7320,11 +7381,12 @@ fn validate_behavioral_validation_artifact(
                 ),
             ));
         }
-        if candidate_kind == "exact_reference"
-            && (circuit.get("source_node_count").and_then(Value::as_u64)
-                != circuit
-                    .get("covered_source_node_count")
-                    .and_then(Value::as_u64))
+        if proof_kind == Some("approximate") {
+            approximate_proof_count += 1;
+        } else if circuit.get("source_node_count").and_then(Value::as_u64)
+            != circuit
+                .get("covered_source_node_count")
+                .and_then(Value::as_u64)
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -7334,6 +7396,15 @@ fn validate_behavioral_validation_artifact(
                 ),
             ));
         }
+    }
+    if candidate_kind == "approximate" && approximate_proof_count == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "approximate behavioral validation evidence {} contains no approximate pedal proof",
+                path.display()
+            ),
+        ));
     }
     if proven_pedals != expected_pedals.keys().copied().collect() {
         return Err(io::Error::new(
@@ -7352,6 +7423,75 @@ fn is_lower_hex_sha256(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn json_tree_sha256(value: &Value) -> io::Result<String> {
+    let mut digest = Sha256::new();
+    update_json_tree_digest(&mut digest, value)?;
+    Ok(digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+fn update_json_tree_digest(digest: &mut Sha256, value: &Value) -> io::Result<()> {
+    match value {
+        Value::Null => digest.update(b"n"),
+        Value::Bool(false) => digest.update(b"f"),
+        Value::Bool(true) => digest.update(b"t"),
+        Value::Number(number) if number.is_i64() => {
+            digest.update(b"i");
+            update_digest_length_prefixed(digest, number.as_i64().unwrap().to_string().as_bytes());
+        }
+        Value::Number(number) if number.is_u64() => {
+            digest.update(b"i");
+            update_digest_length_prefixed(digest, number.as_u64().unwrap().to_string().as_bytes());
+        }
+        Value::Number(number) => {
+            let number = number.as_f64().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "contract digest cannot encode a non-f64 JSON number",
+                )
+            })?;
+            if !number.is_finite() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "contract digest cannot encode a non-finite number",
+                ));
+            }
+            digest.update(b"d");
+            digest.update(number.to_be_bytes());
+        }
+        Value::String(value) => {
+            digest.update(b"s");
+            update_digest_length_prefixed(digest, value.as_bytes());
+        }
+        Value::Array(values) => {
+            digest.update(b"l");
+            digest.update((values.len() as u64).to_be_bytes());
+            for value in values {
+                update_json_tree_digest(digest, value)?;
+            }
+        }
+        Value::Object(values) => {
+            digest.update(b"o");
+            digest.update((values.len() as u64).to_be_bytes());
+            let mut keys = values.keys().collect::<Vec<_>>();
+            keys.sort();
+            for key in keys {
+                update_json_tree_digest(digest, &Value::String(key.clone()))?;
+                update_json_tree_digest(digest, &values[key])?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn update_digest_length_prefixed(digest: &mut Sha256, payload: &[u8]) {
+    digest.update((payload.len() as u64).to_be_bytes());
+    digest.update(payload);
 }
 
 fn validate_resident_package_relative_path(label: &str, value: &str) -> io::Result<()> {
@@ -7420,7 +7560,9 @@ impl VulkanResidentModelPackageManifest {
     pub fn from_json_file(path: impl AsRef<Path>) -> io::Result<Self> {
         let path = path.as_ref();
         let bytes = fs::read(path)?;
-        let manifest: Self = serde_json::from_slice(&bytes)
+        let raw_manifest: Value = serde_json::from_slice(&bytes)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let manifest: Self = serde_json::from_value(raw_manifest.clone())
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         if manifest.schema != VULKAN_RESIDENT_MODEL_PACKAGE_MANIFEST_SCHEMA {
             return Err(io::Error::new(
@@ -7432,7 +7574,7 @@ impl VulkanResidentModelPackageManifest {
             ));
         }
         validate_resident_package_paths(&manifest)?;
-        validate_behavioral_validation_artifact(path, &manifest)?;
+        validate_behavioral_validation_artifact(path, &manifest, &raw_manifest)?;
         let package_root = path.parent().unwrap_or_else(|| Path::new("."));
         let source_graph = manifest
             .resolved_source_graph(package_root)
@@ -17509,11 +17651,17 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let manifest_path = root.join("vulkan_resident_package.json");
         let evidence_path = root.join("behavioral_validation.json");
-        source_manifest.write_json_file(&manifest_path).unwrap();
+        std::fs::copy(&source_manifest_path, &manifest_path).unwrap();
 
         std::fs::write(
             &evidence_path,
-            br#"{"schema":"llmoop.behavioral_validation.v1","status":"passed","candidate_kind":"exact_reference"}"#,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schema": "llmoop.behavioral_validation.v1",
+                "status": "passed",
+                "candidate_kind": "exact_reference",
+                "candidate_contract_digest_algorithm": CONTRACT_DIGEST_ALGORITHM
+            }))
+            .unwrap(),
         )
         .unwrap();
         let shallow_error = VulkanResidentModelPackageManifest::from_json_file(&manifest_path)
@@ -17535,6 +17683,24 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(stale_error.contains("incomplete or stale proof"));
+
+        let original_evidence =
+            std::fs::read(source_root.join(&source_manifest.behavioral_validation_path)).unwrap();
+        std::fs::write(&evidence_path, original_evidence).unwrap();
+        let mut raw_manifest: Value =
+            serde_json::from_slice(&std::fs::read(&source_manifest_path).unwrap()).unwrap();
+        raw_manifest["circuit_graph"]["pedals"][0]["circuit"]["nodes"][0]["attrs"]["adversarial_drift"] =
+            Value::from(true);
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&raw_manifest).unwrap(),
+        )
+        .unwrap();
+        let same_size_stale_error =
+            VulkanResidentModelPackageManifest::from_json_file(&manifest_path)
+                .unwrap_err()
+                .to_string();
+        assert!(same_size_stale_error.contains("incomplete or stale proof"));
 
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -17561,6 +17727,61 @@ mod tests {
 
         assert!(error.contains("config path"));
         assert!(error.contains("must stay inside the package"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn package_loader_accepts_mixed_exact_and_approximate_pedal_proofs() {
+        let source_manifest_path = fixture_model_package_manifest_path();
+        let source_manifest = fixture_model_package_manifest();
+        let source_root = source_manifest_path.parent().unwrap();
+        let mut evidence: Value = serde_json::from_slice(
+            &std::fs::read(source_root.join(&source_manifest.behavioral_validation_path)).unwrap(),
+        )
+        .unwrap();
+        evidence["candidate_kind"] = Value::from("approximate");
+        evidence["teacher_forced"] = serde_json::json!({
+            "status": "passed",
+            "sample_count": 128,
+            "metrics": {"maximum_logit_error": 0.01}
+        });
+        evidence["free_running"] = serde_json::json!({
+            "status": "passed",
+            "sample_count": 64,
+            "metrics": {"distribution_similarity": 0.99}
+        });
+        evidence["circuits"][0]["candidate_kind"] = Value::from("approximate");
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "llmoop-mixed-behavioral-evidence-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let manifest_path = root.join("vulkan_resident_package.json");
+        std::fs::copy(&source_manifest_path, &manifest_path).unwrap();
+        std::fs::write(
+            root.join("behavioral_validation.json"),
+            serde_json::to_vec_pretty(&evidence).unwrap(),
+        )
+        .unwrap();
+
+        VulkanResidentModelPackageManifest::from_json_file(&manifest_path).unwrap();
+
+        evidence["circuits"][0]["candidate_kind"] = Value::from("exact_reference");
+        std::fs::write(
+            root.join("behavioral_validation.json"),
+            serde_json::to_vec_pretty(&evidence).unwrap(),
+        )
+        .unwrap();
+        let error = VulkanResidentModelPackageManifest::from_json_file(&manifest_path)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("no approximate pedal proof"));
+
         std::fs::remove_dir_all(root).unwrap();
     }
 

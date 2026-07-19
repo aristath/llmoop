@@ -7,7 +7,10 @@ from pathlib import Path
 import pytest
 
 from llmoop.compilation import PACKAGE_SCHEMA, ModelCompileError
-from llmoop.behavioral_compiler import json_contract_digest
+from llmoop.behavioral_compiler import (
+    CONTRACT_DIGEST_ALGORITHM,
+    json_contract_digest,
+)
 from llmoop.model_package import (
     compile_shader_artifacts,
     copy_exact_bytes,
@@ -82,6 +85,7 @@ def minimal_package(root: Path) -> dict[str, object]:
                 "schema": "llmoop.behavioral_validation.v1",
                 "status": "passed",
                 "candidate_kind": "exact_reference",
+                "candidate_contract_digest_algorithm": CONTRACT_DIGEST_ALGORITHM,
                 "source_oracle": {
                     "model_contract_digest": "a" * 64,
                     "tensor_count": 1,
@@ -206,10 +210,11 @@ def test_package_integrity_rejects_corrupt_or_incomplete_artifacts(
         (tmp_path / "behavioral_validation.json").write_text(
             json.dumps(
                 {
-                    "schema": "llmoop.behavioral_validation.v1",
-                    "status": "passed",
-                    "candidate_kind": "exact_reference",
-                }
+                        "schema": "llmoop.behavioral_validation.v1",
+                        "status": "passed",
+                        "candidate_kind": "exact_reference",
+                        "candidate_contract_digest_algorithm": CONTRACT_DIGEST_ALGORITHM,
+                    }
             )
         )
     elif corruption == "stale_proof":

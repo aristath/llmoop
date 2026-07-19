@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import struct
 from collections import Counter
 from copy import deepcopy
 from typing import Any
@@ -12,6 +13,7 @@ from llmoop.compilation import Json, ModelCompileError
 
 BEHAVIORAL_VALIDATION_SCHEMA = "llmoop.behavioral_validation.v1"
 BEHAVIORAL_EMPIRICAL_EVIDENCE_SCHEMA = "llmoop.behavioral_empirical_evidence.v1"
+CONTRACT_DIGEST_ALGORITHM = "llmoop.json_tree_sha256.v1"
 EXACT_REWRITE_CONTRACTS = {
     "append_scaled_dot_product_attention": "append_attention_exact_bf16.v1",
     "linear_residual": "linear_residual_exact_bf16.v1",
@@ -97,6 +99,7 @@ def build_behavioral_validation(
         "schema": BEHAVIORAL_VALIDATION_SCHEMA,
         "status": "passed",
         "candidate_kind": "exact_reference" if exact else "approximate",
+        "candidate_contract_digest_algorithm": CONTRACT_DIGEST_ALGORITHM,
         "source_oracle": {
             "kind": "source_checkpoint_contract",
             "model_contract_digest": oracle_digest,
@@ -284,8 +287,51 @@ def model_contract_digest(model_graph: Json, tensor_index: Json) -> str:
 
 
 def json_contract_digest(value: Any) -> str:
-    encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
-    return hashlib.sha256(encoded).hexdigest()
+    digest = hashlib.sha256()
+    _update_json_tree_digest(digest, value)
+    return digest.hexdigest()
+
+
+def _update_json_tree_digest(digest: Any, value: Any) -> None:
+    if value is None:
+        digest.update(b"n")
+    elif value is False:
+        digest.update(b"f")
+    elif value is True:
+        digest.update(b"t")
+    elif isinstance(value, int):
+        digest.update(b"i")
+        _update_length_prefixed(digest, str(value).encode("ascii"))
+    elif isinstance(value, float):
+        if not math.isfinite(value):
+            raise ModelCompileError("contract digest cannot encode a non-finite number")
+        digest.update(b"d")
+        digest.update(struct.pack(">d", value))
+    elif isinstance(value, str):
+        digest.update(b"s")
+        _update_length_prefixed(digest, value.encode("utf-8"))
+    elif isinstance(value, list):
+        digest.update(b"l")
+        digest.update(len(value).to_bytes(8, "big"))
+        for item in value:
+            _update_json_tree_digest(digest, item)
+    elif isinstance(value, dict):
+        if any(not isinstance(key, str) for key in value):
+            raise ModelCompileError("contract digest object keys must be strings")
+        digest.update(b"o")
+        digest.update(len(value).to_bytes(8, "big"))
+        for key in sorted(value):
+            _update_json_tree_digest(digest, key)
+            _update_json_tree_digest(digest, value[key])
+    else:
+        raise ModelCompileError(
+            f"contract digest cannot encode value of type {type(value).__name__}"
+        )
+
+
+def _update_length_prefixed(digest: Any, payload: bytes) -> None:
+    digest.update(len(payload).to_bytes(8, "big"))
+    digest.update(payload)
 
 
 def validate_behavioral_validation_artifact(
@@ -301,6 +347,10 @@ def validate_behavioral_validation_artifact(
     if candidate_kind not in {"exact_reference", "approximate"}:
         raise ModelCompileError(
             f"behavioral validation artifact has unsupported candidate kind {candidate_kind!r}"
+        )
+    if evidence.get("candidate_contract_digest_algorithm") != CONTRACT_DIGEST_ALGORITHM:
+        raise ModelCompileError(
+            "behavioral validation artifact has an unsupported candidate contract digest algorithm"
         )
     source_oracle = evidence.get("source_oracle")
     if (
@@ -362,11 +412,14 @@ def validate_behavioral_validation_artifact(
         raise ModelCompileError(
             "behavioral validation artifact does not prove every packaged pedal"
         )
+    approximate_proof_count = 0
     for pedal_id, candidate in candidate_circuits.items():
         proof = proof_by_pedal[pedal_id]
+        proof_kind = proof.get("candidate_kind")
         if (
             proof.get("status") != "passed"
-            or proof.get("candidate_kind") != candidate_kind
+            or proof_kind not in {"exact_reference", "approximate"}
+            or (candidate_kind == "exact_reference" and proof_kind != "exact_reference")
             or proof.get("candidate_node_count") != len(candidate.get("nodes", []))
             or proof.get("candidate_contract_digest")
             != json_contract_digest(candidate)
@@ -374,13 +427,19 @@ def validate_behavioral_validation_artifact(
             raise ModelCompileError(
                 f"behavioral validation artifact has an incomplete or stale proof for pedal {pedal_id!r}"
             )
-        if candidate_kind == "exact_reference" and (
+        if proof_kind == "approximate":
+            approximate_proof_count += 1
+        elif (
             proof.get("source_node_count")
             != proof.get("covered_source_node_count")
         ):
             raise ModelCompileError(
                 f"behavioral validation artifact does not completely cover pedal {pedal_id!r}"
             )
+    if candidate_kind == "approximate" and approximate_proof_count == 0:
+        raise ModelCompileError(
+            "approximate behavioral validation artifact contains no approximate pedal proof"
+        )
 
 
 def _validate_exact_rewrite_semantics(

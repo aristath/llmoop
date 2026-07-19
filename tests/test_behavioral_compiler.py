@@ -4,7 +4,12 @@ from copy import deepcopy
 
 import pytest
 
-from llmoop.behavioral_compiler import prove_exact_circuit_candidate
+from llmoop.behavioral_compiler import (
+    build_behavioral_validation,
+    model_contract_digest,
+    prove_exact_circuit_candidate,
+    validate_behavioral_validation_artifact,
+)
 from llmoop.compilation import ModelCompileError
 
 
@@ -54,8 +59,7 @@ def empirical_evidence(*, free_running_status: str = "passed") -> dict:
     }
 
 
-def test_exact_candidate_gate_proves_complete_fusion_coverage() -> None:
-    source = source_circuit()
+def fused_candidate(source: dict) -> dict:
     candidate = deepcopy(source)
     candidate["nodes"] = [
         {
@@ -70,6 +74,12 @@ def test_exact_candidate_gate_proves_complete_fusion_coverage() -> None:
             },
         }
     ]
+    return candidate
+
+
+def test_exact_candidate_gate_proves_complete_fusion_coverage() -> None:
+    source = source_circuit()
+    candidate = fused_candidate(source)
 
     evidence = prove_exact_circuit_candidate(
         pedal_id="layer_00", source=source, candidate=candidate
@@ -157,3 +167,72 @@ def test_approximate_candidate_requires_both_closed_loop_evidence_modes() -> Non
     )
     assert evidence["candidate_kind"] == "approximate"
     assert len(evidence["candidate_contract_digest"]) == 64
+
+
+def test_behavioral_validation_accepts_mixed_exact_and_approximate_pedals() -> None:
+    model_graph = {
+        "architecture": {"family": "fixture"},
+        "dimensions": {"hidden_size": 4},
+        "numerics": {"activation_dtype": "BF16"},
+        "graph": {"wiring": "series"},
+    }
+    tensor_index = {
+        "tensors": {},
+        "totals": {"parameter_count": 0, "byte_count": 0},
+    }
+    source_exact = source_circuit()
+    source_approximate = deepcopy(source_exact)
+    source_approximate["source"]["pedal_id"] = "layer_01"
+    candidate_exact = fused_candidate(source_exact)
+    candidate_approximate = deepcopy(source_approximate)
+    candidate_approximate["boundary"]["outputs"][0]["source"] = "approximate_y"
+    empirical = empirical_evidence()
+    empirical["model_contract_digest"] = model_contract_digest(
+        model_graph, tensor_index
+    )
+
+    validation = build_behavioral_validation(
+        model_graph=model_graph,
+        tensor_index=tensor_index,
+        lowered_index={
+            "graph": {
+                "circuits": [
+                    {"id": "layer_00"},
+                    {"id": "layer_01"},
+                ]
+            }
+        },
+        source_circuits={
+            "layer_00": source_exact,
+            "layer_01": source_approximate,
+        },
+        candidate_circuits={
+            "layer_00": candidate_exact,
+            "layer_01": candidate_approximate,
+        },
+        empirical_evidence=empirical,
+    )
+
+    assert validation["candidate_kind"] == "approximate"
+    assert [proof["candidate_kind"] for proof in validation["circuits"]] == [
+        "exact_reference",
+        "approximate",
+    ]
+    validate_behavioral_validation_artifact(
+        validation,
+        {"layer_00": candidate_exact, "layer_01": candidate_approximate},
+    )
+
+    mislabeled = deepcopy(validation)
+    mislabeled["circuits"][1].update(
+        {
+            "candidate_kind": "exact_reference",
+            "source_node_count": 2,
+            "covered_source_node_count": 2,
+        }
+    )
+    with pytest.raises(ModelCompileError, match="no approximate pedal proof"):
+        validate_behavioral_validation_artifact(
+            mislabeled,
+            {"layer_00": candidate_exact, "layer_01": candidate_approximate},
+        )
