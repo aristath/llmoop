@@ -21,7 +21,16 @@ class PedalboardCircuitLoweringTest(unittest.TestCase):
             self.assertEqual("llmoop.lowered_pedalboard.v1", index["schema"])
             self.assertEqual(14, index["summary"]["circuit_count"])
             self.assertEqual({"conv": 8, "full_attention": 6}, index["summary"]["operator_counts"])
-            self.assertEqual("series", index["graph"]["wiring"])
+            self.assertEqual("explicit_graph", index["graph"]["wiring"])
+            self.assertEqual(13, len(index["graph"]["cables"]))
+            self.assertEqual(
+                {
+                    "id": "cable_0000",
+                    "source": {"pedal_id": "layer_00", "port_id": "output_frame"},
+                    "destination": {"pedal_id": "layer_01", "port_id": "input_frame"},
+                },
+                index["graph"]["cables"][0],
+            )
             self.assertEqual("llmoop.compiled_pedalboard_artifact.v1", index["source"]["format"])
             self.assertEqual(".", index["source"]["artifact_root"])
             self.assertTrue(result["index_path"].exists())

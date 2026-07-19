@@ -33,10 +33,20 @@ def minimal_package(root: Path) -> dict[str, object]:
             }
         )
     )
+    (root / "behavioral_validation.json").write_text(
+        json.dumps(
+            {
+                "schema": "llmoop.behavioral_validation.v1",
+                "status": "passed",
+                "candidate_kind": "exact_reference",
+            }
+        )
+    )
     return {
         "schema": PACKAGE_SCHEMA,
         "config_path": "config.json",
         "tensor_index_path": "tensors.json",
+        "behavioral_validation_path": "behavioral_validation.json",
         "tokenizer": {"path": "tokenizer", "files": ["tokenizer.json"]},
         "pedals": [{"kernels": [{"shader_path": "shaders/kernel.spv"}]}],
     }
@@ -53,6 +63,7 @@ def test_package_integrity_accepts_a_complete_compiler_boundary(tmp_path: Path) 
     [
         ("schema", "unsupported schema"),
         ("config", "missing required artifact"),
+        ("behavioral", "missing behavioral validation artifact"),
         ("tokenizer", "missing tokenizer artifact"),
         ("tensor", "references missing artifact"),
         ("shader", "not valid SPIR-V"),
@@ -67,6 +78,8 @@ def test_package_integrity_rejects_corrupt_or_incomplete_artifacts(
         manifest["schema"] = "broken"
     elif corruption == "config":
         (tmp_path / "config.json").unlink()
+    elif corruption == "behavioral":
+        (tmp_path / "behavioral_validation.json").unlink()
     elif corruption == "tokenizer":
         (tmp_path / "tokenizer" / "tokenizer.json").unlink()
     elif corruption == "tensor":

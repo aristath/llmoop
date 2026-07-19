@@ -665,6 +665,7 @@ class VulkanCircuitOptimizerTest(unittest.TestCase):
                     "op": "silu",
                     "inputs": ["gate"],
                     "outputs": ["activated"],
+                    "attrs": {"element_count": 16},
                 },
                 {
                     "id": "product_a",

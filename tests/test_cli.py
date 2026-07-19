@@ -575,32 +575,28 @@ class CompiledPackageTest(unittest.TestCase):
         layer_00 = executions[0]
         self.assertEqual("layer_00", layer_00["pedal_id"])
         self.assertEqual("conv", layer_00["operator_type"])
+        compiled_layer_00 = next(
+            pedal
+            for pedal in manifest["circuit_graph"]["pedals"]
+            if pedal["pedal_id"] == "layer_00"
+        )["circuit"]
         self.assertEqual(
-            [
-                "operator_norm",
-                "conv_in_projection",
-                "split_b_c_x",
-                "input_gate",
-                "temporal_memory_update",
-                "depthwise_temporal_conv",
-                "output_gate",
-                "conv_out_projection__operator_residual",
-                "ffn_norm",
-                "ffn_gate_projection",
-                "ffn_up_projection",
-                "ffn_gate_activation__ffn_gate_multiply",
-                "ffn_down_projection__ffn_residual",
-            ],
+            [node["id"] for node in compiled_layer_00["nodes"]],
             [kernel["node_id"] for kernel in layer_00["kernels"]],
         )
-        self.assertEqual(list(range(13)), [kernel["execution_index"] for kernel in layer_00["kernels"]])
         self.assertEqual(
-            ["linear_residual", "silu_multiply", "linear_residual"],
-            [
-                kernel["op"]
-                for kernel in layer_00["kernels"]
-                if kernel["op"] in {"linear_residual", "silu_multiply"}
-            ],
+            list(range(len(layer_00["kernels"]))),
+            [kernel["execution_index"] for kernel in layer_00["kernels"]],
+        )
+        self.assertEqual(
+            [node["op"] for node in compiled_layer_00["nodes"]],
+            [kernel["op"] for kernel in layer_00["kernels"]],
+        )
+        self.assertTrue(
+            any(
+                len(node.get("attrs", {}).get("compiled_from", [])) > 2
+                for node in compiled_layer_00["nodes"]
+            )
         )
         self.assertNotIn("capacity_profiles", manifest)
         self.assertTrue(
@@ -610,7 +606,8 @@ class CompiledPackageTest(unittest.TestCase):
             kernel
             for execution in executions
             for kernel in execution["kernels"]
-            if kernel["op"] == "scaled_dot_product_attention"
+            if kernel["op"]
+            in {"scaled_dot_product_attention", "append_scaled_dot_product_attention"}
         )
         self.assertEqual(16, attention["workgroup_count_x"])
         self.assertNotIn("_cap", attention["shader_path"])
@@ -651,7 +648,8 @@ class CompiledPackageTest(unittest.TestCase):
         )
         self.assertEqual("runtime_default", manifest["device_id"])
         circuit_graph = manifest["circuit_graph"]
-        self.assertEqual("series", circuit_graph["wiring"])
+        self.assertEqual("explicit_graph", circuit_graph["wiring"])
+        self.assertEqual(13, len(circuit_graph["cables"]))
         self.assertEqual(14, len(circuit_graph["pedals"]))
         layer_00 = circuit_graph["pedals"][0]
         self.assertEqual("layer_00", layer_00["pedal_id"])
@@ -659,6 +657,12 @@ class CompiledPackageTest(unittest.TestCase):
         self.assertEqual("layer_00_shortconv_circuit_v1", layer_00["circuit"]["id"])
         self.assertEqual("llmoop.circuit_params.v1", layer_00["params"]["schema"])
         self.assertEqual("llmoop.circuit_state.v1", layer_00["state"]["schema"])
+        behavioral = json.loads(
+            (fixture.package_dir / manifest["behavioral_validation_path"]).read_text()
+        )
+        self.assertEqual("passed", behavioral["status"])
+        self.assertEqual("exact_reference", behavioral["candidate_kind"])
+        self.assertEqual(14, len(behavioral["circuits"]))
 
     def test_compiled_package_does_not_reference_source_or_transpiled_paths(self) -> None:
         fixture = compiled_model_or_skip()
