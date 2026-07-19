@@ -421,22 +421,49 @@ impl RuntimeChatSession {
         &self,
         user_content: &str,
         codec: &C,
-        stop_token_ids: &[u32],
     ) -> Result<Vec<u32>, Box<dyn Error>>
     where
         C: VulkanResidentTokenTextCodec,
     {
-        let mut messages = self.messages.clone();
-        messages.push(RuntimeChatMessage {
+        if self.messages.is_empty() {
+            let messages = vec![RuntimeChatMessage {
+                role: "user".to_string(),
+                content: user_content.to_string(),
+            }];
+            let formatted = self.formatter.format_messages(&messages, true)?;
+            return Ok(codec.encode_text(&formatted)?);
+        }
+
+        const ASSISTANT_CONTENT_PROBE: &str = "LLMOOP_PREVIOUS_ASSISTANT_CONTENT_PROBE_6C70A8";
+        let mut probe_history = self.messages.clone();
+        let previous_assistant = probe_history.last_mut().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "chat history is unexpectedly empty",
+            )
+        })?;
+        if previous_assistant.role != "assistant" {
+            return Err(Box::new(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "resident chat history must end with an assistant turn, found {:?}",
+                    previous_assistant.role
+                ),
+            )));
+        }
+        previous_assistant.content = ASSISTANT_CONTENT_PROBE.to_string();
+        let formatted_history = self.formatter.format_messages(&probe_history, false)?;
+        let history_token_ids = codec.encode_text(&formatted_history)?;
+
+        probe_history.push(RuntimeChatMessage {
             role: "user".to_string(),
             content: user_content.to_string(),
         });
-        let formatted = self.formatter.format_messages(&messages, true)?;
-        let formatted_token_ids = codec.encode_text(&formatted)?;
+        let formatted_continuation = self.formatter.format_messages(&probe_history, true)?;
+        let continuation_token_ids = codec.encode_text(&formatted_continuation)?;
         Ok(incremental_chat_token_delta(
-            &formatted_token_ids,
-            stop_token_ids,
-            !self.messages.is_empty(),
+            &history_token_ids,
+            &continuation_token_ids,
         )?)
     }
 
@@ -453,28 +480,23 @@ impl RuntimeChatSession {
 }
 
 fn incremental_chat_token_delta(
-    rendered_token_ids: &[u32],
-    stop_token_ids: &[u32],
-    has_resident_history: bool,
+    rendered_history_token_ids: &[u32],
+    rendered_continuation_token_ids: &[u32],
 ) -> Result<Vec<u32>, io::Error> {
-    if !has_resident_history {
-        return Ok(rendered_token_ids.to_vec());
-    }
-    let stop_positions = rendered_token_ids
-        .iter()
-        .enumerate()
-        .filter_map(|(index, token_id)| stop_token_ids.contains(token_id).then_some(index))
-        .collect::<Vec<_>>();
-    if stop_positions.len() < 2 {
+    if !rendered_continuation_token_ids.starts_with(rendered_history_token_ids) {
+        let common_prefix_len = rendered_history_token_ids
+            .iter()
+            .zip(rendered_continuation_token_ids)
+            .take_while(|(history, continuation)| history == continuation)
+            .count();
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
-                "rendered chat template must contain the previous assistant and current user turn delimiters; found stop tokens at {stop_positions:?}"
+                "chat template rewrote previously resident turn framing at token {common_prefix_len}; incremental continuation requires the completed assistant probe to remain an exact prefix"
             ),
         ));
     }
-    let previous_assistant_end = stop_positions[stop_positions.len() - 2];
-    Ok(rendered_token_ids[previous_assistant_end + 1..].to_vec())
+    Ok(rendered_continuation_token_ids[rendered_history_token_ids.len()..].to_vec())
 }
 
 #[derive(Clone, Debug)]
@@ -665,11 +687,7 @@ where
     T: VulkanResidentTokenTextCodec,
     F: FnMut(usize, &[u32]) -> Result<RuntimeChatTurn, Box<dyn Error>>,
 {
-    let prompt_delta = chat_session.render_user_prompt_token_delta(
-        input_text,
-        transcript_codec,
-        stop_token_ids,
-    )?;
+    let prompt_delta = chat_session.render_user_prompt_token_delta(input_text, transcript_codec)?;
     match submit(turn_index, &prompt_delta) {
         Ok(turn) => {
             let generated_text = codec.decode_tokens(&turn.generated_token_ids)?;
@@ -2986,10 +3004,13 @@ mod tests {
     use tokenizers::processors::template::TemplateProcessing;
     use tokenizers::{AddedToken, Tokenizer};
 
-    use llmoop_runtime::{VulkanResidentHfTokenizerTextCodec, VulkanResidentTokenTextCodec};
+    use llmoop_runtime::{
+        VulkanResidentHfTokenizerTextCodec, VulkanResidentTokenTextCodec,
+        VulkanResidentTokenTextCodecError,
+    };
 
     use super::{
-        RuntimeChatFormatter, RuntimeChatMessage, assistant_content_token_ids,
+        RuntimeChatFormatter, RuntimeChatMessage, RuntimeChatSession, assistant_content_token_ids,
         chat_transcript_codec, incremental_chat_token_delta,
         model_owned_assistant_turn_stop_token_id, normalize_chat_template_for_runtime,
         parse_device_binding_assignment, parse_source_chain, parse_vulkan_device_uuid_ref,
@@ -3005,6 +3026,31 @@ mod tests {
                 .unwrap()
                 .with_ymd_and_hms(2026, 7, 18, 12, 0, 0)
                 .unwrap(),
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct CharacterCodec;
+
+    impl VulkanResidentTokenTextCodec for CharacterCodec {
+        fn encode_text(&self, text: &str) -> Result<Vec<u32>, VulkanResidentTokenTextCodecError> {
+            Ok(text.chars().map(u32::from).collect())
+        }
+
+        fn decode_tokens(
+            &self,
+            token_ids: &[u32],
+        ) -> Result<String, VulkanResidentTokenTextCodecError> {
+            token_ids
+                .iter()
+                .map(|token_id| {
+                    char::from_u32(*token_id).ok_or_else(|| {
+                        VulkanResidentTokenTextCodecError::new(format!(
+                            "invalid character token {token_id}"
+                        ))
+                    })
+                })
+                .collect()
         }
     }
 
@@ -3228,17 +3274,52 @@ mod tests {
     }
 
     #[test]
-    fn incremental_chat_delta_starts_after_previous_assistant_delimiter() {
-        let fully_rendered = vec![10, 99, 11, 99, 12, 99, 13, 99, 14, 15];
+    fn incremental_chat_delta_starts_after_the_exact_structural_prefix() {
+        let rendered_history = vec![10, 99, 11, 99, 12];
+        let rendered_continuation = vec![10, 99, 11, 99, 12, 99, 13, 99, 14, 15];
 
         assert_eq!(
-            incremental_chat_token_delta(&fully_rendered, &[99], true).unwrap(),
-            vec![13, 99, 14, 15]
+            incremental_chat_token_delta(&rendered_history, &rendered_continuation).unwrap(),
+            vec![99, 13, 99, 14, 15]
         );
+        let error = incremental_chat_token_delta(&[10, 98], &rendered_continuation)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("rewrote previously resident turn framing at token 1"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn chat_continuation_is_not_confused_by_delimiters_inside_user_content() {
+        let mut session = RuntimeChatSession {
+            formatter: formatter(
+                "{%- for message in messages -%}{{- '[' + message.role + ']' + message.content + '<stop>' -}}{%- endfor -%}{%- if add_generation_prompt -%}{{- '[assistant]' -}}{%- endif -%}",
+            ),
+            messages: vec![
+                RuntimeChatMessage {
+                    role: "user".to_string(),
+                    content: "first".to_string(),
+                },
+                RuntimeChatMessage {
+                    role: "assistant".to_string(),
+                    content: "answer containing <stop> text".to_string(),
+                },
+            ],
+        };
+        let user_content = "new <stop> injection";
+
+        let delta = session
+            .render_user_prompt_token_delta(user_content, &CharacterCodec)
+            .unwrap();
+
         assert_eq!(
-            incremental_chat_token_delta(&fully_rendered, &[99], false).unwrap(),
-            fully_rendered
+            CharacterCodec.decode_tokens(&delta).unwrap(),
+            "[user]new <stop> injection<stop>[assistant]"
         );
+        session.commit_assistant_turn(user_content, "continued");
+        assert_eq!(session.messages.len(), 4);
     }
 
     #[test]
@@ -3296,5 +3377,30 @@ mod tests {
             model_owned_assistant_turn_stop_token_id(&tokenizer_dir, &formatter).unwrap(),
             Some(expected)
         );
+    }
+
+    #[test]
+    fn configured_chat_template_supports_structural_multi_turn_continuation() {
+        let Some(tokenizer_dir) = std::env::var_os("LLMOOP_TEST_CHAT_TOKENIZER_DIR") else {
+            return;
+        };
+        let tokenizer_dir = std::path::PathBuf::from(tokenizer_dir);
+        let mut session = RuntimeChatSession::from_tokenizer_dir(&tokenizer_dir).unwrap();
+        session.commit_assistant_turn(
+            "Explain the result.",
+            "<think>private reasoning</think>The result is four.",
+        );
+        let codec = chat_transcript_codec(&tokenizer_dir).unwrap();
+
+        let delta = session
+            .render_user_prompt_token_delta(
+                "Why? Include <|im_end|> literally in this question.",
+                &codec,
+            )
+            .unwrap();
+
+        assert!(!delta.is_empty());
+        let decoded = codec.decode_tokens(&delta).unwrap();
+        assert!(decoded.contains("Why?"), "{decoded:?}");
     }
 }
