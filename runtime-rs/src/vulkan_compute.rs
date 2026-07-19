@@ -2213,7 +2213,34 @@ unsafe fn read_byte_memory(
 
 #[cfg(test)]
 pub(crate) fn compile_test_shader_words() -> Option<Vec<u32>> {
-    compile_shader_words_from_source("add_one.comp")
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    const SOURCE: &str = r#"#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) buffer Data {
+    uint values[];
+} data;
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    if (index < data.values.length()) {
+        data.values[index] = data.values[index] + 1;
+    }
+}
+"#;
+
+    static SOURCE_COUNTER: AtomicU64 = AtomicU64::new(0);
+    let source_id = SOURCE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let source_path = std::env::temp_dir().join(format!(
+        "llmoop-test-increment-{}-{source_id}.comp",
+        std::process::id()
+    ));
+    std::fs::write(&source_path, SOURCE).ok()?;
+    let words = compile_shader_words_from_source_path(&source_path);
+    let _ = std::fs::remove_file(source_path);
+    words
 }
 
 #[cfg(test)]
