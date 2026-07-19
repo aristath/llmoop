@@ -233,6 +233,29 @@ def test_compiler_renders_fused_recurrent_depthwise_shader(tmp_path: Path) -> No
     assert "{{" not in source
 
 
+def test_compiler_renders_unfused_recurrent_and_activation_shaders(
+    tmp_path: Path,
+) -> None:
+    shader_source_dir = Path(__file__).parents[1] / "runtime-rs" / "shaders"
+    shader_files = {
+        "rolling_state_update_bf16_5x768.comp",
+        "depthwise_conv1d_bf16_5x768.comp",
+        "silu_bf16_3072.comp",
+    }
+
+    copy_shader_templates(shader_source_dir, tmp_path, shader_files)
+
+    rolling = (tmp_path / "rolling_state_update_bf16_5x768.comp").read_text()
+    depthwise = (tmp_path / "depthwise_conv1d_bf16_5x768.comp").read_text()
+    silu = (tmp_path / "silu_bf16_3072.comp").read_text()
+    assert "const uint FRAME_COUNT = 5u;" in rolling
+    assert "const uint FRAME_WORD_COUNT = (768u + 1u) / 2u;" in rolling
+    assert "const uint HIDDEN_SIZE = 768u;" in depthwise
+    assert "const uint KERNEL_TAPS = 5u;" in depthwise
+    assert "const uint WORD_COUNT = (3072u + 1u) / 2u;" in silu
+    assert all("{{" not in source for source in (rolling, depthwise, silu))
+
+
 def test_compiler_renders_output_gated_recurrent_depthwise_shader(
     tmp_path: Path,
 ) -> None:

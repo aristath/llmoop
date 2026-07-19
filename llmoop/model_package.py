@@ -1592,6 +1592,16 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
             ("CHANNELS", "KERNEL_WIDTH"),
         ),
         (
+            r"rolling_state_update_bf16_(\d+)x(\d+)\.comp",
+            "rolling_state_update_bf16.comp.template",
+            ("FRAME_COUNT", "HIDDEN_SIZE"),
+        ),
+        (
+            r"depthwise_conv1d_bf16_(\d+)x(\d+)\.comp",
+            "depthwise_conv1d_bf16.comp.template",
+            ("FRAME_COUNT", "HIDDEN_SIZE"),
+        ),
+        (
             r"scaled_add_bf16_(\d+)_scale([0-9eE+.-]+)\.comp",
             "scaled_add_bf16.comp.template",
             ("ELEMENT_COUNT", "RESIDUAL_SCALE"),
@@ -1614,6 +1624,11 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
         (
             r"gelu_tanh_bf16_(\d+)\.comp",
             "gelu_tanh_bf16.comp.template",
+            ("ELEMENT_COUNT",),
+        ),
+        (
+            r"silu_bf16_(\d+)\.comp",
+            "silu_bf16.comp.template",
             ("ELEMENT_COUNT",),
         ),
     )

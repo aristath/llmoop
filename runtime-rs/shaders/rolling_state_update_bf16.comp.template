@@ -26,24 +26,22 @@ layout(set = 0, binding = 5) buffer StateView {
     uint words[];
 } state_view;
 
-const uint FRAME_WORD_COUNT = 512u;
+const uint FRAME_COUNT = {{FRAME_COUNT}}u;
+const uint FRAME_WORD_COUNT = ({{HIDDEN_SIZE}}u + 1u) / 2u;
 
 void main() {
     for (uint word_index = gl_LocalInvocationID.x; word_index < FRAME_WORD_COUNT; word_index += 64u) {
-        uint shifted_0 = state_read.words[FRAME_WORD_COUNT + word_index];
-        uint shifted_1 = state_read.words[(2u * FRAME_WORD_COUNT) + word_index];
+        for (uint frame = 0u; frame + 1u < FRAME_COUNT; frame += 1u) {
+            uint shifted = state_read.words[((frame + 1u) * FRAME_WORD_COUNT) + word_index];
+            window_out.words[(frame * FRAME_WORD_COUNT) + word_index] = shifted;
+            state_write.words[(frame * FRAME_WORD_COUNT) + word_index] = shifted;
+            state_view.words[(frame * FRAME_WORD_COUNT) + word_index] = shifted;
+        }
+
+        uint final_index = ((FRAME_COUNT - 1u) * FRAME_WORD_COUNT) + word_index;
         uint appended = current_frame.words[word_index];
-
-        window_out.words[word_index] = shifted_0;
-        window_out.words[FRAME_WORD_COUNT + word_index] = shifted_1;
-        window_out.words[(2u * FRAME_WORD_COUNT) + word_index] = appended;
-
-        state_write.words[word_index] = shifted_0;
-        state_write.words[FRAME_WORD_COUNT + word_index] = shifted_1;
-        state_write.words[(2u * FRAME_WORD_COUNT) + word_index] = appended;
-
-        state_view.words[word_index] = shifted_0;
-        state_view.words[FRAME_WORD_COUNT + word_index] = shifted_1;
-        state_view.words[(2u * FRAME_WORD_COUNT) + word_index] = appended;
+        window_out.words[final_index] = appended;
+        state_write.words[final_index] = appended;
+        state_view.words[final_index] = appended;
     }
 }

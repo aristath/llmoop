@@ -10,7 +10,7 @@ layout(set = 0, binding = 1) buffer OutputFrame {
     uint words[];
 } output_frame;
 
-const uint WORD_COUNT = 1280u;
+const uint WORD_COUNT = ({{ELEMENT_COUNT}}u + 1u) / 2u;
 
 float bf16_to_f32(uint value) {
     return uintBitsToFloat((value & 0xffffu) << 16);
@@ -19,8 +19,7 @@ float bf16_to_f32(uint value) {
 uint f32_to_bf16(float value) {
     uint bits = floatBitsToUint(value);
     uint lsb = (bits >> 16) & 1u;
-    uint rounding_bias = 0x7fffu + lsb;
-    return (bits + rounding_bias) >> 16;
+    return (bits + 0x7fffu + lsb) >> 16;
 }
 
 float silu(float value) {
@@ -30,7 +29,7 @@ float silu(float value) {
 void main() {
     for (uint word_index = gl_LocalInvocationID.x; word_index < WORD_COUNT; word_index += 64u) {
         uint packed = input_frame.words[word_index];
-        float lo = bf16_to_f32(packed & 0xffffu);
+        float lo = bf16_to_f32(packed);
         float hi = bf16_to_f32(packed >> 16);
         output_frame.words[word_index] =
             (f32_to_bf16(silu(hi)) << 16) | f32_to_bf16(silu(lo));
