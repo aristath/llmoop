@@ -1121,6 +1121,14 @@ def _linear_params(weight_id: str, parameters: Json) -> list[str]:
     scale_id = f"{weight_id}_scale_inv"
     if scale_id in parameters:
         result.append(scale_id)
+    qzeros_id = f"{weight_id}_qzeros"
+    scales_id = f"{weight_id}_scales"
+    if qzeros_id in parameters or scales_id in parameters:
+        if qzeros_id not in parameters or scales_id not in parameters:
+            raise CircuitLoweringError(
+                f"packed linear parameter {weight_id!r} has incomplete quantization metadata"
+            )
+        result.extend((qzeros_id, scales_id))
     bias_id = f"{weight_id}_bias"
     if bias_id in parameters:
         result.append(bias_id)
@@ -1239,6 +1247,12 @@ def _param_role(name: str) -> str:
     if name.endswith("_scale_inv"):
         weight_id = name.removesuffix("_scale_inv")
         return f"{roles[weight_id]}_block_scale_inverse"
+    if name.endswith("_qzeros"):
+        weight_id = name.removesuffix("_qzeros")
+        return f"{roles[weight_id]}_packed_zero_points"
+    if name.endswith("_scales"):
+        weight_id = name.removesuffix("_scales")
+        return f"{roles[weight_id]}_group_scales"
     return roles[name]
 
 

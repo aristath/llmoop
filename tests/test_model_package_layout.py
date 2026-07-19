@@ -150,6 +150,33 @@ def test_compiler_renders_native_block_scaled_fp8_linear_shaders(
     )
 
 
+def test_compiler_renders_native_auto_gptq_int4_linear_variants(
+    tmp_path: Path,
+) -> None:
+    shader_source_dir = Path(__file__).parents[1] / "runtime-rs" / "shaders"
+    shader_files = {
+        "linear_int4_gptq_g128_512x768.comp",
+        "linear_bias_int4_gptq_g128_512x768.comp",
+        "linear_residual_int4_gptq_g128_512x768.comp",
+    }
+
+    copy_shader_templates(shader_source_dir, tmp_path, shader_files)
+
+    linear = (tmp_path / "linear_int4_gptq_g128_512x768.comp").read_text()
+    bias = (tmp_path / "linear_bias_int4_gptq_g128_512x768.comp").read_text()
+    residual = (
+        tmp_path / "linear_residual_int4_gptq_g128_512x768.comp"
+    ).read_text()
+    assert "const uint GROUP_SIZE = 128u;" in linear
+    assert "const uint INPUT_SIZE = 512u;" in linear
+    assert "const uint OUTPUT_SIZE = 768u;" in linear
+    assert "& 15u) + 1u" in linear
+    assert "unpackHalf2x16" in linear
+    assert "readonly buffer Bias" in bias
+    assert "readonly buffer ResidualFrame" in residual
+    assert all("{{" not in source for source in (linear, bias, residual))
+
+
 def test_compiler_renders_native_block_scaled_fp8_sparse_experts(
     tmp_path: Path,
 ) -> None:

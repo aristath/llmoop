@@ -449,6 +449,16 @@ def shader_file_for_node(
         parameter_shape = parameter_shape_for_node(circuit, node, tensor_index)
         out_features, in_features = parameter_shape
         parameter_dtype = parameter_dtype_for_node(circuit, node, tensor_index)
+        if parameter_dtype == "I32":
+            group_size = packed_int4_linear_group_size_for_node(
+                circuit, node, tensor_index
+            )
+            has_bias = len(node.get("params", [])) == 4
+            prefix = "linear_bias" if has_bias else "linear"
+            return (
+                f"{prefix}_int4_gptq_g{group_size}_"
+                f"{in_features}x{out_features}.comp"
+            )
         if parameter_dtype == "F8_E4M3":
             block_rows, block_columns = fp8_block_shape_for_node(
                 circuit, node, tensor_index
@@ -477,6 +487,14 @@ def shader_file_for_node(
         parameter_shape = parameter_shape_for_node(circuit, node, tensor_index)
         out_features, in_features = parameter_shape
         parameter_dtype = parameter_dtype_for_node(circuit, node, tensor_index)
+        if parameter_dtype == "I32":
+            group_size = packed_int4_linear_group_size_for_node(
+                circuit, node, tensor_index
+            )
+            return (
+                f"linear_residual_int4_gptq_g{group_size}_"
+                f"{in_features}x{out_features}.comp"
+            )
         if parameter_dtype == "F8_E4M3":
             block_rows, block_columns = fp8_block_shape_for_node(
                 circuit, node, tensor_index
@@ -796,6 +814,21 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
         return rendered
 
     shaped_templates = (
+        (
+            r"linear_int4_gptq_g(\d+)_(\d+)x(\d+)\.comp",
+            "linear_int4_gptq.comp.template",
+            ("GROUP_SIZE", "INPUT_SIZE", "OUTPUT_SIZE"),
+        ),
+        (
+            r"linear_bias_int4_gptq_g(\d+)_(\d+)x(\d+)\.comp",
+            "linear_bias_int4_gptq.comp.template",
+            ("GROUP_SIZE", "INPUT_SIZE", "OUTPUT_SIZE"),
+        ),
+        (
+            r"linear_residual_int4_gptq_g(\d+)_(\d+)x(\d+)\.comp",
+            "linear_residual_int4_gptq.comp.template",
+            ("GROUP_SIZE", "INPUT_SIZE", "OUTPUT_SIZE"),
+        ),
         (
             r"linear_fp8_e4m3_b(\d+)x(\d+)_(\d+)x(\d+)\.comp",
             "linear_fp8_e4m3.comp.template",
@@ -1704,6 +1737,77 @@ def scalar_parameter_read_expression(buffer: str, dtype_token: str) -> str:
     )
 
 
+def packed_int4_linear_group_size_for_node(
+    circuit: Json, node: Json, tensor_index: Json
+) -> int:
+    weight_id = str(node["params"][0])
+    qzeros_id = f"{weight_id}_qzeros"
+    scales_id = f"{weight_id}_scales"
+    expected_params = [weight_id, qzeros_id, scales_id]
+    actual_params = list(node.get("params", []))
+    if len(actual_params) == 4:
+        expected_params.append(f"{weight_id}_bias")
+    if actual_params != expected_params:
+        raise ModelCompileError(
+            f"packed INT4 linear node {node['id']!r} must bind {expected_params}; "
+            f"got {actual_params}"
+        )
+    weight_ref = circuit["parameters"]["refs"][weight_id]
+    weight_info = tensor_index["tensors"][weight_ref["tensor"]]
+    quantization = weight_info.get("quantization")
+    if not isinstance(quantization, dict):
+        raise ModelCompileError(
+            f"packed INT4 linear node {node['id']!r} has no compiled quantization metadata"
+        )
+    if (
+        quantization.get("format") != "auto_gptq"
+        or int(quantization.get("bits") or 0) != 4
+        or int(quantization.get("zero_point_add") or 0) != 1
+    ):
+        raise ModelCompileError(
+            f"packed INT4 linear node {node['id']!r} has unsupported quantization "
+            f"{quantization}"
+        )
+    out_features, in_features = parameter_shape_for_id(
+        circuit, weight_id, tensor_index
+    )
+    packed_shape = [int(value) for value in weight_info.get("shape", [])]
+    qzeros_shape = parameter_shape_for_id(circuit, qzeros_id, tensor_index)
+    scales_shape = parameter_shape_for_id(circuit, scales_id, tensor_index)
+    group_size = int(quantization.get("group_size") or 0)
+    group_count = (in_features + group_size - 1) // group_size if group_size else 0
+    if packed_shape != [in_features // 8, out_features]:
+        raise ModelCompileError(
+            f"packed INT4 weight shape {packed_shape} does not encode "
+            f"{[out_features, in_features]}"
+        )
+    if qzeros_shape != [group_count, (out_features + 7) // 8]:
+        raise ModelCompileError(
+            f"packed INT4 zero-point shape {qzeros_shape} is incompatible with "
+            f"{[out_features, in_features]}"
+        )
+    if scales_shape != [group_count, out_features]:
+        raise ModelCompileError(
+            f"packed INT4 scale shape {scales_shape} is incompatible with "
+            f"{[out_features, in_features]}"
+        )
+    if parameter_dtype_for_id(circuit, qzeros_id, tensor_index) != "I32":
+        raise ModelCompileError("packed INT4 zero points must use I32 storage")
+    if parameter_dtype_for_id(circuit, scales_id, tensor_index) != "F16":
+        raise ModelCompileError("packed INT4 scales must use F16 storage")
+    if any(
+        parameter_layout_for_id(circuit, parameter_id, tensor_index)
+        != ROW_MAJOR_LAYOUT
+        for parameter_id in (weight_id, qzeros_id, scales_id)
+    ):
+        raise ModelCompileError("packed INT4 parameters must use row-major storage")
+    if len(actual_params) == 4 and parameter_dtype_for_id(
+        circuit, actual_params[3], tensor_index
+    ) != "BF16":
+        raise ModelCompileError("packed INT4 linear bias must use BF16 storage")
+    return group_size
+
+
 def fp8_block_shape_for_node(
     circuit: Json, node: Json, tensor_index: Json
 ) -> tuple[int, int]:
@@ -1838,7 +1942,10 @@ def state_port(circuit: Json, state_id: str) -> Json:
 
 
 def tensor_shape(tensor_index: Json, tensor: str) -> list[int]:
-    return [int(dim) for dim in tensor_index["tensors"][tensor]["shape"]]
+    info = tensor_index["tensors"][tensor]
+    return [
+        int(dim) for dim in info.get("logical_shape", info["shape"])
+    ]
 
 
 def tensor_dtype(tensor_index: Json, tensor: str) -> str:

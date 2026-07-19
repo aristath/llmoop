@@ -59,7 +59,12 @@ impl TensorIndex {
     pub fn tensor_shape(&self, tensor: &str) -> Option<&[usize]> {
         self.tensors
             .get(tensor)
-            .map(|metadata| metadata.shape.as_slice())
+            .map(|metadata| {
+                metadata
+                    .logical_shape
+                    .as_deref()
+                    .unwrap_or(metadata.shape.as_slice())
+            })
     }
 }
 
@@ -67,6 +72,8 @@ impl TensorIndex {
 pub struct TensorMetadata {
     pub dtype: String,
     pub shape: Vec<usize>,
+    #[serde(default)]
+    pub logical_shape: Option<Vec<usize>>,
     #[serde(default)]
     pub parameter_count: Option<usize>,
     #[serde(default)]
@@ -1487,6 +1494,32 @@ mod tests {
                 .map(|slot| slot.max_elements)
                 .collect::<Vec<_>>(),
             vec![Some(1024), Some(2560), Some(2560), Some(2560)]
+        );
+    }
+
+    #[test]
+    fn tensor_index_uses_logical_shape_without_changing_storage_shape() {
+        let index: TensorIndex = serde_json::from_str(
+            r#"{
+              "schema": "llmoop.tensor_index.v1",
+              "tensors": {
+                "projection.qweight": {
+                  "dtype": "I32",
+                  "shape": [64, 768],
+                  "logical_shape": [768, 512]
+                }
+              }
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            index.tensor_shape("projection.qweight"),
+            Some([768, 512].as_slice())
+        );
+        assert_eq!(
+            index.tensors["projection.qweight"].shape,
+            vec![64, 768]
         );
     }
 

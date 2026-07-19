@@ -894,7 +894,7 @@ def discover_layer_structure(
         )
         q_projection = layer_tensors.get("q_projection")
         if q_projection is not None:
-            q_width = int(tensors[q_projection]["shape"][0])
+            q_width = tensor_matrix_shape(tensors, q_projection)[0]
             configured_output_gate = bool(decoder_config.get("attn_output_gate", False))
             expected_q_width = num_attention_heads * head_width
             if q_width == expected_q_width * 2:
@@ -906,7 +906,9 @@ def discover_layer_structure(
                 )
         num_key_value_heads = configured_num_key_value_heads
         if shared_kv_source_layer is None and "k_projection" in layer_tensors:
-            k_width = int(tensors[layer_tensors["k_projection"]]["shape"][0])
+            k_width = tensor_matrix_shape(
+                tensors, layer_tensors["k_projection"]
+            )[0]
             if k_width % head_width:
                 raise ModelTranspileError(
                     f"attention key projection width {k_width} is not divisible by head width {head_width}"
@@ -942,6 +944,7 @@ def discover_layer_structure(
         value_head_norm = False
 
     attach_block_quantization_scales(tensors, layer_tensors)
+    attach_packed_linear_quantization(tensors, layer_tensors)
 
     return LayerStructure(
         index=layer_index,
@@ -960,7 +963,10 @@ def discover_layer_structure(
         per_layer_input_width=per_layer_input_width,
         feed_forward_type=feed_forward_type,
         shared_intermediate_size=(
-            int(tensors[layer_tensors["shared_mlp_input"]]["shape"][0]) // 2
+            tensor_matrix_shape(
+                tensors, layer_tensors["shared_mlp_input"]
+            )[0]
+            // 2
             if "shared_mlp_input" in layer_tensors
             else None
         ),
@@ -1234,7 +1240,9 @@ def discover_attention_output_gate(
         expected_width = layer.num_attention_heads * layer.head_width
         kv_width = layer.num_key_value_heads * layer.head_width
         if "qkv_projection" in layer.tensors:
-            projection_width = int(tensors[layer.tensors["qkv_projection"]]["shape"][0])
+            projection_width = tensor_matrix_shape(
+                tensors, layer.tensors["qkv_projection"]
+            )[0]
             ordinary_width = expected_width + 2 * kv_width
             discovered = projection_width == ordinary_width + expected_width
             if projection_width not in (
@@ -1247,7 +1255,9 @@ def discover_attention_output_gate(
                     f"width {layer.head_width}"
                 )
         else:
-            projection_width = int(tensors[layer.tensors["q_projection"]]["shape"][0])
+            projection_width = tensor_matrix_shape(
+                tensors, layer.tensors["q_projection"]
+            )[0]
             discovered = projection_width == expected_width * 2
             if projection_width not in (expected_width, expected_width * 2):
                 raise ModelTranspileError(
@@ -1345,10 +1355,15 @@ def discover_intermediate_size(
         if layer.feed_forward_type == "dense_swiglu":
             if "ffn_gate_up" in layer.tensors:
                 discovered.add(
-                    int(tensors[layer.tensors["ffn_gate_up"]]["shape"][0]) // 2
+                    tensor_matrix_shape(
+                        tensors, layer.tensors["ffn_gate_up"]
+                    )[0]
+                    // 2
                 )
             else:
-                discovered.add(int(tensors[layer.tensors["ffn_gate"]]["shape"][0]))
+                discovered.add(
+                    tensor_matrix_shape(tensors, layer.tensors["ffn_gate"])[0]
+                )
         elif layer.feed_forward_type == "sparse_moe":
             shape = tensors[layer.tensors["moe_input"]]["shape"]
             discovered.add(int(shape[-2]) // 2)
@@ -2169,6 +2184,8 @@ def make_tensor_index(model_dir: Path) -> Json:
                 "source_header_bytes": header_len,
             }
 
+    annotate_packed_linear_tensors(model_dir, tensor_entries)
+
     return {
         "schema": "llmoop.tensor_index.v1",
         "source": {
@@ -2228,6 +2245,10 @@ def find_first_existing_tensor(
     for name in candidates:
         if name in tensors:
             return name
+        if name.endswith(".weight"):
+            packed_name = f"{name[: -len('.weight')]}.qweight"
+            if packed_name in tensors and tensors[packed_name].get("quantization"):
+                return packed_name
     return None
 
 
@@ -2252,9 +2273,10 @@ def find_optional_layer_tensor(
 
 
 def find_bias_for_weight(tensors: dict[str, Json], weight: str) -> str | None:
-    if not weight.endswith(".weight"):
+    suffix = ".qweight" if weight.endswith(".qweight") else ".weight"
+    if not weight.endswith(suffix):
         return None
-    bias = f"{weight[: -len('.weight')]}.bias"
+    bias = f"{weight[: -len(suffix)]}.bias"
     return bias if bias in tensors else None
 
 
@@ -2411,12 +2433,109 @@ def synthesize_shared_expert_input(
 
 
 def tensor_matrix_shape(tensors: dict[str, Json], tensor_name: str) -> list[int]:
-    shape = [int(value) for value in tensors[tensor_name].get("shape", [])]
+    info = tensors[tensor_name]
+    shape = [
+        int(value)
+        for value in info.get("logical_shape", info.get("shape", []))
+    ]
     if len(shape) != 2:
         raise ModelTranspileError(
             f"tensor {tensor_name!r} is not a matrix: shape {shape}"
         )
     return shape
+
+
+def annotate_packed_linear_tensors(
+    model_dir: Path, tensors: dict[str, Json]
+) -> None:
+    config = read_json(model_dir / "config.json")
+    quantization = config.get("quantization_config")
+    if not isinstance(quantization, dict):
+        return
+    packing_format = str(quantization.get("packing_format") or "")
+    if packing_format not in {"auto_round:auto_gptq", "auto_round:gptq"}:
+        return
+    bits = int(quantization.get("bits") or 0)
+    if bits <= 0 or 32 % bits:
+        raise ModelTranspileError(
+            f"packed linear format {packing_format!r} has invalid bit width {bits}"
+        )
+    pack_factor = 32 // bits
+    configured_group_size = int(quantization.get("group_size") or 0)
+
+    for name, info in tuple(tensors.items()):
+        if not name.endswith(".qweight"):
+            continue
+        base = name[: -len(".qweight")]
+        qzeros_name = f"{base}.qzeros"
+        scales_name = f"{base}.scales"
+        qzeros = tensors.get(qzeros_name)
+        scales = tensors.get(scales_name)
+        if qzeros is None or scales is None:
+            raise ModelTranspileError(
+                f"packed linear tensor {name!r} is missing qzeros or scales"
+            )
+        packed_shape = [int(value) for value in info.get("shape", [])]
+        zero_shape = [int(value) for value in qzeros.get("shape", [])]
+        scale_shape = [int(value) for value in scales.get("shape", [])]
+        if info.get("dtype") != "I32" or qzeros.get("dtype") != "I32":
+            raise ModelTranspileError(
+                f"packed linear tensor {name!r} requires I32 qweight and qzeros"
+            )
+        if scales.get("dtype") not in {"F16", "BF16"}:
+            raise ModelTranspileError(
+                f"packed linear tensor {name!r} has unsupported scale dtype "
+                f"{scales.get('dtype')!r}"
+            )
+        if len(packed_shape) != 2 or len(scale_shape) != 2 or len(zero_shape) != 2:
+            raise ModelTranspileError(
+                f"packed linear tensor {name!r} has invalid qweight/qzeros/scales shapes"
+            )
+        input_features = packed_shape[0] * pack_factor
+        output_features = packed_shape[1]
+        group_count = scale_shape[0]
+        if group_count <= 0 or input_features % group_count:
+            raise ModelTranspileError(
+                f"packed linear tensor {name!r} cannot infer an integer group size"
+            )
+        group_size = input_features // group_count
+        expected_zero_shape = [
+            group_count,
+            (output_features + pack_factor - 1) // pack_factor,
+        ]
+        if scale_shape[1] != output_features or zero_shape != expected_zero_shape:
+            raise ModelTranspileError(
+                f"packed linear tensor {name!r} has incompatible qzeros {zero_shape} "
+                f"or scales {scale_shape}"
+            )
+        if configured_group_size > 0 and group_size != configured_group_size:
+            raise ModelTranspileError(
+                f"packed linear tensor {name!r} implies group size {group_size}, "
+                f"not configured size {configured_group_size}"
+            )
+        info["logical_shape"] = [output_features, input_features]
+        info["quantization"] = {
+            "format": "auto_gptq",
+            "bits": bits,
+            "group_size": group_size,
+            "symmetric": bool(quantization.get("sym", True)),
+            "zero_point_add": 1,
+            "qzeros": qzeros_name,
+            "scales": scales_name,
+        }
+
+
+def attach_packed_linear_quantization(
+    tensors: dict[str, Json], layer_tensors: dict[str, str]
+) -> None:
+    additions: dict[str, str] = {}
+    for parameter_id, tensor_name in tuple(layer_tensors.items()):
+        quantization = tensors[tensor_name].get("quantization")
+        if not isinstance(quantization, dict):
+            continue
+        additions[f"{parameter_id}_qzeros"] = str(quantization["qzeros"])
+        additions[f"{parameter_id}_scales"] = str(quantization["scales"])
+    layer_tensors.update(additions)
 
 
 def composite_tensor(

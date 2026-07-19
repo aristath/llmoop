@@ -7,6 +7,8 @@ from llmoop.circuit_executors import GQAAttentionCircuitPedal
 from llmoop.circuit_lowering import build_pedal_circuit
 from llmoop.model_transpiler import (
     attach_block_quantization_scales,
+    attach_packed_linear_quantization,
+    annotate_packed_linear_tensors,
     discover_model_structure,
     make_layer,
     synthesize_packed_expert_tensors,
@@ -29,6 +31,46 @@ def test_attaches_block_scale_to_fp8_parameter_by_tensor_structure() -> None:
     assert parameters == {
         "projection": "projection.weight",
         "projection_scale_inv": "projection.weight_scale_inv",
+    }
+
+
+def test_annotates_auto_gptq_storage_as_logical_packed_linear(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "config.json").write_text(
+        """{
+          "quantization_config": {
+            "packing_format": "auto_round:auto_gptq",
+            "bits": 4,
+            "group_size": 128,
+            "sym": true
+          }
+        }"""
+    )
+    tensors = {
+        "projection.qweight": _tensor([64, 768], "I32"),
+        "projection.qzeros": _tensor([4, 96], "I32"),
+        "projection.scales": _tensor([4, 768], "F16"),
+    }
+
+    annotate_packed_linear_tensors(tmp_path, tensors)
+    parameters = {"projection": "projection.qweight"}
+    attach_packed_linear_quantization(tensors, parameters)
+
+    assert tensors["projection.qweight"]["logical_shape"] == [768, 512]
+    assert tensors["projection.qweight"]["quantization"] == {
+        "format": "auto_gptq",
+        "bits": 4,
+        "group_size": 128,
+        "symmetric": True,
+        "zero_point_add": 1,
+        "qzeros": "projection.qzeros",
+        "scales": "projection.scales",
+    }
+    assert parameters == {
+        "projection": "projection.qweight",
+        "projection_qzeros": "projection.qzeros",
+        "projection_scales": "projection.scales",
     }
 
 
