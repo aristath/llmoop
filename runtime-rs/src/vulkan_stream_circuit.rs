@@ -10,6 +10,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use smallvec::SmallVec;
 
 use crate::stream_circuit::{
     CableTransport, CircuitParamsArtifact, CircuitStateArtifact, LOWERED_PEDALBOARD_SCHEMA,
@@ -7903,7 +7904,9 @@ impl VulkanResidentInProcessPlacedModelPackage {
         VulkanMountedPlacedResidentInProcessStreamTickRun,
         VulkanResidentInProcessPlacedModelPackageError,
     > {
-        let mut tick_slices = Vec::with_capacity(self.device_slices.len());
+        let mut tick_slices = SmallVec::<
+            [VulkanMountedPlacedResidentInProcessStreamTickSlice<'_>; 4],
+        >::with_capacity(self.device_slices.len());
 
         for slice in &self.device_slices {
             tick_slices.push(VulkanMountedPlacedResidentInProcessStreamTickSlice::new(
@@ -7950,7 +7953,9 @@ impl VulkanResidentInProcessPlacedModelPackage {
         VulkanMountedPlacedResidentInProcessStreamTickRun,
         VulkanResidentInProcessPlacedModelPackageError,
     > {
-        let mut tick_slices = Vec::with_capacity(self.device_slices.len());
+        let mut tick_slices = SmallVec::<
+            [VulkanMountedPlacedResidentInProcessStreamTickSlice<'_>; 4],
+        >::with_capacity(self.device_slices.len());
 
         for slice in &self.device_slices {
             let slice_device = devices
@@ -7996,7 +8001,9 @@ impl VulkanResidentInProcessPlacedModelPackage {
             .input_transducer
             .prepare_token_id(token_id)
             .map_err(VulkanResidentInProcessPlacedModelPackageError::InputTransducer)?;
-        let mut tick_slices = Vec::with_capacity(self.device_slices.len());
+        let mut tick_slices = SmallVec::<
+            [VulkanMountedPlacedResidentInProcessStreamTickSlice<'_>; 4],
+        >::with_capacity(self.device_slices.len());
         for slice in &self.device_slices {
             let mut dispatch_extensions =
                 VulkanMountedPlacedResidentStreamTickDispatchExtensions::default();
@@ -8086,7 +8093,9 @@ impl VulkanResidentInProcessPlacedModelPackage {
             .input_transducer
             .prepare_token_id(token_id)
             .map_err(VulkanResidentInProcessPlacedModelPackageError::InputTransducer)?;
-        let mut tick_slices = Vec::with_capacity(self.device_slices.len());
+        let mut tick_slices = SmallVec::<
+            [VulkanMountedPlacedResidentInProcessStreamTickSlice<'_>; 4],
+        >::with_capacity(self.device_slices.len());
         for slice in &self.device_slices {
             let slice_device = devices
                 .get(&slice.device_id)
@@ -14505,8 +14514,8 @@ pub struct VulkanMountedPlacedResidentStreamTickCursorAdvance {
 
 #[derive(Default)]
 pub struct VulkanMountedPlacedResidentStreamTickDispatchExtensions<'a> {
-    pub prefix_dispatches: Vec<&'a VulkanResidentKernelDispatch>,
-    pub suffix_dispatches: Vec<&'a VulkanResidentKernelDispatch>,
+    pub prefix_dispatches: SmallVec<[&'a VulkanResidentKernelDispatch; 1]>,
+    pub suffix_dispatches: SmallVec<[&'a VulkanResidentKernelDispatch; 3]>,
     sequence_variant: u8,
 }
 
