@@ -7,7 +7,7 @@ use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -3782,6 +3782,7 @@ impl VulkanResidentSamplerRunner {
         output_transducer: &VulkanResidentOutputTransducerRunner,
         kernels: &[VulkanResidentSamplerKernelArtifact],
         spec: &VulkanResidentSamplerSpec,
+        random_seed: u32,
     ) -> Result<Self, VulkanResidentSamplerRunnerError> {
         Self::from_logits_buffer(
             device,
@@ -3791,6 +3792,7 @@ impl VulkanResidentSamplerRunner {
             kernels,
             spec,
             mounted.buffers.dynamic_state_capacity_activations,
+            random_seed,
         )
     }
 
@@ -3802,6 +3804,7 @@ impl VulkanResidentSamplerRunner {
         kernels: &[VulkanResidentSamplerKernelArtifact],
         spec: &VulkanResidentSamplerSpec,
         history_capacity_activations: usize,
+        random_seed: u32,
     ) -> Result<Self, VulkanResidentSamplerRunnerError> {
         if logits_byte_capacity != spec.logits_byte_capacity {
             return Err(
@@ -3861,15 +3864,7 @@ impl VulkanResidentSamplerRunner {
         output_buffer.persistently_map()?;
         let sampler_seed_buffer = if spec.method == "temperature_top_k_top_p" {
             let buffer = device.create_host_visible_resident_buffer(4)?;
-            let nanos = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos();
-            let seed = (nanos as u32)
-                ^ ((nanos >> 64) as u32)
-                ^ std::process::id()
-                ^ (history_capacity_activations as u32).rotate_left(13);
-            buffer.write_bytes(&seed.to_le_bytes())?;
+            buffer.write_bytes(&random_seed.to_le_bytes())?;
             Some(buffer)
         } else {
             None
@@ -6583,6 +6578,7 @@ pub trait VulkanResidentTokenModelPackage {
     fn create_stream_processor(
         &self,
         device: &VulkanComputeDevice,
+        random_seed: u32,
     ) -> Result<VulkanResidentStreamProcessor, VulkanResidentTokenModelPackageError>;
 
     fn snapshot(
@@ -6666,13 +6662,14 @@ impl VulkanResidentTokenEngine {
         &mut self,
         model_id: &str,
         stream_id: impl Into<String>,
+        random_seed: u32,
     ) -> Result<VulkanResidentTokenEngineStream, VulkanResidentTokenEngineError> {
         let model = self
             .models
             .get(model_id)
             .ok_or_else(|| VulkanResidentTokenEngineError::UnknownModel(model_id.to_string()))?
             .clone();
-        let processor = model.create_stream_processor(&self.device)?;
+        let processor = model.create_stream_processor(&self.device, random_seed)?;
         self.add_processor_with_residency(
             stream_id,
             processor,
@@ -7899,16 +7896,9 @@ impl VulkanResidentModelPackageManifest {
         let default_device_id = default_device_id
             .unwrap_or(&self.placement.default_device_id)
             .to_string();
-        let mut patch = if let Some(source_chain) = source_chain {
-            StreamCircuitRuntimePatch::from_source_chain(
-                &source_graph,
-                default_device_id,
-                source_chain,
-            )
-        } else {
+        let mut patch =
             StreamCircuitRuntimePatch::from_source_series(&source_graph, default_device_id)
-        }
-        .map_err(|error| VulkanResidentTokenModelPackageError::new(error.to_string()))?;
+                .map_err(|error| VulkanResidentTokenModelPackageError::new(error.to_string()))?;
 
         for (pedal_id, device_id) in &self.placement.pedal_devices {
             if patch
@@ -7922,6 +7912,11 @@ impl VulkanResidentModelPackageManifest {
                         VulkanResidentTokenModelPackageError::new(error.to_string())
                     })?;
             }
+        }
+        if let Some(source_chain) = source_chain {
+            patch = patch
+                .with_signal_processor_chain(&source_graph, source_chain)
+                .map_err(|error| VulkanResidentTokenModelPackageError::new(error.to_string()))?;
         }
         for (after_instance_id, new_instance_id) in duplicate_after {
             patch = patch
@@ -7996,17 +7991,19 @@ impl VulkanResidentModelPackageManifest {
             apply_runtime_patch_state_policy(&mut pedal, patch, instance);
             pedals.push(pedal);
 
-            let source_execution = source_executions
-                .get(instance.source_pedal_id.as_str())
-                .ok_or_else(|| {
-                    VulkanResidentTokenModelPackageError::new(format!(
-                        "runtime patch source pedal {} has no execution spec",
-                        instance.source_pedal_id
-                    ))
-                })?;
-            let mut execution = (*source_execution).clone();
-            execution.pedal_id = instance.instance_id.clone();
-            pedal_executions.push(execution);
+            if source_pedal.runtime_role.is_signal_processor() {
+                let source_execution = source_executions
+                    .get(instance.source_pedal_id.as_str())
+                    .ok_or_else(|| {
+                        VulkanResidentTokenModelPackageError::new(format!(
+                            "runtime patch signal processor {} has no execution spec",
+                            instance.source_pedal_id
+                        ))
+                    })?;
+                let mut execution = (*source_execution).clone();
+                execution.pedal_id = instance.instance_id.clone();
+                pedal_executions.push(execution);
+            }
 
             if instance.device_id != patch.default_device_id {
                 placement = placement.with_pedal_device(&instance.instance_id, &instance.device_id);
@@ -8098,6 +8095,7 @@ impl VulkanResidentPackageCircuitGraph {
             let circuit_ref = LoweredCircuitRef {
                 id: pedal.pedal_id.clone(),
                 operator_type: pedal.operator_type.clone(),
+                runtime_role: pedal.runtime_role,
                 circuit: format!("package://{}/circuit", pedal.pedal_id),
                 params: format!("package://{}/params", pedal.pedal_id),
                 state: format!("package://{}/state", pedal.pedal_id),
@@ -8154,12 +8152,172 @@ impl VulkanResidentPackageCircuitGraph {
             circuits,
         })
     }
+
+    fn to_signal_processor_graph(
+        &self,
+        package_root: impl Into<PathBuf>,
+    ) -> Result<ResolvedLoweredPedalboard, VulkanResidentTokenModelPackageError> {
+        let full = self.to_resolved_lowered_pedalboard(package_root)?;
+        let processor_ids = full
+            .circuits
+            .iter()
+            .filter(|artifact| artifact.circuit.runtime_role.is_signal_processor())
+            .map(|artifact| artifact.pedal.id.as_str())
+            .collect::<BTreeSet<_>>();
+        if processor_ids.is_empty() {
+            return Err(VulkanResidentTokenModelPackageError::new(
+                "resident package pedalboard contains no signal processors",
+            ));
+        }
+        let circuits = full
+            .circuits
+            .iter()
+            .filter(|artifact| processor_ids.contains(artifact.pedal.id.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        let circuit_refs = circuits
+            .iter()
+            .map(|artifact| artifact.pedal.clone())
+            .collect::<Vec<_>>();
+        let cables = full
+            .index
+            .graph
+            .cables
+            .iter()
+            .filter(|cable| {
+                cable.connection.is_forward()
+                    && processor_ids.contains(cable.source.pedal_id.as_str())
+                    && processor_ids.contains(cable.destination.pedal_id.as_str())
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let external_inputs = execution_boundary_inputs(&full, &processor_ids);
+        let public_outputs = execution_boundary_outputs(&full, &processor_ids);
+        let mut operator_counts = BTreeMap::new();
+        for artifact in &circuits {
+            *operator_counts
+                .entry(artifact.pedal.operator_type.clone())
+                .or_insert(0) += 1;
+        }
+        let mut index = full.index.clone();
+        index.graph.circuits = circuit_refs;
+        index.graph.cables = cables;
+        index.graph.boundary = StreamCircuitGraphBoundary {
+            external_inputs,
+            public_outputs,
+        };
+        index.summary = LoweredPedalboardSummary {
+            circuit_count: circuits.len(),
+            operator_counts,
+        };
+        index.validate_index().map_err(|error| {
+            VulkanResidentTokenModelPackageError::new(format!(
+                "resident package signal-processor graph is invalid: {error}"
+            ))
+        })?;
+        Ok(ResolvedLoweredPedalboard {
+            artifact_root: full.artifact_root,
+            index,
+            circuits,
+        })
+    }
+
+    fn signal_processor_placement(
+        &self,
+        placement: &StreamCircuitPlacementSpec,
+    ) -> StreamCircuitPlacementSpec {
+        let processor_ids = self
+            .pedals
+            .iter()
+            .filter(|pedal| pedal.runtime_role.is_signal_processor())
+            .map(|pedal| pedal.pedal_id.as_str())
+            .collect::<BTreeSet<_>>();
+        StreamCircuitPlacementSpec {
+            schema: placement.schema.clone(),
+            default_device_id: placement.default_device_id.clone(),
+            pedal_devices: placement
+                .pedal_devices
+                .iter()
+                .filter(|(pedal_id, _)| processor_ids.contains(pedal_id.as_str()))
+                .map(|(pedal_id, device_id)| (pedal_id.clone(), device_id.clone()))
+                .collect(),
+        }
+    }
+}
+
+fn execution_boundary_inputs(
+    graph: &ResolvedLoweredPedalboard,
+    processor_ids: &BTreeSet<&str>,
+) -> Vec<crate::stream_circuit::StreamCircuitGraphBoundaryPort> {
+    let mut ports = graph
+        .index
+        .graph
+        .boundary
+        .external_inputs
+        .iter()
+        .filter(|port| processor_ids.contains(port.endpoint.pedal_id.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    ports.extend(
+        graph
+            .index
+            .graph
+            .cables
+            .iter()
+            .filter(|cable| {
+                cable.connection.is_forward()
+                    && !processor_ids.contains(cable.source.pedal_id.as_str())
+                    && processor_ids.contains(cable.destination.pedal_id.as_str())
+            })
+            .map(
+                |cable| crate::stream_circuit::StreamCircuitGraphBoundaryPort {
+                    id: format!("{}_input", cable.id),
+                    endpoint: cable.destination.clone(),
+                },
+            ),
+    );
+    ports
+}
+
+fn execution_boundary_outputs(
+    graph: &ResolvedLoweredPedalboard,
+    processor_ids: &BTreeSet<&str>,
+) -> Vec<crate::stream_circuit::StreamCircuitGraphBoundaryPort> {
+    let mut ports = graph
+        .index
+        .graph
+        .boundary
+        .public_outputs
+        .iter()
+        .filter(|port| processor_ids.contains(port.endpoint.pedal_id.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    ports.extend(
+        graph
+            .index
+            .graph
+            .cables
+            .iter()
+            .filter(|cable| {
+                cable.connection.is_forward()
+                    && processor_ids.contains(cable.source.pedal_id.as_str())
+                    && !processor_ids.contains(cable.destination.pedal_id.as_str())
+            })
+            .map(
+                |cable| crate::stream_circuit::StreamCircuitGraphBoundaryPort {
+                    id: format!("{}_output", cable.id),
+                    endpoint: cable.source.clone(),
+                },
+            ),
+    );
+    ports
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct VulkanResidentPackagePedalCircuit {
     pub pedal_id: String,
     pub operator_type: String,
+    pub runtime_role: crate::stream_circuit::CircuitRuntimeRole,
     pub implementation: String,
     pub behavioral_role: String,
     pub circuit: StreamCircuit,
@@ -8577,14 +8735,16 @@ impl VulkanResidentInProcessPlacedModelPackage {
     pub fn from_manifest_file(
         device: &VulkanComputeDevice,
         manifest_path: impl AsRef<Path>,
+        random_seed: u32,
     ) -> Result<Self, VulkanResidentInProcessPlacedModelPackageError> {
-        Self::from_manifest_file_with_capacity(device, manifest_path, None)
+        Self::from_manifest_file_with_capacity(device, manifest_path, None, random_seed)
     }
 
     pub fn from_manifest_file_with_capacity(
         device: &VulkanComputeDevice,
         manifest_path: impl AsRef<Path>,
         dynamic_state_capacity_activations: Option<usize>,
+        random_seed: u32,
     ) -> Result<Self, VulkanResidentInProcessPlacedModelPackageError> {
         let manifest_path = manifest_path.as_ref();
         let manifest =
@@ -8605,6 +8765,7 @@ impl VulkanResidentInProcessPlacedModelPackage {
             &manifest_dir,
             manifest,
             dynamic_state_capacity_activations,
+            random_seed,
         )
     }
 
@@ -8613,11 +8774,13 @@ impl VulkanResidentInProcessPlacedModelPackage {
         manifest_dir: impl AsRef<Path>,
         manifest: VulkanResidentModelPackageManifest,
         dynamic_state_capacity_activations: Option<usize>,
+        random_seed: u32,
     ) -> Result<Self, VulkanResidentInProcessPlacedModelPackageError> {
         Self::from_manifest_for_device_resolver(
             manifest_dir,
             manifest,
             dynamic_state_capacity_activations,
+            random_seed,
             |_| Ok(device),
         )
     }
@@ -8627,11 +8790,13 @@ impl VulkanResidentInProcessPlacedModelPackage {
         manifest_dir: impl AsRef<Path>,
         manifest: VulkanResidentModelPackageManifest,
         dynamic_state_capacity_activations: Option<usize>,
+        random_seed: u32,
     ) -> Result<Self, VulkanResidentInProcessPlacedModelPackageError> {
         Self::from_manifest_for_device_resolver(
             manifest_dir,
             manifest,
             dynamic_state_capacity_activations,
+            random_seed,
             |device_id| {
                 devices
                     .get(device_id)
@@ -8649,6 +8814,7 @@ impl VulkanResidentInProcessPlacedModelPackage {
         manifest_dir: impl AsRef<Path>,
         manifest: VulkanResidentModelPackageManifest,
         dynamic_state_capacity_activations: Option<usize>,
+        random_seed: u32,
         device_for: F,
     ) -> Result<Self, VulkanResidentInProcessPlacedModelPackageError>
     where
@@ -8849,6 +9015,7 @@ impl VulkanResidentInProcessPlacedModelPackage {
             &output_transducer,
             &sampler_kernels,
             &manifest.sampler.spec,
+            random_seed,
         )
         .map_err(VulkanResidentInProcessPlacedModelPackageError::Sampler)?;
 
@@ -9953,12 +10120,14 @@ impl VulkanResidentInProcessPlacedPromptStream {
         manifest_dir: impl AsRef<Path>,
         manifest: VulkanResidentModelPackageManifest,
         dynamic_state_capacity_activations: Option<usize>,
+        random_seed: u32,
     ) -> Result<Self, VulkanResidentInProcessPlacedModelPackageError> {
         let package = VulkanResidentInProcessPlacedModelPackage::from_manifest_for_bound_devices(
             &devices,
             manifest_dir,
             manifest,
             dynamic_state_capacity_activations,
+            random_seed,
         )?;
         Self::new(package, devices)
     }
@@ -10902,6 +11071,7 @@ impl VulkanResidentModelPackage {
     pub fn create_stream_processor(
         &self,
         device: &VulkanComputeDevice,
+        random_seed: u32,
     ) -> Result<VulkanResidentStreamProcessor, VulkanResidentTokenModelPackageError> {
         let mounted = VulkanMountedPlacedStreamCircuit::from_placed_plan_with_parameter_buffers(
             device,
@@ -10977,6 +11147,7 @@ impl VulkanResidentModelPackage {
             &output_transducer,
             &self.sampler_kernels,
             &self.sampler_spec,
+            random_seed,
         )
         .map_err(|error| {
             VulkanResidentTokenModelPackageError::new(format!(
@@ -11047,8 +11218,9 @@ impl VulkanResidentTokenModelPackage for VulkanResidentModelPackage {
     fn create_stream_processor(
         &self,
         device: &VulkanComputeDevice,
+        random_seed: u32,
     ) -> Result<VulkanResidentStreamProcessor, VulkanResidentTokenModelPackageError> {
-        VulkanResidentModelPackage::create_stream_processor(self, device)
+        VulkanResidentModelPackage::create_stream_processor(self, device, random_seed)
     }
 }
 
@@ -11095,6 +11267,7 @@ fn validate_pedal_executions_against_graph(
     let graph_pedals = graph
         .circuits
         .iter()
+        .filter(|artifact| artifact.circuit.runtime_role.is_signal_processor())
         .map(|artifact| artifact.pedal.id.as_str())
         .collect::<BTreeSet<_>>();
     if execution_by_pedal.keys().copied().collect::<BTreeSet<_>>() != graph_pedals {
@@ -11103,7 +11276,11 @@ fn validate_pedal_executions_against_graph(
             manifest.package_id
         )));
     }
-    for artifact in &graph.circuits {
+    for artifact in graph
+        .circuits
+        .iter()
+        .filter(|artifact| artifact.circuit.runtime_role.is_signal_processor())
+    {
         let execution = execution_by_pedal[artifact.pedal.id.as_str()];
         if execution.operator_type != artifact.pedal.operator_type
             || execution.implementation != artifact.pedal.implementation
@@ -11385,7 +11562,8 @@ fn plan_resident_package_placed_stream_circuit(
     ),
     VulkanResidentTokenModelPackageError,
 > {
-    let graph = circuit_graph.to_resolved_lowered_pedalboard(manifest_dir.to_path_buf())?;
+    let graph = circuit_graph.to_signal_processor_graph(manifest_dir.to_path_buf())?;
+    let placement_spec = circuit_graph.signal_processor_placement(placement_spec);
     let tensor_index = TensorIndex::from_package_json_file(tensor_index_path).map_err(|error| {
         VulkanResidentTokenModelPackageError::new(format!(
             "failed to load tensor index {:?}: {error}",
@@ -11406,7 +11584,7 @@ fn plan_resident_package_placed_stream_circuit(
                 "failed to create stream resource plan: {error}"
             ))
         })?;
-    let placement_plan = graph.placement_plan(placement_spec).map_err(|error| {
+    let placement_plan = graph.placement_plan(&placement_spec).map_err(|error| {
         VulkanResidentTokenModelPackageError::new(format!(
             "failed to create placement plan for {device_id:?}: {error}"
         ))
@@ -18165,7 +18343,7 @@ mod tests {
 
         let patched = manifest.clone().with_runtime_patch(&patch).unwrap();
 
-        assert_eq!(manifest.circuit_graph.pedals.len(), 14);
+        assert_eq!(manifest.circuit_graph.pedals.len(), 17);
         assert_eq!(manifest.pedal_executions.len(), 14);
         assert!(
             manifest
@@ -18175,7 +18353,7 @@ mod tests {
                 .all(|pedal| pedal.pedal_id != "layer_05_repeat")
         );
 
-        assert_eq!(patched.circuit_graph.pedals.len(), 15);
+        assert_eq!(patched.circuit_graph.pedals.len(), 18);
         assert_eq!(patched.pedal_executions.len(), 15);
         assert_eq!(
             patched.placement.device_for_pedal("layer_05_repeat"),
@@ -18212,6 +18390,65 @@ mod tests {
             .find(|execution| execution.pedal_id == "layer_05")
             .unwrap();
         assert_eq!(repeated_execution.kernels, source_execution.kernels);
+    }
+
+    #[test]
+    fn vulkan_lowering_extracts_signal_processors_from_the_full_pedalboard() {
+        let manifest = fixture_model_package_manifest();
+        let graph = manifest
+            .circuit_graph
+            .to_signal_processor_graph(PathBuf::from("."))
+            .unwrap();
+
+        assert_eq!(graph.circuits.len(), 14);
+        assert!(
+            graph
+                .circuits
+                .iter()
+                .all(|artifact| artifact.circuit.runtime_role.is_signal_processor())
+        );
+        assert_eq!(graph.index.graph.cables.len(), 13);
+        assert_eq!(
+            graph.index.graph.boundary.external_inputs[0]
+                .endpoint
+                .pedal_id,
+            "layer_00"
+        );
+        assert_eq!(
+            graph.index.graph.boundary.public_outputs[0]
+                .endpoint
+                .pedal_id,
+            "layer_13"
+        );
+    }
+
+    #[test]
+    fn runtime_chain_control_preserves_generation_pedals_and_feedback() {
+        let manifest = fixture_model_package_manifest();
+        let chain = vec![
+            ("first".to_string(), "layer_00".to_string()),
+            ("repeat".to_string(), "layer_00".to_string()),
+            ("last".to_string(), "layer_13".to_string()),
+        ];
+
+        let patch = manifest
+            .runtime_patch_from_controls(None, &BTreeMap::new(), &[], Some(&chain))
+            .unwrap();
+
+        assert_eq!(patch.instances.len(), 6);
+        for system_pedal in ["input_transducer", "output_transducer", "sampler"] {
+            assert!(
+                patch
+                    .instances
+                    .iter()
+                    .any(|instance| instance.instance_id == system_pedal)
+            );
+        }
+        assert!(patch.cables.iter().any(|cable| {
+            cable.source.pedal_id == "sampler"
+                && cable.destination.pedal_id == "input_transducer"
+                && !cable.connection.is_forward()
+        }));
     }
 
     #[test]
@@ -19870,6 +20107,7 @@ mod tests {
             &sampler_kernels,
             &fixture_model_greedy_sampler_spec(),
             8,
+            0,
         )
         .unwrap();
         assert_eq!(runner.sampler_id, FIXTURE_MODEL_GREEDY_SAMPLER_PEDAL_ID);
@@ -19981,6 +20219,7 @@ mod tests {
             &sampler_kernels,
             &invalid_spec,
             32,
+            SEED,
         )
         .err()
         .expect("undersized sampler scratch must be rejected");
@@ -19997,14 +20236,9 @@ mod tests {
             &sampler_kernels,
             &spec,
             32,
+            SEED,
         )
         .unwrap();
-        runner
-            ._sampler_seed_buffer
-            .as_ref()
-            .unwrap()
-            .write_bytes(&SEED.to_le_bytes())
-            .unwrap();
 
         let mut selected_tokens = Vec::new();
         for stream_tick in 0..16u32 {
@@ -20279,6 +20513,7 @@ mod tests {
             &output_transducer,
             &sampler_kernels,
             &fixture_model_greedy_sampler_spec(),
+            0,
         )
         .unwrap();
         let tick_runner = VulkanResidentSingleTokenTickRunner::new(
@@ -20867,7 +21102,7 @@ mod tests {
         let create_stream = |stream_id: &str| {
             fixture_model_resident_greedy_model(&device, 16)
                 .unwrap()
-                .create_stream_processor(&device)
+                .create_stream_processor(&device, 0)
                 .unwrap()
                 .into_token_stream(stream_id)
         };
@@ -21522,10 +21757,10 @@ mod tests {
             .add_model_package("shared_compiled_model", model)
             .unwrap();
         engine
-            .create_stream_from_model("shared_compiled_model", "text_batch_stream_a")
+            .create_stream_from_model("shared_compiled_model", "text_batch_stream_a", 0)
             .unwrap();
         engine
-            .create_stream_from_model("shared_compiled_model", "text_batch_stream_b")
+            .create_stream_from_model("shared_compiled_model", "text_batch_stream_b", 1)
             .unwrap();
         let codec = VulkanResidentTokenIdTextCodec;
 
@@ -21672,10 +21907,10 @@ mod tests {
         assert!(loaded_model.reusable_kernel_word_count > 0);
 
         let stream_a = engine
-            .create_stream_from_model("shared_compiled_model", "shared_stream_a")
+            .create_stream_from_model("shared_compiled_model", "shared_stream_a", 0)
             .unwrap();
         let stream_b = engine
-            .create_stream_from_model("shared_compiled_model", "shared_stream_b")
+            .create_stream_from_model("shared_compiled_model", "shared_stream_b", 1)
             .unwrap();
         assert_eq!(stream_a.model_id.as_deref(), Some("shared_compiled_model"));
         assert_eq!(stream_b.model_id.as_deref(), Some("shared_compiled_model"));
@@ -26152,6 +26387,7 @@ mod tests {
             manifest_dir,
             manifest,
             Some(4),
+            0,
         )
         .unwrap();
         assert_eq!(placed_package.device_ids, vec!["gpu0", "gpu1"]);
@@ -26228,6 +26464,7 @@ mod tests {
             manifest_dir,
             manifest,
             Some(4),
+            0,
         )
         .unwrap();
         assert_eq!(placed_package.input_device_id, "gpu0");
@@ -26291,6 +26528,7 @@ mod tests {
             manifest_dir,
             manifest,
             Some(4),
+            0,
         )
         .unwrap();
         let run = placed_package
@@ -26344,6 +26582,7 @@ mod tests {
             manifest_dir,
             manifest,
             Some(4),
+            0,
         )
         .unwrap();
         let run = placed_package
@@ -26393,6 +26632,7 @@ mod tests {
             manifest_dir,
             manifest,
             Some(8),
+            0,
         )
         .unwrap();
         let mut session = placed_package.prompt_session();
@@ -26458,6 +26698,7 @@ mod tests {
                 manifest_dir,
                 manifest,
                 Some(8),
+                0,
             )
             .unwrap();
 
@@ -26510,6 +26751,7 @@ mod tests {
                 manifest_dir,
                 manifest,
                 Some(8),
+                0,
             )
             .unwrap();
 
@@ -26582,6 +26824,7 @@ mod tests {
                 manifest_dir,
                 manifest,
                 Some(8),
+                0,
             )
             .unwrap();
 
@@ -26633,6 +26876,7 @@ mod tests {
             manifest_dir,
             manifest,
             Some(8),
+            0,
         )
         .unwrap();
 
@@ -26720,6 +26964,7 @@ mod tests {
             manifest_dir,
             manifest.clone(),
             Some(8),
+            0,
         )
         .unwrap();
         let stream_b = VulkanResidentInProcessPlacedPromptStream::from_manifest_for_bound_devices(
@@ -26727,6 +26972,7 @@ mod tests {
             manifest_dir,
             manifest,
             Some(8),
+            1,
         )
         .unwrap();
 
@@ -26795,6 +27041,7 @@ mod tests {
             manifest_dir,
             manifest.clone(),
             Some(8),
+            0,
         )
         .unwrap();
         let stream_b = VulkanResidentInProcessPlacedPromptStream::from_manifest_for_bound_devices(
@@ -26802,6 +27049,7 @@ mod tests {
             manifest_dir,
             manifest,
             Some(8),
+            1,
         )
         .unwrap();
 
@@ -26893,6 +27141,7 @@ mod tests {
             manifest_dir,
             manifest.clone(),
             Some(8),
+            0,
         )
         .unwrap();
         let stream_b = VulkanResidentInProcessPlacedPromptStream::from_manifest_for_bound_devices(
@@ -26900,6 +27149,7 @@ mod tests {
             manifest_dir,
             manifest,
             Some(8),
+            1,
         )
         .unwrap();
 
@@ -26973,6 +27223,7 @@ mod tests {
             manifest_dir,
             manifest,
             Some(8),
+            0,
         )
         .unwrap();
 
@@ -27052,6 +27303,7 @@ mod tests {
             manifest_dir,
             manifest,
             Some(4),
+            0,
         )
         .unwrap();
         assert_eq!(placed_package.device_ids, vec!["gpu0", "gpu1"]);

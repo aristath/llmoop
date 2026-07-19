@@ -491,6 +491,7 @@ def package_circuit_graph(
             {
                 "pedal_id": circuit_ref["id"],
                 "operator_type": circuit_ref["operator_type"],
+                "runtime_role": circuit_ref["runtime_role"],
                 "implementation": circuit_ref["implementation"],
                 "behavioral_role": circuit_ref["behavioral_role"],
                 "circuit": deepcopy(compiled_circuits[circuit_ref["id"]]),
@@ -521,6 +522,8 @@ def pedal_execution_specs(
     executions: list[Json] = []
 
     for circuit_ref in lowered_index["graph"]["circuits"]:
+        if circuit_ref["runtime_role"] != "signal_processor":
+            continue
         circuit = compiled_circuits[circuit_ref["id"]]
         kernels = []
         for index, node in enumerate(circuit["nodes"]):
@@ -2499,8 +2502,7 @@ def validate_compiled_circuit_graph(manifest: Json) -> dict[str, Json]:
         raise ModelCompileError("compiled package circuit graph contains no pedals")
 
     candidates: dict[str, Json] = {}
-    position_by_id: dict[str, int] = {}
-    for position, pedal in enumerate(pedals):
+    for pedal in pedals:
         pedal_id = pedal.get("pedal_id") if isinstance(pedal, dict) else None
         if not isinstance(pedal_id, str) or not pedal_id:
             raise ModelCompileError(
@@ -2529,6 +2531,10 @@ def validate_compiled_circuit_graph(manifest: Json) -> dict[str, Json]:
         if pedal.get("operator_type") != source.get("source_operator_type"):
             raise ModelCompileError(
                 f"compiled package pedal {pedal_id!r} operator identity does not match"
+            )
+        if pedal.get("runtime_role") != circuit.get("runtime_role"):
+            raise ModelCompileError(
+                f"compiled package pedal {pedal_id!r} runtime role does not match"
             )
         if pedal.get("implementation") != circuit.get("implementation"):
             raise ModelCompileError(
@@ -2561,7 +2567,6 @@ def validate_compiled_circuit_graph(manifest: Json) -> dict[str, Json]:
                 f"compiled package pedal {pedal_id!r} state artifact does not match its circuit"
             )
         candidates[pedal_id] = circuit
-        position_by_id[pedal_id] = position
 
     placement = manifest.get("placement")
     if (
@@ -2596,6 +2601,12 @@ def validate_compiled_circuit_graph(manifest: Json) -> dict[str, Json]:
     cable_ids: set[str] = set()
     connected_outputs: set[tuple[str, str]] = set()
     connected_inputs: set[tuple[str, str]] = set()
+    forward_inputs: set[tuple[str, str]] = set()
+    feedback_inputs: set[tuple[str, str]] = set()
+    forward_indegree = {pedal_id: 0 for pedal_id in candidates}
+    forward_destinations: dict[str, list[str]] = {
+        pedal_id: [] for pedal_id in candidates
+    }
     for cable in cables:
         cable_id = cable.get("id") if isinstance(cable, dict) else None
         source = cable.get("source") if isinstance(cable, dict) else None
@@ -2615,13 +2626,25 @@ def validate_compiled_circuit_graph(manifest: Json) -> dict[str, Json]:
             raise ModelCompileError(
                 f"compiled package cable {cable_id!r} references an unknown pedal"
             )
-        if source_id == destination_id:
+        connection = cable.get("connection")
+        if not isinstance(connection, dict):
+            raise ModelCompileError(
+                f"compiled package cable {cable_id!r} has no connection contract"
+            )
+        connection_kind = connection.get("kind")
+        if connection_kind not in {"forward", "temporal_feedback"}:
+            raise ModelCompileError(
+                f"compiled package cable {cable_id!r} has unsupported connection kind {connection_kind!r}"
+            )
+        if connection_kind == "temporal_feedback":
+            delay = connection.get("delay_activations")
+            if not isinstance(delay, int) or isinstance(delay, bool) or delay < 1:
+                raise ModelCompileError(
+                    f"compiled package temporal feedback cable {cable_id!r} must delay at least one activation"
+                )
+        if source_id == destination_id and connection_kind == "forward":
             raise ModelCompileError(
                 f"compiled package cable {cable_id!r} creates an instantaneous self-loop"
-            )
-        if position_by_id[source_id] >= position_by_id[destination_id]:
-            raise ModelCompileError(
-                f"compiled package cable {cable_id!r} is not in executable topological order"
             )
         output = _port_by_id(
             candidates[source_id]["boundary"]["outputs"], source.get("port_id")
@@ -2642,36 +2665,116 @@ def validate_compiled_circuit_graph(manifest: Json) -> dict[str, Json]:
             )
         source_endpoint = (source_id, source["port_id"])
         destination_endpoint = (destination_id, destination["port_id"])
-        if source_endpoint in connected_outputs:
+        destination_set = (
+            forward_inputs
+            if connection_kind == "forward"
+            else feedback_inputs
+        )
+        if destination_endpoint in destination_set:
             raise ModelCompileError(
-                f"compiled package output {source_id}.{source['port_id']} requires an explicit splitter"
+                f"compiled package input {destination_id}.{destination['port_id']} has multiple {connection_kind} cables"
             )
-        if destination_endpoint in connected_inputs:
-            raise ModelCompileError(
-                f"compiled package input {destination_id}.{destination['port_id']} has multiple cables"
-            )
+        destination_set.add(destination_endpoint)
         connected_outputs.add(source_endpoint)
         connected_inputs.add(destination_endpoint)
+        if connection_kind == "forward":
+            forward_indegree[destination_id] += 1
+            forward_destinations[source_id].append(destination_id)
 
-    open_inputs = []
-    open_outputs = []
+    remaining = set(candidates)
+    while remaining:
+        ready = next(
+            (pedal_id for pedal_id in candidates if pedal_id in remaining and forward_indegree[pedal_id] == 0),
+            None,
+        )
+        if ready is None:
+            raise ModelCompileError(
+                "compiled package circuit graph contains an instantaneous cycle"
+            )
+        remaining.remove(ready)
+        for destination_id in forward_destinations[ready]:
+            forward_indegree[destination_id] -= 1
+
+    boundary = graph.get("boundary")
+    if not isinstance(boundary, dict):
+        raise ModelCompileError("compiled package circuit graph has no boundary")
+    external_inputs = _validate_package_graph_boundary_ports(
+        boundary.get("external_inputs"),
+        candidates,
+        kind="external input",
+        direction="inputs",
+    )
+    public_outputs = _validate_package_graph_boundary_ports(
+        boundary.get("public_outputs"),
+        candidates,
+        kind="public output",
+        direction="outputs",
+    )
+
+    unrouted_inputs = []
+    unrouted_outputs = []
     for pedal_id, circuit in candidates.items():
-        open_inputs.extend(
+        unrouted_inputs.extend(
             (pedal_id, port["id"])
             for port in circuit["boundary"]["inputs"]
             if (pedal_id, port["id"]) not in connected_inputs
+            and (pedal_id, port["id"]) not in external_inputs
         )
-        open_outputs.extend(
+        unrouted_outputs.extend(
             (pedal_id, port["id"])
             for port in circuit["boundary"]["outputs"]
             if (pedal_id, port["id"]) not in connected_outputs
+            and (pedal_id, port["id"]) not in public_outputs
         )
-    if len(open_inputs) != 1 or len(open_outputs) != 1:
+    if unrouted_inputs or unrouted_outputs:
         raise ModelCompileError(
-            "compiled package circuit graph must expose exactly one model input and output; "
-            f"open inputs={open_inputs}, open outputs={open_outputs}"
+            "compiled package circuit graph has unrouted ports; "
+            f"inputs={unrouted_inputs}, outputs={unrouted_outputs}"
         )
     return candidates
+
+
+def _validate_package_graph_boundary_ports(
+    ports: Any,
+    candidates: dict[str, Json],
+    *,
+    kind: str,
+    direction: str,
+) -> set[tuple[str, str]]:
+    if not isinstance(ports, list) or not ports:
+        raise ModelCompileError(
+            f"compiled package circuit graph must declare at least one {kind}"
+        )
+    ids: set[str] = set()
+    endpoints: set[tuple[str, str]] = set()
+    for port in ports:
+        port_id = port.get("id") if isinstance(port, dict) else None
+        endpoint = port.get("endpoint") if isinstance(port, dict) else None
+        if not isinstance(port_id, str) or not port_id or port_id in ids:
+            raise ModelCompileError(
+                f"compiled package circuit graph has invalid or duplicate {kind} id {port_id!r}"
+            )
+        ids.add(port_id)
+        if not isinstance(endpoint, dict):
+            raise ModelCompileError(
+                f"compiled package circuit graph {kind} {port_id!r} has no endpoint"
+            )
+        pedal_id = endpoint.get("pedal_id")
+        endpoint_port_id = endpoint.get("port_id")
+        circuit = candidates.get(pedal_id)
+        if circuit is None or _port_by_id(
+            circuit["boundary"][direction], endpoint_port_id
+        ) is None:
+            raise ModelCompileError(
+                f"compiled package circuit graph {kind} {port_id!r} references an unknown {direction[:-1]}"
+            )
+        key = (pedal_id, endpoint_port_id)
+        if key in endpoints:
+            raise ModelCompileError(
+                f"compiled package circuit graph repeats {kind} endpoint {pedal_id}.{endpoint_port_id}"
+            )
+        endpoints.add(key)
+    return endpoints
 
 
 def _port_by_id(ports: list[Json], port_id: Any) -> Json | None:
@@ -2693,11 +2796,16 @@ def validate_compiled_pedal_executions(
                 f"compiled package contains invalid or duplicate pedal execution {pedal_id!r}"
             )
         execution_by_pedal[pedal_id] = execution
-    if set(execution_by_pedal) != set(candidate_circuits):
+    executable_circuits = {
+        pedal_id: circuit
+        for pedal_id, circuit in candidate_circuits.items()
+        if circuit.get("runtime_role") == "signal_processor"
+    }
+    if set(execution_by_pedal) != set(executable_circuits):
         raise ModelCompileError(
-            "compiled package pedal executions do not match its circuit graph"
+            "compiled package pedal executions do not match its signal-processing circuits"
         )
-    for pedal_id, circuit in candidate_circuits.items():
+    for pedal_id, circuit in executable_circuits.items():
         execution = execution_by_pedal[pedal_id]
         source = circuit.get("source", {})
         if (

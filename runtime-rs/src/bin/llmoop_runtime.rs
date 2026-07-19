@@ -52,6 +52,7 @@ struct Args {
     context_size: Option<usize>,
     vulkan_device_index: Option<usize>,
     cycle_ticks: usize,
+    random_seed: u32,
     add_special_tokens: bool,
     skip_special_tokens: bool,
     generated_only: bool,
@@ -92,6 +93,7 @@ impl Default for Args {
             context_size: None,
             vulkan_device_index: None,
             cycle_ticks: VULKAN_BACKEND_LOOP_MAX_WINDOW,
+            random_seed: 0,
             add_special_tokens: true,
             skip_special_tokens: true,
             generated_only: false,
@@ -245,7 +247,7 @@ fn execute_single_device_prompt_run(
     )?;
     let mut engine = VulkanResidentTokenEngine::new(device);
     engine.add_model_package("compiled_model", model)?;
-    engine.create_stream_from_model("compiled_model", "main")?;
+    engine.create_stream_from_model("compiled_model", "main", args.random_seed)?;
     let setup_time_ns = elapsed_nanos_u64(setup_start);
 
     let run_start = Instant::now();
@@ -348,7 +350,7 @@ fn run_single_device_chat(
         VulkanResidentModelPackage::from_manifest(&device, manifest_dir, manifest, Some(capacity))?;
     let mut engine = VulkanResidentTokenEngine::new(device);
     engine.add_model_package("compiled_model", model)?;
-    engine.create_stream_from_model("compiled_model", "main")?;
+    engine.create_stream_from_model("compiled_model", "main", args.random_seed)?;
     println!(
         "llmoop chat ready: single_device_resident, context_size={capacity}, setup_ms={:.3}",
         nanos_to_millis(elapsed_nanos_u64(setup_start))
@@ -920,6 +922,7 @@ fn run_placed_chat(
         manifest_dir,
         manifest,
         Some(capacity),
+        args.random_seed,
     )?;
     let mut engine = VulkanResidentInProcessPlacedPromptEngine::new();
     let stream_snapshot = engine.add_stream("main", stream)?;
@@ -1015,6 +1018,7 @@ fn execute_placed_prompt_run(
         manifest_dir,
         manifest,
         Some(*capacity),
+        args.random_seed,
     )?;
     let mut engine = VulkanResidentInProcessPlacedPromptEngine::new();
     let stream_snapshot = engine.add_stream("main", stream)?;
@@ -1651,6 +1655,7 @@ fn source_pedals_report(manifest: &VulkanResidentModelPackageManifest) -> Vec<Ru
                 pedal_index,
                 pedal_id: pedal.pedal_id.clone(),
                 operator_type: pedal.operator_type.clone(),
+                runtime_role: pedal.circuit.runtime_role,
                 implementation: pedal.implementation.clone(),
                 behavioral_role: pedal.behavioral_role.clone(),
                 source_layer_index: pedal.circuit.source.source_layer_index,
@@ -1672,9 +1677,14 @@ fn source_pedals_report(manifest: &VulkanResidentModelPackageManifest) -> Vec<Ru
                 state_port_count: pedal.circuit.state_ports.len(),
                 parameter_ref_count: pedal.params.refs.len(),
                 node_count: pedal.circuit.nodes.len(),
-                kernel_count: execution
-                    .map(|execution| execution.kernels.len())
-                    .unwrap_or(0),
+                kernel_count: match pedal.runtime_role {
+                    llmoop_runtime::CircuitRuntimeRole::SignalProcessor => execution
+                        .map(|execution| execution.kernels.len())
+                        .unwrap_or(0),
+                    llmoop_runtime::CircuitRuntimeRole::InputTransducer => 1,
+                    llmoop_runtime::CircuitRuntimeRole::OutputTransducer => 2,
+                    llmoop_runtime::CircuitRuntimeRole::Sampler => manifest.sampler.kernels.len(),
+                },
             }
         })
         .collect::<Vec<_>>()
@@ -2570,6 +2580,9 @@ fn parse_args() -> Result<Args, String> {
             "--cycle-ticks" => {
                 parsed.cycle_ticks = parse_next(&mut raw, "--cycle-ticks")?;
             }
+            "--seed" => {
+                parsed.random_seed = parse_next(&mut raw, "--seed")?;
+            }
             "--no-special-tokens" => {
                 parsed.add_special_tokens = false;
             }
@@ -2979,6 +2992,7 @@ Options:
   --context-size <N>         Runtime transient-state window. Default: auto, up to the model maximum.
   --vulkan-device-index <N>  Use Vulkan physical device index N as the default local target.
   --cycle-ticks <N>          Max runtime ticks per always-on cycle. Default: 64
+  --seed <U32>               Explicit sampler randomness seed. Default: 0
   --no-special-tokens        Do not add tokenizer special tokens to raw --prompt input.
                              Chat templates always own their complete special-token framing.
   --keep-special-tokens      Keep tokenizer special tokens in decoded output text.

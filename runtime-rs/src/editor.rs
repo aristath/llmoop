@@ -7,10 +7,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    CircuitPlacementError, PedalPlacement, ResolvedLoweredPedalboard, RuntimeAvailableDevice,
-    RuntimeAvailableMemoryHeap, StreamCircuitPedalInstance, StreamCircuitPedalInstanceStatePolicy,
-    StreamCircuitPlacementPlan, StreamCircuitRuntimePatch, VulkanComputeDevice,
-    VulkanResidentModelPackageManifest,
+    CircuitPlacementError, CircuitRuntimeRole, PedalPlacement, ResolvedLoweredPedalboard,
+    RuntimeAvailableDevice, RuntimeAvailableMemoryHeap, StreamCircuitPedalInstance,
+    StreamCircuitPedalInstanceStatePolicy, StreamCircuitPlacementPlan, StreamCircuitRuntimePatch,
+    VulkanComputeDevice, VulkanResidentModelPackageManifest,
 };
 
 pub const RUNTIME_PACKAGE_MANIFEST_FILE: &str = "vulkan_resident_package.json";
@@ -87,6 +87,7 @@ pub struct RuntimeEditorSourcePedal {
     pub source_id: String,
     pub layer_index: Option<usize>,
     pub operator_type: String,
+    pub runtime_role: CircuitRuntimeRole,
     pub implementation: String,
     pub behavioral_role: String,
     pub input_shape: Vec<usize>,
@@ -363,7 +364,7 @@ impl RuntimeModelEditor {
                 Ok(sources[0].clone())
             })
             .collect::<Result<Vec<_>, RuntimeEditorError>>()?;
-        self.replace_source_sequence(&source_sequence)
+        self.replace_signal_processor_sequence(&source_sequence)
     }
 
     pub fn replace_source_sequence(
@@ -434,6 +435,75 @@ impl RuntimeModelEditor {
         candidate.validate_against_graph(&self.source_graph)?;
         self.draft = candidate;
         Ok(())
+    }
+
+    fn replace_signal_processor_sequence(
+        &mut self,
+        source_sequence: &[String],
+    ) -> Result<(), RuntimeEditorError> {
+        let processor_instances = self.instances_for_source_sequence(source_sequence)?;
+        let chain = processor_instances
+            .iter()
+            .map(|instance| {
+                (
+                    instance.instance_id.clone(),
+                    instance.source_pedal_id.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        self.draft = self
+            .draft
+            .clone()
+            .with_signal_processor_chain(&self.source_graph, &chain)?;
+        Ok(())
+    }
+
+    fn instances_for_source_sequence(
+        &self,
+        source_sequence: &[String],
+    ) -> Result<Vec<StreamCircuitPedalInstance>, RuntimeEditorError> {
+        let mut previous_by_source =
+            BTreeMap::<String, VecDeque<StreamCircuitPedalInstance>>::new();
+        for instance in &self.draft.instances {
+            previous_by_source
+                .entry(instance.source_pedal_id.clone())
+                .or_default()
+                .push_back(instance.clone());
+        }
+        let mut occurrence_by_source = BTreeMap::<String, usize>::new();
+        let mut used_instance_ids = BTreeSet::new();
+        let mut instances = Vec::with_capacity(source_sequence.len());
+        for source_id in source_sequence {
+            if !self.source_ids.contains(source_id) {
+                return Err(RuntimeEditorError(format!(
+                    "unknown source pedal {source_id:?}"
+                )));
+            }
+            let occurrence = occurrence_by_source
+                .entry(source_id.clone())
+                .and_modify(|value| *value += 1)
+                .or_insert(1);
+            let previous = previous_by_source
+                .get_mut(source_id)
+                .and_then(VecDeque::pop_front);
+            let instance = if let Some(previous) = previous {
+                used_instance_ids.insert(previous.instance_id.clone());
+                previous
+            } else {
+                let instance_id = allocate_instance_id(source_id, *occurrence, &used_instance_ids);
+                used_instance_ids.insert(instance_id.clone());
+                StreamCircuitPedalInstance {
+                    instance_id,
+                    source_pedal_id: source_id.clone(),
+                    device_id: self.draft.default_device_id.clone(),
+                    enabled: true,
+                    control_values: BTreeMap::new(),
+                    state_policy: StreamCircuitPedalInstanceStatePolicy::Fresh,
+                }
+            };
+            instances.push(instance);
+        }
+        Ok(instances)
     }
 
     pub fn set_instance_device(
@@ -688,6 +758,7 @@ fn source_pedals(manifest: &VulkanResidentModelPackageManifest) -> Vec<RuntimeEd
             source_id: pedal.pedal_id.clone(),
             layer_index: pedal.circuit.source.source_layer_index,
             operator_type: pedal.operator_type.clone(),
+            runtime_role: pedal.circuit.runtime_role,
             implementation: pedal.implementation.clone(),
             behavioral_role: pedal.behavioral_role.clone(),
             input_shape: pedal
@@ -721,10 +792,15 @@ fn source_pedals(manifest: &VulkanResidentModelPackageManifest) -> Vec<RuntimeEd
                 .collect(),
             parameter_ref_count: pedal.params.refs.len(),
             node_count: pedal.circuit.nodes.len(),
-            kernel_count: execution_by_pedal
-                .get(pedal.pedal_id.as_str())
-                .map(|execution| execution.kernels.len())
-                .unwrap_or(0),
+            kernel_count: match pedal.runtime_role {
+                CircuitRuntimeRole::SignalProcessor => execution_by_pedal
+                    .get(pedal.pedal_id.as_str())
+                    .map(|execution| execution.kernels.len())
+                    .unwrap_or(0),
+                CircuitRuntimeRole::InputTransducer => 1,
+                CircuitRuntimeRole::OutputTransducer => 2,
+                CircuitRuntimeRole::Sampler => manifest.sampler.kernels.len(),
+            },
         })
         .collect()
 }
@@ -1146,11 +1222,21 @@ mod tests {
             return;
         }
         let mut editor = load_runtime_model_editor_without_hardware(&package).unwrap();
-        let original_first = editor.instances()[0].instance_id.clone();
+        let original_first = editor
+            .instances()
+            .iter()
+            .find(|instance| instance.layer_index == Some(0))
+            .unwrap()
+            .instance_id
+            .clone();
 
         editor.replace_layer_sequence(&[0, 1, 1, 2]).unwrap();
 
-        let instances = editor.instances();
+        let instances = editor
+            .instances()
+            .into_iter()
+            .filter(|instance| instance.layer_index.is_some())
+            .collect::<Vec<_>>();
         assert_eq!(editor.layer_sequence(), vec![0, 1, 1, 2]);
         assert_eq!(instances[0].instance_id, original_first);
         assert_eq!(instances[1].occurrence, 1);

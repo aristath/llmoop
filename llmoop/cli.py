@@ -145,6 +145,11 @@ def main() -> None:
         help="generation stop condition for --run; independent of context allocation (default: 65536)",
     )
     parser.add_argument(
+        "--seed",
+        type=int,
+        help="explicit sampler randomness seed (default: 0)",
+    )
+    parser.add_argument(
         "--no-special-tokens",
         action="store_true",
         help="do not add tokenizer special tokens to the runtime prompt",
@@ -199,6 +204,8 @@ def main() -> None:
         args.shader_source_dir = Path("runtime-rs/shaders")
     if args.max_new_tokens is None:
         args.max_new_tokens = 65_536
+    if args.seed is None:
+        args.seed = 0
     if args.profile_runs is None:
         args.profile_runs = 1
     if args.context_size is not None and args.context_size < 1:
@@ -265,6 +272,8 @@ def main() -> None:
             parser.error("--json is not supported with --chat yet")
         if args.vulkan_device_index is not None and args.vulkan_device_index < 0:
             parser.error("--vulkan-device-index must be non-negative")
+        if args.seed < 0 or args.seed > 0xFFFF_FFFF:
+            parser.error("--seed must be between 0 and 4294967295")
         if args.profile_runs < 1:
             parser.error("--profile-runs must be at least 1")
         run_engine(args)
@@ -334,6 +343,7 @@ def validate_action_options(
         ("--context-size", args.context_size is not None),
         ("--vulkan-device-index", args.vulkan_device_index is not None),
         ("--max-new-tokens", args.max_new_tokens is not None),
+        ("--seed", args.seed is not None),
         ("--no-special-tokens", args.no_special_tokens),
         ("--keep-special-tokens", args.keep_special_tokens),
         ("--generated-only", args.generated_only),
@@ -469,6 +479,9 @@ def build_runtime_command(args: argparse.Namespace, package_manifest: Path) -> l
         runtime_args.extend(["--context-size", str(args.context_size)])
     if args.vulkan_device_index is not None:
         runtime_args.extend(["--vulkan-device-index", str(args.vulkan_device_index)])
+    random_seed = getattr(args, "seed", 0)
+    if random_seed != 0:
+        runtime_args.extend(["--seed", str(random_seed)])
     if args.no_special_tokens:
         runtime_args.append("--no-special-tokens")
     if args.keep_special_tokens:

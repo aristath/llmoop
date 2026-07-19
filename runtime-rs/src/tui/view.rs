@@ -317,9 +317,9 @@ fn render_pedal(
         device_color
     };
     let title = if instance.occurrence > 1 {
-        format!(" {}^{} ", instance.layer_index, instance.occurrence)
+        format!(" {}^{} ", instance.source_id, instance.occurrence)
     } else {
-        format!(" {} ", instance.layer_index)
+        format!(" {} ", instance.source_id)
     };
     let block = Block::default()
         .title(Span::styled(
@@ -740,8 +740,8 @@ fn render_pedal_modal(frame: &mut Frame<'_>, app: &mut App, modal: &PedalModalSt
     let area = centered_rect(frame.area(), 70, 78, 54, 20);
     frame.render_widget(Clear, area);
     let title = format!(
-        " LAYER {} · OCCURRENCE {} ",
-        modal.layer_index, modal.occurrence
+        " PEDAL {} · OCCURRENCE {} ",
+        modal.source.source_id, modal.occurrence
     );
     let block = Block::default()
         .title(Span::styled(title, Style::default().fg(SIGNAL).bold()))
@@ -1268,8 +1268,9 @@ mod tests {
             instance_id: "layer_00".to_string(),
             source: crate::RuntimeEditorSourcePedal {
                 source_id: "layer_00".to_string(),
-                layer_index: 0,
+                layer_index: Some(0),
                 operator_type: "transformer".to_string(),
+                runtime_role: crate::CircuitRuntimeRole::SignalProcessor,
                 implementation: "compiled_circuit".to_string(),
                 behavioral_role: "stream_transform".to_string(),
                 input_shape: vec![64],
@@ -1281,7 +1282,6 @@ mod tests {
                 node_count: 8,
                 kernel_count: 3,
             },
-            layer_index: 0,
             occurrence: 1,
             device_ids: vec!["gpu0".to_string()],
             device_labels: vec!["gpu0 · fixture".to_string()],

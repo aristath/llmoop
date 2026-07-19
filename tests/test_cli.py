@@ -31,6 +31,7 @@ def runtime_args(**overrides: object) -> Namespace:
         "max_new_tokens": 4,
         "context_size": None,
         "vulkan_device_index": None,
+        "seed": 0,
         "no_special_tokens": False,
         "keep_special_tokens": False,
         "generated_only": False,
@@ -44,6 +45,18 @@ def runtime_args(**overrides: object) -> Namespace:
 
 
 class RuntimeCliCommandTest(unittest.TestCase):
+    def test_build_runtime_command_forwards_non_default_random_seed(self) -> None:
+        package = Path("packages/model_x/vulkan_resident_package.json")
+        args = runtime_args(prompt="Hello", seed=42)
+
+        self.assertIn(
+            ["--seed", "42"],
+            [
+                build_runtime_command(args, package)[index : index + 2]
+                for index in range(len(build_runtime_command(args, package)) - 1)
+            ],
+        )
+
     def test_model_compiler_renders_linear_shader_for_discovered_shape(self) -> None:
         shader_source_dir = Path(__file__).parents[1] / "runtime-rs" / "shaders"
         with tempfile.TemporaryDirectory() as raw_dest:

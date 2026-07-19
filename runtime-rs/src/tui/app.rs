@@ -284,7 +284,6 @@ pub(crate) enum PedalPolicyKind {
 pub(crate) struct PedalModalState {
     pub instance_id: String,
     pub source: RuntimeEditorSourcePedal,
-    pub layer_index: usize,
     pub occurrence: usize,
     pub device_ids: Vec<String>,
     pub device_labels: Vec<String>,
@@ -1179,7 +1178,7 @@ impl App {
         let available = editor
             .source_pedals()
             .iter()
-            .map(|pedal| pedal.layer_index)
+            .filter_map(|pedal| pedal.layer_index)
             .collect::<BTreeSet<_>>();
         match parse_layer_sequence(self.sequence.text(), &available) {
             Ok(sequence) => match editor.replace_layer_sequence(&sequence) {
@@ -1343,7 +1342,6 @@ impl App {
         self.overlay = Some(Overlay::Pedal(PedalModalState {
             instance_id: instance.instance_id,
             source,
-            layer_index: instance.layer_index,
             occurrence: instance.occurrence,
             device_ids,
             device_labels,
@@ -1858,7 +1856,7 @@ mod tests {
                     .unwrap()
                     .source_pedals()
                     .iter()
-                    .map(|pedal| pedal.layer_index)
+                    .filter_map(|pedal| pedal.layer_index)
                     .collect()
             )
             .unwrap(),

@@ -19,17 +19,47 @@ class PedalboardCircuitLoweringTest(unittest.TestCase):
             index = result["index"]
 
             self.assertEqual("llmoop.lowered_pedalboard.v1", index["schema"])
-            self.assertEqual(14, index["summary"]["circuit_count"])
-            self.assertEqual({"conv": 8, "full_attention": 6}, index["summary"]["operator_counts"])
+            self.assertEqual(17, index["summary"]["circuit_count"])
+            self.assertEqual(
+                {
+                    "conv": 8,
+                    "full_attention": 6,
+                    "input_transducer": 1,
+                    "output_transducer": 1,
+                    "sampler": 1,
+                },
+                index["summary"]["operator_counts"],
+            )
             self.assertEqual("explicit_graph", index["graph"]["wiring"])
-            self.assertEqual(13, len(index["graph"]["cables"]))
+            self.assertEqual(17, len(index["graph"]["cables"]))
             self.assertEqual(
                 {
                     "id": "cable_0000",
-                    "source": {"pedal_id": "layer_00", "port_id": "output_frame"},
-                    "destination": {"pedal_id": "layer_01", "port_id": "input_frame"},
+                    "connection": {"kind": "forward"},
+                    "source": {
+                        "pedal_id": "input_transducer",
+                        "port_id": "output_frame",
+                    },
+                    "destination": {
+                        "pedal_id": "layer_00",
+                        "port_id": "input_frame",
+                    },
                 },
                 index["graph"]["cables"][0],
+            )
+            self.assertEqual(
+                {
+                    "kind": "temporal_feedback",
+                    "delay_activations": 1,
+                },
+                index["graph"]["cables"][-1]["connection"],
+            )
+            self.assertEqual(
+                ["user_input", "randomness"],
+                [
+                    port["id"]
+                    for port in index["graph"]["boundary"]["external_inputs"]
+                ],
             )
             self.assertEqual("llmoop.compiled_pedalboard_artifact.v1", index["source"]["format"])
             self.assertEqual(".", index["source"]["artifact_root"])

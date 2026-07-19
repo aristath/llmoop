@@ -73,6 +73,7 @@ fn is_structural_test_fixture(path: &Path) -> bool {
     let operator_types = graph
         .circuits
         .iter()
+        .filter(|artifact| artifact.circuit.runtime_role.is_signal_processor())
         .map(|artifact| artifact.pedal.operator_type.as_str())
         .collect::<Vec<_>>();
 

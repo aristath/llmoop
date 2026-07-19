@@ -4,7 +4,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Any, Callable
 
-from llmoop.circuit_ir import validate_circuit_against_pedal
+from llmoop.circuit_ir import validate_circuit, validate_circuit_against_pedal
 from llmoop.compilation import check_compile_cancelled, read_json, write_json
 
 
@@ -76,6 +76,7 @@ def lower_pedalboard(
             {
                 "id": source_pedal["id"],
                 "operator_type": source_pedal["operator_type"],
+                "runtime_role": result["circuit"]["runtime_role"],
                 "circuit": str(circuit_rel),
                 "params": str(params_rel),
                 "state": str(state_rel),
@@ -86,6 +87,38 @@ def lower_pedalboard(
 
     if not lowered:
         raise ValueError("cannot lower an empty pedalboard")
+
+    system_circuits = build_system_circuits(model)
+    system_refs: dict[str, Json] = {}
+    for circuit in system_circuits:
+        circuit_id = circuit["source"]["pedal_id"]
+        circuit_out_dir = out_dir / circuit_id
+        circuit_out_dir.mkdir(parents=True, exist_ok=True)
+        validation = validate_circuit(circuit)
+        validation.raise_for_errors()
+        circuit_path = circuit_out_dir / "circuit.json"
+        params_path = circuit_out_dir / "params.json"
+        state_path = circuit_out_dir / "state.json"
+        write_json(circuit_path, circuit)
+        write_json(params_path, build_params_artifact(circuit))
+        write_json(state_path, build_state_artifact(circuit))
+        operator_counts[circuit["source"]["source_operator_type"]] += 1
+        system_refs[circuit["runtime_role"]] = {
+            "id": circuit_id,
+            "operator_type": circuit["source"]["source_operator_type"],
+            "runtime_role": circuit["runtime_role"],
+            "circuit": str(circuit_path.relative_to(out_dir)),
+            "params": str(params_path.relative_to(out_dir)),
+            "state": str(state_path.relative_to(out_dir)),
+            "implementation": circuit["implementation"],
+            "behavioral_role": circuit["behavioral_role"],
+        }
+
+    input_ref = system_refs["input_transducer"]
+    output_ref = system_refs["output_transducer"]
+    sampler_ref = system_refs["sampler"]
+    all_circuits = [input_ref, *lowered, output_ref, sampler_ref]
+    forward_chain = [input_ref, *lowered, output_ref, sampler_ref]
 
     index = {
         "schema": "llmoop.lowered_pedalboard.v1",
@@ -99,31 +132,55 @@ def lower_pedalboard(
         "token_ids": model["token_ids"],
         "graph": {
             "wiring": "explicit_graph",
-            "circuits": lowered,
+            "circuits": all_circuits,
             "cables": [
                 {
                     "id": f"cable_{index:04d}",
                     "connection": {"kind": "forward"},
                     "source": {
                         "pedal_id": source["id"],
-                        "port_id": "output_frame",
+                        "port_id": _canonical_output_port(source["runtime_role"]),
                     },
                     "destination": {
                         "pedal_id": destination["id"],
-                        "port_id": "input_frame",
+                        "port_id": _canonical_input_port(destination["runtime_role"]),
                     },
                 }
                 for index, (source, destination) in enumerate(
-                    zip(lowered, lowered[1:])
+                    zip(forward_chain, forward_chain[1:])
                 )
+            ]
+            + [
+                {
+                    "id": "generation_feedback",
+                    "connection": {
+                        "kind": "temporal_feedback",
+                        "delay_activations": 1,
+                    },
+                    "source": {
+                        "pedal_id": sampler_ref["id"],
+                        "port_id": "sampled_token",
+                    },
+                    "destination": {
+                        "pedal_id": input_ref["id"],
+                        "port_id": "input_token",
+                    },
+                }
             ],
             "boundary": {
                 "external_inputs": [
                     {
-                        "id": "model_input",
+                        "id": "user_input",
                         "endpoint": {
-                            "pedal_id": lowered[0]["id"],
-                            "port_id": "input_frame",
+                            "pedal_id": input_ref["id"],
+                            "port_id": "input_token",
+                        },
+                    },
+                    {
+                        "id": "randomness",
+                        "endpoint": {
+                            "pedal_id": sampler_ref["id"],
+                            "port_id": "random_bits",
                         },
                     }
                 ],
@@ -131,8 +188,8 @@ def lower_pedalboard(
                     {
                         "id": "model_output",
                         "endpoint": {
-                            "pedal_id": lowered[-1]["id"],
-                            "port_id": "output_frame",
+                            "pedal_id": sampler_ref["id"],
+                            "port_id": "sampled_token",
                         },
                     }
                 ],
@@ -141,7 +198,7 @@ def lower_pedalboard(
             "output_transducer": model["graph"]["output_transducer"],
         },
         "summary": {
-            "circuit_count": len(lowered),
+            "circuit_count": len(all_circuits),
             "operator_counts": dict(sorted(operator_counts.items())),
         },
         "notes": [
@@ -158,6 +215,215 @@ def lower_pedalboard(
         "index": index,
         "index_path": index_path,
         "circuits": lowered,
+    }
+
+
+def _canonical_input_port(runtime_role: str) -> str:
+    return {
+        "input_transducer": "input_token",
+        "signal_processor": "input_frame",
+        "output_transducer": "input_frame",
+        "sampler": "input_logits",
+    }[runtime_role]
+
+
+def _canonical_output_port(runtime_role: str) -> str:
+    return {
+        "input_transducer": "output_frame",
+        "signal_processor": "output_frame",
+        "output_transducer": "output_logits",
+        "sampler": "sampled_token",
+    }[runtime_role]
+
+
+def build_system_circuits(model: Json) -> list[Json]:
+    dimensions = model["dimensions"]
+    hidden_size = dimensions["hidden_size"]
+    vocab_size = dimensions["vocab_size"]
+    input_component = model["graph"]["input_transducer"]
+    output_components = model["graph"]["output_transducer"].get("components", [])
+    if not output_components:
+        raise ValueError("output transducer must contain at least one component")
+
+    input_params = {
+        name: _system_param_ref(ref, f"input_transducer.{name}")
+        for name, ref in input_component.get("params", {}).items()
+    }
+    input_circuit = _system_circuit(
+        pedal_id="input_transducer",
+        operator_type="input_transducer",
+        runtime_role="input_transducer",
+        implementation="compiled_input_transducer_v1",
+        inputs=[_system_port("input_token", "token_id", [1], "token")],
+        outputs=[
+            _system_port(
+                "output_frame",
+                "frame",
+                [hidden_size],
+                "frame",
+                source="output_frame",
+            )
+        ],
+        parameters=input_params,
+        nodes=[
+            {
+                "id": input_component.get("id", "token_embedding"),
+                "op": input_component["type"],
+                "inputs": ["input_token"],
+                "outputs": ["output_frame"],
+                "params": list(input_params),
+                "state_reads": [],
+                "state_writes": [],
+                "attrs": dict(input_component.get("attrs", {})),
+            }
+        ],
+    )
+
+    output_params: Json = {}
+    output_nodes: list[Json] = []
+    signal = "input_frame"
+    for component_index, component in enumerate(output_components):
+        component_id = component.get("id", f"component_{component_index}")
+        param_ids = []
+        for name, ref in component.get("params", {}).items():
+            param_id = f"{component_id}.{name}"
+            output_params[param_id] = _system_param_ref(
+                ref, f"output_transducer.{param_id}"
+            )
+            param_ids.append(param_id)
+        output_signal = (
+            "output_logits"
+            if component_index + 1 == len(output_components)
+            else f"{component_id}_output"
+        )
+        output_nodes.append(
+            {
+                "id": component_id,
+                "op": component["type"],
+                "inputs": [signal],
+                "outputs": [output_signal],
+                "params": param_ids,
+                "state_reads": [],
+                "state_writes": [],
+                "attrs": dict(component.get("attrs", {})),
+            }
+        )
+        signal = output_signal
+    output_circuit = _system_circuit(
+        pedal_id="output_transducer",
+        operator_type="output_transducer",
+        runtime_role="output_transducer",
+        implementation="compiled_output_transducer_v1",
+        inputs=[_system_port("input_frame", "frame", [hidden_size], "frame")],
+        outputs=[
+            _system_port(
+                "output_logits",
+                "logits",
+                [vocab_size],
+                "logits",
+                source="output_logits",
+            )
+        ],
+        parameters=output_params,
+        nodes=output_nodes,
+    )
+
+    sampler_circuit = _system_circuit(
+        pedal_id="sampler",
+        operator_type="sampler",
+        runtime_role="sampler",
+        implementation="compiled_sampler_v1",
+        inputs=[
+            _system_port("input_logits", "logits", [vocab_size], "logits"),
+            _system_port("random_bits", "random_bits", [1], "randomness"),
+        ],
+        outputs=[
+            _system_port(
+                "sampled_token",
+                "token_id",
+                [1],
+                "token",
+                source="sampled_token",
+            )
+        ],
+        parameters={},
+        nodes=[
+            {
+                "id": "sample",
+                "op": "sample_token",
+                "inputs": ["input_logits", "random_bits"],
+                "outputs": ["sampled_token"],
+                "params": [],
+                "state_reads": [],
+                "state_writes": [],
+                "attrs": {"selection": "runtime_configured"},
+            }
+        ],
+    )
+    return [input_circuit, output_circuit, sampler_circuit]
+
+
+def _system_port(
+    port_id: str,
+    signal: str,
+    shape: list[int],
+    pedal_port: str,
+    *,
+    source: str | None = None,
+) -> Json:
+    port = {
+        "id": port_id,
+        "signal": signal,
+        "shape": shape,
+        "pedal_port": pedal_port,
+    }
+    if source is not None:
+        port["source"] = source
+    return port
+
+
+def _system_param_ref(reference: Json, role: str) -> Json:
+    return {"tensor": reference["tensor"], "role": role}
+
+
+def _system_circuit(
+    *,
+    pedal_id: str,
+    operator_type: str,
+    runtime_role: str,
+    implementation: str,
+    inputs: list[Json],
+    outputs: list[Json],
+    parameters: Json,
+    nodes: list[Json],
+) -> Json:
+    return {
+        "schema": "llmoop.stream_circuit.v1",
+        "id": f"{pedal_id}_circuit_v1",
+        "source": {
+            "pedal_id": pedal_id,
+            "source_layer_index": None,
+            "source_operator_type": operator_type,
+        },
+        "runtime_role": runtime_role,
+        "behavioral_role": "stream_generation_circuit",
+        "implementation": implementation,
+        "boundary": {"inputs": inputs, "outputs": outputs, "controls": []},
+        "state_ports": [],
+        "parameters": {
+            "layout": "source_tensor_refs",
+            "storage": "safetensors",
+            "refs": parameters,
+        },
+        "nodes": nodes,
+        "behavioral_error_contract": {
+            "mode": "exact_source_operation",
+            "reference": operator_type,
+        },
+        "lowering_notes": [
+            "This stream entity is part of the editable pedalboard contract.",
+            "Its optimized Vulkan implementation is a backend lowering, not a host-side exception.",
+        ],
     }
 
 
@@ -296,6 +562,7 @@ def _base_circuit(
             "source_layer_index": pedal["source_layer_index"],
             "source_operator_type": operator_type,
         },
+        "runtime_role": "signal_processor",
         "behavioral_role": behavioral_role,
         "implementation": implementation,
         "boundary": {

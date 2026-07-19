@@ -51,6 +51,7 @@ def minimal_package(root: Path) -> dict[str, object]:
             "source_layer_index": 0,
             "source_operator_type": "fixture",
         },
+        "runtime_role": "signal_processor",
         "behavioral_role": "fixture",
         "implementation": "exact_reference",
         "boundary": {
@@ -128,10 +129,31 @@ def minimal_package(root: Path) -> dict[str, object]:
         "circuit_graph": {
             "wiring": "explicit_graph",
             "cables": [],
+            "boundary": {
+                "external_inputs": [
+                    {
+                        "id": "model_input",
+                        "endpoint": {
+                            "pedal_id": "fixture_pedal",
+                            "port_id": "input_frame",
+                        },
+                    }
+                ],
+                "public_outputs": [
+                    {
+                        "id": "model_output",
+                        "endpoint": {
+                            "pedal_id": "fixture_pedal",
+                            "port_id": "output_frame",
+                        },
+                    }
+                ],
+            },
             "pedals": [
                 {
                     "pedal_id": "fixture_pedal",
                     "operator_type": "fixture",
+                    "runtime_role": "signal_processor",
                     "implementation": "exact_reference",
                     "behavioral_role": "fixture",
                     "circuit": circuit,

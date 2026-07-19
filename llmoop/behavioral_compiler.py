@@ -142,6 +142,7 @@ def prove_exact_circuit_candidate(
     contract_fields = (
         "schema",
         "source",
+        "runtime_role",
         "boundary",
         "state_ports",
         "parameters",

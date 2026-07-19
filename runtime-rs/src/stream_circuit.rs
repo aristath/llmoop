@@ -155,6 +155,7 @@ pub struct StreamCircuit {
     pub schema: String,
     pub id: String,
     pub source: CircuitSource,
+    pub runtime_role: CircuitRuntimeRole,
     pub behavioral_role: String,
     pub implementation: String,
     pub boundary: CircuitBoundary,
@@ -167,6 +168,21 @@ pub struct StreamCircuit {
     pub behavioral_error_contract: Value,
     #[serde(default)]
     pub lowering_notes: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CircuitRuntimeRole {
+    SignalProcessor,
+    InputTransducer,
+    OutputTransducer,
+    Sampler,
+}
+
+impl CircuitRuntimeRole {
+    pub fn is_signal_processor(self) -> bool {
+        matches!(self, Self::SignalProcessor)
+    }
 }
 
 impl StreamCircuit {
@@ -356,6 +372,7 @@ pub struct LoweredPedalboardSource {
 pub struct LoweredCircuitRef {
     pub id: String,
     pub operator_type: String,
+    pub runtime_role: CircuitRuntimeRole,
     pub circuit: String,
     pub params: String,
     pub state: String,
@@ -604,6 +621,12 @@ impl ResolvedCircuitArtifact {
             return Err(CircuitArtifactError(format!(
                 "lowered circuit {} operator {:?} does not match circuit source operator {:?}",
                 self.pedal.id, self.pedal.operator_type, self.circuit.source.source_operator_type
+            )));
+        }
+        if self.pedal.runtime_role != self.circuit.runtime_role {
+            return Err(CircuitArtifactError(format!(
+                "lowered circuit {} runtime role {:?} does not match circuit {:?}",
+                self.pedal.id, self.pedal.runtime_role, self.circuit.runtime_role
             )));
         }
         if self.pedal.implementation != self.circuit.implementation {
@@ -1030,6 +1053,240 @@ impl StreamCircuitRuntimePatch {
                 instance.state_policy = previous.state_policy.clone();
             }
         }
+        patch.validate_against_graph(graph)?;
+        Ok(patch)
+    }
+
+    pub fn with_signal_processor_chain(
+        self,
+        graph: &ResolvedLoweredPedalboard,
+        chain: &[(String, String)],
+    ) -> Result<Self, CircuitPlacementError> {
+        self.validate_against_graph(graph)?;
+        if chain.is_empty() {
+            return Err(CircuitPlacementError(
+                "signal-processor chain must contain at least one pedal".to_string(),
+            ));
+        }
+
+        let source_by_id = graph
+            .circuits
+            .iter()
+            .map(|artifact| (artifact.pedal.id.as_str(), artifact))
+            .collect::<BTreeMap<_, _>>();
+        let old_processor_ids = self
+            .instances
+            .iter()
+            .filter(|instance| {
+                source_by_id
+                    .get(instance.source_pedal_id.as_str())
+                    .is_some_and(|source| source.pedal.runtime_role.is_signal_processor())
+            })
+            .map(|instance| instance.instance_id.as_str())
+            .collect::<BTreeSet<_>>();
+        if old_processor_ids.is_empty() {
+            return Err(CircuitPlacementError(
+                "runtime patch contains no signal-processing pedals to replace".to_string(),
+            ));
+        }
+
+        let preserved_instance_ids = self
+            .instances
+            .iter()
+            .filter(|instance| !old_processor_ids.contains(instance.instance_id.as_str()))
+            .map(|instance| instance.instance_id.as_str())
+            .collect::<BTreeSet<_>>();
+        let previous_by_id = self
+            .instances
+            .iter()
+            .map(|instance| (instance.instance_id.as_str(), instance))
+            .collect::<BTreeMap<_, _>>();
+        let mut chain_instance_ids = BTreeSet::new();
+        let mut processor_instances = Vec::with_capacity(chain.len());
+        for (instance_id, source_pedal_id) in chain {
+            if instance_id.is_empty() || !chain_instance_ids.insert(instance_id.as_str()) {
+                return Err(CircuitPlacementError(format!(
+                    "signal-processor chain contains an empty or duplicate instance id {instance_id:?}"
+                )));
+            }
+            if preserved_instance_ids.contains(instance_id.as_str()) {
+                return Err(CircuitPlacementError(format!(
+                    "signal-processor instance id {instance_id:?} collides with a non-processor pedal"
+                )));
+            }
+            let source = source_by_id.get(source_pedal_id.as_str()).ok_or_else(|| {
+                CircuitPlacementError(format!(
+                    "signal-processor chain references unknown source pedal {source_pedal_id:?}"
+                ))
+            })?;
+            if !source.pedal.runtime_role.is_signal_processor() {
+                return Err(CircuitPlacementError(format!(
+                    "source pedal {source_pedal_id:?} has runtime role {:?}, not signal_processor",
+                    source.pedal.runtime_role
+                )));
+            }
+            let mut instance = StreamCircuitPedalInstance {
+                instance_id: instance_id.clone(),
+                source_pedal_id: source_pedal_id.clone(),
+                device_id: self.default_device_id.clone(),
+                enabled: true,
+                control_values: BTreeMap::new(),
+                state_policy: StreamCircuitPedalInstanceStatePolicy::Fresh,
+            };
+            if let Some(previous) = previous_by_id.get(instance_id.as_str()) {
+                instance.device_id = previous.device_id.clone();
+                if previous.source_pedal_id == *source_pedal_id {
+                    instance.enabled = previous.enabled;
+                    instance.control_values = previous.control_values.clone();
+                    instance.state_policy = previous.state_policy.clone();
+                }
+            }
+            processor_instances.push(instance);
+        }
+
+        if old_processor_ids.len() == self.instances.len() {
+            let mut patch = Self::from_source_chain(graph, self.default_device_id.clone(), chain)?;
+            patch.instances = processor_instances;
+            patch.validate_against_graph(graph)?;
+            return Ok(patch);
+        }
+
+        let crossing_inputs = self
+            .cables
+            .iter()
+            .filter(|cable| {
+                cable.connection.is_forward()
+                    && !old_processor_ids.contains(cable.source.pedal_id.as_str())
+                    && old_processor_ids.contains(cable.destination.pedal_id.as_str())
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let crossing_outputs = self
+            .cables
+            .iter()
+            .filter(|cable| {
+                cable.connection.is_forward()
+                    && old_processor_ids.contains(cable.source.pedal_id.as_str())
+                    && !old_processor_ids.contains(cable.destination.pedal_id.as_str())
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if crossing_inputs.len() != 1 || crossing_outputs.len() != 1 {
+            return Err(CircuitPlacementError(format!(
+                "signal-processor chain replacement requires one forward input and output cable; found {} inputs and {} outputs",
+                crossing_inputs.len(),
+                crossing_outputs.len()
+            )));
+        }
+        if self.cables.iter().any(|cable| {
+            !cable.connection.is_forward()
+                && (old_processor_ids.contains(cable.source.pedal_id.as_str())
+                    || old_processor_ids.contains(cable.destination.pedal_id.as_str()))
+        }) {
+            return Err(CircuitPlacementError(
+                "signal-processor chain replacement cannot discard processor-local temporal wiring"
+                    .to_string(),
+            ));
+        }
+        if self
+            .boundary
+            .external_inputs
+            .iter()
+            .chain(self.boundary.public_outputs.iter())
+            .any(|port| old_processor_ids.contains(port.endpoint.pedal_id.as_str()))
+        {
+            return Err(CircuitPlacementError(
+                "signal-processor chain replacement requires graph boundaries outside the processor chain"
+                    .to_string(),
+            ));
+        }
+
+        let first = processor_instances
+            .first()
+            .expect("non-empty processor chain must have a first instance");
+        let last = processor_instances
+            .last()
+            .expect("non-empty processor chain must have a last instance");
+        let first_source = source_by_id[first.source_pedal_id.as_str()];
+        let last_source = source_by_id[last.source_pedal_id.as_str()];
+        let first_input = single_series_port(
+            &first_source.circuit.boundary.inputs,
+            &first.instance_id,
+            "input",
+        )?;
+        let last_output = single_series_port(
+            &last_source.circuit.boundary.outputs,
+            &last.instance_id,
+            "output",
+        )?;
+
+        let mut instances = Vec::with_capacity(
+            self.instances.len() - old_processor_ids.len() + processor_instances.len(),
+        );
+        let mut inserted = false;
+        for instance in &self.instances {
+            if old_processor_ids.contains(instance.instance_id.as_str()) {
+                if !inserted {
+                    instances.extend(processor_instances.iter().cloned());
+                    inserted = true;
+                }
+            } else {
+                instances.push(instance.clone());
+            }
+        }
+
+        let mut cables = self
+            .cables
+            .iter()
+            .filter(|cable| {
+                !old_processor_ids.contains(cable.source.pedal_id.as_str())
+                    && !old_processor_ids.contains(cable.destination.pedal_id.as_str())
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut input_cable = crossing_inputs[0].clone();
+        input_cable.destination = StreamCircuitCableEndpoint {
+            pedal_id: first.instance_id.clone(),
+            port_id: first_input.id.clone(),
+        };
+        cables.push(input_cable);
+        for pair in processor_instances.windows(2) {
+            let source = source_by_id[pair[0].source_pedal_id.as_str()];
+            let destination = source_by_id[pair[1].source_pedal_id.as_str()];
+            let source_output = single_series_port(
+                &source.circuit.boundary.outputs,
+                &pair[0].instance_id,
+                "output",
+            )?;
+            let destination_input = single_series_port(
+                &destination.circuit.boundary.inputs,
+                &pair[1].instance_id,
+                "input",
+            )?;
+            let cable_id = allocate_cable_id(&cables, &pair[0].instance_id, &pair[1].instance_id);
+            cables.push(StreamCircuitGraphCable {
+                id: cable_id,
+                source: StreamCircuitCableEndpoint {
+                    pedal_id: pair[0].instance_id.clone(),
+                    port_id: source_output.id.clone(),
+                },
+                destination: StreamCircuitCableEndpoint {
+                    pedal_id: pair[1].instance_id.clone(),
+                    port_id: destination_input.id.clone(),
+                },
+                connection: StreamCircuitConnection::Forward,
+            });
+        }
+        let mut output_cable = crossing_outputs[0].clone();
+        output_cable.source = StreamCircuitCableEndpoint {
+            pedal_id: last.instance_id.clone(),
+            port_id: last_output.id.clone(),
+        };
+        cables.push(output_cable);
+
+        let mut patch = self;
+        patch.instances = instances;
+        patch.cables = cables;
         patch.validate_against_graph(graph)?;
         Ok(patch)
     }
@@ -2493,6 +2750,7 @@ pub struct RuntimeSourcePedal {
     pub pedal_index: usize,
     pub pedal_id: String,
     pub operator_type: String,
+    pub runtime_role: CircuitRuntimeRole,
     pub implementation: String,
     pub behavioral_role: String,
     pub source_layer_index: Option<usize>,
@@ -2945,9 +3203,10 @@ mod tests {
             "id": "fixture_circuit",
             "source": {
                 "pedal_id": "fixture_pedal",
-                "source_layer_index": 0,
+                "source_layer_index": null,
                 "source_operator_type": "fixture"
             },
+            "runtime_role": "input_transducer",
             "behavioral_role": "fixture",
             "implementation": "fixture",
             "boundary": {
@@ -2978,6 +3237,9 @@ mod tests {
             }]
         }))
         .unwrap();
+
+        assert_eq!(circuit.source.source_layer_index, None);
+        assert_eq!(circuit.runtime_role, CircuitRuntimeRole::InputTransducer);
 
         let mut duplicate_input = circuit.clone();
         duplicate_input
@@ -3012,7 +3274,7 @@ mod tests {
     }
 
     #[test]
-    fn placement_plan_keeps_layer_pedals_as_deployable_units() {
+    fn placement_plan_keeps_every_stream_entity_as_a_deployable_pedal() {
         let resolved =
             ResolvedLoweredPedalboard::from_index_file(fixture_model_index_path()).unwrap();
 
@@ -3020,14 +3282,14 @@ mod tests {
 
         assert_eq!(placement.schema, STREAM_CIRCUIT_PLACEMENT_SCHEMA);
         assert_eq!(placement.wiring, "explicit_graph");
-        assert_eq!(placement.pedals.len(), 14);
-        assert_eq!(placement.cables.len(), 13);
-        assert_eq!(placement.local_cable_count, 13);
+        assert_eq!(placement.pedals.len(), 17);
+        assert_eq!(placement.cables.len(), 17);
+        assert_eq!(placement.local_cable_count, 17);
         assert_eq!(placement.cross_device_cable_count, 0);
         assert_eq!(
             placement.pedal("layer_00").unwrap(),
             &PedalPlacement {
-                pedal_index: 0,
+                pedal_index: 1,
                 pedal_id: "layer_00".to_string(),
                 circuit_id: "layer_00_shortconv_circuit_v1".to_string(),
                 operator_type: "conv".to_string(),
@@ -3036,13 +3298,13 @@ mod tests {
         );
 
         let first_cable = &placement.cables[0];
-        assert_eq!(first_cable.source_pedal_id, "layer_00");
-        assert_eq!(first_cable.destination_pedal_id, "layer_01");
+        assert_eq!(first_cable.source_pedal_id, "input_transducer");
+        assert_eq!(first_cable.destination_pedal_id, "layer_00");
         assert_eq!(first_cable.signal, "frame");
         assert_eq!(first_cable.shape, vec![1024]);
         assert_eq!(first_cable.source_port_id, "output_frame");
         assert_eq!(first_cable.destination_port_id, "input_frame");
-        assert_eq!(first_cable.source_pedal_port.as_deref(), Some("output"));
+        assert_eq!(first_cable.source_pedal_port.as_deref(), Some("frame"));
         assert_eq!(first_cable.destination_pedal_port.as_deref(), Some("input"));
         assert_eq!(
             first_cable.transport,
@@ -3064,17 +3326,21 @@ mod tests {
         let effective = source.instantiate_runtime_patch(&patch).unwrap();
         let placement = effective.placement_plan(&patch.placement_spec()).unwrap();
 
-        assert_eq!(patch.instances.len(), 14);
-        assert!(!patch.instances[1].enabled);
-        assert_eq!(effective.circuits.len(), 13);
+        assert_eq!(patch.instances.len(), 17);
+        assert!(!patch.instances[2].enabled);
+        assert_eq!(effective.circuits.len(), 16);
         assert!(
             effective
                 .circuits
                 .iter()
                 .all(|circuit| circuit.pedal.id != "layer_01")
         );
-        assert_eq!(placement.cables[0].source_pedal_id, "layer_00");
-        assert_eq!(placement.cables[0].destination_pedal_id, "layer_02");
+        let bypass = placement
+            .cables
+            .iter()
+            .find(|cable| cable.source_pedal_id == "layer_00")
+            .unwrap();
+        assert_eq!(bypass.destination_pedal_id, "layer_02");
     }
 
     #[test]
@@ -3088,9 +3354,9 @@ mod tests {
 
         let placement = resolved.placement_plan(&spec).unwrap();
 
-        assert_eq!(placement.pedals.len(), 14);
-        assert_eq!(placement.cables.len(), 13);
-        assert_eq!(placement.local_cable_count, 9);
+        assert_eq!(placement.pedals.len(), 17);
+        assert_eq!(placement.cables.len(), 17);
+        assert_eq!(placement.local_cable_count, 13);
         assert_eq!(placement.cross_device_cable_count, 4);
         assert_eq!(
             placement
@@ -3168,29 +3434,29 @@ mod tests {
         });
 
         assert_eq!(routes.schema, RUNTIME_CABLE_ROUTES_SCHEMA);
-        assert_eq!(routes.cable_count, 13);
-        assert_eq!(routes.logical_local_cable_count, 10);
+        assert_eq!(routes.cable_count, 17);
+        assert_eq!(routes.logical_local_cable_count, 14);
         assert_eq!(routes.logical_cross_device_cable_count, 3);
         assert_eq!(routes.same_physical_target_cable_count, 1);
         assert_eq!(routes.cross_physical_target_cable_count, 2);
         assert_eq!(routes.unresolved_target_cable_count, 0);
         assert_eq!(
-            routes.routes[0].route_kind,
+            routes.routes[1].route_kind,
             RuntimeCableRouteKind::SamePhysicalTarget
         );
         assert_eq!(
-            routes.routes[1].route_kind,
+            routes.routes[2].route_kind,
             RuntimeCableRouteKind::CrossPhysicalTarget
         );
         assert_eq!(
-            routes.routes[3].route_kind,
+            routes.routes[0].route_kind,
             RuntimeCableRouteKind::LogicalLocal
         );
 
         let payload = serde_json::to_value(&routes).unwrap();
-        assert_eq!(payload["routes"][0]["route_kind"], "same_physical_target");
-        assert_eq!(payload["routes"][1]["route_kind"], "cross_physical_target");
-        assert_eq!(payload["routes"][3]["route_kind"], "logical_local");
+        assert_eq!(payload["routes"][1]["route_kind"], "same_physical_target");
+        assert_eq!(payload["routes"][2]["route_kind"], "cross_physical_target");
+        assert_eq!(payload["routes"][0]["route_kind"], "logical_local");
     }
 
     #[test]
@@ -3387,6 +3653,7 @@ mod tests {
             pedal_index: 5,
             pedal_id: "layer_05".to_string(),
             operator_type: "attention".to_string(),
+            runtime_role: CircuitRuntimeRole::SignalProcessor,
             implementation: "vulkan_resident".to_string(),
             behavioral_role: "transformer_layer".to_string(),
             source_layer_index: Some(5),
@@ -3442,6 +3709,7 @@ mod tests {
             pedal_index: 0,
             pedal_id: "layer_00".to_string(),
             operator_type: "layer".to_string(),
+            runtime_role: CircuitRuntimeRole::SignalProcessor,
             implementation: "vulkan_resident".to_string(),
             behavioral_role: "transformer_layer".to_string(),
             source_layer_index: Some(0),
@@ -4205,16 +4473,17 @@ mod tests {
             .unwrap();
         let duplicate_index = original_index + 1;
         let duplicate = &instantiated.circuits[duplicate_index];
+        let source = resolved
+            .circuits
+            .iter()
+            .find(|artifact| artifact.pedal.id == "layer_05")
+            .unwrap();
 
         assert_eq!(duplicate.pedal.id, "layer_05_repeat");
         assert_eq!(duplicate.circuit.source.pedal_id, "layer_05");
         assert_eq!(
             duplicate.params.refs.keys().collect::<Vec<_>>(),
-            resolved.circuits[original_index]
-                .params
-                .refs
-                .keys()
-                .collect::<Vec<_>>()
+            source.params.refs.keys().collect::<Vec<_>>()
         );
         assert_eq!(
             duplicate.circuit.state_ports,
@@ -4224,22 +4493,18 @@ mod tests {
             placement.pedal("layer_05_repeat").unwrap().device_id,
             "gpu1"
         );
-        assert_eq!(
-            placement.cables[duplicate_index - 1].source_pedal_id,
-            "layer_05"
-        );
-        assert_eq!(
-            placement.cables[duplicate_index - 1].destination_pedal_id,
-            "layer_05_repeat"
-        );
-        assert_eq!(
-            placement.cables[duplicate_index].source_pedal_id,
-            "layer_05_repeat"
-        );
-        assert_eq!(
-            placement.cables[duplicate_index].destination_pedal_id,
-            "layer_06"
-        );
+        let incoming = placement
+            .cables
+            .iter()
+            .find(|cable| cable.destination_pedal_id == "layer_05_repeat")
+            .unwrap();
+        let outgoing = placement
+            .cables
+            .iter()
+            .find(|cable| cable.source_pedal_id == "layer_05_repeat")
+            .unwrap();
+        assert_eq!(incoming.source_pedal_id, "layer_05");
+        assert_eq!(outgoing.destination_pedal_id, "layer_06");
         assert_eq!(placement.cross_device_cable_count, 2);
     }
 
@@ -4311,6 +4576,48 @@ mod tests {
             "gpu1"
         );
         assert_eq!(placement.cross_device_cable_count, 2);
+    }
+
+    #[test]
+    fn processor_chain_edit_preserves_generation_pedals_and_feedback() {
+        let resolved =
+            ResolvedLoweredPedalboard::from_index_file(fixture_model_index_path()).unwrap();
+        let original = resolved.default_runtime_patch("gpu0").unwrap();
+        let chain = vec![
+            ("first".to_string(), "layer_00".to_string()),
+            ("repeat".to_string(), "layer_00".to_string()),
+            ("last".to_string(), "layer_13".to_string()),
+        ];
+
+        let patch = original
+            .with_signal_processor_chain(&resolved, &chain)
+            .unwrap();
+
+        assert_eq!(patch.instances.len(), 6);
+        for system_pedal in ["input_transducer", "output_transducer", "sampler"] {
+            assert!(
+                patch
+                    .instances
+                    .iter()
+                    .any(|instance| instance.instance_id == system_pedal)
+            );
+        }
+        assert_eq!(patch.boundary, resolved.index.graph.boundary);
+        assert!(patch.cables.iter().any(|cable| {
+            cable.source.pedal_id == "sampler"
+                && cable.destination.pedal_id == "input_transducer"
+                && cable.connection
+                    == StreamCircuitConnection::TemporalFeedback {
+                        delay_activations: 1,
+                    }
+        }));
+        assert!(patch.cables.iter().any(|cable| {
+            cable.source.pedal_id == "input_transducer" && cable.destination.pedal_id == "first"
+        }));
+        assert!(patch.cables.iter().any(|cable| {
+            cable.source.pedal_id == "last" && cable.destination.pedal_id == "output_transducer"
+        }));
+        patch.validate_against_graph(&resolved).unwrap();
     }
 
     #[test]
@@ -4514,28 +4821,19 @@ mod tests {
         let resolved =
             ResolvedLoweredPedalboard::from_index_file(fixture_model_index_path()).unwrap();
         let patch = resolved.default_runtime_patch("gpu0").unwrap();
-        let feedback = StreamCircuitGraphCable {
-            id: "generation_feedback".to_string(),
-            source: patch.boundary.public_outputs[0].endpoint.clone(),
-            destination: patch.boundary.external_inputs[0].endpoint.clone(),
-            connection: StreamCircuitConnection::TemporalFeedback {
-                delay_activations: 1,
-            },
-        };
-
-        let mut delayed = patch.clone();
-        delayed.cables.push(feedback.clone());
-        delayed.validate_against_graph(&resolved).unwrap();
+        let feedback_index = patch
+            .cables
+            .iter()
+            .position(|cable| !cable.connection.is_forward())
+            .unwrap();
+        patch.validate_against_graph(&resolved).unwrap();
         assert_eq!(
-            delayed.topological_instance_ids(&resolved).unwrap().len(),
+            patch.topological_instance_ids(&resolved).unwrap().len(),
             resolved.circuits.len()
         );
 
         let mut instantaneous = patch.clone();
-        instantaneous.cables.push(StreamCircuitGraphCable {
-            connection: StreamCircuitConnection::Forward,
-            ..feedback.clone()
-        });
+        instantaneous.cables[feedback_index].connection = StreamCircuitConnection::Forward;
         assert!(
             instantaneous
                 .validate_against_graph(&resolved)
@@ -4545,12 +4843,9 @@ mod tests {
         );
 
         let mut zero_delay = patch;
-        zero_delay.cables.push(StreamCircuitGraphCable {
-            connection: StreamCircuitConnection::TemporalFeedback {
-                delay_activations: 0,
-            },
-            ..feedback
-        });
+        zero_delay.cables[feedback_index].connection = StreamCircuitConnection::TemporalFeedback {
+            delay_activations: 0,
+        };
         assert!(
             zero_delay
                 .validate_against_graph(&resolved)

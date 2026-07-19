@@ -72,6 +72,15 @@ def validate_circuit(circuit: Json) -> CircuitValidationReport:
         "schema",
     )
     _check(isinstance(circuit.get("id"), str) and bool(circuit["id"]), checks, issues, "circuit id exists", "missing circuit id", "id")
+    _check(
+        circuit.get("runtime_role")
+        in {"signal_processor", "input_transducer", "output_transducer", "sampler"},
+        checks,
+        issues,
+        "runtime role is supported",
+        f"unsupported runtime role {circuit.get('runtime_role')!r}",
+        "runtime_role",
+    )
 
     boundary = circuit.get("boundary")
     _check(isinstance(boundary, dict), checks, issues, "boundary exists", "boundary must be an object", "boundary")
