@@ -1169,7 +1169,7 @@ def _linear_params(weight_id: str, parameters: Json) -> list[str]:
     scales_id = f"{weight_id}_scales"
     if qzeros_id in parameters:
         if scales_id not in parameters:
-            raise CircuitLoweringError(
+            raise ValueError(
                 f"packed linear parameter {weight_id!r} has incomplete quantization metadata"
             )
         result.extend((qzeros_id, scales_id))
