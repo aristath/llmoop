@@ -257,6 +257,9 @@ def build_vulkan_resident_package_manifest(
             can_fuse_linear_split=lambda node, circuit=circuit: (
                 can_fuse_bf16_linear_split(circuit, node, tensor_index)
             ),
+            can_fuse_parallel_linears=lambda nodes, circuit=circuit: (
+                can_fuse_bf16_parallel_linears(circuit, nodes, tensor_index)
+            ),
         )
     pedal_executions = pedal_execution_specs(
         lowered_index=lowered_index,
@@ -527,6 +530,57 @@ def shader_file_for_node(
             prefix += "_paired"
         prefix += "_bf16"
         return f"{prefix}_{in_features}x{out_features}.comp"
+    if op in {"parallel_linear_2way", "parallel_linear_3way"}:
+        expected_branch_count = 2 if op == "parallel_linear_2way" else 3
+        branch_count = int(node["attrs"]["branch_count"])
+        if (
+            branch_count != expected_branch_count
+            or branch_count != len(node["params"])
+            or branch_count != len(node["outputs"])
+        ):
+            raise ModelCompileError(
+                f"parallel-linear node {node['id']!r} has inconsistent branch metadata"
+            )
+        shapes = [
+            parameter_shape_for_id(circuit, parameter_id, tensor_index)
+            for parameter_id in node["params"]
+        ]
+        input_widths = {int(shape[1]) for shape in shapes if len(shape) == 2}
+        dtypes = {
+            parameter_dtype_for_id(circuit, parameter_id, tensor_index)
+            for parameter_id in node["params"]
+        }
+        if (
+            len(shapes) != branch_count
+            or any(len(shape) != 2 for shape in shapes)
+            or len(input_widths) != 1
+            or dtypes != {"BF16"}
+        ):
+            raise ModelCompileError(
+                f"parallel-linear node {node['id']!r} has incompatible shapes {shapes}"
+            )
+        output_widths = [int(shape[0]) for shape in shapes]
+        layouts = {
+            parameter_layout_for_id(circuit, parameter_id, tensor_index)
+            for parameter_id in node["params"]
+        }
+        supported_layouts = {ROW_MAJOR_LAYOUT, VULKAN_BF16_ROW_PAIR_LAYOUT}
+        if len(layouts) != 1 or not layouts <= supported_layouts:
+            raise ModelCompileError(
+                f"parallel-linear node {node['id']!r} has unsupported layouts "
+                f"{sorted(layouts)}"
+            )
+        layout_token = (
+            "paired"
+            if layouts == {VULKAN_BF16_ROW_PAIR_LAYOUT}
+            else "row_major"
+        )
+        input_width = input_widths.pop()
+        return (
+            f"parallel_linear_{branch_count}way_{layout_token}_bf16_{input_width}x"
+            + "_".join(map(str, output_widths))
+            + ".comp"
+        )
     if op == "linear_split_3way":
         parameter_shape = parameter_shape_for_node(circuit, node, tensor_index)
         out_features, in_features = map(int, parameter_shape)
@@ -788,6 +842,12 @@ def shader_file_for_node(
 
 
 def workgroup_count_x_for_node(circuit: Json, node: Json, tensor_index: Json) -> int:
+    if node["op"] in {"parallel_linear_2way", "parallel_linear_3way"}:
+        return sum(
+            (int(parameter_shape_for_id(circuit, parameter_id, tensor_index)[0]) + 1)
+            // 2
+            for parameter_id in node["params"]
+        )
     if node["op"] in {"linear", "linear_residual", "linear_split_3way"}:
         out_features, _ = parameter_shape_for_node(circuit, node, tensor_index)
         # One workgroup collaboratively computes and packs two BF16 output rows.
@@ -895,6 +955,99 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
                 f"shader {shader_file} has {replacement_count} stream-control bindings; expected one"
             )
         return rendered
+
+    parallel_linear = re.fullmatch(
+        r"parallel_linear_([23])way_(paired|row_major)_bf16_(\d+)x(\d+)_(\d+)(?:_(\d+))?\.comp",
+        shader_file,
+    )
+    if parallel_linear is not None:
+        branch_count = int(parallel_linear.group(1))
+        weight_layout = parallel_linear.group(2)
+        input_size = int(parallel_linear.group(3))
+        output_widths = [
+            int(width)
+            for width in parallel_linear.groups()[3:]
+            if width is not None
+        ]
+        if (
+            len(output_widths) != branch_count
+            or input_size <= 0
+            or input_size % 2
+            or any(width <= 0 or width % 2 for width in output_widths)
+        ):
+            raise ModelCompileError(
+                f"invalid parallel-linear shader shape {shader_file!r}"
+            )
+        labels = [chr(ord("A") + index) for index in range(branch_count)]
+        output_bindings = "\n\n".join(
+            f"layout(set = 0, binding = {index + 1}) buffer Output{label} {{\n"
+            "    uint words[];\n"
+            f"}} output_{label.lower()};"
+            for index, label in enumerate(labels)
+        )
+        weight_bindings = "\n\n".join(
+            f"layout(set = 0, binding = {branch_count + index + 1}) "
+            f"readonly buffer Weight{label} {{\n"
+            "    uint words[];\n"
+            f"}} weight_{label.lower()};"
+            for index, label in enumerate(labels)
+        )
+        output_constants = "\n".join(
+            f"const uint OUTPUT_{label}_WORDS = {width}u / 2u;"
+            for label, width in zip(labels, output_widths, strict=True)
+        )
+        branch_lines = []
+        consumed_words = []
+        for index, label in enumerate(labels):
+            prefix = "if" if index == 0 else "else if"
+            threshold = " + ".join(
+                [*consumed_words, f"OUTPUT_{label}_WORDS"]
+            )
+            offset = " + ".join(consumed_words) or "0u"
+            branch_lines.append(
+                f"    {prefix} (word_index < {threshold}) {{\n"
+                f"        branch = {index}u;\n"
+                f"        local_word_index = word_index - ({offset});\n"
+                "    }"
+            )
+            consumed_words.append(f"OUTPUT_{label}_WORDS")
+        weight_reads = "\n".join(
+            f"    if (branch == {index}u) return weight_{label.lower()}.words[weight_index];"
+            for index, label in enumerate(labels[:-1])
+        )
+        weight_reads += (
+            "\n    return weight_"
+            + labels[-1].lower()
+            + ".words[weight_index];"
+        )
+        output_writes = "\n".join(
+            f"    if (branch == {index}u) {{ output_{label.lower()}.words[local_word_index] = packed; return; }}"
+            for index, label in enumerate(labels[:-1])
+        )
+        output_writes += (
+            "\n    output_"
+            + labels[-1].lower()
+            + ".words[local_word_index] = packed;"
+        )
+        return render_shader_template(
+            source_dir,
+            "parallel_linear_bf16.comp.template",
+            {
+                "OUTPUT_BINDINGS": output_bindings,
+                "WEIGHT_BINDINGS": weight_bindings,
+                "INPUT_SIZE": str(input_size),
+                "OUTPUT_WORD_CONSTANTS": output_constants,
+                "TOTAL_OUTPUT_WORDS": " + ".join(
+                    f"OUTPUT_{label}_WORDS" for label in labels
+                ),
+                "PAIRED_WEIGHT_LAYOUT": (
+                    "true" if weight_layout == "paired" else "false"
+                ),
+                "BRANCH_SELECTION": "\n".join(branch_lines),
+                "WEIGHT_READS": weight_reads,
+                "OUTPUT_WRITES": output_writes,
+            },
+        )
 
     shaped_templates = (
         (
@@ -1829,6 +1982,33 @@ def can_fuse_bf16_linear_split(circuit: Json, node: Json, tensor_index: Json) ->
         and parameter_dtype_for_node(circuit, node, tensor_index) == "BF16"
         and parameter_layout_for_node(circuit, node, tensor_index)
         in {ROW_MAJOR_LAYOUT, VULKAN_BF16_ROW_PAIR_LAYOUT}
+    )
+
+
+def can_fuse_bf16_parallel_linears(
+    circuit: Json, nodes: list[Json], tensor_index: Json
+) -> bool:
+    shapes = [parameter_shape_for_node(circuit, node, tensor_index) for node in nodes]
+    layouts = {
+        parameter_layout_for_node(circuit, node, tensor_index) for node in nodes
+    }
+    return (
+        len(nodes) in {2, 3}
+        and all(
+            len(shape) == 2
+            and all(
+                int(dimension) > 0 and int(dimension) % 2 == 0
+                for dimension in shape
+            )
+            for shape in shapes
+        )
+        and len({int(shape[1]) for shape in shapes}) == 1
+        and all(
+            parameter_dtype_for_node(circuit, node, tensor_index) == "BF16"
+            for node in nodes
+        )
+        and len(layouts) == 1
+        and layouts <= {ROW_MAJOR_LAYOUT, VULKAN_BF16_ROW_PAIR_LAYOUT}
     )
 
 

@@ -6,6 +6,65 @@ from llmoop.circuit_optimizer import optimize_circuit_for_vulkan
 
 
 class VulkanCircuitOptimizerTest(unittest.TestCase):
+    def test_fuses_two_or_three_independent_linears_with_one_input(self) -> None:
+        nodes = [
+            {
+                "id": branch,
+                "op": "linear",
+                "inputs": ["hidden"],
+                "outputs": [f"{branch}_out"],
+                "params": [f"{branch}_weight"],
+            }
+            for branch in ("a", "b", "c")
+        ]
+
+        optimized = optimize_circuit_for_vulkan(
+            {"nodes": nodes},
+            can_fuse_parallel_linears=lambda group: len(group) in {2, 3},
+        )
+
+        self.assertEqual(1, len(optimized["nodes"]))
+        fused = optimized["nodes"][0]
+        self.assertEqual("parallel_linear_3way", fused["op"])
+        self.assertEqual(["hidden"], fused["inputs"])
+        self.assertEqual(["a_out", "b_out", "c_out"], fused["outputs"])
+        self.assertEqual(
+            ["a_weight", "b_weight", "c_weight"], fused["params"]
+        )
+
+        pair = optimize_circuit_for_vulkan(
+            {"nodes": nodes[:2]},
+            can_fuse_parallel_linears=lambda group: len(group) == 2,
+        )
+        self.assertEqual("parallel_linear_2way", pair["nodes"][0]["op"])
+
+    def test_does_not_fuse_linears_with_different_inputs(self) -> None:
+        circuit = {
+            "nodes": [
+                {
+                    "id": "a",
+                    "op": "linear",
+                    "inputs": ["first"],
+                    "outputs": ["a_out"],
+                    "params": ["a_weight"],
+                },
+                {
+                    "id": "b",
+                    "op": "linear",
+                    "inputs": ["second"],
+                    "outputs": ["b_out"],
+                    "params": ["b_weight"],
+                },
+            ]
+        }
+
+        optimized = optimize_circuit_for_vulkan(
+            circuit,
+            can_fuse_parallel_linears=lambda _group: True,
+        )
+
+        self.assertEqual(circuit, optimized)
+
     def test_fuses_compatible_linear_into_contiguous_three_way_split(self) -> None:
         circuit = {
             "nodes": [

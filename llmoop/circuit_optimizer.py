@@ -13,6 +13,7 @@ def optimize_circuit_for_vulkan(
     circuit: Json,
     *,
     can_fuse_linear_split: Callable[[Json], bool] | None = None,
+    can_fuse_parallel_linears: Callable[[list[Json]], bool] | None = None,
 ) -> Json:
     """Compile discoverable node regions without changing the pedal boundary."""
     optimized = deepcopy(circuit)
@@ -26,6 +27,17 @@ def optimize_circuit_for_vulkan(
     compiled_nodes: list[Json] = []
     index = 0
     while index < len(nodes):
+        parallel_fusion = _fuse_parallel_linears(
+            nodes,
+            index,
+            can_fuse_parallel_linears,
+        )
+        if parallel_fusion is not None:
+            fused, consumed_node_count = parallel_fusion
+            compiled_nodes.append(fused)
+            index += consumed_node_count
+            continue
+
         current = nodes[index]
         following = nodes[index + 1] if index + 1 < len(nodes) else None
 
@@ -49,6 +61,48 @@ def optimize_circuit_for_vulkan(
 
     optimized["nodes"] = compiled_nodes
     return optimized
+
+
+def _fuse_parallel_linears(
+    nodes: list[Json],
+    start: int,
+    can_fuse: Callable[[list[Json]], bool] | None,
+) -> tuple[Json, int] | None:
+    if can_fuse is None:
+        return None
+    candidates = nodes[start : start + 3]
+    for count in range(min(3, len(candidates)), 1, -1):
+        group = candidates[:count]
+        shared_inputs = group[0].get("inputs", [])
+        if (
+            len(shared_inputs) != 1
+            or any(
+                node.get("op") != "linear"
+                or node.get("inputs") != shared_inputs
+                or len(node.get("outputs", [])) != 1
+                or len(node.get("params", [])) != 1
+                or node.get("state_reads")
+                or node.get("state_writes")
+                for node in group
+            )
+            or not can_fuse(group)
+        ):
+            continue
+        return (
+            {
+                "id": "__".join(node["id"] for node in group),
+                "op": f"parallel_linear_{count}way",
+                "inputs": deepcopy(shared_inputs),
+                "outputs": [node["outputs"][0] for node in group],
+                "params": [node["params"][0] for node in group],
+                "attrs": {
+                    "compiled_from": [node["id"] for node in group],
+                    "branch_count": count,
+                },
+            },
+            count,
+        )
+    return None
 
 
 def _fuse_linear_split(

@@ -57,14 +57,12 @@ impl TensorIndex {
     }
 
     pub fn tensor_shape(&self, tensor: &str) -> Option<&[usize]> {
-        self.tensors
-            .get(tensor)
-            .map(|metadata| {
-                metadata
-                    .logical_shape
-                    .as_deref()
-                    .unwrap_or(metadata.shape.as_slice())
-            })
+        self.tensors.get(tensor).map(|metadata| {
+            metadata
+                .logical_shape
+                .as_deref()
+                .unwrap_or(metadata.shape.as_slice())
+        })
     }
 }
 
@@ -984,6 +982,9 @@ fn infer_node_output_shapes(
             outputs,
         )),
         "sigmoid_scalar_multiply" => Ok(repeat_shape(first_input_shape(node, signals), outputs)),
+        "parallel_linear_2way" | "parallel_linear_3way" => {
+            infer_parallel_linear_output_shapes(pedal_id, node, signals, params, tensor_index)
+        }
         "linear" | "linear_residual" => {
             infer_linear_output_shapes(pedal_id, node, signals, params, tensor_index)
         }
@@ -1087,6 +1088,79 @@ fn infer_linear_output_shapes(
     };
 
     Ok(repeat_shape(output_shape, node.outputs.len()))
+}
+
+fn infer_parallel_linear_output_shapes(
+    pedal_id: &str,
+    node: &CircuitNode,
+    signals: &BTreeMap<String, PlannedSignal>,
+    params: &BTreeMap<String, ParameterRef>,
+    tensor_index: Option<&TensorIndex>,
+) -> Result<Vec<Option<Vec<usize>>>, CircuitPlanError> {
+    let expected_branch_count = match node.op.as_str() {
+        "parallel_linear_2way" => 2,
+        "parallel_linear_3way" => 3,
+        _ => unreachable!("parallel-linear shape inference called for {}", node.op),
+    };
+    let declared_branch_count = attr_usize(node, "branch_count");
+    if node.params.len() != expected_branch_count
+        || node.outputs.len() != expected_branch_count
+        || declared_branch_count != Some(expected_branch_count)
+    {
+        return Err(CircuitPlanError(format!(
+            "{} node {} declares {:?} parallel-linear branches for {} parameters and {} outputs; expected {}",
+            pedal_id,
+            node.id,
+            declared_branch_count,
+            node.params.len(),
+            node.outputs.len(),
+            expected_branch_count
+        )));
+    }
+    let Some(tensor_index) = tensor_index else {
+        return Ok(vec![None; node.outputs.len()]);
+    };
+    let input_shape = first_input_shape(node, signals);
+    let input_width = input_shape.as_ref().and_then(|shape| shape.last()).copied();
+    node.params
+        .iter()
+        .map(|param_id| {
+            let parameter = params.get(param_id).ok_or_else(|| {
+                CircuitPlanError(format!(
+                    "{} node {} cannot resolve parallel-linear parameter {:?}",
+                    pedal_id, node.id, param_id
+                ))
+            })?;
+            let tensor = parameter.tensor.as_deref().ok_or_else(|| {
+                CircuitPlanError(format!(
+                    "{} node {} parallel-linear parameter {:?} has no tensor",
+                    pedal_id, node.id, param_id
+                ))
+            })?;
+            let weight_shape = tensor_index.tensor_shape(tensor).ok_or_else(|| {
+                CircuitPlanError(format!(
+                    "{} node {} parallel-linear tensor {:?} has no shape",
+                    pedal_id, node.id, tensor
+                ))
+            })?;
+            if weight_shape.len() != 2 {
+                return Ok(None);
+            }
+            if input_width.is_some_and(|width| width != weight_shape[1]) {
+                return Err(CircuitPlanError(format!(
+                    "{} node {} parallel-linear input width {:?} does not match parameter {:?} width {}",
+                    pedal_id, node.id, input_width, param_id, weight_shape[1]
+                )));
+            }
+            let mut output_shape = input_shape
+                .clone()
+                .unwrap_or_else(|| vec![weight_shape[0]]);
+            if let Some(last) = output_shape.last_mut() {
+                *last = weight_shape[0];
+            }
+            Ok(Some(output_shape))
+        })
+        .collect()
 }
 
 fn infer_split_output_shapes(
@@ -1402,6 +1476,35 @@ mod tests {
     }
 
     #[test]
+    fn rejects_parallel_linear_branch_metadata_mismatch_without_tensor_index() {
+        let node = crate::stream_circuit::CircuitNode {
+            id: "qkv".to_string(),
+            op: "parallel_linear_3way".to_string(),
+            inputs: vec!["hidden".to_string()],
+            outputs: vec!["q".to_string(), "k".to_string(), "v".to_string()],
+            params: vec![
+                "q_weight".to_string(),
+                "k_weight".to_string(),
+                "v_weight".to_string(),
+            ],
+            state_reads: Vec::new(),
+            state_writes: Vec::new(),
+            attrs: serde_json::json!({"branch_count": 2}),
+        };
+
+        let error = infer_parallel_linear_output_shapes(
+            "attention",
+            &node,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            None,
+        )
+        .unwrap_err();
+
+        assert!(error.0.contains("expected 3"), "{}", error.0);
+    }
+
+    #[test]
     fn plans_fixture_model_lowered_pedalboard_activation_schedule() {
         let graph = ResolvedLoweredPedalboard::from_index_file(fixture_model_index_path()).unwrap();
 
@@ -1569,10 +1672,7 @@ mod tests {
             index.tensor_shape("projection.qweight"),
             Some([768, 512].as_slice())
         );
-        assert_eq!(
-            index.tensors["projection.qweight"].shape,
-            vec![64, 768]
-        );
+        assert_eq!(index.tensors["projection.qweight"].shape, vec![64, 768]);
     }
 
     #[test]

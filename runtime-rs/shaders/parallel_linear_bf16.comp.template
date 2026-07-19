@@ -1,0 +1,129 @@
+#version 450
+
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer InputFrame {
+    uint words[];
+} input_frame;
+
+{{OUTPUT_BINDINGS}}
+
+{{WEIGHT_BINDINGS}}
+
+const uint INPUT_SIZE = {{INPUT_SIZE}}u;
+const uint INPUT_WORDS = (INPUT_SIZE + 1u) / 2u;
+{{OUTPUT_WORD_CONSTANTS}}
+const uint TOTAL_OUTPUT_WORDS = {{TOTAL_OUTPUT_WORDS}};
+const bool PAIRED_WEIGHT_LAYOUT = {{PAIRED_WEIGHT_LAYOUT}};
+
+shared float subgroup_lo[64];
+shared float subgroup_hi[64];
+
+float bf16_to_f32(uint value) {
+    return uintBitsToFloat((value & 0xffffu) << 16);
+}
+
+uint f32_to_bf16(float value) {
+    uint bits = floatBitsToUint(value);
+    uint lsb = (bits >> 16) & 1u;
+    uint rounding_bias = 0x7fffu + lsb;
+    return (bits + rounding_bias) >> 16;
+}
+
+uint read_branch_weight(
+    uint branch,
+    uint local_word_index,
+    uint column_word,
+    uint row_offset
+) {
+    uint weight_index;
+    if (PAIRED_WEIGHT_LAYOUT) {
+        weight_index =
+            (2u * ((local_word_index * INPUT_WORDS) + column_word)) + row_offset;
+    } else {
+        uint row = (local_word_index * 2u) + row_offset;
+        weight_index = (row * INPUT_WORDS) + column_word;
+    }
+{{WEIGHT_READS}}
+}
+
+void write_branch_output(
+    uint branch,
+    uint local_word_index,
+    uint packed
+) {
+{{OUTPUT_WRITES}}
+}
+
+void main() {
+    uint word_index = gl_WorkGroupID.x;
+    uint lane = gl_LocalInvocationID.x;
+    if (word_index >= TOTAL_OUTPUT_WORDS) {
+        return;
+    }
+
+    uint branch = 0u;
+    uint local_word_index = 0u;
+{{BRANCH_SELECTION}}
+
+    float lo_sum = 0.0;
+    float hi_sum = 0.0;
+    for (uint column_word = lane; column_word < INPUT_WORDS; column_word += 64u) {
+        uint input_pair = input_frame.words[column_word];
+        float input_lo = bf16_to_f32(input_pair);
+        float input_hi = bf16_to_f32(input_pair >> 16);
+        uint lo_weight_pair = read_branch_weight(
+            branch,
+            local_word_index,
+            column_word,
+            0u
+        );
+        uint hi_weight_pair = read_branch_weight(
+            branch,
+            local_word_index,
+            column_word,
+            1u
+        );
+
+        lo_sum = fma(input_lo, bf16_to_f32(lo_weight_pair), lo_sum);
+        lo_sum = fma(input_hi, bf16_to_f32(lo_weight_pair >> 16), lo_sum);
+        hi_sum = fma(input_lo, bf16_to_f32(hi_weight_pair), hi_sum);
+        hi_sum = fma(input_hi, bf16_to_f32(hi_weight_pair >> 16), hi_sum);
+    }
+
+    lo_sum = subgroupAdd(lo_sum);
+    hi_sum = subgroupAdd(hi_sum);
+    if (gl_NumSubgroups == 1u) {
+        if (gl_SubgroupInvocationID == 0u) {
+            write_branch_output(
+                branch,
+                local_word_index,
+                (f32_to_bf16(hi_sum) << 16) | f32_to_bf16(lo_sum)
+            );
+        }
+        return;
+    }
+
+    if (gl_SubgroupInvocationID == 0u) {
+        subgroup_lo[gl_SubgroupID] = lo_sum;
+        subgroup_hi[gl_SubgroupID] = hi_sum;
+    }
+    barrier();
+
+    if (lane == 0u) {
+        float lo_total = 0.0;
+        float hi_total = 0.0;
+        for (uint subgroup = 0u; subgroup < gl_NumSubgroups; subgroup++) {
+            lo_total += subgroup_lo[subgroup];
+            hi_total += subgroup_hi[subgroup];
+        }
+        write_branch_output(
+            branch,
+            local_word_index,
+            (f32_to_bf16(hi_total) << 16) | f32_to_bf16(lo_total)
+        );
+    }
+}

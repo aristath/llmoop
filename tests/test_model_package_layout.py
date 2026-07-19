@@ -4,11 +4,15 @@ import json
 import struct
 from pathlib import Path
 
+import pytest
+
+from llmoop.model_compiler import ModelCompileError
 from llmoop.model_package import (
     ROW_MAJOR_LAYOUT,
     VULKAN_BF16_ROW_PAIR_LAYOUT,
     compiled_tensor_layout,
     copy_shader_templates,
+    shader_file_for_node,
     write_compiled_tensor,
 )
 
@@ -152,6 +156,64 @@ def test_compiler_renders_direct_three_way_linear_split_shaders(tmp_path: Path) 
     assert "output_c.words" in paired_source
     assert "{{" not in paired_source
     assert "{{" not in row_major_source
+
+
+def test_compiler_renders_parallel_linear_shaders(tmp_path: Path) -> None:
+    shader_source_dir = Path(__file__).parents[1] / "runtime-rs" / "shaders"
+    pair = "parallel_linear_2way_paired_bf16_1024x2560_2560.comp"
+    triple = "parallel_linear_3way_row_major_bf16_1024x1024_512_512.comp"
+
+    copy_shader_templates(shader_source_dir, tmp_path, {pair, triple})
+
+    pair_source = (tmp_path / pair).read_text()
+    triple_source = (tmp_path / triple).read_text()
+    assert "binding = 3) readonly buffer WeightA" in pair_source
+    assert "binding = 4) readonly buffer WeightB" in pair_source
+    assert "const uint OUTPUT_A_WORDS = 2560u / 2u;" in pair_source
+    assert "const bool PAIRED_WEIGHT_LAYOUT = true;" in pair_source
+    assert "binding = 6) readonly buffer WeightC" in triple_source
+    assert "const uint OUTPUT_C_WORDS = 512u / 2u;" in triple_source
+    assert "const bool PAIRED_WEIGHT_LAYOUT = false;" in triple_source
+    assert "{{" not in pair_source
+    assert "{{" not in triple_source
+
+
+def test_parallel_linear_shader_selector_rejects_invalid_metadata_and_layout() -> None:
+    node = {
+        "id": "qkv",
+        "op": "parallel_linear_3way",
+        "inputs": ["hidden"],
+        "outputs": ["q", "k", "v"],
+        "params": ["q_weight", "k_weight", "v_weight"],
+        "attrs": {"branch_count": 2},
+    }
+    circuit = {
+        "parameters": {
+            "refs": {
+                parameter_id: {"tensor": parameter_id}
+                for parameter_id in node["params"]
+            }
+        }
+    }
+    tensor_index = {
+        "tensors": {
+            parameter_id: {
+                "dtype": "BF16",
+                "shape": [512, 1024],
+                "layout": VULKAN_BF16_ROW_PAIR_LAYOUT,
+            }
+            for parameter_id in node["params"]
+        }
+    }
+    dimensions = {"hidden_size": 1024, "intermediate_size": 2560}
+
+    with pytest.raises(ModelCompileError, match="inconsistent branch metadata"):
+        shader_file_for_node(circuit, node, tensor_index, dimensions)
+
+    node["attrs"]["branch_count"] = 3
+    tensor_index["tensors"]["v_weight"]["layout"] = "unknown_layout"
+    with pytest.raises(ModelCompileError, match="unsupported layouts"):
+        shader_file_for_node(circuit, node, tensor_index, dimensions)
 
 
 def test_compiler_renders_native_block_scaled_fp8_linear_shaders(
