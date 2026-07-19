@@ -559,6 +559,25 @@ impl VulkanResidentBuffer {
         }
     }
 
+    pub fn read_persistently_mapped_u32_le_at(&self, offset: usize) -> Result<u32, VulkanError> {
+        let byte_count = std::mem::size_of::<u32>();
+        let end = offset
+            .checked_add(byte_count)
+            .ok_or_else(|| VulkanError("resident u32 read overflowed".to_string()))?;
+        if end > self.byte_capacity as usize {
+            return Err(VulkanError(format!(
+                "resident byte buffer capacity {} cannot read a u32 at offset {}",
+                self.byte_capacity, offset
+            )));
+        }
+        let address = self.persistent_mapping.ok_or_else(|| {
+            VulkanError("resident u32 read requires persistent mapping".to_string())
+        })?;
+        let bytes =
+            unsafe { std::slice::from_raw_parts((address as *const u8).add(offset), byte_count) };
+        Ok(u32::from_le_bytes(bytes.try_into().unwrap()))
+    }
+
     fn byte_len(&self, len: usize) -> Result<vk::DeviceSize, VulkanError> {
         if len == 0 {
             return Err(VulkanError(
