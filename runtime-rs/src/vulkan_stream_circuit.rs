@@ -3236,6 +3236,7 @@ pub struct VulkanResidentOutputTransducerRunner {
     logits_buffer: VulkanResidentBuffer,
     embedding_norm_dispatch: VulkanResidentKernelDispatch,
     tied_projection_dispatch: VulkanResidentKernelDispatch,
+    sequence: VulkanResidentKernelSequence,
     node_ids: Vec<String>,
 }
 
@@ -3384,6 +3385,7 @@ impl VulkanResidentOutputTransducerRunner {
             logits_buffer,
             embedding_norm_dispatch,
             tied_projection_dispatch,
+            sequence: device.create_resident_kernel_sequence()?,
             node_ids: spec.node_ids.clone(),
         })
     }
@@ -3392,8 +3394,13 @@ impl VulkanResidentOutputTransducerRunner {
         &self,
         device: &VulkanComputeDevice,
     ) -> Result<VulkanResidentOutputTransducerRun, VulkanResidentOutputTransducerRunnerError> {
-        device.run_resident_kernel_dispatch(&self.embedding_norm_dispatch, &[])?;
-        device.run_resident_kernel_dispatch(&self.tied_projection_dispatch, &[])?;
+        device.run_resident_kernel_sequence(
+            &self.sequence,
+            &[
+                VulkanResidentKernelSequenceStep::new(&self.embedding_norm_dispatch, &[]),
+                VulkanResidentKernelSequenceStep::new(&self.tied_projection_dispatch, &[]),
+            ],
+        )?;
         Ok(self.completed_run())
     }
 
