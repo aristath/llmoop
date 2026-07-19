@@ -198,6 +198,23 @@ def test_compiler_renders_parallel_head_norm_rope_shader(tmp_path: Path) -> None
     assert "{{" not in source
 
 
+def test_compiler_renders_dual_linear_silu_multiply_shader(tmp_path: Path) -> None:
+    shader_source_dir = Path(__file__).parents[1] / "runtime-rs" / "shaders"
+    shader_file = "dual_linear_silu_multiply_paired_bf16_1024x2560_a0.comp"
+
+    copy_shader_templates(shader_source_dir, tmp_path, {shader_file})
+
+    source = (tmp_path / shader_file).read_text()
+    assert "binding = 2) readonly buffer WeightA" in source
+    assert "binding = 3) readonly buffer WeightB" in source
+    assert "const uint INPUT_SIZE = 1024u;" in source
+    assert "const uint OUTPUT_SIZE = 2560u;" in source
+    assert "const uint ACTIVATED_INPUT_INDEX = 0u;" in source
+    assert "const bool PAIRED_WEIGHT_LAYOUT = true;" in source
+    assert "rounded_silu(activated_lo) * other_lo" in source
+    assert "{{" not in source
+
+
 def test_parallel_linear_shader_selector_rejects_invalid_metadata_and_layout() -> None:
     node = {
         "id": "qkv",

@@ -1,0 +1,166 @@
+#version 450
+
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer InputFrame {
+    uint words[];
+} input_frame;
+
+layout(set = 0, binding = 1) buffer OutputFrame {
+    uint words[];
+} output_frame;
+
+layout(set = 0, binding = 2) readonly buffer WeightA {
+    uint words[];
+} weight_a;
+
+layout(set = 0, binding = 3) readonly buffer WeightB {
+    uint words[];
+} weight_b;
+
+const uint INPUT_SIZE = {{INPUT_SIZE}}u;
+const uint OUTPUT_SIZE = {{OUTPUT_SIZE}}u;
+const uint INPUT_WORDS = (INPUT_SIZE + 1u) / 2u;
+const uint OUTPUT_WORDS = (OUTPUT_SIZE + 1u) / 2u;
+const uint ACTIVATED_INPUT_INDEX = {{ACTIVATED_INPUT_INDEX}}u;
+const bool PAIRED_WEIGHT_LAYOUT = {{PAIRED_WEIGHT_LAYOUT}};
+
+shared float subgroup_a_lo[64];
+shared float subgroup_a_hi[64];
+shared float subgroup_b_lo[64];
+shared float subgroup_b_hi[64];
+
+float bf16_to_f32(uint value) {
+    return uintBitsToFloat((value & 0xffffu) << 16);
+}
+
+uint f32_to_bf16(float value) {
+    uint bits = floatBitsToUint(value);
+    uint lsb = (bits >> 16) & 1u;
+    uint rounding_bias = 0x7fffu + lsb;
+    return (bits + rounding_bias) >> 16;
+}
+
+uint read_weight(
+    uint branch,
+    uint word_index,
+    uint column_word,
+    uint row_offset
+) {
+    uint weight_index;
+    if (PAIRED_WEIGHT_LAYOUT) {
+        weight_index =
+            (2u * ((word_index * INPUT_WORDS) + column_word)) + row_offset;
+    } else {
+        uint row = (word_index * 2u) + row_offset;
+        weight_index = (row * INPUT_WORDS) + column_word;
+    }
+    return branch == 0u
+        ? weight_a.words[weight_index]
+        : weight_b.words[weight_index];
+}
+
+float rounded_bf16(float value) {
+    return bf16_to_f32(f32_to_bf16(value));
+}
+
+float rounded_silu(float value) {
+    float activated = value / (1.0 + exp(-value));
+    return rounded_bf16(activated);
+}
+
+uint combine_branches(
+    float a_lo_sum,
+    float a_hi_sum,
+    float b_lo_sum,
+    float b_hi_sum
+) {
+    float a_lo = rounded_bf16(a_lo_sum);
+    float a_hi = rounded_bf16(a_hi_sum);
+    float b_lo = rounded_bf16(b_lo_sum);
+    float b_hi = rounded_bf16(b_hi_sum);
+    float activated_lo = ACTIVATED_INPUT_INDEX == 0u ? a_lo : b_lo;
+    float activated_hi = ACTIVATED_INPUT_INDEX == 0u ? a_hi : b_hi;
+    float other_lo = ACTIVATED_INPUT_INDEX == 0u ? b_lo : a_lo;
+    float other_hi = ACTIVATED_INPUT_INDEX == 0u ? b_hi : a_hi;
+    float lo = rounded_silu(activated_lo) * other_lo;
+    float hi = rounded_silu(activated_hi) * other_hi;
+    return (f32_to_bf16(hi) << 16) | f32_to_bf16(lo);
+}
+
+void main() {
+    uint word_index = gl_WorkGroupID.x;
+    uint lane = gl_LocalInvocationID.x;
+    if (word_index >= OUTPUT_WORDS) {
+        return;
+    }
+
+    float a_lo_sum = 0.0;
+    float a_hi_sum = 0.0;
+    float b_lo_sum = 0.0;
+    float b_hi_sum = 0.0;
+    for (uint column_word = lane; column_word < INPUT_WORDS; column_word += 64u) {
+        uint input_pair = input_frame.words[column_word];
+        float input_lo = bf16_to_f32(input_pair);
+        float input_hi = bf16_to_f32(input_pair >> 16);
+        uint a_lo_weight = read_weight(0u, word_index, column_word, 0u);
+        uint a_hi_weight = read_weight(0u, word_index, column_word, 1u);
+        uint b_lo_weight = read_weight(1u, word_index, column_word, 0u);
+        uint b_hi_weight = read_weight(1u, word_index, column_word, 1u);
+
+        a_lo_sum = fma(input_lo, bf16_to_f32(a_lo_weight), a_lo_sum);
+        a_lo_sum = fma(input_hi, bf16_to_f32(a_lo_weight >> 16), a_lo_sum);
+        a_hi_sum = fma(input_lo, bf16_to_f32(a_hi_weight), a_hi_sum);
+        a_hi_sum = fma(input_hi, bf16_to_f32(a_hi_weight >> 16), a_hi_sum);
+        b_lo_sum = fma(input_lo, bf16_to_f32(b_lo_weight), b_lo_sum);
+        b_lo_sum = fma(input_hi, bf16_to_f32(b_lo_weight >> 16), b_lo_sum);
+        b_hi_sum = fma(input_lo, bf16_to_f32(b_hi_weight), b_hi_sum);
+        b_hi_sum = fma(input_hi, bf16_to_f32(b_hi_weight >> 16), b_hi_sum);
+    }
+
+    a_lo_sum = subgroupAdd(a_lo_sum);
+    a_hi_sum = subgroupAdd(a_hi_sum);
+    b_lo_sum = subgroupAdd(b_lo_sum);
+    b_hi_sum = subgroupAdd(b_hi_sum);
+    if (gl_NumSubgroups == 1u) {
+        if (gl_SubgroupInvocationID == 0u) {
+            output_frame.words[word_index] = combine_branches(
+                a_lo_sum,
+                a_hi_sum,
+                b_lo_sum,
+                b_hi_sum
+            );
+        }
+        return;
+    }
+
+    if (gl_SubgroupInvocationID == 0u) {
+        subgroup_a_lo[gl_SubgroupID] = a_lo_sum;
+        subgroup_a_hi[gl_SubgroupID] = a_hi_sum;
+        subgroup_b_lo[gl_SubgroupID] = b_lo_sum;
+        subgroup_b_hi[gl_SubgroupID] = b_hi_sum;
+    }
+    barrier();
+
+    if (lane == 0u) {
+        float a_lo_total = 0.0;
+        float a_hi_total = 0.0;
+        float b_lo_total = 0.0;
+        float b_hi_total = 0.0;
+        for (uint subgroup = 0u; subgroup < gl_NumSubgroups; subgroup++) {
+            a_lo_total += subgroup_a_lo[subgroup];
+            a_hi_total += subgroup_a_hi[subgroup];
+            b_lo_total += subgroup_b_lo[subgroup];
+            b_hi_total += subgroup_b_hi[subgroup];
+        }
+        output_frame.words[word_index] = combine_branches(
+            a_lo_total,
+            a_hi_total,
+            b_lo_total,
+            b_hi_total
+        );
+    }
+}

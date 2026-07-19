@@ -6,6 +6,74 @@ from llmoop.circuit_optimizer import optimize_circuit_for_vulkan
 
 
 class VulkanCircuitOptimizerTest(unittest.TestCase):
+    def test_fuses_dual_linear_projection_into_silu_multiply(self) -> None:
+        circuit = {
+            "nodes": [
+                {
+                    "id": "gate__up",
+                    "op": "parallel_linear_2way",
+                    "inputs": ["hidden"],
+                    "outputs": ["gate", "up"],
+                    "params": ["gate_weight", "up_weight"],
+                    "attrs": {"branch_count": 2},
+                },
+                {
+                    "id": "activate__multiply",
+                    "op": "silu_multiply",
+                    "inputs": ["gate", "up"],
+                    "outputs": ["ffn_hidden"],
+                },
+            ]
+        }
+
+        optimized = optimize_circuit_for_vulkan(
+            circuit,
+            can_fuse_dual_linear_silu_multiply=lambda projection, multiply: (
+                projection["outputs"] == multiply["inputs"]
+            ),
+        )
+
+        self.assertEqual(1, len(optimized["nodes"]))
+        fused = optimized["nodes"][0]
+        self.assertEqual("dual_linear_silu_multiply", fused["op"])
+        self.assertEqual(["hidden"], fused["inputs"])
+        self.assertEqual(["ffn_hidden"], fused["outputs"])
+        self.assertEqual(["gate_weight", "up_weight"], fused["params"])
+        self.assertEqual(0, fused["attrs"]["activated_input_index"])
+        self.assertEqual("BF16", fused["attrs"]["activation_rounding"])
+
+    def test_does_not_fuse_dual_linear_outputs_with_extra_consumer(self) -> None:
+        circuit = {
+            "nodes": [
+                {
+                    "id": "gate__up",
+                    "op": "parallel_linear_2way",
+                    "inputs": ["hidden"],
+                    "outputs": ["gate", "up"],
+                    "params": ["gate_weight", "up_weight"],
+                },
+                {
+                    "id": "activate__multiply",
+                    "op": "silu_multiply",
+                    "inputs": ["gate", "up"],
+                    "outputs": ["ffn_hidden"],
+                },
+                {
+                    "id": "extra",
+                    "op": "silu",
+                    "inputs": ["gate"],
+                    "outputs": ["extra_out"],
+                },
+            ]
+        }
+
+        optimized = optimize_circuit_for_vulkan(
+            circuit,
+            can_fuse_dual_linear_silu_multiply=lambda _projection, _multiply: True,
+        )
+
+        self.assertEqual(circuit, optimized)
+
     def test_fuses_parallel_head_norm_rope_branches_across_independent_nodes(
         self,
     ) -> None:

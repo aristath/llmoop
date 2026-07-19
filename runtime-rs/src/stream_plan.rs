@@ -998,7 +998,7 @@ fn infer_node_output_shapes(
         "parallel_linear_2way" | "parallel_linear_3way" => {
             infer_parallel_linear_output_shapes(pedal_id, node, signals, params, tensor_index)
         }
-        "linear" | "linear_residual" => {
+        "linear" | "linear_residual" | "dual_linear_silu_multiply" => {
             infer_linear_output_shapes(pedal_id, node, signals, params, tensor_index)
         }
         "linear_split_3way" => {
