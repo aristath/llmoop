@@ -125,8 +125,7 @@ def main() -> None:
     parser.add_argument(
         "--shader-source-dir",
         type=Path,
-        default=Path("runtime-rs/shaders"),
-        help="directory containing backend shader templates",
+        help="directory containing backend shader templates (default: runtime-rs/shaders)",
     )
     parser.add_argument(
         "--context-size",
@@ -143,7 +142,6 @@ def main() -> None:
     parser.add_argument(
         "--max-new-tokens",
         type=int,
-        default=65_536,
         help="generation stop condition for --run; independent of context allocation (default: 65536)",
     )
     parser.add_argument(
@@ -169,9 +167,8 @@ def main() -> None:
     parser.add_argument(
         "--profile-runs",
         type=int,
-        default=1,
         metavar="N",
-        help="run N fresh prompt trials and report aggregate benchmark stats for --run",
+        help="run N fresh prompt trials and report aggregate benchmark stats for --run (default: 1)",
     )
     parser.add_argument(
         "--json",
@@ -197,6 +194,13 @@ def main() -> None:
             run_tui()
             return
         parser.error("choose an action, or run llmoop without arguments to open the TUI")
+    validate_action_options(parser, args)
+    if args.shader_source_dir is None:
+        args.shader_source_dir = Path("runtime-rs/shaders")
+    if args.max_new_tokens is None:
+        args.max_new_tokens = 65_536
+    if args.profile_runs is None:
+        args.profile_runs = 1
     if args.context_size is not None and args.context_size < 1:
         parser.error("--context-size must be at least 1")
     if args.compiler_events_jsonl and args.compile_model is None and args.discover_model is None:
@@ -233,45 +237,6 @@ def main() -> None:
             print(f"  tokenizer: {', '.join(discovery.tokenizer_files)}")
             print(f"  chat_template: {discovery.has_chat_template}")
         return
-    if args.compile_model is None:
-        if args.inspect_runtime and args.run is None:
-            parser.error("--inspect-runtime is only supported with --run")
-        if args.inspect_package and args.run is None:
-            parser.error("--inspect-package is only supported with --run")
-        if args.inspect_patch and args.run is None:
-            parser.error("--inspect-patch is only supported with --run")
-        if args.inspect_placement and args.run is None:
-            parser.error("--inspect-placement is only supported with --run")
-    elif args.inspect_device_slice is not None:
-        parser.error("--inspect-device-slice is only supported with --run")
-    elif args.inspect_runtime:
-        parser.error("--inspect-runtime is only supported with --run")
-    elif args.inspect_package:
-        parser.error("--inspect-package is only supported with --run")
-    elif args.inspect_patch:
-        parser.error("--inspect-patch is only supported with --run")
-    elif args.inspect_placement:
-        parser.error("--inspect-placement is only supported with --run")
-    elif args.chat:
-        parser.error("--chat is only supported with --run")
-    elif args.device is not None:
-        parser.error("--device is only supported with --run")
-    elif args.place_pedal:
-        parser.error("--place-pedal is only supported with --run")
-    elif args.bind_device:
-        parser.error("--bind-device is only supported with --run")
-    elif args.duplicate_after:
-        parser.error("--duplicate-after is only supported with --run")
-    elif args.chain is not None:
-        parser.error("--chain is only supported with --run")
-    elif args.vulkan_device_index is not None:
-        parser.error("--vulkan-device-index is only supported with --run")
-    elif args.context_size is not None:
-        parser.error("--context-size is only supported with --run")
-    elif args.profile:
-        parser.error("--profile is only supported with --run")
-    elif args.profile_runs != 1:
-        parser.error("--profile-runs is only supported with --run")
     if args.run is not None:
         inspect_mode_count = sum(
             [
@@ -347,6 +312,49 @@ def main() -> None:
         print(f"  package:    {report.package_manifest}")
         print(f"  circuits:   {report.circuit_count}")
         print(f"  shaders:    {report.shader_count}")
+
+
+def validate_action_options(
+    parser: argparse.ArgumentParser, args: argparse.Namespace
+) -> None:
+    runtime_options = (
+        ("--prompt", args.prompt is not None),
+        ("--chat", args.chat),
+        ("--inspect-runtime", args.inspect_runtime),
+        ("--inspect-package", args.inspect_package),
+        ("--inspect-patch", args.inspect_patch),
+        ("--inspect-placement", args.inspect_placement),
+        ("--inspect-device-slice", args.inspect_device_slice is not None),
+        ("--runtime-bin", args.runtime_bin is not None),
+        ("--device", args.device is not None),
+        ("--place-pedal", bool(args.place_pedal)),
+        ("--bind-device", bool(args.bind_device)),
+        ("--duplicate-after", bool(args.duplicate_after)),
+        ("--chain", args.chain is not None),
+        ("--context-size", args.context_size is not None),
+        ("--vulkan-device-index", args.vulkan_device_index is not None),
+        ("--max-new-tokens", args.max_new_tokens is not None),
+        ("--no-special-tokens", args.no_special_tokens),
+        ("--keep-special-tokens", args.keep_special_tokens),
+        ("--generated-only", args.generated_only),
+        ("--profile", args.profile),
+        ("--profile-runs", args.profile_runs is not None),
+    )
+    if args.run is None:
+        for option, provided in runtime_options:
+            if provided:
+                parser.error(f"{option} is only supported with --run")
+
+    compiler_options = (
+        ("--transpiled-dir", args.transpiled_dir is not None),
+        ("--lowered-dir", args.lowered_dir is not None),
+        ("--package-dir", args.package_dir is not None),
+        ("--shader-source-dir", args.shader_source_dir is not None),
+    )
+    if args.compile_model is None:
+        for option, provided in compiler_options:
+            if provided:
+                parser.error(f"{option} is only supported with --compile-model")
 
 
 class JsonLineCompileReporter:
