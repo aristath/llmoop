@@ -343,9 +343,7 @@ fn run_single_device_chat(
         &manifest,
         &chat_session.formatter,
     )?;
-    let transcript_codec = VulkanResidentHfTokenizerTextCodec::from_model_dir(tokenizer_dir)?
-        .with_add_special_tokens(args.add_special_tokens)
-        .with_skip_special_tokens(false);
+    let transcript_codec = chat_transcript_codec(tokenizer_dir)?;
     let model =
         VulkanResidentModelPackage::from_manifest(&device, manifest_dir, manifest, Some(capacity))?;
     let mut engine = VulkanResidentTokenEngine::new(device);
@@ -399,6 +397,16 @@ struct RuntimeChatMessage {
 struct RuntimeChatSession {
     formatter: RuntimeChatFormatter,
     messages: Vec<RuntimeChatMessage>,
+}
+
+fn chat_transcript_codec(
+    tokenizer_dir: &Path,
+) -> Result<VulkanResidentHfTokenizerTextCodec, Box<dyn Error>> {
+    Ok(
+        VulkanResidentHfTokenizerTextCodec::from_model_dir(tokenizer_dir)?
+            .with_add_special_tokens(false)
+            .with_skip_special_tokens(false),
+    )
 }
 
 impl RuntimeChatSession {
@@ -883,9 +891,7 @@ fn run_placed_chat(
         &manifest,
         &chat_session.formatter,
     )?;
-    let transcript_codec = VulkanResidentHfTokenizerTextCodec::from_model_dir(tokenizer_dir)?
-        .with_add_special_tokens(args.add_special_tokens)
-        .with_skip_special_tokens(false);
+    let transcript_codec = chat_transcript_codec(tokenizer_dir)?;
     let mut logical_device_ids = manifest.placement_device_ids();
     if !logical_device_ids.contains(&manifest.device_id) {
         logical_device_ids.push(manifest.device_id.clone());
@@ -2955,7 +2961,8 @@ Options:
   --context-size <N>         Runtime transient-state window. Default: auto, up to the model maximum.
   --vulkan-device-index <N>  Use Vulkan physical device index N as the default local target.
   --cycle-ticks <N>          Max runtime ticks per always-on cycle. Default: 4
-  --no-special-tokens        Do not add tokenizer special tokens to input text.
+  --no-special-tokens        Do not add tokenizer special tokens to raw --prompt input.
+                             Chat templates always own their complete special-token framing.
   --keep-special-tokens      Keep tokenizer special tokens in decoded output text.
   --generated-only           Print only newly generated text instead of prompt + generated text.
   --profile                  Print human-readable timing and top-pedal summaries.
@@ -2975,13 +2982,18 @@ mod tests {
 
     use chrono::{FixedOffset, TimeZone};
     use tokenizers::models::wordlevel::WordLevel;
+    use tokenizers::pre_tokenizers::whitespace::Whitespace;
+    use tokenizers::processors::template::TemplateProcessing;
     use tokenizers::{AddedToken, Tokenizer};
+
+    use llmoop_runtime::{VulkanResidentHfTokenizerTextCodec, VulkanResidentTokenTextCodec};
 
     use super::{
         RuntimeChatFormatter, RuntimeChatMessage, assistant_content_token_ids,
-        incremental_chat_token_delta, model_owned_assistant_turn_stop_token_id,
-        normalize_chat_template_for_runtime, parse_device_binding_assignment, parse_source_chain,
-        parse_vulkan_device_uuid_ref, placed_scheduler_turn_budget, resolve_runtime_context_size,
+        chat_transcript_codec, incremental_chat_token_delta,
+        model_owned_assistant_turn_stop_token_id, normalize_chat_template_for_runtime,
+        parse_device_binding_assignment, parse_source_chain, parse_vulkan_device_uuid_ref,
+        placed_scheduler_turn_budget, resolve_runtime_context_size,
         resolve_runtime_vulkan_physical_device_ref, token_scheduler_turn_budget,
     };
 
@@ -2994,6 +3006,54 @@ mod tests {
                 .with_ymd_and_hms(2026, 7, 18, 12, 0, 0)
                 .unwrap(),
         }
+    }
+
+    #[test]
+    fn chat_template_tokenization_does_not_inject_post_processor_special_tokens() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let tokenizer_dir = std::env::temp_dir().join(format!(
+            "llmoop-chat-tokenizer-specials-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&tokenizer_dir).unwrap();
+
+        let mut tokenizer = Tokenizer::new(WordLevel::default());
+        tokenizer
+            .add_special_tokens([AddedToken::from("<bos>", true)])
+            .unwrap();
+        tokenizer
+            .add_tokens([AddedToken::from("hello", false)])
+            .unwrap();
+        let bos_id = tokenizer.token_to_id("<bos>").unwrap();
+        let hello_id = tokenizer.token_to_id("hello").unwrap();
+        tokenizer.with_pre_tokenizer(Some(Whitespace));
+        tokenizer.with_post_processor(Some(
+            TemplateProcessing::builder()
+                .try_single("<bos> $A")
+                .unwrap()
+                .special_tokens(vec![("<bos>", bos_id)])
+                .build()
+                .unwrap(),
+        ));
+        tokenizer
+            .save(tokenizer_dir.join("tokenizer.json"), false)
+            .unwrap();
+
+        let raw_codec = VulkanResidentHfTokenizerTextCodec::from_model_dir(&tokenizer_dir)
+            .unwrap()
+            .with_add_special_tokens(true);
+        let chat_codec = chat_transcript_codec(&tokenizer_dir).unwrap();
+
+        assert_eq!(
+            raw_codec.encode_text("hello").unwrap(),
+            vec![bos_id, hello_id]
+        );
+        assert_eq!(chat_codec.encode_text("hello").unwrap(), vec![hello_id]);
+
+        fs::remove_dir_all(tokenizer_dir).unwrap();
     }
 
     #[test]
