@@ -12,7 +12,7 @@ from typing import Any, Callable
 
 from llmoop.circuit_lowering import lower_pedalboard
 from llmoop.circuit_optimizer import optimize_circuit_for_vulkan
-from llmoop.model_compiler import (
+from llmoop.compilation import (
     PACKAGE_SCHEMA,
     CompiledModelReport,
     Json,

@@ -1,31 +1,24 @@
 from __future__ import annotations
 
-import json
 import os
 import re
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
 from uuid import uuid4
 
-
-Json = dict[str, Any]
-
-PACKAGE_SCHEMA = "llmoop.vulkan_resident_model_package.v1"
-
-
-class ModelCompileError(RuntimeError):
-    pass
-
-
-class ModelCompileCancelled(ModelCompileError):
-    pass
-
-
-CompileEventSink = Callable[[Json], None]
-CancelCheck = Callable[[], bool]
-
+from llmoop.compilation import (
+    CancelCheck,
+    CompiledModelReport,
+    CompileEventSink,
+    Json,
+    ModelCompileCancelled,
+    ModelCompileError,
+    check_compile_cancelled,
+    emit_compile_event,
+    read_json,
+)
+from llmoop.model_package import compiled_model_slug, compile_model_package
 
 @dataclass(frozen=True)
 class SourceModelDiscovery:
@@ -51,31 +44,6 @@ class SourceModelDiscovery:
         }
 
 
-@dataclass(frozen=True)
-class CompiledModelReport:
-    model_dir: Path
-    transpiled_dir: Path
-    lowered_dir: Path
-    package_dir: Path
-    package_manifest: Path
-    model_type: str
-    circuit_count: int
-    shader_count: int
-
-    def to_json(self) -> Json:
-        return {
-            "ok": True,
-            "model_dir": str(self.model_dir),
-            "model_type": self.model_type,
-            "transpiled_dir": str(self.transpiled_dir),
-            "lowered_dir": str(self.lowered_dir),
-            "package_dir": str(self.package_dir),
-            "package_manifest": str(self.package_manifest),
-            "circuit_count": self.circuit_count,
-            "shader_count": self.shader_count,
-        }
-
-
 def compile_model(
     model_dir: Path,
     *,
@@ -88,8 +56,6 @@ def compile_model(
     cancel_requested: CancelCheck | None = None,
 ) -> CompiledModelReport:
     model_dir = model_dir.expanduser()
-    from llmoop.model_package import compiled_model_slug, compile_model_package
-
     emit_compile_event(event_sink, "DiscoveryStarted", model_dir=str(model_dir))
     try:
         discovery = discover_source_model(model_dir)
@@ -205,18 +171,6 @@ def discover_source_model(model_dir: Path) -> SourceModelDiscovery:
     )
 
 
-def emit_compile_event(
-    event_sink: CompileEventSink | None, event_type: str, **payload: Any
-) -> None:
-    if event_sink is not None:
-        event_sink({"type": event_type, **payload})
-
-
-def check_compile_cancelled(cancel_requested: CancelCheck | None) -> None:
-    if cancel_requested is not None and cancel_requested():
-        raise ModelCompileCancelled("model compilation cancelled")
-
-
 def staging_path(destination: Path, token: str) -> Path:
     return destination.with_name(f".{destination.name}.llmoop-stage-{token}")
 
@@ -262,15 +216,3 @@ def publish_staged_directories(
 def sanitize_slug(raw: str) -> str:
     return re.sub(r"[^a-zA-Z0-9]+", "_", raw).strip("_").lower()
 
-
-def relative_json_path(base_dir: Path, target: Path) -> str:
-    return os.path.relpath(target, base_dir)
-
-
-def read_json(path: Path) -> Json:
-    return json.loads(path.read_text())
-
-
-def write_json(path: Path, data: Json) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, indent=2, sort_keys=False) + "\n")

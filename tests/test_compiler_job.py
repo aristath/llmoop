@@ -7,8 +7,8 @@ from pathlib import Path
 import pytest
 
 from llmoop.cli import main
+from llmoop.compilation import ModelCompileCancelled
 from llmoop.model_compiler import (
-    ModelCompileCancelled,
     compile_model,
     discover_source_model,
     publish_staged_directories,

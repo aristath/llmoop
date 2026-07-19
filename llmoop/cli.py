@@ -9,12 +9,8 @@ import subprocess
 import sys
 from pathlib import Path
 
-from llmoop.model_compiler import (
-    ModelCompileCancelled,
-    ModelCompileError,
-    compile_model,
-    discover_source_model,
-)
+from llmoop.compilation import ModelCompileCancelled, ModelCompileError
+from llmoop.model_compiler import compile_model, discover_source_model
 
 
 RUNTIME_PACKAGE_MANIFEST = "vulkan_resident_package.json"

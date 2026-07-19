@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from llmoop.model_compiler import ModelCompileError
+from llmoop.compilation import ModelCompileError
 from llmoop.model_package import (
     ROW_MAJOR_LAYOUT,
     VULKAN_BF16_ROW_PAIR_LAYOUT,

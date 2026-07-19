@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from llmoop.circuit_ir import validate_circuit_against_pedal
-from llmoop.model_compiler import check_compile_cancelled
+from llmoop.compilation import check_compile_cancelled
 
 
 Json = dict[str, Any]

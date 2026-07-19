@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
-from llmoop.model_compiler import check_compile_cancelled
+from llmoop.compilation import check_compile_cancelled
 
 
 Json = dict[str, Any]
