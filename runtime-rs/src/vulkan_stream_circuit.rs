@@ -23,10 +23,10 @@ use crate::stream_plan::{
 };
 use crate::vulkan::{DEFAULT_COMPUTE_LOCAL_SIZE_X, DEFAULT_SPIRV_ENTRY_POINT, read_spirv_words};
 use crate::vulkan_compute::{
-    VulkanComputeDevice, VulkanError, VulkanResidentBuffer, VulkanResidentBufferCopy,
-    VulkanResidentKernelBufferAccess, VulkanResidentKernelBufferBinding,
-    VulkanResidentKernelDispatch, VulkanResidentKernelSequence,
+    VulkanComputeDevice, VulkanError, VulkanResidentBuffer, VulkanResidentKernelBufferAccess,
+    VulkanResidentKernelBufferBinding, VulkanResidentKernelDispatch, VulkanResidentKernelSequence,
     VulkanResidentKernelSequenceSnapshotCopy, VulkanResidentKernelSequenceStep,
+    VulkanResidentMappedBufferCopy,
 };
 
 pub const VULKAN_STREAM_CIRCUIT_BACKEND_ID: &str = "vulkan_stream_circuit_ir";
@@ -1364,10 +1364,12 @@ impl VulkanPlacedCableIoPlan {
                 byte_capacity,
                 "placed cable endpoint buffer allocation",
             )?;
+            let mut buffer = device.create_host_visible_resident_buffer(byte_capacity)?;
+            buffer.persistently_map()?;
             let allocation = VulkanPlacedCableBufferAllocation {
                 endpoint: endpoint.clone(),
                 byte_capacity,
-                buffer: device.create_resident_buffer(byte_capacity)?,
+                buffer,
             };
             match endpoint.direction {
                 VulkanPlacedCableDirection::Incoming => incoming_buffers.push(allocation),
@@ -1778,7 +1780,7 @@ pub struct VulkanPlacedCableDirectCopy {
     pub source_pedal_id: String,
     pub destination_pedal_id: String,
     pub byte_count: usize,
-    copy: VulkanResidentBufferCopy,
+    copy: VulkanResidentMappedBufferCopy,
 }
 
 impl VulkanInProcessPlacedCableTransport {
@@ -1839,7 +1841,6 @@ impl VulkanInProcessPlacedCableTransport {
 
     pub fn register_direct_cable_copy(
         &mut self,
-        device: &VulkanComputeDevice,
         outgoing: &VulkanPlacedCableBufferAllocation,
         incoming: &VulkanPlacedCableBufferAllocation,
     ) -> Result<(), VulkanPlacedCableTransportError> {
@@ -1861,10 +1862,11 @@ impl VulkanInProcessPlacedCableTransport {
                 incoming_byte_capacity: incoming.byte_capacity,
             });
         }
-        let copy = device
-            .create_resident_buffer_copy(&outgoing.buffer, &incoming.buffer, outgoing.byte_capacity)
+        let copy = outgoing
+            .buffer
+            .create_persistently_mapped_copy_to(&incoming.buffer, outgoing.byte_capacity)
             .map_err(|error| VulkanPlacedCableTransportError::Vulkan {
-                operation: "create direct cable buffer copy",
+                operation: "create persistently mapped cable buffer copy",
                 error,
             })?;
         self.direct_copies.insert(
@@ -14505,16 +14507,15 @@ impl From<VulkanMountedPlacedResidentStreamTickError>
     }
 }
 
-fn register_same_device_direct_cable_copies(
+fn register_in_process_direct_cable_copies(
     slices: &[VulkanMountedPlacedResidentInProcessStreamTickSlice<'_>],
     transport: &mut VulkanInProcessPlacedCableTransport,
 ) -> Result<(), VulkanMountedPlacedResidentInProcessStreamTickError> {
     for source_slice in slices {
         for outgoing in &source_slice.mounted.cable_io.outgoing_buffers {
-            let destination_slice = slices.iter().find(|slice| {
-                slice.device_id() == outgoing.endpoint.remote_device_id
-                    && std::ptr::eq(slice.device, source_slice.device)
-            });
+            let destination_slice = slices
+                .iter()
+                .find(|slice| slice.device_id() == outgoing.endpoint.remote_device_id);
             let Some(destination_slice) = destination_slice else {
                 continue;
             };
@@ -14526,7 +14527,7 @@ fn register_same_device_direct_cable_copies(
                 continue;
             };
             transport
-                .register_direct_cable_copy(source_slice.device, outgoing, incoming)
+                .register_direct_cable_copy(outgoing, incoming)
                 .map_err(VulkanMountedPlacedResidentStreamTickError::Transport)?;
         }
     }
@@ -14542,7 +14543,7 @@ pub fn run_mounted_placed_resident_stream_tick_slices_in_process(
     VulkanMountedPlacedResidentInProcessStreamTickError,
 > {
     transport.reset_tick_state();
-    register_same_device_direct_cable_copies(slices, transport)?;
+    register_in_process_direct_cable_copies(slices, transport)?;
 
     let mut scheduler_turn_count = 0usize;
     let mut completed_stage_delta = 0usize;
@@ -23481,6 +23482,7 @@ mod tests {
         assert_eq!(incoming_cable.endpoint.remote_pedal_id, "layer_01");
         assert_eq!(incoming_cable.byte_capacity, 2_048);
         assert_eq!(incoming_cable.buffer.byte_capacity(), 2_048);
+        assert!(incoming_cable.buffer.is_persistently_mapped());
         incoming_cable.buffer.write_bytes(&[7, 8, 9, 10]).unwrap();
         assert_eq!(
             incoming_cable.buffer.read_bytes(4).unwrap(),
@@ -23495,6 +23497,7 @@ mod tests {
         assert_eq!(outgoing_cable.endpoint.remote_pedal_id, "layer_03");
         assert_eq!(outgoing_cable.byte_capacity, 2_048);
         assert_eq!(outgoing_cable.buffer.byte_capacity(), 2_048);
+        assert!(outgoing_cable.buffer.is_persistently_mapped());
         assert_eq!(
             mounted
                 .buffers
@@ -24469,9 +24472,9 @@ mod tests {
                 0,
             ),
         ];
-        register_same_device_direct_cable_copies(&slices, &mut transport).unwrap();
+        register_in_process_direct_cable_copies(&slices, &mut transport).unwrap();
         assert_eq!(transport.direct_cable_binding_count(), 2);
-        register_same_device_direct_cable_copies(&slices, &mut transport).unwrap();
+        register_in_process_direct_cable_copies(&slices, &mut transport).unwrap();
         assert_eq!(transport.direct_cable_binding_count(), 2);
         let run = run_mounted_placed_resident_stream_tick_slices_in_process(
             &mut slices,

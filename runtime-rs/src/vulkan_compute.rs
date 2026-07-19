@@ -447,6 +447,30 @@ impl VulkanResidentBuffer {
         self.byte_capacity as usize
     }
 
+    pub fn is_persistently_mapped(&self) -> bool {
+        self.persistent_mapping.is_some()
+    }
+
+    pub fn create_persistently_mapped_copy_to(
+        &self,
+        destination: &VulkanResidentBuffer,
+        len: usize,
+    ) -> Result<VulkanResidentMappedBufferCopy, VulkanError> {
+        self.byte_len(len)?;
+        destination.byte_len(len)?;
+        let source_address = self.persistent_mapping.ok_or_else(|| {
+            VulkanError("resident copy source is not persistently mapped".to_string())
+        })?;
+        let destination_address = destination.persistent_mapping.ok_or_else(|| {
+            VulkanError("resident copy destination is not persistently mapped".to_string())
+        })?;
+        Ok(VulkanResidentMappedBufferCopy {
+            source_address,
+            destination_address,
+            byte_len: len,
+        })
+    }
+
     pub fn write_bytes(&self, input: &[u8]) -> Result<(), VulkanError> {
         self.write_bytes_at(0, input)
     }
@@ -818,6 +842,40 @@ pub struct VulkanResidentBufferCopy {
     command_pool: vk::CommandPool,
     command_buffer: vk::CommandBuffer,
     byte_len: vk::DeviceSize,
+}
+
+pub struct VulkanResidentMappedBufferCopy {
+    source_address: usize,
+    destination_address: usize,
+    byte_len: usize,
+}
+
+impl VulkanResidentMappedBufferCopy {
+    pub fn byte_len(&self) -> usize {
+        self.byte_len
+    }
+
+    pub fn run(&self, len: usize) -> Result<(), VulkanError> {
+        if len == 0 {
+            return Err(VulkanError(
+                "persistently mapped resident copy length must not be zero".to_string(),
+            ));
+        }
+        if len != self.byte_len {
+            return Err(VulkanError(format!(
+                "persistently mapped resident copy binding byte length {} cannot run {} bytes",
+                self.byte_len, len
+            )));
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                self.source_address as *const u8,
+                self.destination_address as *mut u8,
+                len,
+            );
+        }
+        Ok(())
+    }
 }
 
 impl VulkanU32ResidentDispatch {
@@ -3197,6 +3255,22 @@ mod tests {
             .chunks_exact(std::mem::size_of::<u32>())
             .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
             .collect()
+    }
+
+    #[test]
+    fn persistently_mapped_copy_moves_exact_bound_bytes() {
+        let source = [1u8, 2, 3, 4, 5, 6];
+        let mut destination = [0u8; 6];
+        let copy = VulkanResidentMappedBufferCopy {
+            source_address: source.as_ptr() as usize,
+            destination_address: destination.as_mut_ptr() as usize,
+            byte_len: source.len(),
+        };
+
+        copy.run(source.len()).unwrap();
+
+        assert_eq!(destination, source);
+        assert!(copy.run(source.len() - 1).is_err());
     }
 
     #[test]
