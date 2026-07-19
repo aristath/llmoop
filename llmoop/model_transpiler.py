@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
-from llmoop.compilation import check_compile_cancelled
+from llmoop.compilation import check_compile_cancelled, read_json, write_json
 
 
 Json = dict[str, Any]
@@ -2759,11 +2759,3 @@ def add_optional_linear_biases(
 def tensor_ref(name: str) -> dict[str, str]:
     return {"tensor": name}
 
-
-def read_json(path: Path) -> Json:
-    return json.loads(path.read_text())
-
-
-def write_json(path: Path, data: Json) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, indent=2, sort_keys=False) + "\n")

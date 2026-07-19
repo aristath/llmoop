@@ -5,7 +5,8 @@ import unittest
 from pathlib import Path
 
 from llmoop.circuit_ir import load_circuit, validate_circuit
-from llmoop.circuit_lowering import lower_pedalboard, read_json
+from llmoop.circuit_lowering import lower_pedalboard
+from llmoop.compilation import read_json
 from tests.fixtures import compiled_model_or_skip
 
 

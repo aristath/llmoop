@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-import json
 from collections import Counter
 from pathlib import Path
 from typing import Any, Callable
 
 from llmoop.circuit_ir import validate_circuit_against_pedal
-from llmoop.compilation import check_compile_cancelled
+from llmoop.compilation import check_compile_cancelled, read_json, write_json
 
 
 Json = dict[str, Any]
@@ -1308,10 +1307,3 @@ def _norm_attrs(numerics: Json) -> Json:
         "weight_offset": float(numerics["rms_norm_weight_offset"]),
     }
 
-
-def read_json(path: Path) -> Json:
-    return json.loads(path.read_text())
-
-
-def write_json(path: Path, data: Json) -> None:
-    path.write_text(json.dumps(data, indent=2) + "\n")
