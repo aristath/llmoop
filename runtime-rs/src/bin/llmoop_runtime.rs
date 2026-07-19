@@ -52,7 +52,6 @@ struct Args {
     context_size: Option<usize>,
     vulkan_device_index: Option<usize>,
     cycle_ticks: usize,
-    max_scheduler_turns: usize,
     add_special_tokens: bool,
     skip_special_tokens: bool,
     generated_only: bool,
@@ -93,7 +92,6 @@ impl Default for Args {
             context_size: None,
             vulkan_device_index: None,
             cycle_ticks: 4,
-            max_scheduler_turns: 1_024,
             add_special_tokens: true,
             skip_special_tokens: true,
             generated_only: false,
@@ -251,6 +249,7 @@ fn execute_single_device_prompt_run(
     let setup_time_ns = elapsed_nanos_u64(setup_start);
 
     let run_start = Instant::now();
+    let scheduler_turn_budget = token_scheduler_turn_budget(*needed_capacity, args.cycle_ticks);
     let turn = engine.submit_live_text_turn_until_idle(
         VulkanResidentTokenEngineTextInputRequest::new(
             "main",
@@ -259,7 +258,7 @@ fn execute_single_device_prompt_run(
             args.max_new_tokens,
         )
         .with_origin("cli"),
-        VulkanResidentTokenEngineRunBudget::new(args.max_scheduler_turns, 1, args.cycle_ticks),
+        VulkanResidentTokenEngineRunBudget::new(scheduler_turn_budget, 1, args.cycle_ticks),
         *codec,
     )?;
     let run_time_ns = elapsed_nanos_u64(run_start);
@@ -373,14 +372,14 @@ fn run_single_device_chat(
             if !stop_token_ids.is_empty() {
                 event = event.with_stop_tokens(stop_token_ids.clone());
             }
+            let scheduler_turn_budget = token_scheduler_turn_budget(
+                token_ids.len().saturating_add(args.max_new_tokens),
+                args.cycle_ticks,
+            );
             let submitted = engine.submit_input_event_until_idle(
                 "main",
                 event,
-                VulkanResidentTokenEngineRunBudget::new(
-                    args.max_scheduler_turns,
-                    1,
-                    args.cycle_ticks,
-                ),
+                VulkanResidentTokenEngineRunBudget::new(scheduler_turn_budget, 1, args.cycle_ticks),
             )?;
             Ok(RuntimeChatTurn {
                 generated_token_ids: submitted.generated_token_ids,
@@ -900,6 +899,10 @@ fn run_placed_chat(
     )?;
     let mut engine = VulkanResidentInProcessPlacedPromptEngine::new();
     let stream_snapshot = engine.add_stream("main", stream)?;
+    let scheduler_turns_per_tick = placed_scheduler_turn_budget(
+        stream_snapshot.hosted_pedal_count,
+        stream_snapshot.device_ids.len(),
+    );
     println!(
         "llmoop chat ready: placed_in_process, devices={:?}, context_size={}, setup_ms={:.3}",
         stream_snapshot.device_ids,
@@ -925,7 +928,7 @@ fn run_placed_chat(
                 token_ids,
                 args.max_new_tokens,
                 &stop_token_ids,
-                args.max_scheduler_turns,
+                scheduler_turns_per_tick,
                 |token_id| {
                     if output_error.is_some() {
                         return;
@@ -991,6 +994,10 @@ fn execute_placed_prompt_run(
     )?;
     let mut engine = VulkanResidentInProcessPlacedPromptEngine::new();
     let stream_snapshot = engine.add_stream("main", stream)?;
+    let scheduler_turns_per_tick = placed_scheduler_turn_budget(
+        stream_snapshot.hosted_pedal_count,
+        stream_snapshot.device_ids.len(),
+    );
     let setup_time_ns = elapsed_nanos_u64(setup_start);
     let run_start = Instant::now();
     let input_event =
@@ -1002,7 +1009,7 @@ fn execute_placed_prompt_run(
             input_event,
         )],
         1,
-        args.max_scheduler_turns,
+        scheduler_turns_per_tick,
     )?;
     let run_time_ns = elapsed_nanos_u64(run_start);
     let run = batch_run
@@ -1069,7 +1076,7 @@ fn execute_placed_prompt_run(
         stop_reason: run.stop_reason.clone(),
         tick_count,
         scheduler_turns: total_scheduler_turns,
-        max_scheduler_turns_per_tick: args.max_scheduler_turns,
+        max_scheduler_turns_per_tick: scheduler_turns_per_tick,
         completed_stage_deltas,
         transport: RuntimePlacedTransportReport {
             published_packet_count: transport_published_packet_count,
@@ -2313,6 +2320,17 @@ fn runtime_report_default_vulkan_physical_device_index(args: &Args) -> Option<us
         .or_else(|| runtime_default_vulkan_physical_device_index().ok())
 }
 
+fn token_scheduler_turn_budget(token_activations: usize, ticks_per_runtime: usize) -> usize {
+    token_activations
+        .div_ceil(ticks_per_runtime.max(1))
+        .saturating_add(1)
+        .max(1)
+}
+
+fn placed_scheduler_turn_budget(hosted_pedal_count: usize, device_count: usize) -> usize {
+    hosted_pedal_count.saturating_add(device_count).max(1)
+}
+
 fn elapsed_nanos_u64(start: Instant) -> u64 {
     u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
@@ -2515,9 +2533,6 @@ fn parse_args() -> Result<Args, String> {
             "--cycle-ticks" => {
                 parsed.cycle_ticks = parse_next(&mut raw, "--cycle-ticks")?;
             }
-            "--max-scheduler-turns" => {
-                parsed.max_scheduler_turns = parse_next(&mut raw, "--max-scheduler-turns")?;
-            }
             "--no-special-tokens" => {
                 parsed.add_special_tokens = false;
             }
@@ -2582,9 +2597,6 @@ fn parse_args() -> Result<Args, String> {
     }
     if parsed.cycle_ticks == 0 {
         return Err("--cycle-ticks must be at least 1".to_string());
-    }
-    if parsed.max_scheduler_turns == 0 {
-        return Err("--max-scheduler-turns must be at least 1".to_string());
     }
     if parsed.profile_runs == 0 {
         return Err("--profile-runs must be at least 1".to_string());
@@ -2907,7 +2919,6 @@ Options:
   --context-size <N>         Runtime transient-state window. Default: auto, up to the model maximum.
   --vulkan-device-index <N>  Use Vulkan physical device index N as the default local target.
   --cycle-ticks <N>          Max runtime ticks per always-on cycle. Default: 4
-  --max-scheduler-turns <N>  Max engine scheduler turns before stopping. Default: 1024
   --no-special-tokens        Do not add tokenizer special tokens to input text.
   --keep-special-tokens      Keep tokenizer special tokens in decoded output text.
   --generated-only           Print only newly generated text instead of prompt + generated text.
@@ -2934,6 +2945,7 @@ mod tests {
         RuntimeChatFormatter, RuntimeChatMessage, assistant_content_token_ids,
         incremental_chat_token_delta, model_owned_assistant_turn_stop_token_id,
         normalize_chat_template_for_runtime, parse_vulkan_device_uuid_ref,
+        placed_scheduler_turn_budget, token_scheduler_turn_budget,
     };
 
     fn formatter(template_source: &str) -> RuntimeChatFormatter {
@@ -2945,6 +2957,13 @@ mod tests {
                 .with_ymd_and_hms(2026, 7, 18, 12, 0, 0)
                 .unwrap(),
         }
+    }
+
+    #[test]
+    fn scheduler_budgets_scale_with_work_instead_of_capping_generation() {
+        assert_eq!(token_scheduler_turn_budget(65_536, 4), 16_385);
+        assert_eq!(token_scheduler_turn_budget(0, 4), 1);
+        assert_eq!(placed_scheduler_turn_budget(40, 3), 43);
     }
 
     #[test]
