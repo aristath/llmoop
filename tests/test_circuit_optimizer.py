@@ -6,6 +6,106 @@ from llmoop.circuit_optimizer import optimize_circuit_for_vulkan
 
 
 class VulkanCircuitOptimizerTest(unittest.TestCase):
+    def test_fuses_parallel_head_norm_rope_branches_across_independent_nodes(
+        self,
+    ) -> None:
+        circuit = {
+            "nodes": [
+                {
+                    "id": "first_norm",
+                    "op": "rms_norm_per_head",
+                    "inputs": ["first_projected"],
+                    "outputs": ["first_normed"],
+                    "params": ["first_weight"],
+                    "attrs": {"head_count": 8},
+                },
+                {
+                    "id": "second_norm",
+                    "op": "rms_norm_per_head",
+                    "inputs": ["second_projected"],
+                    "outputs": ["second_normed"],
+                    "params": ["second_weight"],
+                    "attrs": {"head_count": 2},
+                },
+                {
+                    "id": "first_rope",
+                    "op": "rotary_position_embedding",
+                    "inputs": ["first_normed"],
+                    "outputs": ["first_positioned"],
+                    "attrs": {"head_count": 8},
+                },
+                {
+                    "id": "second_rope",
+                    "op": "rotary_position_embedding",
+                    "inputs": ["second_normed"],
+                    "outputs": ["second_positioned"],
+                    "attrs": {"head_count": 2},
+                },
+            ]
+        }
+
+        optimized = optimize_circuit_for_vulkan(
+            circuit,
+            can_fuse_parallel_head_norm_rope=lambda branches: len(branches) == 2,
+        )
+
+        self.assertEqual(1, len(optimized["nodes"]))
+        fused = optimized["nodes"][0]
+        self.assertEqual("parallel_head_norm_rope_2way", fused["op"])
+        self.assertEqual(
+            ["first_projected", "second_projected"], fused["inputs"]
+        )
+        self.assertEqual(
+            ["first_positioned", "second_positioned"], fused["outputs"]
+        )
+        self.assertEqual(["first_weight", "second_weight"], fused["params"])
+        self.assertEqual("BF16", fused["attrs"]["intermediate_rounding"])
+
+    def test_does_not_fuse_head_norm_with_multiple_consumers(self) -> None:
+        circuit = {
+            "nodes": [
+                {
+                    "id": "first_norm",
+                    "op": "rms_norm_per_head",
+                    "inputs": ["first_projected"],
+                    "outputs": ["first_normed"],
+                    "params": ["first_weight"],
+                },
+                {
+                    "id": "second_norm",
+                    "op": "rms_norm_per_head",
+                    "inputs": ["second_projected"],
+                    "outputs": ["second_normed"],
+                    "params": ["second_weight"],
+                },
+                {
+                    "id": "extra_consumer",
+                    "op": "silu",
+                    "inputs": ["first_normed"],
+                    "outputs": ["extra"],
+                },
+                {
+                    "id": "first_rope",
+                    "op": "rotary_position_embedding",
+                    "inputs": ["first_normed"],
+                    "outputs": ["first_positioned"],
+                },
+                {
+                    "id": "second_rope",
+                    "op": "rotary_position_embedding",
+                    "inputs": ["second_normed"],
+                    "outputs": ["second_positioned"],
+                },
+            ]
+        }
+
+        optimized = optimize_circuit_for_vulkan(
+            circuit,
+            can_fuse_parallel_head_norm_rope=lambda _branches: True,
+        )
+
+        self.assertEqual(circuit, optimized)
+
     def test_fuses_two_or_three_independent_linears_with_one_input(self) -> None:
         nodes = [
             {

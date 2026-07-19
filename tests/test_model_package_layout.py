@@ -178,6 +178,26 @@ def test_compiler_renders_parallel_linear_shaders(tmp_path: Path) -> None:
     assert "{{" not in triple_source
 
 
+def test_compiler_renders_parallel_head_norm_rope_shader(tmp_path: Path) -> None:
+    shader_source_dir = Path(__file__).parents[1] / "runtime-rs" / "shaders"
+    shader_file = (
+        "parallel_head_norm_rope_2way_bf16_h16_8_d64_r64_"
+        "eps1e-05_offset0_theta1000000_half__sc6.comp"
+    )
+
+    copy_shader_templates(shader_source_dir, tmp_path, {shader_file})
+
+    source = (tmp_path / shader_file).read_text()
+    assert "const uint BRANCH_A_HEADS = 16u;" in source
+    assert "const uint BRANCH_B_HEADS = 8u;" in source
+    assert "const uint HEAD_WIDTH = 64u;" in source
+    assert "const uint ROTARY_WIDTH = 64u;" in source
+    assert "const bool ROPE_INTERLEAVED = false;" in source
+    assert "layout(set = 0, binding = 6) readonly buffer StreamControl" in source
+    assert "shared uint normalized_words" in source
+    assert "{{" not in source
+
+
 def test_parallel_linear_shader_selector_rejects_invalid_metadata_and_layout() -> None:
     node = {
         "id": "qkv",

@@ -260,6 +260,11 @@ def build_vulkan_resident_package_manifest(
             can_fuse_parallel_linears=lambda nodes, circuit=circuit: (
                 can_fuse_bf16_parallel_linears(circuit, nodes, tensor_index)
             ),
+            can_fuse_parallel_head_norm_rope=lambda branches, circuit=circuit: (
+                can_fuse_bf16_parallel_head_norm_rope(
+                    circuit, branches, tensor_index
+                )
+            ),
         )
     pedal_executions = pedal_execution_specs(
         lowered_index=lowered_index,
@@ -717,6 +722,74 @@ def shader_file_for_node(
             f"x{node['attrs']['head_width']}"
             f"_eps{shader_float_token(float(node['attrs']['eps']))}.comp"
         )
+    if op == "parallel_head_norm_rope_2way":
+        branches = node.get("attrs", {}).get("branches", [])
+        if (
+            len(branches) != 2
+            or len(node.get("inputs", [])) != 2
+            or len(node.get("outputs", [])) != 2
+            or len(node.get("params", [])) != 2
+        ):
+            raise ModelCompileError(
+                f"parallel head-norm/rope node {node['id']!r} has invalid branch metadata"
+            )
+        norms = [branch.get("norm", {}) for branch in branches]
+        ropes = [branch.get("rope", {}) for branch in branches]
+        head_counts = [int(norm["head_count"]) for norm in norms]
+        common_fields = {
+            "head_width": {int(norm["head_width"]) for norm in norms}
+            | {int(rope["head_width"]) for rope in ropes},
+            "eps": {float(norm["eps"]) for norm in norms},
+            "weight_offset": {float(norm["weight_offset"]) for norm in norms},
+            "rotary_width": {int(rope["rotary_width"]) for rope in ropes},
+            "theta": {float(rope["theta"]) for rope in ropes},
+            "rope_type": {str(rope.get("rope_type", "default")) for rope in ropes},
+            "interleaved": {bool(rope["interleaved"]) for rope in ropes},
+        }
+        if (
+            any(len(values) != 1 for values in common_fields.values())
+            or any(
+                int(norm["head_count"]) != int(rope["head_count"])
+                for norm, rope in zip(norms, ropes, strict=True)
+            )
+        ):
+            raise ModelCompileError(
+                f"parallel head-norm/rope node {node['id']!r} mixes incompatible branch geometry"
+            )
+        parameter_dtypes = {
+            parameter_dtype_for_id(circuit, parameter_id, tensor_index)
+            for parameter_id in node["params"]
+        }
+        parameter_shapes = [
+            parameter_shape_for_id(circuit, parameter_id, tensor_index)
+            for parameter_id in node["params"]
+        ]
+        head_width = common_fields["head_width"].pop()
+        if parameter_dtypes != {"BF16"} or any(
+            list(map(int, shape)) != [head_width] for shape in parameter_shapes
+        ):
+            raise ModelCompileError(
+                f"parallel head-norm/rope node {node['id']!r} has incompatible "
+                f"normalization parameters {parameter_shapes}"
+            )
+        rope_type = common_fields["rope_type"].pop()
+        interleaved = common_fields["interleaved"].pop()
+        rope_layout = (
+            "proportional"
+            if rope_type == "proportional"
+            else "interleaved"
+            if interleaved
+            else "half"
+        )
+        binding = stream_control_binding_for_node(circuit, node)
+        return (
+            f"parallel_head_norm_rope_2way_bf16_h{head_counts[0]}_{head_counts[1]}"
+            f"_d{head_width}_r{common_fields['rotary_width'].pop()}"
+            f"_eps{shader_float_token(common_fields['eps'].pop())}"
+            f"_offset{shader_float_token(common_fields['weight_offset'].pop())}"
+            f"_theta{shader_float_token(common_fields['theta'].pop())}_{rope_layout}"
+            f"__sc{binding}.comp"
+        )
     if op == "per_layer_embedding":
         attrs = node["attrs"]
         token_shape = parameter_shape_for_id(circuit, "token_embedding", tensor_index)
@@ -834,6 +907,11 @@ def shader_file_for_node(
 
 
 def workgroup_count_x_for_node(circuit: Json, node: Json, tensor_index: Json) -> int:
+    if node["op"] == "parallel_head_norm_rope_2way":
+        return sum(
+            int(branch["norm"]["head_count"])
+            for branch in node["attrs"]["branches"]
+        )
     if node["op"] in {"parallel_linear_2way", "parallel_linear_3way"}:
         return sum(
             (int(parameter_shape_for_id(circuit, parameter_id, tensor_index)[0]) + 1)
@@ -1163,6 +1241,22 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
             r"rms_norm_per_head_unscaled_bf16_(\d+)x(\d+)_eps([0-9eE+.-]+)\.comp",
             "rms_norm_per_head_unscaled_bf16.comp.template",
             ("HEAD_COUNT", "HEAD_WIDTH", "NORM_EPS"),
+        ),
+        (
+            r"parallel_head_norm_rope_2way_bf16_h(\d+)_(\d+)_d(\d+)_r(\d+)"
+            r"_eps([0-9eE+.-]+)_offset([0-9eE+.-]+)_theta([0-9eE+.-]+)"
+            r"_(half|interleaved|proportional)\.comp",
+            "parallel_head_norm_rope_2way_bf16.comp.template",
+            (
+                "BRANCH_A_HEADS",
+                "BRANCH_B_HEADS",
+                "HEAD_WIDTH",
+                "ROTARY_WIDTH",
+                "NORM_EPS",
+                "WEIGHT_OFFSET",
+                "ROPE_THETA",
+                "ROPE_LAYOUT",
+            ),
         ),
         (
             r"rotary_bf16_(\d+)x(\d+)_r(\d+)_theta([0-9eE+.-]+)_(half|interleaved|proportional)\.comp",
@@ -1997,6 +2091,66 @@ def can_fuse_bf16_parallel_linears(
         )
         and len(layouts) == 1
         and layouts <= {ROW_MAJOR_LAYOUT, VULKAN_BF16_ROW_PAIR_LAYOUT}
+    )
+
+
+def can_fuse_bf16_parallel_head_norm_rope(
+    circuit: Json,
+    branches: list[tuple[Json, Json]],
+    tensor_index: Json,
+) -> bool:
+    if len(branches) != 2:
+        return False
+    norms = [norm for norm, _rope in branches]
+    ropes = [rope for _norm, rope in branches]
+    try:
+        head_counts = [int(norm["attrs"]["head_count"]) for norm in norms]
+        head_widths = {
+            int(node["attrs"]["head_width"])
+            for branch in branches
+            for node in branch
+        }
+        rotary_widths = {int(rope["attrs"]["rotary_width"]) for rope in ropes}
+        common_values = (
+            {float(norm["attrs"]["eps"]) for norm in norms},
+            {float(norm["attrs"]["weight_offset"]) for norm in norms},
+            {float(rope["attrs"]["theta"]) for rope in ropes},
+            {str(rope["attrs"].get("rope_type", "default")) for rope in ropes},
+            {bool(rope["attrs"]["interleaved"]) for rope in ropes},
+            {str(rope["attrs"]["position_source"]) for rope in ropes},
+        )
+        parameter_shapes = [
+            parameter_shape_for_node(circuit, norm, tensor_index) for norm in norms
+        ]
+    except (KeyError, TypeError, ValueError):
+        return False
+    if len(head_widths) != 1 or len(rotary_widths) != 1:
+        return False
+    head_width = next(iter(head_widths))
+    rotary_width = next(iter(rotary_widths))
+    return (
+        all(count > 0 for count in head_counts)
+        and head_width > 0
+        and head_width % 2 == 0
+        and rotary_width > 0
+        and rotary_width % 2 == 0
+        and rotary_width <= head_width
+        and all(len(values) == 1 for values in common_values)
+        and common_values[-1] == {"stream_tick"}
+        and all(
+            int(norm["attrs"]["head_count"])
+            == int(rope["attrs"]["head_count"])
+            for norm, rope in branches
+        )
+        and all(shape == [head_width] for shape in parameter_shapes)
+        and all(
+            parameter_dtype_for_node(circuit, norm, tensor_index) == "BF16"
+            for norm in norms
+        )
+        and all(
+            parameter_layout_for_node(circuit, norm, tensor_index) == ROW_MAJOR_LAYOUT
+            for norm in norms
+        )
     )
 
 

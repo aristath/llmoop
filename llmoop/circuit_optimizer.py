@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections import Counter
+from collections import Counter, defaultdict
 from copy import deepcopy
 from collections.abc import Callable
 from typing import Any
@@ -14,10 +14,15 @@ def optimize_circuit_for_vulkan(
     *,
     can_fuse_linear_split: Callable[[Json], bool] | None = None,
     can_fuse_parallel_linears: Callable[[list[Json]], bool] | None = None,
+    can_fuse_parallel_head_norm_rope: (
+        Callable[[list[tuple[Json, Json]]], bool] | None
+    ) = None,
 ) -> Json:
     """Compile discoverable node regions without changing the pedal boundary."""
     optimized = deepcopy(circuit)
-    nodes = optimized["nodes"]
+    nodes = _fuse_parallel_head_norm_rope_regions(
+        optimized["nodes"], can_fuse_parallel_head_norm_rope
+    )
     consumer_counts = Counter(
         signal
         for node in nodes
@@ -61,6 +66,118 @@ def optimize_circuit_for_vulkan(
 
     optimized["nodes"] = compiled_nodes
     return optimized
+
+
+def _fuse_parallel_head_norm_rope_regions(
+    nodes: list[Json],
+    can_fuse: Callable[[list[tuple[Json, Json]]], bool] | None,
+) -> list[Json]:
+    if can_fuse is None:
+        return nodes
+
+    consumers: dict[str, list[tuple[int, Json]]] = defaultdict(list)
+    for index, node in enumerate(nodes):
+        for signal in node.get("inputs", []):
+            consumers[signal].append((index, node))
+
+    skipped: set[int] = set()
+    compiled: list[Json] = []
+    for index, node in enumerate(nodes):
+        if index in skipped:
+            continue
+        following_index = index + 1
+        if following_index >= len(nodes) or following_index in skipped:
+            compiled.append(deepcopy(node))
+            continue
+
+        first = _head_norm_rope_branch(nodes, index, consumers)
+        second = _head_norm_rope_branch(nodes, following_index, consumers)
+        branches = [first, second] if first is not None and second is not None else []
+        if (
+            len(branches) != 2
+            or branches[0][1] == branches[1][1]
+            or any(rope_index <= following_index for _, rope_index, _, _ in branches)
+            or branches[1][2].get("inputs") == branches[0][2].get("outputs")
+            or not can_fuse([(norm, rope) for _, _, norm, rope in branches])
+        ):
+            compiled.append(deepcopy(node))
+            continue
+
+        first_norm = branches[0][2]
+        first_rope = branches[0][3]
+        second_norm = branches[1][2]
+        second_rope = branches[1][3]
+        compiled.append(
+            {
+                "id": "__".join(
+                    item["id"]
+                    for item in (first_norm, first_rope, second_norm, second_rope)
+                ),
+                "op": "parallel_head_norm_rope_2way",
+                "inputs": [first_norm["inputs"][0], second_norm["inputs"][0]],
+                "outputs": [first_rope["outputs"][0], second_rope["outputs"][0]],
+                "params": [first_norm["params"][0], second_norm["params"][0]],
+                "attrs": {
+                    "compiled_from": [
+                        item["id"]
+                        for item in (first_norm, first_rope, second_norm, second_rope)
+                    ],
+                    "branches": [
+                        {
+                            "norm": deepcopy(first_norm.get("attrs", {})),
+                            "rope": deepcopy(first_rope.get("attrs", {})),
+                        },
+                        {
+                            "norm": deepcopy(second_norm.get("attrs", {})),
+                            "rope": deepcopy(second_rope.get("attrs", {})),
+                        },
+                    ],
+                    "intermediate_rounding": "BF16",
+                },
+            }
+        )
+        skipped.update(
+            {
+                following_index,
+                branches[0][1],
+                branches[1][1],
+            }
+        )
+
+    return compiled
+
+
+def _head_norm_rope_branch(
+    nodes: list[Json],
+    norm_index: int,
+    consumers: dict[str, list[tuple[int, Json]]],
+) -> tuple[int, int, Json, Json] | None:
+    norm = nodes[norm_index]
+    if (
+        norm.get("op") != "rms_norm_per_head"
+        or len(norm.get("inputs", [])) != 1
+        or len(norm.get("outputs", [])) != 1
+        or len(norm.get("params", [])) != 1
+        or norm.get("state_reads")
+        or norm.get("state_writes")
+    ):
+        return None
+    norm_output = norm["outputs"][0]
+    output_consumers = consumers.get(norm_output, [])
+    if len(output_consumers) != 1:
+        return None
+    rope_index, rope = output_consumers[0]
+    if (
+        rope_index <= norm_index
+        or rope.get("op") != "rotary_position_embedding"
+        or rope.get("inputs") != [norm_output]
+        or len(rope.get("outputs", [])) != 1
+        or rope.get("params")
+        or rope.get("state_reads")
+        or rope.get("state_writes")
+    ):
+        return None
+    return norm_index, rope_index, norm, rope
 
 
 def _fuse_parallel_linears(

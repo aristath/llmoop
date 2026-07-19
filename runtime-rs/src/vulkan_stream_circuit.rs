@@ -11957,6 +11957,7 @@ impl VulkanKernelStreamMetadata {
             uses_stream_tick: matches!(
                 op,
                 "rotary_position_embedding"
+                    | "parallel_head_norm_rope_2way"
                     | "append_state_update"
                     | "scaled_dot_product_attention"
                     | "per_layer_embedding"
@@ -25989,6 +25990,14 @@ mod tests {
     #[test]
     fn recurrent_gate_kernel_receives_stream_control_metadata() {
         let metadata = VulkanKernelStreamMetadata::for_op("rg_lru_step");
+
+        assert!(metadata.uses_stream_tick);
+        assert!(metadata.push_constants().is_empty());
+    }
+
+    #[test]
+    fn fused_head_norm_rope_kernel_receives_stream_control_metadata() {
+        let metadata = VulkanKernelStreamMetadata::for_op("parallel_head_norm_rope_2way");
 
         assert!(metadata.uses_stream_tick);
         assert!(metadata.push_constants().is_empty());

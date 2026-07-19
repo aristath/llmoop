@@ -982,6 +982,19 @@ fn infer_node_output_shapes(
             outputs,
         )),
         "sigmoid_scalar_multiply" => Ok(repeat_shape(first_input_shape(node, signals), outputs)),
+        "parallel_head_norm_rope_2way" => {
+            if node.inputs.len() != 2 || node.outputs.len() != 2 || node.params.len() != 2 {
+                return Err(CircuitPlanError(format!(
+                    "{} node {} requires two head-norm/rope inputs, outputs, and parameters",
+                    pedal_id, node.id
+                )));
+            }
+            Ok(node
+                .inputs
+                .iter()
+                .map(|input| signals.get(input).and_then(|signal| signal.shape.clone()))
+                .collect())
+        }
         "parallel_linear_2way" | "parallel_linear_3way" => {
             infer_parallel_linear_output_shapes(pedal_id, node, signals, params, tensor_index)
         }
