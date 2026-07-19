@@ -3,7 +3,7 @@ use std::io;
 use std::path::PathBuf;
 
 use llmoop_runtime::{
-    VulkanComputeDevice, VulkanResidentGreedyModelPackage, VulkanResidentTokenEngine,
+    VulkanComputeDevice, VulkanResidentModelPackage, VulkanResidentTokenEngine,
     VulkanResidentTokenEngineRunBudget, VulkanResidentTokenEngineRunStopCondition,
     VulkanResidentTokenEngineSubmittedInputRun, VulkanResidentTokenRuntimeCycleRun,
     VulkanResidentTokenRuntimeCycleStopCondition,
@@ -61,7 +61,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         )
     })?;
     let device = VulkanComputeDevice::new()?;
-    let model = VulkanResidentGreedyModelPackage::from_manifest_file_with_capacity(
+    let model = VulkanResidentModelPackage::from_manifest_file_with_capacity(
         &device,
         package_manifest,
         Some(args.context_size),

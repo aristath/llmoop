@@ -12,7 +12,7 @@ from uuid import uuid4
 
 Json = dict[str, Any]
 
-PACKAGE_SCHEMA = "llmoop.vulkan_resident_greedy_model_package.v1"
+PACKAGE_SCHEMA = "llmoop.vulkan_resident_model_package.v1"
 
 
 class ModelCompileError(RuntimeError):

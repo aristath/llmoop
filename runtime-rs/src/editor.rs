@@ -10,10 +10,10 @@ use crate::{
     CircuitPlacementError, PedalPlacement, ResolvedLoweredPedalboard, RuntimeAvailableDevice,
     RuntimeAvailableMemoryHeap, StreamCircuitPedalInstance, StreamCircuitPedalInstanceStatePolicy,
     StreamCircuitPlacementPlan, StreamCircuitRuntimePatch, VulkanComputeDevice,
-    VulkanResidentGreedyModelPackageManifest,
+    VulkanResidentModelPackageManifest,
 };
 
-pub const RUNTIME_PACKAGE_MANIFEST_FILE: &str = "vulkan_resident_greedy_package.json";
+pub const RUNTIME_PACKAGE_MANIFEST_FILE: &str = "vulkan_resident_package.json";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuntimeEditorError(pub String);
@@ -165,7 +165,7 @@ pub struct RuntimeEditorValidation {
 pub struct RuntimeModelEditor {
     package_manifest_path: PathBuf,
     package_root: PathBuf,
-    manifest: VulkanResidentGreedyModelPackageManifest,
+    manifest: VulkanResidentModelPackageManifest,
     source_graph: ResolvedLoweredPedalboard,
     source_pedals: Vec<RuntimeEditorSourcePedal>,
     source_by_layer: BTreeMap<usize, String>,
@@ -204,7 +204,7 @@ impl RuntimeModelEditor {
             .parent()
             .map(Path::to_path_buf)
             .unwrap_or_else(|| PathBuf::from("."));
-        let manifest = VulkanResidentGreedyModelPackageManifest::from_json_file(&manifest_path)?;
+        let manifest = VulkanResidentModelPackageManifest::from_json_file(&manifest_path)?;
         let source_graph = manifest
             .resolved_source_graph(package_root.clone())
             .map_err(|error| RuntimeEditorError(error.to_string()))?;
@@ -586,7 +586,7 @@ pub(crate) fn load_runtime_model_editor_without_hardware(
             ));
         }
     };
-    let manifest = VulkanResidentGreedyModelPackageManifest::from_json_file(&manifest_path)?;
+    let manifest = VulkanResidentModelPackageManifest::from_json_file(&manifest_path)?;
     let device_id = manifest.placement.default_device_id.clone();
     RuntimeModelEditor::load_with_available_devices(
         manifest_path,
@@ -615,9 +615,7 @@ pub(crate) fn load_runtime_model_editor_without_hardware(
     )
 }
 
-fn source_pedals(
-    manifest: &VulkanResidentGreedyModelPackageManifest,
-) -> Vec<RuntimeEditorSourcePedal> {
+fn source_pedals(manifest: &VulkanResidentModelPackageManifest) -> Vec<RuntimeEditorSourcePedal> {
     let execution_by_pedal = manifest
         .pedal_executions
         .iter()

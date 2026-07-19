@@ -73,6 +73,7 @@ class ModelStructure:
     num_experts: int | None
     experts_per_token: int | None
     recurrent_mixer: Json | None
+    sampling: Json
     token_ids: Json
     tensors: dict[str, str]
     layers: tuple[LayerStructure, ...]
@@ -461,6 +462,7 @@ def discover_model_structure(
         num_experts=num_experts,
         experts_per_token=experts_per_token,
         recurrent_mixer=recurrent_mixer,
+        sampling=discover_sampling_policy(generation_config or {}),
         token_ids={
             "bos": decoder_config.get("bos_token_id"),
             "eos": (generation_config or {}).get(
@@ -1364,6 +1366,33 @@ def discover_outer_norm_weight_offset(
     )
 
 
+def discover_sampling_policy(generation_config: Json) -> Json:
+    if not bool(generation_config.get("do_sample", False)):
+        return {"method": "greedy"}
+
+    temperature = float(generation_config.get("temperature", 1.0))
+    top_k = int(generation_config.get("top_k", 0))
+    top_p = float(generation_config.get("top_p", 1.0))
+    if not math.isfinite(temperature) or temperature <= 0.0:
+        raise ModelTranspileError(
+            f"sampling temperature must be finite and positive, got {temperature}"
+        )
+    if top_k <= 0:
+        raise ModelTranspileError(
+            "sampled generation requires a positive top_k for the resident Vulkan sampler"
+        )
+    if not math.isfinite(top_p) or not 0.0 < top_p <= 1.0:
+        raise ModelTranspileError(
+            f"sampling top_p must be in (0, 1], got {top_p}"
+        )
+    return {
+        "method": "temperature_top_k_top_p",
+        "temperature": temperature,
+        "top_k": top_k,
+        "top_p": top_p,
+    }
+
+
 def discover_intermediate_size(
     config: Json, tensors: dict[str, Json], layers: tuple[LayerStructure, ...]
 ) -> int:
@@ -1610,6 +1639,7 @@ def make_model_graph(
             "logits_scale": structure.logits_scale,
             "logits_soft_cap": structure.logits_soft_cap,
         },
+        "sampling": structure.sampling,
         "token_ids": structure.token_ids,
         "files": {
             "tensor_index": "tensors.json",

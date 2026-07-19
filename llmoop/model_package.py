@@ -120,19 +120,19 @@ def compile_model_package(
         ),
         cancel_requested=cancel_requested,
     )
-    package_manifest = build_vulkan_resident_greedy_package_manifest(
+    package_manifest = build_vulkan_resident_package_manifest(
         model_graph=model_graph,
         tensor_index=packaged_tensor_index,
         lowered_index=lowered["index"],
         lowered_dir=lowered_dir,
         package_dir=package_dir,
-        package_id=f"{slug}_vulkan_resident_greedy",
+        package_id=f"{slug}_vulkan_resident",
         shader_source_dir=shader_source_dir,
         tokenizer_manifest=tokenizer_manifest,
         event_sink=event_sink,
         cancel_requested=cancel_requested,
     )
-    package_manifest_path = package_dir / "vulkan_resident_greedy_package.json"
+    package_manifest_path = package_dir / "vulkan_resident_package.json"
     write_json(package_manifest_path, package_manifest)
     emit_compile_event(
         event_sink, "PackageValidationStarted", package=str(package_manifest_path)
@@ -152,7 +152,7 @@ def compile_model_package(
     )
 
 
-def build_vulkan_resident_greedy_package_manifest(
+def build_vulkan_resident_package_manifest(
     *,
     model_graph: Json,
     tensor_index: Json,
@@ -182,6 +182,29 @@ def build_vulkan_resident_greedy_package_manifest(
     dtype_bytes = dtype_byte_count(dtype)
     frame_bytes = hidden_size * dtype_bytes
     logits_bytes = vocab_size * dtype_byte_count("F32")
+    sampling = model_graph["sampling"]
+    sampler_method = str(sampling["method"])
+    if sampler_method == "greedy":
+        sampler_id = "greedy_sampler"
+        sampler_local_size_x = 1024
+        sampler_shader_file = f"greedy_sampler_f32_{vocab_size}.comp"
+        sampler_temperature = 1.0
+        sampler_top_k = 1
+        sampler_top_p = 1.0
+    elif sampler_method == "temperature_top_k_top_p":
+        sampler_id = "temperature_top_k_top_p_sampler"
+        sampler_temperature = float(sampling["temperature"])
+        sampler_top_k = int(sampling["top_k"])
+        sampler_top_p = float(sampling["top_p"])
+        sampler_local_size_x = max(1, min(64, 4096 // sampler_top_k))
+        sampler_shader_file = (
+            f"temperature_top_k_top_p_sampler_f32_{vocab_size}"
+            f"_t{shader_float_token(sampler_temperature)}"
+            f"_k{sampler_top_k}_p{shader_float_token(sampler_top_p)}"
+            f"_l{sampler_local_size_x}.comp"
+        )
+    else:
+        raise ModelCompileError(f"unsupported sampling method {sampler_method!r}")
 
     embed_tensor = model_graph["graph"]["input_transducer"]["params"]["weight"][
         "tensor"
@@ -242,11 +265,11 @@ def build_vulkan_resident_greedy_package_manifest(
         shader_source_dir,
         package_dir / "shaders",
         required_shader_files(
-            dimensions,
             pedal_executions,
             embedding_shader_file=embedding_shader_file,
             projection_shader_file=projection_shader_file,
             norm_shader_file=norm_shader_file,
+            sampler_shader_file=sampler_shader_file,
         ),
     )
     compile_shader_artifacts(
@@ -335,14 +358,16 @@ def build_vulkan_resident_greedy_package_manifest(
         },
         "sampler": {
             "spec": {
-                "sampler_id": "greedy_sampler",
+                "sampler_id": sampler_id,
+                "method": sampler_method,
+                "temperature": sampler_temperature,
+                "top_k": sampler_top_k,
+                "top_p": sampler_top_p,
                 "logits_byte_capacity": logits_bytes,
                 "output_byte_capacity": 16,
-                "local_size_x": 1024,
+                "local_size_x": sampler_local_size_x,
             },
-            "shader_path": compiled_shader_path(
-                f"shaders/greedy_sampler_f32_{vocab_size}.comp"
-            ),
+            "shader_path": compiled_shader_path(f"shaders/{sampler_shader_file}"),
         },
         "pedal_executions": pedal_executions,
     }
@@ -780,18 +805,16 @@ def attention_workgroup_shape(head_width: int) -> tuple[int, int]:
 
 
 def required_shader_files(
-    dimensions: Json,
     pedal_executions: list[Json],
     *,
     embedding_shader_file: str,
     projection_shader_file: str,
     norm_shader_file: str,
+    sampler_shader_file: str,
 ) -> set[str]:
-    vocab_size = int(dimensions["vocab_size"])
-
     return {
         norm_shader_file,
-        f"greedy_sampler_f32_{vocab_size}.comp",
+        sampler_shader_file,
         embedding_shader_file,
         projection_shader_file,
         *(
@@ -974,6 +997,11 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
             r"greedy_sampler_f32_(\d+)\.comp",
             "greedy_sampler_f32.comp.template",
             ("VOCAB_SIZE",),
+        ),
+        (
+            r"temperature_top_k_top_p_sampler_f32_(\d+)_t([0-9eE+.-]+)_k(\d+)_p([0-9eE+.-]+)_l(\d+)\.comp",
+            "temperature_top_k_top_p_sampler_f32.comp.template",
+            ("VOCAB_SIZE", "TEMPERATURE", "TOP_K", "TOP_P", "LOCAL_SIZE_X"),
         ),
         (
             r"split_bf16_2x(\d+)\.comp",

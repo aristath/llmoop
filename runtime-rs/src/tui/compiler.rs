@@ -352,12 +352,12 @@ mod tests {
         assert_eq!(event.current_item(), Some("layer_02"));
 
         let completed: CompilerEvent = serde_json::from_str(
-            r#"{"schema":"llmoop.compiler_event.v1","sequence":8,"type":"Completed","package":{"package_manifest":"/tmp/package/vulkan_resident_greedy_package.json"}}"#,
+            r#"{"schema":"llmoop.compiler_event.v1","sequence":8,"type":"Completed","package":{"package_manifest":"/tmp/package/vulkan_resident_package.json"}}"#,
         )
         .unwrap();
         assert_eq!(
             completed.nested_string("package", "package_manifest"),
-            Some("/tmp/package/vulkan_resident_greedy_package.json")
+            Some("/tmp/package/vulkan_resident_package.json")
         );
     }
 

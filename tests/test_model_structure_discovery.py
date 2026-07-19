@@ -10,6 +10,7 @@ from llmoop.model_transpiler import (
     attach_packed_linear_quantization,
     annotate_packed_linear_tensors,
     discover_model_structure,
+    discover_sampling_policy,
     make_layer,
     synthesize_packed_expert_tensors,
 )
@@ -17,6 +18,23 @@ from llmoop.model_transpiler import (
 
 def _tensor(shape: list[int], dtype: str = "BF16") -> dict[str, object]:
     return {"dtype": dtype, "shape": shape}
+
+
+def test_discovers_model_owned_sampling_policy() -> None:
+    assert discover_sampling_policy({}) == {"method": "greedy"}
+    assert discover_sampling_policy(
+        {
+            "do_sample": True,
+            "temperature": 0.6,
+            "top_k": 20,
+            "top_p": 0.95,
+        }
+    ) == {
+        "method": "temperature_top_k_top_p",
+        "temperature": 0.6,
+        "top_k": 20,
+        "top_p": 0.95,
+    }
 
 
 def test_attaches_block_scale_to_fp8_parameter_by_tensor_structure() -> None:

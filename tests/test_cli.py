@@ -47,14 +47,14 @@ class RuntimeCliCommandTest(unittest.TestCase):
     def test_resolve_runtime_package_manifest_accepts_package_dir_or_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as raw_root:
             root = Path(raw_root)
-            manifest = root / "vulkan_resident_greedy_package.json"
+            manifest = root / "vulkan_resident_package.json"
             manifest.write_text("{}", encoding="utf-8")
 
             self.assertEqual(manifest, resolve_runtime_package_manifest(root))
             self.assertEqual(manifest, resolve_runtime_package_manifest(manifest))
 
     def test_build_runtime_command_prefers_explicit_runtime_binary(self) -> None:
-        package = Path("packages/model_x/vulkan_resident_greedy_package.json")
+        package = Path("packages/model_x/vulkan_resident_package.json")
         args = Namespace(
             prompt="Hello",
             inspect_runtime=False,
@@ -97,7 +97,7 @@ class RuntimeCliCommandTest(unittest.TestCase):
         )
 
     def test_build_runtime_command_forwards_chat_mode_without_prompt(self) -> None:
-        package = Path("packages/model_x/vulkan_resident_greedy_package.json")
+        package = Path("packages/model_x/vulkan_resident_package.json")
         args = Namespace(
             prompt=None,
             chat=True,
@@ -136,7 +136,7 @@ class RuntimeCliCommandTest(unittest.TestCase):
         )
 
     def test_build_runtime_command_forwards_profile_flag(self) -> None:
-        package = Path("packages/model_x/vulkan_resident_greedy_package.json")
+        package = Path("packages/model_x/vulkan_resident_package.json")
         args = Namespace(
             prompt="Hello",
             inspect_runtime=False,
@@ -175,7 +175,7 @@ class RuntimeCliCommandTest(unittest.TestCase):
         )
 
     def test_build_runtime_command_forwards_profile_runs(self) -> None:
-        package = Path("packages/model_x/vulkan_resident_greedy_package.json")
+        package = Path("packages/model_x/vulkan_resident_package.json")
         args = Namespace(
             prompt="Hello",
             inspect_runtime=False,
@@ -217,7 +217,7 @@ class RuntimeCliCommandTest(unittest.TestCase):
         )
 
     def test_build_runtime_command_can_inspect_device_slice_without_prompt(self) -> None:
-        package = Path("packages/model_x/vulkan_resident_greedy_package.json")
+        package = Path("packages/model_x/vulkan_resident_package.json")
         args = Namespace(
             prompt=None,
             inspect_runtime=False,
@@ -255,7 +255,7 @@ class RuntimeCliCommandTest(unittest.TestCase):
         )
 
     def test_build_runtime_command_can_inspect_placement_without_prompt(self) -> None:
-        package = Path("packages/model_x/vulkan_resident_greedy_package.json")
+        package = Path("packages/model_x/vulkan_resident_package.json")
         args = Namespace(
             prompt=None,
             inspect_runtime=False,
@@ -292,7 +292,7 @@ class RuntimeCliCommandTest(unittest.TestCase):
         )
 
     def test_build_runtime_command_can_inspect_package_without_prompt(self) -> None:
-        package = Path("packages/model_x/vulkan_resident_greedy_package.json")
+        package = Path("packages/model_x/vulkan_resident_package.json")
         args = Namespace(
             prompt=None,
             inspect_runtime=False,
@@ -329,7 +329,7 @@ class RuntimeCliCommandTest(unittest.TestCase):
         )
 
     def test_build_runtime_command_can_inspect_patch_without_prompt(self) -> None:
-        package = Path("packages/model_x/vulkan_resident_greedy_package.json")
+        package = Path("packages/model_x/vulkan_resident_package.json")
         args = Namespace(
             prompt=None,
             inspect_runtime=False,
@@ -370,7 +370,7 @@ class RuntimeCliCommandTest(unittest.TestCase):
         )
 
     def test_build_runtime_command_preserves_cpu_logical_placement(self) -> None:
-        package = Path("packages/model_x/vulkan_resident_greedy_package.json")
+        package = Path("packages/model_x/vulkan_resident_package.json")
         args = Namespace(
             prompt=None,
             inspect_runtime=False,
@@ -411,7 +411,7 @@ class RuntimeCliCommandTest(unittest.TestCase):
         )
 
     def test_build_runtime_command_can_inspect_runtime_topology_without_prompt(self) -> None:
-        package = Path("packages/model_x/vulkan_resident_greedy_package.json")
+        package = Path("packages/model_x/vulkan_resident_package.json")
         args = Namespace(
             prompt=None,
             inspect_runtime=True,
@@ -456,7 +456,7 @@ class RuntimeCliCommandTest(unittest.TestCase):
         )
 
     def test_build_runtime_command_forwards_runtime_patch_overrides(self) -> None:
-        package = Path("packages/model_x/vulkan_resident_greedy_package.json")
+        package = Path("packages/model_x/vulkan_resident_package.json")
         args = Namespace(
             prompt="Hello",
             inspect_runtime=False,
@@ -740,10 +740,10 @@ class CompiledPackageTest(unittest.TestCase):
 
         self.assertEqual(fixture.package_dir, fixture.package_manifest.parent)
         self.assertNotEqual(fixture.lowered_dir, fixture.package_dir)
-        self.assertFalse((fixture.lowered_dir / "vulkan_resident_greedy_package.json").exists())
+        self.assertFalse((fixture.lowered_dir / "vulkan_resident_package.json").exists())
         self.assertFalse(
             any(
-                artifact.name == "vulkan_resident_greedy_package.json"
+                artifact.name == "vulkan_resident_package.json"
                 for artifact in fixture.lowered_dir.rglob("*.json")
             )
         )

@@ -17,7 +17,7 @@ from llmoop.model_compiler import (
 )
 
 
-RUNTIME_PACKAGE_MANIFEST = "vulkan_resident_greedy_package.json"
+RUNTIME_PACKAGE_MANIFEST = "vulkan_resident_package.json"
 
 
 def main() -> None:

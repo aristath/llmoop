@@ -3315,7 +3315,7 @@ mod tests {
             package_manifest: PathBuf::from("package.json"),
             package_root: PathBuf::from("."),
             package_id: "model-test".to_string(),
-            compiled_schema: "llmoop.vulkan_resident_greedy_model_package.v1".to_string(),
+            compiled_schema: "llmoop.vulkan_resident_model_package.v1".to_string(),
             config_path: "config.json".to_string(),
             tokenizer: serde_json::json!({"path": "tokenizer"}),
             available_devices: vec![RuntimeAvailableDevice {
@@ -3425,7 +3425,7 @@ mod tests {
             ok: true,
             package_manifest: PathBuf::from("package.json"),
             package_root: PathBuf::from("."),
-            schema: "llmoop.vulkan_resident_greedy_model_package.v1".to_string(),
+            schema: "llmoop.vulkan_resident_model_package.v1".to_string(),
             package_id: "model-test".to_string(),
             config_path: "config.json".to_string(),
             tokenizer: serde_json::json!({"path": "tokenizer"}),
