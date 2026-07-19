@@ -193,6 +193,11 @@ def test_discovers_attention_with_values_derived_from_keys() -> None:
     assert layer.value_head_norm
     assert structure.rms_norm_weight_offset == 0.0
     assert "v_projection" not in nodes
+    assert nodes["q_head_norm"]["attrs"]["head_count"] == 8
+    assert nodes["k_head_norm"]["attrs"]["head_count"] == 2
+    assert nodes["v_head_norm"]["attrs"]["head_count"] == 2
+    assert nodes["q_rope"]["attrs"]["head_count"] == 8
+    assert nodes["k_rope"]["attrs"]["head_count"] == 2
     assert nodes["v_head_norm"]["inputs"] == ["k_projected"]
     assert nodes["kv_memory_append"]["inputs"][:2] == ["k_positioned", "v_normed"]
     assert nodes["ffn_residual"]["outputs"] == ["ffn_residual_out"]
@@ -288,6 +293,8 @@ def test_discovers_attention_without_optional_query_key_norms() -> None:
     assert "k_head_norm" not in nodes
     assert nodes["q_rope"]["inputs"] == ["q_projected"]
     assert nodes["k_rope"]["inputs"] == ["k_projected"]
+    assert nodes["q_rope"]["attrs"]["head_count"] == 15
+    assert nodes["k_rope"]["attrs"]["head_count"] == 5
     assert nodes["q_rope"]["attrs"]["theta"] == 100000.0
     assert nodes["operator_norm"]["attrs"]["eps"] == 1e-5
 

@@ -705,19 +705,15 @@ def shader_file_for_node(
     if op == "sigmoid_scalar_multiply":
         return f"sigmoid_scalar_multiply_bf16_{hidden_size}.comp"
     if op == "rms_norm_per_head":
-        heads = (
-            node["attrs"]["query_heads"]
-            if node["id"].startswith("q_")
-            else node["attrs"]["key_value_heads"]
-        )
         return (
-            f"rms_norm_per_head_bf16_{heads}x{node['attrs']['head_width']}"
+            f"rms_norm_per_head_bf16_{node['attrs']['head_count']}x"
+            f"{node['attrs']['head_width']}"
             f"_eps{shader_float_token(float(node['attrs']['eps']))}"
             f"_offset{shader_float_token(float(node['attrs']['weight_offset']))}.comp"
         )
     if op == "rms_norm_per_head_unscaled":
         return (
-            f"rms_norm_per_head_unscaled_bf16_{node['attrs']['key_value_heads']}"
+            f"rms_norm_per_head_unscaled_bf16_{node['attrs']['head_count']}"
             f"x{node['attrs']['head_width']}"
             f"_eps{shader_float_token(float(node['attrs']['eps']))}.comp"
         )
@@ -736,11 +732,6 @@ def shader_file_for_node(
             f"_cs{shader_float_token(float(attrs['combination_scale']))}__sc{binding}.comp"
         )
     if op == "rotary_position_embedding":
-        heads = (
-            node["attrs"]["query_heads"]
-            if node["id"].startswith("q_")
-            else node["attrs"]["key_value_heads"]
-        )
         binding = stream_control_binding_for_node(circuit, node)
         rope_layout = (
             "proportional"
@@ -750,7 +741,8 @@ def shader_file_for_node(
             else "half"
         )
         return (
-            f"rotary_bf16_{heads}x{node['attrs']['head_width']}"
+            f"rotary_bf16_{node['attrs']['head_count']}x"
+            f"{node['attrs']['head_width']}"
             f"_r{node['attrs']['rotary_width']}"
             f"_theta{shader_float_token(float(node['attrs']['theta']))}_{rope_layout}"
             f"__sc{binding}.comp"
@@ -865,11 +857,7 @@ def workgroup_count_x_for_node(circuit: Json, node: Json, tensor_index: Json) ->
         "rms_norm_per_head_unscaled",
         "rotary_position_embedding",
     }:
-        return int(
-            node["attrs"]["query_heads"]
-            if node["id"].startswith("q_")
-            else node["attrs"]["key_value_heads"]
-        )
+        return int(node["attrs"]["head_count"])
     return 1
 
 

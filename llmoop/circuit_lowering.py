@@ -491,7 +491,11 @@ def _attention_nodes(
                 "inputs": ["q_projected"],
                 "outputs": ["q_normed"],
                 "params": ["q_norm"],
-                "attrs": {**_norm_attrs(numerics), **heads},
+                "attrs": {
+                    **_norm_attrs(numerics),
+                    **heads,
+                    "head_count": int(heads["query_heads"]),
+                },
             }
         )
         q_rope_input = "q_normed"
@@ -504,7 +508,11 @@ def _attention_nodes(
                 "inputs": ["k_projected"],
                 "outputs": ["k_normed"],
                 "params": ["k_norm"],
-                "attrs": {**_norm_attrs(numerics), **heads},
+                "attrs": {
+                    **_norm_attrs(numerics),
+                    **heads,
+                    "head_count": int(heads["key_value_heads"]),
+                },
             }
         )
         k_rope_input = "k_normed"
@@ -520,7 +528,11 @@ def _attention_nodes(
                 "op": "rms_norm_per_head_unscaled",
                 "inputs": [value_input],
                 "outputs": ["v_normed"],
-                "attrs": {**_norm_attrs(numerics), **heads},
+                "attrs": {
+                    **_norm_attrs(numerics),
+                    **heads,
+                    "head_count": int(heads["key_value_heads"]),
+                },
             }
         )
         value_input = "v_normed"
@@ -539,7 +551,10 @@ def _attention_nodes(
             "op": "rotary_position_embedding",
             "inputs": [q_rope_input],
             "outputs": ["q_positioned"],
-            "attrs": rope_attrs,
+            "attrs": {
+                **rope_attrs,
+                "head_count": int(heads["query_heads"]),
+            },
         },
         *(
             [
@@ -548,7 +563,10 @@ def _attention_nodes(
                     "op": "rotary_position_embedding",
                     "inputs": [k_rope_input],
                     "outputs": ["k_positioned"],
-                    "attrs": rope_attrs,
+                    "attrs": {
+                        **rope_attrs,
+                        "head_count": int(heads["key_value_heads"]),
+                    },
                 },
                 {
                     "id": "kv_memory_append",
