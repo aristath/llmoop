@@ -2,13 +2,18 @@ from __future__ import annotations
 
 from collections import Counter
 from copy import deepcopy
+from collections.abc import Callable
 from typing import Any
 
 
 Json = dict[str, Any]
 
 
-def optimize_circuit_for_vulkan(circuit: Json) -> Json:
+def optimize_circuit_for_vulkan(
+    circuit: Json,
+    *,
+    can_fuse_linear_split: Callable[[Json], bool] | None = None,
+) -> Json:
     """Compile discoverable node regions without changing the pedal boundary."""
     optimized = deepcopy(circuit)
     nodes = optimized["nodes"]
@@ -24,7 +29,14 @@ def optimize_circuit_for_vulkan(circuit: Json) -> Json:
         current = nodes[index]
         following = nodes[index + 1] if index + 1 < len(nodes) else None
 
-        fused = _fuse_silu_multiply(current, following, consumer_counts)
+        fused = _fuse_linear_split(
+            current,
+            following,
+            consumer_counts,
+            can_fuse_linear_split,
+        )
+        if fused is None:
+            fused = _fuse_silu_multiply(current, following, consumer_counts)
         if fused is None:
             fused = _fuse_linear_residual(current, following, consumer_counts)
         if fused is not None:
@@ -37,6 +49,65 @@ def optimize_circuit_for_vulkan(circuit: Json) -> Json:
 
     optimized["nodes"] = compiled_nodes
     return optimized
+
+
+def _fuse_linear_split(
+    linear: Json,
+    split: Json | None,
+    consumer_counts: Counter[str],
+    can_fuse: Callable[[Json], bool] | None,
+) -> Json | None:
+    if (
+        split is None
+        or can_fuse is None
+        or linear.get("op") != "linear"
+        or split.get("op") != "split"
+        or not can_fuse(linear)
+    ):
+        return None
+    if (
+        len(linear.get("inputs", [])) != 1
+        or len(linear.get("outputs", [])) != 1
+        or len(linear.get("params", [])) != 1
+        or linear.get("state_reads")
+        or linear.get("state_writes")
+    ):
+        return None
+    linear_output = linear["outputs"][0]
+    split_attrs = split.get("attrs", {})
+    split_outputs = split.get("outputs", [])
+    if (
+        split.get("inputs") != [linear_output]
+        or consumer_counts[linear_output] != 1
+        or len(split_outputs) != 3
+        or split_attrs.get("layout") not in {None, "contiguous"}
+        or split.get("params")
+        or split.get("state_reads")
+        or split.get("state_writes")
+    ):
+        return None
+    if split_attrs.get("part_widths") is not None:
+        part_widths = [int(width) for width in split_attrs["part_widths"]]
+    else:
+        part_width = split_attrs.get("part_width")
+        if part_width is None:
+            return None
+        part_widths = [int(part_width)] * 3
+    if len(part_widths) != 3 or any(width <= 0 or width % 2 for width in part_widths):
+        return None
+
+    attrs = deepcopy(split_attrs)
+    attrs["part_widths"] = part_widths
+    attrs["compiled_from"] = [linear["id"], split["id"]]
+    attrs["intermediate_rounding"] = "BF16"
+    return {
+        "id": f"{linear['id']}__{split['id']}",
+        "op": "linear_split_3way",
+        "inputs": deepcopy(linear["inputs"]),
+        "outputs": deepcopy(split_outputs),
+        "params": deepcopy(linear["params"]),
+        "attrs": attrs,
+    }
 
 
 def _fuse_silu_multiply(

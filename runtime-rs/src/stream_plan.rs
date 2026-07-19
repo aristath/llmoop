@@ -987,6 +987,9 @@ fn infer_node_output_shapes(
         "linear" | "linear_residual" => {
             infer_linear_output_shapes(pedal_id, node, signals, params, tensor_index)
         }
+        "linear_split_3way" => {
+            infer_linear_split_output_shapes(pedal_id, node, signals, params, tensor_index)
+        }
         "split" => infer_split_output_shapes(pedal_id, node, signals),
         "rolling_state_update" => {
             let state_shape = node
@@ -1141,6 +1144,55 @@ fn infer_split_output_shapes(
     }
     *channel_dim /= node.outputs.len();
     Ok(repeat_shape(Some(input_shape), node.outputs.len()))
+}
+
+fn infer_linear_split_output_shapes(
+    pedal_id: &str,
+    node: &CircuitNode,
+    signals: &BTreeMap<String, PlannedSignal>,
+    params: &BTreeMap<String, ParameterRef>,
+    tensor_index: Option<&TensorIndex>,
+) -> Result<Vec<Option<Vec<usize>>>, CircuitPlanError> {
+    let combined_shapes =
+        infer_linear_output_shapes(pedal_id, node, signals, params, tensor_index)?;
+    let Some(Some(combined_shape)) = combined_shapes.first() else {
+        return Ok(vec![None; node.outputs.len()]);
+    };
+    let Some(combined_width) = combined_shape.last().copied() else {
+        return Ok(vec![None; node.outputs.len()]);
+    };
+    let part_widths = node
+        .attrs
+        .get("part_widths")
+        .and_then(|value| value.as_array())
+        .and_then(|widths| {
+            widths
+                .iter()
+                .map(|value| value.as_u64().and_then(|width| usize::try_from(width).ok()))
+                .collect::<Option<Vec<_>>>()
+        })
+        .ok_or_else(|| {
+            CircuitPlanError(format!(
+                "{} node {} requires integer linear-split part widths",
+                pedal_id, node.id
+            ))
+        })?;
+    if part_widths.len() != node.outputs.len()
+        || part_widths.iter().sum::<usize>() != combined_width
+    {
+        return Err(CircuitPlanError(format!(
+            "{} node {} cannot split linear output shape {:?} into widths {:?}",
+            pedal_id, node.id, combined_shape, part_widths
+        )));
+    }
+    Ok(part_widths
+        .into_iter()
+        .map(|width| {
+            let mut shape = combined_shape.clone();
+            *shape.last_mut().unwrap() = width;
+            Some(shape)
+        })
+        .collect())
 }
 
 fn compatible_input_shape(

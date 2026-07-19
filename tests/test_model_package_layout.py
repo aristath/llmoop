@@ -135,6 +135,25 @@ def test_compiler_renders_paired_matrix_and_transducer_shaders(tmp_path: Path) -
     )
 
 
+def test_compiler_renders_direct_three_way_linear_split_shaders(tmp_path: Path) -> None:
+    shader_source_dir = Path(__file__).parents[1] / "runtime-rs" / "shaders"
+    paired = "linear_split_3way_paired_bf16_1024x1024_1024_1024.comp"
+    row_major = "linear_split_3way_row_major_bf16_768x2048_1024_1024.comp"
+
+    copy_shader_templates(shader_source_dir, tmp_path, {paired, row_major})
+
+    paired_source = (tmp_path / paired).read_text()
+    row_major_source = (tmp_path / row_major).read_text()
+    assert "const uint INPUT_SIZE = 1024u;" in paired_source
+    assert "const uint PART_A_WIDTH = 1024u;" in paired_source
+    assert "const bool PAIRED_WEIGHT_LAYOUT = true;" in paired_source
+    assert "const bool PAIRED_WEIGHT_LAYOUT = false;" in row_major_source
+    assert "binding = 4) readonly buffer Weight" in paired_source
+    assert "output_c.words" in paired_source
+    assert "{{" not in paired_source
+    assert "{{" not in row_major_source
+
+
 def test_compiler_renders_native_block_scaled_fp8_linear_shaders(
     tmp_path: Path,
 ) -> None:

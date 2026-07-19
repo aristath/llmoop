@@ -249,12 +249,15 @@ def build_vulkan_resident_package_manifest(
     )
     norm_shader_file = rms_norm_shader_file(hidden_size, norm_eps, norm_weight_offset)
 
-    compiled_circuits = {
-        circuit_ref["id"]: optimize_circuit_for_vulkan(
-            read_json(lowered_dir / circuit_ref["circuit"])
+    compiled_circuits = {}
+    for circuit_ref in lowered_index["graph"]["circuits"]:
+        circuit = read_json(lowered_dir / circuit_ref["circuit"])
+        compiled_circuits[circuit_ref["id"]] = optimize_circuit_for_vulkan(
+            circuit,
+            can_fuse_linear_split=lambda node, circuit=circuit: (
+                can_fuse_bf16_linear_split(circuit, node, tensor_index)
+            ),
         )
-        for circuit_ref in lowered_index["graph"]["circuits"]
-    }
     pedal_executions = pedal_execution_specs(
         lowered_index=lowered_index,
         compiled_circuits=compiled_circuits,
@@ -524,6 +527,32 @@ def shader_file_for_node(
             prefix += "_paired"
         prefix += "_bf16"
         return f"{prefix}_{in_features}x{out_features}.comp"
+    if op == "linear_split_3way":
+        parameter_shape = parameter_shape_for_node(circuit, node, tensor_index)
+        out_features, in_features = map(int, parameter_shape)
+        if parameter_dtype_for_node(circuit, node, tensor_index) != "BF16":
+            raise ModelCompileError(
+                f"linear-split node {node['id']!r} requires BF16 weights"
+            )
+        part_widths = [int(width) for width in node["attrs"]["part_widths"]]
+        if (
+            len(part_widths) != 3
+            or any(width <= 0 or width % 2 for width in part_widths)
+            or sum(part_widths) != out_features
+        ):
+            raise ModelCompileError(
+                f"linear-split node {node['id']!r} cannot partition {out_features} "
+                f"outputs into {part_widths}"
+            )
+        layout = parameter_layout_for_node(circuit, node, tensor_index)
+        layout_token = (
+            "paired" if layout == VULKAN_BF16_ROW_PAIR_LAYOUT else "row_major"
+        )
+        return (
+            f"linear_split_3way_{layout_token}_bf16_{in_features}x"
+            + "_".join(map(str, part_widths))
+            + ".comp"
+        )
     if op == "linear_residual":
         parameter_shape = parameter_shape_for_node(circuit, node, tensor_index)
         out_features, in_features = parameter_shape
@@ -759,7 +788,7 @@ def shader_file_for_node(
 
 
 def workgroup_count_x_for_node(circuit: Json, node: Json, tensor_index: Json) -> int:
-    if node["op"] in {"linear", "linear_residual"}:
+    if node["op"] in {"linear", "linear_residual", "linear_split_3way"}:
         out_features, _ = parameter_shape_for_node(circuit, node, tensor_index)
         # One workgroup collaboratively computes and packs two BF16 output rows.
         return (int(out_features) + 1) // 2
@@ -929,6 +958,17 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
             ("INPUT_SIZE", "OUTPUT_SIZE"),
         ),
         (
+            r"linear_split_3way_(paired|row_major)_bf16_(\d+)x(\d+)_(\d+)_(\d+)\.comp",
+            "linear_split_3way_bf16.comp.template",
+            (
+                "WEIGHT_LAYOUT",
+                "INPUT_SIZE",
+                "PART_A_WIDTH",
+                "PART_B_WIDTH",
+                "PART_C_WIDTH",
+            ),
+        ),
+        (
             r"linear_bias_bf16_(\d+)x(\d+)\.comp",
             "linear_bias_bf16.comp.template",
             ("INPUT_SIZE", "OUTPUT_SIZE"),
@@ -1073,6 +1113,11 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
                 )
                 replacements["ROPE_PROPORTIONAL"] = (
                     "true" if rope_layout == "proportional" else "false"
+                )
+            if "WEIGHT_LAYOUT" in replacements:
+                weight_layout = replacements.pop("WEIGHT_LAYOUT")
+                replacements["PAIRED_WEIGHT_LAYOUT"] = (
+                    "true" if weight_layout == "paired" else "false"
                 )
             return render_shader_template(source_dir, template, replacements)
 
@@ -1774,6 +1819,17 @@ def parameter_shape_for_node(
     parameter_id = node["params"][0]
     parameter = circuit["parameters"]["refs"][parameter_id]
     return tensor_shape(tensor_index, parameter["tensor"])
+
+
+def can_fuse_bf16_linear_split(circuit: Json, node: Json, tensor_index: Json) -> bool:
+    shape = parameter_shape_for_node(circuit, node, tensor_index)
+    return (
+        len(shape) == 2
+        and all(int(dimension) > 0 and int(dimension) % 2 == 0 for dimension in shape)
+        and parameter_dtype_for_node(circuit, node, tensor_index) == "BF16"
+        and parameter_layout_for_node(circuit, node, tensor_index)
+        in {ROW_MAJOR_LAYOUT, VULKAN_BF16_ROW_PAIR_LAYOUT}
+    )
 
 
 def parameter_shape_for_id(

@@ -6,6 +6,66 @@ from llmoop.circuit_optimizer import optimize_circuit_for_vulkan
 
 
 class VulkanCircuitOptimizerTest(unittest.TestCase):
+    def test_fuses_compatible_linear_into_contiguous_three_way_split(self) -> None:
+        circuit = {
+            "nodes": [
+                {
+                    "id": "projection",
+                    "op": "linear",
+                    "inputs": ["hidden"],
+                    "outputs": ["projected"],
+                    "params": ["weight"],
+                },
+                {
+                    "id": "partition",
+                    "op": "split",
+                    "inputs": ["projected"],
+                    "outputs": ["a", "b", "c"],
+                    "attrs": {"part_width": 16},
+                },
+            ]
+        }
+
+        optimized = optimize_circuit_for_vulkan(
+            circuit,
+            can_fuse_linear_split=lambda node: node["params"] == ["weight"],
+        )
+
+        self.assertEqual(1, len(optimized["nodes"]))
+        fused = optimized["nodes"][0]
+        self.assertEqual("linear_split_3way", fused["op"])
+        self.assertEqual(["hidden"], fused["inputs"])
+        self.assertEqual(["a", "b", "c"], fused["outputs"])
+        self.assertEqual([16, 16, 16], fused["attrs"]["part_widths"])
+        self.assertEqual(["projection", "partition"], fused["attrs"]["compiled_from"])
+
+    def test_keeps_linear_split_when_backend_layout_is_not_fusible(self) -> None:
+        circuit = {
+            "nodes": [
+                {
+                    "id": "projection",
+                    "op": "linear",
+                    "inputs": ["hidden"],
+                    "outputs": ["projected"],
+                    "params": ["weight"],
+                },
+                {
+                    "id": "partition",
+                    "op": "split",
+                    "inputs": ["projected"],
+                    "outputs": ["a", "b", "c"],
+                    "attrs": {"part_width": 16},
+                },
+            ]
+        }
+
+        optimized = optimize_circuit_for_vulkan(
+            circuit,
+            can_fuse_linear_split=lambda _node: False,
+        )
+
+        self.assertEqual(circuit, optimized)
+
     def test_fuses_discovered_regions_without_layer_or_node_names(self) -> None:
         circuit = {
             "nodes": [
