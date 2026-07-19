@@ -50,7 +50,6 @@ def compile_model(
     transpiled_dir: Path | None = None,
     lowered_dir: Path | None = None,
     package_dir: Path | None = None,
-    clean: bool = True,
     shader_source_dir: Path = Path("runtime-rs/shaders"),
     event_sink: CompileEventSink | None = None,
     cancel_requested: CancelCheck | None = None,
@@ -81,7 +80,6 @@ def compile_model(
                 transpiled_dir=staged_transpiled,
                 lowered_dir=staged_lowered,
                 package_dir=staged_package,
-                clean=True,
                 shader_source_dir=shader_source_dir,
                 event_sink=event_sink,
                 cancel_requested=cancel_requested,
@@ -215,4 +213,3 @@ def publish_staged_directories(
 
 def sanitize_slug(raw: str) -> str:
     return re.sub(r"[^a-zA-Z0-9]+", "_", raw).strip("_").lower()
-

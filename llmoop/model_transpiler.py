@@ -234,7 +234,6 @@ def transpile_model(
     model_dir: Path,
     output_dir: Path,
     *,
-    clean: bool,
     progress: Callable[[int, int, str], None] | None = None,
     cancel_requested: Callable[[], bool] | None = None,
 ) -> ModelStructure:
@@ -253,7 +252,7 @@ def transpile_model(
     )
     check_compile_cancelled(cancel_requested)
 
-    if clean and output_dir.exists():
+    if output_dir.exists():
         shutil.rmtree(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 

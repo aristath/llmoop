@@ -52,7 +52,6 @@ def compile_model_package(
     transpiled_dir: Path | None,
     lowered_dir: Path | None,
     package_dir: Path | None,
-    clean: bool,
     shader_source_dir: Path,
     event_sink: Callable[[Json], None] | None = None,
     cancel_requested: Callable[[], bool] | None = None,
@@ -65,7 +64,6 @@ def compile_model_package(
     structure = transpile_model(
         model_dir,
         transpiled_dir,
-        clean=clean,
         progress=lambda current, total, pedal_id: emit_compile_event(
             event_sink,
             "PedalTranspiled",
@@ -76,7 +74,7 @@ def compile_model_package(
         cancel_requested=cancel_requested,
     )
     check_compile_cancelled(cancel_requested)
-    if clean and lowered_dir.exists():
+    if lowered_dir.exists():
         shutil.rmtree(lowered_dir)
     lowered = lower_pedalboard(
         transpiled_dir,
@@ -100,7 +98,7 @@ def compile_model_package(
         lowered_dir=lowered_dir,
     )
 
-    if clean and package_dir.exists():
+    if package_dir.exists():
         shutil.rmtree(package_dir)
     package_dir.mkdir(parents=True, exist_ok=True)
     emit_compile_event(event_sink, "ArtifactWritingStarted", package_dir=str(package_dir))

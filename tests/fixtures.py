@@ -41,7 +41,6 @@ def compiled_model_or_skip() -> CompiledModelFixture:
         transpiled_dir=root / "transpiled",
         lowered_dir=root / "lowered",
         package_dir=root / "package",
-        clean=True,
     )
     return CompiledModelFixture(
         source_model_dir=model_dir,

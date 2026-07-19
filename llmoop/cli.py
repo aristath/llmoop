@@ -174,11 +174,6 @@ def main() -> None:
         help="run N fresh prompt trials and report aggregate benchmark stats for --run",
     )
     parser.add_argument(
-        "--no-clean",
-        action="store_true",
-        help="do not delete an existing transpiled model directory before compiling",
-    )
-    parser.add_argument(
         "--json",
         action="store_true",
         help="print a machine-readable report",
@@ -326,7 +321,6 @@ def main() -> None:
             transpiled_dir=args.transpiled_dir,
             lowered_dir=args.lowered_dir,
             package_dir=args.package_dir,
-            clean=not args.no_clean,
             shader_source_dir=args.shader_source_dir,
             event_sink=reporter,
             cancel_requested=lambda: cancel_requested,
