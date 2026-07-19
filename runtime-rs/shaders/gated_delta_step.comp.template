@@ -26,7 +26,7 @@ layout(set = 0, binding = 4) buffer OutputFrame {
 } output_frame;
 
 layout(set = 0, binding = 5) readonly buffer ALog {
-    float values[];
+    uint words[];
 } a_log;
 
 layout(set = 0, binding = 6) readonly buffer DtBias {
@@ -34,7 +34,7 @@ layout(set = 0, binding = 6) readonly buffer DtBias {
 } dt_bias;
 
 layout(set = 0, binding = 7) readonly buffer NormWeight {
-    float values[];
+    uint words[];
 } norm_weight;
 
 layout(set = 0, binding = 8) readonly buffer StateRead {
@@ -91,8 +91,16 @@ float read_a(uint index) {
     return unpack_bf16(a_input.words[index >> 1u], index);
 }
 
+float read_a_log(uint index) {
+    return {{READ_A_LOG}};
+}
+
 float read_dt_bias(uint index) {
-    return unpack_bf16(dt_bias.words[index >> 1u], index);
+    return {{READ_DT_BIAS}};
+}
+
+float read_norm_weight(uint index) {
+    return {{READ_NORM_WEIGHT}};
 }
 
 float softplus(float value) {
@@ -127,7 +135,7 @@ void main() {
     barrier();
 
     float beta = 1.0 / (1.0 + exp(-read_b(value_head)));
-    float decay_log = -exp(a_log.values[value_head]) * softplus(
+    float decay_log = -exp(read_a_log(value_head)) * softplus(
         read_a(value_head)
         + read_dt_bias(value_head)
     );
@@ -165,7 +173,7 @@ void main() {
     }
     float inv_rms = inversesqrt(sum_squares / float(VALUE_HEAD_WIDTH) + NORM_EPS);
     float z = read_z(value_head * VALUE_HEAD_WIDTH + value_dim);
-    head_output[value_dim] = mixed * inv_rms * norm_weight.values[value_dim]
+    head_output[value_dim] = mixed * inv_rms * read_norm_weight(value_dim)
         * (z / (1.0 + exp(-z)));
     barrier();
 

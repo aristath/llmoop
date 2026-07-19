@@ -624,21 +624,22 @@ def shader_file_for_node(
         )
     if op == "gated_delta_step":
         attrs = node["attrs"]
-        expected_dtypes = {
-            "delta_a_log": "F32",
-            "delta_dt_bias": "BF16",
-            "delta_norm": "F32",
-        }
-        for parameter_id, expected_dtype in expected_dtypes.items():
+        dtype_tokens = {"F32": "f32", "BF16": "bf16"}
+        parameter_tokens: dict[str, str] = {}
+        for parameter_id in ("delta_a_log", "delta_dt_bias", "delta_norm"):
             actual_dtype = parameter_dtype_for_id(circuit, parameter_id, tensor_index)
-            if actual_dtype != expected_dtype:
+            if actual_dtype not in dtype_tokens:
                 raise ModelCompileError(
                     f"gated-delta parameter {parameter_id} has dtype {actual_dtype}; "
-                    f"expected {expected_dtype}"
+                    "expected F32 or BF16"
                 )
+            parameter_tokens[parameter_id] = dtype_tokens[actual_dtype]
         return (
             f"gated_delta_step_k{attrs['key_heads']}x{attrs['key_head_width']}"
             f"_v{attrs['value_heads']}x{attrs['value_head_width']}"
+            f"_a{parameter_tokens['delta_a_log']}"
+            f"_dt{parameter_tokens['delta_dt_bias']}"
+            f"_n{parameter_tokens['delta_norm']}"
             f"_eps{shader_float_token(float(attrs['norm_eps']))}.comp"
         )
     if op == "rg_lru_step":
@@ -1039,7 +1040,8 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
         )
 
     gated_delta_shape = re.fullmatch(
-        r"gated_delta_step_k(\d+)x(\d+)_v(\d+)x(\d+)_eps([0-9eE+.-]+)\.comp",
+        r"gated_delta_step_k(\d+)x(\d+)_v(\d+)x(\d+)"
+        r"_a(f32|bf16)_dt(f32|bf16)_n(f32|bf16)_eps([0-9eE+.-]+)\.comp",
         shader_file,
     )
     if gated_delta_shape is not None:
@@ -1063,7 +1065,16 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
                 "VALUE_HEADS": str(value_heads),
                 "VALUE_HEAD_WIDTH": str(value_width),
                 "KEY_HEAD_REPEAT": str(value_heads // key_heads),
-                "NORM_EPS": gated_delta_shape.group(5),
+                "READ_A_LOG": scalar_parameter_read_expression(
+                    "a_log", gated_delta_shape.group(5)
+                ),
+                "READ_DT_BIAS": scalar_parameter_read_expression(
+                    "dt_bias", gated_delta_shape.group(6)
+                ),
+                "READ_NORM_WEIGHT": scalar_parameter_read_expression(
+                    "norm_weight", gated_delta_shape.group(7)
+                ),
+                "NORM_EPS": gated_delta_shape.group(8),
             },
         )
 
@@ -1681,6 +1692,16 @@ def parameter_layout_for_id(circuit: Json, parameter_id: str, tensor_index: Json
 def parameter_dtype_for_id(circuit: Json, parameter_id: str, tensor_index: Json) -> str:
     parameter = circuit["parameters"]["refs"][parameter_id]
     return str(tensor_index["tensors"][parameter["tensor"]]["dtype"])
+
+
+def scalar_parameter_read_expression(buffer: str, dtype_token: str) -> str:
+    if dtype_token == "f32":
+        return f"uintBitsToFloat({buffer}.words[index])"
+    if dtype_token == "bf16":
+        return f"unpack_bf16({buffer}.words[index >> 1u], index)"
+    raise ModelCompileError(
+        f"unsupported scalar parameter shader dtype token {dtype_token!r}"
+    )
 
 
 def fp8_block_shape_for_node(
