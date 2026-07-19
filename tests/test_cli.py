@@ -619,7 +619,7 @@ class CompiledPackageTest(unittest.TestCase):
             manifest["input_transducer"]["shader_path"],
             manifest["output_transducer"]["embedding_norm_shader_path"],
             manifest["output_transducer"]["projection_shader_path"],
-            manifest["sampler"]["shader_path"],
+            *(kernel["shader_path"] for kernel in manifest["sampler"]["kernels"]),
             *(
                 kernel["shader_path"]
                 for execution in manifest["pedal_executions"]

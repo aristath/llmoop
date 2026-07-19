@@ -263,7 +263,8 @@ def test_shader_templates_compile_to_vulkan_1_4_spirv(tmp_path: Path) -> None:
         "rg_lru_step_bf16_h768_b6x128_k4__sc13.comp",
         "moe_topk_bf16_e64_k8.comp",
         "sparse_moe_experts_bf16_h768_i256_e64_k8.comp",
-        "temperature_top_k_top_p_sampler_f32_32000_t0.7_k40_p0.95_l64.comp",
+        "temperature_top_k_candidates_f32_32000_k40_g128_l256.comp",
+        "temperature_top_k_top_p_sampler_f32_t0.7_k40_p0.95_g128_l256.comp",
     }
     shader_dir = tmp_path / "shaders"
     copy_shader_templates(shader_source_dir, shader_dir, shader_files)

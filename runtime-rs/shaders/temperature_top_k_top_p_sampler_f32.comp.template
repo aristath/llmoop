@@ -1,10 +1,13 @@
 #version 450
 
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
 layout(local_size_x = {{LOCAL_SIZE_X}}, local_size_y = 1, local_size_z = 1) in;
 
-layout(set = 0, binding = 0) readonly buffer Logits {
-    float values[];
-} logits;
+layout(set = 0, binding = 0) readonly buffer PartitionCandidates {
+    uvec2 values[];
+} partition_candidates;
 
 layout(set = 0, binding = 1) buffer SamplerOutput {
     uint words[];
@@ -18,16 +21,16 @@ layout(set = 0, binding = 3) readonly buffer SamplerSeed {
     uint words[];
 } sampler_seed;
 
-const uint VOCAB_SIZE = {{VOCAB_SIZE}}u;
 const uint TOP_K = {{TOP_K}}u;
-const uint LOCAL_SIZE_X = {{LOCAL_SIZE_X}}u;
-const uint LANE_CANDIDATE_COUNT = TOP_K * LOCAL_SIZE_X;
+const uint PARTITION_COUNT = {{PARTITION_COUNT}}u;
 const float TEMPERATURE = {{TEMPERATURE}};
 const float TOP_P = {{TOP_P}};
 const float LOWEST_FLOAT = -3.4028234663852886e38;
 
-shared float lane_top_logits[{{LOCAL_SIZE_X}} * {{TOP_K}}];
-shared uint lane_top_token_ids[{{LOCAL_SIZE_X}} * {{TOP_K}}];
+shared uint partition_cursors[{{PARTITION_COUNT}}];
+shared float subgroup_top_logits[{{LOCAL_SIZE_X}}];
+shared uint subgroup_top_token_ids[{{LOCAL_SIZE_X}}];
+shared uint subgroup_top_partitions[{{LOCAL_SIZE_X}}];
 shared float final_top_logits[{{TOP_K}}];
 shared uint final_top_token_ids[{{TOP_K}}];
 
@@ -39,16 +42,6 @@ bool candidate_is_better(
 ) {
     return candidate_logit > current_logit
         || (candidate_logit == current_logit && candidate_token_id < current_token_id);
-}
-
-bool candidate_is_worse(
-    float candidate_logit,
-    uint candidate_token_id,
-    float current_logit,
-    uint current_token_id
-) {
-    return candidate_logit < current_logit
-        || (candidate_logit == current_logit && candidate_token_id > current_token_id);
 }
 
 uint hash_u32(uint value) {
@@ -71,127 +64,69 @@ float random_unit(uint stream_tick_low, uint stream_tick_high) {
 
 void main() {
     uint lane = gl_LocalInvocationID.x;
-    uint base = lane * TOP_K;
-    float local_top_logits[{{TOP_K}}];
-    uint local_top_token_ids[{{TOP_K}}];
-    for (uint index = 0u; index < TOP_K; index += 1u) {
-        local_top_logits[index] = LOWEST_FLOAT;
-        local_top_token_ids[index] = 0xffffffffu;
-    }
-
-    // Keep each lane's candidates as an unsorted reservoir. The previous
-    // insertion-sorted implementation compared almost every vocabulary logit
-    // with all TOP_K entries. Once this reservoir is full, the common case is
-    // one comparison against its worst entry; only a new top-k candidate needs
-    // the short scan that locates the next worst entry.
-    uint lane_worst_index = 0u;
-    float lane_worst_logit = LOWEST_FLOAT;
-    uint lane_worst_token_id = 0xffffffffu;
-    for (uint token_id = lane; token_id < VOCAB_SIZE; token_id += LOCAL_SIZE_X) {
-        float candidate_logit = logits.values[token_id];
-        if (isnan(candidate_logit) || !candidate_is_better(
-            candidate_logit,
-            token_id,
-            lane_worst_logit,
-            lane_worst_token_id
-        )) {
-            continue;
-        }
-
-        local_top_logits[lane_worst_index] = candidate_logit;
-        local_top_token_ids[lane_worst_index] = token_id;
-        lane_worst_index = 0u;
-        lane_worst_logit = local_top_logits[0];
-        lane_worst_token_id = local_top_token_ids[0];
-        for (uint index = 1u; index < TOP_K; index += 1u) {
-            float stored_logit = local_top_logits[index];
-            uint stored_token_id = local_top_token_ids[index];
-            if (candidate_is_worse(
-                stored_logit,
-                stored_token_id,
-                lane_worst_logit,
-                lane_worst_token_id
-            )) {
-                lane_worst_index = index;
-                lane_worst_logit = stored_logit;
-                lane_worst_token_id = stored_token_id;
-            }
-        }
-    }
-    for (uint index = 0u; index < TOP_K; index += 1u) {
-        lane_top_logits[base + index] = local_top_logits[index];
-        lane_top_token_ids[base + index] = local_top_token_ids[index];
+    if (lane < PARTITION_COUNT) {
+        partition_cursors[lane] = 0u;
     }
     barrier();
 
+    // The first kernel has already sorted each disjoint vocabulary partition.
+    // Merge those lists on the GPU without rescanning logits or copying any
+    // candidates to the host.
+    for (uint rank = 0u; rank < TOP_K; rank += 1u) {
+        float local_logit = LOWEST_FLOAT;
+        uint local_token_id = 0xffffffffu;
+        uint local_partition = 0xffffffffu;
+        if (lane < PARTITION_COUNT) {
+            uint cursor = partition_cursors[lane];
+            uvec2 candidate = partition_candidates.values[lane * TOP_K + cursor];
+            local_logit = uintBitsToFloat(candidate.x);
+            local_token_id = candidate.y;
+            local_partition = lane;
+        }
+
+        float subgroup_logit = subgroupMax(local_logit);
+        uint subgroup_token_id = subgroupMin(
+            local_logit == subgroup_logit ? local_token_id : 0xffffffffu
+        );
+        uint subgroup_partition = subgroupMin(
+            local_logit == subgroup_logit && local_token_id == subgroup_token_id
+                ? local_partition
+                : 0xffffffffu
+        );
+        if (subgroupElect()) {
+            subgroup_top_logits[gl_SubgroupID] = subgroup_logit;
+            subgroup_top_token_ids[gl_SubgroupID] = subgroup_token_id;
+            subgroup_top_partitions[gl_SubgroupID] = subgroup_partition;
+        }
+        barrier();
+
+        if (lane == 0u) {
+            float best_logit = subgroup_top_logits[0];
+            uint best_token_id = subgroup_top_token_ids[0];
+            uint best_partition = subgroup_top_partitions[0];
+            for (uint subgroup = 1u; subgroup < gl_NumSubgroups; subgroup += 1u) {
+                float candidate_logit = subgroup_top_logits[subgroup];
+                uint candidate_token_id = subgroup_top_token_ids[subgroup];
+                if (candidate_is_better(
+                    candidate_logit,
+                    candidate_token_id,
+                    best_logit,
+                    best_token_id
+                )) {
+                    best_logit = candidate_logit;
+                    best_token_id = candidate_token_id;
+                    best_partition = subgroup_top_partitions[subgroup];
+                }
+            }
+            final_top_logits[rank] = best_logit;
+            final_top_token_ids[rank] = best_token_id;
+            partition_cursors[best_partition] += 1u;
+        }
+        barrier();
+    }
+
     if (lane != 0u) {
         return;
-    }
-
-    for (uint index = 0u; index < TOP_K; index += 1u) {
-        final_top_logits[index] = LOWEST_FLOAT;
-        final_top_token_ids[index] = 0xffffffffu;
-    }
-
-    uint final_worst_index = 0u;
-    float final_worst_logit = LOWEST_FLOAT;
-    uint final_worst_token_id = 0xffffffffu;
-    for (uint index = 0u; index < LANE_CANDIDATE_COUNT; index += 1u) {
-        float candidate_logit = lane_top_logits[index];
-        uint candidate_token_id = lane_top_token_ids[index];
-        if (!candidate_is_better(
-            candidate_logit,
-            candidate_token_id,
-            final_worst_logit,
-            final_worst_token_id
-        )) {
-            continue;
-        }
-
-        final_top_logits[final_worst_index] = candidate_logit;
-        final_top_token_ids[final_worst_index] = candidate_token_id;
-        final_worst_index = 0u;
-        final_worst_logit = final_top_logits[0];
-        final_worst_token_id = final_top_token_ids[0];
-        for (uint candidate_index = 1u; candidate_index < TOP_K; candidate_index += 1u) {
-            float stored_logit = final_top_logits[candidate_index];
-            uint stored_token_id = final_top_token_ids[candidate_index];
-            if (candidate_is_worse(
-                stored_logit,
-                stored_token_id,
-                final_worst_logit,
-                final_worst_token_id
-            )) {
-                final_worst_index = candidate_index;
-                final_worst_logit = stored_logit;
-                final_worst_token_id = stored_token_id;
-            }
-        }
-    }
-
-    // Only the final TOP_K reservoir needs ordering for top-p truncation and
-    // cumulative sampling. This is tiny compared with sorting every lane's
-    // vocabulary partition while it is being scanned.
-    for (uint position = 0u; position < TOP_K; position += 1u) {
-        uint best_index = position;
-        for (uint candidate_index = position + 1u; candidate_index < TOP_K; candidate_index += 1u) {
-            if (candidate_is_better(
-                final_top_logits[candidate_index],
-                final_top_token_ids[candidate_index],
-                final_top_logits[best_index],
-                final_top_token_ids[best_index]
-            )) {
-                best_index = candidate_index;
-            }
-        }
-        if (best_index != position) {
-            float swap_logit = final_top_logits[position];
-            uint swap_token_id = final_top_token_ids[position];
-            final_top_logits[position] = final_top_logits[best_index];
-            final_top_token_ids[position] = final_top_token_ids[best_index];
-            final_top_logits[best_index] = swap_logit;
-            final_top_token_ids[best_index] = swap_token_id;
-        }
     }
 
     float maximum_scaled_logit = final_top_logits[0] / TEMPERATURE;

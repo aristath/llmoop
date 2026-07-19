@@ -469,19 +469,29 @@ def test_compiler_renders_attention_pedals_from_discovered_dimensions(
 
 def test_compiler_renders_model_owned_sampling_shader(tmp_path: Path) -> None:
     shader_source_dir = Path(__file__).parents[1] / "runtime-rs" / "shaders"
-    shader_file = (
-        "temperature_top_k_top_p_sampler_f32_248320_t0.6_k20_p0.95_l64.comp"
+    candidate_shader_file = "temperature_top_k_candidates_f32_248320_k20_g128_l256.comp"
+    sampler_shader_file = (
+        "temperature_top_k_top_p_sampler_f32_t0.6_k20_p0.95_g128_l256.comp"
     )
 
-    copy_shader_templates(shader_source_dir, tmp_path, {shader_file})
+    copy_shader_templates(
+        shader_source_dir,
+        tmp_path,
+        {candidate_shader_file, sampler_shader_file},
+    )
 
-    shader = (tmp_path / shader_file).read_text()
-    assert "const uint VOCAB_SIZE = 248320u;" in shader
-    assert "const uint TOP_K = 20u;" in shader
-    assert "const float TEMPERATURE = 0.6;" in shader
-    assert "const float TOP_P = 0.95;" in shader
-    assert "binding = 3) readonly buffer SamplerSeed" in shader
-    assert "{{" not in shader
+    candidates = (tmp_path / candidate_shader_file).read_text()
+    sampler = (tmp_path / sampler_shader_file).read_text()
+    assert "const uint VOCAB_SIZE = 248320u;" in candidates
+    assert "const uint TOP_K = 20u;" in candidates
+    assert "const uint PARTITION_COUNT = 128u;" in candidates
+    assert "subgroupMax(local_logit)" in candidates
+    assert "const float TEMPERATURE = 0.6;" in sampler
+    assert "const float TOP_P = 0.95;" in sampler
+    assert "binding = 3) readonly buffer SamplerSeed" in sampler
+    assert "partition_cursors" in sampler
+    assert "{{" not in candidates
+    assert "{{" not in sampler
 
 
 def test_compiler_renders_biased_recurrent_and_windowed_attention_pedals(

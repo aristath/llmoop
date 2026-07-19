@@ -193,23 +193,61 @@ def build_vulkan_resident_package_manifest(
     sampler_method = str(sampling["method"])
     if sampler_method == "greedy":
         sampler_id = "greedy_sampler"
-        sampler_local_size_x = 1024
         sampler_shader_file = f"greedy_sampler_f32_{vocab_size}.comp"
         sampler_temperature = 1.0
         sampler_top_k = 1
         sampler_top_p = 1.0
+        sampler_scratch_byte_capacity = 0
+        sampler_kernels = [
+            {
+                "role": "sample_logits",
+                "shader_path": compiled_shader_path(
+                    f"shaders/{sampler_shader_file}"
+                ),
+                "local_size_x": 1024,
+                "workgroup_count_x": 1,
+            }
+        ]
     elif sampler_method == "temperature_top_k_top_p":
         sampler_id = "temperature_top_k_top_p_sampler"
         sampler_temperature = float(sampling["temperature"])
         sampler_top_k = int(sampling["top_k"])
         sampler_top_p = float(sampling["top_p"])
-        sampler_local_size_x = max(1, min(64, 4096 // sampler_top_k))
+        sampler_partition_count = 128
+        sampler_candidate_local_size_x = 256
+        sampler_merge_local_size_x = 256
+        sampler_scratch_byte_capacity = (
+            sampler_partition_count * sampler_top_k * 8
+        )
+        sampler_candidate_shader_file = (
+            f"temperature_top_k_candidates_f32_{vocab_size}"
+            f"_k{sampler_top_k}_g{sampler_partition_count}"
+            f"_l{sampler_candidate_local_size_x}.comp"
+        )
         sampler_shader_file = (
-            f"temperature_top_k_top_p_sampler_f32_{vocab_size}"
+            f"temperature_top_k_top_p_sampler_f32"
             f"_t{shader_float_token(sampler_temperature)}"
             f"_k{sampler_top_k}_p{shader_float_token(sampler_top_p)}"
-            f"_l{sampler_local_size_x}.comp"
+            f"_g{sampler_partition_count}_l{sampler_merge_local_size_x}.comp"
         )
+        sampler_kernels = [
+            {
+                "role": "partition_top_k",
+                "shader_path": compiled_shader_path(
+                    f"shaders/{sampler_candidate_shader_file}"
+                ),
+                "local_size_x": sampler_candidate_local_size_x,
+                "workgroup_count_x": sampler_partition_count,
+            },
+            {
+                "role": "sample_candidates",
+                "shader_path": compiled_shader_path(
+                    f"shaders/{sampler_shader_file}"
+                ),
+                "local_size_x": sampler_merge_local_size_x,
+                "workgroup_count_x": 1,
+            },
+        ]
     else:
         raise ModelCompileError(f"unsupported sampling method {sampler_method!r}")
 
@@ -317,7 +355,13 @@ def build_vulkan_resident_package_manifest(
             embedding_shader_file=embedding_shader_file,
             projection_shader_file=projection_shader_file,
             norm_shader_file=norm_shader_file,
-            sampler_shader_file=sampler_shader_file,
+            sampler_shader_files={
+                kernel["shader_path"]
+                .removeprefix("shaders/")
+                .removesuffix(".spv")
+                + ".comp"
+                for kernel in sampler_kernels
+            },
         ),
     )
     compile_shader_artifacts(
@@ -414,9 +458,9 @@ def build_vulkan_resident_package_manifest(
                 "top_p": sampler_top_p,
                 "logits_byte_capacity": logits_bytes,
                 "output_byte_capacity": 16,
-                "local_size_x": sampler_local_size_x,
+                "scratch_byte_capacity": sampler_scratch_byte_capacity,
             },
-            "shader_path": compiled_shader_path(f"shaders/{sampler_shader_file}"),
+            "kernels": sampler_kernels,
         },
         "pedal_executions": pedal_executions,
     }
@@ -1141,11 +1185,11 @@ def required_shader_files(
     embedding_shader_file: str,
     projection_shader_file: str,
     norm_shader_file: str,
-    sampler_shader_file: str,
+    sampler_shader_files: set[str],
 ) -> set[str]:
     return {
         norm_shader_file,
-        sampler_shader_file,
+        *sampler_shader_files,
         embedding_shader_file,
         projection_shader_file,
         *(
@@ -1516,9 +1560,14 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
             ("VOCAB_SIZE",),
         ),
         (
-            r"temperature_top_k_top_p_sampler_f32_(\d+)_t([0-9eE+.-]+)_k(\d+)_p([0-9eE+.-]+)_l(\d+)\.comp",
+            r"temperature_top_k_candidates_f32_(\d+)_k(\d+)_g(\d+)_l(\d+)\.comp",
+            "temperature_top_k_candidates_f32.comp.template",
+            ("VOCAB_SIZE", "TOP_K", "PARTITION_COUNT", "LOCAL_SIZE_X"),
+        ),
+        (
+            r"temperature_top_k_top_p_sampler_f32_t([0-9eE+.-]+)_k(\d+)_p([0-9eE+.-]+)_g(\d+)_l(\d+)\.comp",
             "temperature_top_k_top_p_sampler_f32.comp.template",
-            ("VOCAB_SIZE", "TEMPERATURE", "TOP_K", "TOP_P", "LOCAL_SIZE_X"),
+            ("TEMPERATURE", "TOP_K", "TOP_P", "PARTITION_COUNT", "LOCAL_SIZE_X"),
         ),
         (
             r"split_bf16_2x(\d+)\.comp",

@@ -3736,14 +3736,17 @@ pub struct VulkanResidentSamplerRunner {
     pub sampler_id: String,
     pub logits_byte_capacity: usize,
     pub output_byte_capacity: usize,
+    pub dispatch_count: usize,
     pub descriptor_count: usize,
     pub workgroup_count_x: u32,
     pub push_constant_byte_count: u32,
     pub history_capacity_activations: usize,
     output_buffer: VulkanResidentBuffer,
+    _scratch_buffer: Option<VulkanResidentBuffer>,
     _sampler_seed_buffer: Option<VulkanResidentBuffer>,
     _stream_control_buffer: Arc<VulkanResidentBuffer>,
-    resident_dispatch: VulkanResidentKernelDispatch,
+    resident_dispatches: Vec<VulkanResidentKernelDispatch>,
+    sequence: VulkanResidentKernelSequence,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -3755,7 +3758,14 @@ pub struct VulkanResidentSamplerSpec {
     pub top_p: f32,
     pub logits_byte_capacity: usize,
     pub output_byte_capacity: usize,
+    pub scratch_byte_capacity: usize,
+}
+
+pub struct VulkanResidentSamplerKernelArtifact {
+    pub role: String,
+    pub spirv_words: Vec<u32>,
     pub local_size_x: u32,
+    pub workgroup_count_x: u32,
 }
 
 impl VulkanResidentSamplerRunner {
@@ -3763,7 +3773,7 @@ impl VulkanResidentSamplerRunner {
         device: &VulkanComputeDevice,
         mounted: &VulkanMountedPlacedStreamCircuit,
         output_transducer: &VulkanResidentOutputTransducerRunner,
-        spirv_words: &[u32],
+        kernels: &[VulkanResidentSamplerKernelArtifact],
         spec: &VulkanResidentSamplerSpec,
     ) -> Result<Self, VulkanResidentSamplerRunnerError> {
         Self::from_logits_buffer(
@@ -3771,7 +3781,7 @@ impl VulkanResidentSamplerRunner {
             mounted.stream_control_buffer.clone(),
             output_transducer.logits_buffer(),
             output_transducer.logits_byte_capacity,
-            spirv_words,
+            kernels,
             spec,
             mounted.buffers.dynamic_state_capacity_activations,
         )
@@ -3782,7 +3792,7 @@ impl VulkanResidentSamplerRunner {
         stream_control_buffer: Arc<VulkanResidentBuffer>,
         logits_buffer: &VulkanResidentBuffer,
         logits_byte_capacity: usize,
-        spirv_words: &[u32],
+        kernels: &[VulkanResidentSamplerKernelArtifact],
         spec: &VulkanResidentSamplerSpec,
         history_capacity_activations: usize,
     ) -> Result<Self, VulkanResidentSamplerRunnerError> {
@@ -3797,15 +3807,35 @@ impl VulkanResidentSamplerRunner {
         if history_capacity_activations == 0 {
             return Err(VulkanResidentSamplerRunnerError::ZeroHistoryCapacity);
         }
+        let vocabulary_size = logits_byte_capacity / std::mem::size_of::<f32>();
+        let sampled_kernel_plan_is_valid = kernels.len() == 2
+            && kernels[0].role == "partition_top_k"
+            && kernels[0].local_size_x > 0
+            && kernels[0].workgroup_count_x > 0
+            && kernels[1].role == "sample_candidates"
+            && kernels[1].local_size_x >= kernels[0].workgroup_count_x
+            && kernels[1].workgroup_count_x == 1
+            && usize::try_from(kernels[0].workgroup_count_x)
+                .ok()
+                .and_then(|partitions| partitions.checked_mul(spec.top_k as usize))
+                .and_then(|candidates| candidates.checked_mul(2 * std::mem::size_of::<u32>()))
+                == Some(spec.scratch_byte_capacity);
         match spec.method.as_str() {
-            "greedy" => {}
+            "greedy"
+                if spec.scratch_byte_capacity == 0
+                    && kernels.len() == 1
+                    && kernels[0].role == "sample_logits"
+                    && kernels[0].local_size_x > 0
+                    && kernels[0].workgroup_count_x == 1 => {}
             "temperature_top_k_top_p"
                 if spec.temperature.is_finite()
                     && spec.temperature > 0.0
                     && spec.top_k > 0
+                    && spec.top_k as usize <= vocabulary_size
                     && spec.top_p.is_finite()
                     && spec.top_p > 0.0
-                    && spec.top_p <= 1.0 => {}
+                    && spec.top_p <= 1.0
+                    && sampled_kernel_plan_is_valid => {}
             _ => {
                 return Err(VulkanResidentSamplerRunnerError::InvalidSamplingSpec {
                     method: spec.method.clone(),
@@ -3837,44 +3867,109 @@ impl VulkanResidentSamplerRunner {
         } else {
             None
         };
-        let mut bindings = vec![
-            VulkanResidentKernelBufferBinding::new(0, logits_buffer, logits_byte_capacity)
-                .with_access(VulkanResidentKernelBufferAccess::Read),
-            VulkanResidentKernelBufferBinding::new(1, &output_buffer, history_byte_capacity)
-                .with_access(VulkanResidentKernelBufferAccess::Write),
-            VulkanResidentKernelBufferBinding::new(
-                2,
-                &stream_control_buffer,
-                VULKAN_STREAM_CONTROL_BYTE_CAPACITY,
-            )
-            .with_access(VulkanResidentKernelBufferAccess::Write),
-        ];
-        if let Some(buffer) = &sampler_seed_buffer {
-            bindings.push(
-                VulkanResidentKernelBufferBinding::new(3, buffer, 4)
+        let scratch_buffer = (spec.scratch_byte_capacity > 0)
+            .then(|| device.create_resident_buffer(spec.scratch_byte_capacity))
+            .transpose()?;
+        let mut resident_dispatches = Vec::with_capacity(kernels.len());
+        for kernel in kernels {
+            let bindings = match kernel.role.as_str() {
+                "sample_logits" => vec![
+                    VulkanResidentKernelBufferBinding::new(0, logits_buffer, logits_byte_capacity)
+                        .with_access(VulkanResidentKernelBufferAccess::Read),
+                    VulkanResidentKernelBufferBinding::new(
+                        1,
+                        &output_buffer,
+                        history_byte_capacity,
+                    )
+                    .with_access(VulkanResidentKernelBufferAccess::Write),
+                    VulkanResidentKernelBufferBinding::new(
+                        2,
+                        &stream_control_buffer,
+                        VULKAN_STREAM_CONTROL_BYTE_CAPACITY,
+                    )
+                    .with_access(VulkanResidentKernelBufferAccess::ReadWrite),
+                ],
+                "partition_top_k" => vec![
+                    VulkanResidentKernelBufferBinding::new(0, logits_buffer, logits_byte_capacity)
+                        .with_access(VulkanResidentKernelBufferAccess::Read),
+                    VulkanResidentKernelBufferBinding::new(
+                        1,
+                        scratch_buffer.as_ref().expect("sampling plan has scratch"),
+                        spec.scratch_byte_capacity,
+                    )
+                    .with_access(VulkanResidentKernelBufferAccess::Write),
+                ],
+                "sample_candidates" => vec![
+                    VulkanResidentKernelBufferBinding::new(
+                        0,
+                        scratch_buffer.as_ref().expect("sampling plan has scratch"),
+                        spec.scratch_byte_capacity,
+                    )
                     .with_access(VulkanResidentKernelBufferAccess::Read),
-            );
+                    VulkanResidentKernelBufferBinding::new(
+                        1,
+                        &output_buffer,
+                        history_byte_capacity,
+                    )
+                    .with_access(VulkanResidentKernelBufferAccess::Write),
+                    VulkanResidentKernelBufferBinding::new(
+                        2,
+                        &stream_control_buffer,
+                        VULKAN_STREAM_CONTROL_BYTE_CAPACITY,
+                    )
+                    .with_access(VulkanResidentKernelBufferAccess::ReadWrite),
+                    VulkanResidentKernelBufferBinding::new(
+                        3,
+                        sampler_seed_buffer
+                            .as_ref()
+                            .expect("sampled plan has a seed buffer"),
+                        4,
+                    )
+                    .with_access(VulkanResidentKernelBufferAccess::Read),
+                ],
+                _ => unreachable!("sampling plan roles were validated"),
+            };
+            resident_dispatches.push(device.create_resident_kernel_dispatch(
+                &kernel.spirv_words,
+                &bindings,
+                kernel.workgroup_count_x,
+                kernel.local_size_x,
+                0,
+            )?);
         }
-        let resident_dispatch = device.create_resident_kernel_dispatch(
-            spirv_words,
-            &bindings,
-            1,
-            spec.local_size_x,
-            0,
-        )?;
+        let descriptor_count = resident_dispatches
+            .iter()
+            .map(VulkanResidentKernelDispatch::descriptor_count)
+            .sum();
+        let workgroup_count_x = resident_dispatches
+            .iter()
+            .try_fold(0u32, |total, dispatch| {
+                total.checked_add(dispatch.workgroup_count_x())
+            })
+            .ok_or(VulkanResidentSamplerRunnerError::WorkgroupCountOverflow)?;
+        let push_constant_byte_count = resident_dispatches
+            .iter()
+            .try_fold(0u32, |total, dispatch| {
+                total.checked_add(dispatch.push_constant_byte_count())
+            })
+            .ok_or(VulkanResidentSamplerRunnerError::PushConstantByteCountOverflow)?;
+        let sequence = device.create_resident_kernel_sequence()?;
 
         Ok(Self {
             sampler_id: spec.sampler_id.clone(),
             logits_byte_capacity,
             output_byte_capacity: spec.output_byte_capacity,
-            descriptor_count: resident_dispatch.descriptor_count(),
-            workgroup_count_x: resident_dispatch.workgroup_count_x(),
-            push_constant_byte_count: resident_dispatch.push_constant_byte_count(),
+            dispatch_count: resident_dispatches.len(),
+            descriptor_count,
+            workgroup_count_x,
+            push_constant_byte_count,
             history_capacity_activations,
             output_buffer,
+            _scratch_buffer: scratch_buffer,
             _sampler_seed_buffer: sampler_seed_buffer,
             _stream_control_buffer: stream_control_buffer,
-            resident_dispatch,
+            resident_dispatches,
+            sequence,
         })
     }
 
@@ -3882,8 +3977,17 @@ impl VulkanResidentSamplerRunner {
         &self,
         device: &VulkanComputeDevice,
     ) -> Result<VulkanResidentSamplerRun, VulkanResidentSamplerRunnerError> {
-        device.run_resident_kernel_dispatch(&self.resident_dispatch, &[])?;
+        let steps = self
+            .resident_dispatches
+            .iter()
+            .map(|dispatch| VulkanResidentKernelSequenceStep::new(dispatch, &[]))
+            .collect::<Vec<_>>();
+        device.run_resident_kernel_sequence(&self.sequence, &steps)?;
         self.completed_run()
+    }
+
+    fn resident_dispatches(&self) -> &[VulkanResidentKernelDispatch] {
+        &self.resident_dispatches
     }
 
     fn completed_run(&self) -> Result<VulkanResidentSamplerRun, VulkanResidentSamplerRunnerError> {
@@ -3955,6 +4059,8 @@ pub enum VulkanResidentSamplerRunnerError {
     },
     ZeroHistoryCapacity,
     HistoryCapacityOverflow,
+    WorkgroupCountOverflow,
+    PushConstantByteCountOverflow,
     InvalidSamplingSpec {
         method: String,
         temperature: f32,
@@ -3977,6 +4083,10 @@ impl Display for VulkanResidentSamplerRunnerError {
             Self::ZeroHistoryCapacity => f.write_str("sampler history capacity must be nonzero"),
             Self::HistoryCapacityOverflow => {
                 f.write_str("sampler history byte capacity overflowed")
+            }
+            Self::WorkgroupCountOverflow => f.write_str("sampler workgroup count overflowed"),
+            Self::PushConstantByteCountOverflow => {
+                f.write_str("sampler push constant byte count overflowed")
             }
             Self::InvalidSamplingSpec {
                 method,
@@ -4066,7 +4176,7 @@ impl VulkanResidentSingleTokenTickRunner {
         token_id: u32,
         control: VulkanMountedPlacedStreamControl,
     ) -> Result<VulkanResidentSingleTokenTickRun, VulkanResidentSingleTokenTickRunnerError> {
-        self.run_token_id_with_stream_control_and_tail(device, token_id, control, false, true, None)
+        self.run_token_id_with_stream_control_and_tail(device, token_id, control, false, true, &[])
     }
 
     fn run_token_id_with_stream_control_and_tail(
@@ -4076,7 +4186,7 @@ impl VulkanResidentSingleTokenTickRunner {
         control: VulkanMountedPlacedStreamControl,
         input_token_is_resident: bool,
         emit_output: bool,
-        tail_dispatch: Option<&VulkanResidentKernelDispatch>,
+        tail_dispatches: &[VulkanResidentKernelDispatch],
     ) -> Result<VulkanResidentSingleTokenTickRun, VulkanResidentSingleTokenTickRunnerError> {
         if !input_token_is_resident {
             self.stream_control_buffer
@@ -4092,8 +4202,7 @@ impl VulkanResidentSingleTokenTickRunner {
             }
         }
 
-        let mut sequence_steps =
-            Vec::with_capacity(self.dispatch_count + usize::from(tail_dispatch.is_some()));
+        let mut sequence_steps = Vec::with_capacity(self.dispatch_count + tail_dispatches.len());
         sequence_steps.push(VulkanResidentKernelSequenceStep::new(
             &self.input_transducer.resident_dispatch,
             &[],
@@ -4118,7 +4227,7 @@ impl VulkanResidentSingleTokenTickRunner {
                 &[],
             ));
         }
-        if let Some(tail_dispatch) = tail_dispatch {
+        for tail_dispatch in tail_dispatches {
             sequence_steps.push(VulkanResidentKernelSequenceStep::new(tail_dispatch, &[]));
         }
 
@@ -4257,7 +4366,7 @@ impl VulkanResidentFeedbackLoopRunner {
     ) -> Result<Self, VulkanResidentFeedbackLoopRunnerError> {
         let per_tick_dispatch_count = tick_runner
             .dispatch_count
-            .checked_add(1)
+            .checked_add(sampler.dispatch_count)
             .ok_or(VulkanResidentFeedbackLoopRunnerError::DispatchCountOverflow)?;
         let per_tick_descriptor_count = tick_runner
             .total_descriptor_count
@@ -4294,6 +4403,7 @@ impl VulkanResidentFeedbackLoopRunner {
         let mut input_token_id = initial_token_id;
         let mut tick_runs = Vec::with_capacity(max_ticks);
         let mut sampled_token_ids = Vec::with_capacity(max_ticks);
+        let sampler_dispatches = self.sampler.resident_dispatches();
 
         for tick_index in 0..max_ticks {
             let stream_tick = start_stream_tick
@@ -4312,7 +4422,7 @@ impl VulkanResidentFeedbackLoopRunner {
                 },
                 tick_index != 0,
                 true,
-                Some(&self.sampler.resident_dispatch),
+                sampler_dispatches,
             )?;
             let sampler_run = self.sampler.completed_run()?;
             let sampled_token_id = sampler_run.token_id;
@@ -4395,10 +4505,12 @@ impl VulkanResidentFeedbackLoopRunner {
                 &self.tick_runner.output_transducer.tied_projection_dispatch,
                 &[],
             ));
-            sequence_steps.push(VulkanResidentKernelSequenceStep::new(
-                &self.sampler.resident_dispatch,
-                &[],
-            ));
+            sequence_steps.extend(
+                self.sampler
+                    .resident_dispatches()
+                    .iter()
+                    .map(|dispatch| VulkanResidentKernelSequenceStep::new(dispatch, &[])),
+            );
         }
         debug_assert_eq!(sequence_steps.len(), total_steps);
         let snapshot_copies = snapshots.copies_for_cycle(buffers, steps_per_tick, tick_count)?;
@@ -4513,6 +4625,11 @@ impl VulkanResidentFeedbackLoopRunner {
             let external_inputs_remaining = prompt_token_ids.len() - external_input_index;
             let should_emit_public_output =
                 remaining_public_outputs > 0 && external_inputs_remaining == 0;
+            let tail_dispatches = if should_emit_public_output {
+                self.sampler.resident_dispatches()
+            } else {
+                &[]
+            };
             let tick_run = self.tick_runner.run_token_id_with_stream_control_and_tail(
                 device,
                 input_token_id,
@@ -4526,7 +4643,7 @@ impl VulkanResidentFeedbackLoopRunner {
                     VulkanResidentPromptEventInputRoute::PrivateFeedback
                 ),
                 should_emit_public_output,
-                should_emit_public_output.then_some(&self.sampler.resident_dispatch),
+                tail_dispatches,
             )?;
 
             let mut public_output_token_id = None;
@@ -5187,6 +5304,11 @@ impl VulkanResidentRunningStream {
             .ok_or(VulkanResidentFeedbackLoopRunnerError::MissingPrivateFeedback)?;
         let should_emit_public_output =
             self.remaining_public_outputs > 0 && self.external_input_queue.is_empty();
+        let tail_dispatches = if should_emit_public_output {
+            self.processor.loop_runner.sampler.resident_dispatches()
+        } else {
+            &[]
+        };
         let tick_run = self
             .processor
             .loop_runner
@@ -5206,8 +5328,7 @@ impl VulkanResidentRunningStream {
                     VulkanResidentRunningStreamInputSignal::PrivateFeedback(_)
                 ),
                 should_emit_public_output,
-                should_emit_public_output
-                    .then_some(&self.processor.loop_runner.sampler.resident_dispatch),
+                tail_dispatches,
             )?;
         self.next_stream_tick = self
             .next_stream_tick
@@ -7576,9 +7697,11 @@ fn validate_resident_package_paths(
             "output projection shader",
             manifest.output_transducer.projection_shader_path.as_str(),
         ),
-        ("sampler shader", manifest.sampler.shader_path.as_str()),
     ] {
         validate_resident_package_relative_path(label, path)?;
+    }
+    for kernel in &manifest.sampler.kernels {
+        validate_resident_package_relative_path("sampler kernel shader", &kernel.shader_path)?;
     }
     for path in &manifest.tokenizer.files {
         validate_resident_package_relative_path("tokenizer file", path)?;
@@ -7617,6 +7740,11 @@ fn validate_resident_package_artifact_integrity(
             .iter()
             .map(|kernel| kernel.shader_path.clone())
     });
+    let sampler_shaders = manifest
+        .sampler
+        .kernels
+        .iter()
+        .map(|kernel| kernel.shader_path.clone());
     let required = [
         manifest.tensor_index_path.clone(),
         manifest.behavioral_validation_path.clone(),
@@ -7627,10 +7755,10 @@ fn validate_resident_package_artifact_integrity(
             .embedding_norm_shader_path
             .clone(),
         manifest.output_transducer.projection_shader_path.clone(),
-        manifest.sampler.shader_path.clone(),
     ]
     .into_iter()
     .chain(tokenizer_files)
+    .chain(sampler_shaders)
     .chain(kernel_shaders)
     .collect::<BTreeSet<_>>();
     if integrity.files.keys().cloned().collect::<BTreeSet<_>>() != required {
@@ -8052,7 +8180,15 @@ pub struct VulkanResidentOutputTransducerPackageSpec {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct VulkanResidentSamplerPackageSpec {
     pub spec: VulkanResidentSamplerSpec,
+    pub kernels: Vec<VulkanResidentSamplerKernelPackageSpec>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VulkanResidentSamplerKernelPackageSpec {
+    pub role: String,
     pub shader_path: String,
+    pub local_size_x: u32,
+    pub workgroup_count_x: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -8099,7 +8235,7 @@ pub struct VulkanResidentModelPackage {
     input_transducer_spirv_words: Vec<u32>,
     embedding_norm_spirv_words: Vec<u32>,
     tied_projection_spirv_words: Vec<u32>,
-    sampler_spirv_words: Vec<u32>,
+    sampler_kernels: Vec<VulkanResidentSamplerKernelArtifact>,
     input_transducer_spec: VulkanResidentInputEmbeddingTransducerSpec,
     output_transducer_spec: VulkanResidentOutputTransducerSpec,
     sampler_spec: VulkanResidentSamplerSpec,
@@ -8590,10 +8726,7 @@ impl VulkanResidentInProcessPlacedModelPackage {
             manifest_dir,
             &manifest.output_transducer.projection_shader_path,
         )?;
-        let sampler_spirv_words = load_required_resident_model_package_shader(
-            manifest_dir,
-            &manifest.sampler.shader_path,
-        )?;
+        let sampler_kernels = load_resident_sampler_kernels(manifest_dir, &manifest.sampler)?;
         let device_ids = manifest.placement_device_ids();
         let mut device_slices = Vec::with_capacity(device_ids.len());
         let mut hosted_pedal_count = 0usize;
@@ -8704,7 +8837,7 @@ impl VulkanResidentInProcessPlacedModelPackage {
             output_device,
             &output_slice.mounted,
             &output_transducer,
-            &sampler_spirv_words,
+            &sampler_kernels,
             &manifest.sampler.spec,
         )
         .map_err(VulkanResidentInProcessPlacedModelPackageError::Sampler)?;
@@ -8885,7 +9018,7 @@ impl VulkanResidentInProcessPlacedModelPackage {
                 if tail == VulkanResidentPlacedTokenTickTail::Sample {
                     dispatch_extensions
                         .suffix_dispatches
-                        .push(&self.sampler.resident_dispatch);
+                        .extend(self.sampler.resident_dispatches());
                 }
             }
             tick_slices.push(
@@ -9007,7 +9140,7 @@ impl VulkanResidentInProcessPlacedModelPackage {
                 if tail == VulkanResidentPlacedTokenTickTail::Sample {
                     dispatch_extensions
                         .suffix_dispatches
-                        .push(&self.sampler.resident_dispatch);
+                        .extend(self.sampler.resident_dispatches());
                 }
             }
             tick_slices.push(
@@ -10700,10 +10833,7 @@ impl VulkanResidentModelPackage {
             manifest_dir,
             &manifest.output_transducer.projection_shader_path,
         )?;
-        let sampler_spirv_words = load_required_resident_model_package_shader(
-            manifest_dir,
-            &manifest.sampler.shader_path,
-        )?;
+        let sampler_kernels = load_resident_sampler_kernels(manifest_dir, &manifest.sampler)?;
 
         let probe_mounted =
             VulkanMountedPlacedStreamCircuit::from_placed_plan_with_parameter_buffers(
@@ -10752,7 +10882,7 @@ impl VulkanResidentModelPackage {
             input_transducer_spirv_words,
             embedding_norm_spirv_words,
             tied_projection_spirv_words,
-            sampler_spirv_words,
+            sampler_kernels,
             input_transducer_spec: manifest.input_transducer.spec,
             output_transducer_spec: manifest.output_transducer.spec,
             sampler_spec: manifest.sampler.spec,
@@ -10835,7 +10965,7 @@ impl VulkanResidentModelPackage {
             device,
             &mounted,
             &output_transducer,
-            &self.sampler_spirv_words,
+            &self.sampler_kernels,
             &self.sampler_spec,
         )
         .map_err(|error| {
@@ -11543,6 +11673,27 @@ fn load_required_resident_model_package_shader(
             resolved_path
         ))
     })
+}
+
+fn load_resident_sampler_kernels(
+    manifest_dir: &Path,
+    package: &VulkanResidentSamplerPackageSpec,
+) -> Result<Vec<VulkanResidentSamplerKernelArtifact>, VulkanResidentTokenModelPackageError> {
+    package
+        .kernels
+        .iter()
+        .map(|kernel| {
+            Ok(VulkanResidentSamplerKernelArtifact {
+                role: kernel.role.clone(),
+                spirv_words: load_required_resident_model_package_shader(
+                    manifest_dir,
+                    &kernel.shader_path,
+                )?,
+                local_size_x: kernel.local_size_x,
+                workgroup_count_x: kernel.workgroup_count_x,
+            })
+        })
+        .collect()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -17673,31 +17824,67 @@ mod tests {
         );
     }
 
-    fn compile_temperature_top_k_top_p_sampler_test_shader(
+    fn compile_temperature_top_k_top_p_sampler_test_kernels(
         vocab_size: usize,
         temperature: f32,
         top_k: u32,
         top_p: f32,
+        partition_count: u32,
         local_size_x: u32,
-    ) -> Option<Vec<u32>> {
-        let template = std::fs::read_to_string(
-            Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("shaders")
-                .join("temperature_top_k_top_p_sampler_f32.comp.template"),
+    ) -> Option<Vec<VulkanResidentSamplerKernelArtifact>> {
+        let shader_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("shaders");
+        let candidates = std::fs::read_to_string(
+            shader_dir.join("temperature_top_k_candidates_f32.comp.template"),
         )
-        .ok()?;
-        let rendered = template
-            .replace("{{VOCAB_SIZE}}", &vocab_size.to_string())
-            .replace("{{TEMPERATURE}}", &temperature.to_string())
-            .replace("{{TOP_K}}", &top_k.to_string())
-            .replace("{{TOP_P}}", &top_p.to_string())
-            .replace("{{LOCAL_SIZE_X}}", &local_size_x.to_string());
-        let shader_path =
-            std::env::temp_dir().join(format!("llmoop-sampling-test-{}.comp", std::process::id()));
-        std::fs::write(&shader_path, rendered).ok()?;
-        let words = crate::vulkan_compute::compile_shader_words_from_source_path(&shader_path);
-        let _ = std::fs::remove_file(shader_path);
-        words
+        .ok()?
+        .replace("{{VOCAB_SIZE}}", &vocab_size.to_string())
+        .replace("{{TOP_K}}", &top_k.to_string())
+        .replace("{{PARTITION_COUNT}}", &partition_count.to_string())
+        .replace("{{LOCAL_SIZE_X}}", &local_size_x.to_string());
+        let sampler = std::fs::read_to_string(
+            shader_dir.join("temperature_top_k_top_p_sampler_f32.comp.template"),
+        )
+        .ok()?
+        .replace("{{TEMPERATURE}}", &temperature.to_string())
+        .replace("{{TOP_K}}", &top_k.to_string())
+        .replace("{{TOP_P}}", &top_p.to_string())
+        .replace("{{PARTITION_COUNT}}", &partition_count.to_string())
+        .replace("{{LOCAL_SIZE_X}}", &local_size_x.to_string());
+        let compile = |suffix: &str, source: String| {
+            let path = std::env::temp_dir().join(format!(
+                "llmoop-sampling-test-{}-{suffix}.comp",
+                std::process::id()
+            ));
+            std::fs::write(&path, source).ok()?;
+            let words = crate::vulkan_compute::compile_shader_words_from_source_path(&path);
+            let _ = std::fs::remove_file(path);
+            words
+        };
+        Some(vec![
+            VulkanResidentSamplerKernelArtifact {
+                role: "partition_top_k".to_string(),
+                spirv_words: compile("candidates", candidates)?,
+                local_size_x,
+                workgroup_count_x: partition_count,
+            },
+            VulkanResidentSamplerKernelArtifact {
+                role: "sample_candidates".to_string(),
+                spirv_words: compile("sample", sampler)?,
+                local_size_x,
+                workgroup_count_x: 1,
+            },
+        ])
+    }
+
+    fn greedy_sampler_test_kernels(
+        spirv_words: Vec<u32>,
+    ) -> Vec<VulkanResidentSamplerKernelArtifact> {
+        vec![VulkanResidentSamplerKernelArtifact {
+            role: "sample_logits".to_string(),
+            spirv_words,
+            local_size_x: 1_024,
+            workgroup_count_x: 1,
+        }]
     }
 
     fn sampler_test_hash_u32(mut value: u32) -> u32 {
@@ -17873,7 +18060,7 @@ mod tests {
         copy_package_integrity_artifacts(source_root, &root, &source_manifest);
         let manifest_path = root.join("vulkan_resident_package.json");
         std::fs::copy(&source_manifest_path, &manifest_path).unwrap();
-        let shader_path = root.join(&source_manifest.sampler.shader_path);
+        let shader_path = root.join(&source_manifest.sampler.kernels[0].shader_path);
         let mut shader = std::fs::read(&shader_path).unwrap();
         *shader.last_mut().unwrap() ^= 0x01;
         std::fs::write(&shader_path, shader).unwrap();
@@ -18114,7 +18301,7 @@ mod tests {
             top_p: 1.0,
             logits_byte_capacity: FIXTURE_MODEL_LOGITS_BYTES,
             output_byte_capacity: FIXTURE_MODEL_SAMPLER_OUTPUT_BYTES,
-            local_size_x: 1_024,
+            scratch_byte_capacity: 0,
         }
     }
 
@@ -19638,6 +19825,7 @@ mod tests {
             eprintln!("skipping resident sampler: no GLSL to SPIR-V compiler found");
             return;
         };
+        let sampler_kernels = greedy_sampler_test_kernels(sampler_spirv_words);
 
         let logits_buffer = device
             .create_resident_buffer(FIXTURE_MODEL_LOGITS_BYTES)
@@ -19669,7 +19857,7 @@ mod tests {
             stream_control_buffer.clone(),
             &logits_buffer,
             FIXTURE_MODEL_LOGITS_BYTES,
-            &sampler_spirv_words,
+            &sampler_kernels,
             &fixture_model_greedy_sampler_spec(),
             8,
         )
@@ -19712,8 +19900,7 @@ mod tests {
         const VOCAB_SIZE: usize = 64;
         const LOGITS_BYTE_CAPACITY: usize = VOCAB_SIZE * std::mem::size_of::<f32>();
         const SEED: u32 = 0x5eed_1234;
-        const FIRST_TOKEN: u32 = 7;
-        const SECOND_TOKEN: u32 = 19;
+        const TOP_TOKENS: [u32; 4] = [7, 8, 19, 51];
 
         let device = match VulkanComputeDevice::new() {
             Ok(device) => device,
@@ -19722,17 +19909,24 @@ mod tests {
                 return;
             }
         };
-        let Some(sampler_spirv_words) =
-            compile_temperature_top_k_top_p_sampler_test_shader(VOCAB_SIZE, 1.0, 2, 1.0, 16)
-        else {
+        let partition_count = 4;
+        let Some(sampler_kernels) = compile_temperature_top_k_top_p_sampler_test_kernels(
+            VOCAB_SIZE,
+            1.0,
+            4,
+            1.0,
+            partition_count,
+            16,
+        ) else {
             eprintln!("skipping resident sampled sampler: no GLSL to SPIR-V compiler found");
             return;
         };
 
         let logits_buffer = device.create_resident_buffer(LOGITS_BYTE_CAPACITY).unwrap();
         let mut logits = vec![-100.0f32; VOCAB_SIZE];
-        logits[FIRST_TOKEN as usize] = 2.0;
-        logits[SECOND_TOKEN as usize] = 2.0;
+        for token_id in TOP_TOKENS {
+            logits[token_id as usize] = 2.0;
+        }
         logits_buffer
             .write_bytes(
                 &logits
@@ -19757,22 +19951,41 @@ mod tests {
                 },
             ))
             .unwrap();
+        let spec = VulkanResidentSamplerSpec {
+            sampler_id: "temperature_top_k_top_p_sampler".to_string(),
+            method: "temperature_top_k_top_p".to_string(),
+            temperature: 1.0,
+            top_k: 4,
+            top_p: 1.0,
+            logits_byte_capacity: LOGITS_BYTE_CAPACITY,
+            output_byte_capacity: FIXTURE_MODEL_SAMPLER_OUTPUT_BYTES,
+            scratch_byte_capacity: partition_count as usize * 4 * 8,
+        };
+        let mut invalid_spec = spec.clone();
+        invalid_spec.scratch_byte_capacity -= 8;
+        let invalid = VulkanResidentSamplerRunner::from_logits_buffer(
+            &device,
+            stream_control_buffer.clone(),
+            &logits_buffer,
+            LOGITS_BYTE_CAPACITY,
+            &sampler_kernels,
+            &invalid_spec,
+            32,
+        )
+        .err()
+        .expect("undersized sampler scratch must be rejected");
+        assert!(
+            invalid
+                .to_string()
+                .contains("invalid resident sampling spec")
+        );
         let runner = VulkanResidentSamplerRunner::from_logits_buffer(
             &device,
             stream_control_buffer,
             &logits_buffer,
             LOGITS_BYTE_CAPACITY,
-            &sampler_spirv_words,
-            &VulkanResidentSamplerSpec {
-                sampler_id: "temperature_top_k_top_p_sampler".to_string(),
-                method: "temperature_top_k_top_p".to_string(),
-                temperature: 1.0,
-                top_k: 2,
-                top_p: 1.0,
-                logits_byte_capacity: LOGITS_BYTE_CAPACITY,
-                output_byte_capacity: FIXTURE_MODEL_SAMPLER_OUTPUT_BYTES,
-                local_size_x: 16,
-            },
+            &sampler_kernels,
+            &spec,
             32,
         )
         .unwrap();
@@ -19787,19 +20000,21 @@ mod tests {
         for stream_tick in 0..16u32 {
             let run = runner.run(&device).unwrap();
             let random_bits = sampler_test_hash_u32(SEED ^ stream_tick);
-            let expected = if (random_bits >> 8) < (1 << 23) {
-                FIRST_TOKEN
-            } else {
-                SECOND_TOKEN
-            };
+            let selected_index = (((random_bits >> 8) as u64 * 4) >> 24) as usize;
+            let expected = TOP_TOKENS[selected_index];
             assert_eq!(run.token_id, expected);
             assert_eq!(run.selected_logit_bits, 2.0f32.to_bits());
             assert_eq!(run.control_flags, 1);
-            assert_eq!(run.descriptor_count, 4);
+            assert_eq!(runner.dispatch_count, 2);
+            assert_eq!(run.descriptor_count, 6);
+            assert_eq!(run.workgroup_count_x, partition_count + 1);
             selected_tokens.push(run.token_id);
         }
-        assert!(selected_tokens.contains(&FIRST_TOKEN));
-        assert!(selected_tokens.contains(&SECOND_TOKEN));
+        assert!(
+            TOP_TOKENS
+                .iter()
+                .all(|token_id| selected_tokens.contains(token_id))
+        );
     }
 
     #[test]
@@ -20016,6 +20231,7 @@ mod tests {
             eprintln!("skipping {skip_label}: no GLSL to SPIR-V compiler found");
             return None;
         };
+        let sampler_kernels = greedy_sampler_test_kernels(sampler_spirv_words);
 
         let transducer_parameter_buffers = Arc::new(
             load_fixture_model_transducer_parameter_buffers(device, &tensor_index),
@@ -20051,7 +20267,7 @@ mod tests {
             device,
             &mounted,
             &output_transducer,
-            &sampler_spirv_words,
+            &sampler_kernels,
             &fixture_model_greedy_sampler_spec(),
         )
         .unwrap();
