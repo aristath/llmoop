@@ -1,0 +1,164 @@
+#version 450
+
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x = {{VALUE_HEAD_WIDTH}}, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer QkvInput { uint words[]; } qkv_input;
+layout(set = 0, binding = 1) readonly buffer ZInput { uint words[]; } z_input;
+layout(set = 0, binding = 2) readonly buffer BInput { uint words[]; } b_input;
+layout(set = 0, binding = 3) readonly buffer AInput { uint words[]; } a_input;
+layout(set = 0, binding = 4) buffer OutputFrame { uint words[]; } output_frame;
+layout(set = 0, binding = 5) readonly buffer ALog { uint words[]; } a_log;
+layout(set = 0, binding = 6) readonly buffer DtBias { uint words[]; } dt_bias;
+layout(set = 0, binding = 7) readonly buffer NormWeight { uint words[]; } norm_weight;
+layout(set = 0, binding = 8) readonly buffer StateRead { float values[]; } state_read;
+layout(set = 0, binding = 9) buffer StateWrite { float values[]; } state_write;
+
+layout(push_constant) uniform BatchControl { uint batch_width; } batch_control;
+
+const uint KEY_HEADS = {{KEY_HEADS}}u;
+const uint KEY_HEAD_WIDTH = {{KEY_HEAD_WIDTH}}u;
+const uint VALUE_HEADS = {{VALUE_HEADS}}u;
+const uint VALUE_HEAD_WIDTH = {{VALUE_HEAD_WIDTH}}u;
+const uint KEY_HEAD_REPEAT = {{KEY_HEAD_REPEAT}}u;
+const uint KEY_WIDTH = KEY_HEADS * KEY_HEAD_WIDTH;
+const uint VALUE_WIDTH = VALUE_HEADS * VALUE_HEAD_WIDTH;
+const uint QKV_WIDTH = 2u * KEY_WIDTH + VALUE_WIDTH;
+const float NORM_EPS = {{NORM_EPS}};
+
+shared float q_inv_norm;
+shared float k_inv_norm;
+shared float head_output[VALUE_HEAD_WIDTH];
+shared float reduction[VALUE_HEAD_WIDTH];
+
+float bf16_to_f32(uint value) {
+    return uintBitsToFloat((value & 0xffffu) << 16);
+}
+
+uint f32_to_bf16(float value) {
+    uint bits = floatBitsToUint(value);
+    uint lsb = (bits >> 16) & 1u;
+    return (bits + 0x7fffu + lsb) >> 16;
+}
+
+float unpack_bf16(uint packed, uint index) {
+    return bf16_to_f32((index & 1u) == 0u ? packed : packed >> 16u);
+}
+
+float read_qkv(uint position, uint index) {
+    uint scalar_index = position * QKV_WIDTH + index;
+    return unpack_bf16(qkv_input.words[scalar_index >> 1u], scalar_index);
+}
+
+float read_z(uint position, uint index) {
+    uint scalar_index = position * VALUE_WIDTH + index;
+    return unpack_bf16(z_input.words[scalar_index >> 1u], scalar_index);
+}
+
+float read_b(uint position, uint index) {
+    uint scalar_index = position * VALUE_HEADS + index;
+    return unpack_bf16(b_input.words[scalar_index >> 1u], scalar_index);
+}
+
+float read_a(uint position, uint index) {
+    uint scalar_index = position * VALUE_HEADS + index;
+    return unpack_bf16(a_input.words[scalar_index >> 1u], scalar_index);
+}
+
+float read_a_log(uint index) { return {{READ_A_LOG}}; }
+float read_dt_bias(uint index) { return {{READ_DT_BIAS}}; }
+float read_norm_weight(uint index) { return {{READ_NORM_WEIGHT}}; }
+
+float softplus(float value) {
+    return value > 20.0 ? value : log(1.0 + exp(value));
+}
+
+void main() {
+    uint value_head = gl_WorkGroupID.x;
+    uint value_dim = gl_LocalInvocationID.x;
+    if (value_head >= VALUE_HEADS) return;
+
+    uint key_head = value_head / KEY_HEAD_REPEAT;
+    uint q_base = key_head * KEY_HEAD_WIDTH;
+    uint k_base = KEY_WIDTH + q_base;
+    uint v_base = 2u * KEY_WIDTH + value_head * VALUE_HEAD_WIDTH;
+    uint state_base = value_head * KEY_HEAD_WIDTH * VALUE_HEAD_WIDTH;
+    float recurrent_state[KEY_HEAD_WIDTH];
+    for (uint key_dim = 0u; key_dim < KEY_HEAD_WIDTH; key_dim++) {
+        recurrent_state[key_dim] = state_read.values[
+            state_base + key_dim * VALUE_HEAD_WIDTH + value_dim
+        ];
+    }
+
+    for (uint position = 0u; position < batch_control.batch_width; position++) {
+        if (value_dim == 0u) {
+            float q_sum = 0.0;
+            float k_sum = 0.0;
+            for (uint key_dim = 0u; key_dim < KEY_HEAD_WIDTH; key_dim++) {
+                float q = read_qkv(position, q_base + key_dim);
+                float k = read_qkv(position, k_base + key_dim);
+                q_sum = fma(q, q, q_sum);
+                k_sum = fma(k, k, k_sum);
+            }
+            q_inv_norm = inversesqrt(q_sum + 0.000001);
+            k_inv_norm = inversesqrt(k_sum + 0.000001);
+        }
+        barrier();
+
+        float beta = 1.0 / (1.0 + exp(-read_b(position, value_head)));
+        float decay_log = -exp(read_a_log(value_head)) * softplus(
+            read_a(position, value_head) + read_dt_bias(value_head)
+        );
+        float decay = exp(decay_log);
+
+        float key_memory = 0.0;
+        for (uint key_dim = 0u; key_dim < KEY_HEAD_WIDTH; key_dim++) {
+            float previous = recurrent_state[key_dim] * decay;
+            float key = read_qkv(position, k_base + key_dim) * k_inv_norm;
+            key_memory = fma(previous, key, key_memory);
+        }
+        float value = read_qkv(position, v_base + value_dim);
+        float delta = (value - key_memory) * beta;
+
+        float mixed = 0.0;
+        float attention_scale = inversesqrt(float(KEY_HEAD_WIDTH));
+        for (uint key_dim = 0u; key_dim < KEY_HEAD_WIDTH; key_dim++) {
+            float key = read_qkv(position, k_base + key_dim) * k_inv_norm;
+            float next = recurrent_state[key_dim] * decay + key * delta;
+            recurrent_state[key_dim] = next;
+            float query = read_qkv(position, q_base + key_dim) * q_inv_norm;
+            mixed = fma(next, query * attention_scale, mixed);
+        }
+
+        float partial = subgroupAdd(mixed * mixed);
+        if (gl_SubgroupInvocationID == 0u) reduction[gl_SubgroupID] = partial;
+        barrier();
+        float sum_squares = 0.0;
+        for (uint subgroup = 0u; subgroup < gl_NumSubgroups; subgroup++) {
+            sum_squares += reduction[subgroup];
+        }
+        float inv_rms = inversesqrt(
+            sum_squares / float(VALUE_HEAD_WIDTH) + NORM_EPS
+        );
+        float z = read_z(position, value_head * VALUE_HEAD_WIDTH + value_dim);
+        head_output[value_dim] = mixed * inv_rms * read_norm_weight(value_dim)
+            * (z / (1.0 + exp(-z)));
+        barrier();
+
+        if ((value_dim & 1u) == 0u) {
+            uint output_index = value_head * VALUE_HEAD_WIDTH + value_dim;
+            uint output_word = (position * VALUE_WIDTH + output_index) >> 1u;
+            output_frame.words[output_word] =
+                (f32_to_bf16(head_output[value_dim + 1u]) << 16u)
+                | f32_to_bf16(head_output[value_dim]);
+        }
+        barrier();
+    }
+
+    for (uint key_dim = 0u; key_dim < KEY_HEAD_WIDTH; key_dim++) {
+        state_write.values[state_base + key_dim * VALUE_HEAD_WIDTH + value_dim] =
+            recurrent_state[key_dim];
+    }
+}

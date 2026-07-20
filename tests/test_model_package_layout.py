@@ -8,10 +8,13 @@ import pytest
 
 from llmoop.compilation import ModelCompileError
 from llmoop.model_package import (
+    CAUSAL_SCAN_LANE_TILE_WIDTH,
     PEDAL_BATCH_LANE_TILE_WIDTH,
     ROW_MAJOR_LAYOUT,
     VULKAN_BF16_ROW_PAIR_LAYOUT,
     attention_workgroup_shape,
+    causal_scan_batch_shader_file,
+    causal_scan_workgroup_count_x,
     compiled_tensor_layout,
     copy_shader_templates,
     required_vulkan_device_extensions,
@@ -54,6 +57,23 @@ def test_compiler_selects_only_compatible_weight_shared_batch_kernels() -> None:
         "linear_fp8_e4m3_b127x128_5120x17408.comp"
     ) is None
     assert weight_shared_batch_shader_file("linear_paired_bf16_1023x1024.comp") is None
+
+
+def test_compiler_selects_stateful_causal_scan_kernels() -> None:
+    assert CAUSAL_SCAN_LANE_TILE_WIDTH == 64
+    assert causal_scan_batch_shader_file(
+        "causal_conv1d_silu_bf16_c8192_k4.comp"
+    ) == "causal_conv1d_silu_temporal_bf16_c8192_k4.comp"
+    assert causal_scan_batch_shader_file(
+        "gated_delta_step_k16x128_v32x128_af32_dtbf16_nf32_eps1e-06.comp"
+    ) == "gated_delta_scan_k16x128_v32x128_af32_dtbf16_nf32_eps1e-06.comp"
+    assert causal_scan_batch_shader_file("linear_paired_bf16_4096x4096.comp") is None
+    assert causal_scan_workgroup_count_x(
+        "causal_conv1d_silu_bf16_c8192_k4.comp"
+    ) == 64
+    assert causal_scan_workgroup_count_x(
+        "gated_delta_step_k16x128_v32x128_af32_dtbf16_nf32_eps1e-06.comp"
+    ) == 32
 
 
 def test_compiler_renders_weight_shared_pedal_batch_shaders(tmp_path: Path) -> None:

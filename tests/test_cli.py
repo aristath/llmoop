@@ -636,11 +636,20 @@ class CompiledPackageTest(unittest.TestCase):
                 [kernel["op"] for kernel in execution["kernels"]],
             )
             for node, kernel in zip(nodes, execution["kernels"], strict=True):
-                self.assertIn(kernel["batch_mode"], {"serial_lanes", "weight_shared"})
-                if kernel["batch_mode"] == "weight_shared":
+                self.assertIn(
+                    kernel["batch_mode"],
+                    {"serial_lanes", "weight_shared", "causal_scan"},
+                )
+                if kernel["batch_mode"] in {"weight_shared", "causal_scan"}:
                     self.assertTrue(kernel["batch_shader_path"].endswith(".spv"))
                 else:
                     self.assertNotIn("batch_shader_path", kernel)
+                if kernel["batch_mode"] == "causal_scan":
+                    self.assertGreater(kernel["batch_lane_tile_width"], 0)
+                    self.assertGreater(kernel["batch_workgroup_count_x"], 0)
+                else:
+                    self.assertNotIn("batch_lane_tile_width", kernel)
+                    self.assertNotIn("batch_workgroup_count_x", kernel)
                 if node["op"] in {
                     "scaled_dot_product_attention",
                     "append_scaled_dot_product_attention",

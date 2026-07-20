@@ -38,6 +38,7 @@ VULKAN_BF16_ROW_PAIR_LAYOUT = "vulkan_bf16_row_pair_u32"
 ROW_MAJOR_LAYOUT = "row_major"
 CONFIG_PACKAGE_FILE = "config.json"
 PEDAL_BATCH_LANE_TILE_WIDTH = 16
+CAUSAL_SCAN_LANE_TILE_WIDTH = 64
 GLSL_VULKAN_DEVICE_EXTENSION_REQUIREMENTS = {
     "GL_EXT_float_e4m3": "VK_EXT_shader_float8",
 }
@@ -748,7 +749,10 @@ def pedal_kernel_spec(
     local_size_x: int,
     workgroup_count_x: int,
 ) -> Json:
-    batch_shader_file = weight_shared_batch_shader_file(shader_file)
+    causal_scan_shader_file = causal_scan_batch_shader_file(shader_file)
+    batch_shader_file = causal_scan_shader_file or weight_shared_batch_shader_file(
+        shader_file
+    )
     spec = {
         "execution_index": execution_index,
         "node_id": node["id"],
@@ -756,11 +760,51 @@ def pedal_kernel_spec(
         "shader_path": f"shaders/{shader_file}",
         "local_size_x": local_size_x,
         "workgroup_count_x": workgroup_count_x,
-        "batch_mode": "weight_shared" if batch_shader_file else "serial_lanes",
+        "batch_mode": (
+            "causal_scan"
+            if causal_scan_shader_file
+            else "weight_shared" if batch_shader_file else "serial_lanes"
+        ),
     }
     if batch_shader_file is not None:
         spec["batch_shader_path"] = f"shaders/{batch_shader_file}"
+    if causal_scan_shader_file is not None:
+        spec["batch_lane_tile_width"] = CAUSAL_SCAN_LANE_TILE_WIDTH
+        spec["batch_workgroup_count_x"] = causal_scan_workgroup_count_x(shader_file)
     return spec
+
+
+def causal_scan_batch_shader_file(shader_file: str) -> str | None:
+    if re.fullmatch(r"causal_conv1d_silu_bf16_c\d+_k\d+\.comp", shader_file):
+        return shader_file.replace(
+            "causal_conv1d_silu_bf16_",
+            "causal_conv1d_silu_temporal_bf16_",
+            1,
+        )
+    if re.fullmatch(
+        r"gated_delta_step_k\d+x\d+_v\d+x\d+"
+        r"_a(?:f32|bf16)_dt(?:f32|bf16)_n(?:f32|bf16)_eps[0-9eE+.-]+\.comp",
+        shader_file,
+    ):
+        return shader_file.replace("gated_delta_step_", "gated_delta_scan_", 1)
+    return None
+
+
+def causal_scan_workgroup_count_x(shader_file: str) -> int:
+    causal_conv = re.fullmatch(
+        r"causal_conv1d_silu_bf16_c(\d+)_k\d+\.comp", shader_file
+    )
+    if causal_conv is not None:
+        channels = int(causal_conv.group(1))
+        return (channels + 127) // 128
+    gated_delta = re.fullmatch(
+        r"gated_delta_step_k\d+x\d+_v(\d+)x\d+"
+        r"_a(?:f32|bf16)_dt(?:f32|bf16)_n(?:f32|bf16)_eps[0-9eE+.-]+\.comp",
+        shader_file,
+    )
+    if gated_delta is not None:
+        return int(gated_delta.group(1))
+    raise ModelCompileError(f"shader {shader_file!r} is not a causal scan kernel")
 
 
 def weight_shared_batch_shader_file(shader_file: str) -> str | None:
@@ -2240,6 +2284,11 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
             ("BLOCKS", "BLOCK_PART_WIDTH"),
         ),
         (
+            r"causal_conv1d_silu_temporal_bf16_c(\d+)_k(\d+)\.comp",
+            "causal_conv1d_silu_temporal_bf16.comp.template",
+            ("CHANNELS", "KERNEL_WIDTH"),
+        ),
+        (
             r"causal_conv1d_silu_bf16_c(\d+)_k(\d+)\.comp",
             "causal_conv1d_silu_bf16.comp.template",
             ("CHANNELS", "KERNEL_WIDTH"),
@@ -2289,7 +2338,10 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
         match = re.fullmatch(pattern, shader_file)
         if match is not None:
             replacements = dict(zip(names, match.groups(), strict=True))
-            if template == "causal_conv1d_silu_bf16.comp.template":
+            if template in (
+                "causal_conv1d_silu_bf16.comp.template",
+                "causal_conv1d_silu_temporal_bf16.comp.template",
+            ):
                 channels = int(replacements["CHANNELS"])
                 kernel_width = int(replacements["KERNEL_WIDTH"])
                 if channels % 2 != 0 or kernel_width % 2 != 0:
@@ -2421,13 +2473,14 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
         )
 
     gated_delta_shape = re.fullmatch(
-        r"gated_delta_step_k(\d+)x(\d+)_v(\d+)x(\d+)"
+        r"gated_delta_(step|scan)_k(\d+)x(\d+)_v(\d+)x(\d+)"
         r"_a(f32|bf16)_dt(f32|bf16)_n(f32|bf16)_eps([0-9eE+.-]+)\.comp",
         shader_file,
     )
     if gated_delta_shape is not None:
+        execution_mode = gated_delta_shape.group(1)
         key_heads, key_width, value_heads, value_width = map(
-            int, gated_delta_shape.groups()[:4]
+            int, gated_delta_shape.groups()[1:5]
         )
         if value_heads % key_heads != 0:
             raise ModelCompileError(
@@ -2439,7 +2492,11 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
             )
         return render_shader_template(
             source_dir,
-            "gated_delta_step.comp.template",
+            (
+                "gated_delta_scan.comp.template"
+                if execution_mode == "scan"
+                else "gated_delta_step.comp.template"
+            ),
             {
                 "KEY_HEADS": str(key_heads),
                 "KEY_HEAD_WIDTH": str(key_width),
@@ -2447,15 +2504,15 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
                 "VALUE_HEAD_WIDTH": str(value_width),
                 "KEY_HEAD_REPEAT": str(value_heads // key_heads),
                 "READ_A_LOG": scalar_parameter_read_expression(
-                    "a_log", gated_delta_shape.group(5)
+                    "a_log", gated_delta_shape.group(6)
                 ),
                 "READ_DT_BIAS": scalar_parameter_read_expression(
-                    "dt_bias", gated_delta_shape.group(6)
+                    "dt_bias", gated_delta_shape.group(7)
                 ),
                 "READ_NORM_WEIGHT": scalar_parameter_read_expression(
-                    "norm_weight", gated_delta_shape.group(7)
+                    "norm_weight", gated_delta_shape.group(8)
                 ),
-                "NORM_EPS": gated_delta_shape.group(8),
+                "NORM_EPS": gated_delta_shape.group(9),
             },
         )
 
@@ -3531,12 +3588,31 @@ def validate_compiled_pedal_executions(
                 )
             batch_mode = kernel.get("batch_mode")
             batch_shader_path = kernel.get("batch_shader_path")
-            if batch_mode == "serial_lanes" and batch_shader_path is None:
+            batch_lane_tile_width = kernel.get("batch_lane_tile_width")
+            batch_workgroup_count_x = kernel.get("batch_workgroup_count_x")
+            if (
+                batch_mode == "serial_lanes"
+                and batch_shader_path is None
+                and batch_lane_tile_width is None
+                and batch_workgroup_count_x is None
+            ):
                 continue
             if (
                 batch_mode == "weight_shared"
                 and isinstance(batch_shader_path, str)
                 and batch_shader_path
+                and batch_lane_tile_width is None
+                and batch_workgroup_count_x is None
+            ):
+                continue
+            if (
+                batch_mode == "causal_scan"
+                and isinstance(batch_shader_path, str)
+                and batch_shader_path
+                and isinstance(batch_lane_tile_width, int)
+                and batch_lane_tile_width > 0
+                and isinstance(batch_workgroup_count_x, int)
+                and batch_workgroup_count_x > 0
             ):
                 continue
             raise ModelCompileError(

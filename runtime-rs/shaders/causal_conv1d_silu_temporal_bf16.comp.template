@@ -1,0 +1,113 @@
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer InputFrames {
+    uint words[];
+} input_frames;
+
+layout(set = 0, binding = 1) buffer OutputFrames {
+    uint words[];
+} output_frames;
+
+layout(set = 0, binding = 2) readonly buffer ConvKernel {
+    uint words[];
+} conv_kernel;
+
+layout(set = 0, binding = 3) readonly buffer StateRead {
+    uint words[];
+} state_read;
+
+layout(set = 0, binding = 4) buffer StateWrite {
+    uint words[];
+} state_write;
+
+layout(push_constant) uniform BatchControl { uint batch_width; } batch_control;
+
+const uint CHANNELS = {{CHANNELS}}u;
+const uint KERNEL_WIDTH = {{KERNEL_WIDTH}}u;
+const uint FRAME_WORDS = CHANNELS / 2u;
+
+float bf16_to_f32(uint value) {
+    return uintBitsToFloat((value & 0xffffu) << 16);
+}
+
+uint f32_to_bf16(float value) {
+    uint bits = floatBitsToUint(value);
+    uint lsb = (bits >> 16) & 1u;
+    return (bits + 0x7fffu + lsb) >> 16;
+}
+
+uint unpack_bf16(uint packed, uint index) {
+    return (index & 1u) == 0u ? packed & 0xffffu : packed >> 16;
+}
+
+uint read_current(uint position, uint index) {
+    return unpack_bf16(
+        input_frames.words[position * FRAME_WORDS + (index >> 1u)],
+        index
+    );
+}
+
+uint read_kernel(uint index) {
+    return unpack_bf16(conv_kernel.words[index >> 1u], index);
+}
+
+void main() {
+    uint channel_pair = gl_GlobalInvocationID.x;
+    if (channel_pair >= CHANNELS / 2u) return;
+
+    uint channels[2] = uint[2](channel_pair * 2u, channel_pair * 2u + 1u);
+    uint state[2][KERNEL_WIDTH];
+    for (uint pair_lane = 0u; pair_lane < 2u; pair_lane++) {
+        uint state_base = channels[pair_lane] * KERNEL_WIDTH;
+        for (uint tap = 0u; tap < KERNEL_WIDTH; tap++) {
+            state[pair_lane][tap] = unpack_bf16(
+                state_read.words[(state_base + tap) >> 1u],
+                state_base + tap
+            );
+        }
+    }
+
+    for (uint position = 0u; position < batch_control.batch_width; position++) {
+        uint result[2];
+        for (uint pair_lane = 0u; pair_lane < 2u; pair_lane++) {
+            uint channel = channels[pair_lane];
+            uint state_base = channel * KERNEL_WIDTH;
+            float convolution = 0.0;
+            for (uint tap = 0u; tap < KERNEL_WIDTH; tap += 2u) {
+                uint first = tap + 1u < KERNEL_WIDTH
+                    ? state[pair_lane][tap + 1u]
+                    : read_current(position, channel);
+                uint second = tap + 2u < KERNEL_WIDTH
+                    ? state[pair_lane][tap + 2u]
+                    : read_current(position, channel);
+                state[pair_lane][tap] = first;
+                state[pair_lane][tap + 1u] = second;
+                convolution = fma(
+                    bf16_to_f32(first),
+                    bf16_to_f32(read_kernel(state_base + tap)),
+                    convolution
+                );
+                convolution = fma(
+                    bf16_to_f32(second),
+                    bf16_to_f32(read_kernel(state_base + tap + 1u)),
+                    convolution
+                );
+            }
+            result[pair_lane] = f32_to_bf16(
+                convolution / (1.0 + exp(-convolution))
+            );
+        }
+        output_frames.words[position * FRAME_WORDS + channel_pair] =
+            result[0] | (result[1] << 16u);
+    }
+
+    for (uint pair_lane = 0u; pair_lane < 2u; pair_lane++) {
+        uint state_base = channels[pair_lane] * KERNEL_WIDTH;
+        for (uint tap = 0u; tap < KERNEL_WIDTH; tap += 2u) {
+            state_write.words[(state_base + tap) >> 1u] =
+                state[pair_lane][tap] | (state[pair_lane][tap + 1u] << 16u);
+        }
+    }
+}

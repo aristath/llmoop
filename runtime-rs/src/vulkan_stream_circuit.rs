@@ -5946,6 +5946,12 @@ enum VulkanPedalBatchStateSemantics<'a> {
     CausalSequence,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VulkanPedalBatchExecutionMode {
+    IndependentCandidates,
+    CausalSequence,
+}
+
 struct VulkanResidentPedalBatchSliceRunner {
     lane_capacity: usize,
     signal_buffers: Vec<VulkanPedalBatchSignalBuffer>,
@@ -5961,6 +5967,7 @@ impl VulkanResidentPedalBatchSliceRunner {
         slice: &VulkanResidentInProcessPlacedStreamProcessorDevice,
         lane_capacity: usize,
         weight_shared_tile_width: usize,
+        execution_mode: VulkanPedalBatchExecutionMode,
     ) -> Result<Self, VulkanResidentInProcessPlacedRuntimeError> {
         if lane_capacity == 0 || weight_shared_tile_width == 0 {
             return Err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop(
@@ -6013,12 +6020,34 @@ impl VulkanResidentPedalBatchSliceRunner {
         let mut steps = Vec::new();
         for dispatch in &slice.mounted_bound.dispatches {
             let batch_artifact = slice.package_slice.batch_kernels.iter().find(|artifact| {
-                artifact.pedal_id == dispatch.pedal_id && artifact.node_id == dispatch.node_id
+                artifact.pedal_id == dispatch.pedal_id
+                    && artifact.node_id == dispatch.node_id
+                    && (artifact.batch_mode == VulkanResidentPedalKernelBatchMode::WeightShared
+                        || execution_mode == VulkanPedalBatchExecutionMode::CausalSequence)
             });
             if let Some(batch_artifact) = batch_artifact {
-                if dispatch.uses_stream_tick
-                    || !dispatch.push_constants.is_empty()
-                    || dispatch.descriptors.iter().any(|descriptor| {
+                if batch_artifact.batch_mode == VulkanResidentPedalKernelBatchMode::CausalScan
+                    && batch_artifact
+                        .lane_tile_width
+                        .is_none_or(|tile_width| lane_capacity > tile_width)
+                {
+                    return Err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop(
+                        VulkanError(format!(
+                            "causal scan kernel {}.{} cannot execute {lane_capacity} lanes with tile width {:?}",
+                            dispatch.pedal_id, dispatch.node_id, batch_artifact.lane_tile_width
+                        )),
+                    ));
+                }
+                if dispatch.uses_stream_tick || !dispatch.push_constants.is_empty() {
+                    return Err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop(
+                        VulkanError(format!(
+                            "pedal batch kernel {}.{} requires scalar control values",
+                            dispatch.pedal_id, dispatch.node_id
+                        )),
+                    ));
+                }
+                if batch_artifact.batch_mode == VulkanResidentPedalKernelBatchMode::WeightShared
+                    && dispatch.descriptors.iter().any(|descriptor| {
                         matches!(
                             descriptor.usage,
                             VulkanKernelDescriptorUsage::StateRead
@@ -6047,23 +6076,30 @@ impl VulkanResidentPedalBatchSliceRunner {
                         &batch_artifact.spirv_words,
                         &bindings,
                         batch_artifact.workgroup_count_x,
-                        u32::try_from(
-                            lane_capacity
-                                .checked_add(weight_shared_tile_width - 1)
-                                .ok_or_else(|| {
-                                    VulkanResidentInProcessPlacedRuntimeError::BackendLoop(
-                                        VulkanError(
-                                            "pedal batch workgroup count overflowed".to_string(),
-                                        ),
-                                    )
-                                })?
-                                / weight_shared_tile_width,
-                        )
-                        .map_err(|_| {
-                            VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(
-                                "pedal batch workgroup count exceeds u32".to_string(),
-                            ))
-                        })?,
+                        match batch_artifact.batch_mode {
+                            VulkanResidentPedalKernelBatchMode::WeightShared => u32::try_from(
+                                lane_capacity
+                                    .checked_add(weight_shared_tile_width - 1)
+                                    .ok_or_else(|| {
+                                        VulkanResidentInProcessPlacedRuntimeError::BackendLoop(
+                                            VulkanError(
+                                                "pedal batch workgroup count overflowed"
+                                                    .to_string(),
+                                            ),
+                                        )
+                                    })?
+                                    / weight_shared_tile_width,
+                            )
+                            .map_err(|_| {
+                                VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(
+                                    "pedal batch workgroup count exceeds u32".to_string(),
+                                ))
+                            })?,
+                            VulkanResidentPedalKernelBatchMode::CausalScan => 1,
+                            VulkanResidentPedalKernelBatchMode::SerialLanes => unreachable!(
+                                "serial-lane kernels do not have pedal batch artifacts"
+                            ),
+                        },
                         batch_artifact.local_size_x,
                         std::mem::size_of::<u32>() as u32,
                     )
@@ -6436,6 +6472,7 @@ impl VulkanResidentPlacedPedalBatchRunner {
         placed_slices: &[VulkanResidentInProcessPlacedStreamProcessorDevice],
         lane_capacity: usize,
         weight_shared_tile_width: usize,
+        execution_mode: VulkanPedalBatchExecutionMode,
     ) -> Result<Self, VulkanResidentInProcessPlacedRuntimeError> {
         let slices = placed_slices
             .iter()
@@ -6450,6 +6487,7 @@ impl VulkanResidentPlacedPedalBatchRunner {
                     slice,
                     lane_capacity,
                     weight_shared_tile_width,
+                    execution_mode,
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -10422,6 +10460,10 @@ pub struct VulkanResidentPedalKernelSpec {
     pub batch_mode: VulkanResidentPedalKernelBatchMode,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub batch_shader_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub batch_lane_tile_width: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub batch_workgroup_count_x: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -10429,6 +10471,7 @@ pub struct VulkanResidentPedalKernelSpec {
 pub enum VulkanResidentPedalKernelBatchMode {
     SerialLanes,
     WeightShared,
+    CausalScan,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -10494,6 +10537,8 @@ pub struct VulkanResidentPedalKernelShaderRef {
 struct VulkanResidentPedalBatchKernelArtifact {
     pedal_id: String,
     node_id: String,
+    batch_mode: VulkanResidentPedalKernelBatchMode,
+    lane_tile_width: Option<usize>,
     spirv_words: Vec<u32>,
     local_size_x: u32,
     workgroup_count_x: u32,
@@ -12234,6 +12279,7 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
                 &self.device_slices,
                 transaction_width,
                 tile_width,
+                VulkanPedalBatchExecutionMode::IndependentCandidates,
             )?;
             *self.pedal_batch_execution.borrow_mut() = Some(runner);
         }
@@ -12400,6 +12446,19 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
                 width = width.min((SIGNAL_MEMORY_BUDGET_PER_DEVICE / signal_bytes_per_lane).max(1));
             }
 
+            if let Some(causal_scan_tile_width) = slice
+                .package_slice
+                .batch_kernels
+                .iter()
+                .filter(|artifact| {
+                    artifact.batch_mode == VulkanResidentPedalKernelBatchMode::CausalScan
+                })
+                .filter_map(|artifact| artifact.lane_tile_width)
+                .min()
+            {
+                width = width.min(causal_scan_tile_width);
+            }
+
             let scalar_dispatches_per_lane = slice
                 .mounted_bound
                 .dispatches
@@ -12448,6 +12507,7 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
             &self.device_slices,
             block_width,
             tile_width,
+            VulkanPedalBatchExecutionMode::CausalSequence,
         )?;
         let input_device = devices.get(&self.model.input_device_id).ok_or_else(|| {
             VulkanResidentInProcessPlacedRuntimeError::MissingBoundDevice {
@@ -15930,22 +15990,36 @@ fn validate_pedal_executions(
                     package_id, pedal.pedal_id, kernel.node_id
                 )));
             }
-            match (kernel.batch_mode, kernel.batch_shader_path.as_deref()) {
-                (VulkanResidentPedalKernelBatchMode::SerialLanes, None) => {}
-                (VulkanResidentPedalKernelBatchMode::WeightShared, Some(path))
-                    if !path.is_empty() => {}
-                (VulkanResidentPedalKernelBatchMode::SerialLanes, Some(_)) => {
-                    return Err(VulkanResidentTokenModelPackageError::new(format!(
-                        "resident model package {:?} declares serial-lane kernel {}.{} with a batch shader",
-                        package_id, pedal.pedal_id, kernel.node_id
-                    )));
+            let valid_batch_contract = match kernel.batch_mode {
+                VulkanResidentPedalKernelBatchMode::SerialLanes => {
+                    kernel.batch_shader_path.is_none()
+                        && kernel.batch_lane_tile_width.is_none()
+                        && kernel.batch_workgroup_count_x.is_none()
                 }
-                (VulkanResidentPedalKernelBatchMode::WeightShared, _) => {
-                    return Err(VulkanResidentTokenModelPackageError::new(format!(
-                        "resident model package {:?} declares weight-shared kernel {}.{} without a batch shader",
-                        package_id, pedal.pedal_id, kernel.node_id
-                    )));
+                VulkanResidentPedalKernelBatchMode::WeightShared => {
+                    kernel
+                        .batch_shader_path
+                        .as_deref()
+                        .is_some_and(|path| !path.is_empty())
+                        && kernel.batch_lane_tile_width.is_none()
+                        && kernel.batch_workgroup_count_x.is_none()
                 }
+                VulkanResidentPedalKernelBatchMode::CausalScan => {
+                    kernel
+                        .batch_shader_path
+                        .as_deref()
+                        .is_some_and(|path| !path.is_empty())
+                        && kernel.batch_lane_tile_width.is_some_and(|width| width > 0)
+                        && kernel
+                            .batch_workgroup_count_x
+                            .is_some_and(|workgroups| workgroups > 0)
+                }
+            };
+            if !valid_batch_contract {
+                return Err(VulkanResidentTokenModelPackageError::new(format!(
+                    "resident model package {:?} declares invalid {:?} execution metadata for {}.{}",
+                    package_id, kernel.batch_mode, pedal.pedal_id, kernel.node_id
+                )));
             }
         }
     }
@@ -16899,10 +16973,13 @@ fn load_resident_pedal_batch_kernels(
         .iter()
         .flat_map(|pedal| {
             pedal.kernels.iter().filter_map(move |kernel| {
-                (kernel.batch_mode == VulkanResidentPedalKernelBatchMode::WeightShared
-                    && mounted_bound
-                        .dispatch(&pedal.pedal_id, &kernel.node_id)
-                        .is_some())
+                (matches!(
+                    kernel.batch_mode,
+                    VulkanResidentPedalKernelBatchMode::WeightShared
+                        | VulkanResidentPedalKernelBatchMode::CausalScan
+                ) && mounted_bound
+                    .dispatch(&pedal.pedal_id, &kernel.node_id)
+                    .is_some())
                 .then_some((pedal, kernel))
             })
         })
@@ -16916,12 +16993,16 @@ fn load_resident_pedal_batch_kernels(
             Ok(VulkanResidentPedalBatchKernelArtifact {
                 pedal_id: pedal.pedal_id.clone(),
                 node_id: kernel.node_id.clone(),
+                batch_mode: kernel.batch_mode,
+                lane_tile_width: kernel.batch_lane_tile_width.map(|width| width as usize),
                 spirv_words: load_required_resident_model_package_shader(
                     manifest_dir,
                     shader_path,
                 )?,
                 local_size_x: kernel.local_size_x,
-                workgroup_count_x: kernel.workgroup_count_x,
+                workgroup_count_x: kernel
+                    .batch_workgroup_count_x
+                    .unwrap_or(kernel.workgroup_count_x),
             })
         })
         .collect()
@@ -23271,6 +23352,12 @@ mod tests {
                     workgroup_count_x: 1,
                     batch_mode,
                     batch_shader_path,
+                    batch_lane_tile_width: (batch_mode
+                        == VulkanResidentPedalKernelBatchMode::CausalScan)
+                        .then_some(64),
+                    batch_workgroup_count_x: (batch_mode
+                        == VulkanResidentPedalKernelBatchMode::CausalScan)
+                        .then_some(1),
                 }],
             }]
         };
@@ -23288,6 +23375,14 @@ mod tests {
             ),
         )
         .unwrap();
+        validate_pedal_executions(
+            "fixture",
+            &execution(
+                VulkanResidentPedalKernelBatchMode::CausalScan,
+                Some("shaders/project_scan.spv".to_string()),
+            ),
+        )
+        .unwrap();
 
         let serial_error = validate_pedal_executions(
             "fixture",
@@ -23297,14 +23392,14 @@ mod tests {
             ),
         )
         .unwrap_err();
-        assert!(serial_error.to_string().contains("serial-lane kernel"));
+        assert!(serial_error.to_string().contains("invalid SerialLanes"));
 
         let batch_error = validate_pedal_executions(
             "fixture",
             &execution(VulkanResidentPedalKernelBatchMode::WeightShared, None),
         )
         .unwrap_err();
-        assert!(batch_error.to_string().contains("without a batch shader"));
+        assert!(batch_error.to_string().contains("invalid WeightShared"));
     }
 
     fn selected_test_vulkan_device() -> Result<VulkanComputeDevice, VulkanError> {
