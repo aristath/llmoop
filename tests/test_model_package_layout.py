@@ -498,6 +498,27 @@ def test_compiler_renders_direct_three_way_linear_split_shaders(tmp_path: Path) 
     assert "{{" not in row_major_source
 
 
+def test_compiler_renders_row_major_per_layer_embedding_shader(tmp_path: Path) -> None:
+    shader_source_dir = Path(__file__).parents[1] / "runtime-rs" / "shaders"
+    shader_file = (
+        "per_layer_embedding_bf16_v32000_h1024_p128_l2of8_eps1e-06_"
+        "tes1_pes1_mps1_cs1__sc5.comp"
+    )
+
+    copy_shader_templates(shader_source_dir, tmp_path, {shader_file})
+
+    source = (tmp_path / shader_file).read_text()
+    assert "readonly buffer TokenEmbedding { uint words[]; }" in source
+    assert "readonly buffer PerLayerEmbedding { uint words[]; }" in source
+    assert "readonly buffer ModelProjection { uint words[]; }" in source
+    assert "token_id * INPUT_WORDS + word" in source
+    assert "token_id * PACKED_WORDS + word" in source
+    assert "row * INPUT_WORDS + word" in source
+    assert "uvec2" not in source
+    assert "layout(set = 0, binding = 5) readonly buffer StreamControl" in source
+    assert "{{" not in source
+
+
 def test_compiler_renders_parallel_linear_shaders(tmp_path: Path) -> None:
     shader_source_dir = Path(__file__).parents[1] / "runtime-rs" / "shaders"
     pair = "parallel_linear_2way_paired_bf16_1024x2560_2560.comp"

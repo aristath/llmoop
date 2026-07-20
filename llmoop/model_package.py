@@ -1680,7 +1680,7 @@ def shader_file_for_node(
         vocab_size = int(token_shape[0])
         binding = stream_control_binding_for_node(circuit, node)
         return (
-            f"per_layer_embedding_paired_bf16_v{vocab_size}_h{attrs['hidden_size']}"
+            f"per_layer_embedding_bf16_v{vocab_size}_h{attrs['hidden_size']}"
             f"_p{attrs['per_layer_width']}_l{attrs['layer_index']}of{attrs['layer_count']}"
             f"_eps{shader_float_token(float(attrs['norm_eps']))}"
             f"_tes{shader_float_token(float(attrs['token_embedding_scale']))}"
@@ -2815,7 +2815,7 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
             return render_shader_template(source_dir, template, replacements)
 
     per_layer_embedding_shape = re.fullmatch(
-        r"per_layer_embedding_paired_bf16_v(\d+)_h(\d+)_p(\d+)_l(\d+)of(\d+)"
+        r"per_layer_embedding_bf16_v(\d+)_h(\d+)_p(\d+)_l(\d+)of(\d+)"
         r"_eps([0-9eE+.-]+)_tes([0-9eE+.-]+)_pes([0-9eE+.-]+)"
         r"_mps([0-9eE+.-]+)_cs([0-9eE+.-]+)\.comp",
         shader_file,
@@ -2830,7 +2830,7 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
         ) = map(int, per_layer_embedding_shape.groups()[:5])
         if hidden_size % 2 or per_layer_width % 2:
             raise ModelCompileError(
-                "paired per-layer embeddings require even hidden and per-layer widths"
+                "packed BF16 per-layer embeddings require even hidden and per-layer widths"
             )
         if not 0 <= layer_index < layer_count:
             raise ModelCompileError(
@@ -2838,7 +2838,7 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
             )
         return render_shader_template(
             source_dir,
-            "per_layer_embedding_paired_bf16.comp.template",
+            "per_layer_embedding_bf16.comp.template",
             {
                 "VOCAB_SIZE": str(vocab_size),
                 "HIDDEN_SIZE": str(hidden_size),

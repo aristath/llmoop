@@ -526,6 +526,8 @@ def test_shader_templates_compile_to_vulkan_1_4_spirv(tmp_path: Path) -> None:
         "parallel_linear_silu_multiply_fp8_e4m3_b128x128_5120x17408.comp",
         "parallel_linear_silu_multiply_batch16_fp8_e4m3_b128x128_5120x17408.comp",
         "parallel_linear_silu_multiply_batch16_paired_bf16_768x2048.comp",
+        "per_layer_embedding_bf16_v32000_h768_p128_l2of6_eps1e-05_"
+        "tes1_pes1_mps1_cs1__sc5.comp",
         "rms_norm_bf16_h768_eps1e-05_offset0.comp",
         "rotary_bf16_12x64_r64_theta10000_half__sc2.comp",
         "append_kv_state_bf16_4x64__sc9.comp",
