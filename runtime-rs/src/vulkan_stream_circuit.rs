@@ -18,9 +18,9 @@ use crate::stream_circuit::{
     CableTransport, CircuitParamsArtifact, CircuitRuntimeRole, CircuitStateArtifact,
     LOWERED_PEDALBOARD_SCHEMA, LoweredCircuitRef, LoweredPedalboard, LoweredPedalboardGraph,
     LoweredPedalboardSource, LoweredPedalboardSummary, PedalCablePlacement,
-    ResolvedCircuitArtifact, ResolvedLoweredPedalboard, StreamCircuit, StreamCircuitGraphBoundary,
-    StreamCircuitPedalInstanceStatePolicy, StreamCircuitPlacementPlan, StreamCircuitPlacementSpec,
-    StreamCircuitRuntimePatch,
+    RUNTIME_DEFAULT_LOGICAL_DEVICE_ID, ResolvedCircuitArtifact, ResolvedLoweredPedalboard,
+    StreamCircuit, StreamCircuitGraphBoundary, StreamCircuitPedalInstanceStatePolicy,
+    StreamCircuitPlacementPlan, StreamCircuitPlacementSpec, StreamCircuitRuntimePatch,
 };
 use crate::stream_plan::{
     CircuitActivationPlan, PlannedNode, PlannedParameterResource, PlannedPort, SignalProducer,
@@ -7243,7 +7243,11 @@ impl Error for VulkanResidentTokenModelPackageError {}
 pub struct VulkanResidentModelPackageManifest {
     pub schema: String,
     pub package_id: String,
-    pub device_id: String,
+    #[serde(
+        skip_serializing,
+        skip_deserializing,
+        default = "runtime_default_placement"
+    )]
     pub placement: StreamCircuitPlacementSpec,
     pub circuit_graph: VulkanResidentPackageCircuitGraph,
     pub tensor_index_path: String,
@@ -7258,6 +7262,10 @@ pub struct VulkanResidentModelPackageManifest {
     pub sampler: VulkanResidentSamplerPackageSpec,
     pub pedal_executions: Vec<VulkanResidentPedalExecutionSpec>,
     pub artifact_integrity: VulkanResidentPackageArtifactIntegrity,
+}
+
+fn runtime_default_placement() -> StreamCircuitPlacementSpec {
+    StreamCircuitPlacementSpec::new(RUNTIME_DEFAULT_LOGICAL_DEVICE_ID)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -7823,6 +7831,18 @@ impl VulkanResidentModelPackageManifest {
         let bytes = fs::read(path)?;
         let raw_manifest: Value = serde_json::from_slice(&bytes)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let compiler_owned_placement = ["device_id", "placement"]
+            .into_iter()
+            .filter(|field| raw_manifest.get(field).is_some())
+            .collect::<Vec<_>>();
+        if !compiler_owned_placement.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "compiled model package must not contain runtime placement fields {compiler_owned_placement:?}"
+                ),
+            ));
+        }
         let manifest: Self = serde_json::from_value(raw_manifest.clone())
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         if manifest.schema != VULKAN_RESIDENT_MODEL_PACKAGE_MANIFEST_SCHEMA {
@@ -8043,7 +8063,6 @@ impl VulkanResidentModelPackageManifest {
             }
         }
 
-        self.device_id = patch.default_device_id.clone();
         self.placement = placement;
         self.circuit_graph.wiring = patch.wiring.clone();
         self.circuit_graph.cables = patch
@@ -11171,9 +11190,10 @@ impl VulkanResidentModelPackage {
 
         let tensor_index_path =
             resolve_resident_model_package_path(manifest_dir, &manifest.tensor_index_path);
+        let default_device_id = manifest.placement.default_device_id.clone();
         let (tensor_index, resource_plan, placed_plan) =
             plan_resident_package_single_device_stream_circuit(
-                &manifest.device_id,
+                &default_device_id,
                 &manifest.placement,
                 &manifest.circuit_graph,
                 manifest_dir,
@@ -11206,7 +11226,7 @@ impl VulkanResidentModelPackage {
         let transducer_parameter_buffers =
             Arc::new(load_resident_package_transducer_parameter_buffers(
                 device,
-                &manifest.device_id,
+                &default_device_id,
                 &resource_plan,
                 &tensor_index,
             )?);
@@ -11256,7 +11276,7 @@ impl VulkanResidentModelPackage {
 
         Ok(Self {
             package_id: manifest.package_id,
-            device_id: manifest.device_id,
+            device_id: default_device_id,
             dynamic_state_capacity_activations: capacity,
             permanent_parameter_count: parameter_buffers.plan.parameter_count,
             permanent_parameter_bytes: parameter_buffers.total_byte_capacity,
@@ -18739,6 +18759,51 @@ mod tests {
     }
 
     #[test]
+    fn package_loader_rejects_compiler_owned_runtime_placement() {
+        let source_manifest_path = fixture_model_package_manifest_path();
+        let raw_manifest: Value =
+            serde_json::from_slice(&std::fs::read(source_manifest_path).unwrap()).unwrap();
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "llmoop-compiler-placement-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let manifest_path = root.join("vulkan_resident_package.json");
+
+        for (field, value) in [
+            ("device_id", Value::from("gpu0")),
+            (
+                "placement",
+                serde_json::json!({
+                    "schema": "llmoop.stream_circuit_placement.v1",
+                    "default_device_id": "gpu0",
+                    "pedal_devices": {}
+                }),
+            ),
+        ] {
+            let mut invalid_manifest = raw_manifest.clone();
+            invalid_manifest[field] = value;
+            std::fs::write(
+                &manifest_path,
+                serde_json::to_vec_pretty(&invalid_manifest).unwrap(),
+            )
+            .unwrap();
+
+            let error = VulkanResidentModelPackageManifest::from_json_file(&manifest_path)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("must not contain runtime placement fields"));
+            assert!(error.contains(field));
+        }
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn package_loader_rejects_paths_outside_the_package() {
         let mut manifest = fixture_model_package_manifest();
         manifest.config_path = "../config.json".to_string();
@@ -19309,9 +19374,10 @@ mod tests {
         let manifest_dir = manifest_path.parent().unwrap();
         let tensor_index_path =
             resolve_resident_model_package_path(manifest_dir, &manifest.tensor_index_path);
+        let default_device_id = manifest.placement.default_device_id.clone();
         let (_tensor_index, _resource_plan, placed_plan) =
             plan_resident_package_single_device_stream_circuit(
-                &manifest.device_id,
+                &default_device_id,
                 &manifest.placement,
                 &manifest.circuit_graph,
                 manifest_dir,
@@ -19347,9 +19413,10 @@ mod tests {
         let manifest_dir = manifest_path.parent().unwrap();
         let tensor_index_path =
             resolve_resident_model_package_path(manifest_dir, &manifest.tensor_index_path);
+        let default_device_id = manifest.placement.default_device_id.clone();
 
         let error = plan_resident_package_single_device_stream_circuit(
-            &manifest.device_id,
+            &default_device_id,
             &manifest.placement,
             &manifest.circuit_graph,
             manifest_dir,

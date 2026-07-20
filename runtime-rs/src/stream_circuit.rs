@@ -14,6 +14,7 @@ pub const CIRCUIT_STATE_SCHEMA: &str = "llmoop.circuit_state.v1";
 pub const LOWERED_PEDALBOARD_SCHEMA: &str = "llmoop.lowered_pedalboard.v1";
 pub const STREAM_CIRCUIT_PLACEMENT_SCHEMA: &str = "llmoop.stream_circuit_placement.v1";
 pub const STREAM_CIRCUIT_RUNTIME_PATCH_SCHEMA: &str = "llmoop.stream_circuit_runtime_patch.v1";
+pub const RUNTIME_DEFAULT_LOGICAL_DEVICE_ID: &str = "runtime_default";
 pub const RUNTIME_CABLE_ROUTES_SCHEMA: &str = "llmoop.runtime_cable_routes.v1";
 pub const RUNTIME_DEVICE_BINDINGS_SCHEMA: &str = "llmoop.runtime_device_bindings.v1";
 pub const RUNTIME_TOPOLOGY_SCHEMA: &str = "llmoop.runtime_topology.v1";
@@ -2783,8 +2784,6 @@ pub struct RuntimePatchControls {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RuntimeCompiledPedalboardSummary {
     pub wiring: String,
-    pub default_device_id: String,
-    pub pedal_devices: BTreeMap<String, String>,
     pub source_pedal_count: usize,
     pub source_pedals: Vec<RuntimeSourcePedal>,
     pub max_context_activations: usize,
@@ -2832,8 +2831,6 @@ pub struct RuntimePackageInspectionReport {
     pub config_path: String,
     pub tokenizer: Value,
     pub compiled_wiring: String,
-    pub compiled_default_device_id: String,
-    pub compiled_pedal_devices: BTreeMap<String, String>,
     pub runtime_patch: RuntimePatchControls,
     pub device_bindings: RuntimeDeviceBindings,
     pub max_context_activations: usize,
@@ -3751,8 +3748,6 @@ mod tests {
             }],
             compiled: RuntimeCompiledPedalboardSummary {
                 wiring: "series".to_string(),
-                default_device_id: "runtime_default".to_string(),
-                pedal_devices: BTreeMap::new(),
                 source_pedal_count: 1,
                 source_pedals: vec![source_pedal],
                 max_context_activations: 16,
@@ -3829,7 +3824,7 @@ mod tests {
         let payload = serde_json::to_value(&report).unwrap();
 
         assert_eq!(payload["schema"], RUNTIME_TOPOLOGY_SCHEMA);
-        assert_eq!(payload["compiled"]["default_device_id"], "runtime_default");
+        assert!(payload["compiled"].get("default_device_id").is_none());
         assert_eq!(
             payload["available_devices"][0]["physical_device_id"],
             "vulkan:0"
@@ -3856,8 +3851,6 @@ mod tests {
             config_path: "config.json".to_string(),
             tokenizer: serde_json::json!({"path": "tokenizer"}),
             compiled_wiring: "series".to_string(),
-            compiled_default_device_id: "runtime_default".to_string(),
-            compiled_pedal_devices: BTreeMap::new(),
             runtime_patch: RuntimePatchControls {
                 default_device_id: None,
                 pedal_devices: BTreeMap::new(),
@@ -3886,7 +3879,7 @@ mod tests {
         let payload = serde_json::to_value(&report).unwrap();
 
         assert_eq!(payload["package_id"], "model-test");
-        assert_eq!(payload["compiled_default_device_id"], "runtime_default");
+        assert!(payload.get("compiled_default_device_id").is_none());
         assert_eq!(
             payload["runtime_patch"]["default_device_id"],
             serde_json::Value::Null

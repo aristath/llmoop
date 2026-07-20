@@ -264,13 +264,7 @@ def minimal_package(root: Path) -> dict[str, object]:
     manifest = {
         "schema": PACKAGE_SCHEMA,
         "package_id": "fixture_package",
-        "device_id": "runtime_default",
         "max_context_activations": 1024,
-        "placement": {
-            "schema": "llmoop.stream_circuit_placement.v1",
-            "default_device_id": "runtime_default",
-            "pedal_devices": {},
-        },
         "circuit_graph": {
             "wiring": "explicit_graph",
             "cables": [
@@ -432,7 +426,7 @@ def test_package_integrity_accepts_a_complete_compiler_boundary(tmp_path: Path) 
         ("execution_identity", "execution identity does not match"),
         ("sampler_contract", "sampler execution does not match"),
         ("generation_boundary", "boundaries must expose"),
-        ("placement_device", "invalid device id"),
+        ("compiler_placement", "must not contain runtime placement fields"),
         ("path_escape", "must stay inside the package"),
     ],
 )
@@ -486,8 +480,12 @@ def test_package_integrity_rejects_corrupt_or_incomplete_artifacts(
             "pedal_id": "output",
             "port_id": "logits",
         }
-    elif corruption == "placement_device":
-        manifest["placement"]["pedal_devices"]["fixture_pedal"] = ""
+    elif corruption == "compiler_placement":
+        manifest["placement"] = {
+            "schema": "llmoop.stream_circuit_placement.v1",
+            "default_device_id": "gpu0",
+            "pedal_devices": {"fixture_pedal": "gpu0"},
+        }
     elif corruption == "path_escape":
         manifest["config_path"] = "../config.json"
 

@@ -10,7 +10,7 @@ from llmoop.cli import (
     build_runtime_command,
     resolve_runtime_package_manifest,
 )
-from llmoop.model_package import copy_shader_templates, package_placement
+from llmoop.model_package import copy_shader_templates
 from tests.fixtures import compiled_model_or_skip
 
 
@@ -543,18 +543,6 @@ class RuntimeCliCommandTest(unittest.TestCase):
         )
 
 
-class PackagePlacementTest(unittest.TestCase):
-    def test_package_placement_is_neutral_default_patch(self) -> None:
-        self.assertEqual(
-            {
-                "schema": "llmoop.stream_circuit_placement.v1",
-                "default_device_id": "runtime_default",
-                "pedal_devices": {},
-            },
-            package_placement(),
-        )
-
-
 class CompiledPackageTest(unittest.TestCase):
     def test_compiled_package_contains_tokenizer_files(self) -> None:
         fixture = compiled_model_or_skip()
@@ -673,15 +661,8 @@ class CompiledPackageTest(unittest.TestCase):
         manifest = json.loads(fixture.package_manifest.read_text())
 
         self.assertNotIn("circuit_index_path", manifest)
-        self.assertEqual(
-            {
-                "schema": "llmoop.stream_circuit_placement.v1",
-                "default_device_id": "runtime_default",
-                "pedal_devices": {},
-            },
-            manifest["placement"],
-        )
-        self.assertEqual("runtime_default", manifest["device_id"])
+        self.assertNotIn("placement", manifest)
+        self.assertNotIn("device_id", manifest)
         circuit_graph = manifest["circuit_graph"]
         self.assertEqual("explicit_graph", circuit_graph["wiring"])
         roles = [pedal["runtime_role"] for pedal in circuit_graph["pedals"]]

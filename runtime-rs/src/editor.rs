@@ -7,10 +7,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    CircuitPlacementError, CircuitRuntimeRole, PedalPlacement, ResolvedLoweredPedalboard,
-    RuntimeAvailableDevice, RuntimeAvailableMemoryHeap, StreamCircuitPedalInstance,
-    StreamCircuitPedalInstanceStatePolicy, StreamCircuitPlacementPlan, StreamCircuitRuntimePatch,
-    VulkanComputeDevice, VulkanResidentModelPackageManifest,
+    CircuitPlacementError, CircuitRuntimeRole, PedalPlacement, RUNTIME_DEFAULT_LOGICAL_DEVICE_ID,
+    ResolvedLoweredPedalboard, RuntimeAvailableDevice, RuntimeAvailableMemoryHeap,
+    StreamCircuitPedalInstance, StreamCircuitPedalInstanceStatePolicy, StreamCircuitPlacementPlan,
+    StreamCircuitRuntimePatch, VulkanComputeDevice, VulkanResidentModelPackageManifest,
 };
 
 pub const RUNTIME_PACKAGE_MANIFEST_FILE: &str = "vulkan_resident_package.json";
@@ -231,7 +231,7 @@ impl RuntimeModelEditor {
             .iter()
             .map(|pedal| pedal.source_id.clone())
             .collect();
-        let available_devices = devices(&manifest.placement.default_device_id);
+        let available_devices = devices(RUNTIME_DEFAULT_LOGICAL_DEVICE_ID);
         Ok(Self {
             package_manifest_path: manifest_path,
             package_root,
@@ -645,8 +645,7 @@ pub(crate) fn load_runtime_model_editor_without_hardware(
             ));
         }
     };
-    let manifest = VulkanResidentModelPackageManifest::from_json_file(&manifest_path)?;
-    let device_id = manifest.placement.default_device_id.clone();
+    let device_id = RUNTIME_DEFAULT_LOGICAL_DEVICE_ID.to_string();
     RuntimeModelEditor::load_with_available_devices(
         manifest_path,
         vec![RuntimeAvailableDevice {

@@ -8,20 +8,21 @@ use std::time::Instant;
 
 use chrono::{DateTime, FixedOffset, Local};
 use llmoop_runtime::{
-    CircuitPort, PedalCablePlacement, PedalPlacement, RUNTIME_TOPOLOGY_SCHEMA,
-    RuntimeAvailableDevice, RuntimeBoundDevice, RuntimeCableRouteTarget, RuntimeCableRoutes,
-    RuntimeCompiledPedalboardSummary, RuntimeDeviceBindings, RuntimeDeviceSliceReport,
-    RuntimeDeviceTickPlanReport, RuntimeEffectivePedalboardTopology, RuntimeLocalCableBufferReport,
-    RuntimePackageInspectionReport, RuntimePatchControls, RuntimePatchDuplicateAfterControl,
-    RuntimePatchInspectionReport, RuntimePatchPlacementReport, RuntimePatchSourceChainEntry,
-    RuntimePedalPortSummary, RuntimePlacedPedalTimingSummaryReport, RuntimePlacedPromptRunReport,
-    RuntimePlacedTransportReport, RuntimePlacementReport, RuntimePromptBenchmarkReport,
-    RuntimePromptBenchmarkRunReport, RuntimePromptBenchmarkTransportTotalsReport,
-    RuntimePromptBenchmarkU64MetricReport, RuntimePromptBenchmarkUsizeMetricReport,
-    RuntimePromptTimingReport, RuntimeRemoteCableBufferReport, RuntimeSingleDevicePromptRunReport,
-    RuntimeSourcePedal, RuntimeTokenizerOptionsReport, RuntimeTopologyReport,
-    VULKAN_BACKEND_LOOP_MAX_WINDOW, VulkanComputeDevice, VulkanComputeDeviceInfo,
-    VulkanResidentHfTokenizerTextCodec, VulkanResidentInProcessPlacedPromptEngine,
+    CircuitPort, PedalCablePlacement, PedalPlacement, RUNTIME_DEFAULT_LOGICAL_DEVICE_ID,
+    RUNTIME_TOPOLOGY_SCHEMA, RuntimeAvailableDevice, RuntimeBoundDevice, RuntimeCableRouteTarget,
+    RuntimeCableRoutes, RuntimeCompiledPedalboardSummary, RuntimeDeviceBindings,
+    RuntimeDeviceSliceReport, RuntimeDeviceTickPlanReport, RuntimeEffectivePedalboardTopology,
+    RuntimeLocalCableBufferReport, RuntimePackageInspectionReport, RuntimePatchControls,
+    RuntimePatchDuplicateAfterControl, RuntimePatchInspectionReport, RuntimePatchPlacementReport,
+    RuntimePatchSourceChainEntry, RuntimePedalPortSummary, RuntimePlacedPedalTimingSummaryReport,
+    RuntimePlacedPromptRunReport, RuntimePlacedTransportReport, RuntimePlacementReport,
+    RuntimePromptBenchmarkReport, RuntimePromptBenchmarkRunReport,
+    RuntimePromptBenchmarkTransportTotalsReport, RuntimePromptBenchmarkU64MetricReport,
+    RuntimePromptBenchmarkUsizeMetricReport, RuntimePromptTimingReport,
+    RuntimeRemoteCableBufferReport, RuntimeSingleDevicePromptRunReport, RuntimeSourcePedal,
+    RuntimeTokenizerOptionsReport, RuntimeTopologyReport, VULKAN_BACKEND_LOOP_MAX_WINDOW,
+    VulkanComputeDevice, VulkanComputeDeviceInfo, VulkanResidentHfTokenizerTextCodec,
+    VulkanResidentInProcessPlacedPromptEngine,
     VulkanResidentInProcessPlacedPromptEngineInputRequest,
     VulkanResidentInProcessPlacedPromptStream, VulkanResidentModelPackage,
     VulkanResidentModelPackageDeviceSlice, VulkanResidentModelPackageManifest,
@@ -912,10 +913,7 @@ fn run_placed_chat(
         &chat_session.formatter,
     )?;
     let transcript_codec = chat_transcript_codec(tokenizer_dir)?;
-    let mut logical_device_ids = manifest.placement_device_ids();
-    if !logical_device_ids.contains(&manifest.device_id) {
-        logical_device_ids.push(manifest.device_id.clone());
-    }
+    let logical_device_ids = manifest.placement_device_ids();
     let bound_devices = runtime_bound_vulkan_devices(args, &logical_device_ids)?;
     let stream = VulkanResidentInProcessPlacedPromptStream::from_manifest_for_bound_devices(
         bound_devices.devices.clone(),
@@ -1007,10 +1005,7 @@ fn execute_placed_prompt_run(
         ..
     } = context;
     let setup_start = Instant::now();
-    let mut logical_device_ids = manifest.placement_device_ids();
-    if !logical_device_ids.contains(&manifest.device_id) {
-        logical_device_ids.push(manifest.device_id.clone());
-    }
+    let logical_device_ids = manifest.placement_device_ids();
     let placement = runtime_manifest_placement(manifest_dir, &manifest)?;
     let bound_devices = runtime_bound_vulkan_devices(args, &logical_device_ids)?;
     let stream = VulkanResidentInProcessPlacedPromptStream::from_manifest_for_bound_devices(
@@ -1501,7 +1496,7 @@ fn inspect_runtime_topology(
     let default_device_id = args
         .default_device_id
         .as_deref()
-        .unwrap_or(&manifest.placement.default_device_id);
+        .unwrap_or(RUNTIME_DEFAULT_LOGICAL_DEVICE_ID);
     let available_devices = inspect_available_devices(
         default_device_id,
         runtime_report_default_vulkan_physical_device_index(args),
@@ -1531,8 +1526,6 @@ fn inspect_runtime_topology(
         available_devices,
         compiled: RuntimeCompiledPedalboardSummary {
             wiring: manifest.circuit_graph.wiring.clone(),
-            default_device_id: manifest.placement.default_device_id.clone(),
-            pedal_devices: manifest.placement.pedal_devices.clone(),
             source_pedal_count: source_pedals.len(),
             source_pedals,
             max_context_activations: manifest.max_context_activations,
@@ -1593,7 +1586,7 @@ fn inspect_package(
     let default_device_id = args
         .default_device_id
         .as_deref()
-        .unwrap_or(&manifest.placement.default_device_id);
+        .unwrap_or(RUNTIME_DEFAULT_LOGICAL_DEVICE_ID);
     let available_devices = inspect_available_devices(
         default_device_id,
         runtime_report_default_vulkan_physical_device_index(args),
@@ -1609,8 +1602,6 @@ fn inspect_package(
         config_path: manifest.config_path.clone(),
         tokenizer: serde_json::to_value(&manifest.tokenizer)?,
         compiled_wiring: manifest.circuit_graph.wiring.clone(),
-        compiled_default_device_id: manifest.placement.default_device_id.clone(),
-        compiled_pedal_devices: manifest.placement.pedal_devices.clone(),
         runtime_patch: runtime_patch_report(args),
         device_bindings: runtime_device_bindings_report(args, &[]),
         max_context_activations: manifest.max_context_activations,
@@ -1625,7 +1616,6 @@ fn inspect_package(
         println!("package_id={}", payload.package_id);
         println!("source_pedal_count={}", payload.source_pedal_count);
         println!("compiled_wiring={}", payload.compiled_wiring);
-        println!("default_device_id={}", payload.compiled_default_device_id);
         for pedal in &payload.source_pedals {
             println!(
                 "{} {} kernels={} state_ports={}",

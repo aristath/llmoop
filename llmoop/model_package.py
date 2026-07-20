@@ -37,7 +37,6 @@ PACKAGE_ARTIFACT_INTEGRITY_SCHEMA = "llmoop.package_artifact_integrity.v1"
 VULKAN_BF16_ROW_PAIR_LAYOUT = "vulkan_bf16_row_pair_u32"
 ROW_MAJOR_LAYOUT = "row_major"
 CONFIG_PACKAGE_FILE = "config.json"
-RUNTIME_DEFAULT_LOGICAL_DEVICE_ID = "runtime_default"
 TOKENIZER_PACKAGE_FILES = (
     "tokenizer.json",
     "tokenizer_config.json",
@@ -373,13 +372,9 @@ def build_vulkan_resident_package_manifest(
     for execution in pedal_executions:
         for kernel in execution["kernels"]:
             kernel["shader_path"] = compiled_shader_path(kernel["shader_path"])
-    placement = package_placement()
-
     return {
         "schema": PACKAGE_SCHEMA,
         "package_id": package_id,
-        "device_id": RUNTIME_DEFAULT_LOGICAL_DEVICE_ID,
-        "placement": placement,
         "circuit_graph": package_circuit_graph(
             lowered_index, lowered_dir, compiled_circuits
         ),
@@ -458,14 +453,6 @@ def build_vulkan_resident_package_manifest(
             "kernels": sampler_kernels,
         },
         "pedal_executions": pedal_executions,
-    }
-
-
-def package_placement() -> Json:
-    return {
-        "schema": "llmoop.stream_circuit_placement.v1",
-        "default_device_id": RUNTIME_DEFAULT_LOGICAL_DEVICE_ID,
-        "pedal_devices": {},
     }
 
 
@@ -2551,31 +2538,11 @@ def validate_compiled_circuit_graph(manifest: Json) -> dict[str, Json]:
             )
         candidates[pedal_id] = circuit
 
-    placement = manifest.get("placement")
-    if (
-        not isinstance(placement, dict)
-        or placement.get("schema") != "llmoop.stream_circuit_placement.v1"
-        or not isinstance(placement.get("default_device_id"), str)
-        or not placement["default_device_id"]
-        or not isinstance(placement.get("pedal_devices", {}), dict)
-    ):
-        raise ModelCompileError("compiled package placement contract is invalid")
-    pedal_devices = placement.get("pedal_devices", {})
-    if any(
-        not isinstance(device_id, str) or not device_id
-        for device_id in pedal_devices.values()
-    ):
+    compiler_owned_placement = {"device_id", "placement"}.intersection(manifest)
+    if compiler_owned_placement:
         raise ModelCompileError(
-            "compiled package placement contains an invalid device id"
-        )
-    if manifest.get("device_id") != placement["default_device_id"]:
-        raise ModelCompileError(
-            "compiled package default device identity does not match its placement"
-        )
-    unknown_placements = set(pedal_devices) - set(candidates)
-    if unknown_placements:
-        raise ModelCompileError(
-            f"compiled package placement references unknown pedals {sorted(unknown_placements)}"
+            "compiled package must not contain runtime placement fields "
+            f"{sorted(compiler_owned_placement)}"
         )
 
     cables = graph.get("cables")
