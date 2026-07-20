@@ -4159,6 +4159,114 @@ impl VulkanResidentSamplerRunner {
     pub fn read_output_bytes(&self) -> Result<Vec<u8>, VulkanError> {
         self.output_buffer.read_bytes(self.output_byte_capacity)
     }
+
+    fn create_logits_view(
+        &self,
+        device: &VulkanComputeDevice,
+        logits_buffer: &VulkanResidentBuffer,
+        logits_byte_offset: usize,
+        kernels: &[VulkanResidentSamplerKernelArtifact],
+        spec: &VulkanResidentSamplerSpec,
+    ) -> Result<VulkanResidentSamplerLogitsView, VulkanResidentSamplerRunnerError> {
+        let mut resident_dispatches = Vec::with_capacity(kernels.len());
+        for kernel in kernels {
+            let logits_binding = || {
+                VulkanResidentKernelBufferBinding::new(0, logits_buffer, self.logits_byte_capacity)
+                    .with_byte_offset(logits_byte_offset)
+                    .with_access(VulkanResidentKernelBufferAccess::Read)
+            };
+            let bindings = match kernel.role.as_str() {
+                "sample_logits" => vec![
+                    logits_binding(),
+                    VulkanResidentKernelBufferBinding::new(
+                        1,
+                        &self.output_buffer,
+                        self.output_buffer.byte_capacity(),
+                    )
+                    .with_access(VulkanResidentKernelBufferAccess::Write),
+                    VulkanResidentKernelBufferBinding::new(
+                        2,
+                        &self._stream_control_buffer,
+                        VULKAN_STREAM_CONTROL_BYTE_CAPACITY,
+                    )
+                    .with_access(VulkanResidentKernelBufferAccess::ReadWrite),
+                ],
+                "partition_top_k" => vec![
+                    logits_binding(),
+                    VulkanResidentKernelBufferBinding::new(
+                        1,
+                        self._scratch_buffer
+                            .as_ref()
+                            .expect("validated sampling plan has scratch"),
+                        spec.scratch_byte_capacity,
+                    )
+                    .with_access(VulkanResidentKernelBufferAccess::Write),
+                ],
+                "sample_candidates" => vec![
+                    VulkanResidentKernelBufferBinding::new(
+                        0,
+                        self._scratch_buffer
+                            .as_ref()
+                            .expect("validated sampling plan has scratch"),
+                        spec.scratch_byte_capacity,
+                    )
+                    .with_access(VulkanResidentKernelBufferAccess::Read),
+                    VulkanResidentKernelBufferBinding::new(
+                        1,
+                        &self.output_buffer,
+                        self.output_buffer.byte_capacity(),
+                    )
+                    .with_access(VulkanResidentKernelBufferAccess::Write),
+                    VulkanResidentKernelBufferBinding::new(
+                        2,
+                        &self._stream_control_buffer,
+                        VULKAN_STREAM_CONTROL_BYTE_CAPACITY,
+                    )
+                    .with_access(VulkanResidentKernelBufferAccess::ReadWrite),
+                    VulkanResidentKernelBufferBinding::new(
+                        3,
+                        self._sampler_seed_buffer
+                            .as_ref()
+                            .expect("validated sampled plan has a seed buffer"),
+                        4,
+                    )
+                    .with_access(VulkanResidentKernelBufferAccess::Read),
+                ],
+                role => {
+                    return Err(VulkanResidentSamplerRunnerError::InvalidKernelRole(
+                        role.to_string(),
+                    ));
+                }
+            };
+            resident_dispatches.push(device.create_resident_kernel_dispatch(
+                &kernel.spirv_words,
+                &bindings,
+                kernel.workgroup_count_x,
+                kernel.local_size_x,
+                0,
+            )?);
+        }
+        Ok(VulkanResidentSamplerLogitsView {
+            resident_dispatches,
+            sequence: device.create_resident_kernel_sequence()?,
+        })
+    }
+}
+
+struct VulkanResidentSamplerLogitsView {
+    resident_dispatches: Vec<VulkanResidentKernelDispatch>,
+    sequence: VulkanResidentKernelSequence,
+}
+
+impl VulkanResidentSamplerLogitsView {
+    fn run(&self, device: &VulkanComputeDevice) -> Result<(), VulkanError> {
+        let steps = self
+            .resident_dispatches
+            .iter()
+            .map(|dispatch| VulkanResidentKernelSequenceStep::new(dispatch, &[]))
+            .collect::<Vec<_>>();
+        device.run_resident_kernel_sequence(&self.sequence, &steps)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -4182,6 +4290,7 @@ pub enum VulkanResidentSamplerRunnerError {
     HistoryCapacityOverflow,
     WorkgroupCountOverflow,
     PushConstantByteCountOverflow,
+    InvalidKernelRole(String),
     InvalidSamplingSpec {
         method: String,
         temperature: f32,
@@ -4209,6 +4318,9 @@ impl Display for VulkanResidentSamplerRunnerError {
             Self::PushConstantByteCountOverflow => {
                 f.write_str("sampler push constant byte count overflowed")
             }
+            Self::InvalidKernelRole(role) => {
+                write!(f, "invalid resident sampler kernel role {role:?}")
+            }
             Self::InvalidSamplingSpec {
                 method,
                 temperature,
@@ -4228,6 +4340,211 @@ impl Error for VulkanResidentSamplerRunnerError {}
 impl From<VulkanError> for VulkanResidentSamplerRunnerError {
     fn from(error: VulkanError) -> Self {
         Self::Vulkan(error)
+    }
+}
+
+struct VulkanResidentBatchedOutputProjectionRunner {
+    batch_capacity: usize,
+    frame_byte_capacity: usize,
+    normalized_frames_buffer: VulkanResidentBuffer,
+    _batched_logits_buffer: VulkanResidentBuffer,
+    projection_dispatch: VulkanResidentKernelDispatch,
+    projection_sequence: VulkanResidentKernelSequence,
+    sampler_views: Vec<VulkanResidentSamplerLogitsView>,
+}
+
+impl VulkanResidentBatchedOutputProjectionRunner {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        device: &VulkanComputeDevice,
+        batch_capacity: usize,
+        batch_lane_tile_width: u32,
+        projection_weight: &VulkanPermanentParameterBufferAllocation,
+        projection_spirv_words: &[u32],
+        output_spec: &VulkanResidentOutputTransducerSpec,
+        sampler: &VulkanResidentSamplerRunner,
+        sampler_kernels: &[VulkanResidentSamplerKernelArtifact],
+        sampler_spec: &VulkanResidentSamplerSpec,
+    ) -> Result<Self, VulkanResidentInProcessPlacedRuntimeError> {
+        if batch_capacity == 0 {
+            return Err(VulkanResidentInProcessPlacedRuntimeError::ZeroTickBudget);
+        }
+        let tile_width = usize::try_from(batch_lane_tile_width).map_err(|_| {
+            VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(
+                "batched output projection lane tile width exceeds usize".to_string(),
+            ))
+        })?;
+        if tile_width == 0 {
+            return Err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop(
+                VulkanError("batched output projection lane tile width is zero".to_string()),
+            ));
+        }
+        validate_output_projection_weight(projection_weight, output_spec)
+            .map_err(VulkanResidentInProcessPlacedRuntimeError::OutputTransducer)?;
+        let normalized_frames_byte_capacity = output_spec
+            .normalized_frame_byte_capacity
+            .checked_mul(batch_capacity)
+            .ok_or_else(|| {
+                VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(
+                    "batched normalized frame capacity overflowed".to_string(),
+                ))
+            })?;
+        let batched_logits_byte_capacity = output_spec
+            .logits_byte_capacity
+            .checked_mul(batch_capacity)
+            .ok_or_else(|| {
+                VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(
+                    "batched logits capacity overflowed".to_string(),
+                ))
+            })?;
+        let normalized_frames_buffer = device
+            .create_resident_buffer(normalized_frames_byte_capacity)
+            .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
+        let batched_logits_buffer = device
+            .create_resident_buffer(batched_logits_byte_capacity)
+            .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
+        let workgroup_count_y = batch_capacity
+            .checked_add(tile_width - 1)
+            .map(|width| width / tile_width)
+            .and_then(|count| u32::try_from(count).ok())
+            .ok_or_else(|| {
+                VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(
+                    "batched output projection workgroup count overflowed".to_string(),
+                ))
+            })?;
+        let bindings = [
+            VulkanResidentKernelBufferBinding::new(
+                0,
+                &normalized_frames_buffer,
+                normalized_frames_byte_capacity,
+            )
+            .with_access(VulkanResidentKernelBufferAccess::Read),
+            VulkanResidentKernelBufferBinding::new(
+                1,
+                &projection_weight.buffer,
+                projection_weight.byte_capacity,
+            )
+            .with_access(VulkanResidentKernelBufferAccess::Read),
+            VulkanResidentKernelBufferBinding::new(
+                2,
+                &batched_logits_buffer,
+                batched_logits_byte_capacity,
+            )
+            .with_access(VulkanResidentKernelBufferAccess::Write),
+        ];
+        let projection_dispatch = device
+            .create_resident_kernel_dispatch_2d(
+                projection_spirv_words,
+                &bindings,
+                output_spec.projection_workgroup_count_x,
+                workgroup_count_y,
+                output_spec.projection_local_size_x,
+                std::mem::size_of::<u32>() as u32,
+            )
+            .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
+        let mut sampler_views = Vec::with_capacity(batch_capacity);
+        for batch_index in 0..batch_capacity {
+            let logits_byte_offset = output_spec
+                .logits_byte_capacity
+                .checked_mul(batch_index)
+                .ok_or_else(|| {
+                    VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(
+                        "batched sampler logits offset overflowed".to_string(),
+                    ))
+                })?;
+            sampler_views.push(
+                sampler
+                    .create_logits_view(
+                        device,
+                        &batched_logits_buffer,
+                        logits_byte_offset,
+                        sampler_kernels,
+                        sampler_spec,
+                    )
+                    .map_err(VulkanResidentInProcessPlacedRuntimeError::Sampler)?,
+            );
+        }
+        Ok(Self {
+            batch_capacity,
+            frame_byte_capacity: output_spec.normalized_frame_byte_capacity,
+            normalized_frames_buffer,
+            _batched_logits_buffer: batched_logits_buffer,
+            projection_dispatch,
+            projection_sequence: device
+                .create_resident_kernel_sequence()
+                .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?,
+            sampler_views,
+        })
+    }
+
+    fn project(
+        &self,
+        device: &VulkanComputeDevice,
+        normalized_frames: &[Vec<u8>],
+    ) -> Result<(), VulkanResidentInProcessPlacedRuntimeError> {
+        if normalized_frames.is_empty() || normalized_frames.len() > self.batch_capacity {
+            return Err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop(
+                VulkanError(format!(
+                    "batched output projection capacity {} cannot process {} frames",
+                    self.batch_capacity,
+                    normalized_frames.len()
+                )),
+            ));
+        }
+        let mut packed = Vec::with_capacity(
+            self.frame_byte_capacity
+                .checked_mul(normalized_frames.len())
+                .ok_or_else(|| {
+                    VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(
+                        "batched normalized frame write overflowed".to_string(),
+                    ))
+                })?,
+        );
+        for (batch_index, frame) in normalized_frames.iter().enumerate() {
+            if frame.len() != self.frame_byte_capacity {
+                return Err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop(
+                    VulkanError(format!(
+                        "batched output frame {batch_index} has {} bytes, expected {}",
+                        frame.len(),
+                        self.frame_byte_capacity
+                    )),
+                ));
+            }
+            packed.extend_from_slice(frame);
+        }
+        self.normalized_frames_buffer
+            .write_bytes(&packed)
+            .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
+        let batch_width = u32::try_from(normalized_frames.len()).map_err(|_| {
+            VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(
+                "batched output projection width exceeds u32".to_string(),
+            ))
+        })?;
+        device
+            .run_resident_kernel_sequence(
+                &self.projection_sequence,
+                &[VulkanResidentKernelSequenceStep::new(
+                    &self.projection_dispatch,
+                    &batch_width.to_le_bytes(),
+                )],
+            )
+            .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)
+    }
+
+    fn sample(
+        &self,
+        device: &VulkanComputeDevice,
+        batch_index: usize,
+    ) -> Result<(), VulkanResidentInProcessPlacedRuntimeError> {
+        self.sampler_views
+            .get(batch_index)
+            .ok_or_else(|| {
+                VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(format!(
+                    "batched output projection has no sampler lane {batch_index}"
+                )))
+            })?
+            .run(device)
+            .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)
     }
 }
 
@@ -8092,6 +8409,13 @@ fn validate_resident_package_paths(
             "output projection shader",
             manifest.output_transducer.projection_shader_path.as_str(),
         ),
+        (
+            "batched output projection shader",
+            manifest
+                .output_transducer
+                .projection_batch_shader_path
+                .as_str(),
+        ),
     ] {
         validate_resident_package_relative_path(label, path)?;
     }
@@ -8183,6 +8507,10 @@ fn validate_resident_package_artifact_integrity(
             .embedding_norm_shader_path
             .clone(),
         manifest.output_transducer.projection_shader_path.clone(),
+        manifest
+            .output_transducer
+            .projection_batch_shader_path
+            .clone(),
     ]
     .into_iter()
     .chain(tokenizer_files)
@@ -8924,6 +9252,8 @@ pub struct VulkanResidentOutputTransducerPackageSpec {
     pub spec: VulkanResidentOutputTransducerSpec,
     pub embedding_norm_shader_path: String,
     pub projection_shader_path: String,
+    pub projection_batch_shader_path: String,
+    pub projection_batch_lane_tile_width: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -9242,6 +9572,8 @@ pub struct VulkanResidentInProcessPlacedModelPackage {
     input_transducer_spirv_words: Vec<u32>,
     embedding_norm_spirv_words: Vec<u32>,
     tied_projection_spirv_words: Vec<u32>,
+    tied_projection_batch_spirv_words: Vec<u32>,
+    projection_batch_lane_tile_width: u32,
     sampler_kernels: Vec<VulkanResidentSamplerKernelArtifact>,
     input_transducer_spec: VulkanResidentInputEmbeddingTransducerSpec,
     output_transducer_spec: VulkanResidentOutputTransducerSpec,
@@ -9434,6 +9766,7 @@ pub struct VulkanResidentInProcessPlacedStreamProcessor {
     device_slices: Vec<VulkanResidentInProcessPlacedStreamProcessorDevice>,
     speculative_decoders: Vec<VulkanResidentSpeculativeDecoderProcessor>,
     verification_state_transactions: RefCell<Option<Vec<VulkanResidentStateTransactionBank>>>,
+    batched_output_projection: RefCell<Option<VulkanResidentBatchedOutputProjectionRunner>>,
 }
 
 fn create_placed_state_transactions<'a, F>(
@@ -10213,6 +10546,13 @@ impl VulkanResidentInProcessPlacedModelPackage {
                 .output_transducer
                 .projection_shader_path,
         )?;
+        let tied_projection_batch_spirv_words = load_required_resident_model_package_shader(
+            manifest_dir,
+            &runtime_model
+                .package
+                .output_transducer
+                .projection_batch_shader_path,
+        )?;
         let sampler_kernels =
             load_resident_sampler_kernels(manifest_dir, &runtime_model.package.sampler)?;
         let device_ids = runtime_model
@@ -10307,6 +10647,11 @@ impl VulkanResidentInProcessPlacedModelPackage {
             input_transducer_spirv_words,
             embedding_norm_spirv_words,
             tied_projection_spirv_words,
+            tied_projection_batch_spirv_words,
+            projection_batch_lane_tile_width: runtime_model
+                .package
+                .output_transducer
+                .projection_batch_lane_tile_width,
             sampler_kernels,
             input_transducer_spec: runtime_model.package.input_transducer.spec.clone(),
             output_transducer_spec: runtime_model.package.output_transducer.spec.clone(),
@@ -10587,6 +10932,7 @@ impl VulkanResidentInProcessPlacedModelPackage {
             device_slices: devices,
             speculative_decoders,
             verification_state_transactions: RefCell::new(None),
+            batched_output_projection: RefCell::new(None),
         })
     }
 }
@@ -10892,8 +11238,8 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
                 })?;
         }
 
-        let mut target_token_ids = vec![None; input_token_ids.len()];
         let mut target_hidden_frames = vec![None; input_token_ids.len()];
+        let hidden_sequence_variant = VulkanResidentPlacedTokenTickTail::Hidden.sequence_variant();
         let wave_count = input_token_ids
             .len()
             .checked_add(pipeline.len())
@@ -10926,22 +11272,49 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
                     control_flags: 0,
                     dynamic_state_capacity_activations: capacity,
                 };
-                let pending = slice.resident_execution_plan.dispatch_segments[0]
-                    .submit_recorded_with_stream_control(
-                        device,
-                        control,
-                        VulkanResidentPlacedTokenTickTail::Sample.sequence_variant(),
-                        false,
+                let segment = &slice.resident_execution_plan.dispatch_segments[0];
+                let pending = if segment.has_recorded_sequence_variant(hidden_sequence_variant) {
+                    Some(
+                        segment
+                            .submit_recorded_with_stream_control(
+                                device,
+                                control,
+                                hidden_sequence_variant,
+                                false,
+                            )
+                            .map_err(VulkanResidentInProcessPlacedRuntimeError::ResidentDispatch)?,
                     )
-                    .map_err(VulkanResidentInProcessPlacedRuntimeError::ResidentDispatch)?;
+                } else {
+                    let prefix_dispatches = (slice.device_id == self.model.input_device_id)
+                        .then_some(&self.input_transducer.resident_dispatch)
+                        .into_iter()
+                        .collect::<Vec<_>>();
+                    let suffix_dispatches = (slice.device_id == self.model.output_device_id)
+                        .then_some(&self.output_transducer.embedding_norm_dispatch)
+                        .into_iter()
+                        .collect::<Vec<_>>();
+                    segment
+                        .run_with_stream_control(
+                            device,
+                            control,
+                            &prefix_dispatches,
+                            &suffix_dispatches,
+                            hidden_sequence_variant,
+                            false,
+                        )
+                        .map_err(VulkanResidentInProcessPlacedRuntimeError::ResidentDispatch)?;
+                    None
+                };
                 submitted.push((pipeline_index, device_index, token_index, pending));
             }
             let completed = submitted
                 .into_iter()
                 .map(|(pipeline_index, device_index, token_index, pending)| {
-                    pending
-                        .wait()
-                        .map_err(VulkanResidentInProcessPlacedRuntimeError::ResidentDispatch)?;
+                    if let Some(pending) = pending {
+                        pending
+                            .wait()
+                            .map_err(VulkanResidentInProcessPlacedRuntimeError::ResidentDispatch)?;
+                    }
                     Ok((pipeline_index, device_index, token_index))
                 })
                 .collect::<Result<Vec<_>, VulkanResidentInProcessPlacedRuntimeError>>()?;
@@ -10966,17 +11339,6 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
                             )
                         })?;
                 } else {
-                    let stream_tick = start_stream_tick
-                        .checked_add(u64::try_from(token_index).map_err(|_| {
-                            VulkanResidentInProcessPlacedRuntimeError::StreamTickOverflow
-                        })?)
-                        .ok_or(VulkanResidentInProcessPlacedRuntimeError::StreamTickOverflow)?;
-                    target_token_ids[token_index] = Some(
-                        self.sampler
-                            .completed_run_at(stream_tick)
-                            .map_err(VulkanResidentInProcessPlacedRuntimeError::Sampler)?
-                            .token_id,
-                    );
                     target_hidden_frames[token_index] = Some(
                         self.output_transducer
                             .read_normalized_frame_bytes(
@@ -10989,17 +11351,6 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
                 }
             }
         }
-        let target_token_ids = target_token_ids
-            .into_iter()
-            .enumerate()
-            .map(|(index, token)| {
-                token.ok_or_else(|| {
-                    VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(format!(
-                        "placed verification pipeline produced no token at index {index}"
-                    )))
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
         let target_hidden_frames = target_hidden_frames
             .into_iter()
             .enumerate()
@@ -11011,6 +11362,83 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let output_slice = &self.device_slices[*pipeline.last().ok_or_else(|| {
+            VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(
+                "placed verification pipeline is empty".to_string(),
+            ))
+        })?];
+        let output_device = devices.get(&output_slice.device_id).ok_or_else(|| {
+            VulkanResidentInProcessPlacedRuntimeError::MissingBoundDevice {
+                device_id: output_slice.device_id.clone(),
+            }
+        })?;
+        let batch_capacity_is_insufficient = self
+            .batched_output_projection
+            .borrow()
+            .as_ref()
+            .is_none_or(|runner| runner.batch_capacity < input_token_ids.len());
+        if batch_capacity_is_insufficient {
+            let projection_weight = self
+                .model
+                .output_transducer_parameter_buffers
+                .parameter_buffer(&self.model.output_transducer_spec.projection_parameter_tensor)
+                .ok_or_else(|| {
+                    VulkanResidentInProcessPlacedRuntimeError::OutputTransducer(
+                        VulkanResidentOutputTransducerRunnerError::MissingTransducerParameterBuffer {
+                            tensor: self
+                                .model
+                                .output_transducer_spec
+                                .projection_parameter_tensor
+                                .clone(),
+                        },
+                    )
+                })?;
+            let runner = VulkanResidentBatchedOutputProjectionRunner::new(
+                output_device,
+                input_token_ids.len(),
+                self.model.projection_batch_lane_tile_width,
+                projection_weight,
+                &self.model.tied_projection_batch_spirv_words,
+                &self.model.output_transducer_spec,
+                &self.sampler,
+                &self.model.sampler_kernels,
+                &self.model.sampler_spec,
+            )?;
+            *self.batched_output_projection.borrow_mut() = Some(runner);
+        }
+        let batch_runner = self.batched_output_projection.borrow();
+        let batch_runner = batch_runner
+            .as_ref()
+            .expect("batched output projection runner was initialized");
+        batch_runner.project(output_device, &target_hidden_frames)?;
+        let mut target_token_ids = Vec::with_capacity(input_token_ids.len());
+        for batch_index in 0..input_token_ids.len() {
+            let stream_tick =
+                start_stream_tick
+                    .checked_add(u64::try_from(batch_index).map_err(|_| {
+                        VulkanResidentInProcessPlacedRuntimeError::StreamTickOverflow
+                    })?)
+                    .ok_or(VulkanResidentInProcessPlacedRuntimeError::StreamTickOverflow)?;
+            output_slice
+                .mounted
+                .stream_control_buffer
+                .write_bytes_at(
+                    VULKAN_STREAM_CONTROL_METADATA_OFFSET,
+                    &stream_control_metadata_bytes(VulkanMountedPlacedStreamControl {
+                        stream_tick,
+                        control_flags: 0,
+                        dynamic_state_capacity_activations: capacity,
+                    }),
+                )
+                .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
+            batch_runner.sample(output_device, batch_index)?;
+            target_token_ids.push(
+                self.sampler
+                    .completed_run_at(stream_tick)
+                    .map_err(VulkanResidentInProcessPlacedRuntimeError::Sampler)?
+                    .token_id,
+            );
+        }
         Ok((target_token_ids, target_hidden_frames))
     }
 
@@ -14129,6 +14557,11 @@ fn validate_generation_execution_contract(
             .embedding_norm_shader_path
             .is_empty()
         || manifest.output_transducer.projection_shader_path.is_empty()
+        || manifest
+            .output_transducer
+            .projection_batch_shader_path
+            .is_empty()
+        || manifest.output_transducer.projection_batch_lane_tile_width == 0
     {
         return Err(VulkanResidentTokenModelPackageError::new(format!(
             "resident model package {:?} output-transducer execution does not match its circuit pedal",
@@ -15647,6 +16080,13 @@ impl VulkanSubmittedResidentDispatchSegment<'_> {
 }
 
 impl VulkanMountedPlacedResidentDispatchSegmentRunner {
+    fn has_recorded_sequence_variant(&self, sequence_variant: u8) -> bool {
+        self.sequences
+            .borrow()
+            .get(&sequence_variant)
+            .is_some_and(VulkanResidentKernelSequence::has_recorded_commands)
+    }
+
     fn from_dispatch_stages(
         device: &VulkanComputeDevice,
         mounted: &VulkanMountedPlacedStreamCircuit,

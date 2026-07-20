@@ -99,6 +99,7 @@ impl VulkanResidentMemoryAccess {
 pub struct VulkanResidentKernelBufferBinding<'a> {
     pub binding: u32,
     pub buffer: &'a VulkanResidentBuffer,
+    pub byte_offset: usize,
     pub byte_len: usize,
     pub access: VulkanResidentKernelBufferAccess,
 }
@@ -141,9 +142,15 @@ impl<'a> VulkanResidentKernelBufferBinding<'a> {
         Self {
             binding,
             buffer,
+            byte_offset: 0,
             byte_len,
             access: VulkanResidentKernelBufferAccess::ReadWrite,
         }
+    }
+
+    pub fn with_byte_offset(mut self, byte_offset: usize) -> Self {
+        self.byte_offset = byte_offset;
+        self
     }
 
     pub fn with_access(mut self, access: VulkanResidentKernelBufferAccess) -> Self {
@@ -349,11 +356,16 @@ impl VulkanResidentBuffer {
         Ok(())
     }
 
-    fn descriptor_buffer(&self, len: usize) -> Result<vk::DescriptorBufferInfo, VulkanError> {
+    fn descriptor_buffer(
+        &self,
+        offset: usize,
+        len: usize,
+    ) -> Result<vk::DescriptorBufferInfo, VulkanError> {
+        self.byte_range(offset, len)?;
         Ok(vk::DescriptorBufferInfo {
             buffer: self.buffer,
-            offset: 0,
-            range: self.byte_len(len)?,
+            offset: offset as vk::DeviceSize,
+            range: len as vk::DeviceSize,
         })
     }
 }
@@ -379,6 +391,7 @@ pub struct VulkanResidentKernelDispatch {
     pipeline: vk::Pipeline,
     descriptor_count: usize,
     workgroup_count_x: u32,
+    workgroup_count_y: u32,
     push_constant_byte_count: u32,
     buffer_accesses: Vec<(vk::Buffer, VulkanResidentKernelBufferAccess)>,
 }
@@ -401,6 +414,7 @@ struct VulkanResidentKernelRecordedStep {
     pipeline: vk::Pipeline,
     descriptor_set: vk::DescriptorSet,
     workgroup_count_x: u32,
+    workgroup_count_y: u32,
     push_constants: Vec<u8>,
 }
 
@@ -512,13 +526,14 @@ fn print_resident_kernel_timestamp_summary(
         return;
     }
 
-    let mut groups = HashMap::<(u32, usize, u32), (usize, f64)>::new();
+    let mut groups = HashMap::<(u32, u32, usize, u32), (usize, f64)>::new();
     let mut intervals = Vec::with_capacity(steps.len());
     for (step_index, step) in steps.iter().enumerate() {
         let elapsed_ticks = timestamps[step_index + 1].saturating_sub(timestamps[step_index]);
         let elapsed_ns = elapsed_ticks as f64 * f64::from(timestamp_period_ns);
         let key = (
             step.dispatch.workgroup_count_x,
+            step.dispatch.workgroup_count_y,
             step.dispatch.descriptor_count,
             step.dispatch.push_constant_byte_count,
         );
@@ -551,9 +566,9 @@ fn print_resident_kernel_timestamp_summary(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     eprintln!("  grouped step intervals (dispatch plus preceding dependency):");
-    for ((workgroups, descriptors, push_bytes), (count, elapsed_ns)) in groups {
+    for ((workgroups_x, workgroups_y, descriptors, push_bytes), (count, elapsed_ns)) in groups {
         eprintln!(
-            "    workgroups={workgroups:<5} descriptors={descriptors:<2} push_bytes={push_bytes:<3} count={count:<3} total_us={:.3} avg_us={:.3}",
+            "    workgroups={workgroups_x}x{workgroups_y:<5} descriptors={descriptors:<2} push_bytes={push_bytes:<3} count={count:<3} total_us={:.3} avg_us={:.3}",
             elapsed_ns / 1_000.0,
             elapsed_ns / count as f64 / 1_000.0,
         );
@@ -566,11 +581,11 @@ fn print_resident_kernel_timestamp_summary(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     eprintln!("  slowest step intervals:");
-    for (step_index, (workgroups, descriptors, push_bytes), elapsed_ns) in
+    for (step_index, (workgroups_x, workgroups_y, descriptors, push_bytes), elapsed_ns) in
         intervals.into_iter().take(12)
     {
         eprintln!(
-            "    step={step_index:<3} workgroups={workgroups:<5} descriptors={descriptors:<2} push_bytes={push_bytes:<3} elapsed_us={:.3}",
+            "    step={step_index:<3} workgroups={workgroups_x}x{workgroups_y:<5} descriptors={descriptors:<2} push_bytes={push_bytes:<3} elapsed_us={:.3}",
             elapsed_ns / 1_000.0,
         );
     }
@@ -755,6 +770,10 @@ impl VulkanResidentKernelDispatch {
 
     pub fn workgroup_count_x(&self) -> u32 {
         self.workgroup_count_x
+    }
+
+    pub fn workgroup_count_y(&self) -> u32 {
+        self.workgroup_count_y
     }
 
     pub fn push_constant_byte_count(&self) -> u32 {
@@ -1235,6 +1254,25 @@ impl VulkanComputeDevice {
         local_size_x: u32,
         push_constant_byte_count: u32,
     ) -> Result<VulkanResidentKernelDispatch, VulkanError> {
+        self.create_resident_kernel_dispatch_2d(
+            spirv_words,
+            buffers,
+            workgroup_count_x,
+            1,
+            local_size_x,
+            push_constant_byte_count,
+        )
+    }
+
+    pub fn create_resident_kernel_dispatch_2d(
+        &self,
+        spirv_words: &[u32],
+        buffers: &[VulkanResidentKernelBufferBinding<'_>],
+        workgroup_count_x: u32,
+        workgroup_count_y: u32,
+        local_size_x: u32,
+        push_constant_byte_count: u32,
+    ) -> Result<VulkanResidentKernelDispatch, VulkanError> {
         if spirv_words.is_empty() {
             return Err(VulkanError("SPIR-V module must not be empty".to_string()));
         }
@@ -1248,6 +1286,11 @@ impl VulkanComputeDevice {
                 "workgroup_count_x must not be zero".to_string(),
             ));
         }
+        if workgroup_count_y == 0 {
+            return Err(VulkanError(
+                "workgroup_count_y must not be zero".to_string(),
+            ));
+        }
         if local_size_x == 0 {
             return Err(VulkanError("local_size_x must not be zero".to_string()));
         }
@@ -1256,7 +1299,9 @@ impl VulkanComputeDevice {
         let mut buffer_accesses =
             Vec::<(vk::Buffer, VulkanResidentKernelBufferAccess)>::with_capacity(buffers.len());
         for buffer in buffers {
-            buffer.buffer.byte_len(buffer.byte_len)?;
+            buffer
+                .buffer
+                .byte_range(buffer.byte_offset, buffer.byte_len)?;
             if descriptor_bindings.contains(&buffer.binding) {
                 return Err(VulkanError(format!(
                     "duplicate storage buffer binding {}",
@@ -1323,7 +1368,11 @@ impl VulkanComputeDevice {
                 .remove(0);
             let descriptor_buffers = buffers
                 .iter()
-                .map(|buffer| buffer.buffer.descriptor_buffer(buffer.byte_len))
+                .map(|buffer| {
+                    buffer
+                        .buffer
+                        .descriptor_buffer(buffer.byte_offset, buffer.byte_len)
+                })
                 .collect::<Result<Vec<_>, _>>()?;
             let descriptor_writes = buffers
                 .iter()
@@ -1347,6 +1396,7 @@ impl VulkanComputeDevice {
                 pipeline,
                 descriptor_count: buffers.len(),
                 workgroup_count_x,
+                workgroup_count_y,
                 push_constant_byte_count,
                 buffer_accesses,
             })
@@ -1547,6 +1597,7 @@ impl VulkanComputeDevice {
                                 recorded.pipeline == step.dispatch.pipeline
                                     && recorded.descriptor_set == step.dispatch.descriptor_set
                                     && recorded.workgroup_count_x == step.dispatch.workgroup_count_x
+                                    && recorded.workgroup_count_y == step.dispatch.workgroup_count_y
                                     && recorded.push_constants == step.push_constants
                             })
                     })
@@ -1693,7 +1744,7 @@ impl VulkanComputeDevice {
                     self.device.cmd_dispatch(
                         sequence.command_buffer,
                         step.dispatch.workgroup_count_x,
-                        1,
+                        step.dispatch.workgroup_count_y,
                         1,
                     );
                     for (current_buffer, current_access) in &step.dispatch.buffer_accesses {
@@ -1801,6 +1852,7 @@ impl VulkanComputeDevice {
                                 pipeline: step.dispatch.pipeline,
                                 descriptor_set: step.dispatch.descriptor_set,
                                 workgroup_count_x: step.dispatch.workgroup_count_x,
+                                workgroup_count_y: step.dispatch.workgroup_count_y,
                                 push_constants: step.push_constants.to_vec(),
                             })
                             .collect(),

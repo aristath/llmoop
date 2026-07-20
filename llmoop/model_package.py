@@ -287,6 +287,14 @@ def build_vulkan_resident_package_manifest(
         else f"tied_output_projection_bf16_{vocab_size}x{hidden_size}"
         f"_scale{shader_float_token(output_scale)}_to_f32.comp"
     )
+    projection_batch_lane_tile_width = 4
+    projection_batch_shader_file = (
+        f"tied_output_projection_batch{projection_batch_lane_tile_width}_paired_bf16_"
+        f"{vocab_size}x{hidden_size}_scale{shader_float_token(output_scale)}_to_f32.comp"
+        if projection_layout == VULKAN_BF16_ROW_PAIR_LAYOUT
+        else f"tied_output_projection_batch{projection_batch_lane_tile_width}_bf16_"
+        f"{vocab_size}x{hidden_size}_scale{shader_float_token(output_scale)}_to_f32.comp"
+    )
     norm_shader_file = rms_norm_shader_file(hidden_size, norm_eps, norm_weight_offset)
 
     source_circuits = {}
@@ -371,6 +379,7 @@ def build_vulkan_resident_package_manifest(
             all_pedal_executions,
             embedding_shader_file=embedding_shader_file,
             projection_shader_file=projection_shader_file,
+            projection_batch_shader_file=projection_batch_shader_file,
             norm_shader_file=norm_shader_file,
             sampler_shader_files={
                 kernel["shader_path"].removeprefix("shaders/").removesuffix(".spv")
@@ -473,6 +482,10 @@ def build_vulkan_resident_package_manifest(
             "projection_shader_path": compiled_shader_path(
                 f"shaders/{projection_shader_file}"
             ),
+            "projection_batch_shader_path": compiled_shader_path(
+                f"shaders/{projection_batch_shader_file}"
+            ),
+            "projection_batch_lane_tile_width": projection_batch_lane_tile_width,
         },
         "sampler": {
             "spec": {
@@ -1494,6 +1507,7 @@ def required_shader_files(
     *,
     embedding_shader_file: str,
     projection_shader_file: str,
+    projection_batch_shader_file: str,
     norm_shader_file: str,
     sampler_shader_files: set[str],
 ) -> set[str]:
@@ -1502,6 +1516,7 @@ def required_shader_files(
         *sampler_shader_files,
         embedding_shader_file,
         projection_shader_file,
+        projection_batch_shader_file,
         *(
             kernel["shader_path"].removeprefix("shaders/")
             for pedal in pedal_executions
@@ -1876,6 +1891,16 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
             r"tied_output_projection_paired_bf16_(\d+)x(\d+)_scale([0-9eE+.-]+)_to_f32\.comp",
             "tied_output_projection_paired_bf16.comp.template",
             ("VOCAB_SIZE", "INPUT_SIZE", "OUTPUT_SCALE"),
+        ),
+        (
+            r"tied_output_projection_batch(\d+)_bf16_(\d+)x(\d+)_scale([0-9eE+.-]+)_to_f32\.comp",
+            "tied_output_projection_batch_bf16.comp.template",
+            ("BATCH_TILE_WIDTH", "VOCAB_SIZE", "INPUT_SIZE", "OUTPUT_SCALE"),
+        ),
+        (
+            r"tied_output_projection_batch(\d+)_paired_bf16_(\d+)x(\d+)_scale([0-9eE+.-]+)_to_f32\.comp",
+            "tied_output_projection_batch_paired_bf16.comp.template",
+            ("BATCH_TILE_WIDTH", "VOCAB_SIZE", "INPUT_SIZE", "OUTPUT_SCALE"),
         ),
         (
             r"rms_norm_bf16_h(\d+)_eps([0-9eE+.-]+)_offset([0-9eE+.-]+)\.comp",
@@ -3393,8 +3418,15 @@ def validate_compiled_generation_contract(
         or output_spec.get("input_signal_id") != output_edges[0]["source"]["port_id"]
         or any(
             not isinstance(output_package.get(field), str) or not output_package[field]
-            for field in ("embedding_norm_shader_path", "projection_shader_path")
+            for field in (
+                "embedding_norm_shader_path",
+                "projection_shader_path",
+                "projection_batch_shader_path",
+            )
         )
+        or not isinstance(output_package.get("projection_batch_lane_tile_width"), int)
+        or isinstance(output_package.get("projection_batch_lane_tile_width"), bool)
+        or output_package["projection_batch_lane_tile_width"] <= 0
     ):
         raise ModelCompileError(
             "compiled output-transducer execution does not match its circuit pedal"

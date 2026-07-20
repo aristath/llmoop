@@ -131,6 +131,7 @@ def test_compiler_renders_paired_matrix_and_transducer_shaders(tmp_path: Path) -
         "linear_residual_paired_bf16_2048x768.comp",
         "embedding_lookup_paired_bf16_32000x768_scale12.comp",
         "tied_output_projection_paired_bf16_32000x768_scale0.166666667_to_f32.comp",
+        "tied_output_projection_batch4_paired_bf16_32000x768_scale0.166666667_to_f32.comp",
     }
 
     copy_shader_templates(shader_source_dir, tmp_path, shader_files)
@@ -162,6 +163,13 @@ def test_compiler_renders_paired_matrix_and_transducer_shaders(tmp_path: Path) -
             / "tied_output_projection_paired_bf16_32000x768_scale0.166666667_to_f32.comp"
         ).read_text()
     )
+    batched_projection = (
+        tmp_path
+        / "tied_output_projection_batch4_paired_bf16_32000x768_scale0.166666667_to_f32.comp"
+    ).read_text()
+    assert "const uint BATCH_TILE_WIDTH = 4u;" in batched_projection
+    assert "layout(push_constant) uniform BatchControl" in batched_projection
+    assert "gl_WorkGroupID.y * BATCH_TILE_WIDTH" in batched_projection
 
 
 def test_compiler_renders_direct_three_way_linear_split_shaders(tmp_path: Path) -> None:
