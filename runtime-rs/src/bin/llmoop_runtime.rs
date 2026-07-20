@@ -19,14 +19,11 @@ use llmoop_runtime::{
     RuntimePromptBenchmarkReport, RuntimePromptBenchmarkRunReport,
     RuntimePromptBenchmarkTransportTotalsReport, RuntimePromptBenchmarkU64MetricReport,
     RuntimePromptBenchmarkUsizeMetricReport, RuntimePromptTimingReport,
-    RuntimeRemoteCableBufferReport, RuntimeSingleDevicePromptRunReport, RuntimeSourcePedal,
-    RuntimeTokenizerOptionsReport, RuntimeTopologyReport, VULKAN_BACKEND_LOOP_MAX_WINDOW,
-    VulkanComputeDevice, VulkanComputeDeviceInfo, VulkanResidentHfTokenizerTextCodec,
-    VulkanResidentInProcessPlacedPromptEngine, VulkanResidentInProcessPlacedPromptStream,
-    VulkanResidentModelPackage, VulkanResidentModelPackageDeviceSlice,
-    VulkanResidentModelPackageManifest, VulkanResidentRuntimeModel, VulkanResidentTokenEngine,
-    VulkanResidentTokenEngineRunBudget, VulkanResidentTokenEngineRunStopCondition,
-    VulkanResidentTokenEngineTextInputRequest, VulkanResidentTokenInputEvent,
+    RuntimeRemoteCableBufferReport, RuntimeSourcePedal, RuntimeTokenizerOptionsReport,
+    RuntimeTopologyReport, VulkanComputeDevice, VulkanComputeDeviceInfo,
+    VulkanResidentHfTokenizerTextCodec, VulkanResidentInProcessPlacedPromptEngine,
+    VulkanResidentInProcessPlacedPromptStream, VulkanResidentModelPackageDeviceSlice,
+    VulkanResidentModelPackageManifest, VulkanResidentRuntimeModel, VulkanResidentTokenInputEvent,
     VulkanResidentTokenTextCodec, VulkanReusableKernelArtifactManifest, discover_runtime_devices,
 };
 use minijinja::{Environment, Error as TemplateError, ErrorKind as TemplateErrorKind};
@@ -50,7 +47,6 @@ struct Args {
     max_new_tokens: usize,
     context_size: Option<usize>,
     vulkan_device_index: Option<usize>,
-    cycle_ticks: usize,
     random_seed: u32,
     add_special_tokens: bool,
     skip_special_tokens: bool,
@@ -67,7 +63,7 @@ struct PromptRunContext<'a> {
     tokenizer_dir: &'a Path,
     prompt: &'a str,
     prompt_ids: &'a [u32],
-    needed_capacity: usize,
+    scheduled_token_activations: usize,
     capacity: usize,
     codec: &'a VulkanResidentHfTokenizerTextCodec,
 }
@@ -91,7 +87,6 @@ impl Default for Args {
             max_new_tokens: 65_536,
             context_size: None,
             vulkan_device_index: None,
-            cycle_ticks: VULKAN_BACKEND_LOOP_MAX_WINDOW,
             random_seed: 0,
             add_special_tokens: true,
             skip_special_tokens: true,
@@ -155,26 +150,13 @@ fn run() -> Result<(), Box<dyn Error>> {
             device_id,
         );
     }
-    let (runtime_model, use_placed_execution) =
-        runtime_model_for_bound_execution(&args, runtime_model)?;
     let tokenizer_dir = tokenizer_dir_from_package(package_manifest)?;
     let codec = VulkanResidentHfTokenizerTextCodec::from_model_dir(&tokenizer_dir)?
         .with_add_special_tokens(args.add_special_tokens)
         .with_skip_special_tokens(args.skip_special_tokens);
     if args.chat {
         let capacity = choose_chat_runtime_context_size(package_manifest, args.context_size)?;
-        if use_placed_execution {
-            return run_placed_chat(
-                &args,
-                &manifest_dir,
-                &tokenizer_dir,
-                runtime_model,
-                capacity,
-                &codec,
-                args.prompt.as_deref(),
-            );
-        }
-        return run_single_device_chat(
+        return run_placed_chat(
             &args,
             &manifest_dir,
             &tokenizer_dir,
@@ -189,7 +171,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         .as_ref()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "--prompt is required"))?;
     let prompt_ids = codec.encode_text(prompt)?;
-    let needed_capacity = prompt_ids
+    let scheduled_token_activations = prompt_ids
         .len()
         .checked_add(args.max_new_tokens)
         .ok_or_else(|| {
@@ -207,197 +189,15 @@ fn run() -> Result<(), Box<dyn Error>> {
         tokenizer_dir: &tokenizer_dir,
         prompt,
         prompt_ids: &prompt_ids,
-        needed_capacity,
+        scheduled_token_activations,
         capacity,
         codec: &codec,
     };
 
-    if use_placed_execution {
-        if args.profile_runs > 1 {
-            return run_placed_prompt_benchmark(&context, runtime_model);
-        }
-        return run_placed_prompt(&context, runtime_model);
-    }
-
     if args.profile_runs > 1 {
-        return run_single_device_prompt_benchmark(&context, runtime_model);
+        return run_placed_prompt_benchmark(&context, runtime_model);
     }
-
-    let report = execute_single_device_prompt_run(&context, runtime_model)?;
-    print_single_device_prompt_report(&args, &report)?;
-
-    Ok(())
-}
-
-fn execute_single_device_prompt_run(
-    context: &PromptRunContext<'_>,
-    runtime_model: VulkanResidentRuntimeModel,
-) -> Result<RuntimeSingleDevicePromptRunReport, Box<dyn Error>> {
-    let PromptRunContext {
-        args,
-        package_manifest,
-        manifest_dir,
-        tokenizer_dir,
-        prompt,
-        needed_capacity,
-        capacity,
-        codec,
-        ..
-    } = context;
-    let setup_start = Instant::now();
-    let device = runtime_vulkan_device(args)?;
-    let model = VulkanResidentModelPackage::from_runtime_model(
-        &device,
-        manifest_dir,
-        runtime_model,
-        Some(*capacity),
-    )?;
-    let mut engine = VulkanResidentTokenEngine::new(device);
-    engine.add_model_package("compiled_model", model)?;
-    engine.create_stream_from_model("compiled_model", "main", args.random_seed)?;
-    let setup_time_ns = elapsed_nanos_u64(setup_start);
-
-    let run_start = Instant::now();
-    let scheduler_turn_budget = token_scheduler_turn_budget(*needed_capacity, args.cycle_ticks);
-    let turn = engine.submit_live_text_turn_until_idle(
-        VulkanResidentTokenEngineTextInputRequest::new(
-            "main",
-            "prompt",
-            *prompt,
-            args.max_new_tokens,
-        )
-        .with_origin("cli"),
-        VulkanResidentTokenEngineRunBudget::new(scheduler_turn_budget, 1, args.cycle_ticks),
-        *codec,
-    )?;
-    let run_time_ns = elapsed_nanos_u64(run_start);
-    let stream = engine
-        .stream("main")
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "runtime stream disappeared"))?;
-    let snapshot = engine.snapshot();
-    let scheduler_turns = turn.scheduler_turn_count();
-    let runtime_cycles = turn.runtime_cycle_count;
-    let generated_token_count = turn.generated_token_ids.len();
-    let timing = runtime_prompt_timing_report(
-        setup_time_ns,
-        run_time_ns,
-        generated_token_count,
-        runtime_cycles,
-        scheduler_turns,
-    );
-
-    Ok(RuntimeSingleDevicePromptRunReport {
-        ok: true,
-        execution_mode: "single_device_resident".to_string(),
-        package_manifest: package_manifest.to_path_buf(),
-        tokenizer_dir: tokenizer_dir.to_path_buf(),
-        device_name: snapshot.device_name,
-        device_id: stream.device_id.clone(),
-        runtime_patch: runtime_patch_report(args),
-        device_bindings: runtime_device_bindings_report(
-            args,
-            std::slice::from_ref(&stream.device_id),
-        ),
-        pedal_count: stream.pedal_count,
-        dispatches_per_tick: stream.per_tick_dispatch_count,
-        descriptors_per_tick: stream.per_tick_descriptor_count,
-        push_constant_bytes_per_tick: stream.per_tick_push_constant_byte_count,
-        context_window_activations: stream.dynamic_state_capacity_activations,
-        scheduled_token_activations: *needed_capacity,
-        tokenizer: tokenizer_options_report(args),
-        prompt_text: prompt.to_string(),
-        prompt_ids: turn.queued_input_event.encoded_token_ids.clone(),
-        generated_ids: turn.generated_token_ids.clone(),
-        generated_text: turn.generated_text.clone(),
-        output_text: turn.output_text.clone(),
-        stop_reason: engine_stop_label(turn.stop_condition).to_string(),
-        scheduler_turns,
-        runtime_cycles,
-        timing,
-    })
-}
-
-fn print_single_device_prompt_report(
-    args: &Args,
-    report: &RuntimeSingleDevicePromptRunReport,
-) -> Result<(), Box<dyn Error>> {
-    if args.json {
-        println!("{}", serde_json::to_string_pretty(report)?);
-    } else if args.generated_only {
-        print_text(&report.generated_text);
-    } else {
-        print_text(&report.output_text);
-        if args.profile {
-            print_prompt_timing_profile(&report.timing);
-        }
-    }
-    Ok(())
-}
-
-fn run_single_device_chat(
-    args: &Args,
-    manifest_dir: &Path,
-    tokenizer_dir: &Path,
-    runtime_model: VulkanResidentRuntimeModel,
-    capacity: usize,
-    codec: &VulkanResidentHfTokenizerTextCodec,
-    initial_prompt: Option<&str>,
-) -> Result<(), Box<dyn Error>> {
-    let setup_start = Instant::now();
-    let device = runtime_vulkan_device(args)?;
-    let chat_session = RuntimeChatSession::from_tokenizer_dir(tokenizer_dir)?;
-    let stop_token_ids = chat_stop_token_ids_from_manifest(
-        manifest_dir,
-        tokenizer_dir,
-        &runtime_model.package,
-        &chat_session.formatter,
-    )?;
-    let transcript_codec = chat_transcript_codec(tokenizer_dir)?;
-    let model = VulkanResidentModelPackage::from_runtime_model(
-        &device,
-        manifest_dir,
-        runtime_model,
-        Some(capacity),
-    )?;
-    let mut engine = VulkanResidentTokenEngine::new(device);
-    engine.add_model_package("compiled_model", model)?;
-    engine.create_stream_from_model("compiled_model", "main", args.random_seed)?;
-    println!(
-        "llmoop chat ready: single_device_resident, context_size={capacity}, setup_ms={:.3}",
-        nanos_to_millis(elapsed_nanos_u64(setup_start))
-    );
-
-    run_chat_repl(
-        initial_prompt,
-        chat_session,
-        codec,
-        &transcript_codec,
-        &stop_token_ids,
-        |turn_index, token_ids| {
-            let mut event = VulkanResidentTokenInputEvent::new(
-                format!("chat_{turn_index}"),
-                token_ids.to_vec(),
-                args.max_new_tokens,
-            )
-            .with_origin("cli_chat");
-            if !stop_token_ids.is_empty() {
-                event = event.with_stop_tokens(stop_token_ids.clone());
-            }
-            let scheduler_turn_budget = token_scheduler_turn_budget(
-                token_ids.len().saturating_add(args.max_new_tokens),
-                args.cycle_ticks,
-            );
-            let submitted = engine.submit_input_event_until_idle(
-                "main",
-                event,
-                VulkanResidentTokenEngineRunBudget::new(scheduler_turn_budget, 1, args.cycle_ticks),
-            )?;
-            Ok(RuntimeChatTurn {
-                generated_token_ids: submitted.generated_token_ids,
-                streamed: false,
-            })
-        },
-    )
+    run_placed_prompt(&context, runtime_model)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -1010,6 +810,7 @@ fn execute_placed_prompt_run(
         tokenizer_dir,
         prompt,
         prompt_ids,
+        scheduled_token_activations,
         capacity,
         codec,
         ..
@@ -1088,7 +889,7 @@ fn execute_placed_prompt_run(
         device_bindings: runtime_device_bindings_report(args, &stream_snapshot.device_ids),
         hosted_pedal_count: stream_snapshot.hosted_pedal_count,
         context_window_activations: stream_snapshot.context_window_activations,
-        scheduled_token_activations: prompt_ids.len() + args.max_new_tokens,
+        scheduled_token_activations: *scheduled_token_activations,
         tokenizer: tokenizer_options_report(args),
         prompt_text: prompt.to_string(),
         prompt_ids: run.prompt_token_ids.clone(),
@@ -1134,35 +935,6 @@ fn print_placed_prompt_report(
     Ok(())
 }
 
-fn run_single_device_prompt_benchmark(
-    context: &PromptRunContext<'_>,
-    runtime_model: VulkanResidentRuntimeModel,
-) -> Result<(), Box<dyn Error>> {
-    let mut runs = Vec::with_capacity(context.args.profile_runs);
-    for _ in 0..context.args.profile_runs {
-        runs.push(execute_single_device_prompt_run(
-            context,
-            runtime_model.clone(),
-        )?);
-    }
-    let first = runs
-        .first()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "--profile-runs is empty"))?;
-    let benchmark_runs = runs
-        .iter()
-        .enumerate()
-        .map(|(run_index, run)| single_device_benchmark_run_report(run_index, run))
-        .collect::<Vec<_>>();
-    let benchmark = runtime_prompt_benchmark_report(
-        context,
-        &first.execution_mode,
-        vec![first.device_id.clone()],
-        first.device_bindings.clone(),
-        benchmark_runs,
-    );
-    print_prompt_benchmark_report(context.args, &benchmark)
-}
-
 fn run_placed_prompt_benchmark(
     context: &PromptRunContext<'_>,
     runtime_model: VulkanResidentRuntimeModel,
@@ -1187,29 +959,6 @@ fn run_placed_prompt_benchmark(
         benchmark_runs,
     );
     print_prompt_benchmark_report(context.args, &benchmark)
-}
-
-fn single_device_benchmark_run_report(
-    run_index: usize,
-    run: &RuntimeSingleDevicePromptRunReport,
-) -> RuntimePromptBenchmarkRunReport {
-    RuntimePromptBenchmarkRunReport {
-        run_index,
-        execution_mode: run.execution_mode.clone(),
-        stop_reason: run.stop_reason.clone(),
-        generated_token_count: run.timing.generated_token_count,
-        tick_count: run.timing.tick_count,
-        scheduler_turn_count: run.timing.scheduler_turn_count,
-        setup_time_ns: run.timing.setup_time_ns,
-        run_time_ns: run.timing.run_time_ns,
-        total_time_ns: run.timing.total_time_ns,
-        generated_tokens_per_second: generated_tokens_per_second(
-            run.timing.generated_token_count,
-            run.timing.run_time_ns,
-        ),
-        transport: None,
-        pedal_timing_summaries: Vec::new(),
-    }
 }
 
 fn placed_benchmark_run_report(
@@ -2032,61 +1781,10 @@ fn runtime_model(
     )?)
 }
 
-fn runtime_vulkan_device(args: &Args) -> Result<VulkanComputeDevice, Box<dyn Error>> {
-    let mut selected_device_uuid = BTreeSet::new();
-    for target in args
-        .default_device_id
-        .iter()
-        .chain(args.device_bindings.values())
-    {
-        if let Some(device_uuid) = parse_vulkan_device_uuid_ref(target)? {
-            selected_device_uuid.insert(device_uuid);
-        }
-    }
-    let physical_device_index = runtime_physical_device_index(args)?;
-    if selected_device_uuid.len() > 1 {
-        return Err(Box::new(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "single-device execution cannot bind more than one Vulkan device UUID",
-        )));
-    }
-    if let Some(device_uuid) = selected_device_uuid.first().copied() {
-        Ok(VulkanComputeDevice::new_for_device_uuid(device_uuid)?)
-    } else if let Some(physical_device_index) = physical_device_index {
-        Ok(VulkanComputeDevice::new_for_physical_device_index(
-            physical_device_index,
-        )?)
-    } else {
-        Ok(VulkanComputeDevice::new()?)
-    }
-}
-
 struct RuntimeBoundVulkanDevices {
     devices: BTreeMap<String, Rc<VulkanComputeDevice>>,
     physical_device_indices: BTreeMap<String, usize>,
     physical_device_ids: BTreeMap<String, String>,
-}
-
-fn runtime_model_for_bound_execution(
-    args: &Args,
-    runtime_model: VulkanResidentRuntimeModel,
-) -> Result<(VulkanResidentRuntimeModel, bool), Box<dyn Error>> {
-    let logical_device_ids = runtime_model.placement_device_ids();
-    if logical_device_ids.len() <= 1 {
-        return Ok((runtime_model, false));
-    }
-    let available_devices = VulkanComputeDevice::available_compute_devices()?;
-    let physical_bindings =
-        runtime_physical_device_bindings_in(args, &logical_device_ids, &available_devices)?;
-    let physical_device_count = physical_bindings.values().collect::<BTreeSet<_>>().len();
-    if physical_device_count > 1 {
-        return Ok((runtime_model, true));
-    }
-    let execution_device_id = runtime_model.placement.default_device_id.clone();
-    Ok((
-        runtime_model.coalesce_placement_to_device(execution_device_id),
-        false,
-    ))
 }
 
 fn runtime_physical_device_bindings_in(
@@ -2234,68 +1932,6 @@ fn bound_cable_routes_report(
     })
 }
 
-fn runtime_physical_device_index(args: &Args) -> Result<Option<usize>, Box<dyn Error>> {
-    let mut selected = args.vulkan_device_index;
-    let mut unsupported_bindings = Vec::new();
-    if let Some(default_device_id) = args.default_device_id.as_deref() {
-        match resolve_runtime_vulkan_physical_device_ref(default_device_id) {
-            Ok(Some(index)) => {
-                if let Some(existing) = selected {
-                    if existing != index {
-                        return Err(Box::new(io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            format!(
-                                "runtime default device requests Vulkan physical device {index}, but --vulkan-device-index selected {existing}"
-                            ),
-                        )));
-                    }
-                } else {
-                    selected = Some(index);
-                }
-            }
-            Ok(None) if default_device_id.contains(':') => {
-                unsupported_bindings.push(default_device_id.to_string())
-            }
-            Ok(None) => {}
-            Err(error) => {
-                return Err(Box::new(io::Error::new(io::ErrorKind::InvalidInput, error)));
-            }
-        }
-    }
-    for (logical_device_id, target) in &args.device_bindings {
-        match resolve_runtime_vulkan_physical_device_ref(target) {
-            Ok(Some(index)) => {
-                if let Some(existing) = selected {
-                    if existing != index {
-                        return Err(Box::new(io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            format!(
-                                "logical device bindings request multiple Vulkan physical devices ({existing} and {index}); mounted execution still supports one VulkanComputeDevice per process, so use --inspect-patch to preview or bind all logical devices to the same physical device"
-                            ),
-                        )));
-                    }
-                } else {
-                    selected = Some(index);
-                }
-            }
-            Ok(None) => unsupported_bindings.push(format!("{logical_device_id}={target}")),
-            Err(error) => {
-                return Err(Box::new(io::Error::new(io::ErrorKind::InvalidInput, error)));
-            }
-        }
-    }
-    if !unsupported_bindings.is_empty() {
-        return Err(Box::new(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "logical device bindings are not mountable by the local Vulkan runtime yet: {}",
-                unsupported_bindings.join(", ")
-            ),
-        )));
-    }
-    Ok(selected)
-}
-
 fn runtime_mount_physical_device_index(
     args: &Args,
     logical_device_id: &str,
@@ -2380,13 +2016,6 @@ fn runtime_report_default_vulkan_physical_device_index(args: &Args) -> Option<us
             })
         })
         .or_else(|| runtime_default_vulkan_physical_device_index().ok())
-}
-
-fn token_scheduler_turn_budget(token_activations: usize, ticks_per_runtime: usize) -> usize {
-    token_activations
-        .div_ceil(ticks_per_runtime.max(1))
-        .saturating_add(1)
-        .max(1)
 }
 
 fn elapsed_nanos_u64(start: Instant) -> u64 {
@@ -2601,9 +2230,6 @@ fn parse_args() -> Result<Args, String> {
             "--vulkan-device-index" => {
                 parsed.vulkan_device_index = Some(parse_next(&mut raw, "--vulkan-device-index")?);
             }
-            "--cycle-ticks" => {
-                parsed.cycle_ticks = parse_next(&mut raw, "--cycle-ticks")?;
-            }
             "--seed" => {
                 parsed.random_seed = parse_next(&mut raw, "--seed")?;
             }
@@ -2668,9 +2294,6 @@ fn parse_args() -> Result<Args, String> {
     }
     if matches!(parsed.context_size, Some(0)) {
         return Err("--context-size must be at least 1".to_string());
-    }
-    if parsed.cycle_ticks == 0 {
-        return Err("--cycle-ticks must be at least 1".to_string());
     }
     if parsed.profile_runs == 0 {
         return Err("--profile-runs must be at least 1".to_string());
@@ -2981,13 +2604,6 @@ fn nanos_to_millis_f64(nanos: f64) -> f64 {
     nanos / 1_000_000.0
 }
 
-fn engine_stop_label(stop: VulkanResidentTokenEngineRunStopCondition) -> &'static str {
-    match stop {
-        VulkanResidentTokenEngineRunStopCondition::Idle => "idle",
-        VulkanResidentTokenEngineRunStopCondition::SchedulerTurnBudget => "scheduler_turn_budget",
-    }
-}
-
 fn print_usage() {
     println!("{}", usage());
 }
@@ -3015,7 +2631,6 @@ Options:
   --max-new-tokens <N>       Generation stop condition, independent of context size. Default: 65536
   --context-size <N>         Runtime transient-state window. Default: auto, up to the model maximum.
   --vulkan-device-index <N>  Use Vulkan physical device index N as the default local target.
-  --cycle-ticks <N>          Max runtime ticks per always-on cycle. Default: 64
   --seed <U32>               Explicit sampler randomness seed. Default: 0
   --no-special-tokens        Do not add tokenizer special tokens to raw --prompt input.
                              Chat templates always own their complete special-token framing.
@@ -3044,8 +2659,7 @@ mod tests {
     use tokenizers::{AddedToken, Tokenizer};
 
     use llmoop_runtime::{
-        VULKAN_BACKEND_LOOP_MAX_WINDOW, VulkanComputeDeviceInfo,
-        VulkanResidentHfTokenizerTextCodec, VulkanResidentTokenTextCodec,
+        VulkanComputeDeviceInfo, VulkanResidentHfTokenizerTextCodec, VulkanResidentTokenTextCodec,
         VulkanResidentTokenTextCodecError,
     };
 
@@ -3055,7 +2669,7 @@ mod tests {
         model_owned_assistant_turn_stop_token_id, normalize_chat_template_for_runtime,
         parse_device_binding_assignment, parse_source_chain, parse_vulkan_device_uuid_ref,
         resolve_runtime_context_size, resolve_runtime_vulkan_physical_device_ref,
-        runtime_physical_device_bindings_in, token_scheduler_turn_budget,
+        runtime_physical_device_bindings_in,
     };
 
     fn formatter(template_source: &str) -> RuntimeChatFormatter {
@@ -3092,11 +2706,6 @@ mod tests {
                 })
                 .collect()
         }
-    }
-
-    #[test]
-    fn runtime_default_uses_full_resident_backend_cycle_window() {
-        assert_eq!(Args::default().cycle_ticks, VULKAN_BACKEND_LOOP_MAX_WINDOW);
     }
 
     #[test]
@@ -3145,12 +2754,6 @@ mod tests {
         assert_eq!(chat_codec.encode_text("hello").unwrap(), vec![hello_id]);
 
         fs::remove_dir_all(tokenizer_dir).unwrap();
-    }
-
-    #[test]
-    fn scheduler_budgets_scale_with_work_instead_of_capping_generation() {
-        assert_eq!(token_scheduler_turn_budget(65_536, 4), 16_385);
-        assert_eq!(token_scheduler_turn_budget(0, 4), 1);
     }
 
     #[test]

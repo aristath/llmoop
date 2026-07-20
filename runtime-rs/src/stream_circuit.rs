@@ -3093,34 +3093,6 @@ pub struct RuntimePromptBenchmarkReport {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RuntimeSingleDevicePromptRunReport {
-    pub ok: bool,
-    pub execution_mode: String,
-    pub package_manifest: PathBuf,
-    pub tokenizer_dir: PathBuf,
-    pub device_name: String,
-    pub device_id: String,
-    pub runtime_patch: RuntimePatchControls,
-    pub device_bindings: RuntimeDeviceBindings,
-    pub pedal_count: usize,
-    pub dispatches_per_tick: usize,
-    pub descriptors_per_tick: usize,
-    pub push_constant_bytes_per_tick: u32,
-    pub context_window_activations: usize,
-    pub scheduled_token_activations: usize,
-    pub tokenizer: RuntimeTokenizerOptionsReport,
-    pub prompt_text: String,
-    pub prompt_ids: Vec<u32>,
-    pub generated_ids: Vec<u32>,
-    pub generated_text: String,
-    pub output_text: String,
-    pub stop_reason: String,
-    pub scheduler_turns: usize,
-    pub runtime_cycles: usize,
-    pub timing: RuntimePromptTimingReport,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimePlacedPromptRunReport {
     pub ok: bool,
     pub execution_mode: String,
@@ -4150,37 +4122,6 @@ mod tests {
             average_tick_time_ns: Some(90),
             average_scheduler_turn_time_ns: Some(90),
         };
-        let single = RuntimeSingleDevicePromptRunReport {
-            ok: true,
-            execution_mode: "single_device_resident".to_string(),
-            package_manifest: PathBuf::from("package.json"),
-            tokenizer_dir: PathBuf::from("tokenizer"),
-            device_name: "Radeon Test Device".to_string(),
-            device_id: "gpu0".to_string(),
-            runtime_patch: RuntimePatchControls {
-                default_device_id: Some("gpu0".to_string()),
-                pedal_devices: BTreeMap::new(),
-                source_chain: None,
-                duplicate_after: Vec::new(),
-            },
-            device_bindings: bindings.clone(),
-            pedal_count: 14,
-            dispatches_per_tick: 42,
-            descriptors_per_tick: 64,
-            push_constant_bytes_per_tick: 128,
-            context_window_activations: 16,
-            scheduled_token_activations: 2,
-            tokenizer: tokenizer.clone(),
-            prompt_text: "Hello".to_string(),
-            prompt_ids: vec![1],
-            generated_ids: vec![2],
-            generated_text: " world".to_string(),
-            output_text: "Hello world".to_string(),
-            stop_reason: "max_new_tokens".to_string(),
-            scheduler_turns: 1,
-            runtime_cycles: 1,
-            timing: timing.clone(),
-        };
         let placed = RuntimePlacedPromptRunReport {
             ok: true,
             execution_mode: "placed_in_process".to_string(),
@@ -4351,16 +4292,12 @@ mod tests {
             }],
         };
 
-        let single_payload = serde_json::to_value(&single).unwrap();
         let placed_payload = serde_json::to_value(&placed).unwrap();
         let benchmark_payload = serde_json::to_value(&benchmark).unwrap();
 
-        assert_eq!(single_payload["execution_mode"], "single_device_resident");
-        assert_eq!(single_payload["generated_ids"][0], 2);
         assert_eq!(placed_payload["execution_mode"], "placed_in_process");
         assert_eq!(placed_payload["transport"]["direct_copy_count"], 2);
         assert_eq!(placed_payload["completed_stage_deltas"][0], 42);
-        assert_eq!(single_payload["timing"]["total_time_ns"], 100);
         assert_eq!(
             placed_payload["timing"]["average_generated_token_time_ns"],
             90
