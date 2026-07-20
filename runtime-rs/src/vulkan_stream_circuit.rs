@@ -8146,6 +8146,11 @@ impl VulkanResidentRuntimeModel {
         self.circuit_graph
             .to_resolved_lowered_pedalboard(package_root)
     }
+
+    pub fn coalesce_placement_to_device(mut self, device_id: impl Into<String>) -> Self {
+        self.placement = StreamCircuitPlacementSpec::new(device_id);
+        self
+    }
 }
 
 pub(crate) fn attach_generation_pedal_devices_for_vulkan(
@@ -19848,6 +19853,36 @@ mod tests {
             .find(|execution| execution.pedal_id == "layer_05")
             .unwrap();
         assert_eq!(repeated_execution.kernels, source_execution.kernels);
+    }
+
+    #[test]
+    fn runtime_model_coalesces_execution_placement_without_rewriting_the_patch() {
+        let manifest = fixture_model_package_manifest();
+        let source_graph = manifest
+            .circuit_graph
+            .to_resolved_lowered_pedalboard(PathBuf::from("."))
+            .unwrap();
+        let patch = StreamCircuitRuntimePatch::from_source_series(&source_graph, "gpu0")
+            .unwrap()
+            .with_instance_device("layer_05", "gpu1")
+            .unwrap();
+        let runtime_model = manifest.mount_runtime_patch(&patch).unwrap();
+        assert_eq!(
+            runtime_model.placement_device_ids(),
+            vec!["gpu0".to_string(), "gpu1".to_string()]
+        );
+
+        let coalesced = runtime_model
+            .clone()
+            .coalesce_placement_to_device("physical_gpu0");
+
+        assert_eq!(
+            coalesced.placement_device_ids(),
+            vec!["physical_gpu0".to_string()]
+        );
+        assert_eq!(coalesced.patch, runtime_model.patch);
+        assert_eq!(coalesced.circuit_graph, runtime_model.circuit_graph);
+        assert_eq!(coalesced.pedal_executions, runtime_model.pedal_executions);
     }
 
     #[test]
