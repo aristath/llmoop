@@ -1235,6 +1235,7 @@ def _ffn_tail(
                         "op": "silu_multiply",
                         "inputs": ["shared_gate", "shared_up"],
                         "outputs": ["shared_hidden"],
+                        "attrs": {"element_count": shared_width},
                     },
                     {
                         "id": "shared_mlp_output_projection",

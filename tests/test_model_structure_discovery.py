@@ -512,6 +512,7 @@ def test_discovers_mixed_window_attention_sinks_and_shared_sparse_experts() -> N
     assert nodes["moe_reduce"]["outputs"] == ["moe_out"]
     assert nodes["shared_mlp_input_projection"]["params"] == ["shared_mlp_input"]
     assert nodes["shared_mlp_split"]["attrs"] == {"part_width": 10}
+    assert nodes["shared_mlp_activation"]["attrs"] == {"element_count": 10}
     assert nodes["shared_mlp_output_projection"]["params"] == ["shared_mlp_output"]
     assert nodes["shared_and_sparse_expert_add"]["outputs"] == ["ffn_out"]
 
