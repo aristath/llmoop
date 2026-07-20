@@ -115,14 +115,32 @@ void main() {
         }
         barrier();
 
+        float q_sum = 0.0;
+        float k_sum = 0.0;
+        for (
+            uint key_dim = value_dim;
+            key_dim < KEY_HEAD_WIDTH;
+            key_dim += VALUE_HEAD_WIDTH
+        ) {
+            float q = raw_query[key_dim];
+            float k = raw_key[key_dim];
+            q_sum = fma(q, q, q_sum);
+            k_sum = fma(k, k, k_sum);
+        }
+        q_sum = subgroupAdd(q_sum);
+        k_sum = subgroupAdd(k_sum);
+        if (gl_SubgroupInvocationID == 0u) {
+            reduction[gl_SubgroupID] = q_sum;
+            head_output[gl_SubgroupID] = k_sum;
+        }
+        barrier();
+
         if (value_dim == 0u) {
-            float q_sum = 0.0;
-            float k_sum = 0.0;
-            for (uint key_dim = 0u; key_dim < KEY_HEAD_WIDTH; key_dim++) {
-                float q = raw_query[key_dim];
-                float k = raw_key[key_dim];
-                q_sum = fma(q, q, q_sum);
-                k_sum = fma(k, k, k_sum);
+            q_sum = 0.0;
+            k_sum = 0.0;
+            for (uint subgroup = 0u; subgroup < gl_NumSubgroups; subgroup++) {
+                q_sum += reduction[subgroup];
+                k_sum += head_output[subgroup];
             }
             q_inv_norm = inversesqrt(q_sum + 0.000001);
             k_inv_norm = inversesqrt(k_sum + 0.000001);

@@ -1078,6 +1078,10 @@ def test_compiler_renders_hybrid_recurrent_and_gated_attention_pedals(
     assert "unpack_bf16(norm_weight.words[index >> 1u], index)" in bf16_recurrence
     assert "shared float raw_query[KEY_HEAD_WIDTH];" in temporal_recurrence
     assert "shared float raw_key[KEY_HEAD_WIDTH];" in temporal_recurrence
+    assert "q_sum = subgroupAdd(q_sum);" in temporal_recurrence
+    assert "k_sum = subgroupAdd(k_sum);" in temporal_recurrence
+    assert "reduction[gl_SubgroupID] = q_sum;" in temporal_recurrence
+    assert "head_output[gl_SubgroupID] = k_sum;" in temporal_recurrence
     assert "head_beta = 1.0 /" in temporal_recurrence
     assert "float previous = recurrent_state[key_dim] * head_decay;" in temporal_recurrence
     assert "recurrent_state[key_dim] = previous;" in temporal_recurrence
