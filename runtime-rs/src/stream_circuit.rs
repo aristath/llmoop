@@ -3146,7 +3146,6 @@ pub struct RuntimePlacedPromptRunReport {
     pub stop_reason: String,
     pub tick_count: usize,
     pub scheduler_turns: usize,
-    pub max_scheduler_turns_per_tick: usize,
     pub completed_stage_deltas: Vec<usize>,
     pub transport: RuntimePlacedTransportReport,
     pub timing: RuntimePromptTimingReport,
@@ -4221,7 +4220,6 @@ mod tests {
             stop_reason: "max_new_tokens".to_string(),
             tick_count: 1,
             scheduler_turns: 1,
-            max_scheduler_turns_per_tick: 1024,
             completed_stage_deltas: vec![42],
             transport: RuntimePlacedTransportReport {
                 published_packet_count: 0,

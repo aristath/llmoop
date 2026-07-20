@@ -934,10 +934,6 @@ fn run_placed_chat(
     )?;
     let mut engine = VulkanResidentInProcessPlacedPromptEngine::new();
     let stream_snapshot = engine.add_stream("main", stream)?;
-    let scheduler_turns_per_tick = placed_scheduler_turn_budget(
-        stream_snapshot.hosted_pedal_count,
-        stream_snapshot.device_ids.len(),
-    );
     println!(
         "llmoop chat ready: placed_in_process, devices={:?}, context_size={}, setup_ms={:.3}",
         stream_snapshot.device_ids,
@@ -963,7 +959,6 @@ fn run_placed_chat(
                 token_ids,
                 args.max_new_tokens,
                 &stop_token_ids,
-                scheduler_turns_per_tick,
                 |token_id| {
                     if output_error.is_some() {
                         return;
@@ -1027,20 +1022,12 @@ fn execute_placed_prompt_run(
     )?;
     let mut engine = VulkanResidentInProcessPlacedPromptEngine::new();
     let stream_snapshot = engine.add_stream("main", stream)?;
-    let scheduler_turns_per_tick = placed_scheduler_turn_budget(
-        stream_snapshot.hosted_pedal_count,
-        stream_snapshot.device_ids.len(),
-    );
     let setup_time_ns = elapsed_nanos_u64(setup_start);
     let run_start = Instant::now();
     let input_event =
         VulkanResidentTokenInputEvent::new("prompt", prompt_ids.to_vec(), args.max_new_tokens);
     let input_event_id = input_event.id.clone();
-    let submitted_run = engine.submit_input_event_until_idle_bounded(
-        "main",
-        input_event,
-        scheduler_turns_per_tick,
-    )?;
+    let submitted_run = engine.submit_input_event_until_idle("main", input_event)?;
     let run_time_ns = elapsed_nanos_u64(run_start);
     let run = submitted_run
         .engine_run
@@ -1106,7 +1093,6 @@ fn execute_placed_prompt_run(
         stop_reason: run.stop_reason.clone(),
         tick_count,
         scheduler_turns: total_scheduler_turns,
-        max_scheduler_turns_per_tick: scheduler_turns_per_tick,
         completed_stage_deltas,
         transport: RuntimePlacedTransportReport {
             published_packet_count: transport_published_packet_count,
@@ -2398,10 +2384,6 @@ fn token_scheduler_turn_budget(token_activations: usize, ticks_per_runtime: usiz
         .max(1)
 }
 
-fn placed_scheduler_turn_budget(hosted_pedal_count: usize, device_count: usize) -> usize {
-    hosted_pedal_count.saturating_add(device_count).max(1)
-}
-
 fn elapsed_nanos_u64(start: Instant) -> u64 {
     u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
@@ -3067,9 +3049,8 @@ mod tests {
         assistant_content_token_ids, chat_transcript_codec, incremental_chat_token_delta,
         model_owned_assistant_turn_stop_token_id, normalize_chat_template_for_runtime,
         parse_device_binding_assignment, parse_source_chain, parse_vulkan_device_uuid_ref,
-        placed_scheduler_turn_budget, resolve_runtime_context_size,
-        resolve_runtime_vulkan_physical_device_ref, runtime_physical_device_bindings_in,
-        token_scheduler_turn_budget,
+        resolve_runtime_context_size, resolve_runtime_vulkan_physical_device_ref,
+        runtime_physical_device_bindings_in, token_scheduler_turn_budget,
     };
 
     fn formatter(template_source: &str) -> RuntimeChatFormatter {
@@ -3165,7 +3146,6 @@ mod tests {
     fn scheduler_budgets_scale_with_work_instead_of_capping_generation() {
         assert_eq!(token_scheduler_turn_budget(65_536, 4), 16_385);
         assert_eq!(token_scheduler_turn_budget(0, 4), 1);
-        assert_eq!(placed_scheduler_turn_budget(40, 3), 43);
     }
 
     #[test]

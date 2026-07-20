@@ -9025,7 +9025,6 @@ pub struct VulkanResidentPromptRequest<'a> {
     pub prompt_token_ids: &'a [u32],
     pub max_new_tokens: usize,
     pub stop_token_ids: &'a [u32],
-    pub max_scheduler_turns_per_tick: usize,
 }
 
 impl<'a> VulkanResidentPromptRequest<'a> {
@@ -9033,13 +9032,11 @@ impl<'a> VulkanResidentPromptRequest<'a> {
         prompt_token_ids: &'a [u32],
         max_new_tokens: usize,
         stop_token_ids: &'a [u32],
-        max_scheduler_turns_per_tick: usize,
     ) -> Self {
         Self {
             prompt_token_ids,
             max_new_tokens,
             stop_token_ids,
-            max_scheduler_turns_per_tick,
         }
     }
 }
@@ -9559,18 +9556,12 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
         &self,
         device: &VulkanComputeDevice,
         stream_tick: u64,
-        max_scheduler_turns: usize,
     ) -> Result<
         VulkanMountedPlacedResidentInProcessStreamTickRun,
         VulkanResidentInProcessPlacedRuntimeError,
     > {
         let mut transport = VulkanInProcessPlacedCableTransport::new();
-        self.run_stream_tick_in_process_with_transport(
-            device,
-            &mut transport,
-            stream_tick,
-            max_scheduler_turns,
-        )
+        self.run_stream_tick_in_process_with_transport(device, &mut transport, stream_tick)
     }
 
     pub fn run_stream_tick_in_process_with_transport(
@@ -9578,7 +9569,6 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
         device: &VulkanComputeDevice,
         transport: &mut VulkanInProcessPlacedCableTransport,
         stream_tick: u64,
-        max_scheduler_turns: usize,
     ) -> Result<
         VulkanMountedPlacedResidentInProcessStreamTickRun,
         VulkanResidentInProcessPlacedRuntimeError,
@@ -9596,19 +9586,14 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
             ));
         }
 
-        run_mounted_placed_resident_stream_tick_slices_in_process(
-            &mut tick_slices,
-            transport,
-            max_scheduler_turns,
-        )
-        .map_err(VulkanResidentInProcessPlacedRuntimeError::Tick)
+        run_mounted_placed_resident_stream_tick_slices_in_process(&mut tick_slices, transport)
+            .map_err(VulkanResidentInProcessPlacedRuntimeError::Tick)
     }
 
     pub fn run_stream_tick_on_bound_devices_in_process(
         &self,
         devices: &BTreeMap<String, Rc<VulkanComputeDevice>>,
         stream_tick: u64,
-        max_scheduler_turns: usize,
     ) -> Result<
         VulkanMountedPlacedResidentInProcessStreamTickRun,
         VulkanResidentInProcessPlacedRuntimeError,
@@ -9618,7 +9603,6 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
             devices,
             &mut transport,
             stream_tick,
-            max_scheduler_turns,
         )
     }
 
@@ -9627,7 +9611,6 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
         devices: &BTreeMap<String, Rc<VulkanComputeDevice>>,
         transport: &mut VulkanInProcessPlacedCableTransport,
         stream_tick: u64,
-        max_scheduler_turns: usize,
     ) -> Result<
         VulkanMountedPlacedResidentInProcessStreamTickRun,
         VulkanResidentInProcessPlacedRuntimeError,
@@ -9653,12 +9636,8 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
             ));
         }
 
-        run_mounted_placed_resident_stream_tick_slices_in_process(
-            &mut tick_slices,
-            transport,
-            max_scheduler_turns,
-        )
-        .map_err(VulkanResidentInProcessPlacedRuntimeError::Tick)
+        run_mounted_placed_resident_stream_tick_slices_in_process(&mut tick_slices, transport)
+            .map_err(VulkanResidentInProcessPlacedRuntimeError::Tick)
     }
 
     fn execute_prepared_token_id_stream_tick_in_process_with_transport(
@@ -9666,7 +9645,6 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
         device: &VulkanComputeDevice,
         transport: &mut VulkanInProcessPlacedCableTransport,
         stream_tick: u64,
-        max_scheduler_turns: usize,
         tail: VulkanResidentPlacedTokenTickTail,
     ) -> Result<
         VulkanMountedPlacedResidentInProcessStreamTickRun,
@@ -9710,12 +9688,9 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
                 ),
             );
         }
-        let placed_run = run_mounted_placed_resident_stream_tick_slices_in_process(
-            &mut tick_slices,
-            transport,
-            max_scheduler_turns,
-        )
-        .map_err(VulkanResidentInProcessPlacedRuntimeError::Tick)?;
+        let placed_run =
+            run_mounted_placed_resident_stream_tick_slices_in_process(&mut tick_slices, transport)
+                .map_err(VulkanResidentInProcessPlacedRuntimeError::Tick)?;
         if placed_run.status != VulkanMountedPlacedResidentInProcessStreamTickRunStatus::Completed {
             return Err(VulkanResidentInProcessPlacedRuntimeError::IncompleteTick(
                 placed_run.status,
@@ -9730,7 +9705,6 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
         transport: &mut VulkanInProcessPlacedCableTransport,
         input: VulkanResidentPlacedTokenInput,
         stream_tick: u64,
-        max_scheduler_turns: usize,
         tail: VulkanResidentPlacedTokenTickTail,
     ) -> Result<
         (
@@ -9745,7 +9719,6 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
             device,
             transport,
             stream_tick,
-            max_scheduler_turns,
             tail,
         )?;
         let output_run = (tail != VulkanResidentPlacedTokenTickTail::None)
@@ -9778,7 +9751,6 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
         devices: &BTreeMap<String, Rc<VulkanComputeDevice>>,
         transport: &mut VulkanInProcessPlacedCableTransport,
         stream_tick: u64,
-        max_scheduler_turns: usize,
         tail: VulkanResidentPlacedTokenTickTail,
     ) -> Result<
         VulkanMountedPlacedResidentInProcessStreamTickRun,
@@ -9830,12 +9802,9 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
                 ),
             );
         }
-        let placed_run = run_mounted_placed_resident_stream_tick_slices_in_process(
-            &mut tick_slices,
-            transport,
-            max_scheduler_turns,
-        )
-        .map_err(VulkanResidentInProcessPlacedRuntimeError::Tick)?;
+        let placed_run =
+            run_mounted_placed_resident_stream_tick_slices_in_process(&mut tick_slices, transport)
+                .map_err(VulkanResidentInProcessPlacedRuntimeError::Tick)?;
         if placed_run.status != VulkanMountedPlacedResidentInProcessStreamTickRunStatus::Completed {
             return Err(VulkanResidentInProcessPlacedRuntimeError::IncompleteTick(
                 placed_run.status,
@@ -9850,7 +9819,6 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
         transport: &mut VulkanInProcessPlacedCableTransport,
         input: VulkanResidentPlacedTokenInput,
         stream_tick: u64,
-        max_scheduler_turns: usize,
         tail: VulkanResidentPlacedTokenTickTail,
     ) -> Result<
         (
@@ -9866,7 +9834,6 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
                 devices,
                 transport,
                 stream_tick,
-                max_scheduler_turns,
                 tail,
             )?;
         let output_run = (tail != VulkanResidentPlacedTokenTickTail::None)
@@ -9899,7 +9866,6 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
         device: &VulkanComputeDevice,
         token_id: u32,
         stream_tick: u64,
-        max_scheduler_turns: usize,
     ) -> Result<
         VulkanResidentInProcessPlacedSingleTokenTickRun,
         VulkanResidentInProcessPlacedRuntimeError,
@@ -9910,7 +9876,6 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
             &mut transport,
             token_id,
             stream_tick,
-            max_scheduler_turns,
         )
     }
 
@@ -9920,7 +9885,6 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
         transport: &mut VulkanInProcessPlacedCableTransport,
         token_id: u32,
         stream_tick: u64,
-        max_scheduler_turns: usize,
     ) -> Result<
         VulkanResidentInProcessPlacedSingleTokenTickRun,
         VulkanResidentInProcessPlacedRuntimeError,
@@ -9930,7 +9894,6 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
             transport,
             VulkanResidentPlacedTokenInput::HostSupplied(token_id),
             stream_tick,
-            max_scheduler_turns,
             VulkanResidentPlacedTokenTickTail::Logits,
         )
         .map(|(tick_run, _)| tick_run)
@@ -9941,7 +9904,6 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
         devices: &BTreeMap<String, Rc<VulkanComputeDevice>>,
         token_id: u32,
         stream_tick: u64,
-        max_scheduler_turns: usize,
     ) -> Result<
         VulkanResidentInProcessPlacedSingleTokenTickRun,
         VulkanResidentInProcessPlacedRuntimeError,
@@ -9952,7 +9914,6 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
             &mut transport,
             token_id,
             stream_tick,
-            max_scheduler_turns,
         )
     }
 
@@ -9962,7 +9923,6 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
         transport: &mut VulkanInProcessPlacedCableTransport,
         token_id: u32,
         stream_tick: u64,
-        max_scheduler_turns: usize,
     ) -> Result<
         VulkanResidentInProcessPlacedSingleTokenTickRun,
         VulkanResidentInProcessPlacedRuntimeError,
@@ -9972,7 +9932,6 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
             transport,
             VulkanResidentPlacedTokenInput::HostSupplied(token_id),
             stream_tick,
-            max_scheduler_turns,
             VulkanResidentPlacedTokenTickTail::Logits,
         )
         .map(|(tick_run, _)| tick_run)
@@ -9983,7 +9942,6 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
         device: &VulkanComputeDevice,
         token_id: u32,
         stream_tick: u64,
-        max_scheduler_turns: usize,
     ) -> Result<
         VulkanResidentInProcessPlacedSingleTokenSampleRun,
         VulkanResidentInProcessPlacedRuntimeError,
@@ -9994,7 +9952,6 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
             &mut transport,
             token_id,
             stream_tick,
-            max_scheduler_turns,
         )
     }
 
@@ -10004,7 +9961,6 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
         transport: &mut VulkanInProcessPlacedCableTransport,
         token_id: u32,
         stream_tick: u64,
-        max_scheduler_turns: usize,
     ) -> Result<
         VulkanResidentInProcessPlacedSingleTokenSampleRun,
         VulkanResidentInProcessPlacedRuntimeError,
@@ -10015,7 +9971,6 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
                 transport,
                 VulkanResidentPlacedTokenInput::HostSupplied(token_id),
                 stream_tick,
-                max_scheduler_turns,
                 VulkanResidentPlacedTokenTickTail::Sample,
             )?;
         Ok(VulkanResidentInProcessPlacedSingleTokenSampleRun {
@@ -10031,7 +9986,6 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
         initial_token_id: u32,
         start_stream_tick: u64,
         max_ticks: usize,
-        max_scheduler_turns_per_tick: usize,
     ) -> Result<
         VulkanResidentInProcessPlacedFeedbackLoopRun,
         VulkanResidentInProcessPlacedRuntimeError,
@@ -10063,7 +10017,6 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
                         tick_index != 0,
                     ),
                     stream_tick,
-                    max_scheduler_turns_per_tick,
                     VulkanResidentPlacedTokenTickTail::Sample,
                 )?;
             let tick_run = VulkanResidentInProcessPlacedSingleTokenSampleRun {
@@ -10137,7 +10090,6 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
             prompt_token_ids,
             max_new_tokens,
             stop_token_ids,
-            max_scheduler_turns_per_tick,
         } = request;
 
         let mut external_input_index = 0usize;
@@ -10193,7 +10145,6 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
                 device,
                 transport,
                 stream_tick,
-                max_scheduler_turns_per_tick,
                 tail,
             )?;
             scheduler_turn_count =
@@ -10315,7 +10266,6 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
             prompt_token_ids,
             max_new_tokens,
             stop_token_ids,
-            max_scheduler_turns_per_tick,
         } = request;
 
         let mut external_input_index = 0usize;
@@ -10372,7 +10322,6 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
                     devices,
                     transport,
                     stream_tick,
-                    max_scheduler_turns_per_tick,
                     tail,
                 )?;
             scheduler_turn_count =
@@ -10991,9 +10940,8 @@ impl VulkanResidentInProcessPlacedPromptStream {
         }
     }
 
-    pub fn run_next_activation_bounded(
+    pub fn run_next_activation(
         &mut self,
-        max_scheduler_turns_per_tick: usize,
     ) -> Result<
         Option<VulkanResidentInProcessPlacedPromptStreamActivationRun>,
         VulkanResidentInProcessPlacedRuntimeError,
@@ -11038,7 +10986,6 @@ impl VulkanResidentInProcessPlacedPromptStream {
                 &self.devices,
                 &mut self.session.transport,
                 stream_tick,
-                max_scheduler_turns_per_tick,
                 tail,
             )?;
         let sampled_token_id = if activation.should_emit_public_output {
@@ -11142,9 +11089,8 @@ impl VulkanResidentInProcessPlacedPromptStream {
         }
     }
 
-    pub fn run_next_queued_input_event_bounded(
+    pub fn run_next_queued_input_event(
         &mut self,
-        max_scheduler_turns_per_tick: usize,
     ) -> Result<
         Option<VulkanResidentInProcessPlacedSubmittedInputRun>,
         VulkanResidentInProcessPlacedRuntimeError,
@@ -11154,7 +11100,7 @@ impl VulkanResidentInProcessPlacedPromptStream {
         }
         loop {
             let activation = self
-                .run_next_activation_bounded(max_scheduler_turns_per_tick)?
+                .run_next_activation()?
                 .ok_or(VulkanResidentInProcessPlacedRuntimeError::MissingPrivateFeedback)?;
             if let Some(completed_input_run) = activation.completed_input_run {
                 return Ok(Some(completed_input_run));
@@ -11162,30 +11108,26 @@ impl VulkanResidentInProcessPlacedPromptStream {
         }
     }
 
-    pub fn submit_input_event_bounded(
+    pub fn submit_input_event(
         &mut self,
         event: VulkanResidentTokenInputEvent,
-        max_scheduler_turns_per_tick: usize,
     ) -> Result<
         VulkanResidentInProcessPlacedSubmittedInputRun,
         VulkanResidentInProcessPlacedRuntimeError,
     > {
         self.ensure_idle_for_direct_prompt_run()?;
         self.enqueue_input_event(event);
-        self.run_next_queued_input_event_bounded(max_scheduler_turns_per_tick)?
+        self.run_next_queued_input_event()?
             .ok_or(VulkanResidentInProcessPlacedRuntimeError::EmptyPromptEvent)
     }
 
-    pub fn run_queued_input_events_until_idle_bounded(
+    pub fn run_queued_input_events_until_idle(
         &mut self,
-        max_scheduler_turns_per_tick: usize,
     ) -> Result<VulkanResidentInProcessPlacedInputQueueRun, VulkanResidentInProcessPlacedRuntimeError>
     {
         let start_stream_tick = self.next_stream_tick();
         let mut submitted_runs = Vec::new();
-        while let Some(submitted_run) =
-            self.run_next_queued_input_event_bounded(max_scheduler_turns_per_tick)?
-        {
+        while let Some(submitted_run) = self.run_next_queued_input_event()? {
             submitted_runs.push(submitted_run);
         }
         let next_stream_tick = self.next_stream_tick();
@@ -11213,10 +11155,9 @@ impl VulkanResidentInProcessPlacedPromptStream {
         })
     }
 
-    pub fn submit_input_events_until_idle_bounded<I>(
+    pub fn submit_input_events_until_idle<I>(
         &mut self,
         events: I,
-        max_scheduler_turns_per_tick: usize,
     ) -> Result<VulkanResidentInProcessPlacedInputQueueRun, VulkanResidentInProcessPlacedRuntimeError>
     where
         I: IntoIterator<Item = VulkanResidentTokenInputEvent>,
@@ -11224,7 +11165,7 @@ impl VulkanResidentInProcessPlacedPromptStream {
         for event in events {
             self.enqueue_input_event(event);
         }
-        self.run_queued_input_events_until_idle_bounded(max_scheduler_turns_per_tick)
+        self.run_queued_input_events_until_idle()
     }
 
     pub fn run_prompt_event_bounded(
@@ -11232,7 +11173,6 @@ impl VulkanResidentInProcessPlacedPromptStream {
         prompt_token_ids: &[u32],
         max_new_tokens: usize,
         stop_token_ids: &[u32],
-        max_scheduler_turns_per_tick: usize,
     ) -> Result<
         VulkanResidentInProcessPlacedPromptSessionRun,
         VulkanResidentInProcessPlacedRuntimeError,
@@ -11242,12 +11182,7 @@ impl VulkanResidentInProcessPlacedPromptStream {
             .run_prompt_event_bounded_on_bound_devices_in_process(
                 &self.processor,
                 &self.devices,
-                VulkanResidentPromptRequest::new(
-                    prompt_token_ids,
-                    max_new_tokens,
-                    stop_token_ids,
-                    max_scheduler_turns_per_tick,
-                ),
+                VulkanResidentPromptRequest::new(prompt_token_ids, max_new_tokens, stop_token_ids),
             )
     }
 
@@ -11256,7 +11191,6 @@ impl VulkanResidentInProcessPlacedPromptStream {
         prompt_token_ids: &[u32],
         max_new_tokens: usize,
         stop_token_ids: &[u32],
-        max_scheduler_turns_per_tick: usize,
         on_output_token: F,
     ) -> Result<
         VulkanResidentInProcessPlacedPromptSessionRun,
@@ -11270,12 +11204,7 @@ impl VulkanResidentInProcessPlacedPromptStream {
             .run_prompt_event_bounded_on_bound_devices_in_process_with_output(
                 &self.processor,
                 &self.devices,
-                VulkanResidentPromptRequest::new(
-                    prompt_token_ids,
-                    max_new_tokens,
-                    stop_token_ids,
-                    max_scheduler_turns_per_tick,
-                ),
+                VulkanResidentPromptRequest::new(prompt_token_ids, max_new_tokens, stop_token_ids),
                 on_output_token,
             )
     }
@@ -11487,18 +11416,17 @@ impl VulkanResidentInProcessPlacedPromptEngine {
         })
     }
 
-    pub fn submit_input_event_until_idle_bounded(
+    pub fn submit_input_event_until_idle(
         &mut self,
         stream_id: &str,
         event: VulkanResidentTokenInputEvent,
-        max_scheduler_turns_per_tick: usize,
     ) -> Result<
         VulkanResidentInProcessPlacedPromptEngineSubmittedInputRun,
         VulkanResidentInProcessPlacedPromptEngineError,
     > {
         let input_event_id = event.id.clone();
         let queued_input_event = self.enqueue_input_event(stream_id, event)?;
-        let engine_run = self.run_until_idle_bounded(usize::MAX, max_scheduler_turns_per_tick)?;
+        let engine_run = self.run_until_idle_bounded(usize::MAX)?;
         let output_events = engine_run
             .output_events
             .iter()
@@ -11526,7 +11454,6 @@ impl VulkanResidentInProcessPlacedPromptEngine {
         &mut self,
         requests: I,
         max_engine_turns: usize,
-        max_scheduler_turns_per_tick: usize,
     ) -> Result<
         VulkanResidentInProcessPlacedPromptEngineBatchRun,
         VulkanResidentInProcessPlacedPromptEngineError,
@@ -11539,8 +11466,7 @@ impl VulkanResidentInProcessPlacedPromptEngine {
             queued_input_events
                 .push(self.enqueue_input_event(&request.stream_id, request.input_event)?);
         }
-        let engine_run =
-            self.run_until_idle_bounded(max_engine_turns, max_scheduler_turns_per_tick)?;
+        let engine_run = self.run_until_idle_bounded(max_engine_turns)?;
         let output_events = engine_run.output_events.clone();
         let generated_token_ids = engine_run.generated_token_ids.clone();
 
@@ -11555,7 +11481,6 @@ impl VulkanResidentInProcessPlacedPromptEngine {
     pub fn run_until_idle_bounded(
         &mut self,
         max_engine_turns: usize,
-        max_scheduler_turns_per_tick: usize,
     ) -> Result<
         VulkanResidentInProcessPlacedPromptEngineRun,
         VulkanResidentInProcessPlacedPromptEngineError,
@@ -11578,9 +11503,7 @@ impl VulkanResidentInProcessPlacedPromptEngine {
             if stream.is_idle() {
                 continue;
             }
-            let Some(activation_run) =
-                stream.run_next_activation_bounded(max_scheduler_turns_per_tick)?
-            else {
+            let Some(activation_run) = stream.run_next_activation()? else {
                 continue;
             };
             engine_turn_count = engine_turn_count.saturating_add(1);
@@ -11625,7 +11548,6 @@ impl VulkanResidentInProcessPlacedPromptEngine {
 
         Ok(VulkanResidentInProcessPlacedPromptEngineRun {
             max_engine_turns,
-            max_scheduler_turns_per_tick,
             engine_turn_count,
             stop_condition,
             processed_input_event_count: input_runs.len(),
@@ -11739,7 +11661,6 @@ pub enum VulkanResidentInProcessPlacedPromptEngineRunStopCondition {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VulkanResidentInProcessPlacedPromptEngineRun {
     pub max_engine_turns: usize,
-    pub max_scheduler_turns_per_tick: usize,
     pub engine_turn_count: usize,
     pub stop_condition: VulkanResidentInProcessPlacedPromptEngineRunStopCondition,
     pub processed_input_event_count: usize,
@@ -17220,13 +17141,7 @@ pub struct VulkanMountedPlacedResidentInProcessStreamTickRun {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum VulkanMountedPlacedResidentInProcessStreamTickRunStatus {
     Completed,
-    Blocked {
-        pending_device_ids: Vec<String>,
-    },
-    SchedulerBudgetExhausted {
-        max_scheduler_turns: usize,
-        pending_device_ids: Vec<String>,
-    },
+    Blocked { pending_device_ids: Vec<String> },
 }
 
 #[derive(Debug)]
@@ -17282,7 +17197,6 @@ fn register_in_process_direct_cable_copies(
 pub fn run_mounted_placed_resident_stream_tick_slices_in_process(
     slices: &mut [VulkanMountedPlacedResidentInProcessStreamTickSlice<'_>],
     transport: &mut VulkanInProcessPlacedCableTransport,
-    max_scheduler_turns: usize,
 ) -> Result<
     VulkanMountedPlacedResidentInProcessStreamTickRun,
     VulkanMountedPlacedResidentInProcessStreamTickError,
@@ -17293,7 +17207,7 @@ pub fn run_mounted_placed_resident_stream_tick_slices_in_process(
     let mut scheduler_turn_count = 0usize;
     let mut completed_stage_delta = 0usize;
 
-    while scheduler_turn_count < max_scheduler_turns {
+    loop {
         scheduler_turn_count += 1;
         let completed_before_turn = completed_stage_delta;
 
@@ -17336,22 +17250,6 @@ pub fn run_mounted_placed_resident_stream_tick_slices_in_process(
             ));
         }
     }
-
-    let status = if slices.iter().all(|slice| slice.cursor.is_completed()) {
-        VulkanMountedPlacedResidentInProcessStreamTickRunStatus::Completed
-    } else {
-        VulkanMountedPlacedResidentInProcessStreamTickRunStatus::SchedulerBudgetExhausted {
-            max_scheduler_turns,
-            pending_device_ids: pending_in_process_stream_tick_device_ids(slices),
-        }
-    };
-    Ok(in_process_stream_tick_run_snapshot(
-        slices,
-        transport,
-        status,
-        scheduler_turn_count,
-        completed_stage_delta,
-    ))
 }
 
 fn pending_in_process_stream_tick_device_ids(
@@ -27993,12 +27891,9 @@ mod tests {
         assert_eq!(transport.direct_cable_binding_count(), 2);
         register_in_process_direct_cable_copies(&slices, &mut transport).unwrap();
         assert_eq!(transport.direct_cable_binding_count(), 2);
-        let run = run_mounted_placed_resident_stream_tick_slices_in_process(
-            &mut slices,
-            &mut transport,
-            8,
-        )
-        .unwrap();
+        let run =
+            run_mounted_placed_resident_stream_tick_slices_in_process(&mut slices, &mut transport)
+                .unwrap();
 
         assert_eq!(
             run.status,
@@ -28099,7 +27994,7 @@ mod tests {
             .unwrap();
 
         let run = placed_package
-            .run_stream_tick_in_process(&device, 0, 8)
+            .run_stream_tick_in_process(&device, 0)
             .unwrap();
         assert_eq!(
             run.status,
@@ -28165,7 +28060,7 @@ mod tests {
         );
 
         let run = placed_package
-            .sample_token_id_stream_tick_in_process(&device, 1, 0, 8)
+            .sample_token_id_stream_tick_in_process(&device, 1, 0)
             .unwrap();
         assert_eq!(run.tick_run.input_device_id, "gpu0");
         assert_eq!(run.tick_run.output_device_id, "gpu1");
@@ -28225,7 +28120,7 @@ mod tests {
             .create_stream_processor_for_devices(&device, 0)
             .unwrap();
         let run = placed_package
-            .run_feedback_bounded_in_process(&device, 1, 0, 2, 8)
+            .run_feedback_bounded_in_process(&device, 1, 0, 2)
             .unwrap();
 
         assert_eq!(run.input_device_id, "gpu0");
@@ -28285,7 +28180,7 @@ mod tests {
         let run = placed_package
             .run_prompt_event_bounded_in_process(
                 &device,
-                VulkanResidentPromptRequest::new(&[1, 36_309], 1, &[], 8),
+                VulkanResidentPromptRequest::new(&[1, 36_309], 1, &[]),
                 0,
             )
             .unwrap();
@@ -28601,7 +28496,7 @@ mod tests {
             .run_prompt_event_bounded_in_process(
                 &placed_package,
                 &device,
-                VulkanResidentPromptRequest::new(&[1], 1, &[], 8),
+                VulkanResidentPromptRequest::new(&[1], 1, &[]),
             )
             .unwrap();
         assert_eq!(first.prompt_event_index, 0);
@@ -28617,7 +28512,7 @@ mod tests {
             .run_prompt_event_bounded_in_process(
                 &placed_package,
                 &device,
-                VulkanResidentPromptRequest::new(&[36_309], 1, &[], 8),
+                VulkanResidentPromptRequest::new(&[36_309], 1, &[]),
             )
             .unwrap();
         assert_eq!(second.prompt_event_index, 1);
@@ -28667,16 +28562,14 @@ mod tests {
         assert_eq!(stream.devices().len(), 2);
         assert_eq!(stream.next_stream_tick(), 0);
 
-        let first = stream.run_prompt_event_bounded(&[1], 1, &[], 8).unwrap();
+        let first = stream.run_prompt_event_bounded(&[1], 1, &[]).unwrap();
         assert_eq!(first.prompt_event_index, 0);
         assert_eq!(first.start_stream_tick, 0);
         assert_eq!(first.next_stream_tick, 2);
         assert_eq!(stream.next_stream_tick(), 2);
         assert_eq!(stream.completed_prompt_event_count(), 1);
 
-        let second = stream
-            .run_prompt_event_bounded(&[36_309], 1, &[], 8)
-            .unwrap();
+        let second = stream.run_prompt_event_bounded(&[36_309], 1, &[]).unwrap();
         assert_eq!(second.prompt_event_index, 1);
         assert_eq!(second.start_stream_tick, 2);
         assert_eq!(second.next_stream_tick, 4);
@@ -28728,10 +28621,7 @@ mod tests {
         assert_eq!(stream.pending_input_event_count(), 2);
         assert!(!stream.is_idle());
 
-        let first = stream
-            .run_next_queued_input_event_bounded(8)
-            .unwrap()
-            .unwrap();
+        let first = stream.run_next_queued_input_event().unwrap().unwrap();
         assert_eq!(first.input_event.id, "event_a");
         assert_eq!(first.pending_input_event_count, 1);
         assert_eq!(first.generated_token_ids.len(), 1);
@@ -28741,10 +28631,7 @@ mod tests {
         assert_eq!(first.output_events[0].source_stream_tick, 0);
         assert_eq!(stream.next_stream_tick(), 2);
 
-        let second = stream
-            .run_next_queued_input_event_bounded(8)
-            .unwrap()
-            .unwrap();
+        let second = stream.run_next_queued_input_event().unwrap().unwrap();
         assert_eq!(second.input_event.id, "event_b");
         assert_eq!(second.pending_input_event_count, 0);
         assert_eq!(second.generated_token_ids.len(), 1);
@@ -28754,7 +28641,7 @@ mod tests {
         assert_eq!(stream.next_stream_tick(), 4);
         assert!(stream.is_idle());
 
-        let idle = stream.run_next_queued_input_event_bounded(8).unwrap();
+        let idle = stream.run_next_queued_input_event().unwrap();
         assert!(idle.is_none());
     }
 
@@ -28789,13 +28676,10 @@ mod tests {
             .unwrap();
 
         let run = stream
-            .submit_input_events_until_idle_bounded(
-                vec![
-                    VulkanResidentTokenInputEvent::new("event_a", vec![1], 1),
-                    VulkanResidentTokenInputEvent::new("event_b", vec![36_309], 1),
-                ],
-                8,
-            )
+            .submit_input_events_until_idle(vec![
+                VulkanResidentTokenInputEvent::new("event_a", vec![1], 1),
+                VulkanResidentTokenInputEvent::new("event_b", vec![36_309], 1),
+            ])
             .unwrap();
 
         assert_eq!(run.start_stream_tick, 0);
@@ -28850,10 +28734,9 @@ mod tests {
         assert!(engine.snapshot().idle);
 
         let submitted = engine
-            .submit_input_event_until_idle_bounded(
+            .submit_input_event_until_idle(
                 "main",
                 VulkanResidentTokenInputEvent::new("event_a", vec![1], 1),
-                8,
             )
             .unwrap();
 
@@ -28968,10 +28851,9 @@ mod tests {
             .unwrap();
 
         let submitted = engine
-            .submit_input_event_until_idle_bounded(
+            .submit_input_event_until_idle(
                 "stream_a",
                 VulkanResidentTokenInputEvent::new("event_a", vec![1], 1),
-                8,
             )
             .unwrap();
 
@@ -29066,7 +28948,7 @@ mod tests {
             vec!["stream_a".to_string(), "stream_b".to_string()]
         );
 
-        let run = engine.run_until_idle_bounded(6, 8).unwrap();
+        let run = engine.run_until_idle_bounded(6).unwrap();
 
         assert_eq!(
             run.stop_condition,
@@ -29157,7 +29039,6 @@ mod tests {
                     ),
                 ],
                 4,
-                8,
             )
             .unwrap();
 
@@ -29231,7 +29112,7 @@ mod tests {
             )
             .unwrap();
 
-        let budgeted = engine.run_until_idle_bounded(1, 8).unwrap();
+        let budgeted = engine.run_until_idle_bounded(1).unwrap();
 
         assert_eq!(
             budgeted.stop_condition,
@@ -29252,7 +29133,7 @@ mod tests {
         );
         assert_eq!(budgeted.end_snapshot.streams[0].next_stream_tick, 1);
 
-        let completed_a = engine.run_until_idle_bounded(1, 8).unwrap();
+        let completed_a = engine.run_until_idle_bounded(1).unwrap();
         assert_eq!(
             completed_a.stop_condition,
             VulkanResidentInProcessPlacedPromptEngineRunStopCondition::EngineTurnBudget
@@ -29270,7 +29151,7 @@ mod tests {
         );
         assert_eq!(completed_a.end_snapshot.streams[0].next_stream_tick, 2);
 
-        let started_b = engine.run_until_idle_bounded(1, 8).unwrap();
+        let started_b = engine.run_until_idle_bounded(1).unwrap();
         assert_eq!(started_b.engine_turn_count, 1);
         assert_eq!(started_b.processed_input_event_count, 0);
         assert_eq!(started_b.output_events.len(), 1);
@@ -29281,7 +29162,7 @@ mod tests {
         assert!(!started_b.end_snapshot.idle);
         assert_eq!(started_b.end_snapshot.streams[0].next_stream_tick, 3);
 
-        let completed_b = engine.run_until_idle_bounded(1, 8).unwrap();
+        let completed_b = engine.run_until_idle_bounded(1).unwrap();
         assert_eq!(
             completed_b.stop_condition,
             VulkanResidentInProcessPlacedPromptEngineRunStopCondition::Idle
@@ -29338,7 +29219,7 @@ mod tests {
         assert_eq!(placed_package.device("gpu1").unwrap().hosted_pedal_count, 1);
 
         let run = placed_package
-            .sample_token_id_stream_tick_in_process(&device, 1, 0, 8)
+            .sample_token_id_stream_tick_in_process(&device, 1, 0)
             .unwrap();
 
         assert_eq!(
