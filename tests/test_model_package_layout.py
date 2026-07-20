@@ -190,6 +190,9 @@ def test_compiler_selects_cooperative_bfloat16_projection_kernels() -> None:
     assert cooperative_bfloat16_workgroup_count_x(
         "parallel_linear_3way_bf16_1024x1024_256_256.comp"
     ) == 24
+    assert cooperative_bfloat16_workgroup_count_x(
+        "parallel_linear_silu_multiply_bf16_1024x4096.comp"
+    ) == 128
     assert cooperative_bfloat16_batch_shader_file(
         "linear_fp8_e4m3_b128x128_1024x4096.comp"
     ) is None
@@ -311,8 +314,17 @@ def test_compiler_renders_cooperative_bfloat16_batch_shaders(tmp_path: Path) -> 
         assert "#extension GL_EXT_bfloat16 : require" in source
         assert "#extension GL_KHR_cooperative_matrix : require" in source
         assert "layout(local_size_x = 256" in source
-        assert "const uint OUTPUT_TILE = 64u;" in source
+        expected_output_tile = (
+            32 if "silu_multiply" in shader_file else 64
+        )
+        assert f"const uint OUTPUT_TILE = {expected_output_tile}u;" in source
         assert "const uint BATCH_TILE = 64u;" in source
+        expected_result_tile = (
+            "BRANCH_COUNT * OUTPUT_TILE * BATCH_TILE"
+            if "silu_multiply" in shader_file
+            else "OUTPUT_TILE * MATRIX_TILE"
+        )
+        assert f"shared float result_tile[{expected_result_tile}];" in source
         assert "{{" not in source
     direct_linear = (
         tmp_path

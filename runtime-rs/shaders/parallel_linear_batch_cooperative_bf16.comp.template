@@ -27,7 +27,7 @@ const uint BATCH_SUBTILES = BATCH_TILE / MATRIX_TILE;
 
 shared bfloat16_t weight_tile[OUTPUT_TILE * MATRIX_TILE];
 shared bfloat16_t input_tile[MATRIX_TILE * BATCH_TILE];
-shared float result_tile[OUTPUT_TILE * BATCH_TILE];
+shared float result_tile[OUTPUT_TILE * MATRIX_TILE];
 
 uint weight_index(uint row, uint column) {
     return row * INPUT_SIZE + column;
@@ -127,25 +127,26 @@ void main() {
         coopMatStore(
             sums[batch_subtile],
             result_tile,
-            output_subtile * MATRIX_TILE * BATCH_TILE + batch_subtile * MATRIX_TILE,
-            BATCH_TILE,
+            output_subtile * MATRIX_TILE * MATRIX_TILE,
+            MATRIX_TILE,
             gl_CooperativeMatrixLayoutRowMajor
         );
-    }
-    barrier();
-    for (uint index = lane; index < OUTPUT_TILE * BATCH_TILE; index += 256u) {
-        uint row = index / BATCH_TILE;
-        uint batch_lane = index % BATCH_TILE;
-        uint output_index = output_start + row;
-        uint batch_index = batch_start + batch_lane;
-        if (output_index < branch_output_size(branch)
-            && batch_index < batch_control.batch_width) {
-            write_branch_output(
-                branch,
-                batch_index,
-                output_index,
-                uint16_t(f32_to_bf16(result_tile[index]))
-            );
+        barrier();
+        for (uint index = lane; index < OUTPUT_TILE * MATRIX_TILE; index += 256u) {
+            uint row = index / MATRIX_TILE;
+            uint batch_lane = index % MATRIX_TILE;
+            uint output_index = output_start + row;
+            uint batch_index = batch_start + batch_subtile * MATRIX_TILE + batch_lane;
+            if (output_index < branch_output_size(branch)
+                && batch_index < batch_control.batch_width) {
+                write_branch_output(
+                    branch,
+                    batch_index,
+                    output_index,
+                    uint16_t(f32_to_bf16(result_tile[index]))
+                );
+            }
         }
+        barrier();
     }
 }

@@ -46,6 +46,7 @@ GLSL_VULKAN_DEVICE_EXTENSION_REQUIREMENTS = {
 COOPERATIVE_BFLOAT16_SHAPE = [16, 16, 16]
 COOPERATIVE_BATCH_LANE_TILE_WIDTH = 64
 COOPERATIVE_OUTPUT_TILE_WIDTH = 64
+COOPERATIVE_FUSED_OUTPUT_TILE_WIDTH = 32
 TOKENIZER_PACKAGE_FILES = (
     "tokenizer.json",
     "tokenizer_config.json",
@@ -968,8 +969,8 @@ def cooperative_bfloat16_workgroup_count_x(shader_file: str) -> int:
     )
     if fused is not None:
         return (
-            int(fused.group(1)) + COOPERATIVE_OUTPUT_TILE_WIDTH - 1
-        ) // COOPERATIVE_OUTPUT_TILE_WIDTH
+            int(fused.group(1)) + COOPERATIVE_FUSED_OUTPUT_TILE_WIDTH - 1
+        ) // COOPERATIVE_FUSED_OUTPUT_TILE_WIDTH
     raise ModelCompileError(
         f"shader {shader_file!r} has no cooperative BF16 batch geometry"
     )

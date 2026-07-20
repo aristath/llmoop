@@ -19,13 +19,14 @@ layout(push_constant) uniform BatchControl { uint batch_width; } batch_control;
 const uint INPUT_SIZE = {{INPUT_SIZE}}u;
 const uint OUTPUT_SIZE = {{OUTPUT_SIZE}}u;
 const uint MATRIX_TILE = 16u;
-const uint OUTPUT_TILE = 64u;
+const uint OUTPUT_TILE = 32u;
 const uint BATCH_TILE = 64u;
 const uint BATCH_SUBTILES = BATCH_TILE / MATRIX_TILE;
+const uint BRANCH_COUNT = 2u;
 
-shared bfloat16_t weight_tile[OUTPUT_TILE * MATRIX_TILE];
+shared bfloat16_t weight_tile[BRANCH_COUNT * OUTPUT_TILE * MATRIX_TILE];
 shared bfloat16_t input_tile[MATRIX_TILE * BATCH_TILE];
-shared float result_tile[OUTPUT_TILE * BATCH_TILE];
+shared float result_tile[BRANCH_COUNT * OUTPUT_TILE * BATCH_TILE];
 
 uint weight_index(uint row, uint column) {
     return row * INPUT_SIZE + column;
@@ -49,14 +50,12 @@ void main() {
     uint output_start = gl_WorkGroupID.x * OUTPUT_TILE;
     uint batch_start = gl_WorkGroupID.y * BATCH_TILE;
     uint lane = gl_LocalInvocationID.x;
-    uint output_subtile = gl_SubgroupID;
+    uint branch = gl_SubgroupID / (OUTPUT_TILE / MATRIX_TILE);
+    uint output_subtile = gl_SubgroupID % (OUTPUT_TILE / MATRIX_TILE);
 
-    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> gate_sums[BATCH_SUBTILES];
-    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> up_sums[BATCH_SUBTILES];
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> sums[BATCH_SUBTILES];
     for (uint batch_subtile = 0u; batch_subtile < BATCH_SUBTILES; batch_subtile++) {
-        gate_sums[batch_subtile] =
-            coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
-        up_sums[batch_subtile] =
+        sums[batch_subtile] =
             coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
     }
 
@@ -64,13 +63,17 @@ void main() {
         bool stage_weight = output_start + OUTPUT_TILE > OUTPUT_SIZE
             || input_start + MATRIX_TILE > INPUT_SIZE;
         if (stage_weight) {
-            for (uint index = lane; index < OUTPUT_TILE * MATRIX_TILE; index += 256u) {
-                uint row = index / MATRIX_TILE;
+            for (uint index = lane; index < BRANCH_COUNT * OUTPUT_TILE * MATRIX_TILE; index += 256u) {
+                uint combined_row = index / MATRIX_TILE;
+                uint weight_branch = combined_row / OUTPUT_TILE;
+                uint row = combined_row % OUTPUT_TILE;
                 uint column = index % MATRIX_TILE;
                 uint output_index = output_start + row;
                 uint input_index = input_start + column;
                 weight_tile[index] = output_index < OUTPUT_SIZE && input_index < INPUT_SIZE
-                    ? gate_weight.values[weight_index(output_index, input_index)]
+                    ? (weight_branch == 0u
+                        ? gate_weight.values[weight_index(output_index, input_index)]
+                        : up_weight.values[weight_index(output_index, input_index)])
                     : bfloat16_t(0.0);
             }
         }
@@ -91,51 +94,17 @@ void main() {
             coopMatLoad(
                 a,
                 weight_tile,
-                output_subtile * MATRIX_TILE * MATRIX_TILE,
+                gl_SubgroupID * MATRIX_TILE * MATRIX_TILE,
                 MATRIX_TILE,
                 gl_CooperativeMatrixLayoutRowMajor
             );
-        } else {
+        } else if (branch == 0u) {
             coopMatLoad(
                 a,
                 gate_weight.values,
                 (output_start + output_subtile * MATRIX_TILE) * INPUT_SIZE
                     + input_start,
                 INPUT_SIZE,
-                gl_CooperativeMatrixLayoutRowMajor
-            );
-        }
-        for (uint batch_subtile = 0u; batch_subtile < BATCH_SUBTILES; batch_subtile++) {
-            coopmat<bfloat16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> b;
-            coopMatLoad(
-                b,
-                input_tile,
-                batch_subtile * MATRIX_TILE,
-                BATCH_TILE,
-                gl_CooperativeMatrixLayoutRowMajor
-            );
-            gate_sums[batch_subtile] = coopMatMulAdd(a, b, gate_sums[batch_subtile]);
-        }
-        barrier();
-
-        if (stage_weight) {
-            for (uint index = lane; index < OUTPUT_TILE * MATRIX_TILE; index += 256u) {
-                uint row = index / MATRIX_TILE;
-                uint column = index % MATRIX_TILE;
-                uint output_index = output_start + row;
-                uint input_index = input_start + column;
-                weight_tile[index] = output_index < OUTPUT_SIZE && input_index < INPUT_SIZE
-                    ? up_weight.values[weight_index(output_index, input_index)]
-                    : bfloat16_t(0.0);
-            }
-        }
-        barrier();
-        if (stage_weight) {
-            coopMatLoad(
-                a,
-                weight_tile,
-                output_subtile * MATRIX_TILE * MATRIX_TILE,
-                MATRIX_TILE,
                 gl_CooperativeMatrixLayoutRowMajor
             );
         } else {
@@ -157,19 +126,16 @@ void main() {
                 BATCH_TILE,
                 gl_CooperativeMatrixLayoutRowMajor
             );
-            up_sums[batch_subtile] = coopMatMulAdd(a, b, up_sums[batch_subtile]);
+            sums[batch_subtile] = coopMatMulAdd(a, b, sums[batch_subtile]);
         }
         barrier();
     }
 
-    // Preserve the BF16-rounded gate values in the output tile while the shared
-    // result storage is reused for the up projection. This keeps the workgroup's
-    // shared-memory footprint at 20 KiB instead of allocating a second 16 KiB tile.
     for (uint batch_subtile = 0u; batch_subtile < BATCH_SUBTILES; batch_subtile++) {
         coopMatStore(
-            gate_sums[batch_subtile],
+            sums[batch_subtile],
             result_tile,
-            output_subtile * MATRIX_TILE * BATCH_TILE + batch_subtile * MATRIX_TILE,
+            gl_SubgroupID * MATRIX_TILE * BATCH_TILE + batch_subtile * MATRIX_TILE,
             BATCH_TILE,
             gl_CooperativeMatrixLayoutRowMajor
         );
@@ -181,34 +147,10 @@ void main() {
         uint output_index = output_start + row;
         uint batch_index = batch_start + batch_lane;
         if (output_index < OUTPUT_SIZE && batch_index < batch_control.batch_width) {
-            output_frames.values[batch_index * OUTPUT_SIZE + output_index] =
-                uint16_t(f32_to_bf16(result_tile[index]));
-        }
-    }
-    memoryBarrierBuffer();
-    barrier();
-
-    for (uint batch_subtile = 0u; batch_subtile < BATCH_SUBTILES; batch_subtile++) {
-        coopMatStore(
-            up_sums[batch_subtile],
-            result_tile,
-            output_subtile * MATRIX_TILE * BATCH_TILE + batch_subtile * MATRIX_TILE,
-            BATCH_TILE,
-            gl_CooperativeMatrixLayoutRowMajor
-        );
-    }
-    barrier();
-    for (uint index = lane; index < OUTPUT_TILE * BATCH_TILE; index += 256u) {
-        uint row = index / BATCH_TILE;
-        uint batch_lane = index % BATCH_TILE;
-        uint output_index = output_start + row;
-        uint batch_index = batch_start + batch_lane;
-        if (output_index < OUTPUT_SIZE && batch_index < batch_control.batch_width) {
-            uint output_index_in_buffer = batch_index * OUTPUT_SIZE + output_index;
-            float gate = bf16_to_f32(output_frames.values[output_index_in_buffer]);
-            float up = rounded_bf16(result_tile[index]);
+            float gate = rounded_bf16(result_tile[index]);
+            float up = rounded_bf16(result_tile[OUTPUT_TILE * BATCH_TILE + index]);
             float silu = rounded_bf16(gate / (1.0 + exp(-gate)));
-            output_frames.values[output_index_in_buffer] =
+            output_frames.values[batch_index * OUTPUT_SIZE + output_index] =
                 uint16_t(f32_to_bf16(silu * up));
         }
     }
