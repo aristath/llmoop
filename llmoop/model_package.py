@@ -37,6 +37,7 @@ PACKAGE_ARTIFACT_INTEGRITY_SCHEMA = "llmoop.package_artifact_integrity.v1"
 ROW_MAJOR_LAYOUT = "row_major"
 CONFIG_PACKAGE_FILE = "config.json"
 SCALAR_BATCH_LANE_TILE_WIDTH = 16
+EXACT_BATCH_LANE_TILE_WIDTHS = (2, 4, 8, SCALAR_BATCH_LANE_TILE_WIDTH)
 CAUSAL_SCAN_LANE_TILE_WIDTH = 64
 GLSL_VULKAN_DEVICE_EXTENSION_REQUIREMENTS = {
     "GL_EXT_float_e4m3": "VK_EXT_shader_float8",
@@ -789,6 +790,7 @@ def pedal_kernel_spec(
         spec["batch_implementations"].append(
             {
                 "lane_tile_width": CAUSAL_SCAN_LANE_TILE_WIDTH,
+                "exact_primary_equivalence": False,
                 "device_requirements": {
                     "vulkan_device_extensions": [],
                 },
@@ -800,6 +802,7 @@ def pedal_kernel_spec(
             spec["batch_implementations"].append(
                 {
                     "lane_tile_width": COOPERATIVE_BATCH_LANE_TILE_WIDTH,
+                    "exact_primary_equivalence": False,
                     "device_requirements": {
                         "vulkan_device_extensions": [
                             "VK_KHR_cooperative_matrix",
@@ -823,6 +826,7 @@ def pedal_kernel_spec(
             spec["batch_implementations"].append(
                 {
                     "lane_tile_width": 1,
+                    "exact_primary_equivalence": True,
                     "device_requirements": {
                         "vulkan_device_extensions": [],
                         "subgroup_size": 64,
@@ -836,21 +840,30 @@ def pedal_kernel_spec(
                     ],
                 }
             )
-        spec["batch_implementations"].append(
-            {
-                "lane_tile_width": SCALAR_BATCH_LANE_TILE_WIDTH,
-                "device_requirements": {
-                    "vulkan_device_extensions": [],
-                },
-                "stages": [
-                    {
-                        "shader_path": f"shaders/{scalar_batch_shader_file}",
-                        "local_size_x": local_size_x,
-                        "workgroup_count_x": workgroup_count_x,
-                    }
-                ],
-            }
-        )
+        for tile_width in EXACT_BATCH_LANE_TILE_WIDTHS:
+            exact_shader_file = weight_shared_batch_shader_file(
+                shader_file, tile_width=tile_width
+            )
+            if exact_shader_file is None:
+                raise ModelCompileError(
+                    f"shader {shader_file!r} lost its exact batch implementation"
+                )
+            spec["batch_implementations"].append(
+                {
+                    "lane_tile_width": tile_width,
+                    "exact_primary_equivalence": True,
+                    "device_requirements": {
+                        "vulkan_device_extensions": [],
+                    },
+                    "stages": [
+                        {
+                            "shader_path": f"shaders/{exact_shader_file}",
+                            "local_size_x": local_size_x,
+                            "workgroup_count_x": workgroup_count_x,
+                        }
+                    ],
+                }
+            )
     return spec
 
 
@@ -1032,8 +1045,12 @@ def causal_scan_workgroup_count_x(shader_file: str) -> int:
     raise ModelCompileError(f"shader {shader_file!r} is not a causal scan kernel")
 
 
-def weight_shared_batch_shader_file(shader_file: str) -> str | None:
-    tile = SCALAR_BATCH_LANE_TILE_WIDTH
+def weight_shared_batch_shader_file(
+    shader_file: str, *, tile_width: int = SCALAR_BATCH_LANE_TILE_WIDTH
+) -> str | None:
+    if tile_width <= 0:
+        raise ValueError("batch tile width must be positive")
+    tile = tile_width
     if re.fullmatch(r"split_bf16_2x\d+x\d+_head_interleaved\.comp", shader_file):
         return shader_file.replace("split_bf16_", f"split_batch{tile}_bf16_", 1)
     if shader_file == "sigmoid_multiply_bf16.comp":
@@ -2496,6 +2513,11 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
         )
 
     shaped_templates = (
+        (
+            r"sigmoid_multiply_batch(\d+)_bf16\.comp",
+            "sigmoid_multiply_batch_bf16.comp.template",
+            ("BATCH_TILE_WIDTH",),
+        ),
         (
             r"rms_norm_batch(\d+)_bf16_h(\d+)_eps([0-9eE+.-]+)_offset([0-9eE+.-]+)\.comp",
             "rms_norm_batch_bf16.comp.template",
@@ -4114,6 +4136,7 @@ def valid_batch_implementation(implementation: Any) -> bool:
         isinstance(implementation.get("lane_tile_width"), int)
         and not isinstance(implementation.get("lane_tile_width"), bool)
         and implementation["lane_tile_width"] > 0
+        and isinstance(implementation.get("exact_primary_equivalence"), bool)
         and isinstance(stages, list)
         and bool(stages)
         and all(valid_batch_stage(stage) for stage in stages)

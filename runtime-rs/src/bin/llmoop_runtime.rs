@@ -89,7 +89,7 @@ impl Default for Args {
             source_chain: None,
             chat_template_variables: BTreeMap::new(),
             max_new_tokens: 65_536,
-            speculative_draft_tokens: 2,
+            speculative_draft_tokens: 0,
             context_size: None,
             vulkan_device_index: None,
             random_seed: 0,
@@ -2792,7 +2792,7 @@ Options:
                              Mount and summarize only the runtime patch pedals assigned to DEVICE_ID.
   --max-new-tokens <N>       Generation stop condition, independent of context size. Default: 65536
   --speculative-draft-tokens <N>
-                             MTP draft tokens proposed per verification cycle. Default: 2; 0 disables MTP.
+                             MTP draft tokens proposed per verification cycle. Default: 0 (disabled).
   --context-size <N>         Runtime transient-state window. Default: auto, up to the model maximum.
   --vulkan-device-index <N>  Use Vulkan physical device index N as the default local target.
   --seed <U32>               Explicit sampler randomness seed. Default: 0

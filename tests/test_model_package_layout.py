@@ -51,6 +51,9 @@ def test_compiler_selects_only_compatible_weight_shared_batch_kernels() -> None:
         "linear_bf16_1024x1024.comp"
     ) == "linear_batch16_bf16_1024x1024.comp"
     assert weight_shared_batch_shader_file(
+        "linear_bf16_1024x1024.comp", tile_width=4
+    ) == "linear_batch4_bf16_1024x1024.comp"
+    assert weight_shared_batch_shader_file(
         "linear_residual_bf16_1024x1024.comp"
     ) == "linear_residual_batch16_bf16_1024x1024.comp"
     assert weight_shared_batch_shader_file(
@@ -87,8 +90,9 @@ def test_compiler_orders_frame_parallel_before_portable_batch_implementation() -
         workgroup_count_x=1,
     )
 
-    frame_parallel, portable = spec["batch_implementations"]
+    frame_parallel, *portable = spec["batch_implementations"]
     assert frame_parallel["lane_tile_width"] == 1
+    assert frame_parallel["exact_primary_equivalence"] is True
     assert frame_parallel["device_requirements"] == {
         "vulkan_device_extensions": [],
         "subgroup_size": 64,
@@ -96,7 +100,16 @@ def test_compiler_orders_frame_parallel_before_portable_batch_implementation() -
     assert frame_parallel["stages"][0]["shader_path"] == (
         "shaders/rms_norm_batch1_bf16_h4096_eps1e-06_offset1.comp"
     )
-    assert portable["lane_tile_width"] == 16
+    assert [implementation["lane_tile_width"] for implementation in portable] == [
+        2,
+        4,
+        8,
+        16,
+    ]
+    assert all(
+        implementation["exact_primary_equivalence"] is True
+        for implementation in portable
+    )
 
 
 def test_compiler_selects_stateful_causal_scan_kernels() -> None:
@@ -213,9 +226,10 @@ def test_projection_pedal_compiles_ordered_target_native_and_scalar_implementati
     assert spec["batch_mode"] == "weight_shared"
     assert "batch_shader_path" not in spec
     assert "batch_lane_tile_width" not in spec
-    cooperative, scalar = spec["batch_implementations"]
+    cooperative, *exact = spec["batch_implementations"]
     assert cooperative == {
         "lane_tile_width": 64,
+        "exact_primary_equivalence": False,
         "device_requirements": {
             "vulkan_device_extensions": [
                 "VK_KHR_cooperative_matrix",
@@ -234,17 +248,28 @@ def test_projection_pedal_compiles_ordered_target_native_and_scalar_implementati
             }
         ],
     }
-    assert scalar == {
-        "lane_tile_width": 16,
-        "device_requirements": {"vulkan_device_extensions": []},
-        "stages": [
-            {
-                "shader_path": "shaders/linear_batch16_bf16_1024x4096.comp",
-                "local_size_x": 64,
-                "workgroup_count_x": 2048,
-            }
-        ],
-    }
+    assert [implementation["lane_tile_width"] for implementation in exact] == [
+        2,
+        4,
+        8,
+        16,
+    ]
+    for implementation in exact:
+        tile_width = implementation["lane_tile_width"]
+        assert implementation == {
+            "lane_tile_width": tile_width,
+            "exact_primary_equivalence": True,
+            "device_requirements": {"vulkan_device_extensions": []},
+            "stages": [
+                {
+                    "shader_path": (
+                        f"shaders/linear_batch{tile_width}_bf16_1024x4096.comp"
+                    ),
+                    "local_size_x": 64,
+                    "workgroup_count_x": 2048,
+                }
+            ],
+        }
 
 
 def test_compiler_renders_weight_shared_pedal_batch_shaders(tmp_path: Path) -> None:

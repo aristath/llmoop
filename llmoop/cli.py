@@ -152,6 +152,11 @@ def main() -> None:
         help="generation stop condition for --run; independent of context allocation (default: 65536)",
     )
     parser.add_argument(
+        "--speculative-draft-tokens",
+        type=int,
+        help="MTP draft tokens per verification cycle; 0 disables MTP (default: 0)",
+    )
+    parser.add_argument(
         "--seed",
         type=int,
         help="explicit sampler randomness seed (default: 0)",
@@ -211,12 +216,16 @@ def main() -> None:
         args.shader_source_dir = Path("runtime-rs/shaders")
     if args.max_new_tokens is None:
         args.max_new_tokens = 65_536
+    if args.speculative_draft_tokens is None:
+        args.speculative_draft_tokens = 0
     if args.seed is None:
         args.seed = 0
     if args.profile_runs is None:
         args.profile_runs = 1
     if args.context_size is not None and args.context_size < 1:
         parser.error("--context-size must be at least 1")
+    if args.speculative_draft_tokens < 0:
+        parser.error("--speculative-draft-tokens must not be negative")
     if args.compiler_events_jsonl and args.compile_model is None and args.discover_model is None:
         parser.error("--compiler-events-jsonl requires --compile-model or --discover-model")
     if args.compiler_events_jsonl and args.json:
@@ -353,6 +362,7 @@ def validate_action_options(
         ("--context-size", args.context_size is not None),
         ("--vulkan-device-index", args.vulkan_device_index is not None),
         ("--max-new-tokens", args.max_new_tokens is not None),
+        ("--speculative-draft-tokens", args.speculative_draft_tokens is not None),
         ("--seed", args.seed is not None),
         ("--no-special-tokens", args.no_special_tokens),
         ("--keep-special-tokens", args.keep_special_tokens),
@@ -475,6 +485,10 @@ def build_runtime_command(args: argparse.Namespace, package_manifest: Path) -> l
         else:
             runtime_args.extend(["--prompt", args.prompt])
         runtime_args.extend(["--max-new-tokens", str(args.max_new_tokens)])
+    if args.speculative_draft_tokens != 0:
+        runtime_args.extend(
+            ["--speculative-draft-tokens", str(args.speculative_draft_tokens)]
+        )
     if args.device is not None:
         runtime_args.extend(["--device", args.device])
     for raw_placement in args.place_pedal:

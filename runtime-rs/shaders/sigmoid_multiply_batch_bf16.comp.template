@@ -16,7 +16,7 @@ layout(set = 0, binding = 2) buffer OutputFrames {
 
 layout(push_constant) uniform BatchControl { uint batch_width; } batch_control;
 
-const uint BATCH_TILE_WIDTH = 16u;
+const uint BATCH_TILE_WIDTH = {{BATCH_TILE_WIDTH}}u;
 
 float bf16_to_f32(uint value) {
     return uintBitsToFloat((value & 0xffffu) << 16);

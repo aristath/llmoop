@@ -30,6 +30,7 @@ def runtime_args(**overrides: object) -> Namespace:
         "duplicate_after": [],
         "chain": None,
         "max_new_tokens": 4,
+        "speculative_draft_tokens": 0,
         "context_size": None,
         "vulkan_device_index": None,
         "seed": 0,
@@ -223,6 +224,25 @@ class RuntimeCliCommandTest(unittest.TestCase):
                 "--max-new-tokens",
                 "4",
                 "--profile",
+            ],
+            build_runtime_command(args, package),
+        )
+
+    def test_build_runtime_command_forwards_explicit_mtp_window(self) -> None:
+        package = Path("packages/model_x/vulkan_resident_package.json")
+        args = runtime_args(prompt="Hello", speculative_draft_tokens=5)
+
+        self.assertEqual(
+            [
+                "/tmp/llmoop-runtime",
+                "--package",
+                str(package),
+                "--prompt",
+                "Hello",
+                "--max-new-tokens",
+                "4",
+                "--speculative-draft-tokens",
+                "5",
             ],
             build_runtime_command(args, package),
         )
@@ -644,6 +664,9 @@ class CompiledPackageTest(unittest.TestCase):
                     self.assertGreaterEqual(len(kernel["batch_implementations"]), 1)
                     for implementation in kernel["batch_implementations"]:
                         self.assertGreater(implementation["lane_tile_width"], 0)
+                        self.assertIsInstance(
+                            implementation["exact_primary_equivalence"], bool
+                        )
                         self.assertIn("device_requirements", implementation)
                         self.assertGreaterEqual(len(implementation["stages"]), 1)
                         for stage in implementation["stages"]:
