@@ -5085,13 +5085,7 @@ impl VulkanResidentStreamProcessor {
         loop_runner: VulkanResidentFeedbackLoopRunner,
     ) -> Result<Self, VulkanError> {
         let backend_loop_window = backend_loop_window_for_static_state_bytes(
-            mounted
-                .buffers
-                .state_buffers
-                .iter()
-                .filter_map(|state| state.static_byte_capacity)
-                .try_fold(0usize, |total, bytes| total.checked_add(bytes))
-                .ok_or_else(|| VulkanError("static state snapshot size overflowed".to_string()))?,
+            total_static_state_bytes(&mounted.buffers)?,
             loop_runner.sampler.history_capacity_activations,
         );
         let static_state_snapshots = VulkanResidentStaticStateSnapshotBank::new(
@@ -5166,6 +5160,17 @@ impl VulkanResidentStreamProcessor {
     pub fn backend_loop_window(&self) -> usize {
         self.backend_loop_window
     }
+}
+
+fn total_static_state_bytes(
+    buffers: &VulkanStreamCircuitStreamBuffers,
+) -> Result<usize, VulkanError> {
+    buffers
+        .state_buffers
+        .iter()
+        .filter_map(|state| state.static_byte_capacity)
+        .try_fold(0usize, |total, bytes| total.checked_add(bytes))
+        .ok_or_else(|| VulkanError("static state snapshot size overflowed".to_string()))
 }
 
 fn backend_loop_window_for_static_state_bytes(
@@ -8879,6 +8884,7 @@ pub struct VulkanResidentInProcessPlacedStreamProcessor {
     output_transducer: VulkanResidentOutputTransducerRunner,
     sampler: VulkanResidentSamplerRunner,
     feedback_token_cable: Option<VulkanResidentMappedBufferCopy>,
+    resident_feedback_loop: Option<VulkanResidentInProcessPlacedFeedbackLoop>,
     activation_schedule: VulkanMountedPlacedResidentInProcessSchedule,
     device_slices: Vec<VulkanResidentInProcessPlacedStreamProcessorDevice>,
 }
@@ -8892,6 +8898,52 @@ pub struct VulkanResidentInProcessPlacedStreamProcessorDevice {
     package_slice: Arc<VulkanResidentModelPackageDeviceSlice>,
     mounted: VulkanMountedPlacedStreamCircuit,
     resident_execution_plan: VulkanMountedPlacedResidentStreamTickExecutionPlan,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct VulkanResidentInProcessPlacedFeedbackLoopEligibility {
+    device_slice_count: usize,
+    input_and_output_share_device: bool,
+    scheduler_turn_count: usize,
+    dispatch_segment_count: usize,
+    transport_stage_count: usize,
+    has_push_constants: bool,
+    static_state_bytes: usize,
+    sampler_history_capacity: usize,
+}
+
+impl VulkanResidentInProcessPlacedFeedbackLoopEligibility {
+    fn window_width(self) -> Option<usize> {
+        if self.device_slice_count != 1
+            || !self.input_and_output_share_device
+            || self.scheduler_turn_count != 1
+            || self.dispatch_segment_count != 1
+            || self.transport_stage_count != 0
+            || self.has_push_constants
+        {
+            return None;
+        }
+        let width = backend_loop_window_for_static_state_bytes(
+            self.static_state_bytes,
+            self.sampler_history_capacity,
+        );
+        (width >= 2).then_some(width)
+    }
+}
+
+struct VulkanResidentInProcessPlacedFeedbackLoop {
+    sequence: VulkanResidentKernelSequence,
+    static_state_snapshots: VulkanResidentStaticStateSnapshotBank,
+    window_width: usize,
+    steps_per_tick: usize,
+    scheduler_turn_count_per_tick: usize,
+    completed_stage_count_per_tick: usize,
+}
+
+struct VulkanResidentInProcessPlacedFeedbackWindowRun {
+    sampled_token_ids: Vec<u32>,
+    scheduler_turn_count_per_tick: usize,
+    completed_stage_count_per_tick: usize,
 }
 
 fn apply_placed_clone_state_policies(
@@ -8970,6 +9022,87 @@ fn inherit_matching_placed_stream_state(
         copied.insert((target.pedal_id.clone(), target.state_id.clone()));
     }
     Ok((total_copied, copied))
+}
+
+impl VulkanResidentInProcessPlacedFeedbackLoop {
+    fn new_if_supported(
+        device: &VulkanComputeDevice,
+        model: &VulkanResidentInProcessPlacedModelPackage,
+        device_slices: &[VulkanResidentInProcessPlacedStreamProcessorDevice],
+        activation_schedule: &VulkanMountedPlacedResidentInProcessSchedule,
+        input_transducer: &VulkanResidentInputEmbeddingTransducerRunner,
+        output_transducer: &VulkanResidentOutputTransducerRunner,
+        sampler: &VulkanResidentSamplerRunner,
+    ) -> Result<Option<Self>, VulkanError> {
+        let Some(slice) = device_slices.first().filter(|_| device_slices.len() == 1) else {
+            return Ok(None);
+        };
+        let Some(segment) = slice
+            .resident_execution_plan
+            .dispatch_segments
+            .first()
+            .filter(|_| slice.resident_execution_plan.dispatch_segment_count == 1)
+        else {
+            return Ok(None);
+        };
+        let tick_plan = &slice.resident_execution_plan.tick_plan;
+        let has_push_constants = input_transducer
+            .resident_dispatch
+            .push_constant_byte_count()
+            != 0
+            || output_transducer
+                .embedding_norm_dispatch
+                .push_constant_byte_count()
+                != 0
+            || output_transducer
+                .tied_projection_dispatch
+                .push_constant_byte_count()
+                != 0
+            || sampler
+                .resident_dispatches()
+                .iter()
+                .any(|dispatch| dispatch.push_constant_byte_count() != 0)
+            || segment
+                .dispatches
+                .iter()
+                .any(|dispatch| dispatch.resident_dispatch.push_constant_byte_count() != 0);
+        let static_state_bytes = total_static_state_bytes(&slice.mounted.buffers)?;
+        let eligibility = VulkanResidentInProcessPlacedFeedbackLoopEligibility {
+            device_slice_count: device_slices.len(),
+            input_and_output_share_device: model.input_device_id == model.output_device_id
+                && model.input_device_id == slice.device_id,
+            scheduler_turn_count: activation_schedule.turns.len(),
+            dispatch_segment_count: slice.resident_execution_plan.dispatch_segment_count,
+            transport_stage_count: tick_plan
+                .receive_stage_count
+                .saturating_add(tick_plan.publish_stage_count),
+            has_push_constants,
+            static_state_bytes,
+            sampler_history_capacity: sampler.history_capacity_activations,
+        };
+        let Some(window_width) = eligibility.window_width() else {
+            return Ok(None);
+        };
+        let steps_per_tick = 1usize
+            .checked_add(segment.dispatch_count)
+            .and_then(|count| count.checked_add(output_transducer.dispatch_count))
+            .and_then(|count| count.checked_add(sampler.dispatch_count))
+            .ok_or_else(|| VulkanError("placed feedback-loop step count overflowed".to_string()))?;
+        let static_state_snapshots = VulkanResidentStaticStateSnapshotBank::new(
+            device,
+            &slice.mounted.buffers,
+            window_width,
+        )?;
+        let sequence = device.create_resident_kernel_sequence()?;
+        Ok(Some(Self {
+            sequence,
+            static_state_snapshots,
+            window_width,
+            steps_per_tick,
+            scheduler_turn_count_per_tick: activation_schedule.turns.len(),
+            completed_stage_count_per_tick: tick_plan.stage_count,
+        }))
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -9484,6 +9617,16 @@ impl VulkanResidentInProcessPlacedModelPackage {
             })
             .transpose()
             .map_err(VulkanResidentInProcessPlacedRuntimeError::FeedbackCable)?;
+        let resident_feedback_loop = VulkanResidentInProcessPlacedFeedbackLoop::new_if_supported(
+            input_device,
+            self,
+            &devices,
+            &activation_schedule,
+            &input_transducer,
+            &output_transducer,
+            &sampler,
+        )
+        .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
 
         Ok(VulkanResidentInProcessPlacedStreamProcessor {
             model: self.clone(),
@@ -9491,6 +9634,7 @@ impl VulkanResidentInProcessPlacedModelPackage {
             output_transducer,
             sampler,
             feedback_token_cable,
+            resident_feedback_loop,
             activation_schedule,
             device_slices: devices,
         })
@@ -9534,6 +9678,137 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
                 Ok(self.input_transducer.completed_run(token_id))
             }
         }
+    }
+
+    fn resident_feedback_window_width(&self) -> usize {
+        self.resident_feedback_loop
+            .as_ref()
+            .map(|feedback_loop| feedback_loop.window_width)
+            .unwrap_or(0)
+    }
+
+    fn run_resident_feedback_window(
+        &self,
+        device: &VulkanComputeDevice,
+        start_stream_tick: u64,
+        tick_count: usize,
+    ) -> Result<
+        VulkanResidentInProcessPlacedFeedbackWindowRun,
+        VulkanResidentInProcessPlacedRuntimeError,
+    > {
+        let feedback_loop = self.resident_feedback_loop.as_ref().ok_or_else(|| {
+            VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(
+                "placed resident feedback loop is not mounted".to_string(),
+            ))
+        })?;
+        if tick_count < 2 || tick_count > feedback_loop.window_width {
+            return Err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop(
+                VulkanError(format!(
+                    "placed resident feedback window requests {tick_count} ticks, mounted width is {}",
+                    feedback_loop.window_width
+                )),
+            ));
+        }
+        let slice = self.device_slices.first().ok_or_else(|| {
+            VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(
+                "placed resident feedback loop has no device slice".to_string(),
+            ))
+        })?;
+        let segment = slice
+            .resident_execution_plan
+            .dispatch_segments
+            .first()
+            .ok_or_else(|| {
+                VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(
+                    "placed resident feedback loop has no dispatch segment".to_string(),
+                ))
+            })?;
+        let total_steps = feedback_loop
+            .steps_per_tick
+            .checked_mul(tick_count)
+            .ok_or_else(|| {
+                VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(
+                    "placed resident feedback-loop sequence size overflowed".to_string(),
+                ))
+            })?;
+        let mut steps = Vec::with_capacity(total_steps);
+        for _ in 0..tick_count {
+            steps.push(VulkanResidentKernelSequenceStep::new(
+                &self.input_transducer.resident_dispatch,
+                &[],
+            ));
+            steps.extend(segment.dispatches.iter().map(|dispatch| {
+                VulkanResidentKernelSequenceStep::new(&dispatch.resident_dispatch, &[])
+            }));
+            steps.push(VulkanResidentKernelSequenceStep::new(
+                &self.output_transducer.embedding_norm_dispatch,
+                &[],
+            ));
+            steps.push(VulkanResidentKernelSequenceStep::new(
+                &self.output_transducer.tied_projection_dispatch,
+                &[],
+            ));
+            steps.extend(
+                self.sampler
+                    .resident_dispatches()
+                    .iter()
+                    .map(|dispatch| VulkanResidentKernelSequenceStep::new(dispatch, &[])),
+            );
+        }
+        debug_assert_eq!(steps.len(), total_steps);
+        let snapshot_copies = feedback_loop
+            .static_state_snapshots
+            .copies_for_cycle(
+                &slice.mounted.buffers,
+                feedback_loop.steps_per_tick,
+                tick_count,
+            )
+            .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
+        device
+            .run_resident_kernel_sequence_with_snapshot_copies(
+                &feedback_loop.sequence,
+                &steps,
+                &snapshot_copies,
+            )
+            .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
+        let sampled_token_ids = (0..tick_count)
+            .map(|tick_index| {
+                let stream_tick = start_stream_tick
+                    .checked_add(u64::try_from(tick_index).map_err(|_| {
+                        VulkanResidentInProcessPlacedRuntimeError::StreamTickOverflow
+                    })?)
+                    .ok_or(VulkanResidentInProcessPlacedRuntimeError::StreamTickOverflow)?;
+                self.sampler
+                    .completed_run_at(stream_tick)
+                    .map(|run| run.token_id)
+                    .map_err(VulkanResidentInProcessPlacedRuntimeError::Sampler)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(VulkanResidentInProcessPlacedFeedbackWindowRun {
+            sampled_token_ids,
+            scheduler_turn_count_per_tick: feedback_loop.scheduler_turn_count_per_tick,
+            completed_stage_count_per_tick: feedback_loop.completed_stage_count_per_tick,
+        })
+    }
+
+    fn restore_resident_feedback_state_after_tick(
+        &self,
+        tick_index: usize,
+    ) -> Result<(), VulkanResidentInProcessPlacedRuntimeError> {
+        let feedback_loop = self.resident_feedback_loop.as_ref().ok_or_else(|| {
+            VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(
+                "placed resident feedback loop is not mounted".to_string(),
+            ))
+        })?;
+        let slice = self.device_slices.first().ok_or_else(|| {
+            VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(
+                "placed resident feedback loop has no device slice".to_string(),
+            ))
+        })?;
+        feedback_loop
+            .static_state_snapshots
+            .restore_after_tick(&slice.mounted.buffers, tick_index)
+            .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)
     }
 
     pub fn mounted_device(&self, device_id: &str) -> Option<&VulkanMountedPlacedStreamCircuit> {
@@ -10187,6 +10462,22 @@ impl VulkanResidentInProcessPlacedActivePromptEvent {
         })
     }
 
+    fn resident_feedback_window_tick_count(&self, mounted_window_width: usize) -> usize {
+        if mounted_window_width < 2 || self.remaining_public_outputs < 2 {
+            return 0;
+        }
+        let Some(activation) = self.next_activation() else {
+            return 0;
+        };
+        if !activation.input_is_feedback
+            || activation.input_closes_loop_after_processing
+            || !activation.should_emit_public_output
+        {
+            return 0;
+        }
+        mounted_window_width.min(self.remaining_public_outputs)
+    }
+
     fn complete_activation(
         &mut self,
         activation: &VulkanResidentInProcessPlacedPromptActivation,
@@ -10716,6 +11007,16 @@ impl VulkanResidentInProcessPlacedPromptStream {
             return Ok(None);
         }
         loop {
+            if self.run_resident_feedback_window_with_output(&mut on_output_event)? {
+                if self
+                    .active_input_event
+                    .as_ref()
+                    .is_some_and(VulkanResidentInProcessPlacedActivePromptEvent::is_complete)
+                {
+                    return Ok(Some(self.complete_active_input_event()?));
+                }
+                continue;
+            }
             let activation = self
                 .run_next_activation()?
                 .ok_or(VulkanResidentInProcessPlacedRuntimeError::MissingPrivateFeedback)?;
@@ -10796,6 +11097,95 @@ impl VulkanResidentInProcessPlacedPromptStream {
         } else {
             Err(VulkanResidentInProcessPlacedRuntimeError::PromptStreamBusy)
         }
+    }
+
+    fn run_resident_feedback_window_with_output<F>(
+        &mut self,
+        on_output_event: &mut F,
+    ) -> Result<bool, VulkanResidentInProcessPlacedRuntimeError>
+    where
+        F: FnMut(VulkanResidentTokenOutputEvent),
+    {
+        let tick_count = self
+            .active_input_event
+            .as_ref()
+            .map(|event| {
+                event.resident_feedback_window_tick_count(
+                    self.processor.resident_feedback_window_width(),
+                )
+            })
+            .unwrap_or(0);
+        if tick_count == 0 {
+            return Ok(false);
+        }
+        let tick_delta = u64::try_from(tick_count)
+            .map_err(|_| VulkanResidentInProcessPlacedRuntimeError::StreamTickOverflow)?;
+        self.session
+            .next_stream_tick
+            .checked_add(tick_delta)
+            .ok_or(VulkanResidentInProcessPlacedRuntimeError::StreamTickOverflow)?;
+        let feedback_depth_delta = u32::try_from(tick_count)
+            .map_err(|_| VulkanResidentInProcessPlacedRuntimeError::FeedbackDepthOverflow)?;
+        self.active_input_event
+            .as_ref()
+            .and_then(VulkanResidentInProcessPlacedActivePromptEvent::next_activation)
+            .ok_or(VulkanResidentInProcessPlacedRuntimeError::MissingPrivateFeedback)?
+            .input_feedback_depth
+            .checked_add(feedback_depth_delta)
+            .ok_or(VulkanResidentInProcessPlacedRuntimeError::FeedbackDepthOverflow)?;
+        let device_id = &self.processor.model.input_device_id;
+        let device = self.devices.get(device_id).cloned().ok_or_else(|| {
+            VulkanResidentInProcessPlacedRuntimeError::MissingBoundDevice {
+                device_id: device_id.clone(),
+            }
+        })?;
+        let start_stream_tick = self.session.next_stream_tick;
+        let feedback_run = self.processor.run_resident_feedback_window(
+            device.as_ref(),
+            start_stream_tick,
+            tick_count,
+        )?;
+        let mut restore_after_tick = None;
+        for (tick_index, sampled_token_id) in feedback_run.sampled_token_ids.into_iter().enumerate()
+        {
+            let stream_tick = self.session.next_stream_tick;
+            let (output_event, closes_loop) = {
+                let active_input_event = self
+                    .active_input_event
+                    .as_mut()
+                    .expect("resident feedback window requires an active input event");
+                let activation = active_input_event
+                    .next_activation()
+                    .ok_or(VulkanResidentInProcessPlacedRuntimeError::MissingPrivateFeedback)?;
+                let closes_loop = activation.input_closes_loop_after_processing;
+                let output_event = active_input_event.complete_activation(
+                    &activation,
+                    stream_tick,
+                    feedback_run.scheduler_turn_count_per_tick,
+                    feedback_run.completed_stage_count_per_tick,
+                    &VulkanPlacedCableTransportStats::default(),
+                    activation
+                        .should_emit_public_output
+                        .then_some(sampled_token_id),
+                )?;
+                (output_event, closes_loop)
+            };
+            self.session.next_stream_tick = stream_tick
+                .checked_add(1)
+                .ok_or(VulkanResidentInProcessPlacedRuntimeError::StreamTickOverflow)?;
+            if let Some(output_event) = output_event {
+                on_output_event(output_event);
+            }
+            if closes_loop {
+                restore_after_tick = Some(tick_index);
+                break;
+            }
+        }
+        if let Some(tick_index) = restore_after_tick {
+            self.processor
+                .restore_resident_feedback_state_after_tick(tick_index)?;
+        }
+        Ok(true)
     }
 
     fn complete_active_input_event(
@@ -11392,6 +11782,7 @@ pub enum VulkanResidentInProcessPlacedRuntimeError {
     OutputTransducer(VulkanResidentOutputTransducerRunnerError),
     Sampler(VulkanResidentSamplerRunnerError),
     FeedbackCable(VulkanError),
+    BackendLoop(VulkanError),
 }
 
 impl Display for VulkanResidentInProcessPlacedRuntimeError {
@@ -11432,6 +11823,7 @@ impl Display for VulkanResidentInProcessPlacedRuntimeError {
             Self::OutputTransducer(error) => Display::fmt(error, f),
             Self::Sampler(error) => Display::fmt(error, f),
             Self::FeedbackCable(error) => Display::fmt(error, f),
+            Self::BackendLoop(error) => Display::fmt(error, f),
         }
     }
 }
@@ -18902,6 +19294,93 @@ mod tests {
             1
         );
         assert_eq!(backend_loop_window_for_static_state_bytes(0, 8), 8);
+    }
+
+    #[test]
+    fn placed_feedback_window_requires_one_cable_free_device_owned_segment() {
+        let eligible = VulkanResidentInProcessPlacedFeedbackLoopEligibility {
+            device_slice_count: 1,
+            input_and_output_share_device: true,
+            scheduler_turn_count: 1,
+            dispatch_segment_count: 1,
+            transport_stage_count: 0,
+            has_push_constants: false,
+            static_state_bytes: 0,
+            sampler_history_capacity: 4_096,
+        };
+        assert_eq!(eligible.window_width(), Some(64));
+        assert_eq!(
+            VulkanResidentInProcessPlacedFeedbackLoopEligibility {
+                static_state_bytes: 2 * 1024 * 1024,
+                ..eligible
+            }
+            .window_width(),
+            Some(32)
+        );
+        assert_eq!(
+            VulkanResidentInProcessPlacedFeedbackLoopEligibility {
+                sampler_history_capacity: 8,
+                ..eligible
+            }
+            .window_width(),
+            Some(8)
+        );
+        assert_eq!(
+            VulkanResidentInProcessPlacedFeedbackLoopEligibility {
+                device_slice_count: 2,
+                ..eligible
+            }
+            .window_width(),
+            None
+        );
+        assert_eq!(
+            VulkanResidentInProcessPlacedFeedbackLoopEligibility {
+                input_and_output_share_device: false,
+                ..eligible
+            }
+            .window_width(),
+            None
+        );
+        assert_eq!(
+            VulkanResidentInProcessPlacedFeedbackLoopEligibility {
+                scheduler_turn_count: 2,
+                ..eligible
+            }
+            .window_width(),
+            None
+        );
+        assert_eq!(
+            VulkanResidentInProcessPlacedFeedbackLoopEligibility {
+                dispatch_segment_count: 2,
+                ..eligible
+            }
+            .window_width(),
+            None
+        );
+        assert_eq!(
+            VulkanResidentInProcessPlacedFeedbackLoopEligibility {
+                transport_stage_count: 1,
+                ..eligible
+            }
+            .window_width(),
+            None
+        );
+        assert_eq!(
+            VulkanResidentInProcessPlacedFeedbackLoopEligibility {
+                has_push_constants: true,
+                ..eligible
+            }
+            .window_width(),
+            None
+        );
+        assert_eq!(
+            VulkanResidentInProcessPlacedFeedbackLoopEligibility {
+                sampler_history_capacity: 1,
+                ..eligible
+            }
+            .window_width(),
+            None
+        );
     }
 
     fn fixture_tick_dispatch_stage(stage_index: usize) -> VulkanMountedPlacedStreamTickStage {
@@ -28234,6 +28713,63 @@ mod tests {
     }
 
     #[test]
+    fn placed_active_prompt_event_windows_only_open_private_feedback() {
+        let mut active = VulkanResidentInProcessPlacedActivePromptEvent::new(
+            VulkanResidentTokenInputEvent::new("event", vec![10, 11], 4),
+            0,
+        )
+        .unwrap();
+        assert_eq!(active.resident_feedback_window_tick_count(64), 0);
+
+        let first_prompt = active.next_activation().unwrap();
+        active
+            .complete_activation(
+                &first_prompt,
+                0,
+                1,
+                1,
+                &VulkanPlacedCableTransportStats::default(),
+                None,
+            )
+            .unwrap();
+        assert_eq!(active.resident_feedback_window_tick_count(64), 0);
+
+        let final_prompt = active.next_activation().unwrap();
+        active
+            .complete_activation(
+                &final_prompt,
+                1,
+                1,
+                1,
+                &VulkanPlacedCableTransportStats::default(),
+                Some(20),
+            )
+            .unwrap();
+        assert_eq!(active.resident_feedback_window_tick_count(64), 3);
+        assert_eq!(active.resident_feedback_window_tick_count(2), 2);
+
+        active.stop_after_current("user_stop");
+        assert_eq!(active.resident_feedback_window_tick_count(64), 0);
+
+        let mut eos = VulkanResidentInProcessPlacedActivePromptEvent::new(
+            VulkanResidentTokenInputEvent::new("eos", vec![10], 8).with_stop_tokens(vec![20]),
+            0,
+        )
+        .unwrap();
+        let prompt = eos.next_activation().unwrap();
+        eos.complete_activation(
+            &prompt,
+            0,
+            1,
+            1,
+            &VulkanPlacedCableTransportStats::default(),
+            Some(20),
+        )
+        .unwrap();
+        assert_eq!(eos.resident_feedback_window_tick_count(64), 0);
+    }
+
+    #[test]
     fn placed_active_prompt_event_without_output_drains_only_external_input() {
         let input_event = VulkanResidentTokenInputEvent::new("prefill", vec![10, 20], 0);
         let mut active =
@@ -28451,6 +28987,180 @@ mod tests {
         assert_eq!(stream.next_stream_tick(), 4);
         assert_eq!(stream.completed_prompt_event_count(), 2);
         assert_eq!(second.session_run.run.output_source_stream_ticks, vec![2]);
+    }
+
+    #[test]
+    fn placed_prompt_stream_runs_single_device_feedback_as_resident_window() {
+        let device = match selected_test_vulkan_device() {
+            Ok(device) => device,
+            Err(error) => {
+                eprintln!("skipping placed resident feedback-window test: {error}");
+                return;
+            }
+        };
+        let runtime_model = fixture_model_runtime_model();
+        let manifest_path = fixture_model_package_manifest_path();
+        let manifest_dir = manifest_path.parent().unwrap();
+        let device = Rc::new(device);
+        let devices = BTreeMap::from([(
+            RUNTIME_DEFAULT_LOGICAL_DEVICE_ID.to_string(),
+            device.clone(),
+        )]);
+
+        let mut stream =
+            VulkanResidentInProcessPlacedPromptStream::from_runtime_model_for_bound_devices(
+                devices,
+                manifest_dir,
+                runtime_model,
+                Some(8),
+                0,
+            )
+            .unwrap();
+        assert!(stream.processor.resident_feedback_window_width() >= 3);
+
+        let mut first_streamed_output_events = Vec::new();
+        stream.enqueue_input_event(
+            VulkanResidentTokenInputEvent::new("event", vec![1], 4).with_stop_tokens(vec![558]),
+        );
+        let resident_first = stream
+            .run_next_queued_input_event_with_output(|event| {
+                first_streamed_output_events.push(event)
+            })
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(resident_first.generated_token_ids, vec![1, 1, 558]);
+        assert_eq!(resident_first.output_events, first_streamed_output_events);
+        assert_eq!(
+            resident_first
+                .output_events
+                .iter()
+                .map(|event| event.source_stream_tick)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert_eq!(resident_first.session_run.run.stop_reason, "eos");
+        assert_eq!(resident_first.session_run.tick_count, 4);
+        assert_eq!(resident_first.session_run.next_stream_tick, 4);
+
+        let resident_second = stream
+            .submit_input_event(VulkanResidentTokenInputEvent::new(
+                "event_after_eos",
+                vec![36_309],
+                3,
+            ))
+            .unwrap();
+        assert_eq!(
+            resident_second
+                .output_events
+                .iter()
+                .map(|event| event.source_stream_tick)
+                .collect::<Vec<_>>(),
+            vec![4, 5, 6]
+        );
+        assert_eq!(
+            resident_second.session_run.run.stop_reason,
+            "max_new_tokens"
+        );
+        assert_eq!(resident_second.session_run.tick_count, 4);
+        assert_eq!(resident_second.session_run.next_stream_tick, 8);
+        assert_eq!(stream.next_stream_tick(), 8);
+        assert!(stream.is_idle());
+        drop(stream);
+
+        let scalar_runtime_model = fixture_model_runtime_model_with_placement(
+            StreamCircuitPlacementSpec::new("gpu0").with_pedal_device("layer_02", "gpu1"),
+        );
+        let scalar_devices = BTreeMap::from([
+            ("gpu0".to_string(), device.clone()),
+            ("gpu1".to_string(), device),
+        ]);
+        let mut scalar_stream =
+            VulkanResidentInProcessPlacedPromptStream::from_runtime_model_for_bound_devices(
+                scalar_devices,
+                manifest_dir,
+                scalar_runtime_model,
+                Some(8),
+                0,
+            )
+            .unwrap();
+        assert_eq!(scalar_stream.processor.resident_feedback_window_width(), 0);
+        let scalar_first = scalar_stream
+            .submit_input_event(
+                VulkanResidentTokenInputEvent::new("event", vec![1], 4).with_stop_tokens(vec![558]),
+            )
+            .unwrap();
+        let scalar_second = scalar_stream
+            .submit_input_event(VulkanResidentTokenInputEvent::new(
+                "event_after_eos",
+                vec![36_309],
+                3,
+            ))
+            .unwrap();
+
+        assert_eq!(
+            resident_first.generated_token_ids,
+            scalar_first.generated_token_ids
+        );
+        assert_eq!(resident_first.output_events, scalar_first.output_events);
+        assert_eq!(
+            resident_first.session_run.run.output_token_ids,
+            scalar_first.session_run.run.output_token_ids
+        );
+        assert_eq!(
+            resident_first.session_run.run.stop_reason,
+            scalar_first.session_run.run.stop_reason
+        );
+        assert_eq!(
+            resident_first.session_run.run.output_source_stream_ticks,
+            scalar_first.session_run.run.output_source_stream_ticks
+        );
+        assert_eq!(
+            resident_second.generated_token_ids,
+            scalar_second.generated_token_ids
+        );
+        assert_eq!(resident_second.output_events, scalar_second.output_events);
+        assert_eq!(
+            resident_second.session_run.run.output_token_ids,
+            scalar_second.session_run.run.output_token_ids
+        );
+        assert_eq!(
+            resident_second.session_run.run.stop_reason,
+            scalar_second.session_run.run.stop_reason
+        );
+        assert_eq!(
+            resident_second.session_run.run.output_source_stream_ticks,
+            scalar_second.session_run.run.output_source_stream_ticks
+        );
+        assert_eq!(resident_first.session_run.run.scheduler_turn_count, 4);
+        assert_eq!(scalar_first.session_run.run.scheduler_turn_count, 8);
+        assert_eq!(resident_second.session_run.run.scheduler_turn_count, 4);
+        assert_eq!(scalar_second.session_run.run.scheduler_turn_count, 8);
+        assert_eq!(
+            resident_first.session_run.run.transport_stats,
+            VulkanPlacedCableTransportStats::default()
+        );
+        assert_eq!(
+            resident_second.session_run.run.transport_stats,
+            VulkanPlacedCableTransportStats::default()
+        );
+        assert_eq!(
+            scalar_first
+                .session_run
+                .run
+                .transport_stats
+                .direct_copy_count,
+            8
+        );
+        assert_eq!(
+            scalar_second
+                .session_run
+                .run
+                .transport_stats
+                .direct_copy_count,
+            8
+        );
+        assert!(scalar_stream.is_idle());
     }
 
     #[test]
