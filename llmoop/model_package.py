@@ -1993,7 +1993,7 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
         labels = [chr(ord("A") + index) for index in range(branch_count)]
         output_bindings = "\n\n".join(
             f"layout(set = 0, binding = {index + 1}) buffer Output{label} {{\n"
-            "    uint16_t values[];\n"
+            "    bfloat16_t values[];\n"
             f"}} output_{label.lower()};"
             for index, label in enumerate(labels)
         )
@@ -2047,6 +2047,22 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
             f"\n    output_{labels[-1].lower()}.values[batch_index * "
             f"OUTPUT_{labels[-1]}_SIZE + row] = value;"
         )
+        direct_output_stores = "\n".join(
+            (
+                f"            {'if' if index == 0 else 'else if'} "
+                f"(branch == {index}u) {{\n"
+                "                coopMatStore(\n"
+                "                    rounded,\n"
+                f"                    output_{label.lower()}.values,\n"
+                "                    (batch_start + batch_subtile * MATRIX_TILE) "
+                f"* OUTPUT_{label}_SIZE + output_start + output_subtile * MATRIX_TILE,\n"
+                f"                    OUTPUT_{label}_SIZE,\n"
+                "                    gl_CooperativeMatrixLayoutColumnMajor\n"
+                "                );\n"
+                "            }"
+            )
+            for index, label in enumerate(labels)
+        )
         direct_weight_loads = "\n".join(
             (
                 f"            {'if' if index == 0 else 'else if'} "
@@ -2077,6 +2093,7 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
                 "OUTPUT_SIZE_SELECTION": output_size_selection,
                 "OUTPUT_WRITES": output_writes,
                 "DIRECT_WEIGHT_LOADS": direct_weight_loads,
+                "DIRECT_OUTPUT_STORES": direct_output_stores,
             },
         )
 
@@ -2094,6 +2111,81 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
                 f"invalid cooperative BF16 linear shader shape {shader_file!r}"
             )
         residual = operation == "linear_residual"
+        direct_store = (
+            "    if (output_start + OUTPUT_TILE <= OUTPUT_SIZE\n"
+            "        && batch_start + BATCH_TILE <= batch_control.batch_width) {\n"
+            "        for (uint batch_subtile = 0u; batch_subtile < BATCH_SUBTILES; batch_subtile++) {\n"
+            "            coopmat<bfloat16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>\n"
+            "                residual_values;\n"
+            "            coopMatLoad(\n"
+            "                residual_values,\n"
+            "                residual_frames.values,\n"
+            "                (batch_start + batch_subtile * MATRIX_TILE) * OUTPUT_SIZE\n"
+            "                    + output_start + output_subtile * MATRIX_TILE,\n"
+            "                OUTPUT_SIZE,\n"
+            "                gl_CooperativeMatrixLayoutColumnMajor\n"
+            "            );\n"
+            "            coopmat<bfloat16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>\n"
+            "                combined = coopmat<bfloat16_t, gl_ScopeSubgroup, 16, 16,\n"
+            "                    gl_MatrixUseAccumulator>(bfloat16_t(0.0));\n"
+            "            for (uint element = 0u; element < combined.length(); element++) {\n"
+            "                bfloat16_t projection = uintBitsToBFloat16EXT(\n"
+            "                    uint16_t(f32_to_bf16(sums[batch_subtile][element]))\n"
+            "                );\n"
+            "                combined[element] = uintBitsToBFloat16EXT(uint16_t(f32_to_bf16(\n"
+            "                    float(projection) + float(residual_values[element])\n"
+            "                )));\n"
+            "            }\n"
+            "            coopMatStore(\n"
+            "                combined,\n"
+            "                output_frames.values,\n"
+            "                (batch_start + batch_subtile * MATRIX_TILE) * OUTPUT_SIZE\n"
+            "                    + output_start + output_subtile * MATRIX_TILE,\n"
+            "                OUTPUT_SIZE,\n"
+            "                gl_CooperativeMatrixLayoutColumnMajor\n"
+            "            );\n"
+            "        }\n"
+            "        return;\n"
+            "    }"
+            if residual
+            else "    if (output_start + OUTPUT_TILE <= OUTPUT_SIZE\n"
+            "        && batch_start + BATCH_TILE <= batch_control.batch_width) {\n"
+            "        for (uint batch_subtile = 0u; batch_subtile < BATCH_SUBTILES; batch_subtile++) {\n"
+            "            coopmat<bfloat16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>\n"
+            "                rounded = coopmat<bfloat16_t, gl_ScopeSubgroup, 16, 16,\n"
+            "                    gl_MatrixUseAccumulator>(bfloat16_t(0.0));\n"
+            "            for (uint element = 0u; element < rounded.length(); element++) {\n"
+            "                rounded[element] = uintBitsToBFloat16EXT(\n"
+            "                    uint16_t(f32_to_bf16(sums[batch_subtile][element]))\n"
+            "                );\n"
+            "            }\n"
+            "            coopMatStore(\n"
+            "                rounded,\n"
+            "                output_frames.values,\n"
+            "                (batch_start + batch_subtile * MATRIX_TILE) * OUTPUT_SIZE\n"
+            "                    + output_start + output_subtile * MATRIX_TILE,\n"
+            "                OUTPUT_SIZE,\n"
+            "                gl_CooperativeMatrixLayoutColumnMajor\n"
+            "            );\n"
+            "        }\n"
+            "        return;\n"
+            "    }"
+        )
+        finalize_function = (
+            "float rounded_bf16(float value) {\n"
+            "    return uintBitsToFloat(f32_to_bf16(value) << 16u);\n"
+            "}\n\n"
+            "bfloat16_t finalize_result(uint batch_index, uint output_index, float value) {\n"
+            "    uint index = batch_index * OUTPUT_SIZE + output_index;\n"
+            "    return uintBitsToBFloat16EXT(uint16_t(f32_to_bf16(\n"
+            "        rounded_bf16(value) + float(residual_frames.values[index])\n"
+            "    )));\n"
+            "}"
+            if residual
+            else "bfloat16_t finalize_result(uint batch_index, uint output_index, float value) {\n"
+            "    return uintBitsToBFloat16EXT(uint16_t(f32_to_bf16(value)));\n"
+            "}"
+        )
         return render_shader_template(
             source_dir,
             "linear_batch_cooperative_bf16.comp.template",
@@ -2108,22 +2200,10 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
                     else ""
                 ),
                 "OUTPUT_BINDING": "2" if residual else "1",
+                "OUTPUT_TYPE": "bfloat16_t",
                 "WEIGHT_BINDING": "3" if residual else "2",
-                "FINALIZE_FUNCTION": (
-                    "float rounded_bf16(float value) {\n"
-                    "    return uintBitsToFloat(f32_to_bf16(value) << 16u);\n"
-                    "}\n\n"
-                    "uint16_t finalize_result(uint batch_index, uint output_index, float value) {\n"
-                    "    uint index = batch_index * OUTPUT_SIZE + output_index;\n"
-                    "    return uint16_t(f32_to_bf16(\n"
-                    "        rounded_bf16(value) + float(residual_frames.values[index])\n"
-                    "    ));\n"
-                    "}"
-                    if residual
-                    else "uint16_t finalize_result(uint batch_index, uint output_index, float value) {\n"
-                    "    return uint16_t(f32_to_bf16(value));\n"
-                    "}"
-                ),
+                "DIRECT_STORE": direct_store,
+                "FINALIZE_FUNCTION": finalize_function,
             },
         )
 

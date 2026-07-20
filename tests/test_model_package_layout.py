@@ -346,6 +346,12 @@ def test_compiler_renders_cooperative_bfloat16_batch_shaders(tmp_path: Path) -> 
     assert "weight_c.values," in direct_parallel
     assert "gate_weight.values," in direct_fused
     assert "up_weight.values," in direct_fused
+    assert "coopmat<bfloat16_t" in direct_linear
+    assert "uintBitsToBFloat16EXT(uint16_t(f32_to_bf16" in direct_linear
+    assert "residual_frames.values," in direct_linear
+    assert "gl_CooperativeMatrixLayoutColumnMajor" in direct_linear
+    assert "uintBitsToBFloat16EXT" in direct_parallel
+    assert "gl_CooperativeMatrixLayoutColumnMajor" in direct_parallel
     assert required_vulkan_device_extensions(tmp_path, shader_files) == [
         "VK_KHR_cooperative_matrix",
         "VK_KHR_shader_bfloat16",

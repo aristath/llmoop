@@ -11,7 +11,7 @@ layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
 layout(set = 0, binding = 0) readonly buffer InputFrames { bfloat16_t values[]; } input_frames;
 {{RESIDUAL_BINDING}}
-layout(set = 0, binding = {{OUTPUT_BINDING}}) buffer OutputFrames { uint16_t values[]; } output_frames;
+layout(set = 0, binding = {{OUTPUT_BINDING}}) buffer OutputFrames { {{OUTPUT_TYPE}} values[]; } output_frames;
 layout(set = 0, binding = {{WEIGHT_BINDING}}) readonly buffer Weight { bfloat16_t values[]; } weight;
 
 layout(push_constant) uniform BatchControl { uint batch_width; } batch_control;
@@ -109,6 +109,8 @@ void main() {
         }
         barrier();
     }
+
+{{DIRECT_STORE}}
 
     for (uint batch_subtile = 0u; batch_subtile < BATCH_SUBTILES; batch_subtile++) {
         coopMatStore(
