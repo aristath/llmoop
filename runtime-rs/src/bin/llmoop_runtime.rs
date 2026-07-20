@@ -947,23 +947,28 @@ fn run_placed_chat(
         codec,
         &transcript_codec,
         &stop_token_ids,
-        |_turn_index, token_ids| {
+        |turn_index, token_ids| {
             print!("llm> ");
             io::stdout().flush()?;
             let mut decoder = codec.decode_stream();
             let mut output_error = None;
-            let stream = engine.stream_mut("main").ok_or_else(|| {
-                io::Error::new(io::ErrorKind::NotFound, "placed chat stream is missing")
-            })?;
-            let run = stream.run_prompt_event_bounded_with_output(
-                token_ids,
+            let mut event = VulkanResidentTokenInputEvent::new(
+                format!("chat_{turn_index}"),
+                token_ids.to_vec(),
                 args.max_new_tokens,
-                &stop_token_ids,
-                |token_id| {
+            )
+            .with_origin("cli_chat");
+            if !stop_token_ids.is_empty() {
+                event = event.with_stop_tokens(stop_token_ids.clone());
+            }
+            let run = engine.submit_input_event_until_idle_with_output(
+                "main",
+                event,
+                |output_event| {
                     if output_error.is_some() {
                         return;
                     }
-                    match decoder.step(token_id) {
+                    match decoder.step(output_event.output_event.token_id) {
                         Ok(Some(text)) => {
                             print!("{text}");
                             if let Err(error) = io::stdout().flush() {
@@ -979,7 +984,7 @@ fn run_placed_chat(
                 return Err(Box::new(io::Error::new(io::ErrorKind::InvalidData, error)));
             }
             Ok(RuntimeChatTurn {
-                generated_token_ids: run.run.generated_token_ids,
+                generated_token_ids: run.generated_token_ids,
                 streamed: true,
             })
         },
