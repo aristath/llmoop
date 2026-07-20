@@ -760,10 +760,10 @@ def pedal_kernel_spec(
     local_size_x: int,
     workgroup_count_x: int,
 ) -> Json:
-    causal_scan_shader_file = causal_scan_batch_shader_file(shader_file)
+    causal_scan_stages = causal_scan_batch_stages(shader_file, local_size_x)
     scalar_batch_shader_file = (
         None
-        if causal_scan_shader_file is not None
+        if causal_scan_stages is not None
         else weight_shared_batch_shader_file(shader_file)
     )
     cooperative_shader_file = (
@@ -780,27 +780,19 @@ def pedal_kernel_spec(
         "workgroup_count_x": workgroup_count_x,
         "batch_mode": (
             "causal_scan"
-            if causal_scan_shader_file
+            if causal_scan_stages
             else "weight_shared" if scalar_batch_shader_file else "serial_lanes"
         ),
         "batch_implementations": [],
     }
-    if causal_scan_shader_file is not None:
+    if causal_scan_stages is not None:
         spec["batch_implementations"].append(
             {
                 "lane_tile_width": CAUSAL_SCAN_LANE_TILE_WIDTH,
                 "device_requirements": {
                     "vulkan_device_extensions": [],
                 },
-                "stages": [
-                    {
-                        "shader_path": f"shaders/{causal_scan_shader_file}",
-                        "local_size_x": local_size_x,
-                        "workgroup_count_x": causal_scan_workgroup_count_x(
-                            shader_file
-                        ),
-                    }
-                ],
+                "stages": causal_scan_stages,
             }
         )
     elif scalar_batch_shader_file is not None:
@@ -843,6 +835,48 @@ def pedal_kernel_spec(
             }
         )
     return spec
+
+
+def causal_scan_batch_stages(shader_file: str, local_size_x: int) -> list[Json] | None:
+    causal_scan_shader = causal_scan_batch_shader_file(shader_file)
+    if causal_scan_shader is not None:
+        return [
+            {
+                "shader_path": f"shaders/{causal_scan_shader}",
+                "local_size_x": local_size_x,
+                "workgroup_count_x": causal_scan_workgroup_count_x(shader_file),
+            }
+        ]
+
+    attention = re.fullmatch(
+        r"append_gqa_attention_bf16_q(\d+)_kv(\d+)_d(\d+)_scale([0-9eE+.-]+)"
+        r"(?:_w(\d+))?(_sinks)?__sc\d+\.comp",
+        shader_file,
+    )
+    if attention is None:
+        return None
+    query_heads, kv_heads, head_width = map(int, attention.groups()[:3])
+    stem = re.sub(r"__sc\d+\.comp$", ".comp", shader_file).replace(
+        "append_gqa_attention_bf16_",
+        "append_gqa_attention_temporal_read_bf16_",
+        1,
+    )
+    sinks = "_sinks" if attention.group(6) else ""
+    return [
+        {
+            "shader_path": f"shaders/{stem}",
+            "local_size_x": local_size_x,
+            "workgroup_count_x": query_heads,
+        },
+        {
+            "shader_path": (
+                "shaders/append_kv_temporal_commit_bf16_"
+                f"kv{kv_heads}_d{head_width}{sinks}.comp"
+            ),
+            "local_size_x": 64,
+            "workgroup_count_x": kv_heads,
+        },
+    ]
 
 
 def cooperative_bfloat16_batch_shader_file(shader_file: str) -> str | None:
@@ -2796,6 +2830,65 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
                 "ATTENTION_SCALE": attention_shape.group(4),
                 "ATTENTION_WINDOW": attention_shape.group(5) or "0",
                 "HAS_SINKS": "1" if attention_shape.group(6) else "0",
+            },
+        )
+
+    temporal_attention_shape = re.fullmatch(
+        r"append_gqa_attention_temporal_read_bf16_q(\d+)_kv(\d+)_d(\d+)"
+        r"_scale([0-9eE+.-]+)(?:_w(\d+))?(_sinks)?\.comp",
+        shader_file,
+    )
+    if temporal_attention_shape is not None:
+        query_heads, kv_heads, head_width = map(
+            int, temporal_attention_shape.groups()[:3]
+        )
+        if query_heads % kv_heads != 0:
+            raise ModelCompileError(
+                f"query head count {query_heads} is not divisible by KV head count {kv_heads}"
+            )
+        local_size, tile_tokens = attention_workgroup_shape(head_width)
+        if head_width < 2 or head_width % 2 != 0 or tile_tokens == 0:
+            raise ModelCompileError(
+                f"attention head width {head_width} cannot be tiled into a Vulkan workgroup"
+            )
+        has_sinks = temporal_attention_shape.group(6) is not None
+        return render_shader_template(
+            source_dir,
+            "append_gqa_attention_temporal_read_bf16.comp.template",
+            {
+                "QUERY_HEADS": str(query_heads),
+                "KV_HEADS": str(kv_heads),
+                "QUERY_GROUPS_PER_KV_HEAD": str(query_heads // kv_heads),
+                "HEAD_WIDTH": str(head_width),
+                "LOCAL_SIZE": str(local_size),
+                "TILE_TOKENS": str(tile_tokens),
+                "ATTENTION_SCALE": temporal_attention_shape.group(4),
+                "ATTENTION_WINDOW": temporal_attention_shape.group(5) or "0",
+                "HAS_SINKS": "1" if has_sinks else "0",
+                "ATTENTION_SINK_BINDING": "5",
+                "STATE_READ_BINDING": "6" if has_sinks else "5",
+            },
+        )
+
+    temporal_kv_commit_shape = re.fullmatch(
+        r"append_kv_temporal_commit_bf16_kv(\d+)_d(\d+)(_sinks)?\.comp",
+        shader_file,
+    )
+    if temporal_kv_commit_shape is not None:
+        kv_heads, head_width = map(int, temporal_kv_commit_shape.groups()[:2])
+        if head_width < 2 or head_width % 2 != 0:
+            raise ModelCompileError(
+                f"KV head width {head_width} cannot be packed as BF16 pairs"
+            )
+        return render_shader_template(
+            source_dir,
+            "append_kv_temporal_commit_bf16.comp.template",
+            {
+                "KV_HEADS": str(kv_heads),
+                "HEAD_WIDTH": str(head_width),
+                "STATE_WRITE_BINDING": (
+                    "7" if temporal_kv_commit_shape.group(3) else "6"
+                ),
             },
         )
 

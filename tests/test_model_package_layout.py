@@ -14,6 +14,7 @@ from llmoop.model_package import (
     VULKAN_BF16_ROW_PAIR_LAYOUT,
     attention_workgroup_shape,
     causal_scan_batch_shader_file,
+    causal_scan_batch_stages,
     causal_scan_workgroup_count_x,
     compiled_tensor_layout,
     cooperative_bfloat16_batch_shader_file,
@@ -95,6 +96,47 @@ def test_compiler_selects_stateful_causal_scan_kernels() -> None:
         "parallel_head_norm_rope_2way_bf16_h16_4_d256_r64_eps1e-06_"
         "offset1_theta10000000_half__sc6.comp"
     ) == 20
+
+    attention_local_size = attention_workgroup_shape(256)[0]
+    assert causal_scan_batch_stages(
+        "append_gqa_attention_bf16_q16_kv4_d256_scale0.0625__sc7.comp",
+        attention_local_size,
+    ) == [
+        {
+            "shader_path": (
+                "shaders/append_gqa_attention_temporal_read_bf16_"
+                "q16_kv4_d256_scale0.0625.comp"
+            ),
+            "local_size_x": attention_local_size,
+            "workgroup_count_x": 16,
+        },
+        {
+            "shader_path": "shaders/append_kv_temporal_commit_bf16_kv4_d256.comp",
+            "local_size_x": 64,
+            "workgroup_count_x": 4,
+        },
+    ]
+
+
+def test_compiler_renders_temporal_attention_stages(tmp_path: Path) -> None:
+    shader_source_dir = Path(__file__).parents[1] / "runtime-rs" / "shaders"
+    shader_files = {
+        "append_gqa_attention_temporal_read_bf16_"
+        "q16_kv4_d256_scale0.0625_w32768_sinks.comp",
+        "append_kv_temporal_commit_bf16_kv4_d256_sinks.comp",
+    }
+
+    copy_shader_templates(shader_source_dir, tmp_path, shader_files)
+
+    read_source = next(tmp_path.glob("append_gqa_attention_temporal_read_*.comp")).read_text()
+    assert "layout(set = 0, binding = 6) readonly buffer KvStateRead" in read_source
+    assert "const uint ATTENTION_WINDOW = 32768u;" in read_source
+    assert "absolute_tick >= batch_control.start_stream_tick_low" in read_source
+    commit_source = next(tmp_path.glob("append_kv_temporal_commit_*.comp")).read_text()
+    assert "layout(set = 0, binding = 7) buffer KvStateWrite" in commit_source
+    assert "position * KV_WORD_COUNT + head_word" in commit_source
+    assert "{{" not in read_source
+    assert "{{" not in commit_source
 
 
 def test_compiler_selects_cooperative_bfloat16_projection_kernels() -> None:

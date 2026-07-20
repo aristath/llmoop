@@ -1,0 +1,47 @@
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 1) readonly buffer CurrentKFrames {
+    uint words[];
+} current_k_frames;
+
+layout(set = 0, binding = 2) readonly buffer CurrentVFrames {
+    uint words[];
+} current_v_frames;
+
+layout(set = 0, binding = {{STATE_WRITE_BINDING}}) buffer KvStateWrite {
+    uint words[];
+} kv_state_write;
+
+layout(push_constant) uniform BatchControl {
+    uint batch_width;
+    uint start_stream_tick_low;
+    uint start_stream_tick_high;
+    uint dynamic_state_capacity;
+} batch_control;
+
+const uint KV_HEADS = {{KV_HEADS}}u;
+const uint HEAD_WIDTH = {{HEAD_WIDTH}}u;
+const uint HEAD_WORD_COUNT = HEAD_WIDTH / 2u;
+const uint KV_WORD_COUNT = KV_HEADS * HEAD_WORD_COUNT;
+const uint SLOT_WORD_COUNT = KV_WORD_COUNT * 2u;
+
+void main() {
+    uint kv_head = gl_WorkGroupID.x;
+    uint lane = gl_LocalInvocationID.x;
+    uint capacity = batch_control.dynamic_state_capacity;
+    if (kv_head >= KV_HEADS || capacity == 0u) return;
+
+    for (uint word = lane; word < HEAD_WORD_COUNT; word += 64u) {
+        uint head_word = kv_head * HEAD_WORD_COUNT + word;
+        for (uint position = 0u; position < batch_control.batch_width; position++) {
+            uint slot = (batch_control.start_stream_tick_low + position) % capacity;
+            uint source = position * KV_WORD_COUNT + head_word;
+            uint destination = slot * SLOT_WORD_COUNT + head_word;
+            kv_state_write.words[destination] = current_k_frames.words[source];
+            kv_state_write.words[destination + KV_WORD_COUNT] =
+                current_v_frames.words[source];
+        }
+    }
+}
