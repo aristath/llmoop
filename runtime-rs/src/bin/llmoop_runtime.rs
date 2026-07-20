@@ -155,13 +155,15 @@ fn run() -> Result<(), Box<dyn Error>> {
             device_id,
         );
     }
+    let (runtime_model, use_placed_execution) =
+        runtime_model_for_bound_execution(&args, runtime_model)?;
     let tokenizer_dir = tokenizer_dir_from_package(package_manifest)?;
     let codec = VulkanResidentHfTokenizerTextCodec::from_model_dir(&tokenizer_dir)?
         .with_add_special_tokens(args.add_special_tokens)
         .with_skip_special_tokens(args.skip_special_tokens);
     if args.chat {
         let capacity = choose_chat_runtime_context_size(package_manifest, args.context_size)?;
-        if runtime_model.placement_device_ids().len() > 1 {
+        if use_placed_execution {
             return run_placed_chat(
                 &args,
                 &manifest_dir,
@@ -210,7 +212,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         codec: &codec,
     };
 
-    if runtime_model.placement_device_ids().len() > 1 {
+    if use_placed_execution {
         if args.profile_runs > 1 {
             return run_placed_prompt_benchmark(&context, runtime_model);
         }
@@ -2074,11 +2076,33 @@ struct RuntimeBoundVulkanDevices {
     physical_device_ids: BTreeMap<String, String>,
 }
 
-fn runtime_bound_vulkan_devices(
+fn runtime_model_for_bound_execution(
+    args: &Args,
+    runtime_model: VulkanResidentRuntimeModel,
+) -> Result<(VulkanResidentRuntimeModel, bool), Box<dyn Error>> {
+    let logical_device_ids = runtime_model.placement_device_ids();
+    if logical_device_ids.len() <= 1 {
+        return Ok((runtime_model, false));
+    }
+    let available_devices = VulkanComputeDevice::available_compute_devices()?;
+    let physical_bindings =
+        runtime_physical_device_bindings_in(args, &logical_device_ids, &available_devices)?;
+    let physical_device_count = physical_bindings.values().collect::<BTreeSet<_>>().len();
+    if physical_device_count > 1 {
+        return Ok((runtime_model, true));
+    }
+    let execution_device_id = runtime_model.placement.default_device_id.clone();
+    Ok((
+        runtime_model.coalesce_placement_to_device(execution_device_id),
+        false,
+    ))
+}
+
+fn runtime_physical_device_bindings_in(
     args: &Args,
     logical_device_ids: &[String],
-) -> Result<RuntimeBoundVulkanDevices, Box<dyn Error>> {
-    let available_devices = VulkanComputeDevice::available_compute_devices()?;
+    available_devices: &[VulkanComputeDeviceInfo],
+) -> Result<BTreeMap<String, usize>, io::Error> {
     let default_physical_device_index = if let Some(index) = args.vulkan_device_index {
         index
     } else {
@@ -2088,27 +2112,42 @@ fn runtime_bound_vulkan_devices(
             .or_else(|| available_devices.first())
             .map(|device| device.physical_device_index)
             .ok_or_else(|| {
-                Box::new(io::Error::new(
+                io::Error::new(
                     io::ErrorKind::NotFound,
                     "no Vulkan compute-capable physical devices are available",
-                )) as Box<dyn Error>
+                )
             })?
     };
     let mut logical_device_ids = logical_device_ids.to_vec();
     logical_device_ids.sort();
     logical_device_ids.dedup();
+    logical_device_ids
+        .into_iter()
+        .map(|logical_device_id| {
+            let physical_device_index = runtime_mount_physical_device_index(
+                args,
+                &logical_device_id,
+                default_physical_device_index,
+                available_devices,
+            )?;
+            Ok((logical_device_id, physical_device_index))
+        })
+        .collect()
+}
+
+fn runtime_bound_vulkan_devices(
+    args: &Args,
+    logical_device_ids: &[String],
+) -> Result<RuntimeBoundVulkanDevices, Box<dyn Error>> {
+    let available_devices = VulkanComputeDevice::available_compute_devices()?;
+    let requested_bindings =
+        runtime_physical_device_bindings_in(args, logical_device_ids, &available_devices)?;
     let mut devices = BTreeMap::new();
     let mut physical_devices: BTreeMap<usize, Rc<VulkanComputeDevice>> = BTreeMap::new();
     let mut physical_device_indices = BTreeMap::new();
     let mut physical_device_ids = BTreeMap::new();
 
-    for logical_device_id in &logical_device_ids {
-        let physical_device_index = runtime_mount_physical_device_index(
-            args,
-            logical_device_id,
-            default_physical_device_index,
-            &available_devices,
-        )?;
+    for (logical_device_id, physical_device_index) in requested_bindings {
         let available_device = available_devices
             .iter()
             .find(|device| device.physical_device_index == physical_device_index)
@@ -3007,6 +3046,7 @@ Example:
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -3017,8 +3057,9 @@ mod tests {
     use tokenizers::{AddedToken, Tokenizer};
 
     use llmoop_runtime::{
-        VULKAN_BACKEND_LOOP_MAX_WINDOW, VulkanResidentHfTokenizerTextCodec,
-        VulkanResidentTokenTextCodec, VulkanResidentTokenTextCodecError,
+        VULKAN_BACKEND_LOOP_MAX_WINDOW, VulkanComputeDeviceInfo,
+        VulkanResidentHfTokenizerTextCodec, VulkanResidentTokenTextCodec,
+        VulkanResidentTokenTextCodecError,
     };
 
     use super::{
@@ -3027,7 +3068,8 @@ mod tests {
         model_owned_assistant_turn_stop_token_id, normalize_chat_template_for_runtime,
         parse_device_binding_assignment, parse_source_chain, parse_vulkan_device_uuid_ref,
         placed_scheduler_turn_budget, resolve_runtime_context_size,
-        resolve_runtime_vulkan_physical_device_ref, token_scheduler_turn_budget,
+        resolve_runtime_vulkan_physical_device_ref, runtime_physical_device_bindings_in,
+        token_scheduler_turn_budget,
     };
 
     fn formatter(template_source: &str) -> RuntimeChatFormatter {
@@ -3176,6 +3218,64 @@ mod tests {
                 "accepted invalid binding {invalid:?}"
             );
         }
+    }
+
+    #[test]
+    fn runtime_physical_bindings_distinguish_logical_from_physical_placement() {
+        let available_devices = vec![
+            VulkanComputeDeviceInfo {
+                physical_device_index: 2,
+                physical_device_id: "vulkan-uuid:00000000000000000000000000000002".to_string(),
+                device_uuid: [2; 16],
+                device_name: "GPU 2".to_string(),
+                device_type: "discrete_gpu".to_string(),
+                vendor_id: 1,
+                device_id: 2,
+                api_version: 1,
+                driver_version: 1,
+                compute_queue_family_indices: vec![0],
+                memory_heaps: Vec::new(),
+                selected_by_default: true,
+            },
+            VulkanComputeDeviceInfo {
+                physical_device_index: 3,
+                physical_device_id: "vulkan-uuid:00000000000000000000000000000003".to_string(),
+                device_uuid: [3; 16],
+                device_name: "GPU 3".to_string(),
+                device_type: "discrete_gpu".to_string(),
+                vendor_id: 1,
+                device_id: 3,
+                api_version: 1,
+                driver_version: 1,
+                compute_queue_family_indices: vec![0],
+                memory_heaps: Vec::new(),
+                selected_by_default: false,
+            },
+        ];
+        let logical_device_ids = vec!["board_a".to_string(), "board_b".to_string()];
+        let colocated = runtime_physical_device_bindings_in(
+            &Args::default(),
+            &logical_device_ids,
+            &available_devices,
+        )
+        .unwrap();
+        assert_eq!(colocated.get("board_a"), Some(&2));
+        assert_eq!(colocated.get("board_b"), Some(&2));
+        assert_eq!(colocated.values().collect::<BTreeSet<_>>().len(), 1);
+
+        let mut split_args = Args::default();
+        split_args
+            .device_bindings
+            .insert("board_b".to_string(), "vulkan:3".to_string());
+        let split = runtime_physical_device_bindings_in(
+            &split_args,
+            &logical_device_ids,
+            &available_devices,
+        )
+        .unwrap();
+        assert_eq!(split.get("board_a"), Some(&2));
+        assert_eq!(split.get("board_b"), Some(&3));
+        assert_eq!(split.values().collect::<BTreeSet<_>>().len(), 2);
     }
 
     #[test]
