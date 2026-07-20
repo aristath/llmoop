@@ -1079,7 +1079,10 @@ def test_compiler_renders_hybrid_recurrent_and_gated_attention_pedals(
     assert "shared float raw_query[KEY_HEAD_WIDTH];" in temporal_recurrence
     assert "shared float raw_key[KEY_HEAD_WIDTH];" in temporal_recurrence
     assert "head_beta = 1.0 /" in temporal_recurrence
-    assert "recurrent_state[key_dim] * head_decay" in temporal_recurrence
+    assert "float previous = recurrent_state[key_dim] * head_decay;" in temporal_recurrence
+    assert "recurrent_state[key_dim] = previous;" in temporal_recurrence
+    assert "float next = recurrent_state[key_dim] + key * delta;" in temporal_recurrence
+    assert "recurrent_state[key_dim] * head_decay + key * delta" not in temporal_recurrence
     assert "const uint BLOCKS = 8u;" in split
     assert "const uint BLOCK_PART_WIDTH = 256u;" in split
     assert all(

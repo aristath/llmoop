@@ -95,6 +95,14 @@ void main() {
             state_base + key_dim * VALUE_HEAD_WIDTH + value_dim
         ];
     }
+    float norm_scale = read_norm_weight(value_dim);
+    float attention_scale = inversesqrt(float(KEY_HEAD_WIDTH));
+    float decay_scale = 0.0;
+    float dt_bias_value = 0.0;
+    if (value_dim == 0u) {
+        decay_scale = -exp(read_a_log(value_head));
+        dt_bias_value = read_dt_bias(value_head);
+    }
 
     for (uint position = 0u; position < batch_control.batch_width; position++) {
         for (
@@ -119,9 +127,8 @@ void main() {
             q_inv_norm = inversesqrt(q_sum + 0.000001);
             k_inv_norm = inversesqrt(k_sum + 0.000001);
             head_beta = 1.0 / (1.0 + exp(-read_b(position, value_head)));
-            float decay_log = -exp(read_a_log(value_head)) * softplus(
-                read_a(position, value_head) + read_dt_bias(value_head)
-            );
+            float decay_log = decay_scale
+                * softplus(read_a(position, value_head) + dt_bias_value);
             head_decay = exp(decay_log);
         }
         barrier();
@@ -129,6 +136,7 @@ void main() {
         float key_memory = 0.0;
         for (uint key_dim = 0u; key_dim < KEY_HEAD_WIDTH; key_dim++) {
             float previous = recurrent_state[key_dim] * head_decay;
+            recurrent_state[key_dim] = previous;
             float key = raw_key[key_dim] * k_inv_norm;
             key_memory = fma(previous, key, key_memory);
         }
@@ -136,10 +144,9 @@ void main() {
         float delta = (value - key_memory) * head_beta;
 
         float mixed = 0.0;
-        float attention_scale = inversesqrt(float(KEY_HEAD_WIDTH));
         for (uint key_dim = 0u; key_dim < KEY_HEAD_WIDTH; key_dim++) {
             float key = raw_key[key_dim] * k_inv_norm;
-            float next = recurrent_state[key_dim] * head_decay + key * delta;
+            float next = recurrent_state[key_dim] + key * delta;
             recurrent_state[key_dim] = next;
             float query = raw_query[key_dim] * q_inv_norm;
             mixed = fma(next, query * attention_scale, mixed);
@@ -156,7 +163,7 @@ void main() {
             sum_squares / float(VALUE_HEAD_WIDTH) + NORM_EPS
         );
         float z = read_z(position, value_head * VALUE_HEAD_WIDTH + value_dim);
-        head_output[value_dim] = mixed * inv_rms * read_norm_weight(value_dim)
+        head_output[value_dim] = mixed * inv_rms * norm_scale
             * (z / (1.0 + exp(-z)));
         barrier();
 
