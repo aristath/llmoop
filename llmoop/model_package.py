@@ -37,6 +37,10 @@ PACKAGE_ARTIFACT_INTEGRITY_SCHEMA = "llmoop.package_artifact_integrity.v1"
 VULKAN_BF16_ROW_PAIR_LAYOUT = "vulkan_bf16_row_pair_u32"
 ROW_MAJOR_LAYOUT = "row_major"
 CONFIG_PACKAGE_FILE = "config.json"
+PEDAL_BATCH_LANE_TILE_WIDTH = 4
+GLSL_VULKAN_DEVICE_EXTENSION_REQUIREMENTS = {
+    "GL_EXT_float_e4m3": "VK_EXT_shader_float8",
+}
 TOKENIZER_PACKAGE_FILES = (
     "tokenizer.json",
     "tokenizer_config.json",
@@ -372,35 +376,39 @@ def build_vulkan_resident_package_manifest(
             for execution in decoder["pedal_executions"]
         ),
     ]
+    shader_files = required_shader_files(
+        all_pedal_executions,
+        embedding_shader_file=embedding_shader_file,
+        projection_shader_file=projection_shader_file,
+        projection_batch_shader_file=projection_batch_shader_file,
+        norm_shader_file=norm_shader_file,
+        sampler_shader_files={
+            kernel["shader_path"].removeprefix("shaders/").removesuffix(".spv")
+            + ".comp"
+            for kernel in sampler_kernels
+        }
+        | {
+            decoder["output_transducer"]["norm_shader_path"]
+            .removeprefix("shaders/")
+            .removesuffix(".spv")
+            + ".comp"
+            for decoder in speculative_decoders
+        }
+        | {
+            decoder["output_transducer"]["projection_shader_path"]
+            .removeprefix("shaders/")
+            .removesuffix(".spv")
+            + ".comp"
+            for decoder in speculative_decoders
+        },
+    )
     copy_shader_templates(
         shader_source_dir,
         package_dir / "shaders",
-        required_shader_files(
-            all_pedal_executions,
-            embedding_shader_file=embedding_shader_file,
-            projection_shader_file=projection_shader_file,
-            projection_batch_shader_file=projection_batch_shader_file,
-            norm_shader_file=norm_shader_file,
-            sampler_shader_files={
-                kernel["shader_path"].removeprefix("shaders/").removesuffix(".spv")
-                + ".comp"
-                for kernel in sampler_kernels
-            }
-            | {
-                decoder["output_transducer"]["norm_shader_path"]
-                .removeprefix("shaders/")
-                .removesuffix(".spv")
-                + ".comp"
-                for decoder in speculative_decoders
-            }
-            | {
-                decoder["output_transducer"]["projection_shader_path"]
-                .removeprefix("shaders/")
-                .removesuffix(".spv")
-                + ".comp"
-                for decoder in speculative_decoders
-            },
-        ),
+        shader_files,
+    )
+    required_device_extensions = required_vulkan_device_extensions(
+        package_dir / "shaders", shader_files
     )
     compile_shader_artifacts(
         package_dir / "shaders",
@@ -416,6 +424,10 @@ def build_vulkan_resident_package_manifest(
     for execution in all_pedal_executions:
         for kernel in execution["kernels"]:
             kernel["shader_path"] = compiled_shader_path(kernel["shader_path"])
+            if kernel.get("batch_shader_path") is not None:
+                kernel["batch_shader_path"] = compiled_shader_path(
+                    kernel["batch_shader_path"]
+                )
     return {
         "schema": PACKAGE_SCHEMA,
         "package_id": package_id,
@@ -428,6 +440,8 @@ def build_vulkan_resident_package_manifest(
         "tokenizer": tokenizer_manifest,
         "activation_element_bytes": dtype_bytes,
         "max_context_activations": max_context_activations,
+        "required_vulkan_device_extensions": required_device_extensions,
+        "pedal_batch_lane_tile_width": PEDAL_BATCH_LANE_TILE_WIDTH,
         "input_transducer": {
             "spec": {
                 "transducer_id": "input_transducer.token_embedding",
@@ -560,16 +574,15 @@ def pedal_execution_specs(
                 dimensions,
             )
             kernels.append(
-                {
-                    "execution_index": index,
-                    "node_id": node["id"],
-                    "op": node["op"],
-                    "shader_path": f"shaders/{shader_file}",
-                    "local_size_x": local_size_x_for_node(node),
-                    "workgroup_count_x": workgroup_count_x_for_node(
+                pedal_kernel_spec(
+                    execution_index=index,
+                    node=node,
+                    shader_file=shader_file,
+                    local_size_x=local_size_x_for_node(node),
+                    workgroup_count_x=workgroup_count_x_for_node(
                         circuit, node, tensor_index
                     ),
-                }
+                )
             )
         executions.append(
             {
@@ -702,16 +715,15 @@ def pedal_execution_spec(
     for index, node in enumerate(circuit["nodes"]):
         shader_file = shader_file_for_node(circuit, node, tensor_index, dimensions)
         kernels.append(
-            {
-                "execution_index": index,
-                "node_id": node["id"],
-                "op": node["op"],
-                "shader_path": f"shaders/{shader_file}",
-                "local_size_x": local_size_x_for_node(node),
-                "workgroup_count_x": workgroup_count_x_for_node(
+            pedal_kernel_spec(
+                execution_index=index,
+                node=node,
+                shader_file=shader_file,
+                local_size_x=local_size_x_for_node(node),
+                workgroup_count_x=workgroup_count_x_for_node(
                     circuit, node, tensor_index
                 ),
-            }
+            )
         )
     return {
         "pedal_id": circuit_ref["id"],
@@ -719,6 +731,74 @@ def pedal_execution_spec(
         "implementation": circuit_ref["implementation"],
         "kernels": kernels,
     }
+
+
+def pedal_kernel_spec(
+    *,
+    execution_index: int,
+    node: Json,
+    shader_file: str,
+    local_size_x: int,
+    workgroup_count_x: int,
+) -> Json:
+    batch_shader_file = weight_shared_batch_shader_file(shader_file)
+    spec = {
+        "execution_index": execution_index,
+        "node_id": node["id"],
+        "op": node["op"],
+        "shader_path": f"shaders/{shader_file}",
+        "local_size_x": local_size_x,
+        "workgroup_count_x": workgroup_count_x,
+        "batch_mode": "weight_shared" if batch_shader_file else "serial_lanes",
+    }
+    if batch_shader_file is not None:
+        spec["batch_shader_path"] = f"shaders/{batch_shader_file}"
+    return spec
+
+
+def weight_shared_batch_shader_file(shader_file: str) -> str | None:
+    tile = PEDAL_BATCH_LANE_TILE_WIDTH
+    rms_norm = re.fullmatch(
+        r"rms_norm_bf16_h(\d+)_eps([0-9eE+.-]+)_offset([0-9eE+.-]+)\.comp",
+        shader_file,
+    )
+    if rms_norm is not None and int(rms_norm.group(1)) % 2 == 0:
+        return shader_file.replace("rms_norm_bf16_", f"rms_norm_batch{tile}_bf16_", 1)
+    fp8 = re.fullmatch(
+        r"(linear|linear_residual)_fp8_e4m3_b(\d+)x(\d+)_(\d+)x(\d+)\.comp",
+        shader_file,
+    )
+    if fp8 is not None:
+        operation, block_rows, block_columns, input_size, _ = fp8.groups()
+        if int(block_rows) % 2 == 0 and int(block_columns) % 4 == 0 and int(input_size) % 4 == 0:
+            return shader_file.replace(
+                f"{operation}_fp8_e4m3_",
+                f"{operation}_batch{tile}_fp8_e4m3_",
+                1,
+            )
+    parallel = re.fullmatch(
+        r"parallel_linear_([23])way_(paired|row_major)_bf16_(\d+)x.+\.comp",
+        shader_file,
+    )
+    if parallel is not None and int(parallel.group(3)) % 2 == 0:
+        return shader_file.replace(
+            "parallel_linear_",
+            f"parallel_linear_batch{tile}_",
+            1,
+        )
+    fused_ffn = re.fullmatch(
+        r"parallel_linear_silu_multiply_fp8_e4m3_b(\d+)x(\d+)_(\d+)x(\d+)\.comp",
+        shader_file,
+    )
+    if fused_ffn is not None:
+        block_rows, block_columns, input_size, _ = map(int, fused_ffn.groups())
+        if block_rows % 2 == 0 and block_columns % 4 == 0 and input_size % 4 == 0:
+            return shader_file.replace(
+                "parallel_linear_silu_multiply_fp8_e4m3_",
+                f"parallel_linear_silu_multiply_batch{tile}_fp8_e4m3_",
+                1,
+            )
+    return None
 
 
 def package_auxiliary_circuit_graph(
@@ -1522,7 +1602,33 @@ def required_shader_files(
             for pedal in pedal_executions
             for kernel in pedal["kernels"]
         ),
+        *(
+            kernel["batch_shader_path"].removeprefix("shaders/")
+            for pedal in pedal_executions
+            for kernel in pedal["kernels"]
+            if kernel.get("batch_shader_path") is not None
+        ),
     }
+
+
+def required_vulkan_device_extensions(
+    shader_dir: Path, shader_files: set[str]
+) -> list[str]:
+    required_glsl_extensions = set()
+    for shader_file in shader_files:
+        source = (shader_dir / shader_file).read_text()
+        required_glsl_extensions.update(
+            re.findall(r"^\s*#extension\s+(\S+)\s*:\s*require\s*$", source, re.MULTILINE)
+        )
+    return sorted(
+        {
+            vulkan_extension
+            for glsl_extension, vulkan_extension in (
+                GLSL_VULKAN_DEVICE_EXTENSION_REQUIREMENTS.items()
+            )
+            if glsl_extension in required_glsl_extensions
+        }
+    )
 
 
 def rms_norm_shader_file(hidden_size: int, eps: float, weight_offset: float) -> str:
@@ -1568,18 +1674,25 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
         return rendered
 
     parallel_linear = re.fullmatch(
-        r"parallel_linear_([23])way_(paired|row_major)_bf16_(\d+)x(\d+)_(\d+)(?:_(\d+))?\.comp",
+        r"parallel_linear_(?:batch(\d+)_)?([23])way_(paired|row_major)_bf16_"
+        r"(\d+)x(\d+)_(\d+)(?:_(\d+))?\.comp",
         shader_file,
     )
     if parallel_linear is not None:
-        branch_count = int(parallel_linear.group(1))
-        weight_layout = parallel_linear.group(2)
-        input_size = int(parallel_linear.group(3))
+        batch_tile_width = (
+            int(parallel_linear.group(1))
+            if parallel_linear.group(1) is not None
+            else None
+        )
+        branch_count = int(parallel_linear.group(2))
+        weight_layout = parallel_linear.group(3)
+        input_size = int(parallel_linear.group(4))
         output_widths = [
-            int(width) for width in parallel_linear.groups()[3:] if width is not None
+            int(width) for width in parallel_linear.groups()[4:] if width is not None
         ]
         if (
             len(output_widths) != branch_count
+            or (batch_tile_width is not None and batch_tile_width <= 0)
             or input_size <= 0
             or input_size % 2
             or any(width <= 0 or width % 2 for width in output_widths)
@@ -1625,17 +1738,33 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
         weight_reads += (
             "\n    return weight_" + labels[-1].lower() + ".words[weight_index];"
         )
+        output_index = (
+            "batch_index * OUTPUT_{label}_WORDS + local_word_index"
+            if batch_tile_width is not None
+            else "local_word_index"
+        )
         output_writes = "\n".join(
-            f"    if (branch == {index}u) {{ output_{label.lower()}.words[local_word_index] = packed; return; }}"
+            f"    if (branch == {index}u) {{ output_{label.lower()}.words["
+            + output_index.format(label=label)
+            + "] = packed; return; }"
             for index, label in enumerate(labels[:-1])
         )
         output_writes += (
-            "\n    output_" + labels[-1].lower() + ".words[local_word_index] = packed;"
+            "\n    output_"
+            + labels[-1].lower()
+            + ".words["
+            + output_index.format(label=labels[-1])
+            + "] = packed;"
         )
         return render_shader_template(
             source_dir,
-            "parallel_linear_bf16.comp.template",
+            (
+                "parallel_linear_batch_bf16.comp.template"
+                if batch_tile_width is not None
+                else "parallel_linear_bf16.comp.template"
+            ),
             {
+                "BATCH_TILE_WIDTH": str(batch_tile_width or 1),
                 "OUTPUT_BINDINGS": output_bindings,
                 "WEIGHT_BINDINGS": weight_bindings,
                 "INPUT_SIZE": str(input_size),
@@ -1689,24 +1818,35 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
         )
 
     fused_fp8_ffn_projection = re.fullmatch(
-        r"parallel_linear_silu_multiply_fp8_e4m3_b(\d+)x(\d+)_(\d+)x(\d+)\.comp",
+        r"parallel_linear_silu_multiply_(?:batch(\d+)_)?fp8_e4m3_"
+        r"b(\d+)x(\d+)_(\d+)x(\d+)\.comp",
         shader_file,
     )
     if fused_fp8_ffn_projection is not None:
-        block_rows = int(fused_fp8_ffn_projection.group(1))
-        block_columns = int(fused_fp8_ffn_projection.group(2))
-        input_size = int(fused_fp8_ffn_projection.group(3))
-        output_size = int(fused_fp8_ffn_projection.group(4))
+        batch_tile_width = (
+            int(fused_fp8_ffn_projection.group(1))
+            if fused_fp8_ffn_projection.group(1) is not None
+            else None
+        )
+        block_rows = int(fused_fp8_ffn_projection.group(2))
+        block_columns = int(fused_fp8_ffn_projection.group(3))
+        input_size = int(fused_fp8_ffn_projection.group(4))
+        output_size = int(fused_fp8_ffn_projection.group(5))
         if any(
             value <= 0 for value in (block_rows, block_columns, input_size, output_size)
-        ):
+        ) or (batch_tile_width is not None and batch_tile_width <= 0):
             raise ModelCompileError(
                 f"invalid fused FP8 FFN projection shader shape {shader_file!r}"
             )
         return render_shader_template(
             source_dir,
-            "parallel_linear_silu_multiply_fp8_e4m3.comp.template",
+            (
+                "parallel_linear_silu_multiply_batch_fp8_e4m3.comp.template"
+                if batch_tile_width is not None
+                else "parallel_linear_silu_multiply_fp8_e4m3.comp.template"
+            ),
             {
+                "BATCH_TILE_WIDTH": str(batch_tile_width or 1),
                 "BLOCK_ROWS": str(block_rows),
                 "BLOCK_COLUMNS": str(block_columns),
                 "INPUT_SIZE": str(input_size),
@@ -1762,6 +1902,33 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
         )
 
     shaped_templates = (
+        (
+            r"rms_norm_batch(\d+)_bf16_h(\d+)_eps([0-9eE+.-]+)_offset([0-9eE+.-]+)\.comp",
+            "rms_norm_batch_bf16.comp.template",
+            ("BATCH_TILE_WIDTH", "HIDDEN_SIZE", "NORM_EPS", "WEIGHT_OFFSET"),
+        ),
+        (
+            r"linear_batch(\d+)_fp8_e4m3_b(\d+)x(\d+)_(\d+)x(\d+)\.comp",
+            "linear_batch_fp8_e4m3.comp.template",
+            (
+                "BATCH_TILE_WIDTH",
+                "BLOCK_ROWS",
+                "BLOCK_COLUMNS",
+                "INPUT_SIZE",
+                "OUTPUT_SIZE",
+            ),
+        ),
+        (
+            r"linear_residual_batch(\d+)_fp8_e4m3_b(\d+)x(\d+)_(\d+)x(\d+)\.comp",
+            "linear_residual_batch_fp8_e4m3.comp.template",
+            (
+                "BATCH_TILE_WIDTH",
+                "BLOCK_ROWS",
+                "BLOCK_COLUMNS",
+                "INPUT_SIZE",
+                "OUTPUT_SIZE",
+            ),
+        ),
         (
             r"silu_multiply_bf16_(\d+)\.comp",
             "silu_multiply_bf16.comp.template",
@@ -2596,6 +2763,27 @@ def validate_compiled_package(package_dir: Path, manifest: Json) -> None:
         raise ModelCompileError(
             "compiled package max context activation capacity must be positive"
         )
+    if (
+        not isinstance(manifest.get("pedal_batch_lane_tile_width"), int)
+        or isinstance(manifest.get("pedal_batch_lane_tile_width"), bool)
+        or manifest["pedal_batch_lane_tile_width"] <= 0
+    ):
+        raise ModelCompileError(
+            "compiled package pedal batch lane tile width must be positive"
+        )
+    required_device_extensions = manifest.get("required_vulkan_device_extensions")
+    if (
+        not isinstance(required_device_extensions, list)
+        or any(
+            not isinstance(extension, str) or not extension
+            for extension in required_device_extensions
+        )
+        or len(required_device_extensions) != len(set(required_device_extensions))
+        or required_device_extensions != sorted(required_device_extensions)
+    ):
+        raise ModelCompileError(
+            "compiled package required Vulkan device extensions must be unique sorted names"
+        )
     required_files = (
         package_artifact_path(package_dir, manifest.get("config_path"), "config"),
         package_artifact_path(
@@ -3247,6 +3435,19 @@ def validate_compiled_pedal_executions(
                 raise ModelCompileError(
                     f"compiled package pedal {pedal_id!r} kernel {index} does not match its circuit node"
                 )
+            batch_mode = kernel.get("batch_mode")
+            batch_shader_path = kernel.get("batch_shader_path")
+            if batch_mode == "serial_lanes" and batch_shader_path is None:
+                continue
+            if (
+                batch_mode == "weight_shared"
+                and isinstance(batch_shader_path, str)
+                and batch_shader_path
+            ):
+                continue
+            raise ModelCompileError(
+                f"compiled package pedal {pedal_id!r} kernel {index} has an invalid batch execution contract"
+            )
 
 
 def validate_compiled_generation_contract(

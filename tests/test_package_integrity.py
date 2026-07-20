@@ -265,6 +265,8 @@ def minimal_package(root: Path) -> dict[str, object]:
         "schema": PACKAGE_SCHEMA,
         "package_id": "fixture_package",
         "max_context_activations": 1024,
+        "required_vulkan_device_extensions": [],
+        "pedal_batch_lane_tile_width": 4,
         "circuit_graph": {
             "wiring": "explicit_graph",
             "cables": [
@@ -396,6 +398,7 @@ def minimal_package(root: Path) -> dict[str, object]:
                         "node_id": "project",
                         "op": "linear",
                         "shader_path": "shaders/kernel.spv",
+                        "batch_mode": "serial_lanes",
                     }
                 ],
             }
@@ -427,6 +430,8 @@ def test_package_integrity_accepts_a_complete_compiler_boundary(tmp_path: Path) 
         ("kernel", "kernel 0 does not match"),
         ("execution_identity", "execution identity does not match"),
         ("sampler_contract", "sampler execution does not match"),
+        ("batch_contract", "invalid batch execution contract"),
+        ("device_extensions", "required Vulkan device extensions"),
         ("generation_boundary", "boundaries must expose"),
         ("compiler_placement", "must not contain runtime placement fields"),
         ("path_escape", "must stay inside the package"),
@@ -477,6 +482,15 @@ def test_package_integrity_rejects_corrupt_or_incomplete_artifacts(
         manifest["pedal_executions"][0]["implementation"] = "wrong"
     elif corruption == "sampler_contract":
         manifest["sampler"]["spec"]["top_k"] = 2
+    elif corruption == "batch_contract":
+        manifest["pedal_executions"][0]["kernels"][0]["batch_mode"] = (
+            "weight_shared"
+        )
+    elif corruption == "device_extensions":
+        manifest["required_vulkan_device_extensions"] = [
+            "VK_EXT_shader_float8",
+            "VK_EXT_shader_float8",
+        ]
     elif corruption == "generation_boundary":
         manifest["circuit_graph"]["boundary"]["public_outputs"][0]["endpoint"] = {
             "pedal_id": "output",
@@ -500,9 +514,13 @@ def test_shader_templates_compile_to_vulkan_1_4_spirv(tmp_path: Path) -> None:
     shader_files = {
         "linear_paired_bf16_768x2048.comp",
         "linear_fp8_e4m3_b128x128_5120x17408.comp",
+        "linear_batch4_fp8_e4m3_b128x128_5120x17408.comp",
         "linear_bias_fp8_e4m3_b128x128_5120x17408.comp",
         "linear_residual_fp8_e4m3_b128x128_17408x5120.comp",
+        "linear_residual_batch4_fp8_e4m3_b128x128_17408x5120.comp",
+        "parallel_linear_batch4_2way_paired_bf16_1024x2560_2560.comp",
         "parallel_linear_silu_multiply_fp8_e4m3_b128x128_5120x17408.comp",
+        "parallel_linear_silu_multiply_batch4_fp8_e4m3_b128x128_5120x17408.comp",
         "rms_norm_bf16_h768_eps1e-05_offset0.comp",
         "rotary_bf16_12x64_r64_theta10000_half__sc2.comp",
         "append_kv_state_bf16_4x64__sc9.comp",

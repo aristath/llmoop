@@ -1,0 +1,122 @@
+#version 450
+
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer InputFrames { uint words[]; } input_frames;
+
+{{OUTPUT_BINDINGS}}
+
+{{WEIGHT_BINDINGS}}
+
+layout(push_constant) uniform BatchControl { uint batch_width; } batch_control;
+
+const uint BATCH_TILE_WIDTH = {{BATCH_TILE_WIDTH}}u;
+const uint INPUT_SIZE = {{INPUT_SIZE}}u;
+const uint INPUT_WORDS = (INPUT_SIZE + 1u) / 2u;
+{{OUTPUT_WORD_CONSTANTS}}
+const uint TOTAL_OUTPUT_WORDS = {{TOTAL_OUTPUT_WORDS}};
+const bool PAIRED_WEIGHT_LAYOUT = {{PAIRED_WEIGHT_LAYOUT}};
+
+shared float subgroup_lo[BATCH_TILE_WIDTH][64];
+shared float subgroup_hi[BATCH_TILE_WIDTH][64];
+
+float bf16_to_f32(uint value) { return uintBitsToFloat((value & 0xffffu) << 16); }
+
+uint f32_to_bf16(float value) {
+    uint bits = floatBitsToUint(value);
+    uint lsb = (bits >> 16) & 1u;
+    return (bits + 0x7fffu + lsb) >> 16;
+}
+
+uint read_branch_weight(uint branch, uint local_word_index, uint column_word, uint row_offset) {
+    uint weight_index;
+    if (PAIRED_WEIGHT_LAYOUT) {
+        weight_index = (2u * ((local_word_index * INPUT_WORDS) + column_word)) + row_offset;
+    } else {
+        uint row = (local_word_index * 2u) + row_offset;
+        weight_index = (row * INPUT_WORDS) + column_word;
+    }
+{{WEIGHT_READS}}
+}
+
+void write_branch_output(uint branch, uint batch_index, uint local_word_index, uint packed) {
+{{OUTPUT_WRITES}}
+}
+
+void main() {
+    uint word_index = gl_WorkGroupID.x;
+    uint batch_start = gl_WorkGroupID.y * BATCH_TILE_WIDTH;
+    uint lane = gl_LocalInvocationID.x;
+    if (word_index >= TOTAL_OUTPUT_WORDS) return;
+
+    uint branch = 0u;
+    uint local_word_index = 0u;
+{{BRANCH_SELECTION}}
+
+    float lo_sum[BATCH_TILE_WIDTH];
+    float hi_sum[BATCH_TILE_WIDTH];
+    for (uint batch_lane = 0u; batch_lane < BATCH_TILE_WIDTH; batch_lane++) {
+        lo_sum[batch_lane] = 0.0;
+        hi_sum[batch_lane] = 0.0;
+    }
+    for (uint column_word = lane; column_word < INPUT_WORDS; column_word += 64u) {
+        uint lo_weight_pair = read_branch_weight(branch, local_word_index, column_word, 0u);
+        uint hi_weight_pair = read_branch_weight(branch, local_word_index, column_word, 1u);
+        float lo_weight_lo = bf16_to_f32(lo_weight_pair);
+        float lo_weight_hi = bf16_to_f32(lo_weight_pair >> 16u);
+        float hi_weight_lo = bf16_to_f32(hi_weight_pair);
+        float hi_weight_hi = bf16_to_f32(hi_weight_pair >> 16u);
+        for (uint batch_lane = 0u; batch_lane < BATCH_TILE_WIDTH; batch_lane++) {
+            uint batch_index = batch_start + batch_lane;
+            if (batch_index >= batch_control.batch_width) continue;
+            uint input_pair = input_frames.words[batch_index * INPUT_WORDS + column_word];
+            float input_lo = bf16_to_f32(input_pair);
+            float input_hi = bf16_to_f32(input_pair >> 16u);
+            lo_sum[batch_lane] = fma(input_lo, lo_weight_lo, lo_sum[batch_lane]);
+            lo_sum[batch_lane] = fma(input_hi, lo_weight_hi, lo_sum[batch_lane]);
+            hi_sum[batch_lane] = fma(input_lo, hi_weight_lo, hi_sum[batch_lane]);
+            hi_sum[batch_lane] = fma(input_hi, hi_weight_hi, hi_sum[batch_lane]);
+        }
+    }
+
+    for (uint batch_lane = 0u; batch_lane < BATCH_TILE_WIDTH; batch_lane++) {
+        lo_sum[batch_lane] = subgroupAdd(lo_sum[batch_lane]);
+        hi_sum[batch_lane] = subgroupAdd(hi_sum[batch_lane]);
+    }
+    if (gl_NumSubgroups == 1u) {
+        if (gl_SubgroupInvocationID == 0u) {
+            for (uint batch_lane = 0u; batch_lane < BATCH_TILE_WIDTH; batch_lane++) {
+                uint batch_index = batch_start + batch_lane;
+                if (batch_index < batch_control.batch_width) {
+                    write_branch_output(branch, batch_index, local_word_index,
+                        (f32_to_bf16(hi_sum[batch_lane]) << 16u) | f32_to_bf16(lo_sum[batch_lane]));
+                }
+            }
+        }
+        return;
+    }
+    if (gl_SubgroupInvocationID == 0u) {
+        for (uint batch_lane = 0u; batch_lane < BATCH_TILE_WIDTH; batch_lane++) {
+            subgroup_lo[batch_lane][gl_SubgroupID] = lo_sum[batch_lane];
+            subgroup_hi[batch_lane][gl_SubgroupID] = hi_sum[batch_lane];
+        }
+    }
+    barrier();
+    if (lane == 0u) {
+        for (uint batch_lane = 0u; batch_lane < BATCH_TILE_WIDTH; batch_lane++) {
+            uint batch_index = batch_start + batch_lane;
+            if (batch_index >= batch_control.batch_width) continue;
+            float lo_total = 0.0;
+            float hi_total = 0.0;
+            for (uint subgroup = 0u; subgroup < gl_NumSubgroups; subgroup++) {
+                lo_total += subgroup_lo[batch_lane][subgroup];
+                hi_total += subgroup_hi[batch_lane][subgroup];
+            }
+            write_branch_output(branch, batch_index, local_word_index,
+                (f32_to_bf16(hi_total) << 16u) | f32_to_bf16(lo_total));
+        }
+    }
+}

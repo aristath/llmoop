@@ -8,14 +8,69 @@ import pytest
 
 from llmoop.compilation import ModelCompileError
 from llmoop.model_package import (
+    PEDAL_BATCH_LANE_TILE_WIDTH,
     ROW_MAJOR_LAYOUT,
     VULKAN_BF16_ROW_PAIR_LAYOUT,
     attention_workgroup_shape,
     compiled_tensor_layout,
     copy_shader_templates,
+    required_vulkan_device_extensions,
     shader_file_for_node,
+    weight_shared_batch_shader_file,
     write_compiled_tensor,
 )
+
+
+def test_compiler_selects_only_compatible_weight_shared_batch_kernels() -> None:
+    assert PEDAL_BATCH_LANE_TILE_WIDTH == 4
+    assert weight_shared_batch_shader_file(
+        "rms_norm_bf16_h5120_eps1e-06_offset1.comp"
+    ) == "rms_norm_batch4_bf16_h5120_eps1e-06_offset1.comp"
+    assert weight_shared_batch_shader_file(
+        "linear_fp8_e4m3_b128x128_5120x17408.comp"
+    ) == "linear_batch4_fp8_e4m3_b128x128_5120x17408.comp"
+    assert weight_shared_batch_shader_file(
+        "linear_residual_fp8_e4m3_b128x128_17408x5120.comp"
+    ) == "linear_residual_batch4_fp8_e4m3_b128x128_17408x5120.comp"
+    assert weight_shared_batch_shader_file(
+        "parallel_linear_2way_paired_bf16_1024x2560_2560.comp"
+    ) == "parallel_linear_batch4_2way_paired_bf16_1024x2560_2560.comp"
+    assert weight_shared_batch_shader_file(
+        "parallel_linear_silu_multiply_fp8_e4m3_b128x128_5120x17408.comp"
+    ) == (
+        "parallel_linear_silu_multiply_batch4_fp8_e4m3_"
+        "b128x128_5120x17408.comp"
+    )
+    assert weight_shared_batch_shader_file("linear_paired_bf16_1024x1024.comp") is None
+    assert weight_shared_batch_shader_file(
+        "linear_fp8_e4m3_b127x128_5120x17408.comp"
+    ) is None
+
+
+def test_compiler_renders_weight_shared_pedal_batch_shaders(tmp_path: Path) -> None:
+    shader_source_dir = Path(__file__).parents[1] / "runtime-rs" / "shaders"
+    shader_files = {
+        "rms_norm_batch4_bf16_h5120_eps1e-06_offset1.comp",
+        "linear_batch4_fp8_e4m3_b128x128_5120x17408.comp",
+        "linear_residual_batch4_fp8_e4m3_b128x128_17408x5120.comp",
+        "parallel_linear_batch4_2way_paired_bf16_1024x2560_2560.comp",
+        "parallel_linear_silu_multiply_batch4_fp8_e4m3_b128x128_5120x17408.comp",
+    }
+
+    copy_shader_templates(shader_source_dir, tmp_path, shader_files)
+
+    for shader_file in shader_files:
+        source = (tmp_path / shader_file).read_text()
+        assert "const uint BATCH_TILE_WIDTH = 4u;" in source
+        assert "layout(push_constant) uniform BatchControl" in source
+        assert "gl_WorkGroupID.y * BATCH_TILE_WIDTH" in source
+        if "fp8_e4m3" in shader_file:
+            assert "#extension GL_EXT_float_e4m3 : require" in source
+            assert "uintBitsToFloate4m3EXT" in source
+        assert "{{" not in source
+    assert required_vulkan_device_extensions(tmp_path, shader_files) == [
+        "VK_EXT_shader_float8"
+    ]
 
 
 @pytest.mark.parametrize(

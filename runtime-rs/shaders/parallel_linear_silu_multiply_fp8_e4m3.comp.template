@@ -1,7 +1,9 @@
-#version 450
+#version 460
 
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_float_e4m3 : require
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
@@ -55,18 +57,7 @@ float read_up_scale_bf16(uint index) {
 }
 
 float fp8_e4m3_to_f32(uint value) {
-    uint bits = value & 0xffu;
-    uint exponent = (bits >> 3u) & 0x0fu;
-    uint mantissa = bits & 0x07u;
-    if (exponent == 0u) {
-        float subnormal = float(mantissa) * 0.001953125;
-        return (bits & 0x80u) != 0u ? -subnormal : subnormal;
-    }
-    return uintBitsToFloat(
-        ((bits & 0x80u) << 24u)
-        | ((exponent + 120u) << 23u)
-        | (mantissa << 20u)
-    );
+    return float(uintBitsToFloate4m3EXT(uint8_t(value & 0xffu)));
 }
 
 vec4 fp8_e4m3x4_to_f32(uint packed) {

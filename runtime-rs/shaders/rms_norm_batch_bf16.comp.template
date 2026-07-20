@@ -1,0 +1,105 @@
+#version 450
+
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer InputFrames {
+    uint words[];
+} input_frames;
+
+layout(set = 0, binding = 1) buffer OutputFrames {
+    uint words[];
+} output_frames;
+
+layout(set = 0, binding = 2) readonly buffer Weight {
+    uint words[];
+} weight;
+
+layout(push_constant) uniform BatchControl { uint batch_width; } batch_control;
+
+const uint BATCH_TILE_WIDTH = {{BATCH_TILE_WIDTH}}u;
+const uint HIDDEN_SIZE = {{HIDDEN_SIZE}}u;
+const uint FRAME_WORDS = (HIDDEN_SIZE + 1u) / 2u;
+const float NORM_EPS = {{NORM_EPS}};
+const float WEIGHT_OFFSET = {{WEIGHT_OFFSET}};
+
+shared float reduction[BATCH_TILE_WIDTH][64];
+
+float bf16_to_f32(uint value) {
+    return uintBitsToFloat((value & 0xffffu) << 16);
+}
+
+uint f32_to_bf16(float value) {
+    uint bits = floatBitsToUint(value);
+    uint lsb = (bits >> 16) & 1u;
+    uint rounding_bias = 0x7fffu + lsb;
+    return (bits + rounding_bias) >> 16;
+}
+
+float read_input(uint batch_index, uint index) {
+    uint packed = input_frames.words[batch_index * FRAME_WORDS + (index >> 1u)];
+    uint value = ((index & 1u) == 0u) ? (packed & 0xffffu) : (packed >> 16u);
+    return bf16_to_f32(value);
+}
+
+float read_weight(uint index) {
+    uint packed = weight.words[index >> 1u];
+    uint value = ((index & 1u) == 0u) ? (packed & 0xffffu) : (packed >> 16u);
+    return bf16_to_f32(value);
+}
+
+void main() {
+    uint lane = gl_LocalInvocationID.x;
+    uint batch_start = gl_WorkGroupID.y * BATCH_TILE_WIDTH;
+    float sum_squares[BATCH_TILE_WIDTH];
+    for (uint batch_lane = 0u; batch_lane < BATCH_TILE_WIDTH; batch_lane++) {
+        sum_squares[batch_lane] = 0.0;
+    }
+
+    for (uint index = lane; index < HIDDEN_SIZE; index += 64u) {
+        for (uint batch_lane = 0u; batch_lane < BATCH_TILE_WIDTH; batch_lane++) {
+            uint batch_index = batch_start + batch_lane;
+            if (batch_index < batch_control.batch_width) {
+                float value = read_input(batch_index, index);
+                sum_squares[batch_lane] = fma(
+                    value,
+                    value,
+                    sum_squares[batch_lane]
+                );
+            }
+        }
+    }
+    for (uint batch_lane = 0u; batch_lane < BATCH_TILE_WIDTH; batch_lane++) {
+        sum_squares[batch_lane] = subgroupAdd(sum_squares[batch_lane]);
+        if (gl_SubgroupInvocationID == 0u) {
+            reduction[batch_lane][gl_SubgroupID] = sum_squares[batch_lane];
+        }
+    }
+    barrier();
+
+    float inv_rms[BATCH_TILE_WIDTH];
+    for (uint batch_lane = 0u; batch_lane < BATCH_TILE_WIDTH; batch_lane++) {
+        float total = 0.0;
+        for (uint subgroup = 0u; subgroup < gl_NumSubgroups; subgroup++) {
+            total += reduction[batch_lane][subgroup];
+        }
+        inv_rms[batch_lane] = inversesqrt((total / float(HIDDEN_SIZE)) + NORM_EPS);
+    }
+
+    for (uint index = lane * 2u; index < HIDDEN_SIZE; index += 128u) {
+        float lo_weight = read_weight(index) + WEIGHT_OFFSET;
+        float hi_weight = read_weight(index + 1u) + WEIGHT_OFFSET;
+        for (uint batch_lane = 0u; batch_lane < BATCH_TILE_WIDTH; batch_lane++) {
+            uint batch_index = batch_start + batch_lane;
+            if (batch_index >= batch_control.batch_width) {
+                continue;
+            }
+            float lo = read_input(batch_index, index) * inv_rms[batch_lane] * lo_weight;
+            float hi = read_input(batch_index, index + 1u) * inv_rms[batch_lane] * hi_weight;
+            output_frames.words[batch_index * FRAME_WORDS + (index >> 1u)] =
+                (f32_to_bf16(hi) << 16u) | f32_to_bf16(lo);
+        }
+    }
+}

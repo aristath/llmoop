@@ -583,6 +583,7 @@ class CompiledPackageTest(unittest.TestCase):
 
         self.assertNotIn("reusable_kernel_shaders", manifest)
         executions = manifest["pedal_executions"]
+        self.assertEqual(4, manifest["pedal_batch_lane_tile_width"])
         processor_pedals = [
             pedal
             for pedal in manifest["circuit_graph"]["pedals"]
@@ -613,6 +614,11 @@ class CompiledPackageTest(unittest.TestCase):
                 [kernel["op"] for kernel in execution["kernels"]],
             )
             for node, kernel in zip(nodes, execution["kernels"], strict=True):
+                self.assertIn(kernel["batch_mode"], {"serial_lanes", "weight_shared"})
+                if kernel["batch_mode"] == "weight_shared":
+                    self.assertTrue(kernel["batch_shader_path"].endswith(".spv"))
+                else:
+                    self.assertNotIn("batch_shader_path", kernel)
                 if node["op"] in {
                     "scaled_dot_product_attention",
                     "append_scaled_dot_product_attention",
@@ -648,6 +654,12 @@ class CompiledPackageTest(unittest.TestCase):
                 kernel["shader_path"]
                 for execution in manifest["pedal_executions"]
                 for kernel in execution["kernels"]
+            ),
+            *(
+                kernel["batch_shader_path"]
+                for execution in manifest["pedal_executions"]
+                for kernel in execution["kernels"]
+                if "batch_shader_path" in kernel
             ),
         ]
 

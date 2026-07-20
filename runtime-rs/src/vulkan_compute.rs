@@ -1,7 +1,7 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::error::Error;
-use std::ffi::CString;
+use std::ffi::{CStr, CString, c_void};
 use std::fmt::{Display, Formatter};
 #[cfg(test)]
 use std::path::Path;
@@ -9,6 +9,33 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use ash::{Entry, vk};
+
+const VK_EXT_SHADER_FLOAT8_NAME: &CStr = c"VK_EXT_shader_float8";
+const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT8_FEATURES_EXT: i32 = 1_000_567_000;
+
+// ash 0.38 is generated from Vulkan 1.3.281 headers, while shader-float8 was
+// added later. Keep this ABI-compatible definition local until ash publishes
+// bindings generated from current Vulkan headers.
+#[repr(C)]
+struct VulkanPhysicalDeviceShaderFloat8FeaturesExt {
+    s_type: vk::StructureType,
+    p_next: *mut c_void,
+    shader_float8: vk::Bool32,
+    shader_float8_cooperative_matrix: vk::Bool32,
+}
+
+impl VulkanPhysicalDeviceShaderFloat8FeaturesExt {
+    fn disabled() -> Self {
+        Self {
+            s_type: vk::StructureType::from_raw(
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT8_FEATURES_EXT,
+            ),
+            p_next: std::ptr::null_mut(),
+            shader_float8: vk::FALSE,
+            shader_float8_cooperative_matrix: vk::FALSE,
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VulkanError(pub String);
@@ -28,6 +55,7 @@ pub struct VulkanComputeDevice {
     queue_family_index: u32,
     queue: vk::Queue,
     device_name: String,
+    enabled_device_extensions: BTreeSet<String>,
     timestamp_period_ns: f32,
     generic_storage_pipelines: RefCell<HashMap<VulkanGenericPipelineKey, VulkanStoragePipeline>>,
     immediate_kernel_sequence: RefCell<Option<VulkanResidentKernelSequence>>,
@@ -895,7 +923,24 @@ impl VulkanComputeDeviceCatalog {
             let queue_info = [vk::DeviceQueueCreateInfo::default()
                 .queue_family_index(queue_family_index)
                 .queue_priorities(&queue_priorities)];
-            let device_info = vk::DeviceCreateInfo::default().queue_create_infos(&queue_info);
+            let shader_float8_supported =
+                physical_device_supports_extension(
+                    instance,
+                    physical_device,
+                    VK_EXT_SHADER_FLOAT8_NAME,
+                )? && physical_device_supports_shader_float8(instance, physical_device);
+            let mut shader_float8_features =
+                VulkanPhysicalDeviceShaderFloat8FeaturesExt::disabled();
+            let shader_float8_extension_names = [VK_EXT_SHADER_FLOAT8_NAME.as_ptr()];
+            let mut enabled_device_extensions = BTreeSet::new();
+            let mut device_info = vk::DeviceCreateInfo::default().queue_create_infos(&queue_info);
+            if shader_float8_supported {
+                shader_float8_features.shader_float8 = vk::TRUE;
+                device_info = device_info.enabled_extension_names(&shader_float8_extension_names);
+                device_info.p_next = std::ptr::from_ref(&shader_float8_features).cast();
+                enabled_device_extensions
+                    .insert(VK_EXT_SHADER_FLOAT8_NAME.to_string_lossy().into_owned());
+            }
             let device = instance
                 .create_device(physical_device, &device_info, None)
                 .map_err(|error| {
@@ -914,6 +959,7 @@ impl VulkanComputeDeviceCatalog {
                 queue_family_index,
                 queue,
                 device_name,
+                enabled_device_extensions,
                 timestamp_period_ns,
                 generic_storage_pipelines: RefCell::new(HashMap::new()),
                 immediate_kernel_sequence: RefCell::new(None),
@@ -953,6 +999,10 @@ impl VulkanComputeDevice {
 
     pub fn device_name(&self) -> &str {
         &self.device_name
+    }
+
+    pub fn has_enabled_device_extension(&self, extension_name: &str) -> bool {
+        self.enabled_device_extensions.contains(extension_name)
     }
 
     pub fn create_resident_buffer(
@@ -2207,6 +2257,40 @@ unsafe fn select_compute_device_index(
         }
     }
     fallback
+}
+
+fn physical_device_supports_extension(
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+    extension_name: &CStr,
+) -> Result<bool, VulkanError> {
+    let properties = unsafe {
+        instance
+            .enumerate_device_extension_properties(physical_device)
+            .map_err(|error| {
+                VulkanError(format!(
+                    "failed to enumerate Vulkan device extensions: {error:?}"
+                ))
+            })?
+    };
+    Ok(properties.iter().any(|property| unsafe {
+        CStr::from_ptr(property.extension_name.as_ptr()) == extension_name
+    }))
+}
+
+fn physical_device_supports_shader_float8(
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+) -> bool {
+    let mut shader_float8 = VulkanPhysicalDeviceShaderFloat8FeaturesExt::disabled();
+    let mut features = vk::PhysicalDeviceFeatures2 {
+        p_next: std::ptr::from_mut(&mut shader_float8).cast(),
+        ..Default::default()
+    };
+    unsafe {
+        instance.get_physical_device_features2(physical_device, &mut features);
+    }
+    shader_float8.shader_float8 == vk::TRUE
 }
 
 unsafe fn inspect_compute_device(
