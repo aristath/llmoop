@@ -32977,16 +32977,19 @@ mod tests {
             .unwrap();
         let mut temporal =
             VulkanResidentInProcessPlacedPromptStream::from_package_devices_and_session(
-                package, devices, 0, 0,
+                package.clone(),
+                devices.clone(),
+                0,
+                0,
             )
             .unwrap();
         scalar.speculative_draft_tokens = 0;
         temporal.speculative_draft_tokens = 0;
-        let token_pattern = [760, 6_511, 314, 9_338, 369];
-        let prompt_tokens = (0..64)
-            .map(|index| token_pattern[index % token_pattern.len()])
-            .collect();
-        let event = VulkanResidentTokenInputEvent::new("temporal-equivalence", prompt_tokens, 1);
+        let event = VulkanResidentTokenInputEvent::new(
+            "temporal-equivalence",
+            vec![760, 6_511, 314, 9_338, 369],
+            1,
+        );
 
         scalar.enqueue_input_event(event.clone());
         let scalar_run = loop {
@@ -33053,6 +33056,46 @@ mod tests {
                 }
             }
         }
+
+        let mut scalar =
+            VulkanResidentInProcessPlacedPromptStream::from_package_devices_and_session(
+                package.clone(),
+                devices.clone(),
+                0,
+                0,
+            )
+            .unwrap();
+        let mut temporal =
+            VulkanResidentInProcessPlacedPromptStream::from_package_devices_and_session(
+                package, devices, 0, 0,
+            )
+            .unwrap();
+        scalar.speculative_draft_tokens = 0;
+        temporal.speculative_draft_tokens = 0;
+        let token_pattern = [760, 6_511, 314, 9_338, 369];
+        let prompt_tokens = (0..64)
+            .map(|index| token_pattern[index % token_pattern.len()])
+            .collect();
+        let event =
+            VulkanResidentTokenInputEvent::new("full-temporal-equivalence", prompt_tokens, 8);
+
+        scalar.enqueue_input_event(event.clone());
+        let scalar_run = loop {
+            let activation = scalar.run_next_activation().unwrap().unwrap();
+            if let Some(run) = activation.completed_input_run {
+                break run;
+            }
+        };
+        let temporal_run = temporal.submit_input_event(event).unwrap();
+
+        assert_eq!(
+            temporal_run.generated_token_ids,
+            scalar_run.generated_token_ids
+        );
+        assert_eq!(
+            temporal_run.session_run.run.output_source_stream_ticks,
+            scalar_run.session_run.run.output_source_stream_ticks
+        );
     }
 
     #[test]
