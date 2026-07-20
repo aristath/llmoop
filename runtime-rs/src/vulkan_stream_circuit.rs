@@ -41,7 +41,8 @@ pub const VULKAN_RESIDENT_MODEL_PACKAGE_MANIFEST_SCHEMA: &str =
     "llmoop.vulkan_resident_model_package.v1";
 const CONTRACT_DIGEST_ALGORITHM: &str = "llmoop.json_tree_sha256.v1";
 const VULKAN_STREAM_CONTROL_BYTE_CAPACITY: usize = 5 * std::mem::size_of::<u32>();
-const VULKAN_STREAM_CONTROL_METADATA_OFFSET: usize = std::mem::size_of::<u32>();
+const VULKAN_STREAM_CONTROL_TOKEN_BYTE_CAPACITY: usize = std::mem::size_of::<u32>();
+const VULKAN_STREAM_CONTROL_METADATA_OFFSET: usize = VULKAN_STREAM_CONTROL_TOKEN_BYTE_CAPACITY;
 const VULKAN_SAMPLER_HISTORY_RECORD_BYTE_CAPACITY: usize = 4 * std::mem::size_of::<u32>();
 pub const VULKAN_BACKEND_LOOP_MAX_WINDOW: usize = 64;
 const VULKAN_BACKEND_LOOP_SNAPSHOT_BUDGET_BYTES: usize = 64 * 1024 * 1024;
@@ -8877,6 +8878,7 @@ pub struct VulkanResidentInProcessPlacedStreamProcessor {
     input_transducer: VulkanResidentInputEmbeddingTransducerRunner,
     output_transducer: VulkanResidentOutputTransducerRunner,
     sampler: VulkanResidentSamplerRunner,
+    feedback_token_cable: Option<VulkanResidentMappedBufferCopy>,
     device_slices: Vec<VulkanResidentInProcessPlacedStreamProcessorDevice>,
 }
 
@@ -8986,37 +8988,35 @@ impl VulkanResidentPlacedTokenTickTail {
     }
 }
 
-fn placed_feedback_token_is_resident(
+fn placed_token_input(
+    token_id: u32,
     input_device_id: &str,
     output_device_id: &str,
     input_is_feedback: bool,
-) -> bool {
-    input_is_feedback && input_device_id == output_device_id
+) -> VulkanResidentPlacedTokenInput {
+    if !input_is_feedback {
+        VulkanResidentPlacedTokenInput::HostSupplied(token_id)
+    } else if input_device_id == output_device_id {
+        VulkanResidentPlacedTokenInput::ResidentFeedback(token_id)
+    } else {
+        VulkanResidentPlacedTokenInput::CableFeedback(token_id)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum VulkanResidentPlacedTokenInput {
     HostSupplied(u32),
     ResidentFeedback(u32),
+    CableFeedback(u32),
 }
 
 impl VulkanResidentPlacedTokenInput {
-    fn from_residency(token_id: u32, resident: bool) -> Self {
-        if resident {
-            Self::ResidentFeedback(token_id)
-        } else {
-            Self::HostSupplied(token_id)
-        }
-    }
-
     fn token_id(self) -> u32 {
         match self {
-            Self::HostSupplied(token_id) | Self::ResidentFeedback(token_id) => token_id,
+            Self::HostSupplied(token_id)
+            | Self::ResidentFeedback(token_id)
+            | Self::CableFeedback(token_id) => token_id,
         }
-    }
-
-    fn is_resident(self) -> bool {
-        matches!(self, Self::ResidentFeedback(_))
     }
 }
 
@@ -9488,12 +9488,25 @@ impl VulkanResidentInProcessPlacedModelPackage {
             random_seed,
         )
         .map_err(VulkanResidentInProcessPlacedRuntimeError::Sampler)?;
+        let feedback_token_cable = (self.input_device_id != self.output_device_id)
+            .then(|| {
+                output_slice
+                    .mounted
+                    .stream_control_buffer
+                    .create_persistently_mapped_copy_to(
+                        &input_slice.mounted.stream_control_buffer,
+                        VULKAN_STREAM_CONTROL_TOKEN_BYTE_CAPACITY,
+                    )
+            })
+            .transpose()
+            .map_err(VulkanResidentInProcessPlacedRuntimeError::FeedbackCable)?;
 
         Ok(VulkanResidentInProcessPlacedStreamProcessor {
             model: self.clone(),
             input_transducer,
             output_transducer,
             sampler,
+            feedback_token_cable,
             device_slices: devices,
         })
     }
@@ -9511,6 +9524,31 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
         self.device_slices
             .iter()
             .find(|slice| slice.device_id == device_id)
+    }
+
+    fn prepare_token_input(
+        &self,
+        input: VulkanResidentPlacedTokenInput,
+    ) -> Result<VulkanResidentInputEmbeddingTransducerRun, VulkanResidentInProcessPlacedRuntimeError>
+    {
+        let token_id = input.token_id();
+        match input {
+            VulkanResidentPlacedTokenInput::HostSupplied(_) => self
+                .input_transducer
+                .prepare_token_id(token_id)
+                .map_err(VulkanResidentInProcessPlacedRuntimeError::InputTransducer),
+            VulkanResidentPlacedTokenInput::ResidentFeedback(_) => {
+                Ok(self.input_transducer.completed_run(token_id))
+            }
+            VulkanResidentPlacedTokenInput::CableFeedback(_) => {
+                self.feedback_token_cable
+                    .as_ref()
+                    .ok_or(VulkanResidentInProcessPlacedRuntimeError::MissingFeedbackCable)?
+                    .run(VULKAN_STREAM_CONTROL_TOKEN_BYTE_CAPACITY)
+                    .map_err(VulkanResidentInProcessPlacedRuntimeError::FeedbackCable)?;
+                Ok(self.input_transducer.completed_run(token_id))
+            }
+        }
     }
 
     pub fn mounted_device(&self, device_id: &str) -> Option<&VulkanMountedPlacedStreamCircuit> {
@@ -9702,13 +9740,7 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
         VulkanResidentInProcessPlacedRuntimeError,
     > {
         let token_id = input.token_id();
-        let input_run = if input.is_resident() {
-            self.input_transducer.completed_run(token_id)
-        } else {
-            self.input_transducer
-                .prepare_token_id(token_id)
-                .map_err(VulkanResidentInProcessPlacedRuntimeError::InputTransducer)?
-        };
+        let input_run = self.prepare_token_input(input)?;
         let placed_run = self.execute_prepared_token_id_stream_tick_in_process_with_transport(
             device,
             transport,
@@ -9828,13 +9860,7 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
         VulkanResidentInProcessPlacedRuntimeError,
     > {
         let token_id = input.token_id();
-        let input_run = if input.is_resident() {
-            self.input_transducer.completed_run(token_id)
-        } else {
-            self.input_transducer
-                .prepare_token_id(token_id)
-                .map_err(VulkanResidentInProcessPlacedRuntimeError::InputTransducer)?
-        };
+        let input_run = self.prepare_token_input(input)?;
         let placed_run = self
             .execute_prepared_token_id_stream_tick_on_bound_devices_in_process_with_transport(
                 devices,
@@ -10030,13 +10056,11 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
                 .run_prepared_token_id_stream_tick_in_process_with_transport(
                     device,
                     &mut transport,
-                    VulkanResidentPlacedTokenInput::from_residency(
+                    placed_token_input(
                         input_token_id,
-                        placed_feedback_token_is_resident(
-                            &self.model.input_device_id,
-                            &self.model.output_device_id,
-                            tick_index != 0,
-                        ),
+                        &self.model.input_device_id,
+                        &self.model.output_device_id,
+                        tick_index != 0,
                     ),
                     stream_tick,
                     max_scheduler_turns_per_tick,
@@ -10159,15 +10183,12 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
             } else {
                 VulkanResidentPlacedTokenTickTail::None
             };
-            if !placed_feedback_token_is_resident(
+            self.prepare_token_input(placed_token_input(
+                input_token_id,
                 &self.model.input_device_id,
                 &self.model.output_device_id,
                 input_is_feedback,
-            ) {
-                self.input_transducer
-                    .prepare_token_id_only(input_token_id)
-                    .map_err(VulkanResidentInProcessPlacedRuntimeError::InputTransducer)?;
-            }
+            ))?;
             let placed_run = self.execute_prepared_token_id_stream_tick_in_process_with_transport(
                 device,
                 transport,
@@ -10340,15 +10361,12 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
             } else {
                 VulkanResidentPlacedTokenTickTail::None
             };
-            if !placed_feedback_token_is_resident(
+            self.prepare_token_input(placed_token_input(
+                input_token_id,
                 &self.model.input_device_id,
                 &self.model.output_device_id,
                 input_is_feedback,
-            ) {
-                self.input_transducer
-                    .prepare_token_id_only(input_token_id)
-                    .map_err(VulkanResidentInProcessPlacedRuntimeError::InputTransducer)?;
-            }
+            ))?;
             let placed_run = self
                 .execute_prepared_token_id_stream_tick_on_bound_devices_in_process_with_transport(
                     devices,
@@ -11008,16 +11026,12 @@ impl VulkanResidentInProcessPlacedPromptStream {
         } else {
             VulkanResidentPlacedTokenTickTail::None
         };
-        if !placed_feedback_token_is_resident(
+        self.processor.prepare_token_input(placed_token_input(
+            activation.input_token_id,
             &self.processor.model.input_device_id,
             &self.processor.model.output_device_id,
             activation.input_is_feedback,
-        ) {
-            self.processor
-                .input_transducer
-                .prepare_token_id_only(activation.input_token_id)
-                .map_err(VulkanResidentInProcessPlacedRuntimeError::InputTransducer)?;
-        }
+        ))?;
         let placed_run = self
             .processor
             .execute_prepared_token_id_stream_tick_on_bound_devices_in_process_with_transport(
@@ -11846,6 +11860,7 @@ pub enum VulkanResidentInProcessPlacedRuntimeError {
     EmptyPromptEvent,
     PromptStreamBusy,
     MissingPrivateFeedback,
+    MissingFeedbackCable,
     MissingFusedSamplerRun,
     MissingBoundDevice { device_id: String },
     StreamTickOverflow,
@@ -11858,6 +11873,7 @@ pub enum VulkanResidentInProcessPlacedRuntimeError {
     InputTransducer(VulkanResidentInputEmbeddingTransducerRunnerError),
     OutputTransducer(VulkanResidentOutputTransducerRunnerError),
     Sampler(VulkanResidentSamplerRunnerError),
+    FeedbackCable(VulkanError),
 }
 
 impl Display for VulkanResidentInProcessPlacedRuntimeError {
@@ -11872,6 +11888,9 @@ impl Display for VulkanResidentInProcessPlacedRuntimeError {
             }
             Self::MissingPrivateFeedback => {
                 f.write_str("placed feedback loop is missing private feedback")
+            }
+            Self::MissingFeedbackCable => {
+                f.write_str("placed feedback loop is missing its cross-device token cable")
             }
             Self::MissingFusedSamplerRun => {
                 f.write_str("placed token tick completed without its fused sampler result")
@@ -11893,6 +11912,7 @@ impl Display for VulkanResidentInProcessPlacedRuntimeError {
             Self::InputTransducer(error) => Display::fmt(error, f),
             Self::OutputTransducer(error) => Display::fmt(error, f),
             Self::Sampler(error) => Display::fmt(error, f),
+            Self::FeedbackCable(error) => Display::fmt(error, f),
         }
     }
 }
@@ -20033,17 +20053,18 @@ mod tests {
     }
 
     #[test]
-    fn placed_feedback_stays_resident_only_across_the_same_device() {
-        assert!(placed_feedback_token_is_resident("gpu0", "gpu0", true));
-        assert!(!placed_feedback_token_is_resident("gpu0", "gpu1", true));
-        assert!(!placed_feedback_token_is_resident("gpu0", "gpu0", false));
+    fn placed_token_input_route_follows_the_pedalboard_cable() {
         assert_eq!(
-            VulkanResidentPlacedTokenInput::from_residency(7, false),
+            placed_token_input(7, "gpu0", "gpu0", false),
             VulkanResidentPlacedTokenInput::HostSupplied(7)
         );
         assert_eq!(
-            VulkanResidentPlacedTokenInput::from_residency(11, true),
+            placed_token_input(11, "gpu0", "gpu0", true),
             VulkanResidentPlacedTokenInput::ResidentFeedback(11)
+        );
+        assert_eq!(
+            placed_token_input(13, "gpu0", "gpu1", true),
+            VulkanResidentPlacedTokenInput::CableFeedback(13)
         );
     }
 
