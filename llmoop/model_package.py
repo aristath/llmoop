@@ -2067,6 +2067,22 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
             f"\n    output_{labels[-1].lower()}.values[batch_index * "
             f"OUTPUT_{labels[-1]}_SIZE + row] = value;"
         )
+        direct_weight_loads = "\n".join(
+            (
+                f"            {'if' if index == 0 else 'else if'} "
+                f"(branch == {index}u) {{\n"
+                "                coopMatLoad(\n"
+                "                    a,\n"
+                f"                    weight_{label.lower()}.values,\n"
+                "                    (output_start + output_subtile * MATRIX_TILE) "
+                "* INPUT_SIZE + input_start,\n"
+                "                    INPUT_SIZE,\n"
+                "                    gl_CooperativeMatrixLayoutRowMajor\n"
+                "                );\n"
+                "            }"
+            )
+            for index, label in enumerate(labels)
+        )
         return render_shader_template(
             source_dir,
             "parallel_linear_batch_cooperative_bf16.comp.template",
@@ -2083,6 +2099,7 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
                 "WEIGHT_READS": weight_reads,
                 "OUTPUT_SIZE_SELECTION": output_size_selection,
                 "OUTPUT_WRITES": output_writes,
+                "DIRECT_WEIGHT_LOADS": direct_weight_loads,
             },
         )
 
@@ -3339,7 +3356,7 @@ def copy_tensor_package(
         check_compile_cancelled(cancel_requested)
         if progress is not None:
             progress(index, total, tensor_name)
-        layout = compiled_tensor_layout(info, tensor_name=tensor_name)
+        layout = ROW_MAJOR_LAYOUT
         digest = blake2s(tensor_name.encode("utf-8"), digest_size=8).hexdigest()
         destination = weights_dir / f"tensor_{digest}.safetensors"
         if info.get("source_parts"):
@@ -4348,23 +4365,6 @@ def validate_compiled_generation_contract(
         raise ModelCompileError(
             "compiled sampler execution does not match its circuit pedal"
         )
-
-
-def compiled_tensor_layout(info: Json, *, tensor_name: str | None = None) -> str:
-    shape = [int(value) for value in info.get("shape", [])]
-    if info.get("layout_hint") == ROW_MAJOR_LAYOUT:
-        return ROW_MAJOR_LAYOUT
-    if (
-        info.get("dtype") == "BF16"
-        and not (tensor_name or "").endswith(
-            (".weight_scale_inv", ".weight_scale", ".scales")
-        )
-        and len(shape) == 2
-        and shape[0] % 2 == 0
-        and shape[1] % 2 == 0
-    ):
-        return VULKAN_BF16_ROW_PAIR_LAYOUT
-    return ROW_MAJOR_LAYOUT
 
 
 def write_compiled_tensor(

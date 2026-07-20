@@ -16,7 +16,6 @@ from llmoop.model_package import (
     causal_scan_batch_shader_file,
     causal_scan_batch_stages,
     causal_scan_workgroup_count_x,
-    compiled_tensor_layout,
     cooperative_bfloat16_batch_shader_file,
     cooperative_bfloat16_workgroup_count_x,
     copy_shader_templates,
@@ -300,7 +299,11 @@ def test_compiler_renders_cooperative_bfloat16_batch_shaders(tmp_path: Path) -> 
         "linear_residual_batch64_cooperative_row_major_bf16_4096x1024.comp",
         "parallel_linear_batch64_cooperative_3way_paired_bf16_"
         "1024x1024_256_256.comp",
+        "parallel_linear_batch64_cooperative_3way_row_major_bf16_"
+        "1024x1024_256_256.comp",
         "parallel_linear_silu_multiply_batch64_cooperative_paired_bf16_"
+        "1024x4096.comp",
+        "parallel_linear_silu_multiply_batch64_cooperative_row_major_bf16_"
         "1024x4096.comp",
     }
 
@@ -316,6 +319,26 @@ def test_compiler_renders_cooperative_bfloat16_batch_shaders(tmp_path: Path) -> 
         assert "const uint OUTPUT_TILE = 64u;" in source
         assert "const uint BATCH_TILE = 64u;" in source
         assert "{{" not in source
+    direct_linear = (
+        tmp_path
+        / "linear_residual_batch64_cooperative_row_major_bf16_4096x1024.comp"
+    ).read_text()
+    direct_parallel = (
+        tmp_path
+        / "parallel_linear_batch64_cooperative_3way_row_major_bf16_"
+        "1024x1024_256_256.comp"
+    ).read_text()
+    direct_fused = (
+        tmp_path
+        / "parallel_linear_silu_multiply_batch64_cooperative_row_major_bf16_"
+        "1024x4096.comp"
+    ).read_text()
+    assert "weight.values," in direct_linear
+    assert "weight_a.values," in direct_parallel
+    assert "weight_b.values," in direct_parallel
+    assert "weight_c.values," in direct_parallel
+    assert "gate_weight.values," in direct_fused
+    assert "up_weight.values," in direct_fused
     assert required_vulkan_device_extensions(tmp_path, shader_files) == [
         "VK_KHR_cooperative_matrix",
         "VK_KHR_shader_bfloat16",
@@ -344,33 +367,6 @@ def test_attention_tile_stays_within_portable_shared_memory_budget(
     assert local_size <= 1024
     assert tile_tokens > physical_tile_tokens
     assert shared_floats * 4 <= 32 * 1024
-
-
-def test_bf16_matrix_layout_is_compiled_as_interleaved_row_pairs() -> None:
-    assert (
-        compiled_tensor_layout({"dtype": "BF16", "shape": [4, 4]})
-        == VULKAN_BF16_ROW_PAIR_LAYOUT
-    )
-
-
-def test_fp8_block_scales_remain_row_major() -> None:
-    assert (
-        compiled_tensor_layout(
-            {"dtype": "BF16", "shape": [4, 4]},
-            tensor_name="projection.weight_scale_inv",
-        )
-        == ROW_MAJOR_LAYOUT
-    )
-
-
-def test_quantization_scale_grids_remain_row_major() -> None:
-    assert (
-        compiled_tensor_layout(
-            {"dtype": "BF16", "shape": [768, 16]},
-            tensor_name="projection.weight_scale",
-        )
-        == ROW_MAJOR_LAYOUT
-    )
 
 
 def test_write_compiled_tensor_interleaves_bf16_row_pairs(tmp_path: Path) -> None:

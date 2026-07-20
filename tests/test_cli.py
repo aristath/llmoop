@@ -598,6 +598,7 @@ class CompiledPackageTest(unittest.TestCase):
             self.assertFalse(source_file.is_absolute())
             self.assertEqual("weights", source_file.parts[0])
             self.assertTrue((fixture.package_dir / source_file).is_file())
+            self.assertEqual("row_major", info["layout"])
 
     def test_compiled_package_declares_pedal_executions(self) -> None:
         fixture = compiled_model_or_skip()
