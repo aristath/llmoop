@@ -440,6 +440,67 @@ class VulkanCircuitOptimizerTest(unittest.TestCase):
         self.assertEqual("BF16", fused["attrs"]["intermediate_rounding"])
         self.assertEqual(2560, fused["attrs"]["element_count"])
 
+    def test_fuses_block_scaled_fp8_ffn_without_intermediate_parallel_node(
+        self,
+    ) -> None:
+        circuit = {
+            "boundary": {
+                "inputs": [{"id": "input", "source": "hidden"}],
+                "outputs": [{"id": "output", "source": "ffn_hidden"}],
+            },
+            "nodes": [
+                {
+                    "id": "gate",
+                    "op": "linear",
+                    "inputs": ["hidden"],
+                    "outputs": ["gate_projection"],
+                    "params": ["gate_weight", "gate_weight_scale_inv"],
+                },
+                {
+                    "id": "up",
+                    "op": "linear",
+                    "inputs": ["hidden"],
+                    "outputs": ["up_projection"],
+                    "params": ["up_weight", "up_weight_scale_inv"],
+                },
+                {
+                    "id": "activation",
+                    "op": "silu",
+                    "inputs": ["gate_projection"],
+                    "outputs": ["activated"],
+                    "attrs": {"element_count": 2560},
+                },
+                {
+                    "id": "multiply",
+                    "op": "multiply",
+                    "inputs": ["activated", "up_projection"],
+                    "outputs": ["ffn_hidden"],
+                },
+            ],
+        }
+
+        optimized = optimize_circuit_for_vulkan(
+            circuit,
+            can_fuse_parallel_linear_silu_multiply=lambda _projection, _activation: True,
+        )
+
+        self.assertEqual(1, len(optimized["nodes"]))
+        fused = optimized["nodes"][0]
+        self.assertEqual("parallel_linear_silu_multiply", fused["op"])
+        self.assertEqual(
+            [
+                "gate_weight",
+                "gate_weight_scale_inv",
+                "up_weight",
+                "up_weight_scale_inv",
+            ],
+            fused["params"],
+        )
+        self.assertEqual(
+            ["gate", "up", "activation", "multiply"],
+            fused["attrs"]["compiled_from"],
+        )
+
     def test_fuses_parallel_head_norm_rope_branches_across_independent_nodes(
         self,
     ) -> None:

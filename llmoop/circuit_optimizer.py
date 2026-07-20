@@ -119,6 +119,54 @@ def _fuse_parallel_linear_silu_multiply_regions(
     while index < len(nodes):
         projection = nodes[index]
         activation = nodes[index + 1] if index + 1 < len(nodes) else None
+        consumed_node_count = 2
+        projection_sources = projection.get("attrs", {}).get("compiled_from")
+
+        if (
+            projection.get("op") == "linear"
+            and activation is not None
+            and activation.get("op") == "linear"
+            and index + 2 < len(nodes)
+        ):
+            second_projection = activation
+            activation = nodes[index + 2]
+            shared_inputs = projection.get("inputs", [])
+            projection_outputs = [
+                *projection.get("outputs", []),
+                *second_projection.get("outputs", []),
+            ]
+            if (
+                len(shared_inputs) == 1
+                and second_projection.get("inputs") == shared_inputs
+                and len(projection.get("outputs", [])) == 1
+                and len(second_projection.get("outputs", [])) == 1
+                and projection.get("params")
+                and second_projection.get("params")
+                and not projection.get("state_reads")
+                and not projection.get("state_writes")
+                and not second_projection.get("state_reads")
+                and not second_projection.get("state_writes")
+            ):
+                projection = {
+                    "id": f"{projection['id']}__{second_projection['id']}",
+                    "op": "parallel_linear_2way",
+                    "inputs": deepcopy(shared_inputs),
+                    "outputs": projection_outputs,
+                    "params": [
+                        *projection["params"],
+                        *second_projection["params"],
+                    ],
+                    "attrs": {
+                        "compiled_from": [
+                            projection["id"],
+                            second_projection["id"],
+                        ],
+                        "branch_count": 2,
+                    },
+                }
+                projection_sources = projection["attrs"]["compiled_from"]
+                consumed_node_count = 3
+
         outputs = projection.get("outputs", [])
         if (
             activation is None
@@ -126,7 +174,7 @@ def _fuse_parallel_linear_silu_multiply_regions(
             or activation.get("op") != "silu_multiply"
             or len(projection.get("inputs", [])) != 1
             or len(outputs) != 2
-            or len(projection.get("params", [])) != 2
+            or not projection.get("params")
             or projection.get("state_reads")
             or projection.get("state_writes")
             or activation.get("inputs") != outputs
@@ -138,16 +186,15 @@ def _fuse_parallel_linear_silu_multiply_regions(
             or any(output in protected_signals for output in outputs)
             or not can_fuse(projection, activation)
         ):
-            compiled.append(deepcopy(projection))
+            compiled.append(deepcopy(nodes[index]))
             index += 1
             continue
 
-        projection_sources = projection.get("attrs", {}).get("compiled_from")
         activation_sources = activation.get("attrs", {}).get("compiled_from")
         if not isinstance(projection_sources, list) or not isinstance(
             activation_sources, list
         ):
-            compiled.append(deepcopy(projection))
+            compiled.append(deepcopy(nodes[index]))
             index += 1
             continue
         compiled.append(
@@ -167,7 +214,7 @@ def _fuse_parallel_linear_silu_multiply_regions(
                 },
             }
         )
-        index += 2
+        index += consumed_node_count
     return compiled
 
 

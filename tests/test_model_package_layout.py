@@ -223,6 +223,74 @@ def test_compiler_renders_fused_parallel_ffn_projection_shader(
     assert "{{" not in source
 
 
+def test_compiler_selects_and_renders_fused_block_scaled_fp8_ffn_shader(
+    tmp_path: Path,
+) -> None:
+    params = [
+        "gate_weight",
+        "gate_weight_scale_inv",
+        "up_weight",
+        "up_weight_scale_inv",
+    ]
+    node = {
+        "id": "fused_ffn",
+        "op": "parallel_linear_silu_multiply",
+        "inputs": ["hidden"],
+        "outputs": ["ffn_hidden"],
+        "params": params,
+        "attrs": {
+            "branch_count": 2,
+            "intermediate_rounding": "BF16",
+            "element_count": 17408,
+        },
+    }
+    circuit = {
+        "parameters": {
+            "refs": {parameter_id: {"tensor": parameter_id} for parameter_id in params}
+        }
+    }
+    tensor_index = {
+        "tensors": {
+            "gate_weight": {
+                "dtype": "F8_E4M3",
+                "shape": [17408, 5120],
+                "layout": ROW_MAJOR_LAYOUT,
+            },
+            "gate_weight_scale_inv": {
+                "dtype": "BF16",
+                "shape": [136, 40],
+                "layout": ROW_MAJOR_LAYOUT,
+            },
+            "up_weight": {
+                "dtype": "F8_E4M3",
+                "shape": [17408, 5120],
+                "layout": ROW_MAJOR_LAYOUT,
+            },
+            "up_weight_scale_inv": {
+                "dtype": "BF16",
+                "shape": [136, 40],
+                "layout": ROW_MAJOR_LAYOUT,
+            },
+        }
+    }
+    dimensions = {"hidden_size": 5120, "intermediate_size": 17408}
+
+    shader_file = shader_file_for_node(circuit, node, tensor_index, dimensions)
+    assert (
+        shader_file == "parallel_linear_silu_multiply_fp8_e4m3_b128x128_5120x17408.comp"
+    )
+
+    shader_source_dir = Path(__file__).parents[1] / "runtime-rs" / "shaders"
+    copy_shader_templates(shader_source_dir, tmp_path, {shader_file})
+    source = (tmp_path / shader_file).read_text()
+    assert "binding = 3) readonly buffer GateScaleInv" in source
+    assert "binding = 5) readonly buffer UpScaleInv" in source
+    assert "const uint BLOCK_ROWS = 128u;" in source
+    assert "for (uint column = lane * 4u;" in source
+    assert "rounded_silu" in source
+    assert "{{" not in source
+
+
 def test_compiler_renders_parallel_head_norm_rope_shader(tmp_path: Path) -> None:
     shader_source_dir = Path(__file__).parents[1] / "runtime-rs" / "shaders"
     shader_file = (
