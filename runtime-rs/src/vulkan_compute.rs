@@ -11,7 +11,9 @@ use std::time::Instant;
 use ash::{Entry, vk};
 
 const VK_EXT_SHADER_FLOAT8_NAME: &CStr = c"VK_EXT_shader_float8";
+const VK_KHR_SHADER_BFLOAT16_NAME: &CStr = c"VK_KHR_shader_bfloat16";
 const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT8_FEATURES_EXT: i32 = 1_000_567_000;
+const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_BFLOAT16_FEATURES_KHR: i32 = 1_000_141_000;
 
 // ash 0.38 is generated from Vulkan 1.3.281 headers, while shader-float8 was
 // added later. Keep this ABI-compatible definition local until ash publishes
@@ -33,6 +35,31 @@ impl VulkanPhysicalDeviceShaderFloat8FeaturesExt {
             p_next: std::ptr::null_mut(),
             shader_float8: vk::FALSE,
             shader_float8_cooperative_matrix: vk::FALSE,
+        }
+    }
+}
+
+// VK_KHR_shader_bfloat16 was published after the Vulkan headers used by the
+// latest ash release. This definition mirrors the current Vulkan 1.4 ABI.
+#[repr(C)]
+struct VulkanPhysicalDeviceShaderBfloat16FeaturesKhr {
+    s_type: vk::StructureType,
+    p_next: *mut c_void,
+    shader_bfloat16_type: vk::Bool32,
+    shader_bfloat16_dot_product: vk::Bool32,
+    shader_bfloat16_cooperative_matrix: vk::Bool32,
+}
+
+impl VulkanPhysicalDeviceShaderBfloat16FeaturesKhr {
+    fn disabled() -> Self {
+        Self {
+            s_type: vk::StructureType::from_raw(
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_BFLOAT16_FEATURES_KHR,
+            ),
+            p_next: std::ptr::null_mut(),
+            shader_bfloat16_type: vk::FALSE,
+            shader_bfloat16_dot_product: vk::FALSE,
+            shader_bfloat16_cooperative_matrix: vk::FALSE,
         }
     }
 }
@@ -929,18 +956,47 @@ impl VulkanComputeDeviceCatalog {
                     physical_device,
                     VK_EXT_SHADER_FLOAT8_NAME,
                 )? && physical_device_supports_shader_float8(instance, physical_device);
+            let cooperative_bfloat16_supported =
+                physical_device_supports_cooperative_bfloat16(instance, physical_device)?;
             let mut shader_float8_features =
                 VulkanPhysicalDeviceShaderFloat8FeaturesExt::disabled();
-            let shader_float8_extension_names = [VK_EXT_SHADER_FLOAT8_NAME.as_ptr()];
+            let mut shader_bfloat16_features =
+                VulkanPhysicalDeviceShaderBfloat16FeaturesKhr::disabled();
+            let mut cooperative_matrix_features =
+                vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default();
+            let mut extension_names = Vec::new();
             let mut enabled_device_extensions = BTreeSet::new();
             let mut device_info = vk::DeviceCreateInfo::default().queue_create_infos(&queue_info);
             if shader_float8_supported {
                 shader_float8_features.shader_float8 = vk::TRUE;
-                device_info = device_info.enabled_extension_names(&shader_float8_extension_names);
-                device_info.p_next = std::ptr::from_ref(&shader_float8_features).cast();
+                extension_names.push(VK_EXT_SHADER_FLOAT8_NAME.as_ptr());
                 enabled_device_extensions
                     .insert(VK_EXT_SHADER_FLOAT8_NAME.to_string_lossy().into_owned());
             }
+            if cooperative_bfloat16_supported {
+                cooperative_matrix_features.cooperative_matrix = vk::TRUE;
+                shader_bfloat16_features.shader_bfloat16_type = vk::TRUE;
+                shader_bfloat16_features.shader_bfloat16_cooperative_matrix = vk::TRUE;
+                extension_names.push(ash::khr::cooperative_matrix::NAME.as_ptr());
+                extension_names.push(VK_KHR_SHADER_BFLOAT16_NAME.as_ptr());
+                enabled_device_extensions.insert(
+                    ash::khr::cooperative_matrix::NAME
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+                enabled_device_extensions
+                    .insert(VK_KHR_SHADER_BFLOAT16_NAME.to_string_lossy().into_owned());
+            }
+            if shader_float8_supported {
+                device_info.p_next = std::ptr::from_ref(&shader_float8_features).cast();
+            }
+            if cooperative_bfloat16_supported {
+                shader_bfloat16_features.p_next = device_info.p_next.cast_mut();
+                cooperative_matrix_features.p_next =
+                    std::ptr::from_mut(&mut shader_bfloat16_features).cast();
+                device_info.p_next = std::ptr::from_ref(&cooperative_matrix_features).cast();
+            }
+            device_info = device_info.enabled_extension_names(&extension_names);
             let device = instance
                 .create_device(physical_device, &device_info, None)
                 .map_err(|error| {
@@ -2291,6 +2347,39 @@ fn physical_device_supports_shader_float8(
         instance.get_physical_device_features2(physical_device, &mut features);
     }
     shader_float8.shader_float8 == vk::TRUE
+}
+
+fn physical_device_supports_cooperative_bfloat16(
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+) -> Result<bool, VulkanError> {
+    if !physical_device_supports_extension(
+        instance,
+        physical_device,
+        ash::khr::cooperative_matrix::NAME,
+    )? || !physical_device_supports_extension(
+        instance,
+        physical_device,
+        VK_KHR_SHADER_BFLOAT16_NAME,
+    )? {
+        return Ok(false);
+    }
+
+    let mut shader_bfloat16 = VulkanPhysicalDeviceShaderBfloat16FeaturesKhr::disabled();
+    let mut cooperative_matrix = vk::PhysicalDeviceCooperativeMatrixFeaturesKHR {
+        p_next: std::ptr::from_mut(&mut shader_bfloat16).cast(),
+        ..Default::default()
+    };
+    let mut features = vk::PhysicalDeviceFeatures2 {
+        p_next: std::ptr::from_mut(&mut cooperative_matrix).cast(),
+        ..Default::default()
+    };
+    unsafe {
+        instance.get_physical_device_features2(physical_device, &mut features);
+    }
+    Ok(cooperative_matrix.cooperative_matrix == vk::TRUE
+        && shader_bfloat16.shader_bfloat16_type == vk::TRUE
+        && shader_bfloat16.shader_bfloat16_cooperative_matrix == vk::TRUE)
 }
 
 unsafe fn inspect_compute_device(
