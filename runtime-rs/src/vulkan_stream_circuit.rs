@@ -5798,6 +5798,142 @@ struct VulkanPedalBatchSignalBuffer {
     buffer: VulkanResidentBuffer,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct VulkanPedalBatchSignalLifetime {
+    key: VulkanPedalBatchSignalKey,
+    frame_byte_capacity: usize,
+    host_visible: bool,
+    first_dispatch: usize,
+    last_dispatch: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct VulkanPedalBatchSignalBufferPlan {
+    frame_byte_capacity: usize,
+    host_visible: bool,
+    last_dispatch: usize,
+}
+
+fn allocate_pedal_batch_signal_lifetimes(
+    mut lifetimes: Vec<VulkanPedalBatchSignalLifetime>,
+) -> (
+    BTreeMap<VulkanPedalBatchSignalKey, usize>,
+    Vec<VulkanPedalBatchSignalBufferPlan>,
+) {
+    lifetimes.sort_by(|left, right| {
+        left.first_dispatch
+            .cmp(&right.first_dispatch)
+            .then_with(|| left.last_dispatch.cmp(&right.last_dispatch))
+            .then_with(|| left.key.cmp(&right.key))
+    });
+    let mut signal_buffer_indices = BTreeMap::new();
+    let mut buffers = Vec::<VulkanPedalBatchSignalBufferPlan>::new();
+    for lifetime in lifetimes {
+        let buffer_index = buffers
+            .iter()
+            .position(|buffer| {
+                buffer.frame_byte_capacity == lifetime.frame_byte_capacity
+                    && buffer.host_visible == lifetime.host_visible
+                    && buffer.last_dispatch < lifetime.first_dispatch
+            })
+            .unwrap_or_else(|| {
+                buffers.push(VulkanPedalBatchSignalBufferPlan {
+                    frame_byte_capacity: lifetime.frame_byte_capacity,
+                    host_visible: lifetime.host_visible,
+                    last_dispatch: lifetime.last_dispatch,
+                });
+                buffers.len() - 1
+            });
+        buffers[buffer_index].last_dispatch = lifetime.last_dispatch;
+        signal_buffer_indices.insert(lifetime.key, buffer_index);
+    }
+    (signal_buffer_indices, buffers)
+}
+
+fn pedal_batch_signal_buffer_plan(
+    mounted: &VulkanMountedPlacedStreamCircuit,
+    dispatches: &[VulkanMountedPlacedBoundDispatch],
+) -> Result<
+    (
+        BTreeMap<VulkanPedalBatchSignalKey, usize>,
+        Vec<VulkanPedalBatchSignalBufferPlan>,
+    ),
+    VulkanResidentInProcessPlacedRuntimeError,
+> {
+    let dispatch_count = dispatches.len();
+    let mut lifetimes = BTreeMap::<VulkanPedalBatchSignalKey, (usize, bool, usize, usize)>::new();
+    for (dispatch_index, dispatch) in dispatches.iter().enumerate() {
+        for descriptor in &dispatch.descriptors {
+            let Some((key, frame_byte_capacity)) =
+                pedal_batch_signal_target_with_mounted(mounted, descriptor)?
+            else {
+                continue;
+            };
+            let host_visible = matches!(
+                key,
+                VulkanPedalBatchSignalKey::IncomingCable(_)
+                    | VulkanPedalBatchSignalKey::OutgoingCable(_)
+            );
+            let external_source = matches!(
+                key,
+                VulkanPedalBatchSignalKey::ModelInput(_)
+                    | VulkanPedalBatchSignalKey::IncomingCable(_)
+            );
+            let external_sink = matches!(
+                key,
+                VulkanPedalBatchSignalKey::ModelOutput(_)
+                    | VulkanPedalBatchSignalKey::OutgoingCable(_)
+            );
+            let first_dispatch = if external_source { 0 } else { dispatch_index };
+            let last_dispatch = if external_sink {
+                dispatch_count
+            } else {
+                dispatch_index
+            };
+            match lifetimes.entry(key.clone()) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert((
+                        frame_byte_capacity,
+                        host_visible,
+                        first_dispatch,
+                        last_dispatch,
+                    ));
+                }
+                std::collections::btree_map::Entry::Occupied(mut entry) => {
+                    let (existing_capacity, existing_visibility, first, last) = entry.get_mut();
+                    if *existing_capacity != frame_byte_capacity
+                        || *existing_visibility != host_visible
+                    {
+                        return Err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop(
+                            VulkanError(format!(
+                                "pedal batch signal {key:?} has incompatible physical requirements"
+                            )),
+                        ));
+                    }
+                    *first = (*first).min(first_dispatch);
+                    *last = (*last).max(last_dispatch);
+                }
+            }
+        }
+    }
+    Ok(allocate_pedal_batch_signal_lifetimes(
+        lifetimes
+            .into_iter()
+            .map(
+                |(key, (frame_byte_capacity, host_visible, first_dispatch, last_dispatch))| {
+                    VulkanPedalBatchSignalLifetime {
+                        key,
+                        frame_byte_capacity,
+                        host_visible,
+                        first_dispatch,
+                        last_dispatch,
+                    }
+                },
+            )
+            .collect(),
+    ))
+}
+
 struct VulkanPedalBatchDispatchStep {
     dispatch: VulkanResidentKernelDispatch,
     push_constants: Vec<VulkanKernelScalarBinding>,
@@ -5831,60 +5967,36 @@ impl VulkanResidentPedalBatchSliceRunner {
                 VulkanError("pedal batch lane tile width is zero".to_string()),
             ));
         }
-        let mut signal_buffer_indices = BTreeMap::<VulkanPedalBatchSignalKey, usize>::new();
+        let (signal_buffer_indices, signal_buffer_plan) =
+            pedal_batch_signal_buffer_plan(&slice.mounted, &slice.mounted_bound.dispatches)?;
         let mut signal_buffers = Vec::<VulkanPedalBatchSignalBuffer>::new();
-        for dispatch in &slice.mounted_bound.dispatches {
-            for descriptor in &dispatch.descriptors {
-                let Some((key, frame_byte_capacity)) =
-                    pedal_batch_signal_target_with_mounted(&slice.mounted, descriptor)?
-                else {
-                    continue;
-                };
-                if let Some(index) = signal_buffer_indices.get(&key).copied() {
-                    if signal_buffers[index].frame_byte_capacity != frame_byte_capacity {
-                        return Err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop(
-                            VulkanError(format!(
-                                "pedal batch signal {key:?} has conflicting frame capacities {} and {frame_byte_capacity}",
-                                signal_buffers[index].frame_byte_capacity
-                            )),
-                        ));
-                    }
-                    continue;
-                }
-                let byte_capacity =
-                    frame_byte_capacity
-                        .checked_mul(lane_capacity)
-                        .ok_or_else(|| {
-                            VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(
-                                "pedal batch signal capacity overflowed".to_string(),
-                            ))
-                        })?;
-                let index = signal_buffers.len();
-                let cross_device_cable = matches!(
-                    key,
-                    VulkanPedalBatchSignalKey::IncomingCable(_)
-                        | VulkanPedalBatchSignalKey::OutgoingCable(_)
-                );
-                let mut buffer = if cross_device_cable {
-                    // Cross-device cables are the one place where the batch must be
-                    // host-addressable. The cable still moves once per device boundary,
-                    // as one contiguous frame batch.
-                    device.create_host_visible_resident_buffer(byte_capacity)
-                } else {
-                    device.create_resident_buffer(byte_capacity)
-                }
-                .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
-                if cross_device_cable {
-                    buffer
-                        .persistently_map()
-                        .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
-                }
-                signal_buffers.push(VulkanPedalBatchSignalBuffer {
-                    frame_byte_capacity,
-                    buffer,
-                });
-                signal_buffer_indices.insert(key, index);
+        for allocation in signal_buffer_plan {
+            let byte_capacity = allocation
+                .frame_byte_capacity
+                .checked_mul(lane_capacity)
+                .ok_or_else(|| {
+                    VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(
+                        "pedal batch signal capacity overflowed".to_string(),
+                    ))
+                })?;
+            let mut buffer = if allocation.host_visible {
+                // Cross-device cables are the one place where the batch must be
+                // host-addressable. The cable still moves once per device boundary,
+                // as one contiguous frame batch.
+                device.create_host_visible_resident_buffer(byte_capacity)
+            } else {
+                device.create_resident_buffer(byte_capacity)
             }
+            .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
+            if allocation.host_visible {
+                buffer
+                    .persistently_map()
+                    .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
+            }
+            signal_buffers.push(VulkanPedalBatchSignalBuffer {
+                frame_byte_capacity: allocation.frame_byte_capacity,
+                buffer,
+            });
         }
 
         let stream_control_buffers = (0..lane_capacity)
@@ -12270,32 +12382,20 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
         }
         let mut width = available_token_count;
         for slice in &self.device_slices {
-            let mut signals = BTreeMap::<VulkanPedalBatchSignalKey, usize>::new();
-            for dispatch in &slice.mounted_bound.dispatches {
-                for descriptor in &dispatch.descriptors {
-                    let Some((key, frame_bytes)) =
-                        pedal_batch_signal_target_with_mounted(&slice.mounted, descriptor)?
-                    else {
-                        continue;
-                    };
-                    if let Some(previous) = signals.insert(key.clone(), frame_bytes)
-                        && previous != frame_bytes
-                    {
-                        return Err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop(
-                            VulkanError(format!(
-                                "temporal signal {key:?} has conflicting frame capacities {previous} and {frame_bytes}"
-                            )),
-                        ));
-                    }
-                }
-            }
-            let signal_bytes_per_lane = signals.values().try_fold(0usize, |total, bytes| {
-                total.checked_add(*bytes).ok_or_else(|| {
-                    VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(
-                        "temporal signal byte count overflowed".to_string(),
-                    ))
-                })
-            })?;
+            let (_, signal_buffer_plan) =
+                pedal_batch_signal_buffer_plan(&slice.mounted, &slice.mounted_bound.dispatches)?;
+            let signal_bytes_per_lane =
+                signal_buffer_plan
+                    .iter()
+                    .try_fold(0usize, |total, allocation| {
+                        total
+                            .checked_add(allocation.frame_byte_capacity)
+                            .ok_or_else(|| {
+                                VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(
+                                    "temporal signal byte count overflowed".to_string(),
+                                ))
+                            })
+                    })?;
             if signal_bytes_per_lane > 0 {
                 width = width.min((SIGNAL_MEMORY_BUDGET_PER_DEVICE / signal_bytes_per_lane).max(1));
             }
@@ -12312,9 +12412,8 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
                 })
                 .count();
             if scalar_dispatches_per_lane > 0 {
-                width = width.min(
-                    (RECORDED_DISPATCH_BUDGET_PER_DEVICE / scalar_dispatches_per_lane).max(1),
-                );
+                width = width
+                    .min((RECORDED_DISPATCH_BUDGET_PER_DEVICE / scalar_dispatches_per_lane).max(1));
             }
         }
         Ok(width.max(1))
@@ -12467,11 +12566,12 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
             ));
         }
         self.ensure_temporal_block_execution(devices, input_token_ids.len())?;
-        let capacity = u32::try_from(self.model.dynamic_state_capacity_activations).map_err(|_| {
-            VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(
-                "temporal context capacity exceeds u32".to_string(),
-            ))
-        })?;
+        let capacity =
+            u32::try_from(self.model.dynamic_state_capacity_activations).map_err(|_| {
+                VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(
+                    "temporal context capacity exceeds u32".to_string(),
+                ))
+            })?;
         let runner_guard = self.temporal_block_execution.borrow();
         let runner = runner_guard.as_ref().ok_or_else(|| {
             VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(
@@ -14246,9 +14346,8 @@ impl VulkanResidentInProcessPlacedPromptStream {
         }
         let block_start_index = active.next_external_input_index;
         let block_end_index = block_start_index + block_width;
-        let input_token_ids = active.input_event.token_ids
-            [block_start_index..block_end_index]
-            .to_vec();
+        let input_token_ids =
+            active.input_event.token_ids[block_start_index..block_end_index].to_vec();
         let sample_last = block_end_index == active.input_event.token_ids.len()
             && active.remaining_public_outputs > 0;
         let start_stream_tick = self.session.next_stream_tick;
@@ -14270,7 +14369,9 @@ impl VulkanResidentInProcessPlacedPromptStream {
                 || activation.input_token_id != input_token_ids[block_index]
             {
                 return Err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop(
-                    VulkanError("temporal block diverged from the external input queue".to_string()),
+                    VulkanError(
+                        "temporal block diverged from the external input queue".to_string(),
+                    ),
                 ));
             }
             let transport_stats = if block_index + 1 == block_width {
@@ -23053,6 +23154,62 @@ mod tests {
     const FIXTURE_MODEL_INPUT_FRAME_SIGNAL: &str = "input_frame";
     const FIXTURE_MODEL_OUTPUT_FRAME_SIGNAL: &str = "output_frame";
     const FIXTURE_MODEL_HIDDEN_SIZE: usize = 1_024;
+
+    #[test]
+    fn pedal_batch_signal_liveness_reuses_only_compatible_dead_buffers() {
+        let key = |signal_id: &str| VulkanPedalBatchSignalKey::Activation {
+            pedal_id: "pedal".to_string(),
+            signal_id: signal_id.to_string(),
+        };
+        let lifetimes = vec![
+            VulkanPedalBatchSignalLifetime {
+                key: key("first"),
+                frame_byte_capacity: 4_096,
+                host_visible: false,
+                first_dispatch: 0,
+                last_dispatch: 2,
+            },
+            VulkanPedalBatchSignalLifetime {
+                key: key("overlapping"),
+                frame_byte_capacity: 4_096,
+                host_visible: false,
+                first_dispatch: 2,
+                last_dispatch: 3,
+            },
+            VulkanPedalBatchSignalLifetime {
+                key: key("reusable"),
+                frame_byte_capacity: 4_096,
+                host_visible: false,
+                first_dispatch: 3,
+                last_dispatch: 4,
+            },
+            VulkanPedalBatchSignalLifetime {
+                key: key("different_size"),
+                frame_byte_capacity: 8_192,
+                host_visible: false,
+                first_dispatch: 5,
+                last_dispatch: 6,
+            },
+            VulkanPedalBatchSignalLifetime {
+                key: VulkanPedalBatchSignalKey::IncomingCable(7),
+                frame_byte_capacity: 4_096,
+                host_visible: true,
+                first_dispatch: 5,
+                last_dispatch: 6,
+            },
+        ];
+
+        let (indices, buffers) = allocate_pedal_batch_signal_lifetimes(lifetimes);
+
+        assert_eq!(buffers.len(), 4);
+        assert_ne!(indices[&key("first")], indices[&key("overlapping")]);
+        assert_eq!(indices[&key("first")], indices[&key("reusable")]);
+        assert_ne!(indices[&key("first")], indices[&key("different_size")]);
+        assert_ne!(
+            indices[&key("first")],
+            indices[&VulkanPedalBatchSignalKey::IncomingCable(7)]
+        );
+    }
     const FIXTURE_MODEL_FRAME_BYTES: usize = FIXTURE_MODEL_HIDDEN_SIZE * 2;
     const FIXTURE_MODEL_LOGITS_BYTES: usize = 65_536 * 4;
     const FIXTURE_MODEL_SAMPLER_OUTPUT_BYTES: usize = 16;
@@ -32515,9 +32672,12 @@ mod tests {
 
     #[test]
     fn temporal_prompt_block_matches_scalar_ticks_and_pedal_state() {
-        let Some(manifest_path) = std::env::var_os("LLMOOP_TEMPORAL_TEST_PACKAGE").map(PathBuf::from)
+        let Some(manifest_path) =
+            std::env::var_os("LLMOOP_TEMPORAL_TEST_PACKAGE").map(PathBuf::from)
         else {
-            eprintln!("skipping temporal prompt equivalence: LLMOOP_TEMPORAL_TEST_PACKAGE is unset");
+            eprintln!(
+                "skipping temporal prompt equivalence: LLMOOP_TEMPORAL_TEST_PACKAGE is unset"
+            );
             return;
         };
         let device_index = std::env::var("LLMOOP_TEMPORAL_TEST_VULKAN_DEVICE")
@@ -32552,19 +32712,17 @@ mod tests {
             )
             .unwrap(),
         );
-        let mut scalar = VulkanResidentInProcessPlacedPromptStream::from_package_devices_and_session(
-            package.clone(),
-            devices.clone(),
-            0,
-            0,
-        )
-        .unwrap();
+        let mut scalar =
+            VulkanResidentInProcessPlacedPromptStream::from_package_devices_and_session(
+                package.clone(),
+                devices.clone(),
+                0,
+                0,
+            )
+            .unwrap();
         let mut temporal =
             VulkanResidentInProcessPlacedPromptStream::from_package_devices_and_session(
-                package,
-                devices,
-                0,
-                0,
+                package, devices, 0, 0,
             )
             .unwrap();
         scalar.speculative_draft_tokens = 0;
