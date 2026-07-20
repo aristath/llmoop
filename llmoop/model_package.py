@@ -34,7 +34,6 @@ from llmoop.model_transpiler import read_safetensors_header, transpile_model
 TOKENIZER_PACKAGE_DIR = "tokenizer"
 WEIGHTS_PACKAGE_DIR = "weights"
 PACKAGE_ARTIFACT_INTEGRITY_SCHEMA = "llmoop.package_artifact_integrity.v1"
-VULKAN_BF16_ROW_PAIR_LAYOUT = "vulkan_bf16_row_pair_u32"
 ROW_MAJOR_LAYOUT = "row_major"
 CONFIG_PACKAGE_FILE = "config.json"
 SCALAR_BATCH_LANE_TILE_WIDTH = 16
@@ -282,11 +281,12 @@ def build_vulkan_resident_package_manifest(
             )
     embedding_layout = tensor_layout(tensor_index, embed_tensor)
     projection_layout = tensor_layout(tensor_index, projection_tensor)
+    if embedding_layout != ROW_MAJOR_LAYOUT or projection_layout != ROW_MAJOR_LAYOUT:
+        raise ModelCompileError(
+            "compiled input and output transducers require row-major tensors"
+        )
     embedding_shader_file = (
-        f"embedding_lookup_paired_bf16_{vocab_size}x{hidden_size}"
-        f"_scale{shader_float_token(embedding_scale)}.comp"
-        if embedding_layout == VULKAN_BF16_ROW_PAIR_LAYOUT
-        else f"embedding_lookup_bf16_{vocab_size}x{hidden_size}"
+        f"embedding_lookup_bf16_{vocab_size}x{hidden_size}"
         f"_scale{shader_float_token(embedding_scale)}.comp"
     )
     embedding_batch_shader_file = embedding_shader_file.replace(
@@ -294,18 +294,12 @@ def build_vulkan_resident_package_manifest(
     )
     output_scale = 1.0 / logits_scale
     projection_shader_file = (
-        f"tied_output_projection_paired_bf16_{vocab_size}x{hidden_size}"
-        f"_scale{shader_float_token(output_scale)}_to_f32.comp"
-        if projection_layout == VULKAN_BF16_ROW_PAIR_LAYOUT
-        else f"tied_output_projection_bf16_{vocab_size}x{hidden_size}"
+        f"tied_output_projection_bf16_{vocab_size}x{hidden_size}"
         f"_scale{shader_float_token(output_scale)}_to_f32.comp"
     )
     projection_batch_lane_tile_width = 4
     projection_batch_shader_file = (
-        f"tied_output_projection_batch{projection_batch_lane_tile_width}_paired_bf16_"
-        f"{vocab_size}x{hidden_size}_scale{shader_float_token(output_scale)}_to_f32.comp"
-        if projection_layout == VULKAN_BF16_ROW_PAIR_LAYOUT
-        else f"tied_output_projection_batch{projection_batch_lane_tile_width}_bf16_"
+        f"tied_output_projection_batch{projection_batch_lane_tile_width}_bf16_"
         f"{vocab_size}x{hidden_size}_scale{shader_float_token(output_scale)}_to_f32.comp"
     )
     norm_shader_file = rms_norm_shader_file(hidden_size, norm_eps, norm_weight_offset)
@@ -915,18 +909,17 @@ def causal_scan_batch_stages(shader_file: str, local_size_x: int) -> list[Json] 
 
 def cooperative_bfloat16_batch_shader_file(shader_file: str) -> str | None:
     linear = re.fullmatch(
-        r"(linear|linear_residual)_(paired_)?bf16_(\d+)x(\d+)\.comp",
+        r"(linear|linear_residual)_bf16_(\d+)x(\d+)\.comp",
         shader_file,
     )
     if linear is not None:
-        operation, paired, input_size, output_size = linear.groups()
-        layout = "paired" if paired else "row_major"
+        operation, input_size, output_size = linear.groups()
         return (
-            f"{operation}_batch64_cooperative_{layout}_bf16_"
+            f"{operation}_batch64_cooperative_bf16_"
             f"{input_size}x{output_size}.comp"
         )
     parallel = re.fullmatch(
-        r"parallel_linear_([23])way_(paired|row_major)_bf16_(\d+)x.+\.comp",
+        r"parallel_linear_[23]way_bf16_\d+x.+\.comp",
         shader_file,
     )
     if parallel is not None:
@@ -936,8 +929,7 @@ def cooperative_bfloat16_batch_shader_file(shader_file: str) -> str | None:
             1,
         )
     fused = re.fullmatch(
-        r"parallel_linear_silu_multiply_(paired|row_major)_bf16_"
-        r"(\d+)x(\d+)\.comp",
+        r"parallel_linear_silu_multiply_bf16_\d+x\d+\.comp",
         shader_file,
     )
     if fused is not None:
@@ -951,7 +943,7 @@ def cooperative_bfloat16_batch_shader_file(shader_file: str) -> str | None:
 
 def cooperative_bfloat16_workgroup_count_x(shader_file: str) -> int:
     linear = re.fullmatch(
-        r"(?:linear|linear_residual)_(?:paired_)?bf16_\d+x(\d+)\.comp",
+        r"(?:linear|linear_residual)_bf16_\d+x(\d+)\.comp",
         shader_file,
     )
     if linear is not None:
@@ -959,7 +951,7 @@ def cooperative_bfloat16_workgroup_count_x(shader_file: str) -> int:
             int(linear.group(1)) + COOPERATIVE_OUTPUT_TILE_WIDTH - 1
         ) // COOPERATIVE_OUTPUT_TILE_WIDTH
     parallel = re.fullmatch(
-        r"parallel_linear_[23]way_(?:paired|row_major)_bf16_\d+x"
+        r"parallel_linear_[23]way_bf16_\d+x"
         r"(\d+)_(\d+)(?:_(\d+))?\.comp",
         shader_file,
     )
@@ -970,7 +962,7 @@ def cooperative_bfloat16_workgroup_count_x(shader_file: str) -> int:
             for width in parallel.groups()
         )
     fused = re.fullmatch(
-        r"parallel_linear_silu_multiply_(?:paired|row_major)_bf16_"
+        r"parallel_linear_silu_multiply_bf16_"
         r"\d+x(\d+)\.comp",
         shader_file,
     )
@@ -1064,22 +1056,21 @@ def weight_shared_batch_shader_file(shader_file: str) -> str | None:
                 1,
             )
     bf16 = re.fullmatch(
-        r"(linear|linear_residual)_(paired_)?bf16_(\d+)x(\d+)\.comp",
+        r"(linear|linear_residual)_bf16_(\d+)x(\d+)\.comp",
         shader_file,
     )
     if bf16 is not None:
-        operation, paired, input_size, output_size = bf16.groups()
+        operation, input_size, output_size = bf16.groups()
         if int(input_size) % 2 == 0 and int(output_size) % 2 == 0:
-            layout = "paired" if paired else "row_major"
             return (
-                f"{operation}_batch{tile}_{layout}_bf16_"
+                f"{operation}_batch{tile}_bf16_"
                 f"{input_size}x{output_size}.comp"
             )
     parallel = re.fullmatch(
-        r"parallel_linear_([23])way_(paired|row_major)_bf16_(\d+)x.+\.comp",
+        r"parallel_linear_[23]way_bf16_(\d+)x.+\.comp",
         shader_file,
     )
-    if parallel is not None and int(parallel.group(3)) % 2 == 0:
+    if parallel is not None and int(parallel.group(1)) % 2 == 0:
         return shader_file.replace(
             "parallel_linear_",
             f"parallel_linear_batch{tile}_",
@@ -1098,15 +1089,15 @@ def weight_shared_batch_shader_file(shader_file: str) -> str | None:
                 1,
             )
     fused_bf16_ffn = re.fullmatch(
-        r"parallel_linear_silu_multiply_(paired|row_major)_bf16_"
+        r"parallel_linear_silu_multiply_bf16_"
         r"(\d+)x(\d+)\.comp",
         shader_file,
     )
     if fused_bf16_ffn is not None:
-        layout, input_size, output_size = fused_bf16_ffn.groups()
+        input_size, output_size = fused_bf16_ffn.groups()
         if int(input_size) % 2 == 0 and int(output_size) % 2 == 0:
             return (
-                f"parallel_linear_silu_multiply_batch{tile}_{layout}_bf16_"
+                f"parallel_linear_silu_multiply_batch{tile}_bf16_"
                 f"{input_size}x{output_size}.comp"
             )
     return None
@@ -1201,12 +1192,14 @@ def shader_file_for_node(
                 f"{parameter_dtype}"
             )
         layout = parameter_layout_for_node(circuit, node, tensor_index)
+        if layout != ROW_MAJOR_LAYOUT:
+            raise ModelCompileError(
+                f"linear node {node['id']!r} has unsupported layout {layout!r}"
+            )
         has_bias = len(node.get("params", [])) == 2
         prefix = "linear"
         if has_bias:
             prefix += "_bias"
-        if layout == VULKAN_BF16_ROW_PAIR_LAYOUT:
-            prefix += "_paired"
         prefix += "_bf16"
         return f"{prefix}_{in_features}x{out_features}.comp"
     if op in {"parallel_linear_2way", "parallel_linear_3way"}:
@@ -1243,18 +1236,14 @@ def shader_file_for_node(
             parameter_layout_for_id(circuit, parameter_id, tensor_index)
             for parameter_id in node["params"]
         }
-        supported_layouts = {ROW_MAJOR_LAYOUT, VULKAN_BF16_ROW_PAIR_LAYOUT}
-        if len(layouts) != 1 or not layouts <= supported_layouts:
+        if layouts != {ROW_MAJOR_LAYOUT}:
             raise ModelCompileError(
                 f"parallel-linear node {node['id']!r} has unsupported layouts "
                 f"{sorted(layouts)}"
             )
-        layout_token = (
-            "paired" if layouts == {VULKAN_BF16_ROW_PAIR_LAYOUT} else "row_major"
-        )
         input_width = input_widths.pop()
         return (
-            f"parallel_linear_{branch_count}way_{layout_token}_bf16_{input_width}x"
+            f"parallel_linear_{branch_count}way_bf16_{input_width}x"
             + "_".join(map(str, output_widths))
             + ".comp"
         )
@@ -1287,16 +1276,12 @@ def shader_file_for_node(
                 or shapes[0] != shapes[1]
                 or len(shapes[0]) != 2
                 or dtypes != {"BF16"}
-                or len(layouts) != 1
-                or not layouts <= {ROW_MAJOR_LAYOUT, VULKAN_BF16_ROW_PAIR_LAYOUT}
+                or layouts != {ROW_MAJOR_LAYOUT}
             ):
                 raise ModelCompileError(
                     f"fused FFN projection node {node['id']!r} has incompatible "
                     f"parameters {shapes}"
                 )
-            shader_format = (
-                "paired" if layouts == {VULKAN_BF16_ROW_PAIR_LAYOUT} else "row_major"
-            )
             block_shape = None
         elif len(params) == 4:
             weight_ids = [params[0], params[2]]
@@ -1359,7 +1344,7 @@ def shader_file_for_node(
                 f"b{block_rows}x{block_columns}_{input_width}x{output_width}.comp"
             )
         return (
-            f"parallel_linear_silu_multiply_{shader_format}_bf16_"
+            "parallel_linear_silu_multiply_bf16_"
             f"{input_width}x{output_width}.comp"
         )
     if op == "linear_split_3way":
@@ -1380,11 +1365,12 @@ def shader_file_for_node(
                 f"outputs into {part_widths}"
             )
         layout = parameter_layout_for_node(circuit, node, tensor_index)
-        layout_token = (
-            "paired" if layout == VULKAN_BF16_ROW_PAIR_LAYOUT else "row_major"
-        )
+        if layout != ROW_MAJOR_LAYOUT:
+            raise ModelCompileError(
+                f"linear-split node {node['id']!r} has unsupported layout {layout!r}"
+            )
         return (
-            f"linear_split_3way_{layout_token}_bf16_{in_features}x"
+            f"linear_split_3way_bf16_{in_features}x"
             + "_".join(map(str, part_widths))
             + ".comp"
         )
@@ -1429,12 +1415,11 @@ def shader_file_for_node(
                 f"{parameter_dtype}"
             )
         layout = parameter_layout_for_node(circuit, node, tensor_index)
-        prefix = (
-            "linear_residual_paired_bf16"
-            if layout == VULKAN_BF16_ROW_PAIR_LAYOUT
-            else "linear_residual_bf16"
-        )
-        return f"{prefix}_{in_features}x{out_features}.comp"
+        if layout != ROW_MAJOR_LAYOUT:
+            raise ModelCompileError(
+                f"linear-residual node {node['id']!r} has unsupported layout {layout!r}"
+            )
+        return f"linear_residual_bf16_{in_features}x{out_features}.comp"
     if op == "split":
         if node["attrs"].get("layout") == "per_head_interleaved":
             return (
@@ -1559,7 +1544,7 @@ def shader_file_for_node(
                 parameter_dtype_for_id(circuit, parameter_id, tensor_index) != "BF16"
                 for parameter_id in node["params"]
             )
-            or projection_layout not in {ROW_MAJOR_LAYOUT, VULKAN_BF16_ROW_PAIR_LAYOUT}
+            or projection_layout != ROW_MAJOR_LAYOUT
             or parameter_layout_for_id(circuit, node["params"][1], tensor_index)
             != ROW_MAJOR_LAYOUT
         ):
@@ -1568,13 +1553,8 @@ def shader_file_for_node(
                 f"incompatible projection {projection_shape}, state "
                 f"{temporal_memory.get('shape')}, or kernel {kernel_shape}"
             )
-        layout_token = (
-            "paired"
-            if projection_layout == VULKAN_BF16_ROW_PAIR_LAYOUT
-            else "row_major"
-        )
         return (
-            f"linear_split_recurrent_depthwise_gate_{layout_token}_bf16_"
+            "linear_split_recurrent_depthwise_gate_bf16_"
             f"{projection_shape[1]}x{hidden_size}_k{frames}"
             f"_ig{input_gate_indices[0]}_{input_gate_indices[1]}"
             f"_og{output_gate_index}.comp"
@@ -1989,16 +1969,15 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
 
     cooperative_parallel_linear = re.fullmatch(
         r"parallel_linear_batch64_cooperative_([23])way_"
-        r"(paired|row_major)_bf16_(\d+)x(\d+)_(\d+)(?:_(\d+))?\.comp",
+        r"bf16_(\d+)x(\d+)_(\d+)(?:_(\d+))?\.comp",
         shader_file,
     )
     if cooperative_parallel_linear is not None:
         branch_count = int(cooperative_parallel_linear.group(1))
-        weight_layout = cooperative_parallel_linear.group(2)
-        input_size = int(cooperative_parallel_linear.group(3))
+        input_size = int(cooperative_parallel_linear.group(2))
         output_widths = [
             int(width)
-            for width in cooperative_parallel_linear.groups()[3:]
+            for width in cooperative_parallel_linear.groups()[2:]
             if width is not None
         ]
         if (
@@ -2092,9 +2071,6 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
                 "INPUT_SIZE": str(input_size),
                 "OUTPUT_SIZE_CONSTANTS": output_constants,
                 "TOTAL_OUTPUT_TILES": str(sum(tile_counts)),
-                "PAIRED_WEIGHT_LAYOUT": (
-                    "true" if weight_layout == "paired" else "false"
-                ),
                 "BRANCH_SELECTION": "\n".join(branch_lines),
                 "WEIGHT_READS": weight_reads,
                 "OUTPUT_SIZE_SELECTION": output_size_selection,
@@ -2105,14 +2081,13 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
 
     cooperative_bf16_linear = re.fullmatch(
         r"(linear|linear_residual)_batch64_cooperative_"
-        r"(paired|row_major)_bf16_(\d+)x(\d+)\.comp",
+        r"bf16_(\d+)x(\d+)\.comp",
         shader_file,
     )
     if cooperative_bf16_linear is not None:
         operation = cooperative_bf16_linear.group(1)
-        weight_layout = cooperative_bf16_linear.group(2)
-        input_size = int(cooperative_bf16_linear.group(3))
-        output_size = int(cooperative_bf16_linear.group(4))
+        input_size = int(cooperative_bf16_linear.group(2))
+        output_size = int(cooperative_bf16_linear.group(3))
         if input_size <= 0 or input_size % 2 or output_size <= 0 or output_size % 2:
             raise ModelCompileError(
                 f"invalid cooperative BF16 linear shader shape {shader_file!r}"
@@ -2124,9 +2099,6 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
             {
                 "INPUT_SIZE": str(input_size),
                 "OUTPUT_SIZE": str(output_size),
-                "PAIRED_WEIGHT_LAYOUT": (
-                    "true" if weight_layout == "paired" else "false"
-                ),
                 "RESIDUAL_BINDING": (
                     "layout(set = 0, binding = 1) readonly buffer ResidualFrames {\n"
                     "    bfloat16_t values[];\n"
@@ -2156,13 +2128,12 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
 
     cooperative_fused_ffn = re.fullmatch(
         r"parallel_linear_silu_multiply_batch64_cooperative_"
-        r"(paired|row_major)_bf16_(\d+)x(\d+)\.comp",
+        r"bf16_(\d+)x(\d+)\.comp",
         shader_file,
     )
     if cooperative_fused_ffn is not None:
-        weight_layout = cooperative_fused_ffn.group(1)
-        input_size = int(cooperative_fused_ffn.group(2))
-        output_size = int(cooperative_fused_ffn.group(3))
+        input_size = int(cooperative_fused_ffn.group(1))
+        output_size = int(cooperative_fused_ffn.group(2))
         if input_size <= 0 or input_size % 2 or output_size <= 0 or output_size % 2:
             raise ModelCompileError(
                 f"invalid cooperative fused FFN shader shape {shader_file!r}"
@@ -2173,14 +2144,11 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
             {
                 "INPUT_SIZE": str(input_size),
                 "OUTPUT_SIZE": str(output_size),
-                "PAIRED_WEIGHT_LAYOUT": (
-                    "true" if weight_layout == "paired" else "false"
-                ),
             },
         )
 
     parallel_linear = re.fullmatch(
-        r"parallel_linear_(?:batch(\d+)_)?([23])way_(paired|row_major)_bf16_"
+        r"parallel_linear_(?:batch(\d+)_)?([23])way_bf16_"
         r"(\d+)x(\d+)_(\d+)(?:_(\d+))?\.comp",
         shader_file,
     )
@@ -2191,10 +2159,9 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
             else None
         )
         branch_count = int(parallel_linear.group(2))
-        weight_layout = parallel_linear.group(3)
-        input_size = int(parallel_linear.group(4))
+        input_size = int(parallel_linear.group(3))
         output_widths = [
-            int(width) for width in parallel_linear.groups()[4:] if width is not None
+            int(width) for width in parallel_linear.groups()[3:] if width is not None
         ]
         if (
             len(output_widths) != branch_count
@@ -2278,9 +2245,6 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
                 "TOTAL_OUTPUT_WORDS": " + ".join(
                     f"OUTPUT_{label}_WORDS" for label in labels
                 ),
-                "PAIRED_WEIGHT_LAYOUT": (
-                    "true" if weight_layout == "paired" else "false"
-                ),
                 "BRANCH_SELECTION": "\n".join(branch_lines),
                 "WEIGHT_READS": weight_reads,
                 "OUTPUT_WRITES": output_writes,
@@ -2288,16 +2252,15 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
         )
 
     batched_bf16_linear = re.fullmatch(
-        r"(linear|linear_residual)_batch(\d+)_(paired|row_major)_bf16_"
+        r"(linear|linear_residual)_batch(\d+)_bf16_"
         r"(\d+)x(\d+)\.comp",
         shader_file,
     )
     if batched_bf16_linear is not None:
         operation = batched_bf16_linear.group(1)
         batch_tile_width = int(batched_bf16_linear.group(2))
-        weight_layout = batched_bf16_linear.group(3)
-        input_size = int(batched_bf16_linear.group(4))
-        output_size = int(batched_bf16_linear.group(5))
+        input_size = int(batched_bf16_linear.group(3))
+        output_size = int(batched_bf16_linear.group(4))
         if (
             batch_tile_width <= 0
             or input_size <= 0
@@ -2315,15 +2278,12 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
                 "BATCH_TILE_WIDTH": str(batch_tile_width),
                 "INPUT_SIZE": str(input_size),
                 "OUTPUT_SIZE": str(output_size),
-                "PAIRED_WEIGHT_LAYOUT": (
-                    "true" if weight_layout == "paired" else "false"
-                ),
             },
         )
 
     fused_ffn_projection = re.fullmatch(
         r"parallel_linear_silu_multiply_(?:batch(\d+)_)?"
-        r"(paired|row_major)_bf16_(\d+)x(\d+)\.comp",
+        r"bf16_(\d+)x(\d+)\.comp",
         shader_file,
     )
     if fused_ffn_projection is not None:
@@ -2332,9 +2292,8 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
             if fused_ffn_projection.group(1) is not None
             else None
         )
-        weight_layout = fused_ffn_projection.group(2)
-        input_size = int(fused_ffn_projection.group(3))
-        output_size = int(fused_ffn_projection.group(4))
+        input_size = int(fused_ffn_projection.group(2))
+        output_size = int(fused_ffn_projection.group(3))
         if (
             (batch_tile_width is not None and batch_tile_width <= 0)
             or input_size <= 0
@@ -2356,9 +2315,6 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
                 "BATCH_TILE_WIDTH": str(batch_tile_width or 1),
                 "INPUT_SIZE": str(input_size),
                 "OUTPUT_SIZE": str(output_size),
-                "PAIRED_WEIGHT_LAYOUT": (
-                    "true" if weight_layout == "paired" else "false"
-                ),
             },
         )
 
@@ -2547,15 +2503,9 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
             ("INPUT_SIZE", "OUTPUT_SIZE"),
         ),
         (
-            r"linear_paired_bf16_(\d+)x(\d+)\.comp",
-            "linear_paired_bf16.comp.template",
-            ("INPUT_SIZE", "OUTPUT_SIZE"),
-        ),
-        (
-            r"linear_split_3way_(paired|row_major)_bf16_(\d+)x(\d+)_(\d+)_(\d+)\.comp",
+            r"linear_split_3way_bf16_(\d+)x(\d+)_(\d+)_(\d+)\.comp",
             "linear_split_3way_bf16.comp.template",
             (
-                "WEIGHT_LAYOUT",
                 "INPUT_SIZE",
                 "PART_A_WIDTH",
                 "PART_B_WIDTH",
@@ -2563,11 +2513,10 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
             ),
         ),
         (
-            r"linear_split_recurrent_depthwise_gate_(paired|row_major)_bf16_"
+            r"linear_split_recurrent_depthwise_gate_bf16_"
             r"(\d+)x(\d+)_k(\d+)_ig([012])_([012])_og([012])\.comp",
             "linear_split_recurrent_depthwise_gate_bf16.comp.template",
             (
-                "WEIGHT_LAYOUT",
                 "INPUT_SIZE",
                 "HIDDEN_SIZE",
                 "FRAME_COUNT",
@@ -2582,18 +2531,8 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
             ("INPUT_SIZE", "OUTPUT_SIZE"),
         ),
         (
-            r"linear_bias_paired_bf16_(\d+)x(\d+)\.comp",
-            "linear_bias_paired_bf16.comp.template",
-            ("INPUT_SIZE", "OUTPUT_SIZE"),
-        ),
-        (
             r"linear_residual_bf16_(\d+)x(\d+)\.comp",
             "linear_residual_bf16.comp.template",
-            ("INPUT_SIZE", "OUTPUT_SIZE"),
-        ),
-        (
-            r"linear_residual_paired_bf16_(\d+)x(\d+)\.comp",
-            "linear_residual_paired_bf16.comp.template",
             ("INPUT_SIZE", "OUTPUT_SIZE"),
         ),
         (
@@ -2607,33 +2546,13 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
             ("VOCAB_SIZE", "HIDDEN_SIZE", "EMBEDDING_SCALE"),
         ),
         (
-            r"embedding_lookup_paired_bf16_(\d+)x(\d+)_scale([0-9eE+.-]+)\.comp",
-            "embedding_lookup_paired_bf16.comp.template",
-            ("VOCAB_SIZE", "HIDDEN_SIZE", "EMBEDDING_SCALE"),
-        ),
-        (
-            r"embedding_lookup_batch_paired_bf16_(\d+)x(\d+)_scale([0-9eE+.-]+)\.comp",
-            "embedding_lookup_batch_paired_bf16.comp.template",
-            ("VOCAB_SIZE", "HIDDEN_SIZE", "EMBEDDING_SCALE"),
-        ),
-        (
             r"tied_output_projection_bf16_(\d+)x(\d+)_scale([0-9eE+.-]+)_to_f32\.comp",
             "tied_output_projection_bf16.comp.template",
             ("VOCAB_SIZE", "INPUT_SIZE", "OUTPUT_SCALE"),
         ),
         (
-            r"tied_output_projection_paired_bf16_(\d+)x(\d+)_scale([0-9eE+.-]+)_to_f32\.comp",
-            "tied_output_projection_paired_bf16.comp.template",
-            ("VOCAB_SIZE", "INPUT_SIZE", "OUTPUT_SCALE"),
-        ),
-        (
             r"tied_output_projection_batch(\d+)_bf16_(\d+)x(\d+)_scale([0-9eE+.-]+)_to_f32\.comp",
             "tied_output_projection_batch_bf16.comp.template",
-            ("BATCH_TILE_WIDTH", "VOCAB_SIZE", "INPUT_SIZE", "OUTPUT_SCALE"),
-        ),
-        (
-            r"tied_output_projection_batch(\d+)_paired_bf16_(\d+)x(\d+)_scale([0-9eE+.-]+)_to_f32\.comp",
-            "tied_output_projection_batch_paired_bf16.comp.template",
             ("BATCH_TILE_WIDTH", "VOCAB_SIZE", "INPUT_SIZE", "OUTPUT_SCALE"),
         ),
         (
@@ -2806,11 +2725,6 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
                 )
                 replacements["ROPE_PROPORTIONAL"] = (
                     "true" if rope_layout == "proportional" else "false"
-                )
-            if "WEIGHT_LAYOUT" in replacements:
-                weight_layout = replacements.pop("WEIGHT_LAYOUT")
-                replacements["PAIRED_WEIGHT_LAYOUT"] = (
-                    "true" if weight_layout == "paired" else "false"
                 )
             return render_shader_template(source_dir, template, replacements)
 
@@ -4399,18 +4313,9 @@ def write_compiled_tensor(
         destination_handle.write(struct.pack("<Q", len(header_payload)))
         destination_handle.write(header_payload)
         source_handle.seek(source_start)
-        if layout == VULKAN_BF16_ROW_PAIR_LAYOUT:
-            write_bf16_row_pair_tensor(
-                source_handle,
-                destination_handle,
-                rows=int(info["shape"][0]),
-                columns=int(info["shape"][1]),
-                digest=data_digest,
-            )
-        else:
-            copy_exact_bytes(
-                source_handle, destination_handle, byte_count, digest=data_digest
-            )
+        copy_exact_bytes(
+            source_handle, destination_handle, byte_count, digest=data_digest
+        )
     return len(header_payload), data_digest.hexdigest()
 
 
@@ -4471,41 +4376,6 @@ def write_compiled_composite_tensor(
     return len(header_payload), data_digest.hexdigest()
 
 
-def write_bf16_row_pair_tensor(
-    source_handle: Any,
-    destination_handle: Any,
-    *,
-    rows: int,
-    columns: int,
-    digest: Any | None = None,
-) -> None:
-    try:
-        import numpy
-    except ImportError as error:
-        raise ModelCompileError(
-            "compiling Vulkan BF16 matrix layouts requires numpy"
-        ) from error
-
-    row_bytes = columns * 2
-    word_count = columns // 2
-    for _row_pair in range(rows // 2):
-        row_0 = source_handle.read(row_bytes)
-        row_1 = source_handle.read(row_bytes)
-        if len(row_0) != row_bytes or len(row_1) != row_bytes:
-            raise ModelCompileError(
-                "unexpected end of BF16 tensor while compiling row pairs"
-            )
-        words_0 = numpy.frombuffer(row_0, dtype="<u4", count=word_count)
-        words_1 = numpy.frombuffer(row_1, dtype="<u4", count=word_count)
-        paired = numpy.empty((word_count, 2), dtype="<u4")
-        paired[:, 0] = words_0
-        paired[:, 1] = words_1
-        payload = paired.tobytes()
-        destination_handle.write(payload)
-        if digest is not None:
-            digest.update(payload)
-
-
 def copy_exact_bytes(
     source_handle: Any,
     destination_handle: Any,
@@ -4540,8 +4410,7 @@ def can_fuse_bf16_linear_split(circuit: Json, node: Json, tensor_index: Json) ->
         len(shape) == 2
         and all(int(dimension) > 0 and int(dimension) % 2 == 0 for dimension in shape)
         and parameter_dtype_for_node(circuit, node, tensor_index) == "BF16"
-        and parameter_layout_for_node(circuit, node, tensor_index)
-        in {ROW_MAJOR_LAYOUT, VULKAN_BF16_ROW_PAIR_LAYOUT}
+        and parameter_layout_for_node(circuit, node, tensor_index) == ROW_MAJOR_LAYOUT
     )
 
 
@@ -4564,8 +4433,7 @@ def can_fuse_bf16_parallel_linears(
             parameter_dtype_for_node(circuit, node, tensor_index) == "BF16"
             for node in nodes
         )
-        and len(layouts) == 1
-        and layouts <= {ROW_MAJOR_LAYOUT, VULKAN_BF16_ROW_PAIR_LAYOUT}
+        and layouts == {ROW_MAJOR_LAYOUT}
     )
 
 
@@ -4599,8 +4467,7 @@ def can_fuse_parallel_linear_silu_multiply(
                     for parameter_id in weight_ids
                 }
                 == {"BF16"}
-                and len(layouts) == 1
-                and layouts <= {ROW_MAJOR_LAYOUT, VULKAN_BF16_ROW_PAIR_LAYOUT}
+                and layouts == {ROW_MAJOR_LAYOUT}
             )
         except ModelCompileError:
             return False
@@ -4819,7 +4686,7 @@ def can_fuse_bf16_linear_split_recurrent(
         and kernel_shape in ([hidden_size, frames], [hidden_size, 1, frames])
         and parameter_dtype_for_node(circuit, projection, tensor_index) == "BF16"
         and parameter_layout_for_node(circuit, projection, tensor_index)
-        in {ROW_MAJOR_LAYOUT, VULKAN_BF16_ROW_PAIR_LAYOUT}
+        == ROW_MAJOR_LAYOUT
         and parameter_dtype_for_node(circuit, recurrent, tensor_index) == "BF16"
         and parameter_layout_for_node(circuit, recurrent, tensor_index)
         == ROW_MAJOR_LAYOUT

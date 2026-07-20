@@ -34,7 +34,6 @@ const uint INPUT_WORDS = (INPUT_SIZE + 1u) / 2u;
 const uint OUTPUT_WORDS = OUTPUT_SIZE / 2u;
 const uint PART_A_WORDS = PART_A_WIDTH / 2u;
 const uint PART_B_WORDS = PART_B_WIDTH / 2u;
-const bool PAIRED_WEIGHT_LAYOUT = {{PAIRED_WEIGHT_LAYOUT}};
 
 shared float subgroup_lo[64];
 shared float subgroup_hi[64];
@@ -51,17 +50,11 @@ uint f32_to_bf16(float value) {
 }
 
 uint read_lo_weight(uint word_index, uint column_word) {
-    if (PAIRED_WEIGHT_LAYOUT) {
-        return weight.words[2u * ((word_index * INPUT_WORDS) + column_word)];
-    }
     uint row = word_index * 2u;
     return weight.words[(row * INPUT_WORDS) + column_word];
 }
 
 uint read_hi_weight(uint word_index, uint column_word) {
-    if (PAIRED_WEIGHT_LAYOUT) {
-        return weight.words[(2u * ((word_index * INPUT_WORDS) + column_word)) + 1u];
-    }
     uint row = (word_index * 2u) + 1u;
     return weight.words[(row * INPUT_WORDS) + column_word];
 }

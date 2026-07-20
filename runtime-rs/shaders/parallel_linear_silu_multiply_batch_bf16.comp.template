@@ -17,7 +17,6 @@ const uint INPUT_SIZE = {{INPUT_SIZE}}u;
 const uint INPUT_WORDS = INPUT_SIZE / 2u;
 const uint OUTPUT_SIZE = {{OUTPUT_SIZE}}u;
 const uint OUTPUT_WORDS = OUTPUT_SIZE / 2u;
-const bool PAIRED_WEIGHT_LAYOUT = {{PAIRED_WEIGHT_LAYOUT}};
 
 shared float subgroup_gate_lo[BATCH_TILE_WIDTH][64];
 shared float subgroup_gate_hi[BATCH_TILE_WIDTH][64];
@@ -33,9 +32,6 @@ uint f32_to_bf16(float value) {
 }
 
 uint weight_index(uint output_word, uint column_word, uint row_offset) {
-    if (PAIRED_WEIGHT_LAYOUT) {
-        return (2u * ((output_word * INPUT_WORDS) + column_word)) + row_offset;
-    }
     return (((output_word * 2u) + row_offset) * INPUT_WORDS) + column_word;
 }
 

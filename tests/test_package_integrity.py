@@ -513,19 +513,19 @@ def test_package_integrity_rejects_corrupt_or_incomplete_artifacts(
 def test_shader_templates_compile_to_vulkan_1_4_spirv(tmp_path: Path) -> None:
     shader_source_dir = Path(__file__).parents[1] / "runtime-rs" / "shaders"
     shader_files = {
-        "linear_paired_bf16_768x2048.comp",
-        "embedding_lookup_batch_paired_bf16_32000x768_scale12.comp",
-        "linear_batch16_paired_bf16_768x2048.comp",
-        "linear_residual_batch16_row_major_bf16_2048x768.comp",
+        "linear_bf16_768x2048.comp",
+        "embedding_lookup_batch_bf16_32000x768_scale12.comp",
+        "linear_batch16_bf16_768x2048.comp",
+        "linear_residual_batch16_bf16_2048x768.comp",
         "linear_fp8_e4m3_b128x128_5120x17408.comp",
         "linear_batch16_fp8_e4m3_b128x128_5120x17408.comp",
         "linear_bias_fp8_e4m3_b128x128_5120x17408.comp",
         "linear_residual_fp8_e4m3_b128x128_17408x5120.comp",
         "linear_residual_batch16_fp8_e4m3_b128x128_17408x5120.comp",
-        "parallel_linear_batch16_2way_paired_bf16_1024x2560_2560.comp",
+        "parallel_linear_batch16_2way_bf16_1024x2560_2560.comp",
         "parallel_linear_silu_multiply_fp8_e4m3_b128x128_5120x17408.comp",
         "parallel_linear_silu_multiply_batch16_fp8_e4m3_b128x128_5120x17408.comp",
-        "parallel_linear_silu_multiply_batch16_paired_bf16_768x2048.comp",
+        "parallel_linear_silu_multiply_batch16_bf16_768x2048.comp",
         "per_layer_embedding_bf16_v32000_h768_p128_l2of6_eps1e-05_"
         "tes1_pes1_mps1_cs1__sc5.comp",
         "rms_norm_bf16_h768_eps1e-05_offset0.comp",

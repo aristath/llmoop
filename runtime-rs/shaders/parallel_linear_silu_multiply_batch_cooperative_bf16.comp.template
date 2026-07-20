@@ -18,7 +18,6 @@ layout(push_constant) uniform BatchControl { uint batch_width; } batch_control;
 
 const uint INPUT_SIZE = {{INPUT_SIZE}}u;
 const uint OUTPUT_SIZE = {{OUTPUT_SIZE}}u;
-const bool PAIRED_WEIGHT_LAYOUT = {{PAIRED_WEIGHT_LAYOUT}};
 const uint MATRIX_TILE = 16u;
 const uint OUTPUT_TILE = 64u;
 const uint BATCH_TILE = 64u;
@@ -28,16 +27,8 @@ shared bfloat16_t weight_tile[OUTPUT_TILE * MATRIX_TILE];
 shared bfloat16_t input_tile[MATRIX_TILE * BATCH_TILE];
 shared float result_tile[OUTPUT_TILE * BATCH_TILE];
 
-uint paired_weight_index(uint row, uint column) {
-    uint input_words = INPUT_SIZE / 2u;
-    uint word_index = 2u * (((row / 2u) * input_words) + (column / 2u)) + (row & 1u);
-    return word_index * 2u + (column & 1u);
-}
-
 uint weight_index(uint row, uint column) {
-    return PAIRED_WEIGHT_LAYOUT
-        ? paired_weight_index(row, column)
-        : row * INPUT_SIZE + column;
+    return row * INPUT_SIZE + column;
 }
 
 uint f32_to_bf16(float value) {
@@ -70,8 +61,7 @@ void main() {
     }
 
     for (uint input_start = 0u; input_start < INPUT_SIZE; input_start += MATRIX_TILE) {
-        bool stage_weight = PAIRED_WEIGHT_LAYOUT
-            || output_start + OUTPUT_TILE > OUTPUT_SIZE
+        bool stage_weight = output_start + OUTPUT_TILE > OUTPUT_SIZE
             || input_start + MATRIX_TILE > INPUT_SIZE;
         if (stage_weight) {
             for (uint index = lane; index < OUTPUT_TILE * MATRIX_TILE; index += 256u) {

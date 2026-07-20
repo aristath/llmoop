@@ -17,7 +17,6 @@ const uint INPUT_SIZE = {{INPUT_SIZE}}u;
 const uint INPUT_WORDS = (INPUT_SIZE + 1u) / 2u;
 {{OUTPUT_WORD_CONSTANTS}}
 const uint TOTAL_OUTPUT_WORDS = {{TOTAL_OUTPUT_WORDS}};
-const bool PAIRED_WEIGHT_LAYOUT = {{PAIRED_WEIGHT_LAYOUT}};
 
 shared float subgroup_lo[64];
 shared float subgroup_hi[64];
@@ -39,14 +38,8 @@ uint read_branch_weight(
     uint column_word,
     uint row_offset
 ) {
-    uint weight_index;
-    if (PAIRED_WEIGHT_LAYOUT) {
-        weight_index =
-            (2u * ((local_word_index * INPUT_WORDS) + column_word)) + row_offset;
-    } else {
-        uint row = (local_word_index * 2u) + row_offset;
-        weight_index = (row * INPUT_WORDS) + column_word;
-    }
+    uint row = (local_word_index * 2u) + row_offset;
+    uint weight_index = (row * INPUT_WORDS) + column_word;
 {{WEIGHT_READS}}
 }
 

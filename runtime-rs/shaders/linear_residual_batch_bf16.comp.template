@@ -17,7 +17,6 @@ const uint INPUT_SIZE = {{INPUT_SIZE}}u;
 const uint OUTPUT_SIZE = {{OUTPUT_SIZE}}u;
 const uint INPUT_WORDS = INPUT_SIZE / 2u;
 const uint OUTPUT_WORDS = OUTPUT_SIZE / 2u;
-const bool PAIRED_WEIGHT_LAYOUT = {{PAIRED_WEIGHT_LAYOUT}};
 
 shared float subgroup_lo[BATCH_TILE_WIDTH][64];
 shared float subgroup_hi[BATCH_TILE_WIDTH][64];
@@ -33,12 +32,7 @@ uint f32_to_bf16(float value) {
 float rounded_bf16(float value) { return bf16_to_f32(f32_to_bf16(value)); }
 
 uint read_weight(uint output_word, uint column_word, uint row_offset) {
-    uint index;
-    if (PAIRED_WEIGHT_LAYOUT) {
-        index = (2u * ((output_word * INPUT_WORDS) + column_word)) + row_offset;
-    } else {
-        index = (((output_word * 2u) + row_offset) * INPUT_WORDS) + column_word;
-    }
+    uint index = (((output_word * 2u) + row_offset) * INPUT_WORDS) + column_word;
     return weight.words[index];
 }
 

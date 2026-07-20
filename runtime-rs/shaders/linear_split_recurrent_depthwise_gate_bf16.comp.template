@@ -41,7 +41,6 @@ const uint INPUT_GATE_B_INDEX = {{INPUT_GATE_B_INDEX}}u;
 const uint OUTPUT_GATE_INDEX = {{OUTPUT_GATE_INDEX}}u;
 const uint INPUT_WORDS = INPUT_SIZE / 2u;
 const uint OUTPUT_WORDS = HIDDEN_SIZE / 2u;
-const bool PAIRED_WEIGHT_LAYOUT = {{PAIRED_WEIGHT_LAYOUT}};
 
 shared float subgroup_lo[3][64];
 shared float subgroup_hi[3][64];
@@ -64,14 +63,8 @@ uint read_projection_weight(
     uint row_offset
 ) {
     uint combined_word = (branch * OUTPUT_WORDS) + word_index;
-    uint weight_index;
-    if (PAIRED_WEIGHT_LAYOUT) {
-        weight_index =
-            (2u * ((combined_word * INPUT_WORDS) + column_word)) + row_offset;
-    } else {
-        uint row = (combined_word * 2u) + row_offset;
-        weight_index = (row * INPUT_WORDS) + column_word;
-    }
+    uint row = (combined_word * 2u) + row_offset;
+    uint weight_index = (row * INPUT_WORDS) + column_word;
     return projection_weight.words[weight_index];
 }
 

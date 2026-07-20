@@ -2958,13 +2958,12 @@ mod tests {
                 f32_to_bf16_bits(if row == column { 2.0 } else { 0.0 })
             })
             .collect::<Vec<_>>();
-        let paired_weight = bf16_row_pair_layout(&row_major_weight, 16, 16);
         let input = device.create_resident_buffer(512).unwrap();
         let output = device.create_resident_buffer(512).unwrap();
         let weight = device.create_resident_buffer(512).unwrap();
         input.write_bytes(&u16_bytes(&input_values)).unwrap();
         output.write_bytes(&vec![0; 512]).unwrap();
-        weight.write_bytes(&u16_bytes(&paired_weight)).unwrap();
+        weight.write_bytes(&u16_bytes(&row_major_weight)).unwrap();
         let dispatch = device
             .create_resident_kernel_dispatch(
                 &spirv_words,
@@ -3004,20 +3003,6 @@ mod tests {
             .iter()
             .flat_map(|value| value.to_le_bytes())
             .collect()
-    }
-
-    fn bf16_row_pair_layout(values: &[u16], rows: usize, columns: usize) -> Vec<u16> {
-        let mut paired = Vec::with_capacity(values.len());
-        for row in (0..rows).step_by(2) {
-            for column in (0..columns).step_by(2) {
-                paired
-                    .extend_from_slice(&values[row * columns + column..row * columns + column + 2]);
-                paired.extend_from_slice(
-                    &values[(row + 1) * columns + column..(row + 1) * columns + column + 2],
-                );
-            }
-        }
-        paired
     }
 
     fn u32_bytes(values: &[u32]) -> Vec<u8> {

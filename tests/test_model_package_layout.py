@@ -11,7 +11,6 @@ from llmoop.model_package import (
     CAUSAL_SCAN_LANE_TILE_WIDTH,
     SCALAR_BATCH_LANE_TILE_WIDTH,
     ROW_MAJOR_LAYOUT,
-    VULKAN_BF16_ROW_PAIR_LAYOUT,
     attention_workgroup_shape,
     causal_scan_batch_shader_file,
     causal_scan_batch_stages,
@@ -40,8 +39,8 @@ def test_compiler_selects_only_compatible_weight_shared_batch_kernels() -> None:
         "linear_residual_fp8_e4m3_b128x128_17408x5120.comp"
     ) == "linear_residual_batch16_fp8_e4m3_b128x128_17408x5120.comp"
     assert weight_shared_batch_shader_file(
-        "parallel_linear_2way_paired_bf16_1024x2560_2560.comp"
-    ) == "parallel_linear_batch16_2way_paired_bf16_1024x2560_2560.comp"
+        "parallel_linear_2way_bf16_1024x2560_2560.comp"
+    ) == "parallel_linear_batch16_2way_bf16_1024x2560_2560.comp"
     assert weight_shared_batch_shader_file(
         "parallel_linear_silu_multiply_fp8_e4m3_b128x128_5120x17408.comp"
     ) == (
@@ -49,14 +48,14 @@ def test_compiler_selects_only_compatible_weight_shared_batch_kernels() -> None:
         "b128x128_5120x17408.comp"
     )
     assert weight_shared_batch_shader_file(
-        "linear_paired_bf16_1024x1024.comp"
-    ) == "linear_batch16_paired_bf16_1024x1024.comp"
+        "linear_bf16_1024x1024.comp"
+    ) == "linear_batch16_bf16_1024x1024.comp"
     assert weight_shared_batch_shader_file(
         "linear_residual_bf16_1024x1024.comp"
-    ) == "linear_residual_batch16_row_major_bf16_1024x1024.comp"
+    ) == "linear_residual_batch16_bf16_1024x1024.comp"
     assert weight_shared_batch_shader_file(
-        "parallel_linear_silu_multiply_paired_bf16_1024x4096.comp"
-    ) == "parallel_linear_silu_multiply_batch16_paired_bf16_1024x4096.comp"
+        "parallel_linear_silu_multiply_bf16_1024x4096.comp"
+    ) == "parallel_linear_silu_multiply_batch16_bf16_1024x4096.comp"
     assert weight_shared_batch_shader_file(
         "split_bf16_2x16x256_head_interleaved.comp"
     ) == "split_batch16_bf16_2x16x256_head_interleaved.comp"
@@ -67,7 +66,7 @@ def test_compiler_selects_only_compatible_weight_shared_batch_kernels() -> None:
     assert weight_shared_batch_shader_file(
         "linear_fp8_e4m3_b127x128_5120x17408.comp"
     ) is None
-    assert weight_shared_batch_shader_file("linear_paired_bf16_1023x1024.comp") is None
+    assert weight_shared_batch_shader_file("linear_bf16_1023x1024.comp") is None
     assert frame_parallel_batch_shader_file(
         "rms_norm_batch16_bf16_h4096_eps1e-06_offset1.comp"
     ) == "rms_norm_batch1_bf16_h4096_eps1e-06_offset1.comp"
@@ -75,7 +74,7 @@ def test_compiler_selects_only_compatible_weight_shared_batch_kernels() -> None:
         "split_batch16_bf16_2x16x256_head_interleaved.comp"
     ) == "split_batch1_bf16_2x16x256_head_interleaved.comp"
     assert frame_parallel_batch_shader_file(
-        "linear_batch16_paired_bf16_4096x4096.comp"
+        "linear_batch16_bf16_4096x4096.comp"
     ) is None
 
 
@@ -115,7 +114,7 @@ def test_compiler_selects_stateful_causal_scan_kernels() -> None:
         "parallel_head_norm_rope_2way_temporal_bf16_h16_4_d256_r64_"
         "eps1e-06_offset1_theta10000000_half.comp"
     )
-    assert causal_scan_batch_shader_file("linear_paired_bf16_4096x4096.comp") is None
+    assert causal_scan_batch_shader_file("linear_bf16_4096x4096.comp") is None
     assert causal_scan_workgroup_count_x(
         "causal_conv1d_silu_bf16_c8192_k4.comp"
     ) == 64
@@ -171,25 +170,25 @@ def test_compiler_renders_temporal_attention_stages(tmp_path: Path) -> None:
 
 def test_compiler_selects_cooperative_bfloat16_projection_kernels() -> None:
     assert cooperative_bfloat16_batch_shader_file(
-        "linear_paired_bf16_1024x4096.comp"
-    ) == "linear_batch64_cooperative_paired_bf16_1024x4096.comp"
+        "linear_bf16_1024x4096.comp"
+    ) == "linear_batch64_cooperative_bf16_1024x4096.comp"
     assert cooperative_bfloat16_batch_shader_file(
         "linear_residual_bf16_4096x1024.comp"
-    ) == "linear_residual_batch64_cooperative_row_major_bf16_4096x1024.comp"
+    ) == "linear_residual_batch64_cooperative_bf16_4096x1024.comp"
     assert cooperative_bfloat16_batch_shader_file(
-        "parallel_linear_3way_paired_bf16_1024x1024_256_256.comp"
+        "parallel_linear_3way_bf16_1024x1024_256_256.comp"
     ) == (
-        "parallel_linear_batch64_cooperative_3way_paired_bf16_"
+        "parallel_linear_batch64_cooperative_3way_bf16_"
         "1024x1024_256_256.comp"
     )
     assert cooperative_bfloat16_batch_shader_file(
-        "parallel_linear_silu_multiply_paired_bf16_1024x4096.comp"
+        "parallel_linear_silu_multiply_bf16_1024x4096.comp"
     ) == (
-        "parallel_linear_silu_multiply_batch64_cooperative_paired_bf16_"
+        "parallel_linear_silu_multiply_batch64_cooperative_bf16_"
         "1024x4096.comp"
     )
     assert cooperative_bfloat16_workgroup_count_x(
-        "parallel_linear_3way_paired_bf16_1024x1024_256_256.comp"
+        "parallel_linear_3way_bf16_1024x1024_256_256.comp"
     ) == 24
     assert cooperative_bfloat16_batch_shader_file(
         "linear_fp8_e4m3_b128x128_1024x4096.comp"
@@ -200,7 +199,7 @@ def test_projection_pedal_compiles_ordered_target_native_and_scalar_implementati
     spec = pedal_kernel_spec(
         execution_index=0,
         node={"id": "project", "op": "linear"},
-        shader_file="linear_paired_bf16_1024x4096.comp",
+        shader_file="linear_bf16_1024x4096.comp",
         local_size_x=64,
         workgroup_count_x=2048,
     )
@@ -222,7 +221,7 @@ def test_projection_pedal_compiles_ordered_target_native_and_scalar_implementati
         "stages": [
             {
                 "shader_path": (
-                    "shaders/linear_batch64_cooperative_paired_bf16_1024x4096.comp"
+                    "shaders/linear_batch64_cooperative_bf16_1024x4096.comp"
                 ),
                 "local_size_x": 256,
                 "workgroup_count_x": 64,
@@ -234,7 +233,7 @@ def test_projection_pedal_compiles_ordered_target_native_and_scalar_implementati
         "device_requirements": {"vulkan_device_extensions": []},
         "stages": [
             {
-                "shader_path": "shaders/linear_batch16_paired_bf16_1024x4096.comp",
+                "shader_path": "shaders/linear_batch16_bf16_1024x4096.comp",
                 "local_size_x": 64,
                 "workgroup_count_x": 2048,
             }
@@ -248,11 +247,11 @@ def test_compiler_renders_weight_shared_pedal_batch_shaders(tmp_path: Path) -> N
         "rms_norm_batch16_bf16_h5120_eps1e-06_offset1.comp",
         "linear_batch16_fp8_e4m3_b128x128_5120x17408.comp",
         "linear_residual_batch16_fp8_e4m3_b128x128_17408x5120.comp",
-        "parallel_linear_batch16_2way_paired_bf16_1024x2560_2560.comp",
+        "parallel_linear_batch16_2way_bf16_1024x2560_2560.comp",
         "parallel_linear_silu_multiply_batch16_fp8_e4m3_b128x128_5120x17408.comp",
-        "linear_batch16_paired_bf16_1024x4096.comp",
-        "linear_residual_batch16_row_major_bf16_4096x1024.comp",
-        "parallel_linear_silu_multiply_batch16_paired_bf16_1024x4096.comp",
+        "linear_batch16_bf16_1024x4096.comp",
+        "linear_residual_batch16_bf16_4096x1024.comp",
+        "parallel_linear_silu_multiply_batch16_bf16_1024x4096.comp",
         "split_batch16_bf16_2x16x256_head_interleaved.comp",
         "sigmoid_multiply_batch16_bf16.comp",
     }
@@ -295,15 +294,11 @@ def test_compiler_renders_position_aware_temporal_head_norm_rope(
 def test_compiler_renders_cooperative_bfloat16_batch_shaders(tmp_path: Path) -> None:
     shader_source_dir = Path(__file__).parents[1] / "runtime-rs" / "shaders"
     shader_files = {
-        "linear_batch64_cooperative_paired_bf16_1024x4096.comp",
-        "linear_residual_batch64_cooperative_row_major_bf16_4096x1024.comp",
-        "parallel_linear_batch64_cooperative_3way_paired_bf16_"
+        "linear_batch64_cooperative_bf16_1024x4096.comp",
+        "linear_residual_batch64_cooperative_bf16_4096x1024.comp",
+        "parallel_linear_batch64_cooperative_3way_bf16_"
         "1024x1024_256_256.comp",
-        "parallel_linear_batch64_cooperative_3way_row_major_bf16_"
-        "1024x1024_256_256.comp",
-        "parallel_linear_silu_multiply_batch64_cooperative_paired_bf16_"
-        "1024x4096.comp",
-        "parallel_linear_silu_multiply_batch64_cooperative_row_major_bf16_"
+        "parallel_linear_silu_multiply_batch64_cooperative_bf16_"
         "1024x4096.comp",
     }
 
@@ -321,16 +316,16 @@ def test_compiler_renders_cooperative_bfloat16_batch_shaders(tmp_path: Path) -> 
         assert "{{" not in source
     direct_linear = (
         tmp_path
-        / "linear_residual_batch64_cooperative_row_major_bf16_4096x1024.comp"
+        / "linear_residual_batch64_cooperative_bf16_4096x1024.comp"
     ).read_text()
     direct_parallel = (
         tmp_path
-        / "parallel_linear_batch64_cooperative_3way_row_major_bf16_"
+        / "parallel_linear_batch64_cooperative_3way_bf16_"
         "1024x1024_256_256.comp"
     ).read_text()
     direct_fused = (
         tmp_path
-        / "parallel_linear_silu_multiply_batch64_cooperative_row_major_bf16_"
+        / "parallel_linear_silu_multiply_batch64_cooperative_bf16_"
         "1024x4096.comp"
     ).read_text()
     assert "weight.values," in direct_linear
@@ -369,7 +364,7 @@ def test_attention_tile_stays_within_portable_shared_memory_budget(
     assert shared_floats * 4 <= 32 * 1024
 
 
-def test_write_compiled_tensor_interleaves_bf16_row_pairs(tmp_path: Path) -> None:
+def test_write_compiled_tensor_preserves_canonical_row_major_order(tmp_path: Path) -> None:
     tensor_name = "matrix.weight"
     values = tuple(range(16))
     source_header = {
@@ -398,41 +393,24 @@ def test_write_compiled_tensor_interleaves_bf16_row_pairs(tmp_path: Path) -> Non
         },
         source=source,
         destination=destination,
-        layout=VULKAN_BF16_ROW_PAIR_LAYOUT,
+        layout=ROW_MAJOR_LAYOUT,
     )
 
     compiled = destination.read_bytes()
     header_bytes = struct.unpack("<Q", compiled[:8])[0]
     payload = compiled[8 + header_bytes :]
-    assert struct.unpack("<16H", payload) == (
-        0,
-        1,
-        4,
-        5,
-        2,
-        3,
-        6,
-        7,
-        8,
-        9,
-        12,
-        13,
-        10,
-        11,
-        14,
-        15,
-    )
+    assert struct.unpack("<16H", payload) == values
 
 
-def test_compiler_renders_paired_matrix_and_transducer_shaders(tmp_path: Path) -> None:
+def test_compiler_renders_row_major_matrix_and_transducer_shaders(tmp_path: Path) -> None:
     shader_source_dir = Path(__file__).parents[1] / "runtime-rs" / "shaders"
     shader_files = {
-        "linear_paired_bf16_768x2048.comp",
-        "linear_residual_paired_bf16_2048x768.comp",
-        "embedding_lookup_paired_bf16_32000x768_scale12.comp",
-        "embedding_lookup_batch_paired_bf16_32000x768_scale12.comp",
-        "tied_output_projection_paired_bf16_32000x768_scale0.166666667_to_f32.comp",
-        "tied_output_projection_batch4_paired_bf16_32000x768_scale0.166666667_to_f32.comp",
+        "linear_bf16_768x2048.comp",
+        "linear_residual_bf16_2048x768.comp",
+        "embedding_lookup_bf16_32000x768_scale12.comp",
+        "embedding_lookup_batch_bf16_32000x768_scale12.comp",
+        "tied_output_projection_bf16_32000x768_scale0.166666667_to_f32.comp",
+        "tied_output_projection_batch4_bf16_32000x768_scale0.166666667_to_f32.comp",
     }
 
     copy_shader_templates(shader_source_dir, tmp_path, shader_files)
@@ -440,39 +418,39 @@ def test_compiler_renders_paired_matrix_and_transducer_shaders(tmp_path: Path) -
     for shader_file in shader_files:
         shader = (tmp_path / shader_file).read_text()
         assert "{{" not in shader
-        assert "uvec2 words[]" in shader
+        assert "uint words[]" in shader
     assert (
         "const uint INPUT_SIZE = 768u;"
-        in (tmp_path / "linear_paired_bf16_768x2048.comp").read_text()
+        in (tmp_path / "linear_bf16_768x2048.comp").read_text()
     )
     assert (
         "const uint VOCAB_SIZE = 32000u;"
         in (
-            tmp_path / "embedding_lookup_paired_bf16_32000x768_scale12.comp"
+            tmp_path / "embedding_lookup_bf16_32000x768_scale12.comp"
         ).read_text()
     )
     assert (
         "gl_WorkGroupID.y"
         in (
-            tmp_path / "embedding_lookup_batch_paired_bf16_32000x768_scale12.comp"
+            tmp_path / "embedding_lookup_batch_bf16_32000x768_scale12.comp"
         ).read_text()
     )
     assert (
         "const float EMBEDDING_SCALE = 12;"
         in (
-            tmp_path / "embedding_lookup_paired_bf16_32000x768_scale12.comp"
+            tmp_path / "embedding_lookup_bf16_32000x768_scale12.comp"
         ).read_text()
     )
     assert (
         "const float OUTPUT_SCALE = 0.166666667;"
         in (
             tmp_path
-            / "tied_output_projection_paired_bf16_32000x768_scale0.166666667_to_f32.comp"
+            / "tied_output_projection_bf16_32000x768_scale0.166666667_to_f32.comp"
         ).read_text()
     )
     batched_projection = (
         tmp_path
-        / "tied_output_projection_batch4_paired_bf16_32000x768_scale0.166666667_to_f32.comp"
+        / "tied_output_projection_batch4_bf16_32000x768_scale0.166666667_to_f32.comp"
     ).read_text()
     assert "const uint BATCH_TILE_WIDTH = 4u;" in batched_projection
     assert "layout(push_constant) uniform BatchControl" in batched_projection
@@ -481,21 +459,17 @@ def test_compiler_renders_paired_matrix_and_transducer_shaders(tmp_path: Path) -
 
 def test_compiler_renders_direct_three_way_linear_split_shaders(tmp_path: Path) -> None:
     shader_source_dir = Path(__file__).parents[1] / "runtime-rs" / "shaders"
-    paired = "linear_split_3way_paired_bf16_1024x1024_1024_1024.comp"
-    row_major = "linear_split_3way_row_major_bf16_768x2048_1024_1024.comp"
+    shader_file = "linear_split_3way_bf16_1024x1024_1024_1024.comp"
 
-    copy_shader_templates(shader_source_dir, tmp_path, {paired, row_major})
+    copy_shader_templates(shader_source_dir, tmp_path, {shader_file})
 
-    paired_source = (tmp_path / paired).read_text()
-    row_major_source = (tmp_path / row_major).read_text()
-    assert "const uint INPUT_SIZE = 1024u;" in paired_source
-    assert "const uint PART_A_WIDTH = 1024u;" in paired_source
-    assert "const bool PAIRED_WEIGHT_LAYOUT = true;" in paired_source
-    assert "const bool PAIRED_WEIGHT_LAYOUT = false;" in row_major_source
-    assert "binding = 4) readonly buffer Weight" in paired_source
-    assert "output_c.words" in paired_source
-    assert "{{" not in paired_source
-    assert "{{" not in row_major_source
+    source = (tmp_path / shader_file).read_text()
+    assert "const uint INPUT_SIZE = 1024u;" in source
+    assert "const uint PART_A_WIDTH = 1024u;" in source
+    assert "binding = 4) readonly buffer Weight" in source
+    assert "output_c.words" in source
+    assert "PAIRED_WEIGHT_LAYOUT" not in source
+    assert "{{" not in source
 
 
 def test_compiler_renders_row_major_per_layer_embedding_shader(tmp_path: Path) -> None:
@@ -521,8 +495,8 @@ def test_compiler_renders_row_major_per_layer_embedding_shader(tmp_path: Path) -
 
 def test_compiler_renders_parallel_linear_shaders(tmp_path: Path) -> None:
     shader_source_dir = Path(__file__).parents[1] / "runtime-rs" / "shaders"
-    pair = "parallel_linear_2way_paired_bf16_1024x2560_2560.comp"
-    triple = "parallel_linear_3way_row_major_bf16_1024x1024_512_512.comp"
+    pair = "parallel_linear_2way_bf16_1024x2560_2560.comp"
+    triple = "parallel_linear_3way_bf16_1024x1024_512_512.comp"
 
     copy_shader_templates(shader_source_dir, tmp_path, {pair, triple})
 
@@ -531,10 +505,10 @@ def test_compiler_renders_parallel_linear_shaders(tmp_path: Path) -> None:
     assert "binding = 3) readonly buffer WeightA" in pair_source
     assert "binding = 4) readonly buffer WeightB" in pair_source
     assert "const uint OUTPUT_A_WORDS = 2560u / 2u;" in pair_source
-    assert "const bool PAIRED_WEIGHT_LAYOUT = true;" in pair_source
     assert "binding = 6) readonly buffer WeightC" in triple_source
     assert "const uint OUTPUT_C_WORDS = 512u / 2u;" in triple_source
-    assert "const bool PAIRED_WEIGHT_LAYOUT = false;" in triple_source
+    assert "PAIRED_WEIGHT_LAYOUT" not in pair_source
+    assert "PAIRED_WEIGHT_LAYOUT" not in triple_source
     assert "{{" not in pair_source
     assert "{{" not in triple_source
 
@@ -544,7 +518,7 @@ def test_compiler_renders_fused_parallel_ffn_projection_shader(
 ) -> None:
     shader_source_dir = Path(__file__).parents[1] / "runtime-rs" / "shaders"
     shader_file = (
-        "parallel_linear_silu_multiply_paired_bf16_1024x2560.comp"
+        "parallel_linear_silu_multiply_bf16_1024x2560.comp"
     )
 
     copy_shader_templates(shader_source_dir, tmp_path, {shader_file})
@@ -554,7 +528,7 @@ def test_compiler_renders_fused_parallel_ffn_projection_shader(
     assert "binding = 3) readonly buffer UpWeight" in source
     assert "const uint INPUT_SIZE = 1024u;" in source
     assert "const uint OUTPUT_SIZE = 2560u;" in source
-    assert "const bool PAIRED_WEIGHT_LAYOUT = true;" in source
+    assert "PAIRED_WEIGHT_LAYOUT" not in source
     assert "rounded_silu" in source
     assert "{{" not in source
 
@@ -712,7 +686,7 @@ def test_compiler_renders_projected_recurrent_depthwise_shader(
 ) -> None:
     shader_source_dir = Path(__file__).parents[1] / "runtime-rs" / "shaders"
     shader_file = (
-        "linear_split_recurrent_depthwise_gate_paired_bf16_"
+        "linear_split_recurrent_depthwise_gate_bf16_"
         "1024x1024_k3_ig0_2_og1.comp"
     )
 
@@ -727,7 +701,7 @@ def test_compiler_renders_projected_recurrent_depthwise_shader(
     assert "const uint INPUT_GATE_A_INDEX = 0u;" in source
     assert "const uint INPUT_GATE_B_INDEX = 2u;" in source
     assert "const uint OUTPUT_GATE_INDEX = 1u;" in source
-    assert "const bool PAIRED_WEIGHT_LAYOUT = true;" in source
+    assert "PAIRED_WEIGHT_LAYOUT" not in source
     assert "{{" not in source
 
 
@@ -753,7 +727,7 @@ def test_parallel_linear_shader_selector_rejects_invalid_metadata_and_layout() -
             parameter_id: {
                 "dtype": "BF16",
                 "shape": [512, 1024],
-                "layout": VULKAN_BF16_ROW_PAIR_LAYOUT,
+                "layout": ROW_MAJOR_LAYOUT,
             }
             for parameter_id in node["params"]
         }
@@ -951,7 +925,7 @@ def test_compiler_renders_biased_recurrent_and_windowed_attention_pedals(
 ) -> None:
     shader_source_dir = Path(__file__).parents[1] / "runtime-rs" / "shaders"
     shader_files = {
-        "linear_bias_paired_bf16_16x24.comp",
+        "linear_bias_bf16_16x24.comp",
         "gelu_tanh_bf16_24.comp",
         "rg_lru_step_bf16_h16_b2x8_k4__sc13.comp",
         "gqa_attention_bf16_q2_kv1_d8_scale0.353553391_w8__sc6.comp",
@@ -961,7 +935,7 @@ def test_compiler_renders_biased_recurrent_and_windowed_attention_pedals(
 
     copy_shader_templates(shader_source_dir, tmp_path, shader_files)
 
-    linear = (tmp_path / "linear_bias_paired_bf16_16x24.comp").read_text()
+    linear = (tmp_path / "linear_bias_bf16_16x24.comp").read_text()
     recurrent = (tmp_path / "rg_lru_step_bf16_h16_b2x8_k4__sc13.comp").read_text()
     attention = (
         tmp_path / "gqa_attention_bf16_q2_kv1_d8_scale0.353553391_w8__sc6.comp"
