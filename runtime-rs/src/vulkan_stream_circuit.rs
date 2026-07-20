@@ -5966,12 +5966,11 @@ impl VulkanResidentPedalBatchSliceRunner {
         device: &VulkanComputeDevice,
         slice: &VulkanResidentInProcessPlacedStreamProcessorDevice,
         lane_capacity: usize,
-        weight_shared_tile_width: usize,
         execution_mode: VulkanPedalBatchExecutionMode,
     ) -> Result<Self, VulkanResidentInProcessPlacedRuntimeError> {
-        if lane_capacity == 0 || weight_shared_tile_width == 0 {
+        if lane_capacity == 0 {
             return Err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop(
-                VulkanError("pedal batch lane tile width is zero".to_string()),
+                VulkanError("pedal batch lane capacity is zero".to_string()),
             ));
         }
         let (signal_buffer_indices, signal_buffer_plan) =
@@ -6027,13 +6026,11 @@ impl VulkanResidentPedalBatchSliceRunner {
             });
             if let Some(batch_artifact) = batch_artifact {
                 if batch_artifact.batch_mode == VulkanResidentPedalKernelBatchMode::CausalScan
-                    && batch_artifact
-                        .lane_tile_width
-                        .is_none_or(|tile_width| lane_capacity > tile_width)
+                    && lane_capacity > batch_artifact.lane_tile_width
                 {
                     return Err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop(
                         VulkanError(format!(
-                            "causal scan kernel {}.{} cannot execute {lane_capacity} lanes with tile width {:?}",
+                            "causal scan kernel {}.{} cannot execute {lane_capacity} lanes with tile width {}",
                             dispatch.pedal_id, dispatch.node_id, batch_artifact.lane_tile_width
                         )),
                     ));
@@ -6079,7 +6076,7 @@ impl VulkanResidentPedalBatchSliceRunner {
                         match batch_artifact.batch_mode {
                             VulkanResidentPedalKernelBatchMode::WeightShared => u32::try_from(
                                 lane_capacity
-                                    .checked_add(weight_shared_tile_width - 1)
+                                    .checked_add(batch_artifact.lane_tile_width - 1)
                                     .ok_or_else(|| {
                                         VulkanResidentInProcessPlacedRuntimeError::BackendLoop(
                                             VulkanError(
@@ -6088,7 +6085,7 @@ impl VulkanResidentPedalBatchSliceRunner {
                                             ),
                                         )
                                     })?
-                                    / weight_shared_tile_width,
+                                    / batch_artifact.lane_tile_width,
                             )
                             .map_err(|_| {
                                 VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(
@@ -6471,7 +6468,6 @@ impl VulkanResidentPlacedPedalBatchRunner {
         devices: &BTreeMap<String, Rc<VulkanComputeDevice>>,
         placed_slices: &[VulkanResidentInProcessPlacedStreamProcessorDevice],
         lane_capacity: usize,
-        weight_shared_tile_width: usize,
         execution_mode: VulkanPedalBatchExecutionMode,
     ) -> Result<Self, VulkanResidentInProcessPlacedRuntimeError> {
         let slices = placed_slices
@@ -6486,7 +6482,6 @@ impl VulkanResidentPlacedPedalBatchRunner {
                     device,
                     slice,
                     lane_capacity,
-                    weight_shared_tile_width,
                     execution_mode,
                 )
             })
@@ -9078,7 +9073,6 @@ pub struct VulkanResidentModelPackageManifest {
     pub activation_element_bytes: Option<usize>,
     pub max_context_activations: usize,
     pub required_vulkan_device_extensions: Vec<String>,
-    pub pedal_batch_lane_tile_width: u32,
     pub input_transducer: VulkanResidentInputEmbeddingTransducerPackageSpec,
     pub output_transducer: VulkanResidentOutputTransducerPackageSpec,
     pub sampler: VulkanResidentSamplerPackageSpec,
@@ -9589,8 +9583,11 @@ fn validate_resident_package_paths(
     for execution in &manifest.pedal_executions {
         for kernel in &execution.kernels {
             validate_resident_package_relative_path("pedal kernel shader", &kernel.shader_path)?;
-            if let Some(path) = &kernel.batch_shader_path {
-                validate_resident_package_relative_path("pedal batch kernel shader", path)?;
+            for implementation in &kernel.batch_implementations {
+                validate_resident_package_relative_path(
+                    "pedal batch implementation shader",
+                    &implementation.shader_path,
+                )?;
             }
         }
     }
@@ -9609,10 +9606,10 @@ fn validate_resident_package_paths(
                     "draft pedal kernel shader",
                     &kernel.shader_path,
                 )?;
-                if let Some(path) = &kernel.batch_shader_path {
+                for implementation in &kernel.batch_implementations {
                     validate_resident_package_relative_path(
-                        "draft pedal batch kernel shader",
-                        path,
+                        "draft pedal batch implementation shader",
+                        &implementation.shader_path,
                     )?;
                 }
             }
@@ -9643,7 +9640,12 @@ fn validate_resident_package_artifact_integrity(
     });
     let kernel_shaders = manifest.pedal_executions.iter().flat_map(|execution| {
         execution.kernels.iter().flat_map(|kernel| {
-            std::iter::once(kernel.shader_path.clone()).chain(kernel.batch_shader_path.clone())
+            std::iter::once(kernel.shader_path.clone()).chain(
+                kernel
+                    .batch_implementations
+                    .iter()
+                    .map(|implementation| implementation.shader_path.clone()),
+            )
         })
     });
     let draft_shaders = manifest.speculative_decoders.iter().flat_map(|decoder| {
@@ -9652,8 +9654,12 @@ fn validate_resident_package_artifact_integrity(
             .iter()
             .flat_map(|execution| {
                 execution.kernels.iter().flat_map(|kernel| {
-                    std::iter::once(kernel.shader_path.clone())
-                        .chain(kernel.batch_shader_path.clone())
+                    std::iter::once(kernel.shader_path.clone()).chain(
+                        kernel
+                            .batch_implementations
+                            .iter()
+                            .map(|implementation| implementation.shader_path.clone()),
+                    )
                 })
             })
             .chain([
@@ -10458,12 +10464,25 @@ pub struct VulkanResidentPedalKernelSpec {
     pub local_size_x: u32,
     pub workgroup_count_x: u32,
     pub batch_mode: VulkanResidentPedalKernelBatchMode,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub batch_shader_path: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub batch_lane_tile_width: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub batch_workgroup_count_x: Option<u32>,
+    pub batch_implementations: Vec<VulkanResidentPedalBatchImplementationSpec>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VulkanResidentPedalBatchImplementationSpec {
+    pub shader_path: String,
+    pub local_size_x: u32,
+    pub workgroup_count_x: u32,
+    pub lane_tile_width: u32,
+    pub device_requirements: VulkanResidentVulkanDeviceRequirements,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VulkanResidentVulkanDeviceRequirements {
+    pub vulkan_device_extensions: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cooperative_bfloat16_shape: Option<[u32; 3]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subgroup_size: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -10538,7 +10557,7 @@ struct VulkanResidentPedalBatchKernelArtifact {
     pedal_id: String,
     node_id: String,
     batch_mode: VulkanResidentPedalKernelBatchMode,
-    lane_tile_width: Option<usize>,
+    lane_tile_width: usize,
     spirv_words: Vec<u32>,
     local_size_x: u32,
     workgroup_count_x: u32,
@@ -10729,6 +10748,7 @@ impl VulkanResidentModelPackageDeviceSlice {
             &pedal_kernel_shaders,
         )?;
         let batch_kernels = load_resident_pedal_batch_kernels(
+            device,
             manifest_dir,
             &runtime_model.pedal_executions,
             &mounted_bound,
@@ -10792,7 +10812,6 @@ pub struct VulkanResidentInProcessPlacedModelPackage {
     tied_projection_spirv_words: Vec<u32>,
     tied_projection_batch_spirv_words: Vec<u32>,
     projection_batch_lane_tile_width: u32,
-    pedal_batch_lane_tile_width: u32,
     sampler_kernels: Vec<VulkanResidentSamplerKernelArtifact>,
     input_transducer_spec: VulkanResidentInputEmbeddingTransducerSpec,
     output_transducer_spec: VulkanResidentOutputTransducerSpec,
@@ -11879,7 +11898,6 @@ impl VulkanResidentInProcessPlacedModelPackage {
                 .package
                 .output_transducer
                 .projection_batch_lane_tile_width,
-            pedal_batch_lane_tile_width: runtime_model.package.pedal_batch_lane_tile_width,
             sampler_kernels,
             input_transducer_spec: runtime_model.package.input_transducer.spec.clone(),
             output_transducer_spec: runtime_model.package.output_transducer.spec.clone(),
@@ -12268,17 +12286,10 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
             .as_ref()
             .is_none_or(|runner| runner.lane_capacity < transaction_width)
         {
-            let tile_width =
-                usize::try_from(self.model.pedal_batch_lane_tile_width).map_err(|_| {
-                    VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(
-                        "pedal batch lane tile width exceeds usize".to_string(),
-                    ))
-                })?;
             let runner = VulkanResidentPlacedPedalBatchRunner::new(
                 devices,
                 &self.device_slices,
                 transaction_width,
-                tile_width,
                 VulkanPedalBatchExecutionMode::IndependentCandidates,
             )?;
             *self.pedal_batch_execution.borrow_mut() = Some(runner);
@@ -12453,7 +12464,7 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
                 .filter(|artifact| {
                     artifact.batch_mode == VulkanResidentPedalKernelBatchMode::CausalScan
                 })
-                .filter_map(|artifact| artifact.lane_tile_width)
+                .map(|artifact| artifact.lane_tile_width)
                 .min()
             {
                 width = width.min(causal_scan_tile_width);
@@ -12497,16 +12508,10 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
                 "temporal pipeline is empty".to_string(),
             ))
         })?;
-        let tile_width = usize::try_from(self.model.pedal_batch_lane_tile_width).map_err(|_| {
-            VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(
-                "temporal pedal tile width exceeds usize".to_string(),
-            ))
-        })?;
         let pedalboard = VulkanResidentPlacedPedalBatchRunner::new(
             devices,
             &self.device_slices,
             block_width,
-            tile_width,
             VulkanPedalBatchExecutionMode::CausalSequence,
         )?;
         let input_device = devices.get(&self.model.input_device_id).ok_or_else(|| {
@@ -15990,29 +15995,31 @@ fn validate_pedal_executions(
                     package_id, pedal.pedal_id, kernel.node_id
                 )));
             }
+            let implementations_are_valid =
+                kernel.batch_implementations.iter().all(|implementation| {
+                    let extensions = &implementation.device_requirements.vulkan_device_extensions;
+                    !implementation.shader_path.is_empty()
+                        && implementation.local_size_x > 0
+                        && implementation.workgroup_count_x > 0
+                        && implementation.lane_tile_width > 0
+                        && extensions.iter().all(|extension| !extension.is_empty())
+                        && extensions.windows(2).all(|pair| pair[0] < pair[1])
+                        && implementation
+                            .device_requirements
+                            .cooperative_bfloat16_shape
+                            .is_none_or(|shape| shape.into_iter().all(|dimension| dimension > 0))
+                        && implementation
+                            .device_requirements
+                            .subgroup_size
+                            .is_none_or(|subgroup_size| subgroup_size > 0)
+                });
             let valid_batch_contract = match kernel.batch_mode {
                 VulkanResidentPedalKernelBatchMode::SerialLanes => {
-                    kernel.batch_shader_path.is_none()
-                        && kernel.batch_lane_tile_width.is_none()
-                        && kernel.batch_workgroup_count_x.is_none()
+                    kernel.batch_implementations.is_empty()
                 }
-                VulkanResidentPedalKernelBatchMode::WeightShared => {
-                    kernel
-                        .batch_shader_path
-                        .as_deref()
-                        .is_some_and(|path| !path.is_empty())
-                        && kernel.batch_lane_tile_width.is_none()
-                        && kernel.batch_workgroup_count_x.is_none()
-                }
-                VulkanResidentPedalKernelBatchMode::CausalScan => {
-                    kernel
-                        .batch_shader_path
-                        .as_deref()
-                        .is_some_and(|path| !path.is_empty())
-                        && kernel.batch_lane_tile_width.is_some_and(|width| width > 0)
-                        && kernel
-                            .batch_workgroup_count_x
-                            .is_some_and(|workgroups| workgroups > 0)
+                VulkanResidentPedalKernelBatchMode::WeightShared
+                | VulkanResidentPedalKernelBatchMode::CausalScan => {
+                    !kernel.batch_implementations.is_empty() && implementations_are_valid
                 }
             };
             if !valid_batch_contract {
@@ -16047,12 +16054,6 @@ fn validate_generation_execution_contract(
     {
         return Err(VulkanResidentTokenModelPackageError::new(format!(
             "resident model package {:?} has invalid required Vulkan device extensions",
-            manifest.package_id
-        )));
-    }
-    if manifest.pedal_batch_lane_tile_width == 0 {
-        return Err(VulkanResidentTokenModelPackageError::new(format!(
-            "resident model package {:?} has a zero pedal batch lane tile width",
             manifest.package_id
         )));
     }
@@ -16965,6 +16966,7 @@ fn loaded_kernel_pack_from_package_shader_refs(
 }
 
 fn load_resident_pedal_batch_kernels(
+    device: &VulkanComputeDevice,
     manifest_dir: &Path,
     pedal_executions: &[VulkanResidentPedalExecutionSpec],
     mounted_bound: &VulkanMountedPlacedBoundDispatchPlan,
@@ -16984,28 +16986,54 @@ fn load_resident_pedal_batch_kernels(
             })
         })
         .map(|(pedal, kernel)| {
-            let shader_path = kernel.batch_shader_path.as_deref().ok_or_else(|| {
+            let implementation = kernel
+                .batch_implementations
+                .iter()
+                .find(|implementation| {
+                    batch_implementation_is_supported(device, implementation)
+                })
+                .ok_or_else(|| {
                 VulkanResidentTokenModelPackageError::new(format!(
-                    "weight-shared pedal kernel {}.{} has no batch shader",
-                    pedal.pedal_id, kernel.node_id
+                    "pedal kernel {}.{} has no batch implementation compatible with Vulkan device {:?}",
+                    pedal.pedal_id,
+                    kernel.node_id,
+                    device.device_name(),
                 ))
             })?;
             Ok(VulkanResidentPedalBatchKernelArtifact {
                 pedal_id: pedal.pedal_id.clone(),
                 node_id: kernel.node_id.clone(),
                 batch_mode: kernel.batch_mode,
-                lane_tile_width: kernel.batch_lane_tile_width.map(|width| width as usize),
+                lane_tile_width: implementation.lane_tile_width as usize,
                 spirv_words: load_required_resident_model_package_shader(
                     manifest_dir,
-                    shader_path,
+                    &implementation.shader_path,
                 )?,
-                local_size_x: kernel.local_size_x,
-                workgroup_count_x: kernel
-                    .batch_workgroup_count_x
-                    .unwrap_or(kernel.workgroup_count_x),
+                local_size_x: implementation.local_size_x,
+                workgroup_count_x: implementation.workgroup_count_x,
             })
         })
         .collect()
+}
+
+fn batch_implementation_is_supported(
+    device: &VulkanComputeDevice,
+    implementation: &VulkanResidentPedalBatchImplementationSpec,
+) -> bool {
+    device.supports_compute_local_size_x(implementation.local_size_x)
+        && implementation
+            .device_requirements
+            .vulkan_device_extensions
+            .iter()
+            .all(|extension| device.has_enabled_device_extension(extension))
+        && implementation
+            .device_requirements
+            .cooperative_bfloat16_shape
+            .is_none_or(|[m, n, k]| device.supports_cooperative_bfloat16_shape(m, n, k))
+        && implementation
+            .device_requirements
+            .subgroup_size
+            .is_none_or(|subgroup_size| device.subgroup_size() == subgroup_size)
 }
 
 fn load_required_resident_model_package_shader(
@@ -23338,7 +23366,17 @@ mod tests {
 
     #[test]
     fn pedal_batch_execution_contract_requires_matching_shader_mode() {
-        let execution = |batch_mode, batch_shader_path| {
+        let execution = |batch_mode, batch_shader_path: Option<String>| {
+            let batch_implementations = batch_shader_path
+                .into_iter()
+                .map(|shader_path| VulkanResidentPedalBatchImplementationSpec {
+                    shader_path,
+                    local_size_x: 64,
+                    workgroup_count_x: 1,
+                    lane_tile_width: 16,
+                    device_requirements: VulkanResidentVulkanDeviceRequirements::default(),
+                })
+                .collect();
             vec![VulkanResidentPedalExecutionSpec {
                 pedal_id: "processor".to_string(),
                 operator_type: "fixture".to_string(),
@@ -23351,13 +23389,7 @@ mod tests {
                     local_size_x: 64,
                     workgroup_count_x: 1,
                     batch_mode,
-                    batch_shader_path,
-                    batch_lane_tile_width: (batch_mode
-                        == VulkanResidentPedalKernelBatchMode::CausalScan)
-                        .then_some(64),
-                    batch_workgroup_count_x: (batch_mode
-                        == VulkanResidentPedalKernelBatchMode::CausalScan)
-                        .then_some(1),
+                    batch_implementations,
                 }],
             }]
         };
@@ -23604,6 +23636,50 @@ mod tests {
                 "F32 value {index} differs: actual={actual}, expected={expected}, tolerance={max_absolute_error}"
             );
         }
+    }
+
+    fn numeric_state_error(actual: &[u8], expected: &[u8], dtype: &str) -> (f64, f64) {
+        assert_eq!(actual.len(), expected.len());
+        let (squared_error, squared_reference, max_absolute_error, count) = match dtype {
+            "BF16" => actual.chunks_exact(2).zip(expected.chunks_exact(2)).fold(
+                (0.0, 0.0, 0.0_f64, 0usize),
+                |totals, (actual, expected)| {
+                    let actual = f64::from(f32::from_bits(
+                        u32::from(u16::from_le_bytes([actual[0], actual[1]])) << 16,
+                    ));
+                    let expected = f64::from(f32::from_bits(
+                        u32::from(u16::from_le_bytes([expected[0], expected[1]])) << 16,
+                    ));
+                    let error = (actual - expected).abs();
+                    (
+                        totals.0 + error * error,
+                        totals.1 + expected * expected,
+                        totals.2.max(error),
+                        totals.3 + 1,
+                    )
+                },
+            ),
+            "F32" => actual.chunks_exact(4).zip(expected.chunks_exact(4)).fold(
+                (0.0, 0.0, 0.0_f64, 0usize),
+                |totals, (actual, expected)| {
+                    let actual = f64::from(f32::from_le_bytes(actual.try_into().unwrap()));
+                    let expected = f64::from(f32::from_le_bytes(expected.try_into().unwrap()));
+                    let error = (actual - expected).abs();
+                    (
+                        totals.0 + error * error,
+                        totals.1 + expected * expected,
+                        totals.2.max(error),
+                        totals.3 + 1,
+                    )
+                },
+            ),
+            other => panic!("unsupported state dtype {other:?}"),
+        };
+        assert!(count > 0);
+        (
+            (squared_error / squared_reference.max(f64::EPSILON)).sqrt(),
+            max_absolute_error,
+        )
     }
 
     fn assert_f32_bits_close(
@@ -32787,6 +32863,24 @@ mod tests {
             }
         };
         let manifest = VulkanResidentModelPackageManifest::from_json_file(&manifest_path).unwrap();
+        let state_dtypes = manifest
+            .circuit_graph
+            .pedals
+            .iter()
+            .flat_map(|pedal| {
+                pedal.state.state_ports.iter().map(|state| {
+                    (
+                        (pedal.pedal_id.clone(), state.id.clone()),
+                        state
+                            .extra
+                            .get("dtype")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap()
+                            .to_string(),
+                    )
+                })
+            })
+            .collect::<BTreeMap<_, _>>();
         let runtime_model = manifest
             .mount_runtime_patch_controls(None, &BTreeMap::new(), &[], None)
             .unwrap();
@@ -32864,19 +32958,33 @@ mod tests {
             {
                 assert_eq!(temporal_state.pedal_id, scalar_state.pedal_id);
                 assert_eq!(temporal_state.state_id, scalar_state.state_id);
-                assert_eq!(
-                    temporal_state
-                        .buffer
-                        .read_bytes(temporal_state.byte_capacity)
-                        .unwrap(),
-                    scalar_state
-                        .buffer
-                        .read_bytes(scalar_state.byte_capacity)
-                        .unwrap(),
-                    "state mismatch in {}.{}",
-                    temporal_state.pedal_id,
-                    temporal_state.state_id
-                );
+                let temporal_bytes = temporal_state
+                    .buffer
+                    .read_bytes(temporal_state.byte_capacity)
+                    .unwrap();
+                let scalar_bytes = scalar_state
+                    .buffer
+                    .read_bytes(scalar_state.byte_capacity)
+                    .unwrap();
+                if temporal_bytes != scalar_bytes {
+                    let key = (
+                        temporal_state.pedal_id.clone(),
+                        temporal_state.state_id.clone(),
+                    );
+                    let dtype = state_dtypes.get(&key).unwrap();
+                    let (relative_rmse, max_absolute_error) =
+                        numeric_state_error(&temporal_bytes, &scalar_bytes, dtype);
+                    eprintln!(
+                        "state error {}.{} ({dtype}): relative_rmse={relative_rmse:.6}, max_absolute_error={max_absolute_error:.6}",
+                        temporal_state.pedal_id, temporal_state.state_id
+                    );
+                    assert!(
+                        relative_rmse.is_finite() && relative_rmse < 0.02,
+                        "state mismatch in {}.{} has relative RMSE {relative_rmse}",
+                        temporal_state.pedal_id,
+                        temporal_state.state_id,
+                    );
+                }
             }
         }
     }

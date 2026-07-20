@@ -605,7 +605,6 @@ class CompiledPackageTest(unittest.TestCase):
 
         self.assertNotIn("reusable_kernel_shaders", manifest)
         executions = manifest["pedal_executions"]
-        self.assertEqual(4, manifest["pedal_batch_lane_tile_width"])
         processor_pedals = [
             pedal
             for pedal in manifest["circuit_graph"]["pedals"]
@@ -641,15 +640,14 @@ class CompiledPackageTest(unittest.TestCase):
                     {"serial_lanes", "weight_shared", "causal_scan"},
                 )
                 if kernel["batch_mode"] in {"weight_shared", "causal_scan"}:
-                    self.assertTrue(kernel["batch_shader_path"].endswith(".spv"))
+                    self.assertGreaterEqual(len(kernel["batch_implementations"]), 1)
+                    for implementation in kernel["batch_implementations"]:
+                        self.assertTrue(implementation["shader_path"].endswith(".spv"))
+                        self.assertGreater(implementation["lane_tile_width"], 0)
+                        self.assertGreater(implementation["workgroup_count_x"], 0)
+                        self.assertIn("device_requirements", implementation)
                 else:
-                    self.assertNotIn("batch_shader_path", kernel)
-                if kernel["batch_mode"] == "causal_scan":
-                    self.assertGreater(kernel["batch_lane_tile_width"], 0)
-                    self.assertGreater(kernel["batch_workgroup_count_x"], 0)
-                else:
-                    self.assertNotIn("batch_lane_tile_width", kernel)
-                    self.assertNotIn("batch_workgroup_count_x", kernel)
+                    self.assertEqual([], kernel["batch_implementations"])
                 if node["op"] in {
                     "scaled_dot_product_attention",
                     "append_scaled_dot_product_attention",
@@ -688,10 +686,10 @@ class CompiledPackageTest(unittest.TestCase):
                 for kernel in execution["kernels"]
             ),
             *(
-                kernel["batch_shader_path"]
+                implementation["shader_path"]
                 for execution in manifest["pedal_executions"]
                 for kernel in execution["kernels"]
-                if "batch_shader_path" in kernel
+                for implementation in kernel["batch_implementations"]
             ),
         ]
 

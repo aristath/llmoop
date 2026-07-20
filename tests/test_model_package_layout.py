@@ -9,14 +9,17 @@ import pytest
 from llmoop.compilation import ModelCompileError
 from llmoop.model_package import (
     CAUSAL_SCAN_LANE_TILE_WIDTH,
-    PEDAL_BATCH_LANE_TILE_WIDTH,
+    SCALAR_BATCH_LANE_TILE_WIDTH,
     ROW_MAJOR_LAYOUT,
     VULKAN_BF16_ROW_PAIR_LAYOUT,
     attention_workgroup_shape,
     causal_scan_batch_shader_file,
     causal_scan_workgroup_count_x,
     compiled_tensor_layout,
+    cooperative_bfloat16_batch_shader_file,
+    cooperative_bfloat16_workgroup_count_x,
     copy_shader_templates,
+    pedal_kernel_spec,
     required_vulkan_device_extensions,
     shader_file_for_node,
     weight_shared_batch_shader_file,
@@ -25,7 +28,7 @@ from llmoop.model_package import (
 
 
 def test_compiler_selects_only_compatible_weight_shared_batch_kernels() -> None:
-    assert PEDAL_BATCH_LANE_TILE_WIDTH == 16
+    assert SCALAR_BATCH_LANE_TILE_WIDTH == 16
     assert weight_shared_batch_shader_file(
         "rms_norm_bf16_h5120_eps1e-06_offset1.comp"
     ) == "rms_norm_batch16_bf16_h5120_eps1e-06_offset1.comp"
@@ -76,6 +79,71 @@ def test_compiler_selects_stateful_causal_scan_kernels() -> None:
     ) == 32
 
 
+def test_compiler_selects_cooperative_bfloat16_projection_kernels() -> None:
+    assert cooperative_bfloat16_batch_shader_file(
+        "linear_paired_bf16_1024x4096.comp"
+    ) == "linear_batch64_cooperative_paired_bf16_1024x4096.comp"
+    assert cooperative_bfloat16_batch_shader_file(
+        "linear_residual_bf16_4096x1024.comp"
+    ) == "linear_residual_batch64_cooperative_row_major_bf16_4096x1024.comp"
+    assert cooperative_bfloat16_batch_shader_file(
+        "parallel_linear_3way_paired_bf16_1024x1024_256_256.comp"
+    ) == (
+        "parallel_linear_batch64_cooperative_3way_paired_bf16_"
+        "1024x1024_256_256.comp"
+    )
+    assert cooperative_bfloat16_batch_shader_file(
+        "parallel_linear_silu_multiply_paired_bf16_1024x4096.comp"
+    ) == (
+        "parallel_linear_silu_multiply_batch64_cooperative_paired_bf16_"
+        "1024x4096.comp"
+    )
+    assert cooperative_bfloat16_workgroup_count_x(
+        "parallel_linear_3way_paired_bf16_1024x1024_256_256.comp"
+    ) == 24
+    assert cooperative_bfloat16_batch_shader_file(
+        "linear_fp8_e4m3_b128x128_1024x4096.comp"
+    ) is None
+
+
+def test_projection_pedal_compiles_ordered_target_native_and_scalar_implementations() -> None:
+    spec = pedal_kernel_spec(
+        execution_index=0,
+        node={"id": "project", "op": "linear"},
+        shader_file="linear_paired_bf16_1024x4096.comp",
+        local_size_x=64,
+        workgroup_count_x=2048,
+    )
+
+    assert spec["batch_mode"] == "weight_shared"
+    assert "batch_shader_path" not in spec
+    assert "batch_lane_tile_width" not in spec
+    cooperative, scalar = spec["batch_implementations"]
+    assert cooperative == {
+        "shader_path": (
+            "shaders/linear_batch64_cooperative_paired_bf16_1024x4096.comp"
+        ),
+        "local_size_x": 256,
+        "workgroup_count_x": 64,
+        "lane_tile_width": 64,
+        "device_requirements": {
+            "vulkan_device_extensions": [
+                "VK_KHR_cooperative_matrix",
+                "VK_KHR_shader_bfloat16",
+            ],
+            "cooperative_bfloat16_shape": [16, 16, 16],
+            "subgroup_size": 64,
+        },
+    }
+    assert scalar == {
+        "shader_path": "shaders/linear_batch16_paired_bf16_1024x4096.comp",
+        "local_size_x": 64,
+        "workgroup_count_x": 2048,
+        "lane_tile_width": 16,
+        "device_requirements": {"vulkan_device_extensions": []},
+    }
+
+
 def test_compiler_renders_weight_shared_pedal_batch_shaders(tmp_path: Path) -> None:
     shader_source_dir = Path(__file__).parents[1] / "runtime-rs" / "shaders"
     shader_files = {
@@ -102,6 +170,35 @@ def test_compiler_renders_weight_shared_pedal_batch_shaders(tmp_path: Path) -> N
         assert "{{" not in source
     assert required_vulkan_device_extensions(tmp_path, shader_files) == [
         "VK_EXT_shader_float8"
+    ]
+
+
+def test_compiler_renders_cooperative_bfloat16_batch_shaders(tmp_path: Path) -> None:
+    shader_source_dir = Path(__file__).parents[1] / "runtime-rs" / "shaders"
+    shader_files = {
+        "linear_batch64_cooperative_paired_bf16_1024x4096.comp",
+        "linear_residual_batch64_cooperative_row_major_bf16_4096x1024.comp",
+        "parallel_linear_batch64_cooperative_3way_paired_bf16_"
+        "1024x1024_256_256.comp",
+        "parallel_linear_silu_multiply_batch64_cooperative_paired_bf16_"
+        "1024x4096.comp",
+    }
+
+    copy_shader_templates(shader_source_dir, tmp_path, shader_files)
+
+    for shader_file in shader_files:
+        source = (tmp_path / shader_file).read_text()
+        assert "coopMatMulAdd" in source
+        assert "coopmat<bfloat16_t" in source
+        assert "#extension GL_EXT_bfloat16 : require" in source
+        assert "#extension GL_KHR_cooperative_matrix : require" in source
+        assert "layout(local_size_x = 256" in source
+        assert "const uint OUTPUT_TILE = 64u;" in source
+        assert "const uint BATCH_TILE = 64u;" in source
+        assert "{{" not in source
+    assert required_vulkan_device_extensions(tmp_path, shader_files) == [
+        "VK_KHR_cooperative_matrix",
+        "VK_KHR_shader_bfloat16",
     ]
 
 

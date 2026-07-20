@@ -266,7 +266,6 @@ def minimal_package(root: Path) -> dict[str, object]:
         "package_id": "fixture_package",
         "max_context_activations": 1024,
         "required_vulkan_device_extensions": [],
-        "pedal_batch_lane_tile_width": 4,
         "circuit_graph": {
             "wiring": "explicit_graph",
             "cables": [
@@ -400,6 +399,7 @@ def minimal_package(root: Path) -> dict[str, object]:
                         "op": "linear",
                         "shader_path": "shaders/kernel.spv",
                         "batch_mode": "serial_lanes",
+                        "batch_implementations": [],
                     }
                 ],
             }

@@ -37,11 +37,16 @@ PACKAGE_ARTIFACT_INTEGRITY_SCHEMA = "llmoop.package_artifact_integrity.v1"
 VULKAN_BF16_ROW_PAIR_LAYOUT = "vulkan_bf16_row_pair_u32"
 ROW_MAJOR_LAYOUT = "row_major"
 CONFIG_PACKAGE_FILE = "config.json"
-PEDAL_BATCH_LANE_TILE_WIDTH = 16
+SCALAR_BATCH_LANE_TILE_WIDTH = 16
 CAUSAL_SCAN_LANE_TILE_WIDTH = 64
 GLSL_VULKAN_DEVICE_EXTENSION_REQUIREMENTS = {
     "GL_EXT_float_e4m3": "VK_EXT_shader_float8",
+    "GL_EXT_bfloat16": "VK_KHR_shader_bfloat16",
+    "GL_KHR_cooperative_matrix": "VK_KHR_cooperative_matrix",
 }
+COOPERATIVE_BFLOAT16_SHAPE = [16, 16, 16]
+COOPERATIVE_BATCH_LANE_TILE_WIDTH = 64
+COOPERATIVE_OUTPUT_TILE_WIDTH = 64
 TOKENIZER_PACKAGE_FILES = (
     "tokenizer.json",
     "tokenizer_config.json",
@@ -412,8 +417,15 @@ def build_vulkan_resident_package_manifest(
         package_dir / "shaders",
         shader_files,
     )
+    optional_device_shader_files = {
+        implementation["shader_path"].removeprefix("shaders/")
+        for execution in all_pedal_executions
+        for kernel in execution["kernels"]
+        for implementation in kernel["batch_implementations"]
+        if implementation["device_requirements"]["vulkan_device_extensions"]
+    }
     required_device_extensions = required_vulkan_device_extensions(
-        package_dir / "shaders", shader_files
+        package_dir / "shaders", shader_files - optional_device_shader_files
     )
     compile_shader_artifacts(
         package_dir / "shaders",
@@ -429,9 +441,9 @@ def build_vulkan_resident_package_manifest(
     for execution in all_pedal_executions:
         for kernel in execution["kernels"]:
             kernel["shader_path"] = compiled_shader_path(kernel["shader_path"])
-            if kernel.get("batch_shader_path") is not None:
-                kernel["batch_shader_path"] = compiled_shader_path(
-                    kernel["batch_shader_path"]
+            for implementation in kernel["batch_implementations"]:
+                implementation["shader_path"] = compiled_shader_path(
+                    implementation["shader_path"]
                 )
     return {
         "schema": PACKAGE_SCHEMA,
@@ -446,7 +458,6 @@ def build_vulkan_resident_package_manifest(
         "activation_element_bytes": dtype_bytes,
         "max_context_activations": max_context_activations,
         "required_vulkan_device_extensions": required_device_extensions,
-        "pedal_batch_lane_tile_width": PEDAL_BATCH_LANE_TILE_WIDTH,
         "input_transducer": {
             "spec": {
                 "transducer_id": "input_transducer.token_embedding",
@@ -750,8 +761,15 @@ def pedal_kernel_spec(
     workgroup_count_x: int,
 ) -> Json:
     causal_scan_shader_file = causal_scan_batch_shader_file(shader_file)
-    batch_shader_file = causal_scan_shader_file or weight_shared_batch_shader_file(
-        shader_file
+    scalar_batch_shader_file = (
+        None
+        if causal_scan_shader_file is not None
+        else weight_shared_batch_shader_file(shader_file)
+    )
+    cooperative_shader_file = (
+        cooperative_bfloat16_batch_shader_file(shader_file)
+        if scalar_batch_shader_file is not None
+        else None
     )
     spec = {
         "execution_index": execution_index,
@@ -763,15 +781,124 @@ def pedal_kernel_spec(
         "batch_mode": (
             "causal_scan"
             if causal_scan_shader_file
-            else "weight_shared" if batch_shader_file else "serial_lanes"
+            else "weight_shared" if scalar_batch_shader_file else "serial_lanes"
         ),
+        "batch_implementations": [],
     }
-    if batch_shader_file is not None:
-        spec["batch_shader_path"] = f"shaders/{batch_shader_file}"
     if causal_scan_shader_file is not None:
-        spec["batch_lane_tile_width"] = CAUSAL_SCAN_LANE_TILE_WIDTH
-        spec["batch_workgroup_count_x"] = causal_scan_workgroup_count_x(shader_file)
+        spec["batch_implementations"].append(
+            {
+                "shader_path": f"shaders/{causal_scan_shader_file}",
+                "local_size_x": local_size_x,
+                "workgroup_count_x": causal_scan_workgroup_count_x(shader_file),
+                "lane_tile_width": CAUSAL_SCAN_LANE_TILE_WIDTH,
+                "device_requirements": {
+                    "vulkan_device_extensions": [],
+                },
+            }
+        )
+    elif scalar_batch_shader_file is not None:
+        if cooperative_shader_file is not None:
+            spec["batch_implementations"].append(
+                {
+                    "shader_path": f"shaders/{cooperative_shader_file}",
+                    "local_size_x": 256,
+                    "workgroup_count_x": cooperative_bfloat16_workgroup_count_x(
+                        shader_file
+                    ),
+                    "lane_tile_width": COOPERATIVE_BATCH_LANE_TILE_WIDTH,
+                    "device_requirements": {
+                        "vulkan_device_extensions": [
+                            "VK_KHR_cooperative_matrix",
+                            "VK_KHR_shader_bfloat16",
+                        ],
+                        "cooperative_bfloat16_shape": COOPERATIVE_BFLOAT16_SHAPE,
+                        "subgroup_size": 64,
+                    },
+                }
+            )
+        spec["batch_implementations"].append(
+            {
+                "shader_path": f"shaders/{scalar_batch_shader_file}",
+                "local_size_x": local_size_x,
+                "workgroup_count_x": workgroup_count_x,
+                "lane_tile_width": SCALAR_BATCH_LANE_TILE_WIDTH,
+                "device_requirements": {
+                    "vulkan_device_extensions": [],
+                },
+            }
+        )
     return spec
+
+
+def cooperative_bfloat16_batch_shader_file(shader_file: str) -> str | None:
+    linear = re.fullmatch(
+        r"(linear|linear_residual)_(paired_)?bf16_(\d+)x(\d+)\.comp",
+        shader_file,
+    )
+    if linear is not None:
+        operation, paired, input_size, output_size = linear.groups()
+        layout = "paired" if paired else "row_major"
+        return (
+            f"{operation}_batch64_cooperative_{layout}_bf16_"
+            f"{input_size}x{output_size}.comp"
+        )
+    parallel = re.fullmatch(
+        r"parallel_linear_([23])way_(paired|row_major)_bf16_(\d+)x.+\.comp",
+        shader_file,
+    )
+    if parallel is not None:
+        return shader_file.replace(
+            "parallel_linear_",
+            "parallel_linear_batch64_cooperative_",
+            1,
+        )
+    fused = re.fullmatch(
+        r"parallel_linear_silu_multiply_(paired|row_major)_bf16_"
+        r"(\d+)x(\d+)\.comp",
+        shader_file,
+    )
+    if fused is not None:
+        return shader_file.replace(
+            "parallel_linear_silu_multiply_",
+            "parallel_linear_silu_multiply_batch64_cooperative_",
+            1,
+        )
+    return None
+
+
+def cooperative_bfloat16_workgroup_count_x(shader_file: str) -> int:
+    linear = re.fullmatch(
+        r"(?:linear|linear_residual)_(?:paired_)?bf16_\d+x(\d+)\.comp",
+        shader_file,
+    )
+    if linear is not None:
+        return (
+            int(linear.group(1)) + COOPERATIVE_OUTPUT_TILE_WIDTH - 1
+        ) // COOPERATIVE_OUTPUT_TILE_WIDTH
+    parallel = re.fullmatch(
+        r"parallel_linear_[23]way_(?:paired|row_major)_bf16_\d+x"
+        r"(\d+)_(\d+)(?:_(\d+))?\.comp",
+        shader_file,
+    )
+    if parallel is not None:
+        return sum(
+            (int(width) + COOPERATIVE_OUTPUT_TILE_WIDTH - 1)
+            // COOPERATIVE_OUTPUT_TILE_WIDTH
+            for width in parallel.groups()
+        )
+    fused = re.fullmatch(
+        r"parallel_linear_silu_multiply_(?:paired|row_major)_bf16_"
+        r"\d+x(\d+)\.comp",
+        shader_file,
+    )
+    if fused is not None:
+        return (
+            int(fused.group(1)) + COOPERATIVE_OUTPUT_TILE_WIDTH - 1
+        ) // COOPERATIVE_OUTPUT_TILE_WIDTH
+    raise ModelCompileError(
+        f"shader {shader_file!r} has no cooperative BF16 batch geometry"
+    )
 
 
 def causal_scan_batch_shader_file(shader_file: str) -> str | None:
@@ -808,7 +935,7 @@ def causal_scan_workgroup_count_x(shader_file: str) -> int:
 
 
 def weight_shared_batch_shader_file(shader_file: str) -> str | None:
-    tile = PEDAL_BATCH_LANE_TILE_WIDTH
+    tile = SCALAR_BATCH_LANE_TILE_WIDTH
     rms_norm = re.fullmatch(
         r"rms_norm_bf16_h(\d+)_eps([0-9eE+.-]+)_offset([0-9eE+.-]+)\.comp",
         shader_file,
@@ -1680,10 +1807,10 @@ def required_shader_files(
             for kernel in pedal["kernels"]
         ),
         *(
-            kernel["batch_shader_path"].removeprefix("shaders/")
+            implementation["shader_path"].removeprefix("shaders/")
             for pedal in pedal_executions
             for kernel in pedal["kernels"]
-            if kernel.get("batch_shader_path") is not None
+            for implementation in kernel["batch_implementations"]
         ),
     }
 
@@ -1749,6 +1876,181 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
                 f"shader {shader_file} has {replacement_count} stream-control bindings; expected one"
             )
         return rendered
+
+    cooperative_parallel_linear = re.fullmatch(
+        r"parallel_linear_batch64_cooperative_([23])way_"
+        r"(paired|row_major)_bf16_(\d+)x(\d+)_(\d+)(?:_(\d+))?\.comp",
+        shader_file,
+    )
+    if cooperative_parallel_linear is not None:
+        branch_count = int(cooperative_parallel_linear.group(1))
+        weight_layout = cooperative_parallel_linear.group(2)
+        input_size = int(cooperative_parallel_linear.group(3))
+        output_widths = [
+            int(width)
+            for width in cooperative_parallel_linear.groups()[3:]
+            if width is not None
+        ]
+        if (
+            len(output_widths) != branch_count
+            or input_size <= 0
+            or input_size % 2
+            or any(width <= 0 or width % 2 for width in output_widths)
+        ):
+            raise ModelCompileError(
+                f"invalid cooperative parallel-linear shader shape {shader_file!r}"
+            )
+        labels = [chr(ord("A") + index) for index in range(branch_count)]
+        output_bindings = "\n\n".join(
+            f"layout(set = 0, binding = {index + 1}) buffer Output{label} {{\n"
+            "    uint16_t values[];\n"
+            f"}} output_{label.lower()};"
+            for index, label in enumerate(labels)
+        )
+        weight_bindings = "\n\n".join(
+            f"layout(set = 0, binding = {branch_count + index + 1}) "
+            f"readonly buffer Weight{label} {{\n"
+            "    bfloat16_t values[];\n"
+            f"}} weight_{label.lower()};"
+            for index, label in enumerate(labels)
+        )
+        output_constants = "\n".join(
+            f"const uint OUTPUT_{label}_SIZE = {width}u;"
+            for label, width in zip(labels, output_widths, strict=True)
+        )
+        tile_counts = [
+            (width + COOPERATIVE_OUTPUT_TILE_WIDTH - 1)
+            // COOPERATIVE_OUTPUT_TILE_WIDTH
+            for width in output_widths
+        ]
+        branch_lines = []
+        consumed_tiles = 0
+        for index, (label, tile_count) in enumerate(
+            zip(labels, tile_counts, strict=True)
+        ):
+            prefix = "if" if index == 0 else "else if"
+            branch_lines.append(
+                f"    {prefix} (global_tile < {consumed_tiles + tile_count}u) {{\n"
+                f"        branch = {index}u;\n"
+                f"        local_tile = global_tile - {consumed_tiles}u;\n"
+                "    }"
+            )
+            consumed_tiles += tile_count
+        weight_reads = "\n".join(
+            f"    if (branch == {index}u) return weight_{label.lower()}.values[index];"
+            for index, label in enumerate(labels[:-1])
+        )
+        weight_reads += (
+            "\n    return weight_" + labels[-1].lower() + ".values[index];"
+        )
+        output_size_selection = "\n".join(
+            f"    if (branch == {index}u) return OUTPUT_{label}_SIZE;"
+            for index, label in enumerate(labels[:-1])
+        )
+        output_size_selection += f"\n    return OUTPUT_{labels[-1]}_SIZE;"
+        output_writes = "\n".join(
+            f"    if (branch == {index}u) {{ output_{label.lower()}.values["
+            f"batch_index * OUTPUT_{label}_SIZE + row] = value; return; }}"
+            for index, label in enumerate(labels[:-1])
+        )
+        output_writes += (
+            f"\n    output_{labels[-1].lower()}.values[batch_index * "
+            f"OUTPUT_{labels[-1]}_SIZE + row] = value;"
+        )
+        return render_shader_template(
+            source_dir,
+            "parallel_linear_batch_cooperative_bf16.comp.template",
+            {
+                "OUTPUT_BINDINGS": output_bindings,
+                "WEIGHT_BINDINGS": weight_bindings,
+                "INPUT_SIZE": str(input_size),
+                "OUTPUT_SIZE_CONSTANTS": output_constants,
+                "TOTAL_OUTPUT_TILES": str(sum(tile_counts)),
+                "PAIRED_WEIGHT_LAYOUT": (
+                    "true" if weight_layout == "paired" else "false"
+                ),
+                "BRANCH_SELECTION": "\n".join(branch_lines),
+                "WEIGHT_READS": weight_reads,
+                "OUTPUT_SIZE_SELECTION": output_size_selection,
+                "OUTPUT_WRITES": output_writes,
+            },
+        )
+
+    cooperative_bf16_linear = re.fullmatch(
+        r"(linear|linear_residual)_batch64_cooperative_"
+        r"(paired|row_major)_bf16_(\d+)x(\d+)\.comp",
+        shader_file,
+    )
+    if cooperative_bf16_linear is not None:
+        operation = cooperative_bf16_linear.group(1)
+        weight_layout = cooperative_bf16_linear.group(2)
+        input_size = int(cooperative_bf16_linear.group(3))
+        output_size = int(cooperative_bf16_linear.group(4))
+        if input_size <= 0 or input_size % 2 or output_size <= 0 or output_size % 2:
+            raise ModelCompileError(
+                f"invalid cooperative BF16 linear shader shape {shader_file!r}"
+            )
+        residual = operation == "linear_residual"
+        return render_shader_template(
+            source_dir,
+            "linear_batch_cooperative_bf16.comp.template",
+            {
+                "INPUT_SIZE": str(input_size),
+                "OUTPUT_SIZE": str(output_size),
+                "PAIRED_WEIGHT_LAYOUT": (
+                    "true" if weight_layout == "paired" else "false"
+                ),
+                "RESIDUAL_BINDING": (
+                    "layout(set = 0, binding = 1) readonly buffer ResidualFrames {\n"
+                    "    bfloat16_t values[];\n"
+                    "} residual_frames;"
+                    if residual
+                    else ""
+                ),
+                "OUTPUT_BINDING": "2" if residual else "1",
+                "WEIGHT_BINDING": "3" if residual else "2",
+                "FINALIZE_FUNCTION": (
+                    "float rounded_bf16(float value) {\n"
+                    "    return uintBitsToFloat(f32_to_bf16(value) << 16u);\n"
+                    "}\n\n"
+                    "uint16_t finalize_result(uint batch_index, uint output_index, float value) {\n"
+                    "    uint index = batch_index * OUTPUT_SIZE + output_index;\n"
+                    "    return uint16_t(f32_to_bf16(\n"
+                    "        rounded_bf16(value) + float(residual_frames.values[index])\n"
+                    "    ));\n"
+                    "}"
+                    if residual
+                    else "uint16_t finalize_result(uint batch_index, uint output_index, float value) {\n"
+                    "    return uint16_t(f32_to_bf16(value));\n"
+                    "}"
+                ),
+            },
+        )
+
+    cooperative_fused_ffn = re.fullmatch(
+        r"parallel_linear_silu_multiply_batch64_cooperative_"
+        r"(paired|row_major)_bf16_(\d+)x(\d+)\.comp",
+        shader_file,
+    )
+    if cooperative_fused_ffn is not None:
+        weight_layout = cooperative_fused_ffn.group(1)
+        input_size = int(cooperative_fused_ffn.group(2))
+        output_size = int(cooperative_fused_ffn.group(3))
+        if input_size <= 0 or input_size % 2 or output_size <= 0 or output_size % 2:
+            raise ModelCompileError(
+                f"invalid cooperative fused FFN shader shape {shader_file!r}"
+            )
+        return render_shader_template(
+            source_dir,
+            "parallel_linear_silu_multiply_batch_cooperative_bf16.comp.template",
+            {
+                "INPUT_SIZE": str(input_size),
+                "OUTPUT_SIZE": str(output_size),
+                "PAIRED_WEIGHT_LAYOUT": (
+                    "true" if weight_layout == "paired" else "false"
+                ),
+            },
+        )
 
     parallel_linear = re.fullmatch(
         r"parallel_linear_(?:batch(\d+)_)?([23])way_(paired|row_major)_bf16_"
@@ -2914,14 +3216,6 @@ def validate_compiled_package(package_dir: Path, manifest: Json) -> None:
         raise ModelCompileError(
             "compiled package max context activation capacity must be positive"
         )
-    if (
-        not isinstance(manifest.get("pedal_batch_lane_tile_width"), int)
-        or isinstance(manifest.get("pedal_batch_lane_tile_width"), bool)
-        or manifest["pedal_batch_lane_tile_width"] <= 0
-    ):
-        raise ModelCompileError(
-            "compiled package pedal batch lane tile width must be positive"
-        )
     required_device_extensions = manifest.get("required_vulkan_device_extensions")
     if (
         not isinstance(required_device_extensions, list)
@@ -3587,37 +3881,69 @@ def validate_compiled_pedal_executions(
                     f"compiled package pedal {pedal_id!r} kernel {index} does not match its circuit node"
                 )
             batch_mode = kernel.get("batch_mode")
-            batch_shader_path = kernel.get("batch_shader_path")
-            batch_lane_tile_width = kernel.get("batch_lane_tile_width")
-            batch_workgroup_count_x = kernel.get("batch_workgroup_count_x")
-            if (
-                batch_mode == "serial_lanes"
-                and batch_shader_path is None
-                and batch_lane_tile_width is None
-                and batch_workgroup_count_x is None
-            ):
+            batch_implementations = kernel.get("batch_implementations")
+            if batch_mode == "serial_lanes" and batch_implementations == []:
                 continue
-            if (
-                batch_mode == "weight_shared"
-                and isinstance(batch_shader_path, str)
-                and batch_shader_path
-                and batch_lane_tile_width is None
-                and batch_workgroup_count_x is None
-            ):
-                continue
-            if (
-                batch_mode == "causal_scan"
-                and isinstance(batch_shader_path, str)
-                and batch_shader_path
-                and isinstance(batch_lane_tile_width, int)
-                and batch_lane_tile_width > 0
-                and isinstance(batch_workgroup_count_x, int)
-                and batch_workgroup_count_x > 0
+            if batch_mode in {"weight_shared", "causal_scan"} and isinstance(
+                batch_implementations, list
+            ) and batch_implementations and all(
+                valid_batch_implementation(implementation)
+                for implementation in batch_implementations
             ):
                 continue
             raise ModelCompileError(
                 f"compiled package pedal {pedal_id!r} kernel {index} has an invalid batch execution contract"
             )
+
+
+def valid_batch_implementation(implementation: Any) -> bool:
+    if not isinstance(implementation, dict):
+        return False
+    requirements = implementation.get("device_requirements")
+    extensions = (
+        requirements.get("vulkan_device_extensions")
+        if isinstance(requirements, dict)
+        else None
+    )
+    shape = requirements.get("cooperative_bfloat16_shape") if requirements else None
+    subgroup_size = requirements.get("subgroup_size") if requirements else None
+    return (
+        isinstance(implementation.get("shader_path"), str)
+        and bool(implementation["shader_path"])
+        and isinstance(implementation.get("local_size_x"), int)
+        and not isinstance(implementation.get("local_size_x"), bool)
+        and implementation["local_size_x"] > 0
+        and isinstance(implementation.get("workgroup_count_x"), int)
+        and not isinstance(implementation.get("workgroup_count_x"), bool)
+        and implementation["workgroup_count_x"] > 0
+        and isinstance(implementation.get("lane_tile_width"), int)
+        and not isinstance(implementation.get("lane_tile_width"), bool)
+        and implementation["lane_tile_width"] > 0
+        and isinstance(extensions, list)
+        and all(isinstance(extension, str) and extension for extension in extensions)
+        and extensions == sorted(set(extensions))
+        and (
+            shape is None
+            or (
+                isinstance(shape, list)
+                and len(shape) == 3
+                and all(
+                    isinstance(dimension, int)
+                    and not isinstance(dimension, bool)
+                    and dimension > 0
+                    for dimension in shape
+                )
+            )
+        )
+        and (
+            subgroup_size is None
+            or (
+                isinstance(subgroup_size, int)
+                and not isinstance(subgroup_size, bool)
+                and subgroup_size > 0
+            )
+        )
+    )
 
 
 def validate_compiled_generation_contract(

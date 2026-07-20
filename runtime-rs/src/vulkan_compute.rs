@@ -14,6 +14,7 @@ const VK_EXT_SHADER_FLOAT8_NAME: &CStr = c"VK_EXT_shader_float8";
 const VK_KHR_SHADER_BFLOAT16_NAME: &CStr = c"VK_KHR_shader_bfloat16";
 const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT8_FEATURES_EXT: i32 = 1_000_567_000;
 const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_BFLOAT16_FEATURES_KHR: i32 = 1_000_141_000;
+const VK_COMPONENT_TYPE_BFLOAT16_KHR: i32 = 1_000_141_000;
 
 // ash 0.38 is generated from Vulkan 1.3.281 headers, while shader-float8 was
 // added later. Keep this ABI-compatible definition local until ash publishes
@@ -83,6 +84,10 @@ pub struct VulkanComputeDevice {
     queue: vk::Queue,
     device_name: String,
     enabled_device_extensions: BTreeSet<String>,
+    cooperative_bfloat16_shapes: BTreeSet<(u32, u32, u32)>,
+    subgroup_size: u32,
+    max_compute_work_group_invocations: u32,
+    max_compute_work_group_size_x: u32,
     timestamp_period_ns: f32,
     generic_storage_pipelines: RefCell<HashMap<VulkanGenericPipelineKey, VulkanStoragePipeline>>,
     immediate_kernel_sequence: RefCell<Option<VulkanResidentKernelSequence>>,
@@ -956,8 +961,18 @@ impl VulkanComputeDeviceCatalog {
                     physical_device,
                     VK_EXT_SHADER_FLOAT8_NAME,
                 )? && physical_device_supports_shader_float8(instance, physical_device);
-            let cooperative_bfloat16_supported =
+            let cooperative_bfloat16_feature_supported =
                 physical_device_supports_cooperative_bfloat16(instance, physical_device)?;
+            let cooperative_bfloat16_shapes = if cooperative_bfloat16_feature_supported {
+                physical_device_cooperative_bfloat16_shapes(
+                    &self.context._entry,
+                    instance,
+                    physical_device,
+                )?
+            } else {
+                BTreeSet::new()
+            };
+            let cooperative_bfloat16_supported = !cooperative_bfloat16_shapes.is_empty();
             let mut shader_float8_features =
                 VulkanPhysicalDeviceShaderFloat8FeaturesExt::disabled();
             let mut shader_bfloat16_features =
@@ -1003,10 +1018,10 @@ impl VulkanComputeDeviceCatalog {
                     VulkanError(format!("failed to create Vulkan device: {error:?}"))
                 })?;
             let queue = device.get_device_queue(queue_family_index, 0);
-            let timestamp_period_ns = instance
-                .get_physical_device_properties(physical_device)
-                .limits
-                .timestamp_period;
+            let physical_device_properties =
+                instance.get_physical_device_properties(physical_device);
+            let limits = physical_device_properties.limits;
+            let subgroup_size = physical_device_subgroup_size(instance, physical_device);
 
             Ok(VulkanComputeDevice {
                 context: Arc::clone(&self.context),
@@ -1016,7 +1031,11 @@ impl VulkanComputeDeviceCatalog {
                 queue,
                 device_name,
                 enabled_device_extensions,
-                timestamp_period_ns,
+                cooperative_bfloat16_shapes,
+                subgroup_size,
+                max_compute_work_group_invocations: limits.max_compute_work_group_invocations,
+                max_compute_work_group_size_x: limits.max_compute_work_group_size[0],
+                timestamp_period_ns: limits.timestamp_period,
                 generic_storage_pipelines: RefCell::new(HashMap::new()),
                 immediate_kernel_sequence: RefCell::new(None),
             })
@@ -1059,6 +1078,20 @@ impl VulkanComputeDevice {
 
     pub fn has_enabled_device_extension(&self, extension_name: &str) -> bool {
         self.enabled_device_extensions.contains(extension_name)
+    }
+
+    pub fn supports_cooperative_bfloat16_shape(&self, m: u32, n: u32, k: u32) -> bool {
+        self.cooperative_bfloat16_shapes.contains(&(m, n, k))
+    }
+
+    pub fn subgroup_size(&self) -> u32 {
+        self.subgroup_size
+    }
+
+    pub fn supports_compute_local_size_x(&self, local_size_x: u32) -> bool {
+        local_size_x > 0
+            && local_size_x <= self.max_compute_work_group_invocations
+            && local_size_x <= self.max_compute_work_group_size_x
     }
 
     pub fn create_resident_buffer(
@@ -2382,6 +2415,50 @@ fn physical_device_supports_cooperative_bfloat16(
         && shader_bfloat16.shader_bfloat16_cooperative_matrix == vk::TRUE)
 }
 
+fn physical_device_cooperative_bfloat16_shapes(
+    entry: &Entry,
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+) -> Result<BTreeSet<(u32, u32, u32)>, VulkanError> {
+    let cooperative_matrix = ash::khr::cooperative_matrix::Instance::new(entry, instance);
+    let properties = unsafe {
+        cooperative_matrix
+            .get_physical_device_cooperative_matrix_properties(physical_device)
+            .map_err(|error| {
+                VulkanError(format!(
+                    "failed to query cooperative-matrix properties: {error:?}"
+                ))
+            })?
+    };
+    let bfloat16 = vk::ComponentTypeKHR::from_raw(VK_COMPONENT_TYPE_BFLOAT16_KHR);
+    Ok(properties
+        .into_iter()
+        .filter(|property| {
+            property.a_type == bfloat16
+                && property.b_type == bfloat16
+                && property.c_type == vk::ComponentTypeKHR::FLOAT32
+                && property.result_type == vk::ComponentTypeKHR::FLOAT32
+                && property.scope == vk::ScopeKHR::SUBGROUP
+        })
+        .map(|property| (property.m_size, property.n_size, property.k_size))
+        .collect())
+}
+
+fn physical_device_subgroup_size(
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+) -> u32 {
+    let mut subgroup = vk::PhysicalDeviceSubgroupProperties::default();
+    let mut properties = vk::PhysicalDeviceProperties2 {
+        p_next: std::ptr::from_mut(&mut subgroup).cast(),
+        ..Default::default()
+    };
+    unsafe {
+        instance.get_physical_device_properties2(physical_device, &mut properties);
+    }
+    subgroup.subgroup_size
+}
+
 unsafe fn inspect_compute_device(
     instance: &ash::Instance,
     physical_device_index: usize,
@@ -2849,6 +2926,99 @@ fn test_command_exists(command: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cooperative_bfloat16_matrix_shader_preserves_matrix_orientation() {
+        let (Some(shader_path), Some(device_index)) = (
+            std::env::var_os("LLMOOP_TEST_COOPERATIVE_BFLOAT16_SHADER"),
+            std::env::var("LLMOOP_TEST_VULKAN_DEVICE_INDEX")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok()),
+        ) else {
+            eprintln!("skipping cooperative BF16 matrix test: explicit shader/device unset");
+            return;
+        };
+        let bytes = std::fs::read(shader_path).unwrap();
+        let spirv_words = bytes
+            .chunks_exact(4)
+            .map(|word| u32::from_le_bytes(word.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        let device = VulkanComputeDevice::new_for_physical_device_index(device_index).unwrap();
+        assert!(device.supports_cooperative_bfloat16_shape(16, 16, 16));
+        assert_eq!(device.subgroup_size(), 64);
+        assert!(device.supports_compute_local_size_x(256));
+
+        let input_values = (0..256)
+            .map(|index| f32_to_bf16_bits((index % 16) as f32 + 1.0))
+            .collect::<Vec<_>>();
+        let row_major_weight = (0..256)
+            .map(|index| {
+                let row = index / 16;
+                let column = index % 16;
+                f32_to_bf16_bits(if row == column { 2.0 } else { 0.0 })
+            })
+            .collect::<Vec<_>>();
+        let paired_weight = bf16_row_pair_layout(&row_major_weight, 16, 16);
+        let input = device.create_resident_buffer(512).unwrap();
+        let output = device.create_resident_buffer(512).unwrap();
+        let weight = device.create_resident_buffer(512).unwrap();
+        input.write_bytes(&u16_bytes(&input_values)).unwrap();
+        output.write_bytes(&vec![0; 512]).unwrap();
+        weight.write_bytes(&u16_bytes(&paired_weight)).unwrap();
+        let dispatch = device
+            .create_resident_kernel_dispatch(
+                &spirv_words,
+                &[
+                    VulkanResidentKernelBufferBinding::new(0, &input, 512),
+                    VulkanResidentKernelBufferBinding::new(1, &output, 512),
+                    VulkanResidentKernelBufferBinding::new(2, &weight, 512),
+                ],
+                1,
+                256,
+                4,
+            )
+            .unwrap();
+        device
+            .run_resident_kernel_dispatch(&dispatch, &16u32.to_le_bytes())
+            .unwrap();
+
+        let expected = input_values
+            .iter()
+            .map(|value| f32_to_bf16_bits(bf16_bits_to_f32(*value) * 2.0))
+            .collect::<Vec<_>>();
+        assert_eq!(output.read_bytes(512).unwrap(), u16_bytes(&expected));
+    }
+
+    fn f32_to_bf16_bits(value: f32) -> u16 {
+        let bits = value.to_bits();
+        let lsb = (bits >> 16) & 1;
+        ((bits + 0x7fff + lsb) >> 16) as u16
+    }
+
+    fn bf16_bits_to_f32(value: u16) -> f32 {
+        f32::from_bits(u32::from(value) << 16)
+    }
+
+    fn u16_bytes(values: &[u16]) -> Vec<u8> {
+        values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect()
+    }
+
+    fn bf16_row_pair_layout(values: &[u16], rows: usize, columns: usize) -> Vec<u16> {
+        let mut paired = Vec::with_capacity(values.len());
+        for row in (0..rows).step_by(2) {
+            for column in (0..columns).step_by(2) {
+                paired
+                    .extend_from_slice(&values[row * columns + column..row * columns + column + 2]);
+                paired.extend_from_slice(
+                    &values[(row + 1) * columns + column..(row + 1) * columns + column + 2],
+                );
+            }
+        }
+        paired
+    }
 
     fn u32_bytes(values: &[u32]) -> Vec<u8> {
         values
