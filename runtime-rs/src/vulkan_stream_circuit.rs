@@ -1261,55 +1261,137 @@ impl VulkanStreamCircuitStreamBuffers {
     }
 
     pub fn apply_clone_state_policies(&self) -> Result<usize, VulkanError> {
-        let mut pending = self
+        self.apply_clone_state_policies_after(&BTreeSet::new())
+    }
+
+    fn inherit_matching_state_from(
+        &self,
+        source: &Self,
+    ) -> Result<(usize, BTreeSet<(String, String)>), VulkanError> {
+        let source_by_id = source
             .state_buffers
             .iter()
-            .filter_map(|target| target.clone_from.as_ref().map(|source| (target, source)))
-            .collect::<Vec<_>>();
-        let mut copied = BTreeSet::<(String, String)>::new();
-        let clone_targets = pending
-            .iter()
-            .map(|(target, _)| (target.pedal_id.clone(), target.state_id.clone()))
-            .collect::<BTreeSet<_>>();
+            .map(|state| ((state.pedal_id.as_str(), state.state_id.as_str()), state))
+            .collect::<BTreeMap<_, _>>();
+        let mut copied = BTreeSet::new();
         let mut total_copied = 0usize;
-        while !pending.is_empty() {
-            let ready_index = pending
-                .iter()
-                .position(|(_, source)| !clone_targets.contains(source) || copied.contains(source));
-            let Some(ready_index) = ready_index else {
-                return Err(VulkanError(
-                    "clone state policies contain a dependency cycle".to_string(),
-                ));
+        for target in &self.state_buffers {
+            let key = (target.pedal_id.as_str(), target.state_id.as_str());
+            let Some(source) = source_by_id.get(&key) else {
+                continue;
             };
-            let (target, source_id) = pending.remove(ready_index);
+            validate_state_buffer_copy(target, source)?;
+            let bytes = source.buffer.read_bytes(source.byte_capacity)?;
+            target.buffer.write_bytes(&bytes)?;
+            total_copied = total_copied
+                .checked_add(bytes.len())
+                .ok_or_else(|| VulkanError("inherited state byte count overflowed".to_string()))?;
+            copied.insert((target.pedal_id.clone(), target.state_id.clone()));
+        }
+        Ok((total_copied, copied))
+    }
+
+    fn apply_clone_state_policies_after(
+        &self,
+        initialized: &BTreeSet<(String, String)>,
+    ) -> Result<usize, VulkanError> {
+        let copies = ordered_clone_state_copies(
+            self.state_buffers.iter().map(|state| {
+                (
+                    (state.pedal_id.clone(), state.state_id.clone()),
+                    state.clone_from.clone(),
+                )
+            }),
+            initialized,
+        )?;
+        let mut total_copied = 0usize;
+        for (target_id, source_id) in copies {
+            let target = self
+                .state_buffer(&target_id.0, &target_id.1)
+                .expect("planned clone target must exist");
             let source = self
                 .state_buffer(&source_id.0, &source_id.1)
-                .ok_or_else(|| {
-                    VulkanError(format!(
-                        "clone state target {}.{} references unavailable source {}.{}",
-                        target.pedal_id, target.state_id, source_id.0, source_id.1
-                    ))
-                })?;
-            if source.byte_capacity != target.byte_capacity {
-                return Err(VulkanError(format!(
-                    "clone state {}.{} byte capacity {} does not match source {}.{} capacity {}",
-                    target.pedal_id,
-                    target.state_id,
-                    target.byte_capacity,
-                    source.pedal_id,
-                    source.state_id,
-                    source.byte_capacity
-                )));
-            }
+                .expect("planned clone source must exist");
+            validate_state_buffer_copy(target, source)?;
             let bytes = source.buffer.read_bytes(source.byte_capacity)?;
             target.buffer.write_bytes(&bytes)?;
             total_copied = total_copied
                 .checked_add(bytes.len())
                 .ok_or_else(|| VulkanError("clone state byte count overflowed".to_string()))?;
-            copied.insert((target.pedal_id.clone(), target.state_id.clone()));
         }
         Ok(total_copied)
     }
+}
+
+type VulkanStateBufferId = (String, String);
+
+fn ordered_clone_state_copies(
+    states: impl IntoIterator<Item = (VulkanStateBufferId, Option<VulkanStateBufferId>)>,
+    initialized: &BTreeSet<VulkanStateBufferId>,
+) -> Result<Vec<(VulkanStateBufferId, VulkanStateBufferId)>, VulkanError> {
+    let states = states.into_iter().collect::<BTreeMap<_, _>>();
+    let available = states.keys().cloned().collect::<BTreeSet<_>>();
+    let mut pending = states
+        .into_iter()
+        .filter(|(target, _)| !initialized.contains(target))
+        .filter_map(|(target, source)| source.map(|source| (target, source)))
+        .collect::<Vec<_>>();
+    for (target, source) in &pending {
+        if !available.contains(source) {
+            return Err(VulkanError(format!(
+                "clone state target {}.{} references unavailable source {}.{}",
+                target.0, target.1, source.0, source.1
+            )));
+        }
+    }
+    let clone_targets = pending
+        .iter()
+        .map(|(target, _)| target.clone())
+        .collect::<BTreeSet<_>>();
+    let mut copied = BTreeSet::new();
+    let mut ordered = Vec::with_capacity(pending.len());
+    while !pending.is_empty() {
+        let ready_index = pending
+            .iter()
+            .position(|(_, source)| !clone_targets.contains(source) || copied.contains(source));
+        let Some(ready_index) = ready_index else {
+            return Err(VulkanError(
+                "clone state policies contain a dependency cycle".to_string(),
+            ));
+        };
+        let copy = pending.remove(ready_index);
+        copied.insert(copy.0.clone());
+        ordered.push(copy);
+    }
+    Ok(ordered)
+}
+
+fn validate_state_buffer_copy(
+    target: &VulkanStreamStateBufferAllocation,
+    source: &VulkanStreamStateBufferAllocation,
+) -> Result<(), VulkanError> {
+    if target.state_type != source.state_type
+        || target.byte_capacity != source.byte_capacity
+        || target.static_byte_capacity != source.static_byte_capacity
+        || target.bytes_per_activation != source.bytes_per_activation
+    {
+        return Err(VulkanError(format!(
+            "cannot inherit state {}.{} ({}, {} bytes, static {:?}, per activation {:?}) from incompatible state {}.{} ({}, {} bytes, static {:?}, per activation {:?})",
+            target.pedal_id,
+            target.state_id,
+            target.state_type,
+            target.byte_capacity,
+            target.static_byte_capacity,
+            target.bytes_per_activation,
+            source.pedal_id,
+            source.state_id,
+            source.state_type,
+            source.byte_capacity,
+            source.static_byte_capacity,
+            source.bytes_per_activation,
+        )));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -8806,9 +8888,10 @@ pub struct VulkanResidentInProcessPlacedStreamProcessorDevice {
 
 fn apply_placed_clone_state_policies(
     devices: &[VulkanResidentInProcessPlacedStreamProcessorDevice],
+    initialized: &BTreeSet<(String, String)>,
 ) -> Result<usize, VulkanError> {
     let mut state_index = BTreeMap::<(String, String), (usize, usize)>::new();
-    let mut pending = Vec::<((String, String), (String, String))>::new();
+    let mut states = Vec::new();
     for (device_index, device) in devices.iter().enumerate() {
         for (state_index_on_device, state) in
             device.mounted.buffers.state_buffers.iter().enumerate()
@@ -8823,62 +8906,62 @@ fn apply_placed_clone_state_policies(
                     key.0, key.1
                 )));
             }
-            if let Some(source) = &state.clone_from {
-                pending.push((key, source.clone()));
-            }
+            states.push((key, state.clone_from.clone()));
         }
     }
-
-    let clone_targets = pending
-        .iter()
-        .map(|(target, _)| target.clone())
-        .collect::<BTreeSet<_>>();
-    let mut copied = BTreeSet::new();
+    let copies = ordered_clone_state_copies(states, initialized)?;
     let mut total_copied = 0usize;
-    while !pending.is_empty() {
-        let ready_index = pending
-            .iter()
-            .position(|(_, source)| !clone_targets.contains(source) || copied.contains(source));
-        let Some(ready_index) = ready_index else {
-            return Err(VulkanError(
-                "placed clone state policies contain a dependency cycle".to_string(),
-            ));
-        };
-        let (target_id, source_id) = pending.remove(ready_index);
+    for (target_id, source_id) in copies {
         let (target_device_index, target_state_index) = state_index
             .get(&target_id)
             .copied()
             .expect("clone target was indexed from resident states");
-        let (source_device_index, source_state_index) =
-            state_index.get(&source_id).copied().ok_or_else(|| {
-                VulkanError(format!(
-                    "clone state target {}.{} references unavailable source {}.{}",
-                    target_id.0, target_id.1, source_id.0, source_id.1
-                ))
-            })?;
+        let (source_device_index, source_state_index) = state_index
+            .get(&source_id)
+            .copied()
+            .expect("planned clone source must exist");
         let target =
             &devices[target_device_index].mounted.buffers.state_buffers[target_state_index];
         let source =
             &devices[source_device_index].mounted.buffers.state_buffers[source_state_index];
-        if target.byte_capacity != source.byte_capacity {
-            return Err(VulkanError(format!(
-                "clone state {}.{} capacity {} does not match source {}.{} capacity {}",
-                target_id.0,
-                target_id.1,
-                target.byte_capacity,
-                source_id.0,
-                source_id.1,
-                source.byte_capacity
-            )));
-        }
+        validate_state_buffer_copy(target, source)?;
         let bytes = source.buffer.read_bytes(source.byte_capacity)?;
         target.buffer.write_bytes(&bytes)?;
         total_copied = total_copied
             .checked_add(bytes.len())
             .ok_or_else(|| VulkanError("placed clone state byte count overflowed".to_string()))?;
-        copied.insert(target_id);
     }
     Ok(total_copied)
+}
+
+fn inherit_matching_placed_stream_state(
+    target_devices: &[VulkanResidentInProcessPlacedStreamProcessorDevice],
+    source_devices: &[VulkanResidentInProcessPlacedStreamProcessorDevice],
+) -> Result<(usize, BTreeSet<(String, String)>), VulkanError> {
+    let source_by_id = source_devices
+        .iter()
+        .flat_map(|device| device.mounted.buffers.state_buffers.iter())
+        .map(|state| ((state.pedal_id.as_str(), state.state_id.as_str()), state))
+        .collect::<BTreeMap<_, _>>();
+    let mut copied = BTreeSet::new();
+    let mut total_copied = 0usize;
+    for target in target_devices
+        .iter()
+        .flat_map(|device| device.mounted.buffers.state_buffers.iter())
+    {
+        let key = (target.pedal_id.as_str(), target.state_id.as_str());
+        let Some(source) = source_by_id.get(&key) else {
+            continue;
+        };
+        validate_state_buffer_copy(target, source)?;
+        let bytes = source.buffer.read_bytes(source.byte_capacity)?;
+        target.buffer.write_bytes(&bytes)?;
+        total_copied = total_copied.checked_add(bytes.len()).ok_or_else(|| {
+            VulkanError("inherited placed state byte count overflowed".to_string())
+        })?;
+        copied.insert((target.pedal_id.clone(), target.state_id.clone()));
+    }
+    Ok((total_copied, copied))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -9211,7 +9294,7 @@ impl VulkanResidentInProcessPlacedModelPackage {
         VulkanResidentInProcessPlacedStreamProcessor,
         VulkanResidentInProcessPlacedRuntimeError,
     > {
-        self.create_stream_processor_for_device_resolver(random_seed, |_| Ok(device))
+        self.create_stream_processor_for_device_resolver(random_seed, None, |_| Ok(device))
     }
 
     pub fn create_stream_processor_for_bound_devices(
@@ -9222,7 +9305,40 @@ impl VulkanResidentInProcessPlacedModelPackage {
         VulkanResidentInProcessPlacedStreamProcessor,
         VulkanResidentInProcessPlacedRuntimeError,
     > {
-        self.create_stream_processor_for_device_resolver(random_seed, |device_id| {
+        self.create_stream_processor_for_device_resolver(random_seed, None, |device_id| {
+            devices
+                .get(device_id)
+                .map(|device| device.as_ref())
+                .ok_or_else(
+                    || VulkanResidentInProcessPlacedRuntimeError::MissingBoundDevice {
+                        device_id: device_id.to_string(),
+                    },
+                )
+        })
+    }
+
+    pub fn create_stream_processor_inheriting_state_for_devices(
+        self: &Arc<Self>,
+        device: &VulkanComputeDevice,
+        random_seed: u32,
+        source: &VulkanResidentInProcessPlacedStreamProcessor,
+    ) -> Result<
+        VulkanResidentInProcessPlacedStreamProcessor,
+        VulkanResidentInProcessPlacedRuntimeError,
+    > {
+        self.create_stream_processor_for_device_resolver(random_seed, Some(source), |_| Ok(device))
+    }
+
+    pub fn create_stream_processor_inheriting_state_for_bound_devices(
+        self: &Arc<Self>,
+        devices: &BTreeMap<String, Rc<VulkanComputeDevice>>,
+        random_seed: u32,
+        source: &VulkanResidentInProcessPlacedStreamProcessor,
+    ) -> Result<
+        VulkanResidentInProcessPlacedStreamProcessor,
+        VulkanResidentInProcessPlacedRuntimeError,
+    > {
+        self.create_stream_processor_for_device_resolver(random_seed, Some(source), |device_id| {
             devices
                 .get(device_id)
                 .map(|device| device.as_ref())
@@ -9237,6 +9353,7 @@ impl VulkanResidentInProcessPlacedModelPackage {
     fn create_stream_processor_for_device_resolver<'a, F>(
         self: &Arc<Self>,
         random_seed: u32,
+        source: Option<&VulkanResidentInProcessPlacedStreamProcessor>,
         device_for: F,
     ) -> Result<
         VulkanResidentInProcessPlacedStreamProcessor,
@@ -9245,6 +9362,16 @@ impl VulkanResidentInProcessPlacedModelPackage {
     where
         F: Fn(&str) -> Result<&'a VulkanComputeDevice, VulkanResidentInProcessPlacedRuntimeError>,
     {
+        if let Some(source) = source
+            && source.model.package_id != self.package_id
+        {
+            return Err(VulkanResidentInProcessPlacedRuntimeError::Package(
+                VulkanResidentTokenModelPackageError::new(format!(
+                    "cannot inherit stream state from package {:?} into package {:?}",
+                    source.model.package_id, self.package_id
+                )),
+            ));
+        }
         let mut devices = Vec::with_capacity(self.device_slices.len());
         for package_slice in &self.device_slices {
             let device = device_for(&package_slice.device_id)?;
@@ -9285,7 +9412,19 @@ impl VulkanResidentInProcessPlacedModelPackage {
                 resident_execution_plan,
             });
         }
-        apply_placed_clone_state_policies(&devices).map_err(|error| {
+        let inherited = source
+            .map(|source| inherit_matching_placed_stream_state(&devices, &source.device_slices))
+            .transpose()
+            .map_err(|error| {
+                VulkanResidentInProcessPlacedRuntimeError::Package(
+                    VulkanResidentTokenModelPackageError::new(format!(
+                        "failed to inherit mounted stream state: {error}"
+                    )),
+                )
+            })?
+            .map(|(_, copied)| copied)
+            .unwrap_or_default();
+        apply_placed_clone_state_policies(&devices, &inherited).map_err(|error| {
             VulkanResidentInProcessPlacedRuntimeError::Package(
                 VulkanResidentTokenModelPackageError::new(format!(
                     "failed to initialize cloned stream state: {error}"
@@ -10532,6 +10671,22 @@ impl VulkanResidentInProcessPlacedPromptStream {
         &self.devices
     }
 
+    pub fn remount_model_preserving_state(
+        &mut self,
+        package: Arc<VulkanResidentInProcessPlacedModelPackage>,
+        random_seed: u32,
+    ) -> Result<(), VulkanResidentInProcessPlacedRuntimeError> {
+        let processor = package.create_stream_processor_inheriting_state_for_bound_devices(
+            &self.devices,
+            random_seed,
+            &self.processor,
+        )?;
+        self.session.transport = VulkanInProcessPlacedCableTransport::new();
+        self.package = package;
+        self.processor = processor;
+        Ok(())
+    }
+
     pub fn next_stream_tick(&self) -> u64 {
         self.session.next_stream_tick
     }
@@ -11451,6 +11606,24 @@ impl VulkanResidentModelPackage {
         device: &VulkanComputeDevice,
         random_seed: u32,
     ) -> Result<VulkanResidentStreamProcessor, VulkanResidentTokenModelPackageError> {
+        self.create_stream_processor_with_state_source(device, random_seed, None)
+    }
+
+    pub fn create_stream_processor_inheriting_state(
+        &self,
+        device: &VulkanComputeDevice,
+        random_seed: u32,
+        source: &VulkanResidentStreamProcessor,
+    ) -> Result<VulkanResidentStreamProcessor, VulkanResidentTokenModelPackageError> {
+        self.create_stream_processor_with_state_source(device, random_seed, Some(source))
+    }
+
+    fn create_stream_processor_with_state_source(
+        &self,
+        device: &VulkanComputeDevice,
+        random_seed: u32,
+        source: Option<&VulkanResidentStreamProcessor>,
+    ) -> Result<VulkanResidentStreamProcessor, VulkanResidentTokenModelPackageError> {
         let mounted = VulkanMountedPlacedStreamCircuit::from_placed_plan_with_parameter_buffers(
             device,
             self.placed_plan.clone(),
@@ -11467,9 +11640,23 @@ impl VulkanResidentModelPackage {
                 "failed to zero stream state buffers: {error}"
             ))
         })?;
+        let inherited = source
+            .map(|source| {
+                mounted
+                    .buffers
+                    .inherit_matching_state_from(&source._mounted.buffers)
+            })
+            .transpose()
+            .map_err(|error| {
+                VulkanResidentTokenModelPackageError::new(format!(
+                    "failed to inherit stream state: {error}"
+                ))
+            })?
+            .map(|(_, copied)| copied)
+            .unwrap_or_default();
         mounted
             .buffers
-            .apply_clone_state_policies()
+            .apply_clone_state_policies_after(&inherited)
             .map_err(|error| {
                 VulkanResidentTokenModelPackageError::new(format!(
                     "failed to initialize cloned stream state: {error}"
@@ -19389,6 +19576,54 @@ mod tests {
             .unwrap();
         assert_eq!(cloned.clone_from, Some(("layer_05".to_string(), state_id)));
         assert_eq!(cloned_resident.stream_state_buffers.len(), 15);
+    }
+
+    #[test]
+    fn clone_state_copy_order_preserves_inherited_instances_and_initializes_new_clones() {
+        let state_id = |pedal: &str| (pedal.to_string(), "memory".to_string());
+        let inherited = BTreeSet::from([state_id("existing_clone")]);
+
+        let copies = ordered_clone_state_copies(
+            [
+                (state_id("source"), None),
+                (state_id("existing_clone"), Some(state_id("source"))),
+                (state_id("new_clone"), Some(state_id("source"))),
+                (state_id("chained_clone"), Some(state_id("new_clone"))),
+            ],
+            &inherited,
+        )
+        .unwrap();
+
+        assert_eq!(
+            copies,
+            vec![
+                (state_id("new_clone"), state_id("source")),
+                (state_id("chained_clone"), state_id("new_clone")),
+            ]
+        );
+    }
+
+    #[test]
+    fn clone_state_copy_order_rejects_missing_sources_and_cycles() {
+        let state_id = |pedal: &str| (pedal.to_string(), "memory".to_string());
+        let missing = ordered_clone_state_copies(
+            [(state_id("clone"), Some(state_id("missing")))],
+            &BTreeSet::new(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(missing.contains("references unavailable source missing.memory"));
+
+        let cycle = ordered_clone_state_copies(
+            [
+                (state_id("a"), Some(state_id("b"))),
+                (state_id("b"), Some(state_id("a"))),
+            ],
+            &BTreeSet::new(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(cycle.contains("dependency cycle"));
     }
 
     fn fixture_model_input_embedding_transducer_spec() -> VulkanResidentInputEmbeddingTransducerSpec
@@ -28249,6 +28484,115 @@ mod tests {
         );
         assert!(run.tick_run.placed_run.completed_stage_delta > 204);
         assert_eq!(run.sampler_run.descriptor_count, 3);
+    }
+
+    #[test]
+    fn placed_stream_remount_clones_live_pedal_state_without_sharing_it() {
+        let device = match VulkanComputeDevice::new() {
+            Ok(device) => device,
+            Err(error) => {
+                eprintln!("skipping placed live state clone test: {error}");
+                return;
+            }
+        };
+        let manifest = fixture_model_package_manifest();
+        let manifest_path = fixture_model_package_manifest_path();
+        let manifest_dir = manifest_path.parent().unwrap();
+        let source_graph = manifest
+            .circuit_graph
+            .to_resolved_lowered_pedalboard(manifest_dir)
+            .unwrap();
+        let source_patch =
+            StreamCircuitRuntimePatch::from_source_series(&source_graph, "gpu0").unwrap();
+        let source_model = manifest.clone().mount_runtime_patch(&source_patch).unwrap();
+        let device = Rc::new(device);
+        let devices = BTreeMap::from([("gpu0".to_string(), device)]);
+        let source_package = Arc::new(
+            VulkanResidentInProcessPlacedModelPackage::from_runtime_model_for_bound_devices(
+                &devices,
+                manifest_dir,
+                source_model,
+                Some(4),
+            )
+            .unwrap(),
+        );
+        let mut stream =
+            VulkanResidentInProcessPlacedPromptStream::new(source_package, devices.clone(), 0)
+                .unwrap();
+        let source_state = stream
+            .processor
+            .device("gpu0")
+            .unwrap()
+            .mounted
+            .buffers
+            .state_buffers
+            .iter()
+            .find(|state| state.pedal_id == "layer_05")
+            .unwrap();
+        let state_id = source_state.state_id.clone();
+        source_state.buffer.write_bytes(&[0xa5; 16]).unwrap();
+
+        let mut clone_patch = source_patch
+            .duplicate_after_instance(&source_graph, "layer_05", "layer_05_repeat")
+            .unwrap();
+        clone_patch
+            .instances
+            .iter_mut()
+            .find(|instance| instance.instance_id == "layer_05_repeat")
+            .unwrap()
+            .state_policy = StreamCircuitPedalInstanceStatePolicy::CloneFrom {
+            instance_id: "layer_05".to_string(),
+        };
+        clone_patch.validate_against_graph(&source_graph).unwrap();
+        let clone_model = manifest.mount_runtime_patch(&clone_patch).unwrap();
+        let clone_package = Arc::new(
+            VulkanResidentInProcessPlacedModelPackage::from_runtime_model_for_bound_devices(
+                &devices,
+                manifest_dir,
+                clone_model,
+                Some(4),
+            )
+            .unwrap(),
+        );
+
+        stream
+            .remount_model_preserving_state(clone_package.clone(), 0)
+            .unwrap();
+        let mounted = &stream.processor.device("gpu0").unwrap().mounted;
+        let inherited = mounted.buffers.state_buffer("layer_05", &state_id).unwrap();
+        let cloned = mounted
+            .buffers
+            .state_buffer("layer_05_repeat", &state_id)
+            .unwrap();
+        assert_eq!(inherited.buffer.read_bytes(16).unwrap(), vec![0xa5; 16]);
+        assert_eq!(cloned.buffer.read_bytes(16).unwrap(), vec![0xa5; 16]);
+        assert!(!std::ptr::eq(&inherited.buffer, &cloned.buffer));
+
+        cloned.buffer.write_bytes(&[0x5a; 16]).unwrap();
+        stream
+            .remount_model_preserving_state(clone_package, 0)
+            .unwrap();
+        let remounted = &stream.processor.device("gpu0").unwrap().mounted;
+        assert_eq!(
+            remounted
+                .buffers
+                .state_buffer("layer_05", &state_id)
+                .unwrap()
+                .buffer
+                .read_bytes(16)
+                .unwrap(),
+            vec![0xa5; 16]
+        );
+        assert_eq!(
+            remounted
+                .buffers
+                .state_buffer("layer_05_repeat", &state_id)
+                .unwrap()
+                .buffer
+                .read_bytes(16)
+                .unwrap(),
+            vec![0x5a; 16]
+        );
     }
 
     #[test]
