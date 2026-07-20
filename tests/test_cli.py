@@ -18,6 +18,7 @@ def runtime_args(**overrides: object) -> Namespace:
     values: dict[str, object] = {
         "prompt": None,
         "chat": False,
+        "chat_template_var": [],
         "inspect_runtime": False,
         "inspect_package": False,
         "inspect_patch": False,
@@ -45,6 +46,27 @@ def runtime_args(**overrides: object) -> Namespace:
 
 
 class RuntimeCliCommandTest(unittest.TestCase):
+    def test_build_runtime_command_forwards_model_chat_template_variables(self) -> None:
+        package = Path("packages/model_x/vulkan_resident_package.json")
+        args = runtime_args(
+            chat=True,
+            chat_template_var=[
+                "enable_thinking=false",
+                "preserve_thinking=true",
+            ],
+        )
+
+        command = build_runtime_command(args, package)
+
+        self.assertIn(
+            ["--chat-template-var", "enable_thinking=false"],
+            [command[index : index + 2] for index in range(len(command) - 1)],
+        )
+        self.assertIn(
+            ["--chat-template-var", "preserve_thinking=true"],
+            [command[index : index + 2] for index in range(len(command) - 1)],
+        )
+
     def test_build_runtime_command_forwards_non_default_random_seed(self) -> None:
         package = Path("packages/model_x/vulkan_resident_package.json")
         args = runtime_args(prompt="Hello", seed=42)

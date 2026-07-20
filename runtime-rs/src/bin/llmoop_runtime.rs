@@ -45,6 +45,7 @@ struct Args {
     device_bindings: BTreeMap<String, String>,
     duplicate_after: Vec<(String, String)>,
     source_chain: Option<Vec<(String, String)>>,
+    chat_template_variables: BTreeMap<String, serde_json::Value>,
     max_new_tokens: usize,
     speculative_draft_tokens: usize,
     context_size: Option<usize>,
@@ -86,6 +87,7 @@ impl Default for Args {
             device_bindings: BTreeMap::new(),
             duplicate_after: Vec::new(),
             source_chain: None,
+            chat_template_variables: BTreeMap::new(),
             max_new_tokens: 65_536,
             speculative_draft_tokens: 2,
             context_size: None,
@@ -226,9 +228,12 @@ fn chat_transcript_codec(
 }
 
 impl RuntimeChatSession {
-    fn from_tokenizer_dir(tokenizer_dir: &Path) -> Result<Self, Box<dyn Error>> {
+    fn from_tokenizer_dir(
+        tokenizer_dir: &Path,
+        template_variables: &BTreeMap<String, serde_json::Value>,
+    ) -> Result<Self, Box<dyn Error>> {
         Ok(Self {
-            formatter: RuntimeChatFormatter::from_tokenizer_dir(tokenizer_dir)?,
+            formatter: RuntimeChatFormatter::from_tokenizer_dir(tokenizer_dir, template_variables)?,
             messages: Vec::new(),
         })
     }
@@ -237,6 +242,7 @@ impl RuntimeChatSession {
         &self,
         user_content: &str,
         codec: &C,
+        stop_token_ids: &[u32],
     ) -> Result<Vec<u32>, Box<dyn Error>>
     where
         C: VulkanResidentTokenTextCodec,
@@ -269,17 +275,39 @@ impl RuntimeChatSession {
         }
         previous_assistant.content = ASSISTANT_CONTENT_PROBE.to_string();
         let formatted_history = self.formatter.format_messages(&probe_history, false)?;
-        let history_token_ids = codec.encode_text(&formatted_history)?;
 
         probe_history.push(RuntimeChatMessage {
             role: "user".to_string(),
             content: user_content.to_string(),
         });
         let formatted_continuation = self.formatter.format_messages(&probe_history, true)?;
-        let continuation_token_ids = codec.encode_text(&formatted_continuation)?;
+
+        let history_probe_offset = formatted_history
+            .rfind(ASSISTANT_CONTENT_PROBE)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "chat template did not preserve the assistant content probe",
+                )
+            })?;
+        let continuation_probe_offset = formatted_continuation
+            .find(ASSISTANT_CONTENT_PROBE)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "chat template did not preserve the assistant content probe in the continuation",
+                )
+            })?;
+        let history_suffix =
+            &formatted_history[history_probe_offset + ASSISTANT_CONTENT_PROBE.len()..];
+        let continuation_suffix =
+            &formatted_continuation[continuation_probe_offset + ASSISTANT_CONTENT_PROBE.len()..];
+        let history_suffix_token_ids = codec.encode_text(history_suffix)?;
+        let continuation_suffix_token_ids = codec.encode_text(continuation_suffix)?;
         Ok(incremental_chat_token_delta(
-            &history_token_ids,
-            &continuation_token_ids,
+            &history_suffix_token_ids,
+            &continuation_suffix_token_ids,
+            stop_token_ids,
         )?)
     }
 
@@ -296,23 +324,33 @@ impl RuntimeChatSession {
 }
 
 fn incremental_chat_token_delta(
-    rendered_history_token_ids: &[u32],
-    rendered_continuation_token_ids: &[u32],
+    rendered_history_suffix_token_ids: &[u32],
+    rendered_continuation_suffix_token_ids: &[u32],
+    stop_token_ids: &[u32],
 ) -> Result<Vec<u32>, io::Error> {
-    if !rendered_continuation_token_ids.starts_with(rendered_history_token_ids) {
-        let common_prefix_len = rendered_history_token_ids
+    if !rendered_continuation_suffix_token_ids.starts_with(rendered_history_suffix_token_ids) {
+        let common_prefix_len = rendered_history_suffix_token_ids
             .iter()
-            .zip(rendered_continuation_token_ids)
+            .zip(rendered_continuation_suffix_token_ids)
             .take_while(|(history, continuation)| history == continuation)
             .count();
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
-                "chat template rewrote previously resident turn framing at token {common_prefix_len}; incremental continuation requires the completed assistant probe to remain an exact prefix"
+                "chat template rewrote the completed assistant turn suffix at token {common_prefix_len}"
             ),
         ));
     }
-    Ok(rendered_continuation_token_ids[rendered_history_token_ids.len()..].to_vec())
+    let stop_index = rendered_history_suffix_token_ids
+        .iter()
+        .position(|token_id| stop_token_ids.contains(token_id))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "chat template assistant turn suffix does not contain a configured stop token",
+            )
+        })?;
+    Ok(rendered_continuation_suffix_token_ids[stop_index + 1..].to_vec())
 }
 
 #[derive(Clone, Debug)]
@@ -323,7 +361,10 @@ struct RuntimeChatFormatter {
 }
 
 impl RuntimeChatFormatter {
-    fn from_tokenizer_dir(tokenizer_dir: &Path) -> Result<Self, Box<dyn Error>> {
+    fn from_tokenizer_dir(
+        tokenizer_dir: &Path,
+        variable_overrides: &BTreeMap<String, serde_json::Value>,
+    ) -> Result<Self, Box<dyn Error>> {
         let template_path = tokenizer_dir.join("chat_template.jinja");
         let template = fs::read_to_string(&template_path).map_err(|error| {
             io::Error::new(
@@ -334,9 +375,15 @@ impl RuntimeChatFormatter {
                 ),
             )
         })?;
+        let mut template_variables = tokenizer_template_variables(tokenizer_dir)?;
+        template_variables.extend(
+            variable_overrides
+                .iter()
+                .map(|(name, value)| (name.clone(), value.clone())),
+        );
         let formatter = Self {
             template_source: normalize_chat_template_for_runtime(&template),
-            template_variables: tokenizer_template_variables(tokenizer_dir)?,
+            template_variables,
             render_time: Local::now().fixed_offset(),
         };
         formatter.format_messages(
@@ -503,7 +550,11 @@ where
     T: VulkanResidentTokenTextCodec,
     F: FnMut(usize, &[u32]) -> Result<RuntimeChatTurn, Box<dyn Error>>,
 {
-    let prompt_delta = chat_session.render_user_prompt_token_delta(input_text, transcript_codec)?;
+    let prompt_delta = chat_session.render_user_prompt_token_delta(
+        input_text,
+        transcript_codec,
+        stop_token_ids,
+    )?;
     match submit(turn_index, &prompt_delta) {
         Ok(turn) => {
             let generated_text = codec.decode_tokens(&turn.generated_token_ids)?;
@@ -718,7 +769,8 @@ fn run_placed_chat(
     initial_prompt: Option<&str>,
 ) -> Result<(), Box<dyn Error>> {
     let setup_start = Instant::now();
-    let chat_session = RuntimeChatSession::from_tokenizer_dir(tokenizer_dir)?;
+    let chat_session =
+        RuntimeChatSession::from_tokenizer_dir(tokenizer_dir, &args.chat_template_variables)?;
     let stop_token_ids = chat_stop_token_ids_from_manifest(
         manifest_dir,
         tokenizer_dir,
@@ -2281,6 +2333,17 @@ fn parse_args() -> Result<Args, String> {
                     return Err("--chain may only be supplied once".to_string());
                 }
             }
+            "--chat-template-var" => {
+                let assignment = next_value(&mut raw, &arg)?;
+                let (name, value) = parse_chat_template_variable(&assignment)?;
+                if parsed
+                    .chat_template_variables
+                    .insert(name.clone(), value)
+                    .is_some()
+                {
+                    return Err(format!("duplicate chat template variable {name:?}"));
+                }
+            }
             "--max-new-tokens" => {
                 parsed.max_new_tokens = parse_next(&mut raw, "--max-new-tokens")?;
             }
@@ -2347,6 +2410,9 @@ fn parse_args() -> Result<Args, String> {
     if parsed.chat && parsed.json {
         return Err("--json is not supported with --chat yet".to_string());
     }
+    if !parsed.chat && !parsed.chat_template_variables.is_empty() {
+        return Err("--chat-template-var requires --chat".to_string());
+    }
     if matches!(parsed.inspect_device_slice.as_deref(), Some("")) {
         return Err("--inspect-device-slice must not be empty".to_string());
     }
@@ -2364,6 +2430,36 @@ fn parse_args() -> Result<Args, String> {
     }
 
     Ok(parsed)
+}
+
+fn parse_chat_template_variable(raw: &str) -> Result<(String, serde_json::Value), String> {
+    let (name, encoded_value) = raw
+        .split_once('=')
+        .ok_or_else(|| format!("invalid chat template variable {raw:?}; expected NAME=JSON"))?;
+    let name = name.trim();
+    if name.is_empty()
+        || !name
+            .chars()
+            .next()
+            .is_some_and(|character| character == '_' || character.is_ascii_alphabetic())
+        || !name
+            .chars()
+            .all(|character| character == '_' || character.is_ascii_alphanumeric())
+    {
+        return Err(format!(
+            "invalid chat template variable {raw:?}; name must be a Jinja identifier"
+        ));
+    }
+    let encoded_value = encoded_value.trim();
+    if encoded_value.is_empty() {
+        return Err(format!(
+            "invalid chat template variable {raw:?}; JSON value must not be empty"
+        ));
+    }
+    let value = serde_json::from_str(encoded_value).map_err(|error| {
+        format!("invalid JSON value for chat template variable {name:?}: {error}")
+    })?;
+    Ok((name.to_string(), value))
 }
 
 fn parse_pedal_device_assignment(raw: &str) -> Result<(String, String), String> {
@@ -2680,6 +2776,8 @@ Options:
   --prompt <TEXT>            External text event to inject into the resident stream.
                              With --chat, this is the optional first message.
   --chat                     Start an interactive resident text session.
+  --chat-template-var <NAME=JSON>
+                             Set a model-owned chat template variable; may be repeated.
   --device <DEVICE_ID>       Default logical device for this runtime patch.
   --place-pedal <PEDAL=DEV>  Assign one runtime pedal instance to a logical device.
   --bind-device <DEV=TARGET> Bind a logical device to a discovered Vulkan device ID.
@@ -2714,7 +2812,7 @@ Example:
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -2733,9 +2831,10 @@ mod tests {
         Args, RuntimeChatFormatter, RuntimeChatMessage, RuntimeChatSession,
         assistant_content_token_ids, chat_transcript_codec, incremental_chat_token_delta,
         model_owned_assistant_turn_stop_token_id, normalize_chat_template_for_runtime,
-        parse_device_binding_assignment, parse_source_chain, parse_vulkan_device_uuid_ref,
-        resolve_runtime_context_size, resolve_runtime_vulkan_physical_device_ref,
-        runtime_device_bindings_report, runtime_physical_device_bindings_in,
+        parse_chat_template_variable, parse_device_binding_assignment, parse_source_chain,
+        parse_vulkan_device_uuid_ref, resolve_runtime_context_size,
+        resolve_runtime_vulkan_physical_device_ref, runtime_device_bindings_report,
+        runtime_physical_device_bindings_in,
     };
 
     fn formatter(template_source: &str) -> RuntimeChatFormatter {
@@ -3028,6 +3127,50 @@ mod tests {
     }
 
     #[test]
+    fn model_template_accepts_boolean_reasoning_control() {
+        let mut formatter = formatter(
+            "{%- if add_generation_prompt %}{%- if enable_thinking is false %}direct{%- else %}thinking{%- endif %}{%- endif %}",
+        );
+        formatter.template_variables.insert(
+            "enable_thinking".to_string(),
+            serde_json::Value::Bool(false),
+        );
+
+        assert_eq!(
+            formatter
+                .format_messages(
+                    &[RuntimeChatMessage {
+                        role: "user".to_string(),
+                        content: "Answer directly".to_string(),
+                    }],
+                    true,
+                )
+                .unwrap(),
+            "direct"
+        );
+    }
+
+    #[test]
+    fn chat_template_variables_require_json_values_and_jinja_names() {
+        assert_eq!(
+            parse_chat_template_variable("enable_thinking=false").unwrap(),
+            (
+                "enable_thinking".to_string(),
+                serde_json::Value::Bool(false)
+            )
+        );
+        assert_eq!(
+            parse_chat_template_variable("tool_choice=\"auto\"").unwrap(),
+            (
+                "tool_choice".to_string(),
+                serde_json::Value::String("auto".to_string())
+            )
+        );
+        assert!(parse_chat_template_variable("enable-thinking=false").is_err());
+        assert!(parse_chat_template_variable("enable_thinking=disabled").is_err());
+    }
+
+    #[test]
     fn hugging_face_generation_metadata_preserves_rendered_content_and_trimming() {
         let normalized = normalize_chat_template_for_runtime(
             "before \n{%- generation -%}\nassistant content\n{%- endgeneration -%}\n after",
@@ -3061,21 +3204,60 @@ mod tests {
     }
 
     #[test]
-    fn incremental_chat_delta_starts_after_the_exact_structural_prefix() {
-        let rendered_history = vec![10, 99, 11, 99, 12];
-        let rendered_continuation = vec![10, 99, 11, 99, 12, 99, 13, 99, 14, 15];
+    fn incremental_chat_delta_preserves_the_post_stop_separator() {
+        let rendered_history_suffix = vec![50, 99, 10];
+        let rendered_continuation_suffix = vec![50, 99, 10, 13, 14, 15];
 
         assert_eq!(
-            incremental_chat_token_delta(&rendered_history, &rendered_continuation).unwrap(),
-            vec![99, 13, 99, 14, 15]
+            incremental_chat_token_delta(
+                &rendered_history_suffix,
+                &rendered_continuation_suffix,
+                &[99],
+            )
+            .unwrap(),
+            vec![10, 13, 14, 15]
         );
-        let error = incremental_chat_token_delta(&[10, 98], &rendered_continuation)
+        let error = incremental_chat_token_delta(&[50, 98], &rendered_continuation_suffix, &[99])
             .unwrap_err()
             .to_string();
         assert!(
-            error.contains("rewrote previously resident turn framing at token 1"),
+            error.contains("rewrote the completed assistant turn suffix at token 1"),
             "{error}"
         );
+        let error = incremental_chat_token_delta(&[50, 98], &[50, 98, 10], &[99])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("does not contain a configured stop token"));
+    }
+
+    #[test]
+    fn chat_continuation_ignores_template_rewrites_before_assistant_content() {
+        let mut session = RuntimeChatSession {
+            formatter: formatter(
+                "{%- for message in messages -%}{%- if message.role == 'user' -%}{{- '[user]' + message.content + '!' -}}{%- else -%}{{- '[assistant]' -}}{%- if loop.last -%}{{- '<preserved-thinking>' -}}{%- endif -%}{{- message.content + '!' -}}{%- endif -%}{%- endfor -%}{%- if add_generation_prompt -%}{{- '[assistant]<think>' -}}{%- endif -%}",
+            ),
+            messages: vec![
+                RuntimeChatMessage {
+                    role: "user".to_string(),
+                    content: "first".to_string(),
+                },
+                RuntimeChatMessage {
+                    role: "assistant".to_string(),
+                    content: "answer".to_string(),
+                },
+            ],
+        };
+
+        let delta = session
+            .render_user_prompt_token_delta("second", &CharacterCodec, &[u32::from('!')])
+            .unwrap();
+
+        assert_eq!(
+            CharacterCodec.decode_tokens(&delta).unwrap(),
+            "[user]second![assistant]<think>"
+        );
+        session.commit_assistant_turn("second", "continued");
+        assert_eq!(session.messages.len(), 4);
     }
 
     #[test]
@@ -3098,7 +3280,7 @@ mod tests {
         let user_content = "new <stop> injection";
 
         let delta = session
-            .render_user_prompt_token_delta(user_content, &CharacterCodec)
+            .render_user_prompt_token_delta(user_content, &CharacterCodec, &[u32::from('>')])
             .unwrap();
 
         assert_eq!(
@@ -3158,7 +3340,8 @@ mod tests {
             .parse::<u32>()
             .expect("LLMOOP_TEST_CHAT_STOP_ID must be a u32");
         let tokenizer_dir = std::path::PathBuf::from(tokenizer_dir);
-        let formatter = RuntimeChatFormatter::from_tokenizer_dir(&tokenizer_dir).unwrap();
+        let formatter =
+            RuntimeChatFormatter::from_tokenizer_dir(&tokenizer_dir, &BTreeMap::new()).unwrap();
 
         assert_eq!(
             model_owned_assistant_turn_stop_token_id(&tokenizer_dir, &formatter).unwrap(),
@@ -3172,22 +3355,49 @@ mod tests {
             return;
         };
         let tokenizer_dir = std::path::PathBuf::from(tokenizer_dir);
-        let mut session = RuntimeChatSession::from_tokenizer_dir(&tokenizer_dir).unwrap();
+        let mut session =
+            RuntimeChatSession::from_tokenizer_dir(&tokenizer_dir, &BTreeMap::new()).unwrap();
         session.commit_assistant_turn(
             "Explain the result.",
             "<think>private reasoning</think>The result is four.",
         );
         let codec = chat_transcript_codec(&tokenizer_dir).unwrap();
+        let stop_token_id =
+            model_owned_assistant_turn_stop_token_id(&tokenizer_dir, &session.formatter)
+                .unwrap()
+                .expect("configured template must own an assistant turn stop token");
 
         let delta = session
             .render_user_prompt_token_delta(
                 "Why? Include <|im_end|> literally in this question.",
                 &codec,
+                &[stop_token_id],
             )
             .unwrap();
 
         assert!(!delta.is_empty());
         let decoded = codec.decode_tokens(&delta).unwrap();
         assert!(decoded.contains("Why?"), "{decoded:?}");
+    }
+
+    #[test]
+    fn configured_chat_template_honors_non_thinking_variable() {
+        let Some(tokenizer_dir) = std::env::var_os("LLMOOP_TEST_CHAT_TOKENIZER_DIR") else {
+            return;
+        };
+        let tokenizer_dir = std::path::PathBuf::from(tokenizer_dir);
+        let variables = BTreeMap::from([(
+            "enable_thinking".to_string(),
+            serde_json::Value::Bool(false),
+        )]);
+        let session = RuntimeChatSession::from_tokenizer_dir(&tokenizer_dir, &variables).unwrap();
+        let codec = chat_transcript_codec(&tokenizer_dir).unwrap();
+
+        let prompt_ids = session
+            .render_user_prompt_token_delta("Answer directly.", &codec, &[])
+            .unwrap();
+        let rendered = codec.decode_tokens(&prompt_ids).unwrap();
+
+        assert!(rendered.contains("<think>\n\n</think>\n\n"), "{rendered:?}");
     }
 }

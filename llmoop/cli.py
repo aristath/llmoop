@@ -46,6 +46,13 @@ def main() -> None:
         help="start an interactive resident text session for --run",
     )
     parser.add_argument(
+        "--chat-template-var",
+        action="append",
+        default=[],
+        metavar="NAME=JSON",
+        help="set a model-owned chat template variable for --chat; may be repeated",
+    )
+    parser.add_argument(
         "--inspect-runtime",
         action="store_true",
         help="preview UI-ready package, patch, placement, device, and route facts for --run",
@@ -270,6 +277,8 @@ def main() -> None:
             parser.error("--profile-runs is not supported with --chat")
         if args.chat and args.json:
             parser.error("--json is not supported with --chat yet")
+        if args.chat_template_var and not args.chat:
+            parser.error("--chat-template-var requires --chat")
         if args.vulkan_device_index is not None and args.vulkan_device_index < 0:
             parser.error("--vulkan-device-index must be non-negative")
         if args.seed < 0 or args.seed > 0xFFFF_FFFF:
@@ -329,6 +338,7 @@ def validate_action_options(
     runtime_options = (
         ("--prompt", args.prompt is not None),
         ("--chat", args.chat),
+        ("--chat-template-var", bool(args.chat_template_var)),
         ("--inspect-runtime", args.inspect_runtime),
         ("--inspect-package", args.inspect_package),
         ("--inspect-patch", args.inspect_patch),
@@ -475,6 +485,8 @@ def build_runtime_command(args: argparse.Namespace, package_manifest: Path) -> l
         runtime_args.extend(["--duplicate-after", raw_duplicate])
     if args.chain is not None:
         runtime_args.extend(["--chain", args.chain])
+    for raw_variable in args.chat_template_var:
+        runtime_args.extend(["--chat-template-var", raw_variable])
     if args.context_size is not None:
         runtime_args.extend(["--context-size", str(args.context_size)])
     if args.vulkan_device_index is not None:
