@@ -1,0 +1,139 @@
+#version 450
+
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer InputFrames { uint words[]; } input_frames;
+layout(set = 0, binding = 1) buffer OutputFrames { uint words[]; } output_frames;
+layout(set = 0, binding = 2) readonly buffer GateWeight { uint words[]; } gate_weight;
+layout(set = 0, binding = 3) readonly buffer UpWeight { uint words[]; } up_weight;
+
+layout(push_constant) uniform BatchControl { uint batch_width; } batch_control;
+
+const uint BATCH_TILE_WIDTH = {{BATCH_TILE_WIDTH}}u;
+const uint INPUT_SIZE = {{INPUT_SIZE}}u;
+const uint INPUT_WORDS = INPUT_SIZE / 2u;
+const uint OUTPUT_SIZE = {{OUTPUT_SIZE}}u;
+const uint OUTPUT_WORDS = OUTPUT_SIZE / 2u;
+const bool PAIRED_WEIGHT_LAYOUT = {{PAIRED_WEIGHT_LAYOUT}};
+
+shared float subgroup_gate_lo[BATCH_TILE_WIDTH][64];
+shared float subgroup_gate_hi[BATCH_TILE_WIDTH][64];
+shared float subgroup_up_lo[BATCH_TILE_WIDTH][64];
+shared float subgroup_up_hi[BATCH_TILE_WIDTH][64];
+
+float bf16_to_f32(uint value) { return uintBitsToFloat((value & 0xffffu) << 16); }
+
+uint f32_to_bf16(float value) {
+    uint bits = floatBitsToUint(value);
+    uint lsb = (bits >> 16) & 1u;
+    return (bits + 0x7fffu + lsb) >> 16;
+}
+
+uint weight_index(uint output_word, uint column_word, uint row_offset) {
+    if (PAIRED_WEIGHT_LAYOUT) {
+        return (2u * ((output_word * INPUT_WORDS) + column_word)) + row_offset;
+    }
+    return (((output_word * 2u) + row_offset) * INPUT_WORDS) + column_word;
+}
+
+float round_bf16(float value) { return bf16_to_f32(f32_to_bf16(value)); }
+float rounded_silu(float value) { return round_bf16(value / (1.0 + exp(-value))); }
+
+void write_result(
+    uint batch_index,
+    uint output_word,
+    float gate_lo,
+    float gate_hi,
+    float up_lo,
+    float up_hi
+) {
+    uint lo = f32_to_bf16(rounded_silu(round_bf16(gate_lo)) * round_bf16(up_lo));
+    uint hi = f32_to_bf16(rounded_silu(round_bf16(gate_hi)) * round_bf16(up_hi));
+    output_frames.words[batch_index * OUTPUT_WORDS + output_word] = (hi << 16u) | lo;
+}
+
+void main() {
+    uint output_word = gl_WorkGroupID.x;
+    uint batch_start = gl_WorkGroupID.y * BATCH_TILE_WIDTH;
+    uint lane = gl_LocalInvocationID.x;
+    if (output_word >= OUTPUT_WORDS) return;
+
+    float gate_lo[BATCH_TILE_WIDTH];
+    float gate_hi[BATCH_TILE_WIDTH];
+    float up_lo[BATCH_TILE_WIDTH];
+    float up_hi[BATCH_TILE_WIDTH];
+    for (uint batch_lane = 0u; batch_lane < BATCH_TILE_WIDTH; batch_lane++) {
+        gate_lo[batch_lane] = 0.0;
+        gate_hi[batch_lane] = 0.0;
+        up_lo[batch_lane] = 0.0;
+        up_hi[batch_lane] = 0.0;
+    }
+    for (uint column_word = lane; column_word < INPUT_WORDS; column_word += 64u) {
+        uint gate_lo_weight = gate_weight.words[weight_index(output_word, column_word, 0u)];
+        uint gate_hi_weight = gate_weight.words[weight_index(output_word, column_word, 1u)];
+        uint up_lo_weight = up_weight.words[weight_index(output_word, column_word, 0u)];
+        uint up_hi_weight = up_weight.words[weight_index(output_word, column_word, 1u)];
+        for (uint batch_lane = 0u; batch_lane < BATCH_TILE_WIDTH; batch_lane++) {
+            uint batch_index = batch_start + batch_lane;
+            if (batch_index >= batch_control.batch_width) continue;
+            uint input_pair = input_frames.words[batch_index * INPUT_WORDS + column_word];
+            float input_lo = bf16_to_f32(input_pair);
+            float input_hi = bf16_to_f32(input_pair >> 16u);
+            gate_lo[batch_lane] = fma(input_lo, bf16_to_f32(gate_lo_weight), gate_lo[batch_lane]);
+            gate_lo[batch_lane] = fma(input_hi, bf16_to_f32(gate_lo_weight >> 16u), gate_lo[batch_lane]);
+            gate_hi[batch_lane] = fma(input_lo, bf16_to_f32(gate_hi_weight), gate_hi[batch_lane]);
+            gate_hi[batch_lane] = fma(input_hi, bf16_to_f32(gate_hi_weight >> 16u), gate_hi[batch_lane]);
+            up_lo[batch_lane] = fma(input_lo, bf16_to_f32(up_lo_weight), up_lo[batch_lane]);
+            up_lo[batch_lane] = fma(input_hi, bf16_to_f32(up_lo_weight >> 16u), up_lo[batch_lane]);
+            up_hi[batch_lane] = fma(input_lo, bf16_to_f32(up_hi_weight), up_hi[batch_lane]);
+            up_hi[batch_lane] = fma(input_hi, bf16_to_f32(up_hi_weight >> 16u), up_hi[batch_lane]);
+        }
+    }
+
+    for (uint batch_lane = 0u; batch_lane < BATCH_TILE_WIDTH; batch_lane++) {
+        gate_lo[batch_lane] = subgroupAdd(gate_lo[batch_lane]);
+        gate_hi[batch_lane] = subgroupAdd(gate_hi[batch_lane]);
+        up_lo[batch_lane] = subgroupAdd(up_lo[batch_lane]);
+        up_hi[batch_lane] = subgroupAdd(up_hi[batch_lane]);
+    }
+    if (gl_NumSubgroups == 1u) {
+        if (gl_SubgroupInvocationID == 0u) {
+            for (uint batch_lane = 0u; batch_lane < BATCH_TILE_WIDTH; batch_lane++) {
+                uint batch_index = batch_start + batch_lane;
+                if (batch_index < batch_control.batch_width) {
+                    write_result(batch_index, output_word, gate_lo[batch_lane], gate_hi[batch_lane], up_lo[batch_lane], up_hi[batch_lane]);
+                }
+            }
+        }
+        return;
+    }
+    if (gl_SubgroupInvocationID == 0u) {
+        for (uint batch_lane = 0u; batch_lane < BATCH_TILE_WIDTH; batch_lane++) {
+            subgroup_gate_lo[batch_lane][gl_SubgroupID] = gate_lo[batch_lane];
+            subgroup_gate_hi[batch_lane][gl_SubgroupID] = gate_hi[batch_lane];
+            subgroup_up_lo[batch_lane][gl_SubgroupID] = up_lo[batch_lane];
+            subgroup_up_hi[batch_lane][gl_SubgroupID] = up_hi[batch_lane];
+        }
+    }
+    barrier();
+    if (lane == 0u) {
+        for (uint batch_lane = 0u; batch_lane < BATCH_TILE_WIDTH; batch_lane++) {
+            uint batch_index = batch_start + batch_lane;
+            if (batch_index >= batch_control.batch_width) continue;
+            float gate_lo_total = 0.0;
+            float gate_hi_total = 0.0;
+            float up_lo_total = 0.0;
+            float up_hi_total = 0.0;
+            for (uint subgroup = 0u; subgroup < gl_NumSubgroups; subgroup++) {
+                gate_lo_total += subgroup_gate_lo[batch_lane][subgroup];
+                gate_hi_total += subgroup_gate_hi[batch_lane][subgroup];
+                up_lo_total += subgroup_up_lo[batch_lane][subgroup];
+                up_hi_total += subgroup_up_hi[batch_lane][subgroup];
+            }
+            write_result(batch_index, output_word, gate_lo_total, gate_hi_total, up_lo_total, up_hi_total);
+        }
+    }
+}

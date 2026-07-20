@@ -776,6 +776,18 @@ def weight_shared_batch_shader_file(shader_file: str) -> str | None:
                 f"{operation}_batch{tile}_fp8_e4m3_",
                 1,
             )
+    bf16 = re.fullmatch(
+        r"(linear|linear_residual)_(paired_)?bf16_(\d+)x(\d+)\.comp",
+        shader_file,
+    )
+    if bf16 is not None:
+        operation, paired, input_size, output_size = bf16.groups()
+        if int(input_size) % 2 == 0 and int(output_size) % 2 == 0:
+            layout = "paired" if paired else "row_major"
+            return (
+                f"{operation}_batch{tile}_{layout}_bf16_"
+                f"{input_size}x{output_size}.comp"
+            )
     parallel = re.fullmatch(
         r"parallel_linear_([23])way_(paired|row_major)_bf16_(\d+)x.+\.comp",
         shader_file,
@@ -797,6 +809,18 @@ def weight_shared_batch_shader_file(shader_file: str) -> str | None:
                 "parallel_linear_silu_multiply_fp8_e4m3_",
                 f"parallel_linear_silu_multiply_batch{tile}_fp8_e4m3_",
                 1,
+            )
+    fused_bf16_ffn = re.fullmatch(
+        r"parallel_linear_silu_multiply_(paired|row_major)_bf16_"
+        r"(\d+)x(\d+)\.comp",
+        shader_file,
+    )
+    if fused_bf16_ffn is not None:
+        layout, input_size, output_size = fused_bf16_ffn.groups()
+        if int(input_size) % 2 == 0 and int(output_size) % 2 == 0:
+            return (
+                f"parallel_linear_silu_multiply_batch{tile}_{layout}_bf16_"
+                f"{input_size}x{output_size}.comp"
             )
     return None
 
@@ -1781,22 +1805,73 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
             },
         )
 
+    batched_bf16_linear = re.fullmatch(
+        r"(linear|linear_residual)_batch(\d+)_(paired|row_major)_bf16_"
+        r"(\d+)x(\d+)\.comp",
+        shader_file,
+    )
+    if batched_bf16_linear is not None:
+        operation = batched_bf16_linear.group(1)
+        batch_tile_width = int(batched_bf16_linear.group(2))
+        weight_layout = batched_bf16_linear.group(3)
+        input_size = int(batched_bf16_linear.group(4))
+        output_size = int(batched_bf16_linear.group(5))
+        if (
+            batch_tile_width <= 0
+            or input_size <= 0
+            or input_size % 2
+            or output_size <= 0
+            or output_size % 2
+        ):
+            raise ModelCompileError(
+                f"invalid batched BF16 linear shader shape {shader_file!r}"
+            )
+        return render_shader_template(
+            source_dir,
+            f"{operation}_batch_bf16.comp.template",
+            {
+                "BATCH_TILE_WIDTH": str(batch_tile_width),
+                "INPUT_SIZE": str(input_size),
+                "OUTPUT_SIZE": str(output_size),
+                "PAIRED_WEIGHT_LAYOUT": (
+                    "true" if weight_layout == "paired" else "false"
+                ),
+            },
+        )
+
     fused_ffn_projection = re.fullmatch(
-        r"parallel_linear_silu_multiply_(paired|row_major)_bf16_(\d+)x(\d+)\.comp",
+        r"parallel_linear_silu_multiply_(?:batch(\d+)_)?"
+        r"(paired|row_major)_bf16_(\d+)x(\d+)\.comp",
         shader_file,
     )
     if fused_ffn_projection is not None:
-        weight_layout = fused_ffn_projection.group(1)
-        input_size = int(fused_ffn_projection.group(2))
-        output_size = int(fused_ffn_projection.group(3))
-        if input_size <= 0 or input_size % 2 or output_size <= 0 or output_size % 2:
+        batch_tile_width = (
+            int(fused_ffn_projection.group(1))
+            if fused_ffn_projection.group(1) is not None
+            else None
+        )
+        weight_layout = fused_ffn_projection.group(2)
+        input_size = int(fused_ffn_projection.group(3))
+        output_size = int(fused_ffn_projection.group(4))
+        if (
+            (batch_tile_width is not None and batch_tile_width <= 0)
+            or input_size <= 0
+            or input_size % 2
+            or output_size <= 0
+            or output_size % 2
+        ):
             raise ModelCompileError(
                 f"invalid fused FFN projection shader shape {shader_file!r}"
             )
         return render_shader_template(
             source_dir,
-            "parallel_linear_silu_multiply_bf16.comp.template",
+            (
+                "parallel_linear_silu_multiply_batch_bf16.comp.template"
+                if batch_tile_width is not None
+                else "parallel_linear_silu_multiply_bf16.comp.template"
+            ),
             {
+                "BATCH_TILE_WIDTH": str(batch_tile_width or 1),
                 "INPUT_SIZE": str(input_size),
                 "OUTPUT_SIZE": str(output_size),
                 "PAIRED_WEIGHT_LAYOUT": (

@@ -41,10 +41,19 @@ def test_compiler_selects_only_compatible_weight_shared_batch_kernels() -> None:
         "parallel_linear_silu_multiply_batch4_fp8_e4m3_"
         "b128x128_5120x17408.comp"
     )
-    assert weight_shared_batch_shader_file("linear_paired_bf16_1024x1024.comp") is None
+    assert weight_shared_batch_shader_file(
+        "linear_paired_bf16_1024x1024.comp"
+    ) == "linear_batch4_paired_bf16_1024x1024.comp"
+    assert weight_shared_batch_shader_file(
+        "linear_residual_bf16_1024x1024.comp"
+    ) == "linear_residual_batch4_row_major_bf16_1024x1024.comp"
+    assert weight_shared_batch_shader_file(
+        "parallel_linear_silu_multiply_paired_bf16_1024x4096.comp"
+    ) == "parallel_linear_silu_multiply_batch4_paired_bf16_1024x4096.comp"
     assert weight_shared_batch_shader_file(
         "linear_fp8_e4m3_b127x128_5120x17408.comp"
     ) is None
+    assert weight_shared_batch_shader_file("linear_paired_bf16_1023x1024.comp") is None
 
 
 def test_compiler_renders_weight_shared_pedal_batch_shaders(tmp_path: Path) -> None:
@@ -55,6 +64,9 @@ def test_compiler_renders_weight_shared_pedal_batch_shaders(tmp_path: Path) -> N
         "linear_residual_batch4_fp8_e4m3_b128x128_17408x5120.comp",
         "parallel_linear_batch4_2way_paired_bf16_1024x2560_2560.comp",
         "parallel_linear_silu_multiply_batch4_fp8_e4m3_b128x128_5120x17408.comp",
+        "linear_batch4_paired_bf16_1024x4096.comp",
+        "linear_residual_batch4_row_major_bf16_4096x1024.comp",
+        "parallel_linear_silu_multiply_batch4_paired_bf16_1024x4096.comp",
     }
 
     copy_shader_templates(shader_source_dir, tmp_path, shader_files)

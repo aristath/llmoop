@@ -513,6 +513,8 @@ def test_shader_templates_compile_to_vulkan_1_4_spirv(tmp_path: Path) -> None:
     shader_source_dir = Path(__file__).parents[1] / "runtime-rs" / "shaders"
     shader_files = {
         "linear_paired_bf16_768x2048.comp",
+        "linear_batch4_paired_bf16_768x2048.comp",
+        "linear_residual_batch4_row_major_bf16_2048x768.comp",
         "linear_fp8_e4m3_b128x128_5120x17408.comp",
         "linear_batch4_fp8_e4m3_b128x128_5120x17408.comp",
         "linear_bias_fp8_e4m3_b128x128_5120x17408.comp",
@@ -521,6 +523,7 @@ def test_shader_templates_compile_to_vulkan_1_4_spirv(tmp_path: Path) -> None:
         "parallel_linear_batch4_2way_paired_bf16_1024x2560_2560.comp",
         "parallel_linear_silu_multiply_fp8_e4m3_b128x128_5120x17408.comp",
         "parallel_linear_silu_multiply_batch4_fp8_e4m3_b128x128_5120x17408.comp",
+        "parallel_linear_silu_multiply_batch4_paired_bf16_768x2048.comp",
         "rms_norm_bf16_h768_eps1e-05_offset0.comp",
         "rotary_bf16_12x64_r64_theta10000_half__sc2.comp",
         "append_kv_state_bf16_4x64__sc9.comp",
