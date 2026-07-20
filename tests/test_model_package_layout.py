@@ -57,6 +57,13 @@ def test_compiler_selects_only_compatible_weight_shared_batch_kernels() -> None:
         "parallel_linear_silu_multiply_paired_bf16_1024x4096.comp"
     ) == "parallel_linear_silu_multiply_batch16_paired_bf16_1024x4096.comp"
     assert weight_shared_batch_shader_file(
+        "split_bf16_2x16x256_head_interleaved.comp"
+    ) == "split_batch16_bf16_2x16x256_head_interleaved.comp"
+    assert (
+        weight_shared_batch_shader_file("sigmoid_multiply_bf16.comp")
+        == "sigmoid_multiply_batch16_bf16.comp"
+    )
+    assert weight_shared_batch_shader_file(
         "linear_fp8_e4m3_b127x128_5120x17408.comp"
     ) is None
     assert weight_shared_batch_shader_file("linear_paired_bf16_1023x1024.comp") is None
@@ -70,6 +77,13 @@ def test_compiler_selects_stateful_causal_scan_kernels() -> None:
     assert causal_scan_batch_shader_file(
         "gated_delta_step_k16x128_v32x128_af32_dtbf16_nf32_eps1e-06.comp"
     ) == "gated_delta_scan_k16x128_v32x128_af32_dtbf16_nf32_eps1e-06.comp"
+    assert causal_scan_batch_shader_file(
+        "parallel_head_norm_rope_2way_bf16_h16_4_d256_r64_eps1e-06_"
+        "offset1_theta10000000_half__sc6.comp"
+    ) == (
+        "parallel_head_norm_rope_2way_temporal_bf16_h16_4_d256_r64_"
+        "eps1e-06_offset1_theta10000000_half.comp"
+    )
     assert causal_scan_batch_shader_file("linear_paired_bf16_4096x4096.comp") is None
     assert causal_scan_workgroup_count_x(
         "causal_conv1d_silu_bf16_c8192_k4.comp"
@@ -77,6 +91,10 @@ def test_compiler_selects_stateful_causal_scan_kernels() -> None:
     assert causal_scan_workgroup_count_x(
         "gated_delta_step_k16x128_v32x128_af32_dtbf16_nf32_eps1e-06.comp"
     ) == 32
+    assert causal_scan_workgroup_count_x(
+        "parallel_head_norm_rope_2way_bf16_h16_4_d256_r64_eps1e-06_"
+        "offset1_theta10000000_half__sc6.comp"
+    ) == 20
 
 
 def test_compiler_selects_cooperative_bfloat16_projection_kernels() -> None:
@@ -155,6 +173,8 @@ def test_compiler_renders_weight_shared_pedal_batch_shaders(tmp_path: Path) -> N
         "linear_batch16_paired_bf16_1024x4096.comp",
         "linear_residual_batch16_row_major_bf16_4096x1024.comp",
         "parallel_linear_silu_multiply_batch16_paired_bf16_1024x4096.comp",
+        "split_batch16_bf16_2x16x256_head_interleaved.comp",
+        "sigmoid_multiply_batch16_bf16.comp",
     }
 
     copy_shader_templates(shader_source_dir, tmp_path, shader_files)
@@ -171,6 +191,25 @@ def test_compiler_renders_weight_shared_pedal_batch_shaders(tmp_path: Path) -> N
     assert required_vulkan_device_extensions(tmp_path, shader_files) == [
         "VK_EXT_shader_float8"
     ]
+
+
+def test_compiler_renders_position_aware_temporal_head_norm_rope(
+    tmp_path: Path,
+) -> None:
+    shader_source_dir = Path(__file__).parents[1] / "runtime-rs" / "shaders"
+    shader_file = (
+        "parallel_head_norm_rope_2way_temporal_bf16_h16_4_d256_r64_"
+        "eps1e-06_offset1_theta10000000_half.comp"
+    )
+
+    copy_shader_templates(shader_source_dir, tmp_path, {shader_file})
+
+    source = (tmp_path / shader_file).read_text()
+    assert "uint start_stream_tick_low;" in source
+    assert "position < batch_control.batch_width" in source
+    assert "start_stream_tick_low + position" in source
+    assert "StreamControl" not in source
+    assert "{{" not in source
 
 
 def test_compiler_renders_cooperative_bfloat16_batch_shaders(tmp_path: Path) -> None:

@@ -1,0 +1,184 @@
+#version 450
+
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer InputAFrames { uint words[]; } input_a_frames;
+layout(set = 0, binding = 1) readonly buffer InputBFrames { uint words[]; } input_b_frames;
+layout(set = 0, binding = 2) buffer OutputAFrames { uint words[]; } output_a_frames;
+layout(set = 0, binding = 3) buffer OutputBFrames { uint words[]; } output_b_frames;
+layout(set = 0, binding = 4) readonly buffer WeightA { uint words[]; } weight_a;
+layout(set = 0, binding = 5) readonly buffer WeightB { uint words[]; } weight_b;
+
+layout(push_constant) uniform BatchControl {
+    uint batch_width;
+    uint start_stream_tick_low;
+    uint start_stream_tick_high;
+    uint dynamic_state_capacity;
+} batch_control;
+
+const uint BRANCH_A_HEADS = {{BRANCH_A_HEADS}}u;
+const uint BRANCH_B_HEADS = {{BRANCH_B_HEADS}}u;
+const uint HEAD_WIDTH = {{HEAD_WIDTH}}u;
+const uint ROTARY_WIDTH = {{ROTARY_WIDTH}}u;
+const uint BRANCH_A_WIDTH = BRANCH_A_HEADS * HEAD_WIDTH;
+const uint BRANCH_B_WIDTH = BRANCH_B_HEADS * HEAD_WIDTH;
+const uint BRANCH_A_WORDS = BRANCH_A_WIDTH / 2u;
+const uint BRANCH_B_WORDS = BRANCH_B_WIDTH / 2u;
+const float NORM_EPS = {{NORM_EPS}};
+const float WEIGHT_OFFSET = {{WEIGHT_OFFSET}};
+const float ROPE_THETA = {{ROPE_THETA}};
+const bool ROPE_INTERLEAVED = {{ROPE_INTERLEAVED}};
+const bool ROPE_PROPORTIONAL = {{ROPE_PROPORTIONAL}};
+
+shared float reduction[64];
+shared uint normalized_words[(HEAD_WIDTH + 1u) / 2u];
+
+float bf16_to_f32(uint value) {
+    return uintBitsToFloat((value & 0xffffu) << 16);
+}
+
+uint f32_to_bf16(float value) {
+    uint bits = floatBitsToUint(value);
+    uint lsb = (bits >> 16) & 1u;
+    return (bits + 0x7fffu + lsb) >> 16;
+}
+
+uint branch_frame_words(uint branch) {
+    return branch == 0u ? BRANCH_A_WORDS : BRANCH_B_WORDS;
+}
+
+float read_branch_input(uint branch, uint position, uint index) {
+    uint word_index = position * branch_frame_words(branch) + (index >> 1u);
+    uint packed = branch == 0u
+        ? input_a_frames.words[word_index]
+        : input_b_frames.words[word_index];
+    uint value = ((index & 1u) == 0u) ? (packed & 0xffffu) : (packed >> 16);
+    return bf16_to_f32(value);
+}
+
+float read_branch_weight(uint branch, uint index) {
+    uint packed = branch == 0u
+        ? weight_a.words[index >> 1]
+        : weight_b.words[index >> 1];
+    uint value = ((index & 1u) == 0u) ? (packed & 0xffffu) : (packed >> 16);
+    return bf16_to_f32(value);
+}
+
+float read_normalized(uint dim) {
+    uint packed = normalized_words[dim >> 1];
+    uint value = ((dim & 1u) == 0u) ? (packed & 0xffffu) : (packed >> 16);
+    return bf16_to_f32(value);
+}
+
+float rotate_value(uint dim) {
+    if (ROPE_PROPORTIONAL) {
+        uint half_width = HEAD_WIDTH / 2u;
+        return dim < half_width
+            ? -read_normalized(dim + half_width)
+            : read_normalized(dim - half_width);
+    }
+    if (ROPE_INTERLEAVED) {
+        return (dim & 1u) == 0u
+            ? -read_normalized(dim + 1u)
+            : read_normalized(dim - 1u);
+    }
+    return dim < (ROTARY_WIDTH / 2u)
+        ? -read_normalized(dim + (ROTARY_WIDTH / 2u))
+        : read_normalized(dim - (ROTARY_WIDTH / 2u));
+}
+
+float rope_angle(uint dim, uint position) {
+    if (ROPE_PROPORTIONAL) {
+        uint half_width = HEAD_WIDTH / 2u;
+        uint frequency_index = dim % half_width;
+        if (frequency_index >= (ROTARY_WIDTH / 2u)) return 0.0;
+        float inv_freq = pow(
+            ROPE_THETA,
+            -2.0 * float(frequency_index) / float(HEAD_WIDTH)
+        );
+        return float(batch_control.start_stream_tick_low + position) * inv_freq;
+    }
+    uint frequency_index = ROPE_INTERLEAVED
+        ? dim / 2u
+        : dim % (ROTARY_WIDTH / 2u);
+    float inv_freq = pow(
+        ROPE_THETA,
+        -2.0 * float(frequency_index) / float(ROTARY_WIDTH)
+    );
+    return float(batch_control.start_stream_tick_low + position) * inv_freq;
+}
+
+float rotate(uint dim, uint position) {
+    if (!ROPE_PROPORTIONAL && dim >= ROTARY_WIDTH) return read_normalized(dim);
+    float angle = rope_angle(dim, position);
+    return (read_normalized(dim) * cos(angle))
+        + (rotate_value(dim) * sin(angle));
+}
+
+void write_branch_output(
+    uint branch,
+    uint position,
+    uint word_in_frame,
+    uint packed
+) {
+    uint index = position * branch_frame_words(branch) + word_in_frame;
+    if (branch == 0u) {
+        output_a_frames.words[index] = packed;
+    } else {
+        output_b_frames.words[index] = packed;
+    }
+}
+
+void main() {
+    uint global_head = gl_WorkGroupID.x;
+    uint lane = gl_LocalInvocationID.x;
+    uint total_heads = BRANCH_A_HEADS + BRANCH_B_HEADS;
+    if (global_head >= total_heads) return;
+
+    uint branch = global_head < BRANCH_A_HEADS ? 0u : 1u;
+    uint head = branch == 0u ? global_head : global_head - BRANCH_A_HEADS;
+    uint base = head * HEAD_WIDTH;
+
+    for (uint position = 0u; position < batch_control.batch_width; position++) {
+        float sum_squares = 0.0;
+        for (uint dim = lane; dim < HEAD_WIDTH; dim += 64u) {
+            float value = read_branch_input(branch, position, base + dim);
+            sum_squares = fma(value, value, sum_squares);
+        }
+        sum_squares = subgroupAdd(sum_squares);
+        if (gl_SubgroupInvocationID == 0u) reduction[gl_SubgroupID] = sum_squares;
+        barrier();
+        sum_squares = 0.0;
+        for (uint subgroup = 0u; subgroup < gl_NumSubgroups; subgroup++) {
+            sum_squares += reduction[subgroup];
+        }
+        float inv_rms = inversesqrt((sum_squares / float(HEAD_WIDTH)) + NORM_EPS);
+
+        for (uint pair_dim = lane * 2u; pair_dim < HEAD_WIDTH; pair_dim += 128u) {
+            float lo = read_branch_input(branch, position, base + pair_dim)
+                * inv_rms
+                * (read_branch_weight(branch, pair_dim) + WEIGHT_OFFSET);
+            float hi = read_branch_input(branch, position, base + pair_dim + 1u)
+                * inv_rms
+                * (read_branch_weight(branch, pair_dim + 1u) + WEIGHT_OFFSET);
+            normalized_words[pair_dim >> 1] =
+                (f32_to_bf16(hi) << 16) | f32_to_bf16(lo);
+        }
+        barrier();
+
+        for (uint dim = lane * 2u; dim < HEAD_WIDTH; dim += 128u) {
+            float lo = rotate(dim, position);
+            float hi = rotate(dim + 1u, position);
+            write_branch_output(
+                branch,
+                position,
+                (base + dim) >> 1,
+                (f32_to_bf16(hi) << 16) | f32_to_bf16(lo)
+            );
+        }
+        barrier();
+    }
+}

@@ -44,6 +44,7 @@ const CONTRACT_DIGEST_ALGORITHM: &str = "llmoop.json_tree_sha256.v1";
 const VULKAN_STREAM_CONTROL_BYTE_CAPACITY: usize = 5 * std::mem::size_of::<u32>();
 const VULKAN_STREAM_CONTROL_TOKEN_BYTE_CAPACITY: usize = std::mem::size_of::<u32>();
 const VULKAN_STREAM_CONTROL_METADATA_OFFSET: usize = VULKAN_STREAM_CONTROL_TOKEN_BYTE_CAPACITY;
+const VULKAN_PEDAL_BATCH_CONTROL_BYTE_CAPACITY: u32 = 4 * std::mem::size_of::<u32>() as u32;
 const VULKAN_SAMPLER_HISTORY_RECORD_BYTE_CAPACITY: usize = 4 * std::mem::size_of::<u32>();
 pub const VULKAN_BACKEND_LOOP_MAX_WINDOW: usize = 64;
 const VULKAN_BACKEND_LOOP_SNAPSHOT_BUDGET_BYTES: usize = 64 * 1024 * 1024;
@@ -6035,10 +6036,10 @@ impl VulkanResidentPedalBatchSliceRunner {
                         )),
                     ));
                 }
-                if dispatch.uses_stream_tick || !dispatch.push_constants.is_empty() {
+                if !dispatch.push_constants.is_empty() {
                     return Err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop(
                         VulkanError(format!(
-                            "pedal batch kernel {}.{} requires scalar control values",
+                            "pedal batch kernel {}.{} requires model-specific scalar values",
                             dispatch.pedal_id, dispatch.node_id
                         )),
                     ));
@@ -6098,7 +6099,7 @@ impl VulkanResidentPedalBatchSliceRunner {
                             ),
                         },
                         batch_artifact.local_size_x,
-                        std::mem::size_of::<u32>() as u32,
+                        VULKAN_PEDAL_BATCH_CONTROL_BYTE_CAPACITY,
                     )
                     .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
                 steps.push(VulkanPedalBatchDispatchStep {
@@ -6268,6 +6269,11 @@ impl VulkanResidentPedalBatchSliceRunner {
                 "pedal batch width exceeds u32".to_string(),
             ))
         })?;
+        let batch_control = pedal_batch_control_bytes(
+            batch_width_u32,
+            start_stream_tick,
+            dynamic_state_capacity_activations,
+        );
         let mut push_constant_storage = Vec::<Vec<u8>>::new();
         let mut active_steps = Vec::<&VulkanPedalBatchDispatchStep>::new();
         for step in &self.steps {
@@ -6294,7 +6300,7 @@ impl VulkanResidentPedalBatchSliceRunner {
                     )))
                 })?
             } else {
-                batch_width_u32.to_le_bytes().to_vec()
+                batch_control.to_vec()
             };
             push_constant_storage.push(push_constants);
             active_steps.push(step);
@@ -18258,6 +18264,18 @@ fn stream_control_metadata_bytes(
     bytes
 }
 
+fn pedal_batch_control_bytes(
+    batch_width: u32,
+    start_stream_tick: u64,
+    dynamic_state_capacity_activations: u32,
+) -> [u8; VULKAN_PEDAL_BATCH_CONTROL_BYTE_CAPACITY as usize] {
+    let mut bytes = [0; VULKAN_PEDAL_BATCH_CONTROL_BYTE_CAPACITY as usize];
+    bytes[0..4].copy_from_slice(&batch_width.to_le_bytes());
+    bytes[4..12].copy_from_slice(&start_stream_tick.to_le_bytes());
+    bytes[12..16].copy_from_slice(&dynamic_state_capacity_activations.to_le_bytes());
+    bytes
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VulkanKernelInterfacePlan {
     pub backend_id: String,
@@ -23432,6 +23450,15 @@ mod tests {
         )
         .unwrap_err();
         assert!(batch_error.to_string().contains("invalid WeightShared"));
+    }
+
+    #[test]
+    fn pedal_batch_control_preserves_temporal_position_and_capacity() {
+        let bytes = pedal_batch_control_bytes(64, 0x1122_3344_5566_7788, 65_536);
+
+        assert_eq!(&bytes[0..4], &64u32.to_le_bytes());
+        assert_eq!(&bytes[4..12], &0x1122_3344_5566_7788u64.to_le_bytes());
+        assert_eq!(&bytes[12..16], &65_536u32.to_le_bytes());
     }
 
     fn selected_test_vulkan_device() -> Result<VulkanComputeDevice, VulkanError> {

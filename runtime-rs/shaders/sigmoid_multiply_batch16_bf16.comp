@@ -1,0 +1,53 @@
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer ValueInputFrames {
+    uint words[];
+} value_input_frames;
+
+layout(set = 0, binding = 1) readonly buffer GateInputFrames {
+    uint words[];
+} gate_input_frames;
+
+layout(set = 0, binding = 2) buffer OutputFrames {
+    uint words[];
+} output_frames;
+
+layout(push_constant) uniform BatchControl { uint batch_width; } batch_control;
+
+const uint BATCH_TILE_WIDTH = 16u;
+
+float bf16_to_f32(uint value) {
+    return uintBitsToFloat((value & 0xffffu) << 16);
+}
+
+uint f32_to_bf16(float value) {
+    uint bits = floatBitsToUint(value);
+    uint lsb = (bits >> 16) & 1u;
+    return (bits + 0x7fffu + lsb) >> 16;
+}
+
+float sigmoid(float value) {
+    return 1.0 / (1.0 + exp(-value));
+}
+
+void main() {
+    uint frame_words = uint(output_frames.words.length()) / batch_control.batch_width;
+    uint batch_start = gl_WorkGroupID.y * BATCH_TILE_WIDTH;
+    for (uint word_in_frame = gl_LocalInvocationID.x;
+         word_in_frame < frame_words;
+         word_in_frame += 64u) {
+        for (uint batch_lane = 0u; batch_lane < BATCH_TILE_WIDTH; batch_lane++) {
+            uint batch_index = batch_start + batch_lane;
+            if (batch_index >= batch_control.batch_width) continue;
+            uint word_index = batch_index * frame_words + word_in_frame;
+            uint value = value_input_frames.words[word_index];
+            uint gate = gate_input_frames.words[word_index];
+            float lo = bf16_to_f32(value) * sigmoid(bf16_to_f32(gate));
+            float hi = bf16_to_f32(value >> 16) * sigmoid(bf16_to_f32(gate >> 16));
+            output_frames.words[word_index] =
+                (f32_to_bf16(hi) << 16) | f32_to_bf16(lo);
+        }
+    }
+}

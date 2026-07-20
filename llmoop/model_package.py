@@ -914,6 +914,21 @@ def causal_scan_batch_shader_file(shader_file: str) -> str | None:
         shader_file,
     ):
         return shader_file.replace("gated_delta_step_", "gated_delta_scan_", 1)
+    if re.fullmatch(
+        r"parallel_head_norm_rope_2way_bf16_h\d+_\d+_d\d+_r\d+"
+        r"_eps[0-9eE+.-]+_offset[0-9eE+.-]+_theta[0-9eE+.-]+"
+        r"_(?:half|interleaved|proportional)__sc\d+\.comp",
+        shader_file,
+    ):
+        return re.sub(
+            r"__sc\d+\.comp$",
+            ".comp",
+            shader_file.replace(
+                "parallel_head_norm_rope_2way_",
+                "parallel_head_norm_rope_2way_temporal_",
+                1,
+            ),
+        )
     return None
 
 
@@ -931,11 +946,23 @@ def causal_scan_workgroup_count_x(shader_file: str) -> int:
     )
     if gated_delta is not None:
         return int(gated_delta.group(1))
+    head_norm_rope = re.fullmatch(
+        r"parallel_head_norm_rope_2way_bf16_h(\d+)_(\d+)_d\d+_r\d+"
+        r"_eps[0-9eE+.-]+_offset[0-9eE+.-]+_theta[0-9eE+.-]+"
+        r"_(?:half|interleaved|proportional)__sc\d+\.comp",
+        shader_file,
+    )
+    if head_norm_rope is not None:
+        return int(head_norm_rope.group(1)) + int(head_norm_rope.group(2))
     raise ModelCompileError(f"shader {shader_file!r} is not a causal scan kernel")
 
 
 def weight_shared_batch_shader_file(shader_file: str) -> str | None:
     tile = SCALAR_BATCH_LANE_TILE_WIDTH
+    if re.fullmatch(r"split_bf16_2x\d+x\d+_head_interleaved\.comp", shader_file):
+        return shader_file.replace("split_bf16_", f"split_batch{tile}_bf16_", 1)
+    if shader_file == "sigmoid_multiply_bf16.comp":
+        return f"sigmoid_multiply_batch{tile}_bf16.comp"
     rms_norm = re.fullmatch(
         r"rms_norm_bf16_h(\d+)_eps([0-9eE+.-]+)_offset([0-9eE+.-]+)\.comp",
         shader_file,
@@ -2525,6 +2552,22 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
             ("HEAD_COUNT", "HEAD_WIDTH", "NORM_EPS"),
         ),
         (
+            r"parallel_head_norm_rope_2way_temporal_bf16_h(\d+)_(\d+)_d(\d+)_r(\d+)"
+            r"_eps([0-9eE+.-]+)_offset([0-9eE+.-]+)_theta([0-9eE+.-]+)"
+            r"_(half|interleaved|proportional)\.comp",
+            "parallel_head_norm_rope_2way_temporal_bf16.comp.template",
+            (
+                "BRANCH_A_HEADS",
+                "BRANCH_B_HEADS",
+                "HEAD_WIDTH",
+                "ROTARY_WIDTH",
+                "NORM_EPS",
+                "WEIGHT_OFFSET",
+                "ROPE_THETA",
+                "ROPE_LAYOUT",
+            ),
+        ),
+        (
             r"parallel_head_norm_rope_2way_bf16_h(\d+)_(\d+)_d(\d+)_r(\d+)"
             r"_eps([0-9eE+.-]+)_offset([0-9eE+.-]+)_theta([0-9eE+.-]+)"
             r"_(half|interleaved|proportional)\.comp",
@@ -2564,6 +2607,11 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
             r"temperature_top_k_top_p_sampler_f32_t([0-9eE+.-]+)_k(\d+)_p([0-9eE+.-]+)_g(\d+)_l(\d+)\.comp",
             "temperature_top_k_top_p_sampler_f32.comp.template",
             ("TEMPERATURE", "TOP_K", "TOP_P", "PARTITION_COUNT", "LOCAL_SIZE_X"),
+        ),
+        (
+            r"split_batch(\d+)_bf16_2x(\d+)x(\d+)_head_interleaved\.comp",
+            "split_batch_bf16_2way_head_interleaved.comp.template",
+            ("BATCH_TILE_WIDTH", "BLOCKS", "BLOCK_PART_WIDTH"),
         ),
         (
             r"split_bf16_2x(\d+)\.comp",
