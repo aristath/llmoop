@@ -22,14 +22,12 @@ use llmoop_runtime::{
     RuntimeRemoteCableBufferReport, RuntimeSingleDevicePromptRunReport, RuntimeSourcePedal,
     RuntimeTokenizerOptionsReport, RuntimeTopologyReport, VULKAN_BACKEND_LOOP_MAX_WINDOW,
     VulkanComputeDevice, VulkanComputeDeviceInfo, VulkanResidentHfTokenizerTextCodec,
-    VulkanResidentInProcessPlacedPromptEngine,
-    VulkanResidentInProcessPlacedPromptEngineInputRequest,
-    VulkanResidentInProcessPlacedPromptStream, VulkanResidentModelPackage,
-    VulkanResidentModelPackageDeviceSlice, VulkanResidentModelPackageManifest,
-    VulkanResidentRuntimeModel, VulkanResidentTokenEngine, VulkanResidentTokenEngineRunBudget,
-    VulkanResidentTokenEngineRunStopCondition, VulkanResidentTokenEngineTextInputRequest,
-    VulkanResidentTokenInputEvent, VulkanResidentTokenTextCodec,
-    VulkanReusableKernelArtifactManifest, discover_runtime_devices,
+    VulkanResidentInProcessPlacedPromptEngine, VulkanResidentInProcessPlacedPromptStream,
+    VulkanResidentModelPackage, VulkanResidentModelPackageDeviceSlice,
+    VulkanResidentModelPackageManifest, VulkanResidentRuntimeModel, VulkanResidentTokenEngine,
+    VulkanResidentTokenEngineRunBudget, VulkanResidentTokenEngineRunStopCondition,
+    VulkanResidentTokenEngineTextInputRequest, VulkanResidentTokenInputEvent,
+    VulkanResidentTokenTextCodec, VulkanReusableKernelArtifactManifest, discover_runtime_devices,
 };
 use minijinja::{Environment, Error as TemplateError, ErrorKind as TemplateErrorKind};
 use serde::Serialize;
@@ -1036,16 +1034,13 @@ fn execute_placed_prompt_run(
     let input_event =
         VulkanResidentTokenInputEvent::new("prompt", prompt_ids.to_vec(), args.max_new_tokens);
     let input_event_id = input_event.id.clone();
-    let batch_run = engine.submit_input_events_until_idle_bounded(
-        vec![VulkanResidentInProcessPlacedPromptEngineInputRequest::new(
-            "main",
-            input_event,
-        )],
-        1,
+    let submitted_run = engine.submit_input_event_until_idle_bounded(
+        "main",
+        input_event,
         scheduler_turns_per_tick,
     )?;
     let run_time_ns = elapsed_nanos_u64(run_start);
-    let run = batch_run
+    let run = submitted_run
         .engine_run
         .input_runs
         .into_iter()

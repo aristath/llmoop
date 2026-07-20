@@ -10464,6 +10464,202 @@ pub struct VulkanResidentInProcessPlacedPromptEventRun {
     pub output_source_stream_ticks: Vec<u64>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct VulkanResidentInProcessPlacedActivePromptEvent {
+    input_event: VulkanResidentTokenInputEvent,
+    start_stream_tick: u64,
+    next_external_input_index: usize,
+    pending_feedback: Option<VulkanResidentPendingPrivateFeedback>,
+    remaining_public_outputs: usize,
+    stop_reason: Option<String>,
+    tick_count: usize,
+    scheduler_turn_count: usize,
+    completed_stage_count: usize,
+    transport_stats: VulkanPlacedCableTransportStats,
+    generated_token_ids: Vec<u32>,
+    output_source_stream_ticks: Vec<u64>,
+    output_events: Vec<VulkanResidentTokenOutputEvent>,
+}
+
+impl VulkanResidentInProcessPlacedActivePromptEvent {
+    fn new(
+        input_event: VulkanResidentTokenInputEvent,
+        start_stream_tick: u64,
+    ) -> Result<Self, VulkanResidentInProcessPlacedRuntimeError> {
+        if input_event.token_ids.is_empty() {
+            return Err(VulkanResidentInProcessPlacedRuntimeError::EmptyPromptEvent);
+        }
+        let remaining_public_outputs = input_event.max_public_tokens;
+        let stop_reason = (remaining_public_outputs == 0).then(|| "max_new_tokens".to_string());
+        Ok(Self {
+            generated_token_ids: Vec::with_capacity(remaining_public_outputs),
+            output_source_stream_ticks: Vec::with_capacity(remaining_public_outputs),
+            output_events: Vec::with_capacity(remaining_public_outputs),
+            input_event,
+            start_stream_tick,
+            next_external_input_index: 0,
+            pending_feedback: None,
+            remaining_public_outputs,
+            stop_reason,
+            tick_count: 0,
+            scheduler_turn_count: 0,
+            completed_stage_count: 0,
+            transport_stats: VulkanPlacedCableTransportStats::default(),
+        })
+    }
+
+    fn next_activation(&self) -> Option<VulkanResidentInProcessPlacedPromptActivation> {
+        let (
+            input_token_id,
+            input_feedback_depth,
+            input_closes_loop_after_processing,
+            input_is_feedback,
+        ) = if self.next_external_input_index < self.input_event.token_ids.len() {
+            (
+                self.input_event.token_ids[self.next_external_input_index],
+                0,
+                false,
+                false,
+            )
+        } else {
+            let feedback = self.pending_feedback.as_ref()?;
+            (
+                feedback.token_id,
+                feedback.feedback_depth,
+                feedback.closes_loop_after_processing,
+                true,
+            )
+        };
+        let external_inputs_remaining = self.input_event.token_ids.len()
+            - self.next_external_input_index
+            - usize::from(!input_is_feedback);
+        Some(VulkanResidentInProcessPlacedPromptActivation {
+            input_token_id,
+            input_feedback_depth,
+            input_closes_loop_after_processing,
+            input_is_feedback,
+            should_emit_public_output: self.remaining_public_outputs > 0
+                && external_inputs_remaining == 0,
+        })
+    }
+
+    fn complete_activation(
+        &mut self,
+        activation: &VulkanResidentInProcessPlacedPromptActivation,
+        stream_tick: u64,
+        scheduler_turn_count: usize,
+        completed_stage_count: usize,
+        transport_stats: &VulkanPlacedCableTransportStats,
+        sampled_token_id: Option<u32>,
+    ) -> Result<Option<VulkanResidentTokenOutputEvent>, VulkanResidentInProcessPlacedRuntimeError>
+    {
+        if activation.input_is_feedback {
+            self.pending_feedback
+                .take()
+                .ok_or(VulkanResidentInProcessPlacedRuntimeError::MissingPrivateFeedback)?;
+        } else {
+            self.next_external_input_index = self.next_external_input_index.saturating_add(1);
+        }
+
+        self.tick_count = self.tick_count.saturating_add(1);
+        self.scheduler_turn_count = self
+            .scheduler_turn_count
+            .saturating_add(scheduler_turn_count);
+        self.completed_stage_count = self
+            .completed_stage_count
+            .saturating_add(completed_stage_count);
+        self.transport_stats.accumulate(transport_stats);
+
+        let output_event = if activation.should_emit_public_output {
+            let sampled_token_id = sampled_token_id
+                .ok_or(VulkanResidentInProcessPlacedRuntimeError::MissingFusedSamplerRun)?;
+            let output_index = self.generated_token_ids.len();
+            let output_event = VulkanResidentTokenOutputEvent {
+                id: format!("{}.{}", self.input_event.id, output_index),
+                input_event_id: self.input_event.id.clone(),
+                output_index,
+                token_id: sampled_token_id,
+                source_stream_tick: stream_tick,
+            };
+            self.generated_token_ids.push(sampled_token_id);
+            self.output_source_stream_ticks.push(stream_tick);
+            self.output_events.push(output_event.clone());
+            self.remaining_public_outputs -= 1;
+
+            let closes_loop_after_processing =
+                if self.input_event.stop_token_ids.contains(&sampled_token_id) {
+                    self.remaining_public_outputs = 0;
+                    self.stop_reason = Some("eos".to_string());
+                    true
+                } else if self.remaining_public_outputs == 0 {
+                    self.stop_reason = Some("max_new_tokens".to_string());
+                    true
+                } else {
+                    false
+                };
+            self.pending_feedback = Some(VulkanResidentPendingPrivateFeedback {
+                token_id: sampled_token_id,
+                feedback_depth: activation
+                    .input_feedback_depth
+                    .checked_add(1)
+                    .ok_or(VulkanResidentInProcessPlacedRuntimeError::FeedbackDepthOverflow)?,
+                closes_loop_after_processing,
+            });
+            Some(output_event)
+        } else {
+            None
+        };
+
+        if activation.input_closes_loop_after_processing {
+            self.pending_feedback = None;
+        }
+        Ok(output_event)
+    }
+
+    fn is_complete(&self) -> bool {
+        self.next_external_input_index == self.input_event.token_ids.len()
+            && self.pending_feedback.is_none()
+    }
+
+    fn into_event_run(
+        self,
+        input_device_id: String,
+        output_device_id: String,
+    ) -> VulkanResidentInProcessPlacedPromptEventRun {
+        let output_token_ids = self
+            .input_event
+            .token_ids
+            .iter()
+            .copied()
+            .chain(self.generated_token_ids.iter().copied())
+            .collect();
+        VulkanResidentInProcessPlacedPromptEventRun {
+            input_device_id,
+            output_device_id,
+            prompt_token_ids: self.input_event.token_ids,
+            generated_token_ids: self.generated_token_ids,
+            output_token_ids,
+            stop_reason: self
+                .stop_reason
+                .unwrap_or_else(|| "max_new_tokens".to_string()),
+            tick_count: self.tick_count,
+            scheduler_turn_count: self.scheduler_turn_count,
+            completed_stage_count: self.completed_stage_count,
+            transport_stats: self.transport_stats,
+            output_source_stream_ticks: self.output_source_stream_ticks,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct VulkanResidentInProcessPlacedPromptActivation {
+    input_token_id: u32,
+    input_feedback_depth: u32,
+    input_closes_loop_after_processing: bool,
+    input_is_feedback: bool,
+    should_emit_public_output: bool,
+}
+
 pub struct VulkanResidentInProcessPlacedPromptSession {
     pub next_stream_tick: u64,
     pub completed_prompt_event_count: usize,
@@ -10603,6 +10799,7 @@ pub struct VulkanResidentInProcessPlacedPromptStream {
     processor: VulkanResidentInProcessPlacedStreamProcessor,
     devices: BTreeMap<String, Rc<VulkanComputeDevice>>,
     session: VulkanResidentInProcessPlacedPromptSession,
+    active_input_event: Option<VulkanResidentInProcessPlacedActivePromptEvent>,
     pending_input_events: VecDeque<VulkanResidentTokenInputEvent>,
 }
 
@@ -10655,6 +10852,7 @@ impl VulkanResidentInProcessPlacedPromptStream {
             processor,
             devices,
             session,
+            active_input_event: None,
             pending_input_events: VecDeque::new(),
         })
     }
@@ -10696,11 +10894,11 @@ impl VulkanResidentInProcessPlacedPromptStream {
     }
 
     pub fn pending_input_event_count(&self) -> usize {
-        self.pending_input_events.len()
+        self.pending_input_events.len() + usize::from(self.active_input_event.is_some())
     }
 
     pub fn is_idle(&self) -> bool {
-        self.pending_input_events.is_empty()
+        self.active_input_event.is_none() && self.pending_input_events.is_empty()
     }
 
     pub fn enqueue_input_event(
@@ -10710,9 +10908,132 @@ impl VulkanResidentInProcessPlacedPromptStream {
         self.pending_input_events.push_back(event.clone());
         VulkanResidentInProcessPlacedQueuedInputEvent {
             input_event: event,
-            pending_input_event_count: self.pending_input_events.len(),
+            pending_input_event_count: self.pending_input_event_count(),
             next_stream_tick: self.next_stream_tick(),
         }
+    }
+
+    pub fn run_next_activation_bounded(
+        &mut self,
+        max_scheduler_turns_per_tick: usize,
+    ) -> Result<
+        Option<VulkanResidentInProcessPlacedPromptStreamActivationRun>,
+        VulkanResidentInProcessPlacedRuntimeError,
+    > {
+        if self.active_input_event.is_none() {
+            let Some(input_event) = self.pending_input_events.pop_front() else {
+                return Ok(None);
+            };
+            self.active_input_event = Some(VulkanResidentInProcessPlacedActivePromptEvent::new(
+                input_event,
+                self.session.next_stream_tick,
+            )?);
+        }
+
+        let activation = self
+            .active_input_event
+            .as_ref()
+            .and_then(VulkanResidentInProcessPlacedActivePromptEvent::next_activation)
+            .ok_or(VulkanResidentInProcessPlacedRuntimeError::MissingPrivateFeedback)?;
+        let input_event_id = self
+            .active_input_event
+            .as_ref()
+            .expect("active prompt event was initialized")
+            .input_event
+            .id
+            .clone();
+        let stream_tick = self.session.next_stream_tick;
+        let tail = if activation.should_emit_public_output {
+            VulkanResidentPlacedTokenTickTail::Sample
+        } else {
+            VulkanResidentPlacedTokenTickTail::None
+        };
+        if !placed_feedback_token_is_resident(
+            &self.processor.model.input_device_id,
+            &self.processor.model.output_device_id,
+            activation.input_is_feedback,
+        ) {
+            self.processor
+                .input_transducer
+                .prepare_token_id_only(activation.input_token_id)
+                .map_err(VulkanResidentInProcessPlacedRuntimeError::InputTransducer)?;
+        }
+        let placed_run = self
+            .processor
+            .execute_prepared_token_id_stream_tick_on_bound_devices_in_process_with_transport(
+                &self.devices,
+                &mut self.session.transport,
+                stream_tick,
+                max_scheduler_turns_per_tick,
+                tail,
+            )?;
+        let sampled_token_id = if activation.should_emit_public_output {
+            Some(
+                self.processor
+                    .sampler
+                    .completed_token_id()
+                    .map_err(VulkanResidentInProcessPlacedRuntimeError::Sampler)?,
+            )
+        } else {
+            None
+        };
+        let output_event = self
+            .active_input_event
+            .as_mut()
+            .expect("active prompt event was initialized")
+            .complete_activation(
+                &activation,
+                stream_tick,
+                placed_run.scheduler_turn_count,
+                placed_run.completed_stage_delta,
+                &placed_run.transport_stats,
+                sampled_token_id,
+            )?;
+        self.session.next_stream_tick = stream_tick
+            .checked_add(1)
+            .ok_or(VulkanResidentInProcessPlacedRuntimeError::StreamTickOverflow)?;
+
+        let completed_input_run = if self
+            .active_input_event
+            .as_ref()
+            .is_some_and(VulkanResidentInProcessPlacedActivePromptEvent::is_complete)
+        {
+            let active_input_event = self
+                .active_input_event
+                .take()
+                .expect("completed prompt event was active");
+            let input_event = active_input_event.input_event.clone();
+            let output_events = active_input_event.output_events.clone();
+            let generated_token_ids = active_input_event.generated_token_ids.clone();
+            let start_stream_tick = active_input_event.start_stream_tick;
+            let event_run = active_input_event.into_event_run(
+                self.package.input_device_id.clone(),
+                self.package.output_device_id.clone(),
+            );
+            let session_run = self
+                .session
+                .complete_prompt_event(start_stream_tick, event_run)?;
+            Some(VulkanResidentInProcessPlacedSubmittedInputRun {
+                input_event,
+                pending_input_event_count: self.pending_input_event_count(),
+                session_run,
+                output_events,
+                generated_token_ids,
+            })
+        } else {
+            None
+        };
+
+        Ok(Some(
+            VulkanResidentInProcessPlacedPromptStreamActivationRun {
+                input_event_id,
+                stream_tick,
+                input_token_id: activation.input_token_id,
+                input_is_feedback: activation.input_is_feedback,
+                output_event,
+                completed_input_run,
+            },
+        ))
     }
 
     pub fn run_next_queued_input_event_bounded(
@@ -10722,28 +11043,17 @@ impl VulkanResidentInProcessPlacedPromptStream {
         Option<VulkanResidentInProcessPlacedSubmittedInputRun>,
         VulkanResidentInProcessPlacedRuntimeError,
     > {
-        let Some(event) = self.pending_input_events.pop_front() else {
+        if self.is_idle() {
             return Ok(None);
-        };
-        let session_run = self.run_prompt_event_bounded(
-            &event.token_ids,
-            event.max_public_tokens,
-            &event.stop_token_ids,
-            max_scheduler_turns_per_tick,
-        )?;
-        let output_events = placed_prompt_stream_output_events_for(&event, &session_run);
-        let generated_token_ids = output_events
-            .iter()
-            .map(|event| event.token_id)
-            .collect::<Vec<_>>();
-
-        Ok(Some(VulkanResidentInProcessPlacedSubmittedInputRun {
-            input_event: event,
-            pending_input_event_count: self.pending_input_events.len(),
-            session_run,
-            output_events,
-            generated_token_ids,
-        }))
+        }
+        loop {
+            let activation = self
+                .run_next_activation_bounded(max_scheduler_turns_per_tick)?
+                .ok_or(VulkanResidentInProcessPlacedRuntimeError::MissingPrivateFeedback)?;
+            if let Some(completed_input_run) = activation.completed_input_run {
+                return Ok(Some(completed_input_run));
+            }
+        }
     }
 
     pub fn submit_input_event_bounded(
@@ -10754,6 +11064,7 @@ impl VulkanResidentInProcessPlacedPromptStream {
         VulkanResidentInProcessPlacedSubmittedInputRun,
         VulkanResidentInProcessPlacedRuntimeError,
     > {
+        self.ensure_idle_for_direct_prompt_run()?;
         self.enqueue_input_event(event);
         self.run_next_queued_input_event_bounded(max_scheduler_turns_per_tick)?
             .ok_or(VulkanResidentInProcessPlacedRuntimeError::EmptyPromptEvent)
@@ -10820,6 +11131,7 @@ impl VulkanResidentInProcessPlacedPromptStream {
         VulkanResidentInProcessPlacedPromptSessionRun,
         VulkanResidentInProcessPlacedRuntimeError,
     > {
+        self.ensure_idle_for_direct_prompt_run()?;
         self.session
             .run_prompt_event_bounded_on_bound_devices_in_process(
                 &self.processor,
@@ -10847,6 +11159,7 @@ impl VulkanResidentInProcessPlacedPromptStream {
     where
         F: FnMut(u32),
     {
+        self.ensure_idle_for_direct_prompt_run()?;
         self.session
             .run_prompt_event_bounded_on_bound_devices_in_process_with_output(
                 &self.processor,
@@ -10859,6 +11172,16 @@ impl VulkanResidentInProcessPlacedPromptStream {
                 ),
                 on_output_token,
             )
+    }
+
+    fn ensure_idle_for_direct_prompt_run(
+        &self,
+    ) -> Result<(), VulkanResidentInProcessPlacedRuntimeError> {
+        if self.is_idle() {
+            Ok(())
+        } else {
+            Err(VulkanResidentInProcessPlacedRuntimeError::PromptStreamBusy)
+        }
     }
 }
 
@@ -10879,6 +11202,16 @@ pub struct VulkanResidentInProcessPlacedSubmittedInputRun {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanResidentInProcessPlacedPromptStreamActivationRun {
+    pub input_event_id: String,
+    pub stream_tick: u64,
+    pub input_token_id: u32,
+    pub input_is_feedback: bool,
+    pub output_event: Option<VulkanResidentTokenOutputEvent>,
+    pub completed_input_run: Option<VulkanResidentInProcessPlacedSubmittedInputRun>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VulkanResidentInProcessPlacedInputQueueRun {
     pub start_stream_tick: u64,
     pub next_stream_tick: u64,
@@ -10887,29 +11220,6 @@ pub struct VulkanResidentInProcessPlacedInputQueueRun {
     pub generated_token_ids: Vec<u32>,
     pub tick_count: usize,
     pub pending_input_event_count: usize,
-}
-
-fn placed_prompt_stream_output_events_for(
-    event: &VulkanResidentTokenInputEvent,
-    session_run: &VulkanResidentInProcessPlacedPromptSessionRun,
-) -> Vec<VulkanResidentTokenOutputEvent> {
-    session_run
-        .run
-        .generated_token_ids
-        .iter()
-        .copied()
-        .zip(session_run.run.output_source_stream_ticks.iter().copied())
-        .enumerate()
-        .map(
-            |(output_index, (token_id, source_stream_tick))| VulkanResidentTokenOutputEvent {
-                id: format!("{}.{}", event.id, output_index),
-                input_event_id: event.id.clone(),
-                output_index,
-                token_id,
-                source_stream_tick,
-            },
-        )
-        .collect()
 }
 
 #[derive(Default)]
@@ -11054,11 +11364,12 @@ impl VulkanResidentInProcessPlacedPromptEngine {
         VulkanResidentInProcessPlacedPromptEngineError,
     > {
         let start_snapshot = self.snapshot();
+        let mut engine_turn_count = 0usize;
         let mut input_runs = Vec::new();
         let mut output_events = Vec::new();
         self.refresh_active_queue();
 
-        while input_runs.len() < max_engine_turns {
+        while engine_turn_count < max_engine_turns {
             let Some(stream_id) = self.active_queue.pop_front() else {
                 break;
             };
@@ -11070,25 +11381,35 @@ impl VulkanResidentInProcessPlacedPromptEngine {
             if stream.is_idle() {
                 continue;
             }
-            let Some(submitted_run) =
-                stream.run_next_queued_input_event_bounded(max_scheduler_turns_per_tick)?
+            let Some(activation_run) =
+                stream.run_next_activation_bounded(max_scheduler_turns_per_tick)?
             else {
                 continue;
             };
+            engine_turn_count = engine_turn_count.saturating_add(1);
             let stream_still_active = !stream.is_idle();
-            let stream_output_events =
-                placed_prompt_engine_output_events_for(&stream_id, &submitted_run.output_events);
-            let stream_generated_token_ids = stream_output_events
-                .iter()
-                .map(|event| event.output_event.token_id)
-                .collect::<Vec<_>>();
-            output_events.extend(stream_output_events.iter().cloned());
-            input_runs.push(VulkanResidentInProcessPlacedPromptEngineInputRun {
-                stream_id: stream_id.clone(),
-                submitted_run,
-                output_events: stream_output_events,
-                generated_token_ids: stream_generated_token_ids,
-            });
+            if let Some(output_event) = activation_run.output_event {
+                output_events.push(VulkanResidentTokenRuntimeSchedulerOutputEvent {
+                    stream_id: stream_id.clone(),
+                    output_event,
+                });
+            }
+            if let Some(submitted_run) = activation_run.completed_input_run {
+                let stream_output_events = placed_prompt_engine_output_events_for(
+                    &stream_id,
+                    &submitted_run.output_events,
+                );
+                let stream_generated_token_ids = stream_output_events
+                    .iter()
+                    .map(|event| event.output_event.token_id)
+                    .collect::<Vec<_>>();
+                input_runs.push(VulkanResidentInProcessPlacedPromptEngineInputRun {
+                    stream_id: stream_id.clone(),
+                    submitted_run,
+                    output_events: stream_output_events,
+                    generated_token_ids: stream_generated_token_ids,
+                });
+            }
             if stream_still_active {
                 self.active_queue.push_back(stream_id);
             }
@@ -11108,6 +11429,7 @@ impl VulkanResidentInProcessPlacedPromptEngine {
         Ok(VulkanResidentInProcessPlacedPromptEngineRun {
             max_engine_turns,
             max_scheduler_turns_per_tick,
+            engine_turn_count,
             stop_condition,
             processed_input_event_count: input_runs.len(),
             input_runs,
@@ -11215,6 +11537,7 @@ pub enum VulkanResidentInProcessPlacedPromptEngineRunStopCondition {
 pub struct VulkanResidentInProcessPlacedPromptEngineRun {
     pub max_engine_turns: usize,
     pub max_scheduler_turns_per_tick: usize,
+    pub engine_turn_count: usize,
     pub stop_condition: VulkanResidentInProcessPlacedPromptEngineRunStopCondition,
     pub processed_input_event_count: usize,
     pub input_runs: Vec<VulkanResidentInProcessPlacedPromptEngineInputRun>,
@@ -11332,6 +11655,7 @@ impl VulkanResidentInProcessPlacedStreamProcessorDevice {
 pub enum VulkanResidentInProcessPlacedRuntimeError {
     ZeroTickBudget,
     EmptyPromptEvent,
+    PromptStreamBusy,
     MissingPrivateFeedback,
     MissingFusedSamplerRun,
     MissingBoundDevice { device_id: String },
@@ -11354,6 +11678,9 @@ impl Display for VulkanResidentInProcessPlacedRuntimeError {
                 f.write_str("placed feedback loop tick budget must not be zero")
             }
             Self::EmptyPromptEvent => f.write_str("placed prompt event must not be empty"),
+            Self::PromptStreamBusy => {
+                f.write_str("placed prompt stream already has active or queued input")
+            }
             Self::MissingPrivateFeedback => {
                 f.write_str("placed feedback loop is missing private feedback")
             }
@@ -27745,6 +28072,139 @@ mod tests {
     }
 
     #[test]
+    fn placed_active_prompt_event_advances_one_activation_at_a_time() {
+        let input_event =
+            VulkanResidentTokenInputEvent::new("event", vec![10, 20], 2).with_stop_tokens(vec![99]);
+        let mut active =
+            VulkanResidentInProcessPlacedActivePromptEvent::new(input_event, 5).unwrap();
+
+        let first = active.next_activation().unwrap();
+        assert_eq!(first.input_token_id, 10);
+        assert!(!first.input_is_feedback);
+        assert!(!first.should_emit_public_output);
+        assert_eq!(
+            active
+                .complete_activation(
+                    &first,
+                    5,
+                    3,
+                    7,
+                    &VulkanPlacedCableTransportStats::default(),
+                    None,
+                )
+                .unwrap(),
+            None
+        );
+        assert!(!active.is_complete());
+
+        let second = active.next_activation().unwrap();
+        assert_eq!(second.input_token_id, 20);
+        assert!(!second.input_is_feedback);
+        assert!(second.should_emit_public_output);
+        let first_output = active
+            .complete_activation(
+                &second,
+                6,
+                3,
+                7,
+                &VulkanPlacedCableTransportStats::default(),
+                Some(30),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(first_output.id, "event.0");
+        assert_eq!(first_output.token_id, 30);
+        assert_eq!(first_output.source_stream_tick, 6);
+
+        let third = active.next_activation().unwrap();
+        assert_eq!(third.input_token_id, 30);
+        assert!(third.input_is_feedback);
+        assert_eq!(third.input_feedback_depth, 1);
+        assert!(!third.input_closes_loop_after_processing);
+        assert!(third.should_emit_public_output);
+        let second_output = active
+            .complete_activation(
+                &third,
+                7,
+                3,
+                7,
+                &VulkanPlacedCableTransportStats::default(),
+                Some(99),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(second_output.id, "event.1");
+        assert_eq!(second_output.token_id, 99);
+
+        let closing = active.next_activation().unwrap();
+        assert_eq!(closing.input_token_id, 99);
+        assert!(closing.input_is_feedback);
+        assert_eq!(closing.input_feedback_depth, 2);
+        assert!(closing.input_closes_loop_after_processing);
+        assert!(!closing.should_emit_public_output);
+        assert_eq!(
+            active
+                .complete_activation(
+                    &closing,
+                    8,
+                    3,
+                    7,
+                    &VulkanPlacedCableTransportStats::default(),
+                    None,
+                )
+                .unwrap(),
+            None
+        );
+        assert!(active.is_complete());
+        assert!(active.next_activation().is_none());
+
+        let run = active.into_event_run("gpu0".to_string(), "gpu1".to_string());
+        assert_eq!(run.prompt_token_ids, vec![10, 20]);
+        assert_eq!(run.generated_token_ids, vec![30, 99]);
+        assert_eq!(run.output_token_ids, vec![10, 20, 30, 99]);
+        assert_eq!(run.output_source_stream_ticks, vec![6, 7]);
+        assert_eq!(run.stop_reason, "eos");
+        assert_eq!(run.tick_count, 4);
+        assert_eq!(run.scheduler_turn_count, 12);
+        assert_eq!(run.completed_stage_count, 28);
+    }
+
+    #[test]
+    fn placed_active_prompt_event_without_output_drains_only_external_input() {
+        let input_event = VulkanResidentTokenInputEvent::new("prefill", vec![10, 20], 0);
+        let mut active =
+            VulkanResidentInProcessPlacedActivePromptEvent::new(input_event, 12).unwrap();
+
+        for stream_tick in [12, 13] {
+            let activation = active.next_activation().unwrap();
+            assert!(!activation.input_is_feedback);
+            assert!(!activation.should_emit_public_output);
+            assert!(
+                active
+                    .complete_activation(
+                        &activation,
+                        stream_tick,
+                        1,
+                        2,
+                        &VulkanPlacedCableTransportStats::default(),
+                        None,
+                    )
+                    .unwrap()
+                    .is_none()
+            );
+        }
+
+        assert!(active.is_complete());
+        assert!(active.next_activation().is_none());
+        let run = active.into_event_run("gpu0".to_string(), "gpu0".to_string());
+        assert_eq!(run.prompt_token_ids, vec![10, 20]);
+        assert!(run.generated_token_ids.is_empty());
+        assert_eq!(run.output_token_ids, vec![10, 20]);
+        assert_eq!(run.stop_reason, "max_new_tokens");
+        assert_eq!(run.tick_count, 2);
+    }
+
+    #[test]
     fn placed_prompt_session_keeps_stream_tick_across_prompt_events() {
         let device = match VulkanComputeDevice::new() {
             Ok(device) => device,
@@ -28052,6 +28512,7 @@ mod tests {
             0
         );
         assert_eq!(submitted.generated_token_ids.len(), 1);
+        assert_eq!(submitted.engine_run.engine_turn_count, 2);
         assert_eq!(
             submitted.engine_run.stop_condition,
             VulkanResidentInProcessPlacedPromptEngineRunStopCondition::Idle
@@ -28150,6 +28611,7 @@ mod tests {
 
         assert_eq!(submitted.output_events.len(), 1);
         assert_eq!(submitted.output_events[0].stream_id, "stream_a");
+        assert_eq!(submitted.engine_run.engine_turn_count, 4);
         assert_eq!(submitted.engine_run.input_runs.len(), 2);
         assert_eq!(submitted.engine_run.input_runs[0].stream_id, "stream_b");
         assert_eq!(
@@ -28238,13 +28700,14 @@ mod tests {
             vec!["stream_a".to_string(), "stream_b".to_string()]
         );
 
-        let run = engine.run_until_idle_bounded(4, 8).unwrap();
+        let run = engine.run_until_idle_bounded(6, 8).unwrap();
 
         assert_eq!(
             run.stop_condition,
             VulkanResidentInProcessPlacedPromptEngineRunStopCondition::Idle
         );
         assert_eq!(run.processed_input_event_count, 3);
+        assert_eq!(run.engine_turn_count, 6);
         assert_eq!(run.input_runs.len(), 3);
         assert_eq!(run.input_runs[0].stream_id, "stream_b");
         assert_eq!(run.input_runs[0].submitted_run.input_event.id, "event_b");
@@ -28340,6 +28803,7 @@ mod tests {
             VulkanResidentInProcessPlacedPromptEngineRunStopCondition::Idle
         );
         assert_eq!(batch.engine_run.input_runs.len(), 2);
+        assert_eq!(batch.engine_run.engine_turn_count, 4);
         assert_eq!(batch.engine_run.input_runs[0].stream_id, "stream_b");
         assert_eq!(
             batch.engine_run.input_runs[0].submitted_run.input_event.id,
@@ -28407,30 +28871,63 @@ mod tests {
             budgeted.stop_condition,
             VulkanResidentInProcessPlacedPromptEngineRunStopCondition::EngineTurnBudget
         );
-        assert_eq!(budgeted.processed_input_event_count, 1);
+        assert_eq!(budgeted.engine_turn_count, 1);
+        assert_eq!(budgeted.processed_input_event_count, 0);
+        assert!(budgeted.input_runs.is_empty());
+        assert_eq!(budgeted.output_events.len(), 1);
         assert_eq!(
-            budgeted.input_runs[0].submitted_run.input_event.id,
+            budgeted.output_events[0].output_event.input_event_id,
             "event_a"
         );
         assert!(!budgeted.end_snapshot.idle);
         assert_eq!(
             budgeted.end_snapshot.streams[0].pending_input_event_count,
+            2
+        );
+        assert_eq!(budgeted.end_snapshot.streams[0].next_stream_tick, 1);
+
+        let completed_a = engine.run_until_idle_bounded(1, 8).unwrap();
+        assert_eq!(
+            completed_a.stop_condition,
+            VulkanResidentInProcessPlacedPromptEngineRunStopCondition::EngineTurnBudget
+        );
+        assert_eq!(completed_a.engine_turn_count, 1);
+        assert_eq!(completed_a.processed_input_event_count, 1);
+        assert_eq!(
+            completed_a.input_runs[0].submitted_run.input_event.id,
+            "event_a"
+        );
+        assert!(!completed_a.end_snapshot.idle);
+        assert_eq!(
+            completed_a.end_snapshot.streams[0].pending_input_event_count,
             1
         );
-        assert_eq!(budgeted.end_snapshot.streams[0].next_stream_tick, 2);
+        assert_eq!(completed_a.end_snapshot.streams[0].next_stream_tick, 2);
 
-        let completed = engine.run_until_idle_bounded(1, 8).unwrap();
+        let started_b = engine.run_until_idle_bounded(1, 8).unwrap();
+        assert_eq!(started_b.engine_turn_count, 1);
+        assert_eq!(started_b.processed_input_event_count, 0);
+        assert_eq!(started_b.output_events.len(), 1);
         assert_eq!(
-            completed.stop_condition,
-            VulkanResidentInProcessPlacedPromptEngineRunStopCondition::Idle
-        );
-        assert_eq!(completed.processed_input_event_count, 1);
-        assert_eq!(
-            completed.input_runs[0].submitted_run.input_event.id,
+            started_b.output_events[0].output_event.input_event_id,
             "event_b"
         );
-        assert!(completed.end_snapshot.idle);
-        assert_eq!(completed.end_snapshot.streams[0].next_stream_tick, 4);
+        assert!(!started_b.end_snapshot.idle);
+        assert_eq!(started_b.end_snapshot.streams[0].next_stream_tick, 3);
+
+        let completed_b = engine.run_until_idle_bounded(1, 8).unwrap();
+        assert_eq!(
+            completed_b.stop_condition,
+            VulkanResidentInProcessPlacedPromptEngineRunStopCondition::Idle
+        );
+        assert_eq!(completed_b.engine_turn_count, 1);
+        assert_eq!(completed_b.processed_input_event_count, 1);
+        assert_eq!(
+            completed_b.input_runs[0].submitted_run.input_event.id,
+            "event_b"
+        );
+        assert!(completed_b.end_snapshot.idle);
+        assert_eq!(completed_b.end_snapshot.streams[0].next_stream_tick, 4);
     }
 
     #[test]
