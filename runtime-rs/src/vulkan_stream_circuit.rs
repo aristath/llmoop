@@ -7243,12 +7243,6 @@ impl Error for VulkanResidentTokenModelPackageError {}
 pub struct VulkanResidentModelPackageManifest {
     pub schema: String,
     pub package_id: String,
-    #[serde(
-        skip_serializing,
-        skip_deserializing,
-        default = "runtime_default_placement"
-    )]
-    pub placement: StreamCircuitPlacementSpec,
     pub circuit_graph: VulkanResidentPackageCircuitGraph,
     pub tensor_index_path: String,
     pub behavioral_validation_path: String,
@@ -7264,8 +7258,13 @@ pub struct VulkanResidentModelPackageManifest {
     pub artifact_integrity: VulkanResidentPackageArtifactIntegrity,
 }
 
-fn runtime_default_placement() -> StreamCircuitPlacementSpec {
-    StreamCircuitPlacementSpec::new(RUNTIME_DEFAULT_LOGICAL_DEVICE_ID)
+#[derive(Clone, Debug, PartialEq)]
+pub struct VulkanResidentRuntimeModel {
+    pub package: VulkanResidentModelPackageManifest,
+    pub patch: StreamCircuitRuntimePatch,
+    pub placement: StreamCircuitPlacementSpec,
+    pub circuit_graph: VulkanResidentPackageCircuitGraph,
+    pub pedal_executions: Vec<VulkanResidentPedalExecutionSpec>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -7861,15 +7860,13 @@ impl VulkanResidentModelPackageManifest {
         let source_graph = manifest
             .resolved_source_graph(package_root)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
-        let patch =
-            StreamCircuitRuntimePatch::from_placement_spec(&source_graph, &manifest.placement)
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
-        patch
-            .validate_against_graph(&source_graph)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
-        validate_pedal_executions_against_graph(&manifest, &source_graph)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
-        validate_generation_execution_contract(&manifest)
+        validate_pedal_executions_against_graph(
+            &manifest.package_id,
+            &manifest.pedal_executions,
+            &source_graph,
+        )
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+        validate_generation_execution_contract(&manifest, &manifest.circuit_graph)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
         Ok(manifest)
     }
@@ -7880,31 +7877,13 @@ impl VulkanResidentModelPackageManifest {
         fs::write(path, bytes)
     }
 
-    pub fn placement_device_ids(&self) -> Vec<String> {
-        self.circuit_graph
-            .pedals
-            .iter()
-            .map(|pedal| self.placement.device_for_pedal(&pedal.pedal_id).to_string())
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect()
-    }
-
-    pub fn with_runtime_patch_controls(
+    pub fn mount_runtime_patch_controls(
         self,
         default_device_id: Option<&str>,
         pedal_devices: &BTreeMap<String, String>,
         duplicate_after: &[(String, String)],
         source_chain: Option<&[(String, String)]>,
-    ) -> Result<Self, VulkanResidentTokenModelPackageError> {
-        if default_device_id.is_none()
-            && pedal_devices.is_empty()
-            && duplicate_after.is_empty()
-            && source_chain.is_none()
-        {
-            return Ok(self);
-        }
-
+    ) -> Result<VulkanResidentRuntimeModel, VulkanResidentTokenModelPackageError> {
         let patch = self.runtime_patch_from_controls(
             default_device_id,
             pedal_devices,
@@ -7912,7 +7891,7 @@ impl VulkanResidentModelPackageManifest {
             source_chain,
         )?;
 
-        self.with_runtime_patch(&patch)
+        self.mount_runtime_patch(&patch)
     }
 
     pub fn runtime_patch_from_controls(
@@ -7926,25 +7905,11 @@ impl VulkanResidentModelPackageManifest {
             .circuit_graph
             .to_resolved_lowered_pedalboard(PathBuf::from("."))?;
         let default_device_id = default_device_id
-            .unwrap_or(&self.placement.default_device_id)
+            .unwrap_or(RUNTIME_DEFAULT_LOGICAL_DEVICE_ID)
             .to_string();
         let mut patch =
             StreamCircuitRuntimePatch::from_source_series(&source_graph, default_device_id)
                 .map_err(|error| VulkanResidentTokenModelPackageError::new(error.to_string()))?;
-
-        for (pedal_id, device_id) in &self.placement.pedal_devices {
-            if patch
-                .instances
-                .iter()
-                .any(|instance| instance.instance_id == *pedal_id)
-            {
-                patch = patch
-                    .with_instance_device(pedal_id, device_id)
-                    .map_err(|error| {
-                        VulkanResidentTokenModelPackageError::new(error.to_string())
-                    })?;
-            }
-        }
         if let Some(source_chain) = source_chain {
             patch = patch
                 .with_signal_processor_chain(&source_graph, source_chain)
@@ -7991,10 +7956,10 @@ impl VulkanResidentModelPackageManifest {
             .to_resolved_lowered_pedalboard(package_root)
     }
 
-    pub fn with_runtime_patch(
-        mut self,
+    pub fn mount_runtime_patch(
+        self,
         patch: &StreamCircuitRuntimePatch,
-    ) -> Result<Self, VulkanResidentTokenModelPackageError> {
+    ) -> Result<VulkanResidentRuntimeModel, VulkanResidentTokenModelPackageError> {
         let source_graph = self
             .circuit_graph
             .to_resolved_lowered_pedalboard(PathBuf::from("."))?;
@@ -8063,16 +8028,41 @@ impl VulkanResidentModelPackageManifest {
             }
         }
 
-        self.placement = placement;
-        self.circuit_graph.wiring = patch.wiring.clone();
-        self.circuit_graph.cables = patch
+        let mut circuit_graph = self.circuit_graph.clone();
+        circuit_graph.wiring = patch.wiring.clone();
+        circuit_graph.cables = patch
             .effective_cables()
             .map_err(|error| VulkanResidentTokenModelPackageError::new(error.to_string()))?;
-        self.circuit_graph.boundary = patch.boundary.clone();
-        self.circuit_graph.pedals = pedals;
-        self.pedal_executions = pedal_executions;
-        validate_generation_execution_contract(&self)?;
-        Ok(self)
+        circuit_graph.boundary = patch.boundary.clone();
+        circuit_graph.pedals = pedals;
+        validate_generation_execution_contract(&self, &circuit_graph)?;
+        Ok(VulkanResidentRuntimeModel {
+            package: self,
+            patch,
+            placement,
+            circuit_graph,
+            pedal_executions,
+        })
+    }
+}
+
+impl VulkanResidentRuntimeModel {
+    pub fn placement_device_ids(&self) -> Vec<String> {
+        self.circuit_graph
+            .pedals
+            .iter()
+            .map(|pedal| self.placement.device_for_pedal(&pedal.pedal_id).to_string())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    pub fn resolved_graph(
+        &self,
+        package_root: impl Into<PathBuf>,
+    ) -> Result<ResolvedLoweredPedalboard, VulkanResidentTokenModelPackageError> {
+        self.circuit_graph
+            .to_resolved_lowered_pedalboard(package_root)
     }
 }
 
@@ -8621,49 +8611,56 @@ impl VulkanResidentModelPackageDeviceSlice {
             .parent()
             .map(Path::to_path_buf)
             .unwrap_or_else(|| PathBuf::from("."));
-        Self::from_manifest_for_device(
+        let runtime_model =
+            manifest.mount_runtime_patch_controls(None, &BTreeMap::new(), &[], None)?;
+        Self::from_runtime_model_for_device(
             device,
             &manifest_dir,
-            manifest,
+            runtime_model,
             device_id,
             dynamic_state_capacity_activations,
         )
     }
 
-    pub fn from_manifest_for_device(
+    pub fn from_runtime_model_for_device(
         device: &VulkanComputeDevice,
         manifest_dir: impl AsRef<Path>,
-        manifest: VulkanResidentModelPackageManifest,
+        runtime_model: VulkanResidentRuntimeModel,
         device_id: impl AsRef<str>,
         dynamic_state_capacity_activations: Option<usize>,
     ) -> Result<Self, VulkanResidentTokenModelPackageError> {
         let manifest_dir = manifest_dir.as_ref();
         let device_id = device_id.as_ref();
-        let capacity =
-            dynamic_state_capacity_activations.unwrap_or(manifest.max_context_activations);
+        let capacity = dynamic_state_capacity_activations
+            .unwrap_or(runtime_model.package.max_context_activations);
         if capacity == 0 {
             return Err(VulkanResidentTokenModelPackageError::new(
                 "resident dynamic state capacity must be at least 1 activation",
             ));
         }
-        validate_pedal_executions(&manifest)?;
+        validate_pedal_executions(
+            &runtime_model.package.package_id,
+            &runtime_model.pedal_executions,
+        )?;
 
-        let tensor_index_path =
-            resolve_resident_model_package_path(manifest_dir, &manifest.tensor_index_path);
+        let tensor_index_path = resolve_resident_model_package_path(
+            manifest_dir,
+            &runtime_model.package.tensor_index_path,
+        );
         let (tensor_index, _resource_plan, _placement_plan, placed_plan) =
             plan_resident_package_placed_stream_circuit(
                 device_id,
-                &manifest.placement,
-                &manifest.circuit_graph,
+                &runtime_model.placement,
+                &runtime_model.circuit_graph,
                 manifest_dir,
                 &tensor_index_path,
-                manifest.activation_element_bytes,
+                runtime_model.package.activation_element_bytes,
             )?;
         let hosted_pedal_count = placed_plan.binding_plan.circuits.len();
         if hosted_pedal_count == 0 {
             return Err(VulkanResidentTokenModelPackageError::new(format!(
                 "resident model package {:?} has no pedals assigned to device {device_id:?}",
-                manifest.package_id
+                runtime_model.package.package_id
             )));
         }
 
@@ -8711,9 +8708,13 @@ impl VulkanResidentModelPackageDeviceSlice {
                     "failed to bind Vulkan stream circuit dispatch plan for device {device_id:?}: {error}"
                 ))
             })?;
-        validate_pedal_executions_cover_mounted_dispatches(&manifest, &mounted_bound)?;
+        validate_pedal_executions_cover_mounted_dispatches(
+            &runtime_model.package.package_id,
+            &runtime_model.pedal_executions,
+            &mounted_bound,
+        )?;
         let pedal_kernel_shaders = resident_package_pedal_kernel_shader_refs_for_mounted_dispatches(
-            &manifest,
+            &runtime_model.pedal_executions,
             &mounted_bound,
         );
         let loaded_manifest = loaded_kernel_pack_from_package_shader_refs(
@@ -8724,7 +8725,7 @@ impl VulkanResidentModelPackageDeviceSlice {
         )?;
 
         Ok(Self {
-            package_id: manifest.package_id,
+            package_id: runtime_model.package.package_id.clone(),
             device_id: device_id.to_string(),
             dynamic_state_capacity_activations: capacity,
             hosted_pedal_count,
@@ -8972,41 +8973,44 @@ impl VulkanResidentInProcessPlacedModelPackage {
             .parent()
             .map(Path::to_path_buf)
             .unwrap_or_else(|| PathBuf::from("."));
-        Self::from_manifest_for_devices(
+        let runtime_model = manifest
+            .mount_runtime_patch_controls(None, &BTreeMap::new(), &[], None)
+            .map_err(VulkanResidentInProcessPlacedModelPackageError::Package)?;
+        Self::from_runtime_model_for_devices(
             device,
             &manifest_dir,
-            manifest,
+            runtime_model,
             dynamic_state_capacity_activations,
             random_seed,
         )
     }
 
-    pub fn from_manifest_for_devices(
+    pub fn from_runtime_model_for_devices(
         device: &VulkanComputeDevice,
         manifest_dir: impl AsRef<Path>,
-        manifest: VulkanResidentModelPackageManifest,
+        runtime_model: VulkanResidentRuntimeModel,
         dynamic_state_capacity_activations: Option<usize>,
         random_seed: u32,
     ) -> Result<Self, VulkanResidentInProcessPlacedModelPackageError> {
-        Self::from_manifest_for_device_resolver(
+        Self::from_runtime_model_for_device_resolver(
             manifest_dir,
-            manifest,
+            runtime_model,
             dynamic_state_capacity_activations,
             random_seed,
             |_| Ok(device),
         )
     }
 
-    pub fn from_manifest_for_bound_devices(
+    pub fn from_runtime_model_for_bound_devices(
         devices: &BTreeMap<String, Rc<VulkanComputeDevice>>,
         manifest_dir: impl AsRef<Path>,
-        manifest: VulkanResidentModelPackageManifest,
+        runtime_model: VulkanResidentRuntimeModel,
         dynamic_state_capacity_activations: Option<usize>,
         random_seed: u32,
     ) -> Result<Self, VulkanResidentInProcessPlacedModelPackageError> {
-        Self::from_manifest_for_device_resolver(
+        Self::from_runtime_model_for_device_resolver(
             manifest_dir,
-            manifest,
+            runtime_model,
             dynamic_state_capacity_activations,
             random_seed,
             |device_id| {
@@ -9022,9 +9026,9 @@ impl VulkanResidentInProcessPlacedModelPackage {
         )
     }
 
-    fn from_manifest_for_device_resolver<'a, F>(
+    fn from_runtime_model_for_device_resolver<'a, F>(
         manifest_dir: impl AsRef<Path>,
-        manifest: VulkanResidentModelPackageManifest,
+        runtime_model: VulkanResidentRuntimeModel,
         dynamic_state_capacity_activations: Option<usize>,
         random_seed: u32,
         device_for: F,
@@ -9036,31 +9040,33 @@ impl VulkanResidentInProcessPlacedModelPackage {
             -> Result<&'a VulkanComputeDevice, VulkanResidentInProcessPlacedModelPackageError>,
     {
         let manifest_dir = manifest_dir.as_ref();
-        let package_id = manifest.package_id.clone();
-        let (input_processor_id, output_processor_id) = manifest
+        let package_id = runtime_model.package.package_id.clone();
+        let (input_processor_id, output_processor_id) = runtime_model
             .circuit_graph
             .signal_processor_endpoint_pedal_ids()
             .map_err(VulkanResidentInProcessPlacedModelPackageError::Package)?;
-        let input_device_id = manifest
+        let input_device_id = runtime_model
             .placement
             .device_for_pedal(&input_processor_id)
             .to_string();
-        let output_device_id = manifest
+        let output_device_id = runtime_model
             .placement
             .device_for_pedal(&output_processor_id)
             .to_string();
-        let capacity =
-            dynamic_state_capacity_activations.unwrap_or(manifest.max_context_activations);
-        let tensor_index_path =
-            resolve_resident_model_package_path(manifest_dir, &manifest.tensor_index_path);
+        let capacity = dynamic_state_capacity_activations
+            .unwrap_or(runtime_model.package.max_context_activations);
+        let tensor_index_path = resolve_resident_model_package_path(
+            manifest_dir,
+            &runtime_model.package.tensor_index_path,
+        );
         let (tensor_index, resource_plan, _placement_plan, _boundary_placed_plan) =
             plan_resident_package_placed_stream_circuit(
                 &input_device_id,
-                &manifest.placement,
-                &manifest.circuit_graph,
+                &runtime_model.placement,
+                &runtime_model.circuit_graph,
                 manifest_dir,
                 &tensor_index_path,
-                manifest.activation_element_bytes,
+                runtime_model.package.activation_element_bytes,
             )?;
         let input_device = device_for(&input_device_id)?;
         let output_device = device_for(&output_device_id)?;
@@ -9082,33 +9088,41 @@ impl VulkanResidentInProcessPlacedModelPackage {
             )?);
         let input_transducer_spirv_words = load_required_resident_model_package_shader(
             manifest_dir,
-            &manifest.input_transducer.shader_path,
+            &runtime_model.package.input_transducer.shader_path,
         )?;
         let embedding_norm_spirv_words = load_required_resident_model_package_shader(
             manifest_dir,
-            &manifest.output_transducer.embedding_norm_shader_path,
+            &runtime_model
+                .package
+                .output_transducer
+                .embedding_norm_shader_path,
         )?;
         let tied_projection_spirv_words = load_required_resident_model_package_shader(
             manifest_dir,
-            &manifest.output_transducer.projection_shader_path,
+            &runtime_model
+                .package
+                .output_transducer
+                .projection_shader_path,
         )?;
-        let sampler_kernels = load_resident_sampler_kernels(manifest_dir, &manifest.sampler)?;
-        let device_ids = manifest
+        let sampler_kernels =
+            load_resident_sampler_kernels(manifest_dir, &runtime_model.package.sampler)?;
+        let device_ids = runtime_model
             .circuit_graph
-            .signal_processor_device_ids(&manifest.placement);
+            .signal_processor_device_ids(&runtime_model.placement);
         let mut device_slices = Vec::with_capacity(device_ids.len());
         let mut hosted_pedal_count = 0usize;
 
         for device_id in &device_ids {
             let slice_device = device_for(device_id)?;
-            let package_slice = VulkanResidentModelPackageDeviceSlice::from_manifest_for_device(
-                slice_device,
-                manifest_dir,
-                manifest.clone(),
-                device_id,
-                Some(capacity),
-            )
-            .map_err(VulkanResidentInProcessPlacedModelPackageError::Package)?;
+            let package_slice =
+                VulkanResidentModelPackageDeviceSlice::from_runtime_model_for_device(
+                    slice_device,
+                    manifest_dir,
+                    runtime_model.clone(),
+                    device_id,
+                    Some(capacity),
+                )
+                .map_err(VulkanResidentInProcessPlacedModelPackageError::Package)?;
             let mounted = package_slice
                 .create_mounted_stream_circuit(slice_device)
                 .map_err(VulkanResidentInProcessPlacedModelPackageError::Package)?;
@@ -9188,7 +9202,7 @@ impl VulkanResidentInProcessPlacedModelPackage {
                 &input_slice.mounted,
                 &input_transducer_parameter_buffers,
                 &input_transducer_spirv_words,
-                &manifest.input_transducer.spec,
+                &runtime_model.package.input_transducer.spec,
             )
             .map_err(VulkanResidentInProcessPlacedModelPackageError::InputTransducer)?;
         let output_transducer =
@@ -9198,7 +9212,7 @@ impl VulkanResidentInProcessPlacedModelPackage {
                 &output_transducer_parameter_buffers,
                 &embedding_norm_spirv_words,
                 &tied_projection_spirv_words,
-                &manifest.output_transducer.spec,
+                &runtime_model.package.output_transducer.spec,
             )
             .map_err(VulkanResidentInProcessPlacedModelPackageError::OutputTransducer)?;
         let sampler = VulkanResidentSamplerRunner::from_output_transducer_with_spec(
@@ -9206,7 +9220,7 @@ impl VulkanResidentInProcessPlacedModelPackage {
             &output_slice.mounted,
             &output_transducer,
             &sampler_kernels,
-            &manifest.sampler.spec,
+            &runtime_model.package.sampler.spec,
             random_seed,
         )
         .map_err(VulkanResidentInProcessPlacedModelPackageError::Sampler)?;
@@ -10344,20 +10358,21 @@ impl VulkanResidentInProcessPlacedPromptStream {
         Self::from_package_devices_and_session(package, devices, 0)
     }
 
-    pub fn from_manifest_for_bound_devices(
+    pub fn from_runtime_model_for_bound_devices(
         devices: BTreeMap<String, Rc<VulkanComputeDevice>>,
         manifest_dir: impl AsRef<Path>,
-        manifest: VulkanResidentModelPackageManifest,
+        runtime_model: VulkanResidentRuntimeModel,
         dynamic_state_capacity_activations: Option<usize>,
         random_seed: u32,
     ) -> Result<Self, VulkanResidentInProcessPlacedModelPackageError> {
-        let package = VulkanResidentInProcessPlacedModelPackage::from_manifest_for_bound_devices(
-            &devices,
-            manifest_dir,
-            manifest,
-            dynamic_state_capacity_activations,
-            random_seed,
-        )?;
+        let package =
+            VulkanResidentInProcessPlacedModelPackage::from_runtime_model_for_bound_devices(
+                &devices,
+                manifest_dir,
+                runtime_model,
+                dynamic_state_capacity_activations,
+                random_seed,
+            )?;
         Self::new(package, devices)
     }
 
@@ -11164,41 +11179,48 @@ impl VulkanResidentModelPackage {
             .parent()
             .map(Path::to_path_buf)
             .unwrap_or_else(|| PathBuf::from("."));
-        Self::from_manifest(
+        let runtime_model =
+            manifest.mount_runtime_patch_controls(None, &BTreeMap::new(), &[], None)?;
+        Self::from_runtime_model(
             device,
             &manifest_dir,
-            manifest,
+            runtime_model,
             dynamic_state_capacity_activations,
         )
     }
 
-    pub fn from_manifest(
+    pub fn from_runtime_model(
         device: &VulkanComputeDevice,
         manifest_dir: impl AsRef<Path>,
-        manifest: VulkanResidentModelPackageManifest,
+        runtime_model: VulkanResidentRuntimeModel,
         dynamic_state_capacity_activations: Option<usize>,
     ) -> Result<Self, VulkanResidentTokenModelPackageError> {
         let manifest_dir = manifest_dir.as_ref();
-        let capacity =
-            dynamic_state_capacity_activations.unwrap_or(manifest.max_context_activations);
+        let capacity = dynamic_state_capacity_activations
+            .unwrap_or(runtime_model.package.max_context_activations);
         if capacity == 0 {
             return Err(VulkanResidentTokenModelPackageError::new(
                 "resident dynamic state capacity must be at least 1 activation",
             ));
         }
-        validate_pedal_executions(&manifest)?;
+        validate_pedal_executions(
+            &runtime_model.package.package_id,
+            &runtime_model.pedal_executions,
+        )?;
 
-        let tensor_index_path =
-            resolve_resident_model_package_path(manifest_dir, &manifest.tensor_index_path);
-        let default_device_id = manifest.placement.default_device_id.clone();
+        let tensor_index_path = resolve_resident_model_package_path(
+            manifest_dir,
+            &runtime_model.package.tensor_index_path,
+        );
+        let default_device_id = runtime_model.placement.default_device_id.clone();
         let (tensor_index, resource_plan, placed_plan) =
             plan_resident_package_single_device_stream_circuit(
                 &default_device_id,
-                &manifest.placement,
-                &manifest.circuit_graph,
+                &runtime_model.placement,
+                &runtime_model.circuit_graph,
                 manifest_dir,
                 &tensor_index_path,
-                manifest.activation_element_bytes,
+                runtime_model.package.activation_element_bytes,
             )?;
         let parameter_buffer_plan = VulkanPermanentParameterBufferPlan::from_placed_resident_plan(
             &placed_plan.placed_resident_plan,
@@ -11232,17 +11254,24 @@ impl VulkanResidentModelPackage {
             )?);
         let input_transducer_spirv_words = load_required_resident_model_package_shader(
             manifest_dir,
-            &manifest.input_transducer.shader_path,
+            &runtime_model.package.input_transducer.shader_path,
         )?;
         let embedding_norm_spirv_words = load_required_resident_model_package_shader(
             manifest_dir,
-            &manifest.output_transducer.embedding_norm_shader_path,
+            &runtime_model
+                .package
+                .output_transducer
+                .embedding_norm_shader_path,
         )?;
         let tied_projection_spirv_words = load_required_resident_model_package_shader(
             manifest_dir,
-            &manifest.output_transducer.projection_shader_path,
+            &runtime_model
+                .package
+                .output_transducer
+                .projection_shader_path,
         )?;
-        let sampler_kernels = load_resident_sampler_kernels(manifest_dir, &manifest.sampler)?;
+        let sampler_kernels =
+            load_resident_sampler_kernels(manifest_dir, &runtime_model.package.sampler)?;
 
         let probe_mounted =
             VulkanMountedPlacedStreamCircuit::from_placed_plan_with_parameter_buffers(
@@ -11265,8 +11294,13 @@ impl VulkanResidentModelPackage {
                     "failed to bind Vulkan stream circuit dispatch plan: {error}"
                 ))
             })?;
-        validate_pedal_executions_against_mounted_dispatches(&manifest, &mounted_bound)?;
-        let pedal_kernel_shaders = resident_package_pedal_kernel_shader_refs(&manifest);
+        validate_pedal_executions_against_mounted_dispatches(
+            &runtime_model.package.package_id,
+            &runtime_model.pedal_executions,
+            &mounted_bound,
+        )?;
+        let pedal_kernel_shaders =
+            resident_package_pedal_kernel_shader_refs(&runtime_model.pedal_executions);
         let loaded_manifest = loaded_kernel_pack_from_package_shader_refs(
             manifest_dir,
             &probe_mounted,
@@ -11275,7 +11309,7 @@ impl VulkanResidentModelPackage {
         )?;
 
         Ok(Self {
-            package_id: manifest.package_id,
+            package_id: runtime_model.package.package_id.clone(),
             device_id: default_device_id,
             dynamic_state_capacity_activations: capacity,
             permanent_parameter_count: parameter_buffers.plan.parameter_count,
@@ -11292,9 +11326,9 @@ impl VulkanResidentModelPackage {
             embedding_norm_spirv_words,
             tied_projection_spirv_words,
             sampler_kernels,
-            input_transducer_spec: manifest.input_transducer.spec,
-            output_transducer_spec: manifest.output_transducer.spec,
-            sampler_spec: manifest.sampler.spec,
+            input_transducer_spec: runtime_model.package.input_transducer.spec.clone(),
+            output_transducer_spec: runtime_model.package.output_transducer.spec.clone(),
+            sampler_spec: runtime_model.package.sampler.spec.clone(),
         })
     }
 
@@ -11455,27 +11489,28 @@ impl VulkanResidentTokenModelPackage for VulkanResidentModelPackage {
 }
 
 fn validate_pedal_executions(
-    manifest: &VulkanResidentModelPackageManifest,
+    package_id: &str,
+    pedal_executions: &[VulkanResidentPedalExecutionSpec],
 ) -> Result<(), VulkanResidentTokenModelPackageError> {
-    if manifest.pedal_executions.is_empty() {
+    if pedal_executions.is_empty() {
         return Err(VulkanResidentTokenModelPackageError::new(format!(
             "resident model package {:?} does not declare pedal executions",
-            manifest.package_id
+            package_id
         )));
     }
     let mut declared_kernels = BTreeSet::new();
-    for pedal in &manifest.pedal_executions {
+    for pedal in pedal_executions {
         if pedal.kernels.is_empty() {
             return Err(VulkanResidentTokenModelPackageError::new(format!(
                 "resident model package {:?} declares pedal {:?} with no executable kernels",
-                manifest.package_id, pedal.pedal_id
+                package_id, pedal.pedal_id
             )));
         }
         for kernel in &pedal.kernels {
             if !declared_kernels.insert((pedal.pedal_id.as_str(), kernel.node_id.as_str())) {
                 return Err(VulkanResidentTokenModelPackageError::new(format!(
                     "resident model package {:?} declares duplicate pedal kernel {}.{}",
-                    manifest.package_id, pedal.pedal_id, kernel.node_id
+                    package_id, pedal.pedal_id, kernel.node_id
                 )));
             }
         }
@@ -11486,10 +11521,10 @@ fn validate_pedal_executions(
 
 fn validate_generation_execution_contract(
     manifest: &VulkanResidentModelPackageManifest,
+    circuit_graph: &VulkanResidentPackageCircuitGraph,
 ) -> Result<(), VulkanResidentTokenModelPackageError> {
     let pedals_with_role = |role: crate::stream_circuit::CircuitRuntimeRole| {
-        manifest
-            .circuit_graph
+        circuit_graph
             .pedals
             .iter()
             .filter(|pedal| pedal.runtime_role == role)
@@ -11512,8 +11547,7 @@ fn validate_generation_execution_contract(
         .iter()
         .map(|pedal| pedal.pedal_id.as_str())
         .collect::<BTreeSet<_>>();
-    let forward = manifest
-        .circuit_graph
+    let forward = circuit_graph
         .cables
         .iter()
         .filter(|cable| cable.connection.is_forward())
@@ -11542,8 +11576,7 @@ fn validate_generation_execution_contract(
                 && cable.destination.pedal_id == sampler.pedal_id
         })
         .collect::<Vec<_>>();
-    let feedback_edges = manifest
-        .circuit_graph
+    let feedback_edges = circuit_graph
         .cables
         .iter()
         .filter(|cable| {
@@ -11605,8 +11638,7 @@ fn validate_generation_execution_contract(
         )));
     }
 
-    let external_input_endpoints = manifest
-        .circuit_graph
+    let external_input_endpoints = circuit_graph
         .boundary
         .external_inputs
         .iter()
@@ -11617,8 +11649,7 @@ fn validate_generation_execution_contract(
             )
         })
         .collect::<BTreeSet<_>>();
-    let public_output_endpoints = manifest
-        .circuit_graph
+    let public_output_endpoints = circuit_graph
         .boundary
         .public_outputs
         .iter()
@@ -11629,13 +11660,13 @@ fn validate_generation_execution_contract(
             )
         })
         .collect::<BTreeSet<_>>();
-    if manifest.circuit_graph.boundary.external_inputs.len() != 2
+    if circuit_graph.boundary.external_inputs.len() != 2
         || external_input_endpoints
             != BTreeSet::from([
                 (input.pedal_id.as_str(), input_token_port),
                 (sampler.pedal_id.as_str(), sampler_random_port),
             ])
-        || manifest.circuit_graph.boundary.public_outputs.len() != 1
+        || circuit_graph.boundary.public_outputs.len() != 1
         || public_output_endpoints
             != BTreeSet::from([(sampler.pedal_id.as_str(), sampler_token_port)])
     {
@@ -11755,12 +11786,12 @@ fn validate_generation_execution_contract(
 }
 
 fn validate_pedal_executions_against_graph(
-    manifest: &VulkanResidentModelPackageManifest,
+    package_id: &str,
+    pedal_executions: &[VulkanResidentPedalExecutionSpec],
     graph: &ResolvedLoweredPedalboard,
 ) -> Result<(), VulkanResidentTokenModelPackageError> {
-    validate_pedal_executions(manifest)?;
-    let execution_by_pedal = manifest
-        .pedal_executions
+    validate_pedal_executions(package_id, pedal_executions)?;
+    let execution_by_pedal = pedal_executions
         .iter()
         .map(|execution| (execution.pedal_id.as_str(), execution))
         .collect::<BTreeMap<_, _>>();
@@ -11773,7 +11804,7 @@ fn validate_pedal_executions_against_graph(
     if execution_by_pedal.keys().copied().collect::<BTreeSet<_>>() != graph_pedals {
         return Err(VulkanResidentTokenModelPackageError::new(format!(
             "resident model package {:?} pedal executions do not match its circuit graph",
-            manifest.package_id
+            package_id
         )));
     }
     for artifact in graph
@@ -11787,13 +11818,13 @@ fn validate_pedal_executions_against_graph(
         {
             return Err(VulkanResidentTokenModelPackageError::new(format!(
                 "resident model package {:?} execution identity for pedal {} does not match its circuit",
-                manifest.package_id, artifact.pedal.id
+                package_id, artifact.pedal.id
             )));
         }
         if execution.kernels.len() != artifact.circuit.nodes.len() {
             return Err(VulkanResidentTokenModelPackageError::new(format!(
                 "resident model package {:?} pedal {} execution does not cover every circuit node",
-                manifest.package_id, artifact.pedal.id
+                package_id, artifact.pedal.id
             )));
         }
         for (expected_index, (kernel, node)) in execution
@@ -11809,7 +11840,7 @@ fn validate_pedal_executions_against_graph(
             {
                 return Err(VulkanResidentTokenModelPackageError::new(format!(
                     "resident model package {:?} pedal {} kernel {} does not match its circuit node",
-                    manifest.package_id, artifact.pedal.id, expected_index
+                    package_id, artifact.pedal.id, expected_index
                 )));
             }
         }
@@ -11818,11 +11849,11 @@ fn validate_pedal_executions_against_graph(
 }
 
 fn validate_pedal_executions_against_mounted_dispatches(
-    manifest: &VulkanResidentModelPackageManifest,
+    package_id: &str,
+    pedal_executions: &[VulkanResidentPedalExecutionSpec],
     mounted_bound: &VulkanMountedPlacedBoundDispatchPlan,
 ) -> Result<(), VulkanResidentTokenModelPackageError> {
-    let declared_pedals = manifest
-        .pedal_executions
+    let declared_pedals = pedal_executions
         .iter()
         .map(|pedal| pedal.pedal_id.as_str())
         .collect::<BTreeSet<_>>();
@@ -11839,7 +11870,7 @@ fn validate_pedal_executions_against_mounted_dispatches(
     if !missing_pedals.is_empty() {
         return Err(VulkanResidentTokenModelPackageError::new(format!(
             "resident model package {:?} is missing pedal executions for mounted pedals: {}",
-            manifest.package_id,
+            package_id,
             missing_pedals.join(", ")
         )));
     }
@@ -11851,12 +11882,12 @@ fn validate_pedal_executions_against_mounted_dispatches(
     if !unknown_pedals.is_empty() {
         return Err(VulkanResidentTokenModelPackageError::new(format!(
             "resident model package {:?} declares pedal executions for unknown mounted pedals: {}",
-            manifest.package_id,
+            package_id,
             unknown_pedals.join(", ")
         )));
     }
 
-    for pedal in &manifest.pedal_executions {
+    for pedal in pedal_executions {
         let mounted_dispatches = mounted_bound
             .dispatches
             .iter()
@@ -11865,7 +11896,7 @@ fn validate_pedal_executions_against_mounted_dispatches(
         if pedal.kernels.len() != mounted_dispatches.len() {
             return Err(VulkanResidentTokenModelPackageError::new(format!(
                 "resident model package {:?} declares {} kernels for pedal {}, but mounted dispatch plan has {}",
-                manifest.package_id,
+                package_id,
                 pedal.kernels.len(),
                 pedal.pedal_id,
                 mounted_dispatches.len()
@@ -11878,7 +11909,7 @@ fn validate_pedal_executions_against_mounted_dispatches(
             if kernel.execution_index != expected_index {
                 return Err(VulkanResidentTokenModelPackageError::new(format!(
                     "resident model package {:?} declares pedal {} kernel {} with execution_index {}, expected {}",
-                    manifest.package_id,
+                    package_id,
                     pedal.pedal_id,
                     kernel.node_id,
                     kernel.execution_index,
@@ -11888,23 +11919,19 @@ fn validate_pedal_executions_against_mounted_dispatches(
             if kernel.node_id != dispatch.node_id {
                 return Err(VulkanResidentTokenModelPackageError::new(format!(
                     "resident model package {:?} declares pedal {} execution_index {} as node {}, but mounted dispatch plan has node {}",
-                    manifest.package_id,
-                    pedal.pedal_id,
-                    expected_index,
-                    kernel.node_id,
-                    dispatch.node_id
+                    package_id, pedal.pedal_id, expected_index, kernel.node_id, dispatch.node_id
                 )));
             }
             if kernel.op != dispatch.op {
                 return Err(VulkanResidentTokenModelPackageError::new(format!(
                     "resident model package {:?} declares pedal {} node {} op {}, but mounted dispatch plan has op {}",
-                    manifest.package_id, pedal.pedal_id, kernel.node_id, kernel.op, dispatch.op
+                    package_id, pedal.pedal_id, kernel.node_id, kernel.op, dispatch.op
                 )));
             }
             if kernel.execution_index != dispatch.node_index {
                 return Err(VulkanResidentTokenModelPackageError::new(format!(
                     "resident model package {:?} declares pedal {} node {} execution_index {}, but mounted dispatch plan has node_index {}",
-                    manifest.package_id,
+                    package_id,
                     pedal.pedal_id,
                     kernel.node_id,
                     kernel.execution_index,
@@ -11918,11 +11945,11 @@ fn validate_pedal_executions_against_mounted_dispatches(
 }
 
 fn validate_pedal_executions_cover_mounted_dispatches(
-    manifest: &VulkanResidentModelPackageManifest,
+    package_id: &str,
+    pedal_executions: &[VulkanResidentPedalExecutionSpec],
     mounted_bound: &VulkanMountedPlacedBoundDispatchPlan,
 ) -> Result<(), VulkanResidentTokenModelPackageError> {
-    let declared_pedals = manifest
-        .pedal_executions
+    let declared_pedals = pedal_executions
         .iter()
         .map(|pedal| pedal.pedal_id.as_str())
         .collect::<BTreeSet<_>>();
@@ -11939,13 +11966,12 @@ fn validate_pedal_executions_cover_mounted_dispatches(
     if !missing_pedals.is_empty() {
         return Err(VulkanResidentTokenModelPackageError::new(format!(
             "resident model package {:?} is missing pedal executions for mounted pedals: {}",
-            manifest.package_id,
+            package_id,
             missing_pedals.join(", ")
         )));
     }
 
-    for pedal in manifest
-        .pedal_executions
+    for pedal in pedal_executions
         .iter()
         .filter(|pedal| mounted_pedals.contains(pedal.pedal_id.as_str()))
     {
@@ -11957,7 +11983,7 @@ fn validate_pedal_executions_cover_mounted_dispatches(
         if pedal.kernels.len() != mounted_dispatches.len() {
             return Err(VulkanResidentTokenModelPackageError::new(format!(
                 "resident model package {:?} declares {} kernels for mounted pedal {}, but mounted dispatch plan has {}",
-                manifest.package_id,
+                package_id,
                 pedal.kernels.len(),
                 pedal.pedal_id,
                 mounted_dispatches.len()
@@ -11970,7 +11996,7 @@ fn validate_pedal_executions_cover_mounted_dispatches(
             if kernel.execution_index != expected_index {
                 return Err(VulkanResidentTokenModelPackageError::new(format!(
                     "resident model package {:?} declares pedal {} kernel {} with execution_index {}, expected {}",
-                    manifest.package_id,
+                    package_id,
                     pedal.pedal_id,
                     kernel.node_id,
                     kernel.execution_index,
@@ -11980,23 +12006,19 @@ fn validate_pedal_executions_cover_mounted_dispatches(
             if kernel.node_id != dispatch.node_id {
                 return Err(VulkanResidentTokenModelPackageError::new(format!(
                     "resident model package {:?} declares mounted pedal {} execution_index {} as node {}, but mounted dispatch plan has node {}",
-                    manifest.package_id,
-                    pedal.pedal_id,
-                    expected_index,
-                    kernel.node_id,
-                    dispatch.node_id
+                    package_id, pedal.pedal_id, expected_index, kernel.node_id, dispatch.node_id
                 )));
             }
             if kernel.op != dispatch.op {
                 return Err(VulkanResidentTokenModelPackageError::new(format!(
                     "resident model package {:?} declares mounted pedal {} node {} op {}, but mounted dispatch plan has op {}",
-                    manifest.package_id, pedal.pedal_id, kernel.node_id, kernel.op, dispatch.op
+                    package_id, pedal.pedal_id, kernel.node_id, kernel.op, dispatch.op
                 )));
             }
             if kernel.execution_index != dispatch.node_index {
                 return Err(VulkanResidentTokenModelPackageError::new(format!(
                     "resident model package {:?} declares mounted pedal {} node {} execution_index {}, but mounted dispatch plan has node_index {}",
-                    manifest.package_id,
+                    package_id,
                     pedal.pedal_id,
                     kernel.node_id,
                     kernel.execution_index,
@@ -12226,10 +12248,9 @@ fn resident_package_reusable_kernel_manifest(
 }
 
 fn resident_package_pedal_kernel_shader_refs(
-    manifest: &VulkanResidentModelPackageManifest,
+    pedal_executions: &[VulkanResidentPedalExecutionSpec],
 ) -> Vec<VulkanResidentPedalKernelShaderRef> {
-    manifest
-        .pedal_executions
+    pedal_executions
         .iter()
         .flat_map(|pedal| {
             pedal
@@ -12247,10 +12268,10 @@ fn resident_package_pedal_kernel_shader_refs(
 }
 
 fn resident_package_pedal_kernel_shader_refs_for_mounted_dispatches(
-    manifest: &VulkanResidentModelPackageManifest,
+    pedal_executions: &[VulkanResidentPedalExecutionSpec],
     mounted_bound: &VulkanMountedPlacedBoundDispatchPlan,
 ) -> Vec<VulkanResidentPedalKernelShaderRef> {
-    resident_package_pedal_kernel_shader_refs(manifest)
+    resident_package_pedal_kernel_shader_refs(pedal_executions)
         .into_iter()
         .filter(|shader| {
             mounted_bound
@@ -18612,6 +18633,26 @@ mod tests {
             .unwrap()
     }
 
+    fn fixture_model_runtime_model() -> VulkanResidentRuntimeModel {
+        fixture_model_package_manifest()
+            .mount_runtime_patch_controls(None, &BTreeMap::new(), &[], None)
+            .unwrap()
+    }
+
+    fn fixture_model_runtime_model_with_placement(
+        placement: StreamCircuitPlacementSpec,
+    ) -> VulkanResidentRuntimeModel {
+        let manifest = fixture_model_package_manifest();
+        let source_graph = manifest
+            .circuit_graph
+            .to_resolved_lowered_pedalboard(PathBuf::from("."))
+            .unwrap();
+        let patch = source_graph
+            .runtime_patch_from_placement(&placement)
+            .unwrap();
+        manifest.mount_runtime_patch(&patch).unwrap()
+    }
+
     fn fixture_model_execution_graph() -> ResolvedLoweredPedalboard {
         let full = ResolvedLoweredPedalboard::from_index_file(fixture_model_index_path()).unwrap();
         let processor_ids = full
@@ -18938,7 +18979,7 @@ mod tests {
             .with_instance_device("layer_05_repeat", "gpu1")
             .unwrap();
 
-        let patched = manifest.clone().with_runtime_patch(&patch).unwrap();
+        let patched = manifest.clone().mount_runtime_patch(&patch).unwrap();
 
         assert_eq!(manifest.circuit_graph.pedals.len(), 17);
         assert_eq!(manifest.pedal_executions.len(), 14);
@@ -18952,6 +18993,14 @@ mod tests {
 
         assert_eq!(patched.circuit_graph.pedals.len(), 18);
         assert_eq!(patched.pedal_executions.len(), 15);
+        assert_eq!(patched.package, manifest);
+        assert!(
+            patched
+                .patch
+                .instances
+                .iter()
+                .any(|instance| instance.instance_id == "layer_05_repeat")
+        );
         assert_eq!(
             patched.placement.device_for_pedal("layer_05_repeat"),
             "gpu1"
@@ -19026,9 +19075,7 @@ mod tests {
             .circuit_graph
             .signal_processor_endpoint_pedal_ids()
             .unwrap();
-        let placement = manifest
-            .placement
-            .clone()
+        let placement = StreamCircuitPlacementSpec::new(RUNTIME_DEFAULT_LOGICAL_DEVICE_ID)
             .with_pedal_device(&input_pedal, "gpu-input")
             .with_pedal_device(&output_pedal, "gpu-output");
 
@@ -19110,9 +19157,10 @@ mod tests {
 
         let mut sampler_drift = manifest.clone();
         sampler_drift.sampler.spec.top_k += 1;
-        let sampler_error = validate_generation_execution_contract(&sampler_drift)
-            .unwrap_err()
-            .to_string();
+        let sampler_error =
+            validate_generation_execution_contract(&sampler_drift, &sampler_drift.circuit_graph)
+                .unwrap_err()
+                .to_string();
         assert!(sampler_error.contains("sampler execution does not match"));
 
         let mut wiring_drift = manifest;
@@ -19120,18 +19168,20 @@ mod tests {
             .circuit_graph
             .cables
             .retain(|cable| cable.connection.is_forward());
-        let wiring_error = validate_generation_execution_contract(&wiring_drift)
-            .unwrap_err()
-            .to_string();
+        let wiring_error =
+            validate_generation_execution_contract(&wiring_drift, &wiring_drift.circuit_graph)
+                .unwrap_err()
+                .to_string();
         assert!(wiring_error.contains("delayed sampler feedback"));
 
         let mut boundary_drift = fixture_model_package_manifest();
         boundary_drift.circuit_graph.boundary.public_outputs[0]
             .endpoint
             .port_id = "random_seed".to_string();
-        let boundary_error = validate_generation_execution_contract(&boundary_drift)
-            .unwrap_err()
-            .to_string();
+        let boundary_error =
+            validate_generation_execution_contract(&boundary_drift, &boundary_drift.circuit_graph)
+                .unwrap_err()
+                .to_string();
         assert!(boundary_error.contains("sampler public output"));
     }
 
@@ -19176,10 +19226,9 @@ mod tests {
             .state_policy = StreamCircuitPedalInstanceStatePolicy::ShareWith {
             instance_id: "layer_05".to_string(),
         };
-        let shared_manifest = manifest.clone().with_runtime_patch(&shared_patch).unwrap();
-        let shared_graph = shared_manifest
-            .circuit_graph
-            .to_resolved_lowered_pedalboard(PathBuf::from("."))
+        let shared_runtime_model = manifest.clone().mount_runtime_patch(&shared_patch).unwrap();
+        let shared_graph = shared_runtime_model
+            .resolved_graph(PathBuf::from("."))
             .unwrap();
         let shared_execution = StreamCircuitExecutionPlan::from_graph(&shared_graph).unwrap();
         let shared_resources =
@@ -19208,10 +19257,9 @@ mod tests {
             .state_policy = StreamCircuitPedalInstanceStatePolicy::CloneFrom {
             instance_id: "layer_05".to_string(),
         };
-        let cloned_manifest = manifest.with_runtime_patch(&cloned_patch).unwrap();
-        let cloned_graph = cloned_manifest
-            .circuit_graph
-            .to_resolved_lowered_pedalboard(PathBuf::from("."))
+        let cloned_runtime_model = manifest.mount_runtime_patch(&cloned_patch).unwrap();
+        let cloned_graph = cloned_runtime_model
+            .resolved_graph(PathBuf::from("."))
             .unwrap();
         let cloned_execution = StreamCircuitExecutionPlan::from_graph(&cloned_graph).unwrap();
         let cloned_resources =
@@ -19369,20 +19417,22 @@ mod tests {
                 return;
             }
         };
-        let mut manifest = fixture_model_package_manifest();
+        let mut runtime_model = fixture_model_runtime_model();
         let manifest_path = fixture_model_package_manifest_path();
         let manifest_dir = manifest_path.parent().unwrap();
-        let tensor_index_path =
-            resolve_resident_model_package_path(manifest_dir, &manifest.tensor_index_path);
-        let default_device_id = manifest.placement.default_device_id.clone();
+        let tensor_index_path = resolve_resident_model_package_path(
+            manifest_dir,
+            &runtime_model.package.tensor_index_path,
+        );
+        let default_device_id = runtime_model.placement.default_device_id.clone();
         let (_tensor_index, _resource_plan, placed_plan) =
             plan_resident_package_single_device_stream_circuit(
                 &default_device_id,
-                &manifest.placement,
-                &manifest.circuit_graph,
+                &runtime_model.placement,
+                &runtime_model.circuit_graph,
                 manifest_dir,
                 &tensor_index_path,
-                manifest.activation_element_bytes,
+                runtime_model.package.activation_element_bytes,
             )
             .unwrap();
         let mounted =
@@ -19392,11 +19442,20 @@ mod tests {
             .mounted_placed_bound_dispatch_plan(&kernel_manifest)
             .unwrap();
 
-        validate_pedal_executions_against_mounted_dispatches(&manifest, &mounted_bound).unwrap();
+        validate_pedal_executions_against_mounted_dispatches(
+            &runtime_model.package.package_id,
+            &runtime_model.pedal_executions,
+            &mounted_bound,
+        )
+        .unwrap();
 
-        manifest.pedal_executions[0].kernels.swap(0, 1);
-        let error = validate_pedal_executions_against_mounted_dispatches(&manifest, &mounted_bound)
-            .unwrap_err();
+        runtime_model.pedal_executions[0].kernels.swap(0, 1);
+        let error = validate_pedal_executions_against_mounted_dispatches(
+            &runtime_model.package.package_id,
+            &runtime_model.pedal_executions,
+            &mounted_bound,
+        )
+        .unwrap_err();
         assert!(error.to_string().contains(
             "declares pedal layer_00 kernel conv_in_projection with execution_index 1, expected 0"
         ));
@@ -19404,20 +19463,18 @@ mod tests {
 
     #[test]
     fn single_device_package_rejects_remote_pedal_placement() {
-        let mut manifest = fixture_model_package_manifest();
-        manifest
-            .placement
-            .pedal_devices
-            .insert("layer_00".to_string(), "gpu1".to_string());
+        let manifest = fixture_model_package_manifest();
+        let placement = StreamCircuitPlacementSpec::new(RUNTIME_DEFAULT_LOGICAL_DEVICE_ID)
+            .with_pedal_device("layer_00", "gpu1");
         let manifest_path = fixture_model_package_manifest_path();
         let manifest_dir = manifest_path.parent().unwrap();
         let tensor_index_path =
             resolve_resident_model_package_path(manifest_dir, &manifest.tensor_index_path);
-        let default_device_id = manifest.placement.default_device_id.clone();
+        let default_device_id = placement.default_device_id.clone();
 
         let error = plan_resident_package_single_device_stream_circuit(
             &default_device_id,
-            &manifest.placement,
+            &placement,
             &manifest.circuit_graph,
             manifest_dir,
             &tensor_index_path,
@@ -19438,18 +19495,19 @@ mod tests {
                 return;
             }
         };
-        let mut manifest = fixture_model_package_manifest();
-        manifest.placement = StreamCircuitPlacementSpec::new("gpu0")
-            .with_pedal_device("layer_01", "cpu0")
-            .with_pedal_device("layer_02", "gpu1")
-            .with_pedal_device("layer_03", "lan:worker-a");
+        let runtime_model = fixture_model_runtime_model_with_placement(
+            StreamCircuitPlacementSpec::new("gpu0")
+                .with_pedal_device("layer_01", "cpu0")
+                .with_pedal_device("layer_02", "gpu1")
+                .with_pedal_device("layer_03", "lan:worker-a"),
+        );
         let manifest_path = fixture_model_package_manifest_path();
         let manifest_dir = manifest_path.parent().unwrap();
 
-        let slice = VulkanResidentModelPackageDeviceSlice::from_manifest_for_device(
+        let slice = VulkanResidentModelPackageDeviceSlice::from_runtime_model_for_device(
             &device,
             manifest_dir,
-            manifest,
+            runtime_model,
             "gpu1",
             Some(4),
         )
@@ -26675,24 +26733,24 @@ mod tests {
                 return;
             }
         };
-        let mut manifest = fixture_model_package_manifest();
-        manifest.placement =
-            StreamCircuitPlacementSpec::new("gpu0").with_pedal_device("layer_02", "gpu1");
+        let runtime_model = fixture_model_runtime_model_with_placement(
+            StreamCircuitPlacementSpec::new("gpu0").with_pedal_device("layer_02", "gpu1"),
+        );
         let manifest_path = fixture_model_package_manifest_path();
         let manifest_dir = manifest_path.parent().unwrap();
 
-        let gpu0_slice = VulkanResidentModelPackageDeviceSlice::from_manifest_for_device(
+        let gpu0_slice = VulkanResidentModelPackageDeviceSlice::from_runtime_model_for_device(
             &device,
             manifest_dir,
-            manifest.clone(),
+            runtime_model.clone(),
             "gpu0",
             Some(4),
         )
         .unwrap();
-        let gpu1_slice = VulkanResidentModelPackageDeviceSlice::from_manifest_for_device(
+        let gpu1_slice = VulkanResidentModelPackageDeviceSlice::from_runtime_model_for_device(
             &device,
             manifest_dir,
-            manifest,
+            runtime_model,
             "gpu1",
             Some(4),
         )
@@ -26773,24 +26831,24 @@ mod tests {
                 return;
             }
         };
-        let mut manifest = fixture_model_package_manifest();
-        manifest.placement =
-            StreamCircuitPlacementSpec::new("gpu0").with_pedal_device("layer_02", "gpu1");
+        let runtime_model = fixture_model_runtime_model_with_placement(
+            StreamCircuitPlacementSpec::new("gpu0").with_pedal_device("layer_02", "gpu1"),
+        );
         let manifest_path = fixture_model_package_manifest_path();
         let manifest_dir = manifest_path.parent().unwrap();
 
-        let gpu0_slice = VulkanResidentModelPackageDeviceSlice::from_manifest_for_device(
+        let gpu0_slice = VulkanResidentModelPackageDeviceSlice::from_runtime_model_for_device(
             &device,
             manifest_dir,
-            manifest.clone(),
+            runtime_model.clone(),
             "gpu0",
             Some(4),
         )
         .unwrap();
-        let gpu1_slice = VulkanResidentModelPackageDeviceSlice::from_manifest_for_device(
+        let gpu1_slice = VulkanResidentModelPackageDeviceSlice::from_runtime_model_for_device(
             &device,
             manifest_dir,
-            manifest,
+            runtime_model,
             "gpu1",
             Some(4),
         )
@@ -26932,24 +26990,24 @@ mod tests {
                 return;
             }
         };
-        let mut manifest = fixture_model_package_manifest();
-        manifest.placement =
-            StreamCircuitPlacementSpec::new("gpu0").with_pedal_device("layer_02", "gpu1");
+        let runtime_model = fixture_model_runtime_model_with_placement(
+            StreamCircuitPlacementSpec::new("gpu0").with_pedal_device("layer_02", "gpu1"),
+        );
         let manifest_path = fixture_model_package_manifest_path();
         let manifest_dir = manifest_path.parent().unwrap();
 
-        let gpu0_slice = VulkanResidentModelPackageDeviceSlice::from_manifest_for_device(
+        let gpu0_slice = VulkanResidentModelPackageDeviceSlice::from_runtime_model_for_device(
             &device,
             manifest_dir,
-            manifest.clone(),
+            runtime_model.clone(),
             "gpu0",
             Some(4),
         )
         .unwrap();
-        let gpu1_slice = VulkanResidentModelPackageDeviceSlice::from_manifest_for_device(
+        let gpu1_slice = VulkanResidentModelPackageDeviceSlice::from_runtime_model_for_device(
             &device,
             manifest_dir,
-            manifest,
+            runtime_model,
             "gpu1",
             Some(4),
         )
@@ -27083,20 +27141,21 @@ mod tests {
                 return;
             }
         };
-        let mut manifest = fixture_model_package_manifest();
-        manifest.placement =
-            StreamCircuitPlacementSpec::new("gpu0").with_pedal_device("layer_02", "gpu1");
+        let runtime_model = fixture_model_runtime_model_with_placement(
+            StreamCircuitPlacementSpec::new("gpu0").with_pedal_device("layer_02", "gpu1"),
+        );
         let manifest_path = fixture_model_package_manifest_path();
         let manifest_dir = manifest_path.parent().unwrap();
 
-        let placed_package = VulkanResidentInProcessPlacedModelPackage::from_manifest_for_devices(
-            &device,
-            manifest_dir,
-            manifest,
-            Some(4),
-            0,
-        )
-        .unwrap();
+        let placed_package =
+            VulkanResidentInProcessPlacedModelPackage::from_runtime_model_for_devices(
+                &device,
+                manifest_dir,
+                runtime_model,
+                Some(4),
+                0,
+            )
+            .unwrap();
         assert_eq!(placed_package.device_ids, vec!["gpu0", "gpu1"]);
         assert_eq!(placed_package.device_count, 2);
         assert_eq!(placed_package.hosted_pedal_count, 14);
@@ -27159,21 +27218,22 @@ mod tests {
                 return;
             }
         };
-        let mut manifest = fixture_model_package_manifest();
-        manifest.placement =
-            StreamCircuitPlacementSpec::new("gpu0").with_pedal_device("layer_02", "gpu1");
+        let runtime_model = fixture_model_runtime_model_with_placement(
+            StreamCircuitPlacementSpec::new("gpu0").with_pedal_device("layer_02", "gpu1"),
+        );
         let manifest_path = fixture_model_package_manifest_path();
         let manifest_dir = manifest_path.parent().unwrap();
         let tensor_index = TensorIndex::from_json_file(fixture_model_tensor_index_path()).unwrap();
 
-        let placed_package = VulkanResidentInProcessPlacedModelPackage::from_manifest_for_devices(
-            &device,
-            manifest_dir,
-            manifest,
-            Some(4),
-            0,
-        )
-        .unwrap();
+        let placed_package =
+            VulkanResidentInProcessPlacedModelPackage::from_runtime_model_for_devices(
+                &device,
+                manifest_dir,
+                runtime_model,
+                Some(4),
+                0,
+            )
+            .unwrap();
         assert_eq!(placed_package.input_device_id, "gpu0");
         assert_eq!(placed_package.output_device_id, "gpu1");
         assert_eq!(placed_package.transducer_parameter_count, 3);
@@ -27224,20 +27284,21 @@ mod tests {
                 return;
             }
         };
-        let mut manifest = fixture_model_package_manifest();
-        manifest.placement =
-            StreamCircuitPlacementSpec::new("gpu0").with_pedal_device("layer_02", "gpu1");
+        let runtime_model = fixture_model_runtime_model_with_placement(
+            StreamCircuitPlacementSpec::new("gpu0").with_pedal_device("layer_02", "gpu1"),
+        );
         let manifest_path = fixture_model_package_manifest_path();
         let manifest_dir = manifest_path.parent().unwrap();
 
-        let placed_package = VulkanResidentInProcessPlacedModelPackage::from_manifest_for_devices(
-            &device,
-            manifest_dir,
-            manifest,
-            Some(4),
-            0,
-        )
-        .unwrap();
+        let placed_package =
+            VulkanResidentInProcessPlacedModelPackage::from_runtime_model_for_devices(
+                &device,
+                manifest_dir,
+                runtime_model,
+                Some(4),
+                0,
+            )
+            .unwrap();
         let run = placed_package
             .run_feedback_bounded_in_process(&device, 1, 0, 2, 8)
             .unwrap();
@@ -27278,20 +27339,21 @@ mod tests {
                 return;
             }
         };
-        let mut manifest = fixture_model_package_manifest();
-        manifest.placement =
-            StreamCircuitPlacementSpec::new("gpu0").with_pedal_device("layer_02", "gpu1");
+        let runtime_model = fixture_model_runtime_model_with_placement(
+            StreamCircuitPlacementSpec::new("gpu0").with_pedal_device("layer_02", "gpu1"),
+        );
         let manifest_path = fixture_model_package_manifest_path();
         let manifest_dir = manifest_path.parent().unwrap();
 
-        let placed_package = VulkanResidentInProcessPlacedModelPackage::from_manifest_for_devices(
-            &device,
-            manifest_dir,
-            manifest,
-            Some(4),
-            0,
-        )
-        .unwrap();
+        let placed_package =
+            VulkanResidentInProcessPlacedModelPackage::from_runtime_model_for_devices(
+                &device,
+                manifest_dir,
+                runtime_model,
+                Some(4),
+                0,
+            )
+            .unwrap();
         let run = placed_package
             .run_prompt_event_bounded_in_process(
                 &device,
@@ -27330,18 +27392,19 @@ mod tests {
                 return;
             }
         };
-        let manifest = fixture_model_package_manifest();
+        let runtime_model = fixture_model_runtime_model();
         let manifest_path = fixture_model_package_manifest_path();
         let manifest_dir = manifest_path.parent().unwrap();
 
-        let placed_package = VulkanResidentInProcessPlacedModelPackage::from_manifest_for_devices(
-            &device,
-            manifest_dir,
-            manifest,
-            Some(8),
-            0,
-        )
-        .unwrap();
+        let placed_package =
+            VulkanResidentInProcessPlacedModelPackage::from_runtime_model_for_devices(
+                &device,
+                manifest_dir,
+                runtime_model,
+                Some(8),
+                0,
+            )
+            .unwrap();
         let mut session = placed_package.prompt_session();
 
         let first = session
@@ -27388,9 +27451,9 @@ mod tests {
                 return;
             }
         };
-        let mut manifest = fixture_model_package_manifest();
-        manifest.placement =
-            StreamCircuitPlacementSpec::new("gpu0").with_pedal_device("layer_02", "gpu1");
+        let runtime_model = fixture_model_runtime_model_with_placement(
+            StreamCircuitPlacementSpec::new("gpu0").with_pedal_device("layer_02", "gpu1"),
+        );
         let manifest_path = fixture_model_package_manifest_path();
         let manifest_dir = manifest_path.parent().unwrap();
         let device = Rc::new(device);
@@ -27400,10 +27463,10 @@ mod tests {
         ]);
 
         let mut stream =
-            VulkanResidentInProcessPlacedPromptStream::from_manifest_for_bound_devices(
+            VulkanResidentInProcessPlacedPromptStream::from_runtime_model_for_bound_devices(
                 devices,
                 manifest_dir,
-                manifest,
+                runtime_model,
                 Some(8),
                 0,
             )
@@ -27441,9 +27504,9 @@ mod tests {
                 return;
             }
         };
-        let mut manifest = fixture_model_package_manifest();
-        manifest.placement =
-            StreamCircuitPlacementSpec::new("gpu0").with_pedal_device("layer_02", "gpu1");
+        let runtime_model = fixture_model_runtime_model_with_placement(
+            StreamCircuitPlacementSpec::new("gpu0").with_pedal_device("layer_02", "gpu1"),
+        );
         let manifest_path = fixture_model_package_manifest_path();
         let manifest_dir = manifest_path.parent().unwrap();
         let device = Rc::new(device);
@@ -27453,10 +27516,10 @@ mod tests {
         ]);
 
         let mut stream =
-            VulkanResidentInProcessPlacedPromptStream::from_manifest_for_bound_devices(
+            VulkanResidentInProcessPlacedPromptStream::from_runtime_model_for_bound_devices(
                 devices,
                 manifest_dir,
-                manifest,
+                runtime_model,
                 Some(8),
                 0,
             )
@@ -27514,9 +27577,9 @@ mod tests {
                 return;
             }
         };
-        let mut manifest = fixture_model_package_manifest();
-        manifest.placement =
-            StreamCircuitPlacementSpec::new("gpu0").with_pedal_device("layer_02", "gpu1");
+        let runtime_model = fixture_model_runtime_model_with_placement(
+            StreamCircuitPlacementSpec::new("gpu0").with_pedal_device("layer_02", "gpu1"),
+        );
         let manifest_path = fixture_model_package_manifest_path();
         let manifest_dir = manifest_path.parent().unwrap();
         let device = Rc::new(device);
@@ -27526,10 +27589,10 @@ mod tests {
         ]);
 
         let mut stream =
-            VulkanResidentInProcessPlacedPromptStream::from_manifest_for_bound_devices(
+            VulkanResidentInProcessPlacedPromptStream::from_runtime_model_for_bound_devices(
                 devices,
                 manifest_dir,
-                manifest,
+                runtime_model,
                 Some(8),
                 0,
             )
@@ -27568,9 +27631,9 @@ mod tests {
                 return;
             }
         };
-        let mut manifest = fixture_model_package_manifest();
-        manifest.placement =
-            StreamCircuitPlacementSpec::new("gpu0").with_pedal_device("layer_02", "gpu1");
+        let runtime_model = fixture_model_runtime_model_with_placement(
+            StreamCircuitPlacementSpec::new("gpu0").with_pedal_device("layer_02", "gpu1"),
+        );
         let manifest_path = fixture_model_package_manifest_path();
         let manifest_dir = manifest_path.parent().unwrap();
         let device = Rc::new(device);
@@ -27578,14 +27641,15 @@ mod tests {
             ("gpu0".to_string(), device.clone()),
             ("gpu1".to_string(), device.clone()),
         ]);
-        let stream = VulkanResidentInProcessPlacedPromptStream::from_manifest_for_bound_devices(
-            devices,
-            manifest_dir,
-            manifest,
-            Some(8),
-            0,
-        )
-        .unwrap();
+        let stream =
+            VulkanResidentInProcessPlacedPromptStream::from_runtime_model_for_bound_devices(
+                devices,
+                manifest_dir,
+                runtime_model,
+                Some(8),
+                0,
+            )
+            .unwrap();
 
         let mut engine = VulkanResidentInProcessPlacedPromptEngine::new();
         let added = engine.add_stream("main", stream).unwrap();
@@ -27656,9 +27720,9 @@ mod tests {
                 return;
             }
         };
-        let mut manifest = fixture_model_package_manifest();
-        manifest.placement =
-            StreamCircuitPlacementSpec::new("gpu0").with_pedal_device("layer_02", "gpu1");
+        let runtime_model = fixture_model_runtime_model_with_placement(
+            StreamCircuitPlacementSpec::new("gpu0").with_pedal_device("layer_02", "gpu1"),
+        );
         let manifest_path = fixture_model_package_manifest_path();
         let manifest_dir = manifest_path.parent().unwrap();
         let device = Rc::new(device);
@@ -27666,22 +27730,24 @@ mod tests {
             ("gpu0".to_string(), device.clone()),
             ("gpu1".to_string(), device.clone()),
         ]);
-        let stream_a = VulkanResidentInProcessPlacedPromptStream::from_manifest_for_bound_devices(
-            devices.clone(),
-            manifest_dir,
-            manifest.clone(),
-            Some(8),
-            0,
-        )
-        .unwrap();
-        let stream_b = VulkanResidentInProcessPlacedPromptStream::from_manifest_for_bound_devices(
-            devices,
-            manifest_dir,
-            manifest,
-            Some(8),
-            1,
-        )
-        .unwrap();
+        let stream_a =
+            VulkanResidentInProcessPlacedPromptStream::from_runtime_model_for_bound_devices(
+                devices.clone(),
+                manifest_dir,
+                runtime_model.clone(),
+                Some(8),
+                0,
+            )
+            .unwrap();
+        let stream_b =
+            VulkanResidentInProcessPlacedPromptStream::from_runtime_model_for_bound_devices(
+                devices,
+                manifest_dir,
+                runtime_model,
+                Some(8),
+                1,
+            )
+            .unwrap();
 
         let mut engine = VulkanResidentInProcessPlacedPromptEngine::new();
         engine.add_stream("stream_a", stream_a).unwrap();
@@ -27732,9 +27798,9 @@ mod tests {
                 return;
             }
         };
-        let mut manifest = fixture_model_package_manifest();
-        manifest.placement =
-            StreamCircuitPlacementSpec::new("gpu0").with_pedal_device("layer_02", "gpu1");
+        let runtime_model = fixture_model_runtime_model_with_placement(
+            StreamCircuitPlacementSpec::new("gpu0").with_pedal_device("layer_02", "gpu1"),
+        );
         let manifest_path = fixture_model_package_manifest_path();
         let manifest_dir = manifest_path.parent().unwrap();
         let device = Rc::new(device);
@@ -27743,22 +27809,24 @@ mod tests {
             ("gpu1".to_string(), device.clone()),
         ]);
 
-        let stream_a = VulkanResidentInProcessPlacedPromptStream::from_manifest_for_bound_devices(
-            devices.clone(),
-            manifest_dir,
-            manifest.clone(),
-            Some(8),
-            0,
-        )
-        .unwrap();
-        let stream_b = VulkanResidentInProcessPlacedPromptStream::from_manifest_for_bound_devices(
-            devices,
-            manifest_dir,
-            manifest,
-            Some(8),
-            1,
-        )
-        .unwrap();
+        let stream_a =
+            VulkanResidentInProcessPlacedPromptStream::from_runtime_model_for_bound_devices(
+                devices.clone(),
+                manifest_dir,
+                runtime_model.clone(),
+                Some(8),
+                0,
+            )
+            .unwrap();
+        let stream_b =
+            VulkanResidentInProcessPlacedPromptStream::from_runtime_model_for_bound_devices(
+                devices,
+                manifest_dir,
+                runtime_model,
+                Some(8),
+                1,
+            )
+            .unwrap();
 
         let mut engine = VulkanResidentInProcessPlacedPromptEngine::new();
         engine.add_stream("stream_a", stream_a).unwrap();
@@ -27832,9 +27900,9 @@ mod tests {
                 return;
             }
         };
-        let mut manifest = fixture_model_package_manifest();
-        manifest.placement =
-            StreamCircuitPlacementSpec::new("gpu0").with_pedal_device("layer_02", "gpu1");
+        let runtime_model = fixture_model_runtime_model_with_placement(
+            StreamCircuitPlacementSpec::new("gpu0").with_pedal_device("layer_02", "gpu1"),
+        );
         let manifest_path = fixture_model_package_manifest_path();
         let manifest_dir = manifest_path.parent().unwrap();
         let device = Rc::new(device);
@@ -27843,22 +27911,24 @@ mod tests {
             ("gpu1".to_string(), device.clone()),
         ]);
 
-        let stream_a = VulkanResidentInProcessPlacedPromptStream::from_manifest_for_bound_devices(
-            devices.clone(),
-            manifest_dir,
-            manifest.clone(),
-            Some(8),
-            0,
-        )
-        .unwrap();
-        let stream_b = VulkanResidentInProcessPlacedPromptStream::from_manifest_for_bound_devices(
-            devices,
-            manifest_dir,
-            manifest,
-            Some(8),
-            1,
-        )
-        .unwrap();
+        let stream_a =
+            VulkanResidentInProcessPlacedPromptStream::from_runtime_model_for_bound_devices(
+                devices.clone(),
+                manifest_dir,
+                runtime_model.clone(),
+                Some(8),
+                0,
+            )
+            .unwrap();
+        let stream_b =
+            VulkanResidentInProcessPlacedPromptStream::from_runtime_model_for_bound_devices(
+                devices,
+                manifest_dir,
+                runtime_model,
+                Some(8),
+                1,
+            )
+            .unwrap();
 
         let mut engine = VulkanResidentInProcessPlacedPromptEngine::new();
         engine.add_stream("stream_a", stream_a).unwrap();
@@ -27915,9 +27985,9 @@ mod tests {
                 return;
             }
         };
-        let mut manifest = fixture_model_package_manifest();
-        manifest.placement =
-            StreamCircuitPlacementSpec::new("gpu0").with_pedal_device("layer_02", "gpu1");
+        let runtime_model = fixture_model_runtime_model_with_placement(
+            StreamCircuitPlacementSpec::new("gpu0").with_pedal_device("layer_02", "gpu1"),
+        );
         let manifest_path = fixture_model_package_manifest_path();
         let manifest_dir = manifest_path.parent().unwrap();
         let device = Rc::new(device);
@@ -27925,14 +27995,15 @@ mod tests {
             ("gpu0".to_string(), device.clone()),
             ("gpu1".to_string(), device.clone()),
         ]);
-        let stream = VulkanResidentInProcessPlacedPromptStream::from_manifest_for_bound_devices(
-            devices,
-            manifest_dir,
-            manifest,
-            Some(8),
-            0,
-        )
-        .unwrap();
+        let stream =
+            VulkanResidentInProcessPlacedPromptStream::from_runtime_model_for_bound_devices(
+                devices,
+                manifest_dir,
+                runtime_model,
+                Some(8),
+                0,
+            )
+            .unwrap();
 
         let mut engine = VulkanResidentInProcessPlacedPromptEngine::new();
         engine.add_stream("main", stream).unwrap();
@@ -28003,16 +28074,17 @@ mod tests {
             .unwrap()
             .with_instance_device("layer_05_repeat", "gpu1")
             .unwrap();
-        let manifest = manifest.with_runtime_patch(&patch).unwrap();
+        let runtime_model = manifest.mount_runtime_patch(&patch).unwrap();
 
-        let placed_package = VulkanResidentInProcessPlacedModelPackage::from_manifest_for_devices(
-            &device,
-            manifest_dir,
-            manifest,
-            Some(4),
-            0,
-        )
-        .unwrap();
+        let placed_package =
+            VulkanResidentInProcessPlacedModelPackage::from_runtime_model_for_devices(
+                &device,
+                manifest_dir,
+                runtime_model,
+                Some(4),
+                0,
+            )
+            .unwrap();
         assert_eq!(placed_package.device_ids, vec!["gpu0", "gpu1"]);
         assert_eq!(placed_package.device_count, 2);
         assert_eq!(placed_package.hosted_pedal_count, 15);

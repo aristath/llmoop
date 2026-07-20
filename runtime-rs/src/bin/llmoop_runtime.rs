@@ -26,7 +26,7 @@ use llmoop_runtime::{
     VulkanResidentInProcessPlacedPromptEngineInputRequest,
     VulkanResidentInProcessPlacedPromptStream, VulkanResidentModelPackage,
     VulkanResidentModelPackageDeviceSlice, VulkanResidentModelPackageManifest,
-    VulkanResidentTokenEngine, VulkanResidentTokenEngineRunBudget,
+    VulkanResidentRuntimeModel, VulkanResidentTokenEngine, VulkanResidentTokenEngineRunBudget,
     VulkanResidentTokenEngineRunStopCondition, VulkanResidentTokenEngineTextInputRequest,
     VulkanResidentTokenInputEvent, VulkanResidentTokenTextCodec,
     VulkanReusableKernelArtifactManifest, discover_runtime_devices,
@@ -144,12 +144,18 @@ fn run() -> Result<(), Box<dyn Error>> {
         let manifest = VulkanResidentModelPackageManifest::from_json_file(package_manifest)?;
         return inspect_patch(&args, package_manifest, &manifest_dir, manifest);
     }
-    let manifest = runtime_manifest(&args, package_manifest)?;
+    let runtime_model = runtime_model(&args, package_manifest)?;
     if args.inspect_placement {
-        return inspect_placement(&args, package_manifest, &manifest_dir, manifest);
+        return inspect_placement(&args, package_manifest, &manifest_dir, runtime_model);
     }
     if let Some(device_id) = args.inspect_device_slice.as_deref() {
-        return inspect_device_slice(&args, package_manifest, &manifest_dir, manifest, device_id);
+        return inspect_device_slice(
+            &args,
+            package_manifest,
+            &manifest_dir,
+            runtime_model,
+            device_id,
+        );
     }
     let tokenizer_dir = tokenizer_dir_from_package(package_manifest)?;
     let codec = VulkanResidentHfTokenizerTextCodec::from_model_dir(&tokenizer_dir)?
@@ -157,12 +163,12 @@ fn run() -> Result<(), Box<dyn Error>> {
         .with_skip_special_tokens(args.skip_special_tokens);
     if args.chat {
         let capacity = choose_chat_runtime_context_size(package_manifest, args.context_size)?;
-        if manifest.placement_device_ids().len() > 1 {
+        if runtime_model.placement_device_ids().len() > 1 {
             return run_placed_chat(
                 &args,
                 &manifest_dir,
                 &tokenizer_dir,
-                manifest,
+                runtime_model,
                 capacity,
                 &codec,
                 args.prompt.as_deref(),
@@ -172,7 +178,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             &args,
             &manifest_dir,
             &tokenizer_dir,
-            manifest,
+            runtime_model,
             capacity,
             &codec,
             args.prompt.as_deref(),
@@ -206,18 +212,18 @@ fn run() -> Result<(), Box<dyn Error>> {
         codec: &codec,
     };
 
-    if manifest.placement_device_ids().len() > 1 {
+    if runtime_model.placement_device_ids().len() > 1 {
         if args.profile_runs > 1 {
-            return run_placed_prompt_benchmark(&context, manifest);
+            return run_placed_prompt_benchmark(&context, runtime_model);
         }
-        return run_placed_prompt(&context, manifest);
+        return run_placed_prompt(&context, runtime_model);
     }
 
     if args.profile_runs > 1 {
-        return run_single_device_prompt_benchmark(&context, manifest);
+        return run_single_device_prompt_benchmark(&context, runtime_model);
     }
 
-    let report = execute_single_device_prompt_run(&context, manifest)?;
+    let report = execute_single_device_prompt_run(&context, runtime_model)?;
     print_single_device_prompt_report(&args, &report)?;
 
     Ok(())
@@ -225,7 +231,7 @@ fn run() -> Result<(), Box<dyn Error>> {
 
 fn execute_single_device_prompt_run(
     context: &PromptRunContext<'_>,
-    manifest: VulkanResidentModelPackageManifest,
+    runtime_model: VulkanResidentRuntimeModel,
 ) -> Result<RuntimeSingleDevicePromptRunReport, Box<dyn Error>> {
     let PromptRunContext {
         args,
@@ -240,10 +246,10 @@ fn execute_single_device_prompt_run(
     } = context;
     let setup_start = Instant::now();
     let device = runtime_vulkan_device(args)?;
-    let model = VulkanResidentModelPackage::from_manifest(
+    let model = VulkanResidentModelPackage::from_runtime_model(
         &device,
         manifest_dir,
-        manifest,
+        runtime_model,
         Some(*capacity),
     )?;
     let mut engine = VulkanResidentTokenEngine::new(device);
@@ -332,7 +338,7 @@ fn run_single_device_chat(
     args: &Args,
     manifest_dir: &Path,
     tokenizer_dir: &Path,
-    manifest: VulkanResidentModelPackageManifest,
+    runtime_model: VulkanResidentRuntimeModel,
     capacity: usize,
     codec: &VulkanResidentHfTokenizerTextCodec,
     initial_prompt: Option<&str>,
@@ -343,12 +349,16 @@ fn run_single_device_chat(
     let stop_token_ids = chat_stop_token_ids_from_manifest(
         manifest_dir,
         tokenizer_dir,
-        &manifest,
+        &runtime_model.package,
         &chat_session.formatter,
     )?;
     let transcript_codec = chat_transcript_codec(tokenizer_dir)?;
-    let model =
-        VulkanResidentModelPackage::from_manifest(&device, manifest_dir, manifest, Some(capacity))?;
+    let model = VulkanResidentModelPackage::from_runtime_model(
+        &device,
+        manifest_dir,
+        runtime_model,
+        Some(capacity),
+    )?;
     let mut engine = VulkanResidentTokenEngine::new(device);
     engine.add_model_package("compiled_model", model)?;
     engine.create_stream_from_model("compiled_model", "main", args.random_seed)?;
@@ -899,7 +909,7 @@ fn run_placed_chat(
     args: &Args,
     manifest_dir: &Path,
     tokenizer_dir: &Path,
-    manifest: VulkanResidentModelPackageManifest,
+    runtime_model: VulkanResidentRuntimeModel,
     capacity: usize,
     codec: &VulkanResidentHfTokenizerTextCodec,
     initial_prompt: Option<&str>,
@@ -909,16 +919,16 @@ fn run_placed_chat(
     let stop_token_ids = chat_stop_token_ids_from_manifest(
         manifest_dir,
         tokenizer_dir,
-        &manifest,
+        &runtime_model.package,
         &chat_session.formatter,
     )?;
     let transcript_codec = chat_transcript_codec(tokenizer_dir)?;
-    let logical_device_ids = manifest.placement_device_ids();
+    let logical_device_ids = runtime_model.placement_device_ids();
     let bound_devices = runtime_bound_vulkan_devices(args, &logical_device_ids)?;
-    let stream = VulkanResidentInProcessPlacedPromptStream::from_manifest_for_bound_devices(
+    let stream = VulkanResidentInProcessPlacedPromptStream::from_runtime_model_for_bound_devices(
         bound_devices.devices.clone(),
         manifest_dir,
-        manifest,
+        runtime_model,
         Some(capacity),
         args.random_seed,
     )?;
@@ -983,15 +993,15 @@ fn run_placed_chat(
 
 fn run_placed_prompt(
     context: &PromptRunContext<'_>,
-    manifest: VulkanResidentModelPackageManifest,
+    runtime_model: VulkanResidentRuntimeModel,
 ) -> Result<(), Box<dyn Error>> {
-    let report = execute_placed_prompt_run(context, manifest)?;
+    let report = execute_placed_prompt_run(context, runtime_model)?;
     print_placed_prompt_report(context.args, &report)
 }
 
 fn execute_placed_prompt_run(
     context: &PromptRunContext<'_>,
-    manifest: VulkanResidentModelPackageManifest,
+    runtime_model: VulkanResidentRuntimeModel,
 ) -> Result<RuntimePlacedPromptRunReport, Box<dyn Error>> {
     let PromptRunContext {
         args,
@@ -1005,13 +1015,13 @@ fn execute_placed_prompt_run(
         ..
     } = context;
     let setup_start = Instant::now();
-    let logical_device_ids = manifest.placement_device_ids();
-    let placement = runtime_manifest_placement(manifest_dir, &manifest)?;
+    let logical_device_ids = runtime_model.placement_device_ids();
+    let placement = runtime_model_placement(manifest_dir, &runtime_model)?;
     let bound_devices = runtime_bound_vulkan_devices(args, &logical_device_ids)?;
-    let stream = VulkanResidentInProcessPlacedPromptStream::from_manifest_for_bound_devices(
+    let stream = VulkanResidentInProcessPlacedPromptStream::from_runtime_model_for_bound_devices(
         bound_devices.devices.clone(),
         manifest_dir,
-        manifest,
+        runtime_model,
         Some(*capacity),
         args.random_seed,
     )?;
@@ -1138,11 +1148,14 @@ fn print_placed_prompt_report(
 
 fn run_single_device_prompt_benchmark(
     context: &PromptRunContext<'_>,
-    manifest: VulkanResidentModelPackageManifest,
+    runtime_model: VulkanResidentRuntimeModel,
 ) -> Result<(), Box<dyn Error>> {
     let mut runs = Vec::with_capacity(context.args.profile_runs);
     for _ in 0..context.args.profile_runs {
-        runs.push(execute_single_device_prompt_run(context, manifest.clone())?);
+        runs.push(execute_single_device_prompt_run(
+            context,
+            runtime_model.clone(),
+        )?);
     }
     let first = runs
         .first()
@@ -1164,11 +1177,11 @@ fn run_single_device_prompt_benchmark(
 
 fn run_placed_prompt_benchmark(
     context: &PromptRunContext<'_>,
-    manifest: VulkanResidentModelPackageManifest,
+    runtime_model: VulkanResidentRuntimeModel,
 ) -> Result<(), Box<dyn Error>> {
     let mut runs = Vec::with_capacity(context.args.profile_runs);
     for _ in 0..context.args.profile_runs {
-        runs.push(execute_placed_prompt_run(context, manifest.clone())?);
+        runs.push(execute_placed_prompt_run(context, runtime_model.clone())?);
     }
     let first = runs
         .first()
@@ -1762,7 +1775,7 @@ fn inspect_device_slice(
     args: &Args,
     package_manifest: &Path,
     manifest_dir: &Path,
-    manifest: VulkanResidentModelPackageManifest,
+    runtime_model: VulkanResidentRuntimeModel,
     device_id: &str,
 ) -> Result<(), Box<dyn Error>> {
     let capacity = choose_runtime_context_size(package_manifest, args.context_size, 1)?;
@@ -1778,7 +1791,7 @@ fn inspect_device_slice(
         device,
         package_manifest,
         manifest_dir,
-        manifest,
+        runtime_model,
         device_id,
         capacity,
     )?;
@@ -1802,11 +1815,11 @@ fn inspect_placement(
     args: &Args,
     package_manifest: &Path,
     manifest_dir: &Path,
-    manifest: VulkanResidentModelPackageManifest,
+    runtime_model: VulkanResidentRuntimeModel,
 ) -> Result<(), Box<dyn Error>> {
     let capacity = choose_runtime_context_size(package_manifest, args.context_size, 1)?;
-    let device_ids = manifest.placement_device_ids();
-    let placement = runtime_manifest_placement(manifest_dir, &manifest)?;
+    let device_ids = runtime_model.placement_device_ids();
+    let placement = runtime_model_placement(manifest_dir, &runtime_model)?;
     let bound_devices = runtime_bound_vulkan_devices(args, &device_ids)?;
     let slices = device_ids
         .iter()
@@ -1821,7 +1834,7 @@ fn inspect_placement(
                 device,
                 package_manifest,
                 manifest_dir,
-                manifest.clone(),
+                runtime_model.clone(),
                 device_id,
                 capacity,
             )
@@ -1863,14 +1876,14 @@ fn inspect_device_slice_payload(
     device: &VulkanComputeDevice,
     package_manifest: &Path,
     manifest_dir: &Path,
-    manifest: VulkanResidentModelPackageManifest,
+    runtime_model: VulkanResidentRuntimeModel,
     device_id: &str,
     capacity: usize,
 ) -> Result<RuntimeDeviceSliceReport, Box<dyn Error>> {
-    let slice = VulkanResidentModelPackageDeviceSlice::from_manifest_for_device(
+    let slice = VulkanResidentModelPackageDeviceSlice::from_runtime_model_for_device(
         device,
         manifest_dir,
-        manifest,
+        runtime_model,
         device_id,
         Some(capacity),
     )?;
@@ -1980,13 +1993,13 @@ fn placement_device_ids(pedals: &[PedalPlacement]) -> Vec<String> {
     device_ids
 }
 
-fn runtime_manifest_placement(
+fn runtime_model_placement(
     manifest_dir: &Path,
-    manifest: &VulkanResidentModelPackageManifest,
+    runtime_model: &VulkanResidentRuntimeModel,
 ) -> Result<llmoop_runtime::StreamCircuitPlacementPlan, Box<dyn Error>> {
-    let graph = manifest.resolved_source_graph(manifest_dir.to_path_buf())?;
+    let graph = runtime_model.resolved_graph(manifest_dir.to_path_buf())?;
     graph
-        .placement_plan(&manifest.placement)
+        .placement_plan(&runtime_model.placement)
         .map_err(|error| Box::new(error) as Box<dyn Error>)
 }
 
@@ -2018,12 +2031,12 @@ fn resolve_package_path(manifest_dir: &Path, raw_path: &str) -> PathBuf {
     }
 }
 
-fn runtime_manifest(
+fn runtime_model(
     args: &Args,
     package_manifest: &Path,
-) -> Result<VulkanResidentModelPackageManifest, Box<dyn Error>> {
+) -> Result<VulkanResidentRuntimeModel, Box<dyn Error>> {
     let manifest = VulkanResidentModelPackageManifest::from_json_file(package_manifest)?;
-    Ok(manifest.with_runtime_patch_controls(
+    Ok(manifest.mount_runtime_patch_controls(
         args.default_device_id.as_deref(),
         &args.pedal_devices,
         &args.duplicate_after,

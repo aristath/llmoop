@@ -210,8 +210,9 @@ impl RuntimeModelEditor {
         let source_graph = manifest
             .resolved_source_graph(package_root.clone())
             .map_err(|error| RuntimeEditorError(error.to_string()))?;
-        let draft =
-            StreamCircuitRuntimePatch::from_placement_spec(&source_graph, &manifest.placement)?;
+        let draft = manifest
+            .runtime_patch_from_controls(None, &BTreeMap::new(), &[], None)
+            .map_err(|error| RuntimeEditorError(error.to_string()))?;
         let source_pedals = source_pedals(&manifest);
         let source_by_layer = source_pedals
             .iter()
