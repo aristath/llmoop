@@ -197,6 +197,7 @@ def test_compiler_renders_paired_matrix_and_transducer_shaders(tmp_path: Path) -
         "linear_paired_bf16_768x2048.comp",
         "linear_residual_paired_bf16_2048x768.comp",
         "embedding_lookup_paired_bf16_32000x768_scale12.comp",
+        "embedding_lookup_batch_paired_bf16_32000x768_scale12.comp",
         "tied_output_projection_paired_bf16_32000x768_scale0.166666667_to_f32.comp",
         "tied_output_projection_batch4_paired_bf16_32000x768_scale0.166666667_to_f32.comp",
     }
@@ -215,6 +216,12 @@ def test_compiler_renders_paired_matrix_and_transducer_shaders(tmp_path: Path) -
         "const uint VOCAB_SIZE = 32000u;"
         in (
             tmp_path / "embedding_lookup_paired_bf16_32000x768_scale12.comp"
+        ).read_text()
+    )
+    assert (
+        "gl_WorkGroupID.y"
+        in (
+            tmp_path / "embedding_lookup_batch_paired_bf16_32000x768_scale12.comp"
         ).read_text()
     )
     assert (

@@ -1,0 +1,34 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer EmbeddingWeight { uint words[]; } embedding_weight;
+layout(set = 0, binding = 1) buffer OutputFrames { uint words[]; } output_frames;
+layout(set = 0, binding = 2) readonly buffer TokenIds { uint values[]; } token_ids;
+
+layout(push_constant) uniform BatchControl { uint batch_width; } batch_control;
+
+const uint VOCAB_SIZE = {{VOCAB_SIZE}}u;
+const uint FRAME_WORDS = ({{HIDDEN_SIZE}}u + 1u) / 2u;
+const float EMBEDDING_SCALE = {{EMBEDDING_SCALE}};
+
+float bf16_to_f32(uint value) { return uintBitsToFloat((value & 0xffffu) << 16); }
+
+uint f32_to_bf16(float value) {
+    uint bits = floatBitsToUint(value);
+    uint lsb = (bits >> 16) & 1u;
+    return (bits + 0x7fffu + lsb) >> 16;
+}
+
+void main() {
+    uint frame_index = gl_WorkGroupID.y;
+    uint word_index = gl_GlobalInvocationID.x;
+    if (frame_index >= batch_control.batch_width || word_index >= FRAME_WORDS) return;
+    uint token_id = token_ids.values[frame_index];
+    if (token_id >= VOCAB_SIZE) return;
+
+    uint packed = embedding_weight.words[token_id * FRAME_WORDS + word_index];
+    uint lo = f32_to_bf16(bf16_to_f32(packed) * EMBEDDING_SCALE);
+    uint hi = f32_to_bf16(bf16_to_f32(packed >> 16u) * EMBEDDING_SCALE);
+    output_frames.words[frame_index * FRAME_WORDS + word_index] = (hi << 16u) | lo;
+}

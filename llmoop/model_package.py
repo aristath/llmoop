@@ -283,6 +283,9 @@ def build_vulkan_resident_package_manifest(
         else f"embedding_lookup_bf16_{vocab_size}x{hidden_size}"
         f"_scale{shader_float_token(embedding_scale)}.comp"
     )
+    embedding_batch_shader_file = embedding_shader_file.replace(
+        "embedding_lookup_", "embedding_lookup_batch_", 1
+    )
     output_scale = 1.0 / logits_scale
     projection_shader_file = (
         f"tied_output_projection_paired_bf16_{vocab_size}x{hidden_size}"
@@ -379,6 +382,7 @@ def build_vulkan_resident_package_manifest(
     shader_files = required_shader_files(
         all_pedal_executions,
         embedding_shader_file=embedding_shader_file,
+        embedding_batch_shader_file=embedding_batch_shader_file,
         projection_shader_file=projection_shader_file,
         projection_batch_shader_file=projection_batch_shader_file,
         norm_shader_file=norm_shader_file,
@@ -457,6 +461,9 @@ def build_vulkan_resident_package_manifest(
                 "local_size_x": 256,
             },
             "shader_path": compiled_shader_path(f"shaders/{embedding_shader_file}"),
+            "batch_shader_path": compiled_shader_path(
+                f"shaders/{embedding_batch_shader_file}"
+            ),
         },
         "output_transducer": {
             "spec": {
@@ -1610,6 +1617,7 @@ def required_shader_files(
     pedal_executions: list[Json],
     *,
     embedding_shader_file: str,
+    embedding_batch_shader_file: str,
     projection_shader_file: str,
     projection_batch_shader_file: str,
     norm_shader_file: str,
@@ -1619,6 +1627,7 @@ def required_shader_files(
         norm_shader_file,
         *sampler_shader_files,
         embedding_shader_file,
+        embedding_batch_shader_file,
         projection_shader_file,
         projection_batch_shader_file,
         *(
@@ -2120,8 +2129,18 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
             ("VOCAB_SIZE", "HIDDEN_SIZE", "EMBEDDING_SCALE"),
         ),
         (
+            r"embedding_lookup_batch_bf16_(\d+)x(\d+)_scale([0-9eE+.-]+)\.comp",
+            "embedding_lookup_batch_bf16.comp.template",
+            ("VOCAB_SIZE", "HIDDEN_SIZE", "EMBEDDING_SCALE"),
+        ),
+        (
             r"embedding_lookup_paired_bf16_(\d+)x(\d+)_scale([0-9eE+.-]+)\.comp",
             "embedding_lookup_paired_bf16.comp.template",
+            ("VOCAB_SIZE", "HIDDEN_SIZE", "EMBEDDING_SCALE"),
+        ),
+        (
+            r"embedding_lookup_batch_paired_bf16_(\d+)x(\d+)_scale([0-9eE+.-]+)\.comp",
+            "embedding_lookup_batch_paired_bf16.comp.template",
             ("VOCAB_SIZE", "HIDDEN_SIZE", "EMBEDDING_SCALE"),
         ),
         (
@@ -3675,6 +3694,8 @@ def validate_compiled_generation_contract(
         != input_edges[0]["destination"]["port_id"]
         or not isinstance(input_package.get("shader_path"), str)
         or not input_package["shader_path"]
+        or not isinstance(input_package.get("batch_shader_path"), str)
+        or not input_package["batch_shader_path"]
     ):
         raise ModelCompileError(
             "compiled input-transducer execution does not match its circuit pedal"

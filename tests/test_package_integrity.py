@@ -365,6 +365,7 @@ def minimal_package(root: Path) -> dict[str, object]:
                 "output_signal_id": "input_frame",
             },
             "shader_path": "shaders/kernel.spv",
+            "batch_shader_path": "shaders/kernel.spv",
         },
         "output_transducer": {
             "spec": {
@@ -513,6 +514,7 @@ def test_shader_templates_compile_to_vulkan_1_4_spirv(tmp_path: Path) -> None:
     shader_source_dir = Path(__file__).parents[1] / "runtime-rs" / "shaders"
     shader_files = {
         "linear_paired_bf16_768x2048.comp",
+        "embedding_lookup_batch_paired_bf16_32000x768_scale12.comp",
         "linear_batch4_paired_bf16_768x2048.comp",
         "linear_residual_batch4_row_major_bf16_2048x768.comp",
         "linear_fp8_e4m3_b128x128_5120x17408.comp",

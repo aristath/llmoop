@@ -668,6 +668,7 @@ class CompiledPackageTest(unittest.TestCase):
         manifest = json.loads(fixture.package_manifest.read_text())
         shader_paths = [
             manifest["input_transducer"]["shader_path"],
+            manifest["input_transducer"]["batch_shader_path"],
             manifest["output_transducer"]["embedding_norm_shader_path"],
             manifest["output_transducer"]["projection_shader_path"],
             manifest["output_transducer"]["projection_batch_shader_path"],
