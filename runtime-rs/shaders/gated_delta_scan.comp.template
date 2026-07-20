@@ -30,8 +30,12 @@ const float NORM_EPS = {{NORM_EPS}};
 
 shared float q_inv_norm;
 shared float k_inv_norm;
+shared float head_beta;
+shared float head_decay;
 shared float head_output[VALUE_HEAD_WIDTH];
 shared float reduction[VALUE_HEAD_WIDTH];
+shared float raw_query[KEY_HEAD_WIDTH];
+shared float raw_key[KEY_HEAD_WIDTH];
 
 float bf16_to_f32(uint value) {
     return uintBitsToFloat((value & 0xffffu) << 16);
@@ -93,42 +97,51 @@ void main() {
     }
 
     for (uint position = 0u; position < batch_control.batch_width; position++) {
+        for (
+            uint key_dim = value_dim;
+            key_dim < KEY_HEAD_WIDTH;
+            key_dim += VALUE_HEAD_WIDTH
+        ) {
+            raw_query[key_dim] = read_qkv(position, q_base + key_dim);
+            raw_key[key_dim] = read_qkv(position, k_base + key_dim);
+        }
+        barrier();
+
         if (value_dim == 0u) {
             float q_sum = 0.0;
             float k_sum = 0.0;
             for (uint key_dim = 0u; key_dim < KEY_HEAD_WIDTH; key_dim++) {
-                float q = read_qkv(position, q_base + key_dim);
-                float k = read_qkv(position, k_base + key_dim);
+                float q = raw_query[key_dim];
+                float k = raw_key[key_dim];
                 q_sum = fma(q, q, q_sum);
                 k_sum = fma(k, k, k_sum);
             }
             q_inv_norm = inversesqrt(q_sum + 0.000001);
             k_inv_norm = inversesqrt(k_sum + 0.000001);
+            head_beta = 1.0 / (1.0 + exp(-read_b(position, value_head)));
+            float decay_log = -exp(read_a_log(value_head)) * softplus(
+                read_a(position, value_head) + read_dt_bias(value_head)
+            );
+            head_decay = exp(decay_log);
         }
         barrier();
 
-        float beta = 1.0 / (1.0 + exp(-read_b(position, value_head)));
-        float decay_log = -exp(read_a_log(value_head)) * softplus(
-            read_a(position, value_head) + read_dt_bias(value_head)
-        );
-        float decay = exp(decay_log);
-
         float key_memory = 0.0;
         for (uint key_dim = 0u; key_dim < KEY_HEAD_WIDTH; key_dim++) {
-            float previous = recurrent_state[key_dim] * decay;
-            float key = read_qkv(position, k_base + key_dim) * k_inv_norm;
+            float previous = recurrent_state[key_dim] * head_decay;
+            float key = raw_key[key_dim] * k_inv_norm;
             key_memory = fma(previous, key, key_memory);
         }
         float value = read_qkv(position, v_base + value_dim);
-        float delta = (value - key_memory) * beta;
+        float delta = (value - key_memory) * head_beta;
 
         float mixed = 0.0;
         float attention_scale = inversesqrt(float(KEY_HEAD_WIDTH));
         for (uint key_dim = 0u; key_dim < KEY_HEAD_WIDTH; key_dim++) {
-            float key = read_qkv(position, k_base + key_dim) * k_inv_norm;
-            float next = recurrent_state[key_dim] * decay + key * delta;
+            float key = raw_key[key_dim] * k_inv_norm;
+            float next = recurrent_state[key_dim] * head_decay + key * delta;
             recurrent_state[key_dim] = next;
-            float query = read_qkv(position, q_base + key_dim) * q_inv_norm;
+            float query = raw_query[key_dim] * q_inv_norm;
             mixed = fma(next, query * attention_scale, mixed);
         }
 

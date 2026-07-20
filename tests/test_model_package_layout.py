@@ -1038,6 +1038,7 @@ def test_compiler_renders_hybrid_recurrent_and_gated_attention_pedals(
         "causal_conv1d_silu_bf16_c6144_k4.comp",
         "gated_delta_step_k16x128_v16x128_af32_dtbf16_nf32_eps1e-06.comp",
         "gated_delta_step_k16x128_v16x128_abf16_dtbf16_nbf16_eps1e-06.comp",
+        "gated_delta_scan_k16x128_v16x128_af32_dtbf16_nf32_eps1e-06.comp",
         "split_bf16_2x8x256_head_interleaved.comp",
         "sigmoid_multiply_bf16.comp",
     }
@@ -1053,6 +1054,10 @@ def test_compiler_renders_hybrid_recurrent_and_gated_attention_pedals(
         tmp_path
         / "gated_delta_step_k16x128_v16x128_abf16_dtbf16_nbf16_eps1e-06.comp"
     ).read_text()
+    temporal_recurrence = (
+        tmp_path
+        / "gated_delta_scan_k16x128_v16x128_af32_dtbf16_nf32_eps1e-06.comp"
+    ).read_text()
     split = (tmp_path / "split_bf16_2x8x256_head_interleaved.comp").read_text()
     assert "const uint CHANNELS = 6144u;" in convolution
     assert "const uint KEY_HEADS = 16u;" in recurrence
@@ -1062,6 +1067,10 @@ def test_compiler_renders_hybrid_recurrent_and_gated_attention_pedals(
     assert "uintBitsToFloat(norm_weight.words[index])" in recurrence
     assert "unpack_bf16(a_log.words[index >> 1u], index)" in bf16_recurrence
     assert "unpack_bf16(norm_weight.words[index >> 1u], index)" in bf16_recurrence
+    assert "shared float raw_query[KEY_HEAD_WIDTH];" in temporal_recurrence
+    assert "shared float raw_key[KEY_HEAD_WIDTH];" in temporal_recurrence
+    assert "head_beta = 1.0 /" in temporal_recurrence
+    assert "recurrent_state[key_dim] * head_decay" in temporal_recurrence
     assert "const uint BLOCKS = 8u;" in split
     assert "const uint BLOCK_PART_WIDTH = 256u;" in split
     assert all(
