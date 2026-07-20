@@ -11476,7 +11476,7 @@ impl VulkanResidentInProcessPlacedPromptEngine {
     pub fn submit_input_events_until_idle_bounded<I>(
         &mut self,
         requests: I,
-        max_engine_turns: usize,
+        max_input_events: usize,
     ) -> Result<
         VulkanResidentInProcessPlacedPromptEngineBatchRun,
         VulkanResidentInProcessPlacedPromptEngineError,
@@ -11489,7 +11489,7 @@ impl VulkanResidentInProcessPlacedPromptEngine {
             queued_input_events
                 .push(self.enqueue_input_event(&request.stream_id, request.input_event)?);
         }
-        let engine_run = self.run_until_idle_bounded(max_engine_turns)?;
+        let engine_run = self.run_until_idle_bounded(max_input_events)?;
         let output_events = engine_run.output_events.clone();
         let generated_token_ids = engine_run.generated_token_ids.clone();
 
@@ -11503,18 +11503,17 @@ impl VulkanResidentInProcessPlacedPromptEngine {
 
     pub fn run_until_idle_bounded(
         &mut self,
-        max_engine_turns: usize,
+        max_input_events: usize,
     ) -> Result<
         VulkanResidentInProcessPlacedPromptEngineRun,
         VulkanResidentInProcessPlacedPromptEngineError,
     > {
         let start_snapshot = self.snapshot();
-        let mut engine_turn_count = 0usize;
         let mut input_runs = Vec::new();
         let mut output_events = Vec::new();
         self.refresh_active_queue();
 
-        while engine_turn_count < max_engine_turns {
+        while input_runs.len() < max_input_events {
             let Some(stream_id) = self.active_queue.pop_front() else {
                 break;
             };
@@ -11526,33 +11525,23 @@ impl VulkanResidentInProcessPlacedPromptEngine {
             if stream.is_idle() {
                 continue;
             }
-            let Some(activation_run) = stream.run_next_activation()? else {
+            let Some(submitted_run) = stream.run_next_queued_input_event()? else {
                 continue;
             };
-            engine_turn_count = engine_turn_count.saturating_add(1);
             let stream_still_active = !stream.is_idle();
-            if let Some(output_event) = activation_run.output_event {
-                output_events.push(VulkanResidentTokenRuntimeSchedulerOutputEvent {
-                    stream_id: stream_id.clone(),
-                    output_event,
-                });
-            }
-            if let Some(submitted_run) = activation_run.completed_input_run {
-                let stream_output_events = placed_prompt_engine_output_events_for(
-                    &stream_id,
-                    &submitted_run.output_events,
-                );
-                let stream_generated_token_ids = stream_output_events
-                    .iter()
-                    .map(|event| event.output_event.token_id)
-                    .collect::<Vec<_>>();
-                input_runs.push(VulkanResidentInProcessPlacedPromptEngineInputRun {
-                    stream_id: stream_id.clone(),
-                    submitted_run,
-                    output_events: stream_output_events,
-                    generated_token_ids: stream_generated_token_ids,
-                });
-            }
+            let stream_output_events =
+                placed_prompt_engine_output_events_for(&stream_id, &submitted_run.output_events);
+            let stream_generated_token_ids = stream_output_events
+                .iter()
+                .map(|event| event.output_event.token_id)
+                .collect::<Vec<_>>();
+            output_events.extend(stream_output_events.iter().cloned());
+            input_runs.push(VulkanResidentInProcessPlacedPromptEngineInputRun {
+                stream_id: stream_id.clone(),
+                submitted_run,
+                output_events: stream_output_events,
+                generated_token_ids: stream_generated_token_ids,
+            });
             if stream_still_active {
                 self.active_queue.push_back(stream_id);
             }
@@ -11566,12 +11555,11 @@ impl VulkanResidentInProcessPlacedPromptEngine {
         let stop_condition = if end_snapshot.idle {
             VulkanResidentInProcessPlacedPromptEngineRunStopCondition::Idle
         } else {
-            VulkanResidentInProcessPlacedPromptEngineRunStopCondition::EngineTurnBudget
+            VulkanResidentInProcessPlacedPromptEngineRunStopCondition::InputEventBudget
         };
 
         Ok(VulkanResidentInProcessPlacedPromptEngineRun {
-            max_engine_turns,
-            engine_turn_count,
+            max_input_events,
             stop_condition,
             processed_input_event_count: input_runs.len(),
             input_runs,
@@ -11678,13 +11666,12 @@ pub struct VulkanResidentInProcessPlacedPromptEngineInputRun {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VulkanResidentInProcessPlacedPromptEngineRunStopCondition {
     Idle,
-    EngineTurnBudget,
+    InputEventBudget,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VulkanResidentInProcessPlacedPromptEngineRun {
-    pub max_engine_turns: usize,
-    pub engine_turn_count: usize,
+    pub max_input_events: usize,
     pub stop_condition: VulkanResidentInProcessPlacedPromptEngineRunStopCondition,
     pub processed_input_event_count: usize,
     pub input_runs: Vec<VulkanResidentInProcessPlacedPromptEngineInputRun>,
@@ -29114,7 +29101,7 @@ mod tests {
             0
         );
         assert_eq!(submitted.generated_token_ids.len(), 1);
-        assert_eq!(submitted.engine_run.engine_turn_count, 2);
+        assert_eq!(submitted.engine_run.processed_input_event_count, 1);
         assert_eq!(
             submitted.engine_run.stop_condition,
             VulkanResidentInProcessPlacedPromptEngineRunStopCondition::Idle
@@ -29212,7 +29199,7 @@ mod tests {
 
         assert_eq!(submitted.output_events.len(), 1);
         assert_eq!(submitted.output_events[0].stream_id, "stream_a");
-        assert_eq!(submitted.engine_run.engine_turn_count, 4);
+        assert_eq!(submitted.engine_run.processed_input_event_count, 2);
         assert_eq!(submitted.engine_run.input_runs.len(), 2);
         assert_eq!(submitted.engine_run.input_runs[0].stream_id, "stream_b");
         assert_eq!(
@@ -29301,14 +29288,13 @@ mod tests {
             vec!["stream_a".to_string(), "stream_b".to_string()]
         );
 
-        let run = engine.run_until_idle_bounded(6).unwrap();
+        let run = engine.run_until_idle_bounded(3).unwrap();
 
         assert_eq!(
             run.stop_condition,
             VulkanResidentInProcessPlacedPromptEngineRunStopCondition::Idle
         );
         assert_eq!(run.processed_input_event_count, 3);
-        assert_eq!(run.engine_turn_count, 6);
         assert_eq!(run.input_runs.len(), 3);
         assert_eq!(run.input_runs[0].stream_id, "stream_b");
         assert_eq!(run.input_runs[0].submitted_run.input_event.id, "event_b");
@@ -29391,7 +29377,7 @@ mod tests {
                         VulkanResidentTokenInputEvent::new("event_a", vec![1], 1),
                     ),
                 ],
-                4,
+                2,
             )
             .unwrap();
 
@@ -29403,7 +29389,7 @@ mod tests {
             VulkanResidentInProcessPlacedPromptEngineRunStopCondition::Idle
         );
         assert_eq!(batch.engine_run.input_runs.len(), 2);
-        assert_eq!(batch.engine_run.engine_turn_count, 4);
+        assert_eq!(batch.engine_run.processed_input_event_count, 2);
         assert_eq!(batch.engine_run.input_runs[0].stream_id, "stream_b");
         assert_eq!(
             batch.engine_run.input_runs[0].submitted_run.input_event.id,
@@ -29422,7 +29408,7 @@ mod tests {
     }
 
     #[test]
-    fn placed_prompt_engine_preserves_queued_work_at_engine_turn_budget() {
+    fn placed_prompt_engine_preserves_queued_work_at_input_event_budget() {
         let device = match VulkanComputeDevice::new() {
             Ok(device) => device,
             Err(error) => {
@@ -29469,11 +29455,14 @@ mod tests {
 
         assert_eq!(
             budgeted.stop_condition,
-            VulkanResidentInProcessPlacedPromptEngineRunStopCondition::EngineTurnBudget
+            VulkanResidentInProcessPlacedPromptEngineRunStopCondition::InputEventBudget
         );
-        assert_eq!(budgeted.engine_turn_count, 1);
-        assert_eq!(budgeted.processed_input_event_count, 0);
-        assert!(budgeted.input_runs.is_empty());
+        assert_eq!(budgeted.processed_input_event_count, 1);
+        assert_eq!(budgeted.input_runs.len(), 1);
+        assert_eq!(
+            budgeted.input_runs[0].submitted_run.input_event.id,
+            "event_a"
+        );
         assert_eq!(budgeted.output_events.len(), 1);
         assert_eq!(
             budgeted.output_events[0].output_event.input_event_id,
@@ -29482,48 +29471,23 @@ mod tests {
         assert!(!budgeted.end_snapshot.idle);
         assert_eq!(
             budgeted.end_snapshot.streams[0].pending_input_event_count,
-            2
-        );
-        assert_eq!(budgeted.end_snapshot.streams[0].next_stream_tick, 1);
-
-        let completed_a = engine.run_until_idle_bounded(1).unwrap();
-        assert_eq!(
-            completed_a.stop_condition,
-            VulkanResidentInProcessPlacedPromptEngineRunStopCondition::EngineTurnBudget
-        );
-        assert_eq!(completed_a.engine_turn_count, 1);
-        assert_eq!(completed_a.processed_input_event_count, 1);
-        assert_eq!(
-            completed_a.input_runs[0].submitted_run.input_event.id,
-            "event_a"
-        );
-        assert!(!completed_a.end_snapshot.idle);
-        assert_eq!(
-            completed_a.end_snapshot.streams[0].pending_input_event_count,
             1
         );
-        assert_eq!(completed_a.end_snapshot.streams[0].next_stream_tick, 2);
-
-        let started_b = engine.run_until_idle_bounded(1).unwrap();
-        assert_eq!(started_b.engine_turn_count, 1);
-        assert_eq!(started_b.processed_input_event_count, 0);
-        assert_eq!(started_b.output_events.len(), 1);
-        assert_eq!(
-            started_b.output_events[0].output_event.input_event_id,
-            "event_b"
-        );
-        assert!(!started_b.end_snapshot.idle);
-        assert_eq!(started_b.end_snapshot.streams[0].next_stream_tick, 3);
+        assert_eq!(budgeted.end_snapshot.streams[0].next_stream_tick, 2);
 
         let completed_b = engine.run_until_idle_bounded(1).unwrap();
         assert_eq!(
             completed_b.stop_condition,
             VulkanResidentInProcessPlacedPromptEngineRunStopCondition::Idle
         );
-        assert_eq!(completed_b.engine_turn_count, 1);
         assert_eq!(completed_b.processed_input_event_count, 1);
         assert_eq!(
             completed_b.input_runs[0].submitted_run.input_event.id,
+            "event_b"
+        );
+        assert_eq!(completed_b.output_events.len(), 1);
+        assert_eq!(
+            completed_b.output_events[0].output_event.input_event_id,
             "event_b"
         );
         assert!(completed_b.end_snapshot.idle);
