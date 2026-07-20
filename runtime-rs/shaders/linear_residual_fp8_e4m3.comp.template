@@ -28,6 +28,17 @@ float read_input_bf16(uint index) {
     return bf16_to_f32(pair >> ((index & 1u) * 16u));
 }
 
+vec4 read_input_bf16x4(uint column) {
+    uint lo = input_frame.words[column >> 1u];
+    uint hi = input_frame.words[(column >> 1u) + 1u];
+    return vec4(
+        bf16_to_f32(lo),
+        bf16_to_f32(lo >> 16u),
+        bf16_to_f32(hi),
+        bf16_to_f32(hi >> 16u)
+    );
+}
+
 float read_scale_bf16(uint index) {
     uint pair = weight_scale_inv.words[index >> 1u];
     return bf16_to_f32(pair >> ((index & 1u) * 16u));
@@ -45,6 +56,15 @@ float fp8_e4m3_to_f32(uint value) {
         ((bits & 0x80u) << 24u)
         | ((exponent + 120u) << 23u)
         | (mantissa << 20u)
+    );
+}
+
+vec4 fp8_e4m3x4_to_f32(uint packed) {
+    return vec4(
+        fp8_e4m3_to_f32(packed),
+        fp8_e4m3_to_f32(packed >> 8u),
+        fp8_e4m3_to_f32(packed >> 16u),
+        fp8_e4m3_to_f32(packed >> 24u)
     );
 }
 
@@ -71,17 +91,46 @@ void main() {
     float hi_sum = 0.0;
 
     if (word_index < OUTPUT_WORDS) {
-        for (uint column = lane; column < INPUT_SIZE; column += 64u) {
-            float input_value = read_input_bf16(column);
-            lo_sum = fma(input_value, read_weight(lo_row, column), lo_sum);
-            if (hi_row < OUTPUT_SIZE) {
-                hi_sum = fma(input_value, read_weight(hi_row, column), hi_sum);
+        if ((INPUT_SIZE % 4u) == 0u && (BLOCK_ROWS % 2u) == 0u && (BLOCK_COLUMNS % 4u) == 0u) {
+            for (uint column = lane * 4u; column < INPUT_SIZE; column += 256u) {
+                vec4 input_value = read_input_bf16x4(column);
+                uint lo_weight_index = lo_row * INPUT_SIZE + column;
+                vec4 lo_weight = fp8_e4m3x4_to_f32(weight.words[lo_weight_index >> 2u]);
+                float scale = read_scale_bf16(
+                    (lo_row / BLOCK_ROWS) * SCALE_COLUMNS + column / BLOCK_COLUMNS
+                );
+                lo_sum = fma(dot(input_value, lo_weight), scale, lo_sum);
+                if (hi_row < OUTPUT_SIZE) {
+                    uint hi_weight_index = hi_row * INPUT_SIZE + column;
+                    vec4 hi_weight = fp8_e4m3x4_to_f32(weight.words[hi_weight_index >> 2u]);
+                    hi_sum = fma(dot(input_value, hi_weight), scale, hi_sum);
+                }
+            }
+        } else {
+            for (uint column = lane; column < INPUT_SIZE; column += 64u) {
+                float input_value = read_input_bf16(column);
+                lo_sum = fma(input_value, read_weight(lo_row, column), lo_sum);
+                if (hi_row < OUTPUT_SIZE) {
+                    hi_sum = fma(input_value, read_weight(hi_row, column), hi_sum);
+                }
             }
         }
     }
 
     lo_sum = subgroupAdd(lo_sum);
     hi_sum = subgroupAdd(hi_sum);
+    if (gl_NumSubgroups == 1u) {
+        if (gl_SubgroupInvocationID == 0u && word_index < OUTPUT_WORDS) {
+            uint residual = residual_frame.words[word_index];
+            uint lo = f32_to_bf16(bf16_to_f32(residual) + lo_sum);
+            uint hi = hi_row < OUTPUT_SIZE
+                ? f32_to_bf16(bf16_to_f32(residual >> 16u) + hi_sum)
+                : 0u;
+            output_frame.words[word_index] = (hi << 16u) | lo;
+        }
+        return;
+    }
+
     if (gl_SubgroupInvocationID == 0u) {
         subgroup_lo[gl_SubgroupID] = lo_sum;
         subgroup_hi[gl_SubgroupID] = hi_sum;

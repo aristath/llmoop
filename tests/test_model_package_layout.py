@@ -382,6 +382,9 @@ def test_compiler_renders_native_block_scaled_fp8_linear_shaders(
         assert "const uint BLOCK_ROWS = 128u;" in shader
         assert "const uint BLOCK_COLUMNS = 128u;" in shader
         assert "fp8_e4m3_to_f32" in shader
+        assert "fp8_e4m3x4_to_f32" in shader
+        assert "for (uint column = lane * 4u;" in shader
+        assert "gl_NumSubgroups == 1u" in shader
         assert "WeightScaleInv" in shader
         assert "{{" not in shader
     assert (
