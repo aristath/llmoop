@@ -7343,6 +7343,8 @@ pub struct VulkanResidentModelPackageManifest {
     pub output_transducer: VulkanResidentOutputTransducerPackageSpec,
     pub sampler: VulkanResidentSamplerPackageSpec,
     pub pedal_executions: Vec<VulkanResidentPedalExecutionSpec>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub speculative_decoders: Vec<VulkanResidentSpeculativeDecoderPackageSpec>,
     pub artifact_integrity: VulkanResidentPackageArtifactIntegrity,
 }
 
@@ -7540,8 +7542,26 @@ fn validate_behavioral_validation_artifact(
                 "resident model package has no raw circuit graph pedals",
             )
         })?;
+    let mut all_raw_pedals = raw_pedals.iter().collect::<Vec<_>>();
+    if let Some(decoders) = raw_manifest
+        .get("speculative_decoders")
+        .and_then(Value::as_array)
+    {
+        for decoder in decoders {
+            let pedals = decoder
+                .pointer("/circuit_graph/pedals")
+                .and_then(Value::as_array)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "resident model package speculative decoder has no raw circuit graph pedals",
+                    )
+                })?;
+            all_raw_pedals.extend(pedals);
+        }
+    }
     let mut expected_pedals = BTreeMap::new();
-    for pedal in raw_pedals {
+    for pedal in all_raw_pedals {
         let pedal_id = pedal
             .get("pedal_id")
             .and_then(Value::as_str)
@@ -7820,6 +7840,24 @@ fn validate_resident_package_paths(
             validate_resident_package_relative_path("pedal kernel shader", &kernel.shader_path)?;
         }
     }
+    for decoder in &manifest.speculative_decoders {
+        validate_resident_package_relative_path(
+            "draft output norm shader",
+            &decoder.output_transducer.norm_shader_path,
+        )?;
+        validate_resident_package_relative_path(
+            "draft output projection shader",
+            &decoder.output_transducer.projection_shader_path,
+        )?;
+        for execution in &decoder.pedal_executions {
+            for kernel in &execution.kernels {
+                validate_resident_package_relative_path(
+                    "draft pedal kernel shader",
+                    &kernel.shader_path,
+                )?;
+            }
+        }
+    }
     Ok(())
 }
 
@@ -7849,6 +7887,21 @@ fn validate_resident_package_artifact_integrity(
             .iter()
             .map(|kernel| kernel.shader_path.clone())
     });
+    let draft_shaders = manifest.speculative_decoders.iter().flat_map(|decoder| {
+        decoder
+            .pedal_executions
+            .iter()
+            .flat_map(|execution| {
+                execution
+                    .kernels
+                    .iter()
+                    .map(|kernel| kernel.shader_path.clone())
+            })
+            .chain([
+                decoder.output_transducer.norm_shader_path.clone(),
+                decoder.output_transducer.projection_shader_path.clone(),
+            ])
+    });
     let sampler_shaders = manifest
         .sampler
         .kernels
@@ -7869,6 +7922,7 @@ fn validate_resident_package_artifact_integrity(
     .chain(tokenizer_files)
     .chain(sampler_shaders)
     .chain(kernel_shaders)
+    .chain(draft_shaders)
     .collect::<BTreeSet<_>>();
     if integrity.files.keys().cloned().collect::<BTreeSet<_>>() != required {
         return Err(io::Error::new(
@@ -8636,6 +8690,51 @@ pub struct VulkanResidentPedalKernelSpec {
     pub shader_path: String,
     pub local_size_x: u32,
     pub workgroup_count_x: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct VulkanResidentSpeculativeDecoderPackageSpec {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub decoder_type: String,
+    pub source_prefix: String,
+    pub circuit_graph: VulkanResidentPackageCircuitGraph,
+    pub input_adapter: VulkanResidentDraftInputAdapterPackageSpec,
+    pub output_transducer: VulkanResidentDraftOutputTransducerPackageSpec,
+    pub pedal_executions: Vec<VulkanResidentPedalExecutionSpec>,
+    pub state_contract: Value,
+    pub verification_contract: Value,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VulkanResidentDraftInputAdapterPackageSpec {
+    pub pedal_id: String,
+    pub input_frame_byte_capacity: usize,
+    pub target_hidden_byte_capacity: usize,
+    pub output_frame_byte_capacity: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VulkanResidentDraftOutputTransducerPackageSpec {
+    pub pedal_id: String,
+    pub norm_parameter_tensor: String,
+    pub norm_parameter_dtype: String,
+    pub norm_parameter_shape: Vec<usize>,
+    pub norm_parameter_byte_capacity: usize,
+    pub projection_parameter_tensor: String,
+    pub projection_parameter_dtype: String,
+    pub projection_parameter_shape: Vec<usize>,
+    pub projection_parameter_byte_capacity: usize,
+    pub input_frame_byte_capacity: usize,
+    pub output_hidden_byte_capacity: usize,
+    pub logits_byte_capacity: usize,
+    pub vocabulary_size: usize,
+    pub hidden_size: usize,
+    pub projection_workgroup_count_x: u32,
+    pub norm_local_size_x: u32,
+    pub projection_local_size_x: u32,
+    pub norm_shader_path: String,
+    pub projection_shader_path: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

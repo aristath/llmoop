@@ -1031,8 +1031,35 @@ fn infer_node_output_shapes(
         "parallel_linear_2way" | "parallel_linear_3way" => {
             infer_parallel_linear_output_shapes(pedal_id, node, signals, params, tensor_index)
         }
-        "linear" | "linear_residual" | "parallel_linear_silu_multiply" => {
+        "linear" | "linear_residual" | "linear_projection" | "parallel_linear_silu_multiply" => {
             infer_linear_output_shapes(pedal_id, node, signals, params, tensor_index)
+        }
+        "concatenate" => {
+            let mut width = 0usize;
+            for input in &node.inputs {
+                let shape = signals
+                    .get(input)
+                    .and_then(|signal| signal.shape.as_ref())
+                    .ok_or_else(|| {
+                        CircuitPlanError(format!(
+                            "{} node {} concatenate input {} has no known shape",
+                            pedal_id, node.id, input
+                        ))
+                    })?;
+                let [input_width] = shape.as_slice() else {
+                    return Err(CircuitPlanError(format!(
+                        "{} node {} concatenate input {} must be one-dimensional",
+                        pedal_id, node.id, input
+                    )));
+                };
+                width = width.checked_add(*input_width).ok_or_else(|| {
+                    CircuitPlanError(format!(
+                        "{} node {} concatenate width overflowed",
+                        pedal_id, node.id
+                    ))
+                })?;
+            }
+            Ok(repeat_shape(Some(vec![width]), outputs))
         }
         "linear_split_3way" => {
             infer_linear_split_output_shapes(pedal_id, node, signals, params, tensor_index)

@@ -178,6 +178,9 @@ pub enum CircuitRuntimeRole {
     InputTransducer,
     OutputTransducer,
     Sampler,
+    DraftProcessor,
+    DraftInputAdapter,
+    DraftOutputTransducer,
 }
 
 impl CircuitRuntimeRole {

@@ -74,7 +74,15 @@ def validate_circuit(circuit: Json) -> CircuitValidationReport:
     _check(isinstance(circuit.get("id"), str) and bool(circuit["id"]), checks, issues, "circuit id exists", "missing circuit id", "id")
     _check(
         circuit.get("runtime_role")
-        in {"signal_processor", "input_transducer", "output_transducer", "sampler"},
+        in {
+            "signal_processor",
+            "input_transducer",
+            "output_transducer",
+            "sampler",
+            "draft_processor",
+            "draft_input_adapter",
+            "draft_output_transducer",
+        },
         checks,
         issues,
         "runtime role is supported",

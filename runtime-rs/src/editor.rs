@@ -730,6 +730,9 @@ fn source_pedals(manifest: &VulkanResidentModelPackageManifest) -> Vec<RuntimeEd
                 CircuitRuntimeRole::InputTransducer => 1,
                 CircuitRuntimeRole::OutputTransducer => 2,
                 CircuitRuntimeRole::Sampler => manifest.sampler.kernels.len(),
+                CircuitRuntimeRole::DraftProcessor
+                | CircuitRuntimeRole::DraftInputAdapter
+                | CircuitRuntimeRole::DraftOutputTransducer => 0,
             },
         })
         .collect()

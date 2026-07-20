@@ -43,6 +43,14 @@ class LayerStructure:
 
 
 @dataclass(frozen=True)
+class DraftPedalboardStructure:
+    id: str
+    prefix: str
+    tensors: dict[str, str]
+    layers: tuple[LayerStructure, ...]
+
+
+@dataclass(frozen=True)
 class ModelStructure:
     model_dir: Path
     model_type: str | None
@@ -77,6 +85,7 @@ class ModelStructure:
     token_ids: Json
     tensors: dict[str, str]
     layers: tuple[LayerStructure, ...]
+    draft_pedalboards: tuple[DraftPedalboardStructure, ...]
 
 
 TOKEN_EMBEDDING_CANDIDATES = (
@@ -229,6 +238,25 @@ LAYER_ROOT_PATTERNS = (
     re.compile(r"^(?P<root>gpt_neox\.layers)\.(?P<index>\d+)\."),
 )
 
+DRAFT_INPUT_PROJECTION_SUFFIXES = (
+    "fc.weight",
+    "eh_proj.weight",
+)
+DRAFT_EMBEDDING_NORM_SUFFIXES = (
+    "pre_fc_norm_embedding.weight",
+    "embedding_norm.weight",
+    "enorm.weight",
+)
+DRAFT_HIDDEN_NORM_SUFFIXES = (
+    "pre_fc_norm_hidden.weight",
+    "hidden_norm.weight",
+    "hnorm.weight",
+)
+DRAFT_OUTPUT_NORM_SUFFIXES = (
+    "norm.weight",
+    "shared_head_norm.weight",
+)
+
 
 def transpile_model(
     model_dir: Path,
@@ -261,15 +289,32 @@ def transpile_model(
         output_dir / "model.json", make_model_graph(structure, output_dir, tensor_index)
     )
 
-    total = len(structure.layers)
-    for current, layer in enumerate(structure.layers, start=1):
+    emitted_layers = [
+        (layer, f"layer_{layer.index:02d}", "layers") for layer in structure.layers
+    ]
+    emitted_layers.extend(
+        (layer, f"{draft.id}_layer_{layer.index:02d}", f"drafts/{draft.id}/layers")
+        for draft in structure.draft_pedalboards
+        for layer in draft.layers
+    )
+    total = len(emitted_layers)
+    for current, (layer, pedal_id, relative_dir) in enumerate(emitted_layers, start=1):
         check_compile_cancelled(cancel_requested)
         write_json(
-            output_dir / "layers" / f"layer_{layer.index:02d}.json",
-            make_layer(structure, layer),
+            output_dir / relative_dir / f"{pedal_id}.json",
+            make_layer(
+                structure,
+                layer,
+                pedal_id=pedal_id,
+                runtime_role=(
+                    "signal_processor"
+                    if relative_dir == "layers"
+                    else "draft_processor"
+                ),
+            ),
         )
         if progress is not None:
-            progress(current, total, f"layer_{layer.index:02d}")
+            progress(current, total, pedal_id)
 
     return structure
 
@@ -353,6 +398,18 @@ def discover_model_structure(
             layer_index=index,
         )
         for index in range(layer_count)
+    )
+    draft_pedalboards = discover_draft_pedalboards(
+        tensors=tensors,
+        decoder_config=decoder_config,
+        primary_layer_root=layer_root,
+        hidden_size=hidden_size,
+        token_embedding=token_embedding,
+        output_projection=output_projection,
+        num_attention_heads=num_attention_heads,
+        configured_num_key_value_heads=configured_num_key_value_heads,
+        configured_head_width=configured_head_width,
+        configured_attention_window_size=attention_window_size,
     )
 
     intermediate_size = discover_intermediate_size(decoder_config, tensors, layers)
@@ -475,6 +532,7 @@ def discover_model_structure(
             "output_projection": output_projection,
         },
         layers=layers,
+        draft_pedalboards=draft_pedalboards,
     )
 
 
@@ -921,9 +979,7 @@ def discover_layer_structure(
                 )
         num_key_value_heads = configured_num_key_value_heads
         if shared_kv_source_layer is None and "k_projection" in layer_tensors:
-            k_width = tensor_matrix_shape(
-                tensors, layer_tensors["k_projection"]
-            )[0]
+            k_width = tensor_matrix_shape(tensors, layer_tensors["k_projection"])[0]
             if k_width % head_width:
                 raise ModelTranspileError(
                     f"attention key projection width {k_width} is not divisible by head width {head_width}"
@@ -981,10 +1037,7 @@ def discover_layer_structure(
         per_layer_input_width=per_layer_input_width,
         feed_forward_type=feed_forward_type,
         shared_intermediate_size=(
-            tensor_matrix_shape(
-                tensors, layer_tensors["shared_mlp_input"]
-            )[0]
-            // 2
+            tensor_matrix_shape(tensors, layer_tensors["shared_mlp_input"])[0] // 2
             if "shared_mlp_input" in layer_tensors
             else None
         ),
@@ -1049,7 +1102,9 @@ def discover_layer_root(
             boundary_score += 200
         if f"{model_prefix}.norm.weight" in tensors:
             boundary_score += 50
-        layer_count_score = 100 if len(indices) in decoder_layer_counts and contiguous else 0
+        layer_count_score = (
+            100 if len(indices) in decoder_layer_counts and contiguous else 0
+        )
         first_prefix = f"{root}.{min(indices)}"
         decoder_operator_score = 0
         if find_first_existing_tensor(
@@ -1069,6 +1124,114 @@ def discover_layer_root(
 
     root = max(roots, key=score)
     return root, tuple(sorted(root_indices[root]))
+
+
+def discover_draft_pedalboards(
+    *,
+    tensors: dict[str, Json],
+    decoder_config: Json,
+    primary_layer_root: str,
+    hidden_size: int,
+    token_embedding: str,
+    output_projection: str,
+    num_attention_heads: int,
+    configured_num_key_value_heads: int,
+    configured_head_width: int,
+    configured_attention_window_size: int | None,
+) -> tuple[DraftPedalboardStructure, ...]:
+    """Discover auxiliary next-token predictors from their tensor topology.
+
+    The checkpoint family name is deliberately irrelevant. A candidate is an
+    auxiliary repeated layer stack whose parent also owns the two normalizers
+    and 2H-to-H projection needed to combine a token embedding with a target
+    hidden frame.
+    """
+    roots: dict[str, set[int]] = {}
+    for name in tensors:
+        for pattern in LAYER_ROOT_PATTERNS:
+            match = pattern.match(name)
+            if match is not None:
+                roots.setdefault(match.group("root"), set()).add(
+                    int(match.group("index"))
+                )
+                break
+
+    discovered: list[DraftPedalboardStructure] = []
+    for root in sorted(roots):
+        if root == primary_layer_root:
+            continue
+        indices = sorted(roots[root])
+        if indices != list(range(len(indices))):
+            continue
+        prefix = root.removesuffix(".layers")
+        input_projection = find_first_existing_tensor(
+            tensors,
+            (f"{prefix}.{suffix}" for suffix in DRAFT_INPUT_PROJECTION_SUFFIXES),
+        )
+        embedding_norm = find_first_existing_tensor(
+            tensors,
+            (f"{prefix}.{suffix}" for suffix in DRAFT_EMBEDDING_NORM_SUFFIXES),
+        )
+        hidden_norm = find_first_existing_tensor(
+            tensors,
+            (f"{prefix}.{suffix}" for suffix in DRAFT_HIDDEN_NORM_SUFFIXES),
+        )
+        output_norm = find_first_existing_tensor(
+            tensors,
+            (f"{prefix}.{suffix}" for suffix in DRAFT_OUTPUT_NORM_SUFFIXES),
+        )
+        if None in (input_projection, embedding_norm, hidden_norm, output_norm):
+            continue
+        assert input_projection is not None
+        assert embedding_norm is not None
+        assert hidden_norm is not None
+        assert output_norm is not None
+        if tensor_matrix_shape(tensors, input_projection) != [
+            hidden_size,
+            hidden_size * 2,
+        ]:
+            continue
+        if any(
+            tensors[name].get("shape") != [hidden_size]
+            for name in (embedding_norm, hidden_norm, output_norm)
+        ):
+            continue
+
+        layers = tuple(
+            discover_layer_structure(
+                tensors=tensors,
+                decoder_config=decoder_config,
+                configured_layer_types=None,
+                configured_attention_window_size=configured_attention_window_size,
+                num_attention_heads=num_attention_heads,
+                configured_num_key_value_heads=configured_num_key_value_heads,
+                configured_head_width=configured_head_width,
+                shared_kv_source_layer=None,
+                per_layer_input=None,
+                token_embedding=token_embedding,
+                layer_root=root,
+                layer_index=index,
+            )
+            for index in indices
+        )
+        adapter_tensors = {
+            "embedding_norm": embedding_norm,
+            "hidden_norm": hidden_norm,
+            "input_projection": input_projection,
+            "output_norm": output_norm,
+            "output_projection": output_projection,
+        }
+        attach_block_quantization_scales(tensors, adapter_tensors)
+        attach_packed_linear_quantization(tensors, adapter_tensors)
+        discovered.append(
+            DraftPedalboardStructure(
+                id=f"draft_{len(discovered):02d}",
+                prefix=prefix,
+                tensors=adapter_tensors,
+                layers=layers,
+            )
+        )
+    return tuple(discovered)
 
 
 def discover_configured_layer_counts(config: Json) -> set[int]:
@@ -1230,7 +1393,9 @@ def discover_layer_rope_parameters(
 ) -> Json:
     configured = config.get("rope_parameters")
     if isinstance(configured, dict):
-        nested = configured.get(configured_layer_type) if configured_layer_type else None
+        nested = (
+            configured.get(configured_layer_type) if configured_layer_type else None
+        )
         if isinstance(nested, dict):
             return nested
         if "rope_theta" in configured:
@@ -1381,9 +1546,7 @@ def discover_sampling_policy(generation_config: Json) -> Json:
             "sampled generation requires a positive top_k for the resident Vulkan sampler"
         )
     if not math.isfinite(top_p) or not 0.0 < top_p <= 1.0:
-        raise ModelTranspileError(
-            f"sampling top_p must be in (0, 1], got {top_p}"
-        )
+        raise ModelTranspileError(f"sampling top_p must be in (0, 1], got {top_p}")
     return {
         "method": "temperature_top_k_top_p",
         "temperature": temperature,
@@ -1400,10 +1563,7 @@ def discover_intermediate_size(
         if layer.feed_forward_type == "dense_swiglu":
             if "ffn_gate_up" in layer.tensors:
                 discovered.add(
-                    tensor_matrix_shape(
-                        tensors, layer.tensors["ffn_gate_up"]
-                    )[0]
-                    // 2
+                    tensor_matrix_shape(tensors, layer.tensors["ffn_gate_up"])[0] // 2
                 )
             else:
                 discovered.add(
@@ -1490,8 +1650,15 @@ def discover_rope_theta(config: Json) -> float:
     raise ModelTranspileError("could not discover RoPE theta from model config")
 
 
-def make_layer(structure: ModelStructure, layer: LayerStructure) -> Json:
+def make_layer(
+    structure: ModelStructure,
+    layer: LayerStructure,
+    *,
+    pedal_id: str | None = None,
+    runtime_role: str = "signal_processor",
+) -> Json:
     hidden_size = structure.hidden_size
+    pedal_id = pedal_id or f"layer_{layer.index:02d}"
     tensor_refs = list(layer.tensors.values())
     operator = (
         make_conv_operator(structure, layer)
@@ -1505,9 +1672,10 @@ def make_layer(structure: ModelStructure, layer: LayerStructure) -> Json:
 
     return {
         "schema": "llmoop.pedal_instance.v1",
-        "id": f"layer_{layer.index:02d}",
+        "id": pedal_id,
         "source_layer_index": layer.index,
         "type": "pedal_instance",
+        "runtime_role": runtime_role,
         "pedal_class": make_pedal_class(structure, layer),
         "operator_type": layer.operator_type,
         "feed_forward": make_feed_forward_descriptor(structure, layer),
@@ -1548,7 +1716,7 @@ def make_layer(structure: ModelStructure, layer: LayerStructure) -> Json:
         "transition_contract": {
             "type": "stateful_frame_transform",
             "equation": "(output_frame, next_state, events) = pedal(input_frame, state, params, control)",
-            "reference_behavior": f"source_transformers_layer_{layer.index}",
+            "reference_behavior": f"source_checkpoint_entity:{layer.prefix}",
             "behavioral_error_contract": "not_defined_yet",
         },
         "runtime_boundary": {
@@ -1672,6 +1840,10 @@ def make_model_graph(
                     output_projection,
                 ]
             },
+            "draft_pedalboards": [
+                make_draft_pedalboard_descriptor(structure, draft)
+                for draft in structure.draft_pedalboards
+            ],
         },
         "component_templates": {
             "shortconv_layer": "opaque layer pedal with fixed rolling temporal state",
@@ -1682,6 +1854,83 @@ def make_model_graph(
             "residual_add": "stateless signal mixer",
         },
         "output_dir": str(output_dir),
+    }
+
+
+def make_draft_pedalboard_descriptor(
+    structure: ModelStructure,
+    draft: DraftPedalboardStructure,
+) -> Json:
+    hidden_size = structure.hidden_size
+    adapter_params = {
+        name: tensor_ref(tensor)
+        for name, tensor in draft.tensors.items()
+        if name not in {"output_norm", "output_projection"}
+    }
+    return {
+        "id": draft.id,
+        "type": "multi_token_prediction",
+        "source_prefix": draft.prefix,
+        "input_adapter": {
+            "type": "normalized_embedding_hidden_projection",
+            "inputs": [
+                {"id": "token_embedding", "signal": "frame", "shape": [hidden_size]},
+                {"id": "target_hidden", "signal": "frame", "shape": [hidden_size]},
+            ],
+            "output": {"id": "output_frame", "signal": "frame", "shape": [hidden_size]},
+            "attrs": {
+                "eps": structure.norm_eps,
+                "weight_offset": structure.rms_norm_weight_offset,
+                "concatenation_order": ["token_embedding", "target_hidden"],
+            },
+            "params": adapter_params,
+        },
+        "pedalboard": {
+            "wiring": "series",
+            "pedals": [
+                {
+                    "id": f"{draft.id}_layer_{layer.index:02d}",
+                    "type": "pedal_instance",
+                    "pedal_class": make_pedal_class(structure, layer),
+                    "operator_type": layer.operator_type,
+                    "file": (
+                        f"drafts/{draft.id}/layers/"
+                        f"{draft.id}_layer_{layer.index:02d}.json"
+                    ),
+                }
+                for layer in draft.layers
+            ],
+        },
+        "output_transducer": {
+            "type": "normalized_hidden_projection",
+            "inputs": [
+                {"id": "input_frame", "signal": "frame", "shape": [hidden_size]}
+            ],
+            "outputs": [
+                {"id": "output_hidden", "signal": "frame", "shape": [hidden_size]},
+                {
+                    "id": "output_logits",
+                    "signal": "logits",
+                    "shape": [structure.vocab_size],
+                },
+            ],
+            "attrs": {
+                "eps": structure.norm_eps,
+                "weight_offset": structure.rms_norm_weight_offset,
+                "scale": 1.0 / structure.logits_scale,
+                "soft_cap": structure.logits_soft_cap,
+            },
+            "params": {
+                "norm": tensor_ref(draft.tensors["output_norm"]),
+                "projection": tensor_ref(draft.tensors["output_projection"]),
+            },
+        },
+        "state_contract": {
+            "ownership": "per_stream_per_pedal_instance",
+            "draft_updates": "tentative",
+            "acceptance": "commit_accepted_prefix",
+            "rejection": "restore_last_committed_state",
+        },
     }
 
 
@@ -2451,9 +2700,7 @@ def synthesize_packed_expert_tensors(
     synthesize_shared_expert_input(tensors, layer_prefix)
 
 
-def synthesize_shared_expert_input(
-    tensors: dict[str, Json], layer_prefix: str
-) -> None:
+def synthesize_shared_expert_input(tensors: dict[str, Json], layer_prefix: str) -> None:
     base = f"{layer_prefix}.mlp.shared_expert"
     packed = f"{base}.gate_up_proj"
     gate = f"{base}.gate_proj.weight"
@@ -2489,10 +2736,7 @@ def synthesize_shared_expert_input(
 
 def tensor_matrix_shape(tensors: dict[str, Json], tensor_name: str) -> list[int]:
     info = tensors[tensor_name]
-    shape = [
-        int(value)
-        for value in info.get("logical_shape", info.get("shape", []))
-    ]
+    shape = [int(value) for value in info.get("logical_shape", info.get("shape", []))]
     if len(shape) != 2:
         raise ModelTranspileError(
             f"tensor {tensor_name!r} is not a matrix: shape {shape}"
@@ -2500,9 +2744,7 @@ def tensor_matrix_shape(tensors: dict[str, Json], tensor_name: str) -> list[int]
     return shape
 
 
-def annotate_packed_linear_tensors(
-    model_dir: Path, tensors: dict[str, Json]
-) -> None:
+def annotate_packed_linear_tensors(model_dir: Path, tensors: dict[str, Json]) -> None:
     config = read_json(model_dir / "config.json")
     quantization = config.get("quantization_config")
     if not isinstance(quantization, dict):
@@ -2679,9 +2921,7 @@ def composite_tensor(
         raise ModelTranspileError("cannot create an empty composite tensor")
     dtype = tensors[names[0]].get("dtype")
     if any(tensors[name].get("dtype") != dtype for name in names):
-        raise ModelTranspileError(
-            f"composite tensor parts have mixed dtypes: {names}"
-        )
+        raise ModelTranspileError(f"composite tensor parts have mixed dtypes: {names}")
     byte_count = sum(int(tensors[name]["byte_count"]) for name in names)
     return {
         "dtype": dtype,

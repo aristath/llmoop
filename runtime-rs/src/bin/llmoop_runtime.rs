@@ -1424,6 +1424,9 @@ fn source_pedals_report(manifest: &VulkanResidentModelPackageManifest) -> Vec<Ru
                     llmoop_runtime::CircuitRuntimeRole::InputTransducer => 1,
                     llmoop_runtime::CircuitRuntimeRole::OutputTransducer => 2,
                     llmoop_runtime::CircuitRuntimeRole::Sampler => manifest.sampler.kernels.len(),
+                    llmoop_runtime::CircuitRuntimeRole::DraftProcessor
+                    | llmoop_runtime::CircuitRuntimeRole::DraftInputAdapter
+                    | llmoop_runtime::CircuitRuntimeRole::DraftOutputTransducer => 0,
                 },
             }
         })

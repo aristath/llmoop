@@ -75,7 +75,13 @@ def build_behavioral_validation(
 ) -> Json:
     oracle_digest = model_contract_digest(model_graph, tensor_index)
     circuit_evidence = []
-    for circuit_ref in lowered_index["graph"]["circuits"]:
+    circuit_refs = list(lowered_index["graph"]["circuits"])
+    circuit_refs.extend(
+        circuit_ref
+        for draft in lowered_index.get("draft_pedalboards", [])
+        for circuit_ref in draft["circuits"]
+    )
+    for circuit_ref in circuit_refs:
         pedal_id = circuit_ref["id"]
         try:
             source = source_circuits[pedal_id]

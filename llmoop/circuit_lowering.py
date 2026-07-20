@@ -57,10 +57,14 @@ def lower_pedalboard(
 ) -> Json:
     model = read_json(pedalboard_dir / "model.json")
     source_pedals = model["graph"]["pedalboard"]["pedals"]
+    source_drafts = model["graph"].get("draft_pedalboards", [])
+    draft_source_pedals = [
+        pedal for draft in source_drafts for pedal in draft["pedalboard"]["pedals"]
+    ]
 
     lowered: list[Json] = []
     operator_counts: Counter[str] = Counter()
-    total = len(source_pedals)
+    total = len(source_pedals) + len(draft_source_pedals)
     for current, source_pedal in enumerate(source_pedals, start=1):
         check_compile_cancelled(cancel_requested)
         if progress is not None:
@@ -84,6 +88,36 @@ def lower_pedalboard(
                 "behavioral_role": result["circuit"]["behavioral_role"],
             }
         )
+
+    draft_pedalboards: list[Json] = []
+    lowered_count = len(source_pedals)
+    for draft in source_drafts:
+        draft_refs: list[Json] = []
+        for source_pedal in draft["pedalboard"]["pedals"]:
+            check_compile_cancelled(cancel_requested)
+            lowered_count += 1
+            if progress is not None:
+                progress(lowered_count, total, source_pedal["id"])
+            pedal_path = pedalboard_dir / source_pedal["file"]
+            pedal_out_dir = out_dir / "drafts" / draft["id"] / source_pedal["id"]
+            result = lower_pedal(pedal_path, pedal_out_dir)
+            operator_counts[source_pedal["operator_type"]] += 1
+            draft_refs.append(
+                {
+                    "id": source_pedal["id"],
+                    "operator_type": source_pedal["operator_type"],
+                    "runtime_role": result["circuit"]["runtime_role"],
+                    "circuit": str(result["circuit_path"].relative_to(out_dir)),
+                    "params": str(result["params_path"].relative_to(out_dir)),
+                    "state": str(result["state_path"].relative_to(out_dir)),
+                    "implementation": result["circuit"]["implementation"],
+                    "behavioral_role": result["circuit"]["behavioral_role"],
+                }
+            )
+        lowered_draft = lower_draft_pedalboard(model, draft, draft_refs, out_dir)
+        operator_counts["draft_input_adapter"] += 1
+        operator_counts["draft_output_transducer"] += 1
+        draft_pedalboards.append(lowered_draft)
 
     if not lowered:
         raise ValueError("cannot lower an empty pedalboard")
@@ -197,8 +231,12 @@ def lower_pedalboard(
             "input_transducer": model["graph"]["input_transducer"],
             "output_transducer": model["graph"]["output_transducer"],
         },
+        "draft_pedalboards": draft_pedalboards,
         "summary": {
-            "circuit_count": len(all_circuits),
+            "circuit_count": len(all_circuits)
+            + sum(len(draft["circuits"]) for draft in draft_pedalboards),
+            "generation_circuit_count": len(all_circuits),
+            "draft_pedalboard_count": len(draft_pedalboards),
             "operator_counts": dict(sorted(operator_counts.items())),
         },
         "notes": [
@@ -215,6 +253,7 @@ def lower_pedalboard(
         "index": index,
         "index_path": index_path,
         "circuits": lowered,
+        "draft_pedalboards": draft_pedalboards,
     }
 
 
@@ -234,6 +273,107 @@ def _canonical_output_port(runtime_role: str) -> str:
         "output_transducer": "output_logits",
         "sampler": "sampled_token",
     }[runtime_role]
+
+
+def lower_draft_pedalboard(
+    model: Json,
+    draft: Json,
+    layer_refs: list[Json],
+    out_dir: Path,
+) -> Json:
+    if not layer_refs:
+        raise ValueError(f"draft pedalboard {draft['id']!r} contains no layer pedals")
+    system_circuits = build_draft_system_circuits(model, draft)
+    system_refs = []
+    for circuit in system_circuits:
+        circuit_id = circuit["source"]["pedal_id"]
+        circuit_out_dir = out_dir / "drafts" / draft["id"] / circuit_id
+        circuit_out_dir.mkdir(parents=True, exist_ok=True)
+        validate_circuit(circuit).raise_for_errors()
+        circuit_path = circuit_out_dir / "circuit.json"
+        params_path = circuit_out_dir / "params.json"
+        state_path = circuit_out_dir / "state.json"
+        write_json(circuit_path, circuit)
+        write_json(params_path, build_params_artifact(circuit))
+        write_json(state_path, build_state_artifact(circuit))
+        system_refs.append(
+            {
+                "id": circuit_id,
+                "operator_type": circuit["source"]["source_operator_type"],
+                "runtime_role": circuit["runtime_role"],
+                "circuit": str(circuit_path.relative_to(out_dir)),
+                "params": str(params_path.relative_to(out_dir)),
+                "state": str(state_path.relative_to(out_dir)),
+                "implementation": circuit["implementation"],
+                "behavioral_role": circuit["behavioral_role"],
+            }
+        )
+
+    input_ref, output_ref = system_refs
+    forward_chain = [input_ref, *layer_refs, output_ref]
+    return {
+        "id": draft["id"],
+        "type": draft["type"],
+        "source_prefix": draft["source_prefix"],
+        "wiring": "explicit_graph",
+        "circuits": forward_chain,
+        "cables": [
+            {
+                "id": f"{draft['id']}_cable_{index:04d}",
+                "connection": {"kind": "forward"},
+                "source": {
+                    "pedal_id": source["id"],
+                    "port_id": (
+                        "output_frame"
+                        if source["runtime_role"] != "draft_output_transducer"
+                        else "output_hidden"
+                    ),
+                },
+                "destination": {
+                    "pedal_id": destination["id"],
+                    "port_id": "input_frame",
+                },
+            }
+            for index, (source, destination) in enumerate(
+                zip(forward_chain, forward_chain[1:])
+            )
+        ],
+        "boundary": {
+            "external_inputs": [
+                {
+                    "id": "token_embedding",
+                    "endpoint": {
+                        "pedal_id": input_ref["id"],
+                        "port_id": "token_embedding",
+                    },
+                },
+                {
+                    "id": "target_hidden",
+                    "endpoint": {
+                        "pedal_id": input_ref["id"],
+                        "port_id": "target_hidden",
+                    },
+                },
+            ],
+            "public_outputs": [
+                {
+                    "id": "draft_hidden",
+                    "endpoint": {
+                        "pedal_id": output_ref["id"],
+                        "port_id": "output_hidden",
+                    },
+                },
+                {
+                    "id": "draft_logits",
+                    "endpoint": {
+                        "pedal_id": output_ref["id"],
+                        "port_id": "output_logits",
+                    },
+                },
+            ],
+        },
+        "state_contract": dict(draft["state_contract"]),
+    }
 
 
 def build_system_circuits(model: Json) -> list[Json]:
@@ -377,6 +517,146 @@ def build_system_circuits(model: Json) -> list[Json]:
         ],
     )
     return [input_circuit, output_circuit, sampler_circuit]
+
+
+def build_draft_system_circuits(model: Json, draft: Json) -> list[Json]:
+    hidden_size = int(model["dimensions"]["hidden_size"])
+    vocab_size = int(model["dimensions"]["vocab_size"])
+    adapter = draft["input_adapter"]
+    adapter_id = f"{draft['id']}_input_adapter"
+    adapter_params = {
+        name: _system_param_ref(ref, f"{adapter_id}.{name}")
+        for name, ref in adapter["params"].items()
+    }
+    norm_attrs = {
+        "eps": float(adapter["attrs"]["eps"]),
+        "weight_offset": float(adapter["attrs"]["weight_offset"]),
+    }
+    input_circuit = _system_circuit(
+        pedal_id=adapter_id,
+        operator_type="draft_input_adapter",
+        runtime_role="draft_input_adapter",
+        implementation="compiled_normalized_embedding_hidden_projection_v1",
+        inputs=[
+            _system_port("token_embedding", "frame", [hidden_size], "token_embedding"),
+            _system_port("target_hidden", "frame", [hidden_size], "target_hidden"),
+        ],
+        outputs=[
+            _system_port(
+                "output_frame",
+                "frame",
+                [hidden_size],
+                "output_frame",
+                source="output_frame",
+            )
+        ],
+        parameters=adapter_params,
+        nodes=[
+            {
+                "id": "embedding_norm",
+                "op": "rms_norm",
+                "inputs": ["token_embedding"],
+                "outputs": ["normalized_embedding"],
+                "params": ["embedding_norm"],
+                "state_reads": [],
+                "state_writes": [],
+                "attrs": norm_attrs,
+            },
+            {
+                "id": "hidden_norm",
+                "op": "rms_norm",
+                "inputs": ["target_hidden"],
+                "outputs": ["normalized_hidden"],
+                "params": ["hidden_norm"],
+                "state_reads": [],
+                "state_writes": [],
+                "attrs": norm_attrs,
+            },
+            {
+                "id": "embedding_hidden_concat",
+                "op": "concatenate",
+                "inputs": ["normalized_embedding", "normalized_hidden"],
+                "outputs": ["combined_frame"],
+                "params": [],
+                "state_reads": [],
+                "state_writes": [],
+                "attrs": {
+                    "axis": "channel",
+                    "part_widths": [hidden_size, hidden_size],
+                },
+            },
+            {
+                "id": "input_projection",
+                "op": "linear",
+                "inputs": ["combined_frame"],
+                "outputs": ["output_frame"],
+                "params": _linear_params("input_projection", adapter_params),
+                "state_reads": [],
+                "state_writes": [],
+                "attrs": {},
+            },
+        ],
+    )
+
+    output = draft["output_transducer"]
+    output_id = f"{draft['id']}_output_transducer"
+    output_params = {
+        name: _system_param_ref(ref, f"{output_id}.{name}")
+        for name, ref in output["params"].items()
+    }
+    output_circuit = _system_circuit(
+        pedal_id=output_id,
+        operator_type="draft_output_transducer",
+        runtime_role="draft_output_transducer",
+        implementation="compiled_draft_output_transducer_v1",
+        inputs=[_system_port("input_frame", "frame", [hidden_size], "input_frame")],
+        outputs=[
+            _system_port(
+                "output_hidden",
+                "frame",
+                [hidden_size],
+                "output_hidden",
+                source="output_hidden",
+            ),
+            _system_port(
+                "output_logits",
+                "logits",
+                [vocab_size],
+                "output_logits",
+                source="output_logits",
+            ),
+        ],
+        parameters=output_params,
+        nodes=[
+            {
+                "id": "output_norm",
+                "op": "rms_norm",
+                "inputs": ["input_frame"],
+                "outputs": ["output_hidden"],
+                "params": ["norm"],
+                "state_reads": [],
+                "state_writes": [],
+                "attrs": {
+                    "eps": float(output["attrs"]["eps"]),
+                    "weight_offset": float(output["attrs"]["weight_offset"]),
+                },
+            },
+            {
+                "id": "output_projection",
+                "op": "linear_projection",
+                "inputs": ["output_hidden"],
+                "outputs": ["output_logits"],
+                "params": ["projection"],
+                "state_reads": [],
+                "state_writes": [],
+                "attrs": {
+                    "scale": float(output["attrs"]["scale"]),
+                    "soft_cap": output["attrs"].get("soft_cap"),
+                },
+            },
+        ],
+    )
+    return [input_circuit, output_circuit]
 
 
 def _system_port(
@@ -578,7 +858,7 @@ def _base_circuit(
             "source_layer_index": pedal["source_layer_index"],
             "source_operator_type": operator_type,
         },
-        "runtime_role": "signal_processor",
+        "runtime_role": pedal.get("runtime_role", "signal_processor"),
         "behavioral_role": behavioral_role,
         "implementation": implementation,
         "boundary": {

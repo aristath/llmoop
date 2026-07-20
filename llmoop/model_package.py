@@ -291,7 +291,7 @@ def build_vulkan_resident_package_manifest(
 
     source_circuits = {}
     compiled_circuits = {}
-    for circuit_ref in lowered_index["graph"]["circuits"]:
+    for circuit_ref in all_lowered_circuit_refs(lowered_index):
         circuit = read_json(lowered_dir / circuit_ref["circuit"])
         source_circuits[circuit_ref["id"]] = circuit
         compiled_circuits[circuit_ref["id"]] = optimize_circuit_for_vulkan(
@@ -343,11 +343,32 @@ def build_vulkan_resident_package_manifest(
         tensor_index=tensor_index,
         dimensions=dimensions,
     )
+    speculative_decoders = speculative_decoder_specs(
+        lowered_index=lowered_index,
+        lowered_dir=lowered_dir,
+        compiled_circuits=compiled_circuits,
+        tensor_index=tensor_index,
+        dimensions=dimensions,
+        projection_shader_file=projection_shader_file,
+        norm_shader_file=norm_shader_file,
+        frame_bytes=frame_bytes,
+        logits_bytes=logits_bytes,
+        vocab_size=vocab_size,
+        hidden_size=hidden_size,
+    )
+    all_pedal_executions = [
+        *pedal_executions,
+        *(
+            execution
+            for decoder in speculative_decoders
+            for execution in decoder["pedal_executions"]
+        ),
+    ]
     copy_shader_templates(
         shader_source_dir,
         package_dir / "shaders",
         required_shader_files(
-            pedal_executions,
+            all_pedal_executions,
             embedding_shader_file=embedding_shader_file,
             projection_shader_file=projection_shader_file,
             norm_shader_file=norm_shader_file,
@@ -355,6 +376,20 @@ def build_vulkan_resident_package_manifest(
                 kernel["shader_path"].removeprefix("shaders/").removesuffix(".spv")
                 + ".comp"
                 for kernel in sampler_kernels
+            }
+            | {
+                decoder["output_transducer"]["norm_shader_path"]
+                .removeprefix("shaders/")
+                .removesuffix(".spv")
+                + ".comp"
+                for decoder in speculative_decoders
+            }
+            | {
+                decoder["output_transducer"]["projection_shader_path"]
+                .removeprefix("shaders/")
+                .removesuffix(".spv")
+                + ".comp"
+                for decoder in speculative_decoders
             },
         ),
     )
@@ -369,7 +404,7 @@ def build_vulkan_resident_package_manifest(
         ),
         cancel_requested=cancel_requested,
     )
-    for execution in pedal_executions:
+    for execution in all_pedal_executions:
         for kernel in execution["kernels"]:
             kernel["shader_path"] = compiled_shader_path(kernel["shader_path"])
     return {
@@ -453,6 +488,7 @@ def build_vulkan_resident_package_manifest(
             "kernels": sampler_kernels,
         },
         "pedal_executions": pedal_executions,
+        "speculative_decoders": speculative_decoders,
     }
 
 
@@ -532,6 +568,165 @@ def pedal_execution_specs(
         )
 
     return executions
+
+
+def speculative_decoder_specs(
+    *,
+    lowered_index: Json,
+    lowered_dir: Path,
+    compiled_circuits: dict[str, Json],
+    tensor_index: Json,
+    dimensions: Json,
+    projection_shader_file: str,
+    norm_shader_file: str,
+    frame_bytes: int,
+    logits_bytes: int,
+    vocab_size: int,
+    hidden_size: int,
+) -> list[Json]:
+    decoders = []
+    for draft in lowered_index.get("draft_pedalboards", []):
+        circuit_refs = draft["circuits"]
+        input_ref = next(
+            ref for ref in circuit_refs if ref["runtime_role"] == "draft_input_adapter"
+        )
+        output_ref = next(
+            ref
+            for ref in circuit_refs
+            if ref["runtime_role"] == "draft_output_transducer"
+        )
+        executable_refs = [
+            ref
+            for ref in circuit_refs
+            if ref["runtime_role"] in {"draft_input_adapter", "draft_processor"}
+        ]
+        executions = [
+            pedal_execution_spec(
+                circuit_ref=ref,
+                circuit=compiled_circuits[ref["id"]],
+                tensor_index=tensor_index,
+                dimensions=dimensions,
+            )
+            for ref in executable_refs
+        ]
+        output_circuit = compiled_circuits[output_ref["id"]]
+        output_refs = output_circuit["parameters"]["refs"]
+        norm_tensor = output_refs["norm"]["tensor"]
+        projection_tensor = output_refs["projection"]["tensor"]
+        decoders.append(
+            {
+                "id": draft["id"],
+                "type": draft["type"],
+                "source_prefix": draft["source_prefix"],
+                "circuit_graph": package_auxiliary_circuit_graph(
+                    draft, lowered_dir, compiled_circuits
+                ),
+                "input_adapter": {
+                    "pedal_id": input_ref["id"],
+                    "input_frame_byte_capacity": frame_bytes,
+                    "target_hidden_byte_capacity": frame_bytes,
+                    "output_frame_byte_capacity": frame_bytes,
+                },
+                "output_transducer": {
+                    "pedal_id": output_ref["id"],
+                    "norm_parameter_tensor": norm_tensor,
+                    "norm_parameter_dtype": tensor_dtype(tensor_index, norm_tensor),
+                    "norm_parameter_shape": tensor_shape(tensor_index, norm_tensor),
+                    "norm_parameter_byte_capacity": tensor_byte_count(
+                        tensor_index, norm_tensor
+                    ),
+                    "projection_parameter_tensor": projection_tensor,
+                    "projection_parameter_dtype": tensor_dtype(
+                        tensor_index, projection_tensor
+                    ),
+                    "projection_parameter_shape": tensor_shape(
+                        tensor_index, projection_tensor
+                    ),
+                    "projection_parameter_byte_capacity": tensor_byte_count(
+                        tensor_index, projection_tensor
+                    ),
+                    "input_frame_byte_capacity": frame_bytes,
+                    "output_hidden_byte_capacity": frame_bytes,
+                    "logits_byte_capacity": logits_bytes,
+                    "vocabulary_size": vocab_size,
+                    "hidden_size": hidden_size,
+                    "projection_workgroup_count_x": (vocab_size + 1) // 2,
+                    "norm_local_size_x": 64,
+                    "projection_local_size_x": 64,
+                    "norm_shader_path": compiled_shader_path(
+                        f"shaders/{norm_shader_file}"
+                    ),
+                    "projection_shader_path": compiled_shader_path(
+                        f"shaders/{projection_shader_file}"
+                    ),
+                },
+                "pedal_executions": executions,
+                "state_contract": deepcopy(draft["state_contract"]),
+                "verification_contract": {
+                    "target_execution": "multi_token",
+                    "state_updates": "transactional",
+                    "acceptance": "longest_matching_prefix",
+                },
+            }
+        )
+    return decoders
+
+
+def pedal_execution_spec(
+    *,
+    circuit_ref: Json,
+    circuit: Json,
+    tensor_index: Json,
+    dimensions: Json,
+) -> Json:
+    kernels = []
+    for index, node in enumerate(circuit["nodes"]):
+        shader_file = shader_file_for_node(circuit, node, tensor_index, dimensions)
+        kernels.append(
+            {
+                "execution_index": index,
+                "node_id": node["id"],
+                "op": node["op"],
+                "shader_path": f"shaders/{shader_file}",
+                "local_size_x": local_size_x_for_node(node),
+                "workgroup_count_x": workgroup_count_x_for_node(
+                    circuit, node, tensor_index
+                ),
+            }
+        )
+    return {
+        "pedal_id": circuit_ref["id"],
+        "operator_type": circuit_ref["operator_type"],
+        "implementation": circuit_ref["implementation"],
+        "kernels": kernels,
+    }
+
+
+def package_auxiliary_circuit_graph(
+    draft: Json,
+    lowered_dir: Path,
+    compiled_circuits: dict[str, Json],
+) -> Json:
+    pedals = []
+    for circuit_ref in draft["circuits"]:
+        pedals.append(
+            {
+                "pedal_id": circuit_ref["id"],
+                "operator_type": circuit_ref["operator_type"],
+                "runtime_role": circuit_ref["runtime_role"],
+                "implementation": circuit_ref["implementation"],
+                "behavioral_role": circuit_ref["behavioral_role"],
+                "circuit": deepcopy(compiled_circuits[circuit_ref["id"]]),
+                "params": read_json(lowered_dir / circuit_ref["params"]),
+                "state": read_json(lowered_dir / circuit_ref["state"]),
+            }
+        )
+    return {
+        "wiring": draft["wiring"],
+        "cables": deepcopy(draft["cables"]),
+        "boundary": deepcopy(draft["boundary"]),
+        "pedals": pedals,
+    }
 
 
 def shader_file_for_node(
@@ -845,6 +1040,18 @@ def shader_file_for_node(
             return "split_bf16_3x" + "_".join(map(str, part_widths)) + ".comp"
         part_width = int(node["attrs"]["part_width"])
         return f"split_bf16_{len(node['outputs'])}x{part_width}.comp"
+    if op == "concatenate":
+        part_widths = [int(width) for width in node["attrs"]["part_widths"]]
+        if (
+            node["attrs"].get("axis") != "channel"
+            or len(node.get("inputs", [])) != len(part_widths)
+            or len(node.get("outputs", [])) != 1
+            or any(width <= 0 or width % 2 for width in part_widths)
+        ):
+            raise ModelCompileError(
+                f"concatenate node {node['id']!r} has unsupported geometry"
+            )
+        return "concatenate_bf16_" + "_".join(map(str, part_widths)) + ".comp"
     if op == "multiply":
         element_count = int(
             node.get("attrs", {}).get(
@@ -1446,6 +1653,18 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
                     "true" if weight_layout == "paired" else "false"
                 ),
             },
+        )
+
+    concatenate = re.fullmatch(r"concatenate_bf16_(\d+)_(\d+)\.comp", shader_file)
+    if concatenate is not None:
+        width_a = int(concatenate.group(1))
+        width_b = int(concatenate.group(2))
+        if width_a <= 0 or width_a % 2 or width_b <= 0 or width_b % 2:
+            raise ModelCompileError(f"invalid concatenate shader shape {shader_file!r}")
+        return render_shader_template(
+            source_dir,
+            "concatenate_bf16.comp.template",
+            {"WIDTH_A": str(width_a), "WIDTH_B": str(width_b)},
         )
 
     fused_fp8_ffn_projection = re.fullmatch(
@@ -2219,7 +2438,7 @@ def referenced_tensor_index(
     }
     for component in model_graph["graph"]["output_transducer"]["components"]:
         referenced.update(ref["tensor"] for ref in component.get("params", {}).values())
-    for circuit_ref in lowered_index["graph"]["circuits"]:
+    for circuit_ref in all_lowered_circuit_refs(lowered_index):
         circuit = read_json(lowered_dir / circuit_ref["circuit"])
         referenced.update(
             ref["tensor"] for ref in circuit["parameters"]["refs"].values()
@@ -2244,6 +2463,16 @@ def referenced_tensor_index(
         ),
     }
     return selected
+
+
+def all_lowered_circuit_refs(lowered_index: Json) -> list[Json]:
+    refs = list(lowered_index["graph"]["circuits"])
+    refs.extend(
+        circuit_ref
+        for draft in lowered_index.get("draft_pedalboards", [])
+        for circuit_ref in draft["circuits"]
+    )
+    return refs
 
 
 def copy_tensor_package(
@@ -2359,8 +2588,16 @@ def validate_compiled_package(package_dir: Path, manifest: Json) -> None:
         )
     behavioral = read_json(behavioral_path)
     candidate_circuits = validate_compiled_circuit_graph(manifest)
+    auxiliary_circuits = validate_compiled_speculative_decoders(manifest)
+    duplicate_circuits = set(candidate_circuits).intersection(auxiliary_circuits)
+    if duplicate_circuits:
+        raise ModelCompileError(
+            "compiled package repeats circuit ids across target and draft graphs: "
+            f"{sorted(duplicate_circuits)}"
+        )
+    all_candidate_circuits = {**candidate_circuits, **auxiliary_circuits}
     validate_compiled_generation_contract(manifest, candidate_circuits)
-    validate_behavioral_validation_artifact(behavioral, candidate_circuits)
+    validate_behavioral_validation_artifact(behavioral, all_candidate_circuits)
     validate_compiled_pedal_executions(manifest, candidate_circuits)
 
     tokenizer = manifest.get("tokenizer")
@@ -2809,6 +3046,119 @@ def _validate_package_graph_boundary_ports(
 
 def _port_by_id(ports: list[Json], port_id: Any) -> Json | None:
     return next((port for port in ports if port.get("id") == port_id), None)
+
+
+def validate_compiled_speculative_decoders(manifest: Json) -> dict[str, Json]:
+    raw_decoders = manifest.get("speculative_decoders", [])
+    if not isinstance(raw_decoders, list):
+        raise ModelCompileError("compiled package speculative decoders must be a list")
+    decoder_ids: set[str] = set()
+    candidates: dict[str, Json] = {}
+    for decoder in raw_decoders:
+        decoder_id = decoder.get("id") if isinstance(decoder, dict) else None
+        if (
+            not isinstance(decoder_id, str)
+            or not decoder_id
+            or decoder_id in decoder_ids
+        ):
+            raise ModelCompileError(
+                f"compiled package contains invalid or duplicate speculative decoder {decoder_id!r}"
+            )
+        decoder_ids.add(decoder_id)
+        if decoder.get("type") != "multi_token_prediction":
+            raise ModelCompileError(
+                f"speculative decoder {decoder_id!r} has unsupported type {decoder.get('type')!r}"
+            )
+        graph = decoder.get("circuit_graph")
+        graph_candidates = validate_compiled_circuit_graph({"circuit_graph": graph})
+        duplicate = set(candidates).intersection(graph_candidates)
+        if duplicate:
+            raise ModelCompileError(
+                f"speculative decoder {decoder_id!r} repeats pedal ids {sorted(duplicate)}"
+            )
+        roles: dict[str, list[str]] = {}
+        for pedal_id, circuit in graph_candidates.items():
+            roles.setdefault(str(circuit.get("runtime_role")), []).append(pedal_id)
+        if (
+            len(roles.get("draft_input_adapter", [])) != 1
+            or not roles.get("draft_processor")
+            or len(roles.get("draft_output_transducer", [])) != 1
+            or set(roles)
+            != {
+                "draft_input_adapter",
+                "draft_processor",
+                "draft_output_transducer",
+            }
+        ):
+            raise ModelCompileError(
+                f"speculative decoder {decoder_id!r} must contain one input adapter, "
+                "at least one draft processor, and one output transducer"
+            )
+        execution_by_pedal = {
+            execution.get("pedal_id"): execution
+            for execution in decoder.get("pedal_executions", [])
+            if isinstance(execution, dict)
+        }
+        executable_ids = set(roles["draft_input_adapter"]) | set(
+            roles["draft_processor"]
+        )
+        if set(execution_by_pedal) != executable_ids:
+            raise ModelCompileError(
+                f"speculative decoder {decoder_id!r} executions do not cover its executable pedals"
+            )
+        for pedal_id in executable_ids:
+            circuit = graph_candidates[pedal_id]
+            execution = execution_by_pedal[pedal_id]
+            kernels = execution.get("kernels")
+            if not isinstance(kernels, list) or len(kernels) != len(circuit["nodes"]):
+                raise ModelCompileError(
+                    f"speculative decoder {decoder_id!r} execution for {pedal_id!r} "
+                    "does not cover every circuit node"
+                )
+            for index, (kernel, node) in enumerate(
+                zip(kernels, circuit["nodes"], strict=True)
+            ):
+                if (
+                    kernel.get("execution_index") != index
+                    or kernel.get("node_id") != node.get("id")
+                    or kernel.get("op") != node.get("op")
+                    or not isinstance(kernel.get("shader_path"), str)
+                    or not kernel["shader_path"]
+                ):
+                    raise ModelCompileError(
+                        f"speculative decoder {decoder_id!r} kernel {pedal_id}.{index} "
+                        "does not match its circuit node"
+                    )
+        output_id = roles["draft_output_transducer"][0]
+        output_spec = decoder.get("output_transducer")
+        output_refs = graph_candidates[output_id]["parameters"]["refs"]
+        if (
+            not isinstance(output_spec, dict)
+            or output_spec.get("pedal_id") != output_id
+            or output_spec.get("norm_parameter_tensor")
+            != output_refs.get("norm", {}).get("tensor")
+            or output_spec.get("projection_parameter_tensor")
+            != output_refs.get("projection", {}).get("tensor")
+            or any(
+                not isinstance(output_spec.get(field), str) or not output_spec[field]
+                for field in ("norm_shader_path", "projection_shader_path")
+            )
+        ):
+            raise ModelCompileError(
+                f"speculative decoder {decoder_id!r} output execution does not match its circuit"
+            )
+        expected_state_contract = {
+            "ownership": "per_stream_per_pedal_instance",
+            "draft_updates": "tentative",
+            "acceptance": "commit_accepted_prefix",
+            "rejection": "restore_last_committed_state",
+        }
+        if decoder.get("state_contract") != expected_state_contract:
+            raise ModelCompileError(
+                f"speculative decoder {decoder_id!r} has no transactional state contract"
+            )
+        candidates.update(graph_candidates)
+    return candidates
 
 
 def validate_compiled_pedal_executions(

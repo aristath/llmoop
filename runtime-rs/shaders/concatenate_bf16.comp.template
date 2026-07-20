@@ -1,0 +1,30 @@
+#version 460
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer InputA {
+    uint words[];
+} input_a;
+
+layout(set = 0, binding = 1) readonly buffer InputB {
+    uint words[];
+} input_b;
+
+layout(set = 0, binding = 2) buffer Output {
+    uint words[];
+} output_frame;
+
+const uint WIDTH_A_WORDS = {{WIDTH_A}}u / 2u;
+const uint WIDTH_B_WORDS = {{WIDTH_B}}u / 2u;
+
+void main() {
+    for (
+        uint word_index = gl_LocalInvocationIndex;
+        word_index < WIDTH_A_WORDS + WIDTH_B_WORDS;
+        word_index += gl_WorkGroupSize.x
+    ) {
+        output_frame.words[word_index] = word_index < WIDTH_A_WORDS
+            ? input_a.words[word_index]
+            : input_b.words[word_index - WIDTH_A_WORDS];
+    }
+}

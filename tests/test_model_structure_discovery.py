@@ -11,6 +11,7 @@ from llmoop.model_transpiler import (
     discover_model_structure,
     discover_sampling_policy,
     make_layer,
+    make_model_graph,
     synthesize_packed_expert_tensors,
 )
 
@@ -180,9 +181,7 @@ def test_discovers_attention_with_values_derived_from_keys() -> None:
 
     structure = discover_model_structure(Path("synthetic"), config, tensors)
     layer = structure.layers[0]
-    circuit = build_pedal_circuit(
-        make_layer(structure, layer), Path("layer_00.json")
-    )
+    circuit = build_pedal_circuit(make_layer(structure, layer), Path("layer_00.json"))
     nodes = {node["id"]: node for node in circuit["nodes"]}
 
     assert layer.attention_key_equals_value
@@ -202,6 +201,84 @@ def test_discovers_attention_with_values_derived_from_keys() -> None:
     assert nodes["ffn_residual"]["outputs"] == ["ffn_residual_out"]
     assert nodes["layer_scale"]["inputs"] == ["ffn_residual_out"]
     assert nodes["layer_scale"]["outputs"] == ["output_frame"]
+
+
+def test_discovers_structural_mtp_as_auxiliary_pedalboard() -> None:
+    tensors = {
+        "model.embed_tokens.weight": _tensor([1024, 512]),
+        "model.norm.weight": _tensor([512]),
+        "lm_head.weight": _tensor([1024, 512]),
+        "mtp.fc.weight": _tensor([512, 1024]),
+        "mtp.pre_fc_norm_embedding.weight": _tensor([512]),
+        "mtp.pre_fc_norm_hidden.weight": _tensor([512]),
+        "mtp.norm.weight": _tensor([512]),
+    }
+    for prefix in ("model.layers.0", "mtp.layers.0"):
+        tensors.update(
+            {
+                f"{prefix}.input_layernorm.weight": _tensor([512]),
+                f"{prefix}.post_attention_layernorm.weight": _tensor([512]),
+                f"{prefix}.self_attn.q_proj.weight": _tensor([512, 512]),
+                f"{prefix}.self_attn.k_proj.weight": _tensor([256, 512]),
+                f"{prefix}.self_attn.v_proj.weight": _tensor([256, 512]),
+                f"{prefix}.self_attn.o_proj.weight": _tensor([512, 512]),
+                f"{prefix}.self_attn.q_norm.weight": _tensor([128]),
+                f"{prefix}.self_attn.k_norm.weight": _tensor([128]),
+                f"{prefix}.mlp.gate_proj.weight": _tensor([2048, 512]),
+                f"{prefix}.mlp.up_proj.weight": _tensor([2048, 512]),
+                f"{prefix}.mlp.down_proj.weight": _tensor([512, 2048]),
+            }
+        )
+    config = {
+        "model_type": "synthetic_decoder",
+        "hidden_size": 512,
+        "intermediate_size": 2048,
+        "num_hidden_layers": 1,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "head_dim": 128,
+        "vocab_size": 1024,
+        "max_position_embeddings": 4096,
+        "rms_norm_eps": 1e-6,
+        "rope_theta": 10000.0,
+    }
+
+    structure = discover_model_structure(Path("synthetic"), config, tensors)
+    assert len(structure.layers) == 1
+    assert len(structure.draft_pedalboards) == 1
+    draft = structure.draft_pedalboards[0]
+    assert draft.id == "draft_00"
+    assert draft.prefix == "mtp"
+    assert draft.tensors == {
+        "embedding_norm": "mtp.pre_fc_norm_embedding.weight",
+        "hidden_norm": "mtp.pre_fc_norm_hidden.weight",
+        "input_projection": "mtp.fc.weight",
+        "output_norm": "mtp.norm.weight",
+        "output_projection": "lm_head.weight",
+    }
+    assert len(draft.layers) == 1
+    assert draft.layers[0].prefix == "mtp.layers.0"
+
+    graph = make_model_graph(structure, Path("transpiled"), {"source": {}})
+    [draft_graph] = graph["graph"]["draft_pedalboards"]
+    assert draft_graph["type"] == "multi_token_prediction"
+    assert draft_graph["input_adapter"]["attrs"]["concatenation_order"] == [
+        "token_embedding",
+        "target_hidden",
+    ]
+    assert draft_graph["pedalboard"]["pedals"][0]["id"] == "draft_00_layer_00"
+    assert draft_graph["state_contract"]["draft_updates"] == "tentative"
+
+    draft_layer = make_layer(
+        structure,
+        draft.layers[0],
+        pedal_id="draft_00_layer_00",
+        runtime_role="draft_processor",
+    )
+    assert draft_layer["runtime_role"] == "draft_processor"
+    assert draft_layer["transition_contract"]["reference_behavior"] == (
+        "source_checkpoint_entity:mtp.layers.0"
+    )
 
 
 def test_synthesizes_separate_experts_as_packed_circuit_parameters() -> None:
@@ -296,6 +373,7 @@ def test_discovers_attention_without_optional_query_key_norms() -> None:
     assert nodes["k_rope"]["attrs"]["head_count"] == 5
     assert nodes["q_rope"]["attrs"]["theta"] == 100000.0
     assert nodes["operator_norm"]["attrs"]["eps"] == 1e-5
+
 
 def test_discovers_nested_hybrid_decoder_by_tensor_structure() -> None:
     root = "model.language_model"
@@ -561,8 +639,12 @@ def test_discovers_fused_qkv_and_gate_up_projections_by_shape() -> None:
 def test_discovers_multimodal_decoder_with_per_layer_inputs_and_shared_kv() -> None:
     language_root = "model.language_model"
     tensors = {
-        "model.audio_tower.layers.0.feed_forward1.ffw_layer_1.linear.weight": _tensor([64, 16]),
-        "model.audio_tower.layers.0.feed_forward1.ffw_layer_2.linear.weight": _tensor([16, 64]),
+        "model.audio_tower.layers.0.feed_forward1.ffw_layer_1.linear.weight": _tensor(
+            [64, 16]
+        ),
+        "model.audio_tower.layers.0.feed_forward1.ffw_layer_2.linear.weight": _tensor(
+            [16, 64]
+        ),
         f"{language_root}.embed_tokens.weight": _tensor([256, 16]),
         f"{language_root}.embed_tokens_per_layer.weight": _tensor([256, 8]),
         f"{language_root}.per_layer_model_projection.weight": _tensor([8, 16]),
