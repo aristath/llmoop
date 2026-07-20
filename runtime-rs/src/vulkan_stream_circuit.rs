@@ -8879,6 +8879,7 @@ pub struct VulkanResidentInProcessPlacedStreamProcessor {
     output_transducer: VulkanResidentOutputTransducerRunner,
     sampler: VulkanResidentSamplerRunner,
     feedback_token_cable: Option<VulkanResidentMappedBufferCopy>,
+    activation_schedule: VulkanMountedPlacedResidentInProcessSchedule,
     device_slices: Vec<VulkanResidentInProcessPlacedStreamProcessorDevice>,
 }
 
@@ -9433,6 +9434,13 @@ impl VulkanResidentInProcessPlacedModelPackage {
                 )),
             )
         })?;
+        let activation_tick_plans = devices
+            .iter()
+            .map(|slice| slice.resident_execution_plan.tick_plan.as_ref())
+            .collect::<Vec<_>>();
+        let activation_schedule =
+            VulkanMountedPlacedResidentInProcessSchedule::from_tick_plans(&activation_tick_plans)
+                .map_err(VulkanResidentInProcessPlacedRuntimeError::Schedule)?;
         let input_slice = devices
             .iter()
             .find(|slice| slice.device_id == self.input_device_id)
@@ -9504,6 +9512,7 @@ impl VulkanResidentInProcessPlacedModelPackage {
             output_transducer,
             sampler,
             feedback_token_cable,
+            activation_schedule,
             device_slices: devices,
         })
     }
@@ -9586,8 +9595,12 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
             ));
         }
 
-        run_mounted_placed_resident_stream_tick_slices_in_process(&mut tick_slices, transport)
-            .map_err(VulkanResidentInProcessPlacedRuntimeError::Tick)
+        run_mounted_placed_resident_stream_tick_slices_in_process_with_schedule(
+            &mut tick_slices,
+            transport,
+            &self.activation_schedule,
+        )
+        .map_err(VulkanResidentInProcessPlacedRuntimeError::Tick)
     }
 
     pub fn run_stream_tick_on_bound_devices_in_process(
@@ -9636,8 +9649,12 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
             ));
         }
 
-        run_mounted_placed_resident_stream_tick_slices_in_process(&mut tick_slices, transport)
-            .map_err(VulkanResidentInProcessPlacedRuntimeError::Tick)
+        run_mounted_placed_resident_stream_tick_slices_in_process_with_schedule(
+            &mut tick_slices,
+            transport,
+            &self.activation_schedule,
+        )
+        .map_err(VulkanResidentInProcessPlacedRuntimeError::Tick)
     }
 
     fn execute_prepared_token_id_stream_tick_in_process_with_transport(
@@ -9688,9 +9705,12 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
                 ),
             );
         }
-        let placed_run =
-            run_mounted_placed_resident_stream_tick_slices_in_process(&mut tick_slices, transport)
-                .map_err(VulkanResidentInProcessPlacedRuntimeError::Tick)?;
+        let placed_run = run_mounted_placed_resident_stream_tick_slices_in_process_with_schedule(
+            &mut tick_slices,
+            transport,
+            &self.activation_schedule,
+        )
+        .map_err(VulkanResidentInProcessPlacedRuntimeError::Tick)?;
         if placed_run.status != VulkanMountedPlacedResidentInProcessStreamTickRunStatus::Completed {
             return Err(VulkanResidentInProcessPlacedRuntimeError::IncompleteTick(
                 placed_run.status,
@@ -9802,9 +9822,12 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
                 ),
             );
         }
-        let placed_run =
-            run_mounted_placed_resident_stream_tick_slices_in_process(&mut tick_slices, transport)
-                .map_err(VulkanResidentInProcessPlacedRuntimeError::Tick)?;
+        let placed_run = run_mounted_placed_resident_stream_tick_slices_in_process_with_schedule(
+            &mut tick_slices,
+            transport,
+            &self.activation_schedule,
+        )
+        .map_err(VulkanResidentInProcessPlacedRuntimeError::Tick)?;
         if placed_run.status != VulkanMountedPlacedResidentInProcessStreamTickRunStatus::Completed {
             return Err(VulkanResidentInProcessPlacedRuntimeError::IncompleteTick(
                 placed_run.status,
@@ -11790,6 +11813,7 @@ pub enum VulkanResidentInProcessPlacedRuntimeError {
     Package(VulkanResidentTokenModelPackageError),
     BoundDispatchPlan(VulkanBoundDispatchPlanError),
     ResidentDispatch(VulkanMountedPlacedResidentKernelDispatchError),
+    Schedule(VulkanError),
     Tick(VulkanMountedPlacedResidentInProcessStreamTickError),
     InputTransducer(VulkanResidentInputEmbeddingTransducerRunnerError),
     OutputTransducer(VulkanResidentOutputTransducerRunnerError),
@@ -11829,6 +11853,7 @@ impl Display for VulkanResidentInProcessPlacedRuntimeError {
             Self::Package(error) => Display::fmt(error, f),
             Self::BoundDispatchPlan(error) => Display::fmt(error, f),
             Self::ResidentDispatch(error) => Display::fmt(error, f),
+            Self::Schedule(error) => Display::fmt(error, f),
             Self::Tick(error) => Display::fmt(error, f),
             Self::InputTransducer(error) => Display::fmt(error, f),
             Self::OutputTransducer(error) => Display::fmt(error, f),
@@ -17144,15 +17169,135 @@ pub enum VulkanMountedPlacedResidentInProcessStreamTickRunStatus {
     Blocked { pending_device_ids: Vec<String> },
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct VulkanMountedPlacedResidentInProcessSchedule {
+    device_ids: Vec<String>,
+    turns: Vec<Vec<usize>>,
+}
+
+impl VulkanMountedPlacedResidentInProcessSchedule {
+    fn from_tick_plans(
+        tick_plans: &[&VulkanMountedPlacedStreamTickPlan],
+    ) -> Result<Self, VulkanError> {
+        let device_ids = tick_plans
+            .iter()
+            .map(|plan| plan.device_id.clone())
+            .collect::<Vec<_>>();
+        let mut unique_device_ids = BTreeSet::new();
+        for device_id in &device_ids {
+            if !unique_device_ids.insert(device_id.clone()) {
+                return Err(VulkanError(format!(
+                    "placed activation schedule repeats device {device_id:?}"
+                )));
+            }
+        }
+
+        let mut next_stage_indices = vec![0usize; tick_plans.len()];
+        let mut ready_cables = BTreeSet::<VulkanPlacedCablePacketKey>::new();
+        let mut turns = Vec::new();
+
+        while tick_plans
+            .iter()
+            .enumerate()
+            .any(|(index, plan)| next_stage_indices[index] < plan.stages.len())
+        {
+            let mut turn = Vec::new();
+            for (device_index, plan) in tick_plans.iter().enumerate() {
+                let completed_before = next_stage_indices[device_index];
+                while next_stage_indices[device_index] < plan.stages.len() {
+                    match &plan.stages[next_stage_indices[device_index]] {
+                        VulkanMountedPlacedStreamTickStage::ReceiveCable {
+                            cable_index,
+                            remote_device_id,
+                            ..
+                        } => {
+                            let key = VulkanPlacedCablePacketKey {
+                                cable_index: *cable_index,
+                                from_device_id: remote_device_id.clone(),
+                                to_device_id: plan.device_id.clone(),
+                            };
+                            if !ready_cables.remove(&key) {
+                                break;
+                            }
+                        }
+                        VulkanMountedPlacedStreamTickStage::Dispatch { .. } => {}
+                        VulkanMountedPlacedStreamTickStage::PublishCable {
+                            cable_index,
+                            remote_device_id,
+                            ..
+                        } => {
+                            ready_cables.insert(VulkanPlacedCablePacketKey {
+                                cable_index: *cable_index,
+                                from_device_id: plan.device_id.clone(),
+                                to_device_id: remote_device_id.clone(),
+                            });
+                        }
+                    }
+                    next_stage_indices[device_index] += 1;
+                }
+                if next_stage_indices[device_index] != completed_before {
+                    turn.push(device_index);
+                }
+            }
+
+            if turn.is_empty() {
+                let pending_device_ids = tick_plans
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, plan)| next_stage_indices[*index] < plan.stages.len())
+                    .map(|(_, plan)| plan.device_id.clone())
+                    .collect::<Vec<_>>();
+                return Err(VulkanError(format!(
+                    "placed activation topology is blocked with pending devices {pending_device_ids:?}"
+                )));
+            }
+            turns.push(turn);
+        }
+
+        if !ready_cables.is_empty() {
+            return Err(VulkanError(format!(
+                "placed activation topology leaves unconsumed cables {:?}",
+                ready_cables.into_iter().collect::<Vec<_>>()
+            )));
+        }
+
+        Ok(Self { device_ids, turns })
+    }
+
+    fn validate_slices(
+        &self,
+        slices: &[VulkanMountedPlacedResidentInProcessStreamTickSlice<'_>],
+    ) -> Result<(), VulkanError> {
+        if slices.len() != self.device_ids.len() {
+            return Err(VulkanError(format!(
+                "placed activation schedule expects {} device slices, found {}",
+                self.device_ids.len(),
+                slices.len()
+            )));
+        }
+        for (device_index, (expected, slice)) in self.device_ids.iter().zip(slices).enumerate() {
+            if expected != slice.device_id() {
+                return Err(VulkanError(format!(
+                    "placed activation schedule device {device_index} is {expected:?}, found {:?}",
+                    slice.device_id()
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug)]
 pub enum VulkanMountedPlacedResidentInProcessStreamTickError {
     StreamTick(VulkanMountedPlacedResidentStreamTickError),
+    Schedule(VulkanError),
 }
 
 impl Display for VulkanMountedPlacedResidentInProcessStreamTickError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::StreamTick(error) => Display::fmt(error, f),
+            Self::Schedule(error) => Display::fmt(error, f),
         }
     }
 }
@@ -17201,20 +17346,36 @@ pub fn run_mounted_placed_resident_stream_tick_slices_in_process(
     VulkanMountedPlacedResidentInProcessStreamTickRun,
     VulkanMountedPlacedResidentInProcessStreamTickError,
 > {
+    let tick_plans = slices
+        .iter()
+        .map(|slice| slice.execution_plan.tick_plan.as_ref())
+        .collect::<Vec<_>>();
+    let schedule = VulkanMountedPlacedResidentInProcessSchedule::from_tick_plans(&tick_plans)
+        .map_err(VulkanMountedPlacedResidentInProcessStreamTickError::Schedule)?;
+    run_mounted_placed_resident_stream_tick_slices_in_process_with_schedule(
+        slices, transport, &schedule,
+    )
+}
+
+fn run_mounted_placed_resident_stream_tick_slices_in_process_with_schedule(
+    slices: &mut [VulkanMountedPlacedResidentInProcessStreamTickSlice<'_>],
+    transport: &mut VulkanInProcessPlacedCableTransport,
+    schedule: &VulkanMountedPlacedResidentInProcessSchedule,
+) -> Result<
+    VulkanMountedPlacedResidentInProcessStreamTickRun,
+    VulkanMountedPlacedResidentInProcessStreamTickError,
+> {
+    schedule
+        .validate_slices(slices)
+        .map_err(VulkanMountedPlacedResidentInProcessStreamTickError::Schedule)?;
     transport.reset_tick_state();
     register_in_process_direct_cable_copies(slices, transport)?;
 
-    let mut scheduler_turn_count = 0usize;
     let mut completed_stage_delta = 0usize;
 
-    loop {
-        scheduler_turn_count += 1;
-        let completed_before_turn = completed_stage_delta;
-
-        for slice in slices.iter_mut() {
-            if slice.cursor.is_completed() {
-                continue;
-            }
+    for (turn_index, device_indices) in schedule.turns.iter().enumerate() {
+        for device_index in device_indices {
+            let slice = &mut slices[*device_index];
             let advance = slice
                 .cursor
                 .advance_with_resident_execution_plan_and_in_process_transport(
@@ -17224,32 +17385,36 @@ pub fn run_mounted_placed_resident_stream_tick_slices_in_process(
                     &slice.dispatch_extensions,
                     transport,
                 )?;
+            if advance.completed_stage_delta == 0 {
+                return Err(
+                    VulkanMountedPlacedResidentInProcessStreamTickError::Schedule(VulkanError(
+                        format!(
+                            "placed activation schedule turn {turn_index} made no progress on device {:?}",
+                            slice.device_id()
+                        ),
+                    )),
+                );
+            }
             completed_stage_delta += advance.completed_stage_delta;
         }
-
-        if slices.iter().all(|slice| slice.cursor.is_completed()) {
-            return Ok(in_process_stream_tick_run_snapshot(
-                slices,
-                transport,
-                VulkanMountedPlacedResidentInProcessStreamTickRunStatus::Completed,
-                scheduler_turn_count,
-                completed_stage_delta,
-            ));
-        }
-
-        if completed_stage_delta == completed_before_turn {
-            let pending_device_ids = pending_in_process_stream_tick_device_ids(slices);
-            return Ok(in_process_stream_tick_run_snapshot(
-                slices,
-                transport,
-                VulkanMountedPlacedResidentInProcessStreamTickRunStatus::Blocked {
-                    pending_device_ids,
-                },
-                scheduler_turn_count,
-                completed_stage_delta,
-            ));
-        }
     }
+
+    if !slices.iter().all(|slice| slice.cursor.is_completed()) {
+        return Err(
+            VulkanMountedPlacedResidentInProcessStreamTickError::Schedule(VulkanError(format!(
+                "placed activation schedule ended with pending devices {:?}",
+                pending_in_process_stream_tick_device_ids(slices)
+            ))),
+        );
+    }
+
+    Ok(in_process_stream_tick_run_snapshot(
+        slices,
+        transport,
+        VulkanMountedPlacedResidentInProcessStreamTickRunStatus::Completed,
+        schedule.turns.len(),
+        completed_stage_delta,
+    ))
 }
 
 fn pending_in_process_stream_tick_device_ids(
@@ -19963,6 +20128,194 @@ mod tests {
         assert_eq!(
             placed_token_input(13, "gpu0", "gpu1", true),
             VulkanResidentPlacedTokenInput::CableFeedback(13)
+        );
+    }
+
+    #[test]
+    fn placed_activation_schedule_is_compiled_from_cable_dependencies() {
+        fn dispatch(stage_index: usize, device_id: &str) -> VulkanMountedPlacedStreamTickStage {
+            VulkanMountedPlacedStreamTickStage::Dispatch {
+                stage_index,
+                dispatch: VulkanMountedPlacedStreamTickDispatch {
+                    dispatch_index: stage_index,
+                    kernel_id: format!("{device_id}.kernel_{stage_index}"),
+                    pedal_id: format!("{device_id}.pedal"),
+                    node_id: format!("node_{stage_index}"),
+                    op: "test".to_string(),
+                    descriptor_count: 0,
+                    resident_descriptor_count: 0,
+                    reads: Vec::new(),
+                    writes: Vec::new(),
+                },
+            }
+        }
+
+        fn plan(
+            device_id: &str,
+            stages: Vec<VulkanMountedPlacedStreamTickStage>,
+        ) -> VulkanMountedPlacedStreamTickPlan {
+            let stage_count = stages.len();
+            let receive_stage_count = stages
+                .iter()
+                .filter(|stage| {
+                    matches!(
+                        stage,
+                        VulkanMountedPlacedStreamTickStage::ReceiveCable { .. }
+                    )
+                })
+                .count();
+            let dispatch_stage_count = stages
+                .iter()
+                .filter(|stage| {
+                    matches!(stage, VulkanMountedPlacedStreamTickStage::Dispatch { .. })
+                })
+                .count();
+            let publish_stage_count = stages
+                .iter()
+                .filter(|stage| {
+                    matches!(
+                        stage,
+                        VulkanMountedPlacedStreamTickStage::PublishCable { .. }
+                    )
+                })
+                .count();
+            VulkanMountedPlacedStreamTickPlan {
+                backend_id: VULKAN_STREAM_CIRCUIT_BACKEND_ID.to_string(),
+                device_id: device_id.to_string(),
+                stages,
+                stage_count,
+                receive_stage_count,
+                dispatch_stage_count,
+                publish_stage_count,
+                local_cable_read_count: 0,
+                local_cable_write_count: 0,
+                incoming_cable_read_count: receive_stage_count,
+                outgoing_cable_write_count: publish_stage_count,
+                model_input_read_count: 0,
+                model_output_write_count: 0,
+                can_execute: true,
+            }
+        }
+
+        let gpu0 = plan(
+            "gpu0",
+            vec![
+                dispatch(0, "gpu0"),
+                VulkanMountedPlacedStreamTickStage::PublishCable {
+                    stage_index: 1,
+                    cable_index: 0,
+                    endpoint_id: "cable_0_out".to_string(),
+                    buffer_index: 0,
+                    byte_capacity: 16,
+                    remote_device_id: "gpu1".to_string(),
+                    remote_pedal_id: "gpu1.pedal".to_string(),
+                },
+                VulkanMountedPlacedStreamTickStage::ReceiveCable {
+                    stage_index: 2,
+                    cable_index: 1,
+                    endpoint_id: "cable_1_in".to_string(),
+                    buffer_index: 0,
+                    byte_capacity: 16,
+                    remote_device_id: "gpu1".to_string(),
+                    remote_pedal_id: "gpu1.pedal".to_string(),
+                },
+                dispatch(3, "gpu0"),
+            ],
+        );
+        let gpu1 = plan(
+            "gpu1",
+            vec![
+                VulkanMountedPlacedStreamTickStage::ReceiveCable {
+                    stage_index: 0,
+                    cable_index: 0,
+                    endpoint_id: "cable_0_in".to_string(),
+                    buffer_index: 0,
+                    byte_capacity: 16,
+                    remote_device_id: "gpu0".to_string(),
+                    remote_pedal_id: "gpu0.pedal".to_string(),
+                },
+                dispatch(1, "gpu1"),
+                VulkanMountedPlacedStreamTickStage::PublishCable {
+                    stage_index: 2,
+                    cable_index: 1,
+                    endpoint_id: "cable_1_out".to_string(),
+                    buffer_index: 0,
+                    byte_capacity: 16,
+                    remote_device_id: "gpu0".to_string(),
+                    remote_pedal_id: "gpu0.pedal".to_string(),
+                },
+            ],
+        );
+
+        let schedule =
+            VulkanMountedPlacedResidentInProcessSchedule::from_tick_plans(&[&gpu0, &gpu1]).unwrap();
+        assert_eq!(schedule.device_ids, ["gpu0", "gpu1"]);
+        assert_eq!(schedule.turns, [vec![0, 1], vec![0]]);
+        assert_eq!(schedule.turns.len(), 2);
+        assert_eq!(schedule.turns.iter().map(Vec::len).sum::<usize>(), 3);
+
+        let reversed =
+            VulkanMountedPlacedResidentInProcessSchedule::from_tick_plans(&[&gpu1, &gpu0]).unwrap();
+        assert_eq!(reversed.device_ids, ["gpu1", "gpu0"]);
+        assert_eq!(reversed.turns, [vec![1], vec![0, 1]]);
+        assert_eq!(reversed.turns.iter().map(Vec::len).sum::<usize>(), 3);
+    }
+
+    #[test]
+    fn placed_activation_schedule_rejects_unroutable_cables() {
+        let blocked = VulkanMountedPlacedStreamTickPlan {
+            backend_id: VULKAN_STREAM_CIRCUIT_BACKEND_ID.to_string(),
+            device_id: "gpu0".to_string(),
+            stages: vec![VulkanMountedPlacedStreamTickStage::ReceiveCable {
+                stage_index: 0,
+                cable_index: 7,
+                endpoint_id: "missing_in".to_string(),
+                buffer_index: 0,
+                byte_capacity: 16,
+                remote_device_id: "gpu1".to_string(),
+                remote_pedal_id: "remote".to_string(),
+            }],
+            stage_count: 1,
+            receive_stage_count: 1,
+            dispatch_stage_count: 0,
+            publish_stage_count: 0,
+            local_cable_read_count: 0,
+            local_cable_write_count: 0,
+            incoming_cable_read_count: 1,
+            outgoing_cable_write_count: 0,
+            model_input_read_count: 0,
+            model_output_write_count: 0,
+            can_execute: true,
+        };
+        assert_eq!(
+            VulkanMountedPlacedResidentInProcessSchedule::from_tick_plans(&[&blocked])
+                .unwrap_err()
+                .0,
+            "placed activation topology is blocked with pending devices [\"gpu0\"]"
+        );
+
+        let mut unconsumed = blocked.clone();
+        unconsumed.stages[0] = VulkanMountedPlacedStreamTickStage::PublishCable {
+            stage_index: 0,
+            cable_index: 7,
+            endpoint_id: "orphan_out".to_string(),
+            buffer_index: 0,
+            byte_capacity: 16,
+            remote_device_id: "gpu1".to_string(),
+            remote_pedal_id: "remote".to_string(),
+        };
+        assert!(
+            VulkanMountedPlacedResidentInProcessSchedule::from_tick_plans(&[&unconsumed])
+                .unwrap_err()
+                .0
+                .contains("leaves unconsumed cables")
+        );
+
+        assert_eq!(
+            VulkanMountedPlacedResidentInProcessSchedule::from_tick_plans(&[&blocked, &blocked])
+                .unwrap_err()
+                .0,
+            "placed activation schedule repeats device \"gpu0\""
         );
     }
 
