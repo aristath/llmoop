@@ -195,7 +195,7 @@ def test_compiler_selects_cooperative_bfloat16_projection_kernels() -> None:
     ) == 24
     assert cooperative_bfloat16_workgroup_count_x(
         "parallel_linear_silu_multiply_bf16_1024x4096.comp"
-    ) == 128
+    ) == 64
     assert cooperative_bfloat16_batch_shader_file(
         "linear_fp8_e4m3_b128x128_1024x4096.comp"
     ) is None
@@ -317,9 +317,7 @@ def test_compiler_renders_cooperative_bfloat16_batch_shaders(tmp_path: Path) -> 
         assert "#extension GL_EXT_bfloat16 : require" in source
         assert "#extension GL_KHR_cooperative_matrix : require" in source
         assert "layout(local_size_x = 256" in source
-        expected_output_tile = (
-            32 if "silu_multiply" in shader_file else 64
-        )
+        expected_output_tile = 64
         assert f"const uint OUTPUT_TILE = {expected_output_tile}u;" in source
         assert "const uint BATCH_TILE = 64u;" in source
         expected_result_tile = (
@@ -349,6 +347,9 @@ def test_compiler_renders_cooperative_bfloat16_batch_shaders(tmp_path: Path) -> 
     assert "weight_c.values," in direct_parallel
     assert "gate_weight.values," in direct_fused
     assert "up_weight.values," in direct_fused
+    assert "const uint BRANCH_SUBGROUPS = 2u;" in direct_fused
+    assert "sums[OUTPUT_SUBTILES_PER_SUBGROUP * BATCH_SUBTILES]" in direct_fused
+    assert "branch * OUTPUT_TILE * BATCH_TILE" in direct_fused
     assert "coopmat<bfloat16_t" in direct_linear
     assert "uintBitsToBFloat16EXT(uint16_t(f32_to_bf16" in direct_linear
     assert "residual_frames.values," in direct_linear
