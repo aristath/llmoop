@@ -623,12 +623,18 @@ def speculative_decoder_specs(
                 ),
                 "input_adapter": {
                     "pedal_id": input_ref["id"],
+                    "token_embedding_signal_id": "token_embedding",
+                    "target_hidden_signal_id": "target_hidden",
+                    "output_signal_id": "output_frame",
                     "input_frame_byte_capacity": frame_bytes,
                     "target_hidden_byte_capacity": frame_bytes,
                     "output_frame_byte_capacity": frame_bytes,
                 },
                 "output_transducer": {
                     "pedal_id": output_ref["id"],
+                    "input_signal_id": "output_frame",
+                    "hidden_signal_id": "output_hidden",
+                    "logits_signal_id": "output_logits",
                     "norm_parameter_tensor": norm_tensor,
                     "norm_parameter_dtype": tensor_dtype(tensor_index, norm_tensor),
                     "norm_parameter_shape": tensor_shape(tensor_index, norm_tensor),

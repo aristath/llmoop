@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Ref, RefCell};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
@@ -28,7 +28,8 @@ use crate::stream_plan::{
 };
 use crate::vulkan::{DEFAULT_COMPUTE_LOCAL_SIZE_X, DEFAULT_SPIRV_ENTRY_POINT, read_spirv_words};
 use crate::vulkan_compute::{
-    VulkanComputeDevice, VulkanError, VulkanResidentBuffer, VulkanResidentKernelBufferAccess,
+    VulkanComputeDevice, VulkanError, VulkanResidentBuffer, VulkanResidentBufferCopy,
+    VulkanResidentBufferCopyBatch, VulkanResidentBufferRangeCopy, VulkanResidentKernelBufferAccess,
     VulkanResidentKernelBufferBinding, VulkanResidentKernelDispatch, VulkanResidentKernelSequence,
     VulkanResidentKernelSequenceSnapshotCopy, VulkanResidentKernelSequenceStep,
     VulkanResidentMappedBufferCopy,
@@ -3510,6 +3511,40 @@ impl VulkanResidentOutputTransducerRunner {
         tied_projection_spirv_words: &[u32],
         spec: &VulkanResidentOutputTransducerSpec,
     ) -> Result<Self, VulkanResidentOutputTransducerRunnerError> {
+        let embedding_norm_weight = transducer_parameter_buffers
+            .parameter_buffer(&spec.norm_parameter_tensor)
+            .ok_or_else(|| {
+                VulkanResidentOutputTransducerRunnerError::MissingTransducerParameterBuffer {
+                    tensor: spec.norm_parameter_tensor.clone(),
+                }
+            })?;
+        let embedding_weight = transducer_parameter_buffers
+            .parameter_buffer(&spec.projection_parameter_tensor)
+            .ok_or_else(|| {
+                VulkanResidentOutputTransducerRunnerError::MissingTransducerParameterBuffer {
+                    tensor: spec.projection_parameter_tensor.clone(),
+                }
+            })?;
+        Self::from_mounted_output_transducer_with_parameter_allocations(
+            device,
+            mounted,
+            embedding_norm_weight,
+            embedding_weight,
+            embedding_norm_spirv_words,
+            tied_projection_spirv_words,
+            spec,
+        )
+    }
+
+    fn from_mounted_output_transducer_with_parameter_allocations(
+        device: &VulkanComputeDevice,
+        mounted: &VulkanMountedPlacedStreamCircuit,
+        embedding_norm_weight: &VulkanPermanentParameterBufferAllocation,
+        embedding_weight: &VulkanPermanentParameterBufferAllocation,
+        embedding_norm_spirv_words: &[u32],
+        tied_projection_spirv_words: &[u32],
+        spec: &VulkanResidentOutputTransducerSpec,
+    ) -> Result<Self, VulkanResidentOutputTransducerRunnerError> {
         let output_frame = mounted
             .boundary_io
             .output_buffer(&spec.input_signal_id)
@@ -3528,22 +3563,8 @@ impl VulkanResidentOutputTransducerRunner {
             );
         }
 
-        let embedding_norm_weight = transducer_parameter_buffers
-            .parameter_buffer(&spec.norm_parameter_tensor)
-            .ok_or_else(|| {
-                VulkanResidentOutputTransducerRunnerError::MissingTransducerParameterBuffer {
-                    tensor: spec.norm_parameter_tensor.clone(),
-                }
-            })?;
-        validate_output_embedding_norm_weight(embedding_norm_weight, spec)?;
-        let embedding_weight = transducer_parameter_buffers
-            .parameter_buffer(&spec.projection_parameter_tensor)
-            .ok_or_else(|| {
-                VulkanResidentOutputTransducerRunnerError::MissingTransducerParameterBuffer {
-                    tensor: spec.projection_parameter_tensor.clone(),
-                }
-            })?;
         validate_output_projection_weight(embedding_weight, spec)?;
+        validate_output_embedding_norm_weight(embedding_norm_weight, spec)?;
 
         let normalized_frame_buffer =
             device.create_resident_buffer(spec.normalized_frame_byte_capacity)?;
@@ -3672,6 +3693,10 @@ impl VulkanResidentOutputTransducerRunner {
 
     pub fn logits_buffer(&self) -> &VulkanResidentBuffer {
         &self.logits_buffer
+    }
+
+    pub fn normalized_frame_buffer(&self) -> &VulkanResidentBuffer {
+        &self.normalized_frame_buffer
     }
 
     pub fn read_normalized_frame_bytes(&self, len: usize) -> Result<Vec<u8>, VulkanError> {
@@ -4551,7 +4576,7 @@ impl VulkanResidentFeedbackLoopRunner {
         start_stream_tick: u64,
         tick_count: usize,
         buffers: &VulkanStreamCircuitStreamBuffers,
-        snapshots: &VulkanResidentStaticStateSnapshotBank,
+        snapshots: &VulkanResidentStateTransactionBank,
     ) -> Result<VulkanResidentFeedbackLoopRun, VulkanResidentFeedbackLoopRunnerError> {
         if tick_count == 0 {
             return Err(VulkanResidentFeedbackLoopRunnerError::ZeroTickBudget);
@@ -4957,22 +4982,161 @@ impl From<VulkanError> for VulkanResidentFeedbackLoopRunnerError {
     }
 }
 
-struct VulkanResidentStaticStateSnapshotEntry {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanSpeculativeVerificationResult {
+    pub accepted_draft_count: usize,
+    pub committed_target_tick_count: usize,
+    pub emitted_token_ids: Vec<u32>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanSpeculativeCycleRun {
+    pub decoder_id: String,
+    pub initial_token_id: u32,
+    pub start_stream_tick: u64,
+    pub draft_token_ids: Vec<u32>,
+    pub target_token_ids: Vec<u32>,
+    pub verification: VulkanSpeculativeVerificationResult,
+    pub draft_time_ns: u64,
+    pub target_verification_time_ns: u64,
+    pub draft_catch_up_time_ns: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct VulkanSpeculativeDecodeStats {
+    pub cycle_count: usize,
+    pub proposed_draft_token_count: usize,
+    pub accepted_draft_token_count: usize,
+    pub emitted_token_count: usize,
+    pub draft_time_ns: u64,
+    pub target_verification_time_ns: u64,
+    pub draft_catch_up_time_ns: u64,
+}
+
+impl VulkanSpeculativeDecodeStats {
+    fn record_cycle(&mut self, cycle: &VulkanSpeculativeCycleRun) {
+        self.cycle_count = self.cycle_count.saturating_add(1);
+        self.proposed_draft_token_count = self
+            .proposed_draft_token_count
+            .saturating_add(cycle.draft_token_ids.len());
+        self.accepted_draft_token_count = self
+            .accepted_draft_token_count
+            .saturating_add(cycle.verification.accepted_draft_count);
+        self.emitted_token_count = self
+            .emitted_token_count
+            .saturating_add(cycle.verification.emitted_token_ids.len());
+        self.draft_time_ns = self.draft_time_ns.saturating_add(cycle.draft_time_ns);
+        self.target_verification_time_ns = self
+            .target_verification_time_ns
+            .saturating_add(cycle.target_verification_time_ns);
+        self.draft_catch_up_time_ns = self
+            .draft_catch_up_time_ns
+            .saturating_add(cycle.draft_catch_up_time_ns);
+    }
+}
+
+pub fn verify_speculative_token_prefix(
+    draft_token_ids: &[u32],
+    target_token_ids: &[u32],
+) -> Result<VulkanSpeculativeVerificationResult, VulkanError> {
+    let expected_target_count = draft_token_ids
+        .len()
+        .checked_add(1)
+        .ok_or_else(|| VulkanError("speculative verification width overflowed".to_string()))?;
+    if target_token_ids.len() != expected_target_count {
+        return Err(VulkanError(format!(
+            "speculative verification has {} draft tokens but {} target predictions; expected {}",
+            draft_token_ids.len(),
+            target_token_ids.len(),
+            expected_target_count
+        )));
+    }
+
+    let accepted_draft_count = draft_token_ids
+        .iter()
+        .zip(target_token_ids)
+        .take_while(|(draft, target)| draft == target)
+        .count();
+    let committed_target_tick_count = accepted_draft_count
+        .checked_add(1)
+        .ok_or_else(|| VulkanError("speculative commit width overflowed".to_string()))?;
+    let mut emitted_token_ids = draft_token_ids[..accepted_draft_count].to_vec();
+    emitted_token_ids.push(target_token_ids[accepted_draft_count]);
+
+    Ok(VulkanSpeculativeVerificationResult {
+        accepted_draft_count,
+        committed_target_tick_count,
+        emitted_token_ids,
+    })
+}
+
+fn truncate_speculative_verification_at_stop(
+    verification: &mut VulkanSpeculativeVerificationResult,
+    stop_token_ids: &BTreeSet<u32>,
+) {
+    let Some(stop_index) = verification
+        .emitted_token_ids
+        .iter()
+        .position(|token_id| stop_token_ids.contains(token_id))
+    else {
+        return;
+    };
+    verification.accepted_draft_count = verification
+        .accepted_draft_count
+        .min(stop_index.saturating_add(1));
+    verification.committed_target_tick_count = stop_index.saturating_add(1);
+    verification.emitted_token_ids.truncate(stop_index + 1);
+}
+
+fn pipeline_wave_assignments(
+    wave_index: usize,
+    stage_count: usize,
+    token_count: usize,
+) -> Vec<(usize, usize)> {
+    (0..stage_count)
+        .filter_map(|stage_index| {
+            let token_index = wave_index.checked_sub(stage_index)?;
+            (token_index < token_count).then_some((stage_index, token_index))
+        })
+        .collect()
+}
+
+struct VulkanResidentStateTransactionEntry {
     state_buffer_index: usize,
     byte_capacity: usize,
     snapshots: VulkanResidentBuffer,
 }
 
-struct VulkanResidentStaticStateSnapshotBank {
+struct VulkanResidentStateTransactionBank {
     cycle_width: usize,
-    entries: Vec<VulkanResidentStaticStateSnapshotEntry>,
+    has_baseline: bool,
+    capture_batches: Vec<Option<VulkanResidentBufferCopyBatch>>,
+    restore_batches: Vec<Option<VulkanResidentBufferCopyBatch>>,
+    entries: Vec<VulkanResidentStateTransactionEntry>,
 }
 
-impl VulkanResidentStaticStateSnapshotBank {
+impl VulkanResidentStateTransactionBank {
     fn new(
         device: &VulkanComputeDevice,
         buffers: &VulkanStreamCircuitStreamBuffers,
         cycle_width: usize,
+    ) -> Result<Self, VulkanError> {
+        Self::new_with_baseline(device, buffers, cycle_width, false)
+    }
+
+    fn new_transactional(
+        device: &VulkanComputeDevice,
+        buffers: &VulkanStreamCircuitStreamBuffers,
+        cycle_width: usize,
+    ) -> Result<Self, VulkanError> {
+        Self::new_with_baseline(device, buffers, cycle_width, true)
+    }
+
+    fn new_with_baseline(
+        device: &VulkanComputeDevice,
+        buffers: &VulkanStreamCircuitStreamBuffers,
+        cycle_width: usize,
+        has_baseline: bool,
     ) -> Result<Self, VulkanError> {
         if cycle_width == 0 {
             return Err(VulkanError(
@@ -4984,24 +5148,75 @@ impl VulkanResidentStaticStateSnapshotBank {
             if state.static_byte_capacity.is_none() {
                 continue;
             }
-            let snapshot_byte_capacity =
-                state
-                    .byte_capacity
-                    .checked_mul(cycle_width)
-                    .ok_or_else(|| {
-                        VulkanError("resident feedback snapshot capacity overflowed".to_string())
-                    })?;
-            let mut snapshots =
-                device.create_host_visible_resident_buffer(snapshot_byte_capacity)?;
-            snapshots.persistently_map()?;
-            entries.push(VulkanResidentStaticStateSnapshotEntry {
+            let snapshot_count = cycle_width
+                .checked_add(usize::from(has_baseline))
+                .ok_or_else(|| {
+                    VulkanError("resident state transaction snapshot count overflowed".to_string())
+                })?;
+            let snapshot_byte_capacity = state
+                .byte_capacity
+                .checked_mul(snapshot_count)
+                .ok_or_else(|| {
+                    VulkanError("resident feedback snapshot capacity overflowed".to_string())
+                })?;
+            let snapshots = device.create_resident_buffer(snapshot_byte_capacity)?;
+            entries.push(VulkanResidentStateTransactionEntry {
                 state_buffer_index,
                 byte_capacity: state.byte_capacity,
                 snapshots,
             });
         }
+        let snapshot_count = cycle_width
+            .checked_add(usize::from(has_baseline))
+            .ok_or_else(|| {
+                VulkanError("resident state transaction snapshot count overflowed".to_string())
+            })?;
+        let mut capture_batches = Vec::with_capacity(snapshot_count);
+        let mut restore_batches = Vec::with_capacity(snapshot_count);
+        for snapshot_index in 0..snapshot_count {
+            let mut captures = Vec::with_capacity(entries.len());
+            let mut restores = Vec::with_capacity(entries.len());
+            for entry in &entries {
+                let state = &buffers.state_buffers[entry.state_buffer_index];
+                let snapshot_offset =
+                    snapshot_index
+                        .checked_mul(entry.byte_capacity)
+                        .ok_or_else(|| {
+                            VulkanError(
+                                "resident state transaction snapshot offset overflowed".to_string(),
+                            )
+                        })?;
+                captures.push(VulkanResidentBufferRangeCopy::new(
+                    &state.buffer,
+                    &entry.snapshots,
+                    0,
+                    snapshot_offset,
+                    entry.byte_capacity,
+                )?);
+                restores.push(VulkanResidentBufferRangeCopy::new(
+                    &entry.snapshots,
+                    &state.buffer,
+                    snapshot_offset,
+                    0,
+                    entry.byte_capacity,
+                )?);
+            }
+            capture_batches.push(
+                (!captures.is_empty())
+                    .then(|| device.create_resident_buffer_copy_batch(&captures))
+                    .transpose()?,
+            );
+            restore_batches.push(
+                (!restores.is_empty())
+                    .then(|| device.create_resident_buffer_copy_batch(&restores))
+                    .transpose()?,
+            );
+        }
         Ok(Self {
             cycle_width,
+            has_baseline,
+            capture_batches,
+            restore_batches,
             entries,
         })
     }
@@ -5033,7 +5248,7 @@ impl VulkanResidentStaticStateSnapshotBank {
                     &state.buffer,
                     &entry.snapshots,
                     0,
-                    tick_index * entry.byte_capacity,
+                    (tick_index + usize::from(self.has_baseline)) * entry.byte_capacity,
                     entry.byte_capacity,
                 )?);
             }
@@ -5041,23 +5256,77 @@ impl VulkanResidentStaticStateSnapshotBank {
         Ok(copies)
     }
 
-    fn restore_after_tick(
+    fn commit_prefix(
+        &self,
+        buffers: &VulkanStreamCircuitStreamBuffers,
+        processed_tick_count: usize,
+    ) -> Result<(), VulkanError> {
+        if processed_tick_count == 0 {
+            return Err(VulkanError(
+                "resident state transaction cannot commit an empty processed prefix".to_string(),
+            ));
+        }
+        if processed_tick_count > self.cycle_width {
+            return Err(VulkanError(format!(
+                "resident state transaction prefix {processed_tick_count} exceeds capacity {}",
+                self.cycle_width
+            )));
+        }
+        let _ = buffers;
+        let snapshot_index = processed_tick_count - 1 + usize::from(self.has_baseline);
+        if let Some(batch) = &self.restore_batches[snapshot_index] {
+            batch.run()?;
+        }
+        Ok(())
+    }
+
+    fn capture_processed_tick(
         &self,
         buffers: &VulkanStreamCircuitStreamBuffers,
         tick_index: usize,
     ) -> Result<(), VulkanError> {
         if tick_index >= self.cycle_width {
             return Err(VulkanError(format!(
-                "resident feedback snapshot tick {tick_index} exceeds capacity {}",
+                "resident state transaction tick {tick_index} exceeds capacity {}",
                 self.cycle_width
             )));
         }
-        for entry in &self.entries {
-            let offset = tick_index * entry.byte_capacity;
-            let bytes = entry.snapshots.read_bytes_at(offset, entry.byte_capacity)?;
-            buffers.state_buffers[entry.state_buffer_index]
-                .buffer
-                .write_bytes(&bytes)?;
+        let _ = buffers;
+        let snapshot_index = tick_index + usize::from(self.has_baseline);
+        if let Some(batch) = &self.capture_batches[snapshot_index] {
+            batch.run()?;
+        }
+        Ok(())
+    }
+
+    fn capture_baseline(
+        &self,
+        buffers: &VulkanStreamCircuitStreamBuffers,
+    ) -> Result<(), VulkanError> {
+        if !self.has_baseline {
+            return Err(VulkanError(
+                "resident state snapshot bank has no transactional baseline".to_string(),
+            ));
+        }
+        let _ = buffers;
+        if let Some(batch) = &self.capture_batches[0] {
+            batch.run()?;
+        }
+        Ok(())
+    }
+
+    fn restore_baseline(
+        &self,
+        buffers: &VulkanStreamCircuitStreamBuffers,
+    ) -> Result<(), VulkanError> {
+        if !self.has_baseline {
+            return Err(VulkanError(
+                "resident state snapshot bank has no transactional baseline".to_string(),
+            ));
+        }
+        let _ = buffers;
+        if let Some(batch) = &self.restore_batches[0] {
+            batch.run()?;
         }
         Ok(())
     }
@@ -5073,7 +5342,7 @@ pub struct VulkanResidentStreamProcessor {
     _mounted: VulkanMountedPlacedStreamCircuit,
     _transducer_parameter_buffers: Arc<VulkanPermanentParameterBuffers>,
     loop_runner: VulkanResidentFeedbackLoopRunner,
-    static_state_snapshots: VulkanResidentStaticStateSnapshotBank,
+    static_state_snapshots: VulkanResidentStateTransactionBank,
     backend_loop_window: usize,
 }
 
@@ -5088,11 +5357,8 @@ impl VulkanResidentStreamProcessor {
             total_static_state_bytes(&mounted.buffers)?,
             loop_runner.sampler.history_capacity_activations,
         );
-        let static_state_snapshots = VulkanResidentStaticStateSnapshotBank::new(
-            device,
-            &mounted.buffers,
-            backend_loop_window,
-        )?;
+        let static_state_snapshots =
+            VulkanResidentStateTransactionBank::new(device, &mounted.buffers, backend_loop_window)?;
         Ok(Self {
             device_id: loop_runner.device_id.clone(),
             pedal_count: loop_runner.pedal_count,
@@ -5674,7 +5940,7 @@ impl VulkanResidentRunningStream {
         if let Some(tick_index) = restore_after_tick {
             self.processor
                 .static_state_snapshots
-                .restore_after_tick(&self.processor._mounted.buffers, tick_index)?;
+                .commit_prefix(&self.processor._mounted.buffers, tick_index + 1)?;
         }
         Ok(ticks)
     }
@@ -8709,6 +8975,9 @@ pub struct VulkanResidentSpeculativeDecoderPackageSpec {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VulkanResidentDraftInputAdapterPackageSpec {
     pub pedal_id: String,
+    pub token_embedding_signal_id: String,
+    pub target_hidden_signal_id: String,
+    pub output_signal_id: String,
     pub input_frame_byte_capacity: usize,
     pub target_hidden_byte_capacity: usize,
     pub output_frame_byte_capacity: usize,
@@ -8717,6 +8986,9 @@ pub struct VulkanResidentDraftInputAdapterPackageSpec {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VulkanResidentDraftOutputTransducerPackageSpec {
     pub pedal_id: String,
+    pub input_signal_id: String,
+    pub hidden_signal_id: String,
+    pub logits_signal_id: String,
     pub norm_parameter_tensor: String,
     pub norm_parameter_dtype: String,
     pub norm_parameter_shape: Vec<usize>,
@@ -8975,6 +9247,180 @@ pub struct VulkanResidentInProcessPlacedModelPackage {
     output_transducer_spec: VulkanResidentOutputTransducerSpec,
     sampler_spec: VulkanResidentSamplerSpec,
     device_slices: Vec<Arc<VulkanResidentModelPackageDeviceSlice>>,
+    speculative_decoders: Vec<VulkanResidentSpeculativeDecoderModelPackage>,
+}
+
+pub struct VulkanResidentSpeculativeDecoderModelPackage {
+    pub id: String,
+    pub device_id: String,
+    pub hosted_pedal_count: usize,
+    package: VulkanResidentSpeculativeDecoderPackageSpec,
+    device_slice: Arc<VulkanResidentModelPackageDeviceSlice>,
+    additional_output_parameter_buffers: Option<Arc<VulkanPermanentParameterBuffers>>,
+    output_norm_spirv_words: Vec<u32>,
+    output_projection_spirv_words: Vec<u32>,
+}
+
+struct VulkanResidentSpeculativeDecoderLoadContext<'a> {
+    manifest_dir: &'a Path,
+    runtime_model: &'a VulkanResidentRuntimeModel,
+    capacity: usize,
+    tensor_index: &'a TensorIndex,
+    target_output_parameters: &'a VulkanPermanentParameterBuffers,
+}
+
+impl VulkanResidentSpeculativeDecoderModelPackage {
+    fn from_runtime_model(
+        device: &VulkanComputeDevice,
+        decoder: &VulkanResidentSpeculativeDecoderPackageSpec,
+        device_id: &str,
+        context: &VulkanResidentSpeculativeDecoderLoadContext<'_>,
+    ) -> Result<Self, VulkanResidentInProcessPlacedRuntimeError> {
+        let mut circuit_graph = decoder.circuit_graph.clone();
+        for pedal in &mut circuit_graph.pedals {
+            if matches!(
+                pedal.runtime_role,
+                CircuitRuntimeRole::DraftInputAdapter | CircuitRuntimeRole::DraftProcessor
+            ) {
+                pedal.runtime_role = CircuitRuntimeRole::SignalProcessor;
+                pedal.circuit.runtime_role = CircuitRuntimeRole::SignalProcessor;
+            }
+        }
+        let mut package = context.runtime_model.package.clone();
+        package.package_id = format!("{}::{}", package.package_id, decoder.id);
+        package.circuit_graph = circuit_graph.clone();
+        package.pedal_executions = decoder.pedal_executions.clone();
+        package.speculative_decoders.clear();
+        let draft_runtime_model = VulkanResidentRuntimeModel {
+            package,
+            patch: context.runtime_model.patch.clone(),
+            placement: StreamCircuitPlacementSpec::new(device_id),
+            circuit_graph,
+            pedal_executions: decoder.pedal_executions.clone(),
+        };
+        let device_slice = Arc::new(
+            VulkanResidentModelPackageDeviceSlice::from_runtime_model_for_device(
+                device,
+                context.manifest_dir,
+                draft_runtime_model,
+                device_id,
+                Some(context.capacity),
+            )
+            .map_err(VulkanResidentInProcessPlacedRuntimeError::Package)?,
+        );
+
+        let additional_tensors = [
+            decoder.output_transducer.norm_parameter_tensor.as_str(),
+            decoder
+                .output_transducer
+                .projection_parameter_tensor
+                .as_str(),
+        ]
+        .into_iter()
+        .filter(|tensor| {
+            context
+                .target_output_parameters
+                .parameter_buffer(tensor)
+                .is_none()
+        })
+        .collect::<Vec<_>>();
+        let additional_output_parameter_buffers = if additional_tensors.is_empty() {
+            None
+        } else {
+            Some(Arc::new(
+                load_resident_package_parameter_buffers_for_tensors(
+                    device,
+                    device_id,
+                    context.tensor_index,
+                    &additional_tensors,
+                )
+                .map_err(VulkanResidentInProcessPlacedRuntimeError::Package)?,
+            ))
+        };
+        let output_norm_spirv_words = load_required_resident_model_package_shader(
+            context.manifest_dir,
+            &decoder.output_transducer.norm_shader_path,
+        )
+        .map_err(VulkanResidentInProcessPlacedRuntimeError::Package)?;
+        let output_projection_spirv_words = load_required_resident_model_package_shader(
+            context.manifest_dir,
+            &decoder.output_transducer.projection_shader_path,
+        )
+        .map_err(VulkanResidentInProcessPlacedRuntimeError::Package)?;
+
+        Ok(Self {
+            id: decoder.id.clone(),
+            device_id: device_id.to_string(),
+            hosted_pedal_count: device_slice.hosted_pedal_count,
+            package: decoder.clone(),
+            device_slice,
+            additional_output_parameter_buffers,
+            output_norm_spirv_words,
+            output_projection_spirv_words,
+        })
+    }
+
+    fn output_parameter<'a>(
+        &'a self,
+        target_output_parameters: &'a VulkanPermanentParameterBuffers,
+        tensor: &str,
+    ) -> Option<&'a VulkanPermanentParameterBufferAllocation> {
+        self.additional_output_parameter_buffers
+            .as_deref()
+            .and_then(|buffers| buffers.parameter_buffer(tensor))
+            .or_else(|| target_output_parameters.parameter_buffer(tensor))
+    }
+
+    fn output_transducer_spec(
+        &self,
+        input_signal_id: String,
+    ) -> Result<VulkanResidentOutputTransducerSpec, VulkanResidentTokenModelPackageError> {
+        let pedal = self
+            .package
+            .circuit_graph
+            .pedals
+            .iter()
+            .find(|pedal| pedal.pedal_id == self.package.output_transducer.pedal_id)
+            .ok_or_else(|| {
+                VulkanResidentTokenModelPackageError::new(format!(
+                    "speculative decoder {:?} has no output transducer pedal {:?}",
+                    self.id, self.package.output_transducer.pedal_id
+                ))
+            })?;
+        let node_ids = pedal
+            .circuit
+            .nodes
+            .iter()
+            .map(|node| node.id.clone())
+            .collect::<Vec<_>>();
+        if node_ids.len() != 2 {
+            return Err(VulkanResidentTokenModelPackageError::new(format!(
+                "speculative decoder {:?} output transducer requires two nodes, found {}",
+                self.id,
+                node_ids.len()
+            )));
+        }
+        let output = &self.package.output_transducer;
+        Ok(VulkanResidentOutputTransducerSpec {
+            transducer_id: output.pedal_id.clone(),
+            input_signal_id,
+            node_ids,
+            norm_parameter_tensor: output.norm_parameter_tensor.clone(),
+            norm_parameter_dtype: output.norm_parameter_dtype.clone(),
+            norm_parameter_shape: output.norm_parameter_shape.clone(),
+            norm_parameter_byte_capacity: output.norm_parameter_byte_capacity,
+            projection_parameter_tensor: output.projection_parameter_tensor.clone(),
+            projection_parameter_dtype: output.projection_parameter_dtype.clone(),
+            projection_parameter_shape: output.projection_parameter_shape.clone(),
+            projection_parameter_byte_capacity: output.projection_parameter_byte_capacity,
+            input_frame_byte_capacity: output.input_frame_byte_capacity,
+            normalized_frame_byte_capacity: output.output_hidden_byte_capacity,
+            logits_byte_capacity: output.logits_byte_capacity,
+            projection_workgroup_count_x: output.projection_workgroup_count_x,
+            norm_local_size_x: output.norm_local_size_x,
+            projection_local_size_x: output.projection_local_size_x,
+        })
+    }
 }
 
 pub struct VulkanResidentInProcessPlacedStreamProcessor {
@@ -8986,6 +9432,346 @@ pub struct VulkanResidentInProcessPlacedStreamProcessor {
     resident_feedback_loop: Option<VulkanResidentInProcessPlacedFeedbackLoop>,
     activation_schedule: VulkanMountedPlacedResidentInProcessSchedule,
     device_slices: Vec<VulkanResidentInProcessPlacedStreamProcessorDevice>,
+    speculative_decoders: Vec<VulkanResidentSpeculativeDecoderProcessor>,
+    verification_state_transactions: RefCell<Option<Vec<VulkanResidentStateTransactionBank>>>,
+}
+
+fn create_placed_state_transactions<'a, F>(
+    devices: &[VulkanResidentInProcessPlacedStreamProcessorDevice],
+    transaction_width: usize,
+    device_for: &F,
+) -> Result<Vec<VulkanResidentStateTransactionBank>, VulkanResidentInProcessPlacedRuntimeError>
+where
+    F: Fn(&str) -> Result<&'a VulkanComputeDevice, VulkanResidentInProcessPlacedRuntimeError>,
+{
+    devices
+        .iter()
+        .map(|slice| {
+            VulkanResidentStateTransactionBank::new_transactional(
+                device_for(&slice.device_id)?,
+                &slice.mounted.buffers,
+                transaction_width,
+            )
+            .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)
+        })
+        .collect()
+}
+
+struct VulkanResidentSpeculativeDecoderProcessor {
+    id: String,
+    device_id: String,
+    mounted: VulkanMountedPlacedStreamCircuit,
+    execution_plan: VulkanMountedPlacedResidentStreamTickExecutionPlan,
+    output_transducer: VulkanResidentOutputTransducerRunner,
+    sampler: VulkanResidentSamplerRunner,
+    target_embedding_copy: Option<VulkanResidentBufferCopy>,
+    token_embedding_signal_id: String,
+    target_hidden_copy: VulkanResidentBufferCopy,
+    recursive_hidden_copy: VulkanResidentBufferCopy,
+    pending_hidden_input_copy: VulkanResidentBufferCopy,
+    update_pending_hidden_copy: VulkanResidentBufferCopy,
+    restore_target_hidden_copy: VulkanResidentBufferCopy,
+    _pending_target_hidden: VulkanResidentBuffer,
+    state_transaction: VulkanResidentStateTransactionBank,
+}
+
+#[derive(Clone, Copy)]
+enum VulkanDraftHiddenSource {
+    Target,
+    Recursive,
+    PendingTarget,
+}
+
+impl VulkanResidentSpeculativeDecoderProcessor {
+    #[allow(clippy::too_many_arguments)]
+    fn from_model(
+        device: &VulkanComputeDevice,
+        model: &VulkanResidentSpeculativeDecoderModelPackage,
+        target_embedding: &VulkanResidentBuffer,
+        target_embedding_device_id: &str,
+        target_hidden: &VulkanResidentBuffer,
+        target_output_parameters: &VulkanPermanentParameterBuffers,
+        sampler_kernels: &[VulkanResidentSamplerKernelArtifact],
+        sampler_spec: &VulkanResidentSamplerSpec,
+        random_seed: u32,
+    ) -> Result<Self, VulkanResidentInProcessPlacedRuntimeError> {
+        let mounted = model
+            .device_slice
+            .create_mounted_stream_circuit(device)
+            .map_err(VulkanResidentInProcessPlacedRuntimeError::Package)?;
+        mounted.buffers.zero_state_buffers().map_err(|error| {
+            VulkanResidentInProcessPlacedRuntimeError::Package(
+                VulkanResidentTokenModelPackageError::new(format!(
+                    "failed to zero speculative decoder {:?} state: {error}",
+                    model.id
+                )),
+            )
+        })?;
+        mounted
+            .buffers
+            .apply_clone_state_policies()
+            .map_err(|error| {
+                VulkanResidentInProcessPlacedRuntimeError::Package(
+                    VulkanResidentTokenModelPackageError::new(format!(
+                        "failed to initialize speculative decoder {:?} cloned state: {error}",
+                        model.id
+                    )),
+                )
+            })?;
+        let reusable_manifest = resident_package_reusable_kernel_manifest(&mounted.placed_plan);
+        let mounted_bound = mounted
+            .mounted_placed_bound_dispatch_plan(&reusable_manifest)
+            .map_err(VulkanResidentInProcessPlacedRuntimeError::BoundDispatchPlan)?;
+        let tick_plan = VulkanMountedPlacedStreamTickPlan::from_mounted_bound_plan(&mounted_bound);
+        let execution_plan = VulkanMountedPlacedResidentStreamTickExecutionPlan::from_tick_plan(
+            device,
+            &mounted,
+            &mounted_bound,
+            model.device_slice.loaded_manifest(),
+            tick_plan,
+        )
+        .map_err(VulkanResidentInProcessPlacedRuntimeError::ResidentDispatch)?;
+
+        let adapter = &model.package.input_adapter;
+        let token_embedding = mounted
+            .boundary_io
+            .input_buffer(&adapter.token_embedding_signal_id)
+            .ok_or_else(|| {
+                VulkanResidentInProcessPlacedRuntimeError::Package(
+                    VulkanResidentTokenModelPackageError::new(format!(
+                        "speculative decoder {:?} has no token embedding input {:?}",
+                        model.id, adapter.token_embedding_signal_id
+                    )),
+                )
+            })?;
+        let hidden_input = mounted
+            .boundary_io
+            .input_buffer(&adapter.target_hidden_signal_id)
+            .ok_or_else(|| {
+                VulkanResidentInProcessPlacedRuntimeError::Package(
+                    VulkanResidentTokenModelPackageError::new(format!(
+                        "speculative decoder {:?} has no hidden input {:?}",
+                        model.id, adapter.target_hidden_signal_id
+                    )),
+                )
+            })?;
+        let output_spec = model
+            .output_transducer_spec(model.package.output_transducer.input_signal_id.clone())
+            .map_err(VulkanResidentInProcessPlacedRuntimeError::Package)?;
+        let norm_weight = model
+            .output_parameter(target_output_parameters, &output_spec.norm_parameter_tensor)
+            .ok_or_else(|| {
+                VulkanResidentInProcessPlacedRuntimeError::OutputTransducer(
+                    VulkanResidentOutputTransducerRunnerError::MissingTransducerParameterBuffer {
+                        tensor: output_spec.norm_parameter_tensor.clone(),
+                    },
+                )
+            })?;
+        let projection_weight = model
+            .output_parameter(
+                target_output_parameters,
+                &output_spec.projection_parameter_tensor,
+            )
+            .ok_or_else(|| {
+                VulkanResidentInProcessPlacedRuntimeError::OutputTransducer(
+                    VulkanResidentOutputTransducerRunnerError::MissingTransducerParameterBuffer {
+                        tensor: output_spec.projection_parameter_tensor.clone(),
+                    },
+                )
+            })?;
+        let output_transducer =
+            VulkanResidentOutputTransducerRunner::from_mounted_output_transducer_with_parameter_allocations(
+                device,
+                &mounted,
+                norm_weight,
+                projection_weight,
+                &model.output_norm_spirv_words,
+                &model.output_projection_spirv_words,
+                &output_spec,
+            )
+            .map_err(VulkanResidentInProcessPlacedRuntimeError::OutputTransducer)?;
+        let sampler = VulkanResidentSamplerRunner::from_output_transducer_with_spec(
+            device,
+            &mounted,
+            &output_transducer,
+            sampler_kernels,
+            sampler_spec,
+            random_seed,
+        )
+        .map_err(VulkanResidentInProcessPlacedRuntimeError::Sampler)?;
+        let target_embedding_copy = (target_embedding_device_id == model.device_id)
+            .then(|| {
+                device.create_resident_buffer_copy(
+                    target_embedding,
+                    &token_embedding.buffer,
+                    adapter.input_frame_byte_capacity,
+                )
+            })
+            .transpose()
+            .map_err(VulkanResidentInProcessPlacedRuntimeError::FeedbackCable)?;
+        let target_hidden_copy = device
+            .create_resident_buffer_copy(
+                target_hidden,
+                &hidden_input.buffer,
+                adapter.target_hidden_byte_capacity,
+            )
+            .map_err(VulkanResidentInProcessPlacedRuntimeError::FeedbackCable)?;
+        let recursive_hidden_copy = device
+            .create_resident_buffer_copy(
+                output_transducer.normalized_frame_buffer(),
+                &hidden_input.buffer,
+                adapter.target_hidden_byte_capacity,
+            )
+            .map_err(VulkanResidentInProcessPlacedRuntimeError::FeedbackCable)?;
+        let pending_target_hidden = device
+            .create_resident_buffer(adapter.target_hidden_byte_capacity)
+            .map_err(VulkanResidentInProcessPlacedRuntimeError::FeedbackCable)?;
+        pending_target_hidden
+            .write_bytes(&vec![0u8; adapter.target_hidden_byte_capacity])
+            .map_err(VulkanResidentInProcessPlacedRuntimeError::FeedbackCable)?;
+        let pending_hidden_input_copy = device
+            .create_resident_buffer_copy(
+                &pending_target_hidden,
+                &hidden_input.buffer,
+                adapter.target_hidden_byte_capacity,
+            )
+            .map_err(VulkanResidentInProcessPlacedRuntimeError::FeedbackCable)?;
+        let update_pending_hidden_copy = device
+            .create_resident_buffer_copy(
+                target_hidden,
+                &pending_target_hidden,
+                adapter.target_hidden_byte_capacity,
+            )
+            .map_err(VulkanResidentInProcessPlacedRuntimeError::FeedbackCable)?;
+        let restore_target_hidden_copy = device
+            .create_resident_buffer_copy(
+                &pending_target_hidden,
+                target_hidden,
+                adapter.target_hidden_byte_capacity,
+            )
+            .map_err(VulkanResidentInProcessPlacedRuntimeError::FeedbackCable)?;
+        let state_transaction =
+            VulkanResidentStateTransactionBank::new_transactional(device, &mounted.buffers, 1)
+                .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
+
+        Ok(Self {
+            id: model.id.clone(),
+            device_id: model.device_id.clone(),
+            mounted,
+            execution_plan,
+            output_transducer,
+            sampler,
+            target_embedding_copy,
+            token_embedding_signal_id: adapter.token_embedding_signal_id.clone(),
+            target_hidden_copy,
+            recursive_hidden_copy,
+            pending_hidden_input_copy,
+            update_pending_hidden_copy,
+            restore_target_hidden_copy,
+            _pending_target_hidden: pending_target_hidden,
+            state_transaction,
+        })
+    }
+
+    fn copy_target_embedding(
+        &self,
+        target_embedding: &VulkanResidentBuffer,
+        byte_capacity: usize,
+    ) -> Result<(), VulkanResidentInProcessPlacedRuntimeError> {
+        if let Some(copy) = &self.target_embedding_copy {
+            return copy
+                .run(byte_capacity)
+                .map_err(VulkanResidentInProcessPlacedRuntimeError::FeedbackCable);
+        }
+        let bytes = target_embedding
+            .read_bytes(byte_capacity)
+            .map_err(VulkanResidentInProcessPlacedRuntimeError::FeedbackCable)?;
+        self.mounted
+            .boundary_io
+            .input_buffer(&self.token_embedding_signal_id)
+            .expect("validated speculative token embedding boundary must remain mounted")
+            .buffer
+            .write_bytes(&bytes)
+            .map_err(VulkanResidentInProcessPlacedRuntimeError::FeedbackCable)
+    }
+
+    fn capture_baseline(&self) -> Result<(), VulkanResidentInProcessPlacedRuntimeError> {
+        self.state_transaction
+            .capture_baseline(&self.mounted.buffers)
+            .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)
+    }
+
+    fn restore_baseline(&self) -> Result<(), VulkanResidentInProcessPlacedRuntimeError> {
+        self.restore_target_hidden_copy
+            .run(self.restore_target_hidden_copy.byte_len())
+            .map_err(VulkanResidentInProcessPlacedRuntimeError::FeedbackCable)?;
+        self.state_transaction
+            .restore_baseline(&self.mounted.buffers)
+            .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)
+    }
+
+    fn run_draft_step(
+        &self,
+        device: &VulkanComputeDevice,
+        stream_tick: u64,
+        draft_index: usize,
+    ) -> Result<u32, VulkanResidentInProcessPlacedRuntimeError> {
+        let hidden_source = if draft_index == 0 {
+            VulkanDraftHiddenSource::Target
+        } else {
+            VulkanDraftHiddenSource::Recursive
+        };
+        self.run_state_step(device, stream_tick, hidden_source)?;
+        self.output_transducer
+            .run(device)
+            .map_err(VulkanResidentInProcessPlacedRuntimeError::OutputTransducer)?;
+        let sampled = self
+            .sampler
+            .run(device)
+            .map_err(VulkanResidentInProcessPlacedRuntimeError::Sampler)?;
+        Ok(sampled.token_id)
+    }
+
+    fn run_state_step(
+        &self,
+        device: &VulkanComputeDevice,
+        stream_tick: u64,
+        hidden_source: VulkanDraftHiddenSource,
+    ) -> Result<(), VulkanResidentInProcessPlacedRuntimeError> {
+        let hidden_copy = match hidden_source {
+            VulkanDraftHiddenSource::Target => &self.target_hidden_copy,
+            VulkanDraftHiddenSource::Recursive => &self.recursive_hidden_copy,
+            VulkanDraftHiddenSource::PendingTarget => &self.pending_hidden_input_copy,
+        };
+        hidden_copy
+            .run(hidden_copy.byte_len())
+            .map_err(VulkanResidentInProcessPlacedRuntimeError::FeedbackCable)?;
+        let schedule = VulkanMountedPlacedResidentInProcessSchedule::from_tick_plans(&[self
+            .execution_plan
+            .tick_plan
+            .as_ref()])
+        .map_err(VulkanResidentInProcessPlacedRuntimeError::Schedule)?;
+        let mut slices = [VulkanMountedPlacedResidentInProcessStreamTickSlice::new(
+            device,
+            &self.mounted,
+            &self.execution_plan,
+            stream_tick,
+        )];
+        let mut transport = VulkanInProcessPlacedCableTransport::new();
+        run_mounted_placed_resident_stream_tick_slices_in_process_with_schedule(
+            &mut slices,
+            &mut transport,
+            &schedule,
+        )
+        .map_err(VulkanResidentInProcessPlacedRuntimeError::Tick)?;
+        Ok(())
+    }
+
+    fn commit_target_hidden(&self) -> Result<(), VulkanResidentInProcessPlacedRuntimeError> {
+        self.update_pending_hidden_copy
+            .run(self.update_pending_hidden_copy.byte_len())
+            .map_err(VulkanResidentInProcessPlacedRuntimeError::FeedbackCable)
+    }
 }
 
 pub struct VulkanResidentInProcessPlacedStreamProcessorDevice {
@@ -9032,7 +9818,7 @@ impl VulkanResidentInProcessPlacedFeedbackLoopEligibility {
 
 struct VulkanResidentInProcessPlacedFeedbackLoop {
     sequence: VulkanResidentKernelSequence,
-    static_state_snapshots: VulkanResidentStaticStateSnapshotBank,
+    static_state_snapshots: VulkanResidentStateTransactionBank,
     window_width: usize,
     steps_per_tick: usize,
     scheduler_turn_count_per_tick: usize,
@@ -9187,11 +9973,8 @@ impl VulkanResidentInProcessPlacedFeedbackLoop {
             .and_then(|count| count.checked_add(output_transducer.dispatch_count))
             .and_then(|count| count.checked_add(sampler.dispatch_count))
             .ok_or_else(|| VulkanError("placed feedback-loop step count overflowed".to_string()))?;
-        let static_state_snapshots = VulkanResidentStaticStateSnapshotBank::new(
-            device,
-            &slice.mounted.buffers,
-            window_width,
-        )?;
+        let static_state_snapshots =
+            VulkanResidentStateTransactionBank::new(device, &slice.mounted.buffers, window_width)?;
         let sequence = device.create_resident_kernel_sequence()?;
         Ok(Some(Self {
             sequence,
@@ -9207,6 +9990,7 @@ impl VulkanResidentInProcessPlacedFeedbackLoop {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum VulkanResidentPlacedTokenTickTail {
     None,
+    Hidden,
     Logits,
     Sample,
 }
@@ -9215,9 +9999,14 @@ impl VulkanResidentPlacedTokenTickTail {
     fn sequence_variant(self) -> u8 {
         match self {
             Self::None => 0,
-            Self::Logits => 1,
-            Self::Sample => 2,
+            Self::Hidden => 1,
+            Self::Logits => 2,
+            Self::Sample => 3,
         }
+    }
+
+    fn produces_logits(self) -> bool {
+        matches!(self, Self::Logits | Self::Sample)
     }
 }
 
@@ -9301,6 +10090,7 @@ impl VulkanResidentInProcessPlacedModelPackage {
             manifest_dir,
             runtime_model,
             dynamic_state_capacity_activations,
+            true,
             |_| Ok(device),
         )
     }
@@ -9310,11 +10100,13 @@ impl VulkanResidentInProcessPlacedModelPackage {
         manifest_dir: impl AsRef<Path>,
         runtime_model: VulkanResidentRuntimeModel,
         dynamic_state_capacity_activations: Option<usize>,
+        mount_speculative_decoders: bool,
     ) -> Result<Self, VulkanResidentInProcessPlacedRuntimeError> {
         Self::from_runtime_model_for_device_resolver(
             manifest_dir,
             runtime_model,
             dynamic_state_capacity_activations,
+            mount_speculative_decoders,
             |device_id| {
                 devices
                     .get(device_id)
@@ -9332,6 +10124,7 @@ impl VulkanResidentInProcessPlacedModelPackage {
         manifest_dir: impl AsRef<Path>,
         runtime_model: VulkanResidentRuntimeModel,
         dynamic_state_capacity_activations: Option<usize>,
+        mount_speculative_decoders: bool,
         device_for: F,
     ) -> Result<Self, VulkanResidentInProcessPlacedRuntimeError>
     where
@@ -9470,6 +10263,35 @@ impl VulkanResidentInProcessPlacedModelPackage {
                 + output_transducer_parameter_buffers.total_byte_capacity
         };
 
+        let speculative_decoder_count = if mount_speculative_decoders {
+            runtime_model.package.speculative_decoders.len()
+        } else {
+            0
+        };
+        let mut speculative_decoders = Vec::with_capacity(speculative_decoder_count);
+        let speculative_decoder_context = VulkanResidentSpeculativeDecoderLoadContext {
+            manifest_dir,
+            runtime_model: &runtime_model,
+            capacity,
+            tensor_index: &tensor_index,
+            target_output_parameters: &output_transducer_parameter_buffers,
+        };
+        for decoder in runtime_model
+            .package
+            .speculative_decoders
+            .iter()
+            .take(speculative_decoder_count)
+        {
+            speculative_decoders.push(
+                VulkanResidentSpeculativeDecoderModelPackage::from_runtime_model(
+                    output_device,
+                    decoder,
+                    &output_device_id,
+                    &speculative_decoder_context,
+                )?,
+            );
+        }
+
         Ok(Self {
             package_id,
             input_device_id,
@@ -9490,6 +10312,7 @@ impl VulkanResidentInProcessPlacedModelPackage {
             output_transducer_spec: runtime_model.package.output_transducer.spec.clone(),
             sampler_spec: runtime_model.package.sampler.spec.clone(),
             device_slices,
+            speculative_decoders,
         })
     }
 
@@ -9726,7 +10549,33 @@ impl VulkanResidentInProcessPlacedModelPackage {
             &sampler,
         )
         .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
-
+        let target_embedding = input_slice
+            .mounted
+            .boundary_io
+            .input_buffer(&self.input_transducer_spec.output_signal_id)
+            .ok_or_else(|| {
+                VulkanResidentInProcessPlacedRuntimeError::Package(
+                    VulkanResidentTokenModelPackageError::new(format!(
+                        "placed package {:?} has no target embedding buffer {:?}",
+                        self.package_id, self.input_transducer_spec.output_signal_id
+                    )),
+                )
+            })?;
+        let mut speculative_decoders = Vec::with_capacity(self.speculative_decoders.len());
+        for decoder in &self.speculative_decoders {
+            let draft_device = device_for(&decoder.device_id)?;
+            speculative_decoders.push(VulkanResidentSpeculativeDecoderProcessor::from_model(
+                draft_device,
+                decoder,
+                &target_embedding.buffer,
+                &self.input_device_id,
+                output_transducer.normalized_frame_buffer(),
+                &self.output_transducer_parameter_buffers,
+                &self.sampler_kernels,
+                &self.sampler_spec,
+                random_seed,
+            )?);
+        }
         Ok(VulkanResidentInProcessPlacedStreamProcessor {
             model: self.clone(),
             input_transducer,
@@ -9736,6 +10585,8 @@ impl VulkanResidentInProcessPlacedModelPackage {
             resident_feedback_loop,
             activation_schedule,
             device_slices: devices,
+            speculative_decoders,
+            verification_state_transactions: RefCell::new(None),
         })
     }
 }
@@ -9743,6 +10594,424 @@ impl VulkanResidentInProcessPlacedModelPackage {
 impl VulkanResidentInProcessPlacedStreamProcessor {
     pub fn model_package(&self) -> &VulkanResidentInProcessPlacedModelPackage {
         &self.model
+    }
+
+    pub fn speculative_decoder_count(&self) -> usize {
+        self.speculative_decoders.len()
+    }
+
+    fn synchronize_speculative_decoders_after_target_tick(
+        &self,
+        devices: &BTreeMap<String, Rc<VulkanComputeDevice>>,
+        stream_tick: u64,
+    ) -> Result<(), VulkanResidentInProcessPlacedRuntimeError> {
+        if self.speculative_decoders.is_empty() {
+            return Ok(());
+        }
+        let target_embedding = self
+            .device(&self.model.input_device_id)
+            .and_then(|slice| {
+                slice
+                    .mounted
+                    .boundary_io
+                    .input_buffer(&self.model.input_transducer_spec.output_signal_id)
+            })
+            .ok_or_else(|| {
+                VulkanResidentInProcessPlacedRuntimeError::Package(
+                    VulkanResidentTokenModelPackageError::new(format!(
+                        "placed package {:?} has no target embedding boundary {:?}",
+                        self.model.package_id, self.model.input_transducer_spec.output_signal_id
+                    )),
+                )
+            })?;
+        for decoder in &self.speculative_decoders {
+            let draft_device = devices.get(&decoder.device_id).ok_or_else(|| {
+                VulkanResidentInProcessPlacedRuntimeError::MissingBoundDevice {
+                    device_id: decoder.device_id.clone(),
+                }
+            })?;
+            decoder.copy_target_embedding(
+                &target_embedding.buffer,
+                self.model.input_transducer_spec.output_frame_byte_capacity,
+            )?;
+            decoder.run_state_step(
+                draft_device.as_ref(),
+                stream_tick,
+                VulkanDraftHiddenSource::PendingTarget,
+            )?;
+            decoder.commit_target_hidden()?;
+        }
+        Ok(())
+    }
+
+    fn ensure_verification_state_transactions(
+        &self,
+        devices: &BTreeMap<String, Rc<VulkanComputeDevice>>,
+        transaction_width: usize,
+    ) -> Result<(), VulkanResidentInProcessPlacedRuntimeError> {
+        if self
+            .verification_state_transactions
+            .borrow()
+            .as_ref()
+            .is_some_and(|transactions| {
+                transactions
+                    .iter()
+                    .all(|transaction| transaction.cycle_width >= transaction_width)
+            })
+        {
+            return Ok(());
+        }
+        let transactions = create_placed_state_transactions(
+            &self.device_slices,
+            transaction_width,
+            &|device_id| {
+                devices
+                    .get(device_id)
+                    .map(|device| device.as_ref())
+                    .ok_or_else(
+                        || VulkanResidentInProcessPlacedRuntimeError::MissingBoundDevice {
+                            device_id: device_id.to_string(),
+                        },
+                    )
+            },
+        )?;
+        *self.verification_state_transactions.borrow_mut() = Some(transactions);
+        Ok(())
+    }
+
+    fn capture_verification_baseline(
+        &self,
+    ) -> Result<(), VulkanResidentInProcessPlacedRuntimeError> {
+        let transactions = self.verification_state_transactions.borrow();
+        let transactions = transactions.as_ref().ok_or_else(|| {
+            VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(
+                "verification state transaction is not mounted".to_string(),
+            ))
+        })?;
+        for (transaction, slice) in transactions.iter().zip(&self.device_slices) {
+            transaction
+                .capture_baseline(&slice.mounted.buffers)
+                .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
+        }
+        Ok(())
+    }
+
+    fn capture_verification_device_tick(
+        &self,
+        device_index: usize,
+        tick_index: usize,
+    ) -> Result<(), VulkanResidentInProcessPlacedRuntimeError> {
+        let transactions = self.verification_state_transactions.borrow();
+        let transactions = transactions.as_ref().ok_or_else(|| {
+            VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(
+                "verification state transaction is not mounted".to_string(),
+            ))
+        })?;
+        let transaction = transactions.get(device_index).ok_or_else(|| {
+            VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(format!(
+                "verification state transaction has no device index {device_index}"
+            )))
+        })?;
+        let slice = self.device_slices.get(device_index).ok_or_else(|| {
+            VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(format!(
+                "placed stream processor has no device index {device_index}"
+            )))
+        })?;
+        transaction
+            .capture_processed_tick(&slice.mounted.buffers, tick_index)
+            .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)
+    }
+
+    fn restore_verification_baseline(
+        &self,
+    ) -> Result<(), VulkanResidentInProcessPlacedRuntimeError> {
+        let transactions = self.verification_state_transactions.borrow();
+        let transactions = transactions.as_ref().ok_or_else(|| {
+            VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(
+                "verification state transaction is not mounted".to_string(),
+            ))
+        })?;
+        for (transaction, slice) in transactions.iter().zip(&self.device_slices) {
+            transaction
+                .restore_baseline(&slice.mounted.buffers)
+                .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
+        }
+        Ok(())
+    }
+
+    fn commit_verification_prefix(
+        &self,
+        processed_tick_count: usize,
+    ) -> Result<(), VulkanResidentInProcessPlacedRuntimeError> {
+        let transactions = self.verification_state_transactions.borrow();
+        let transactions = transactions.as_ref().ok_or_else(|| {
+            VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(
+                "verification state transaction is not mounted".to_string(),
+            ))
+        })?;
+        for (transaction, slice) in transactions.iter().zip(&self.device_slices) {
+            transaction
+                .commit_prefix(&slice.mounted.buffers, processed_tick_count)
+                .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
+        }
+        Ok(())
+    }
+
+    fn linear_pipeline_device_indices(
+        &self,
+    ) -> Result<Vec<usize>, VulkanResidentInProcessPlacedRuntimeError> {
+        let mut current = self
+            .device_slices
+            .iter()
+            .position(|slice| slice.device_id == self.model.input_device_id)
+            .ok_or_else(|| {
+                VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(format!(
+                    "placed package {:?} has no input pipeline device {:?}",
+                    self.model.package_id, self.model.input_device_id
+                )))
+            })?;
+        let output = self
+            .device_slices
+            .iter()
+            .position(|slice| slice.device_id == self.model.output_device_id)
+            .ok_or_else(|| {
+                VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(format!(
+                    "placed package {:?} has no output pipeline device {:?}",
+                    self.model.package_id, self.model.output_device_id
+                )))
+            })?;
+        let mut ordered = Vec::with_capacity(self.device_slices.len());
+        let mut visited = BTreeSet::new();
+        loop {
+            if !visited.insert(current) {
+                return Err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop(
+                    VulkanError("placed verification pipeline contains a device cycle".to_string()),
+                ));
+            }
+            ordered.push(current);
+            if current == output {
+                break;
+            }
+            let outgoing = &self.device_slices[current]
+                .mounted
+                .cable_io
+                .outgoing_buffers;
+            let [outgoing] = outgoing.as_slice() else {
+                return Err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop(
+                    VulkanError(format!(
+                        "placed verification pipeline device {:?} has {} outgoing activation cables; expected one",
+                        self.device_slices[current].device_id,
+                        outgoing.len()
+                    )),
+                ));
+            };
+            current = self
+                .device_slices
+                .iter()
+                .position(|slice| {
+                    slice.device_id == outgoing.endpoint.remote_device_id
+                        && slice
+                            .mounted
+                            .cable_io
+                            .incoming_buffer(outgoing.endpoint.cable_index)
+                            .is_some()
+                })
+                .ok_or_else(|| {
+                    VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(format!(
+                        "placed verification pipeline cable {} has no mounted destination {:?}",
+                        outgoing.endpoint.cable_index, outgoing.endpoint.remote_device_id
+                    )))
+                })?;
+        }
+        if ordered.len() != self.device_slices.len() {
+            return Err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop(
+                VulkanError(format!(
+                    "placed verification pipeline reaches {} of {} mounted devices",
+                    ordered.len(),
+                    self.device_slices.len()
+                )),
+            ));
+        }
+        Ok(ordered)
+    }
+
+    fn run_pipelined_target_candidates(
+        &self,
+        devices: &BTreeMap<String, Rc<VulkanComputeDevice>>,
+        input_token_ids: &[u32],
+        start_stream_tick: u64,
+    ) -> Result<(Vec<u32>, Vec<Vec<u8>>), VulkanResidentInProcessPlacedRuntimeError> {
+        if input_token_ids.is_empty() {
+            return Err(VulkanResidentInProcessPlacedRuntimeError::ZeroTickBudget);
+        }
+        let pipeline = self.linear_pipeline_device_indices()?;
+        let capacity =
+            u32::try_from(self.model.dynamic_state_capacity_activations).map_err(|_| {
+                VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(
+                    "placed verification context capacity exceeds u32".to_string(),
+                ))
+            })?;
+        for device_index in &pipeline {
+            let segments = &self.device_slices[*device_index]
+                .resident_execution_plan
+                .dispatch_segments;
+            if segments.len() != 1 {
+                return Err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop(
+                    VulkanError(format!(
+                        "placed verification pipeline device {:?} has {} dispatch segments; expected one",
+                        self.device_slices[*device_index].device_id,
+                        segments.len()
+                    )),
+                ));
+            }
+        }
+
+        let mut transport = VulkanInProcessPlacedCableTransport::new();
+        for adjacent in pipeline.windows(2) {
+            let source = &self.device_slices[adjacent[0]];
+            let destination = &self.device_slices[adjacent[1]];
+            let outgoing = &source.mounted.cable_io.outgoing_buffers[0];
+            let incoming = destination
+                .mounted
+                .cable_io
+                .incoming_buffer(outgoing.endpoint.cable_index)
+                .ok_or_else(|| {
+                    VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(format!(
+                        "placed verification pipeline destination {:?} has no cable {}",
+                        destination.device_id, outgoing.endpoint.cable_index
+                    )))
+                })?;
+            transport
+                .register_direct_cable_copy(outgoing, incoming)
+                .map_err(|error| {
+                    VulkanResidentInProcessPlacedRuntimeError::Tick(
+                        VulkanMountedPlacedResidentInProcessStreamTickError::StreamTick(
+                            VulkanMountedPlacedResidentStreamTickError::Transport(error),
+                        ),
+                    )
+                })?;
+        }
+
+        let mut target_token_ids = vec![None; input_token_ids.len()];
+        let mut target_hidden_frames = vec![None; input_token_ids.len()];
+        let wave_count = input_token_ids
+            .len()
+            .checked_add(pipeline.len())
+            .and_then(|count| count.checked_sub(1))
+            .ok_or(VulkanResidentInProcessPlacedRuntimeError::StreamTickOverflow)?;
+        for wave in 0..wave_count {
+            let mut submitted = Vec::new();
+            for (pipeline_index, token_index) in
+                pipeline_wave_assignments(wave, pipeline.len(), input_token_ids.len())
+            {
+                let device_index = pipeline[pipeline_index];
+                if pipeline_index == 0 {
+                    self.input_transducer
+                        .prepare_token_id_only(input_token_ids[token_index])
+                        .map_err(VulkanResidentInProcessPlacedRuntimeError::InputTransducer)?;
+                }
+                let slice = &self.device_slices[device_index];
+                let device = devices.get(&slice.device_id).ok_or_else(|| {
+                    VulkanResidentInProcessPlacedRuntimeError::MissingBoundDevice {
+                        device_id: slice.device_id.clone(),
+                    }
+                })?;
+                let stream_tick = start_stream_tick
+                    .checked_add(u64::try_from(token_index).map_err(|_| {
+                        VulkanResidentInProcessPlacedRuntimeError::StreamTickOverflow
+                    })?)
+                    .ok_or(VulkanResidentInProcessPlacedRuntimeError::StreamTickOverflow)?;
+                let control = VulkanMountedPlacedStreamControl {
+                    stream_tick,
+                    control_flags: 0,
+                    dynamic_state_capacity_activations: capacity,
+                };
+                let pending = slice.resident_execution_plan.dispatch_segments[0]
+                    .submit_recorded_with_stream_control(
+                        device,
+                        control,
+                        VulkanResidentPlacedTokenTickTail::Sample.sequence_variant(),
+                        false,
+                    )
+                    .map_err(VulkanResidentInProcessPlacedRuntimeError::ResidentDispatch)?;
+                submitted.push((pipeline_index, device_index, token_index, pending));
+            }
+            let completed = submitted
+                .into_iter()
+                .map(|(pipeline_index, device_index, token_index, pending)| {
+                    pending
+                        .wait()
+                        .map_err(VulkanResidentInProcessPlacedRuntimeError::ResidentDispatch)?;
+                    Ok((pipeline_index, device_index, token_index))
+                })
+                .collect::<Result<Vec<_>, VulkanResidentInProcessPlacedRuntimeError>>()?;
+            for (pipeline_index, device_index, token_index) in completed {
+                self.capture_verification_device_tick(device_index, token_index)?;
+                let slice = &self.device_slices[device_index];
+                if pipeline_index + 1 < pipeline.len() {
+                    let outgoing = &slice.mounted.cable_io.outgoing_buffers[0];
+                    transport
+                        .publish_outgoing_cable(&slice.mounted, outgoing.endpoint.cable_index)
+                        .and_then(|_| {
+                            transport.receive_incoming_cable(
+                                &self.device_slices[pipeline[pipeline_index + 1]].mounted,
+                                outgoing.endpoint.cable_index,
+                            )
+                        })
+                        .map_err(|error| {
+                            VulkanResidentInProcessPlacedRuntimeError::Tick(
+                                VulkanMountedPlacedResidentInProcessStreamTickError::StreamTick(
+                                    VulkanMountedPlacedResidentStreamTickError::Transport(error),
+                                ),
+                            )
+                        })?;
+                } else {
+                    let stream_tick = start_stream_tick
+                        .checked_add(u64::try_from(token_index).map_err(|_| {
+                            VulkanResidentInProcessPlacedRuntimeError::StreamTickOverflow
+                        })?)
+                        .ok_or(VulkanResidentInProcessPlacedRuntimeError::StreamTickOverflow)?;
+                    target_token_ids[token_index] = Some(
+                        self.sampler
+                            .completed_run_at(stream_tick)
+                            .map_err(VulkanResidentInProcessPlacedRuntimeError::Sampler)?
+                            .token_id,
+                    );
+                    target_hidden_frames[token_index] = Some(
+                        self.output_transducer
+                            .read_normalized_frame_bytes(
+                                self.model
+                                    .output_transducer_spec
+                                    .normalized_frame_byte_capacity,
+                            )
+                            .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?,
+                    );
+                }
+            }
+        }
+        let target_token_ids = target_token_ids
+            .into_iter()
+            .enumerate()
+            .map(|(index, token)| {
+                token.ok_or_else(|| {
+                    VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(format!(
+                        "placed verification pipeline produced no token at index {index}"
+                    )))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let target_hidden_frames = target_hidden_frames
+            .into_iter()
+            .enumerate()
+            .map(|(index, hidden)| {
+                hidden.ok_or_else(|| {
+                    VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(format!(
+                        "placed verification pipeline produced no hidden frame at index {index}"
+                    )))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((target_token_ids, target_hidden_frames))
     }
 
     pub fn device(
@@ -9780,6 +11049,9 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
     }
 
     fn resident_feedback_window_width(&self) -> usize {
+        if !self.speculative_decoders.is_empty() {
+            return 0;
+        }
         self.resident_feedback_loop
             .as_ref()
             .map(|feedback_loop| feedback_loop.window_width)
@@ -9906,7 +11178,7 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
         })?;
         feedback_loop
             .static_state_snapshots
-            .restore_after_tick(&slice.mounted.buffers, tick_index)
+            .commit_prefix(&slice.mounted.buffers, tick_index + 1)
             .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)
     }
 
@@ -10039,9 +11311,11 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
                 dispatch_extensions
                     .suffix_dispatches
                     .push(&self.output_transducer.embedding_norm_dispatch);
-                dispatch_extensions
-                    .suffix_dispatches
-                    .push(&self.output_transducer.tied_projection_dispatch);
+                if tail.produces_logits() {
+                    dispatch_extensions
+                        .suffix_dispatches
+                        .push(&self.output_transducer.tied_projection_dispatch);
+                }
                 if tail == VulkanResidentPlacedTokenTickTail::Sample {
                     dispatch_extensions
                         .suffix_dispatches
@@ -10094,7 +11368,8 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
             stream_tick,
             tail,
         )?;
-        let output_run = (tail != VulkanResidentPlacedTokenTickTail::None)
+        let output_run = tail
+            .produces_logits()
             .then(|| self.output_transducer.completed_run());
         let sampler_run = if tail == VulkanResidentPlacedTokenTickTail::Sample {
             Some(
@@ -10156,9 +11431,11 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
                 dispatch_extensions
                     .suffix_dispatches
                     .push(&self.output_transducer.embedding_norm_dispatch);
-                dispatch_extensions
-                    .suffix_dispatches
-                    .push(&self.output_transducer.tied_projection_dispatch);
+                if tail.produces_logits() {
+                    dispatch_extensions
+                        .suffix_dispatches
+                        .push(&self.output_transducer.tied_projection_dispatch);
+                }
                 if tail == VulkanResidentPlacedTokenTickTail::Sample {
                     dispatch_extensions
                         .suffix_dispatches
@@ -10212,7 +11489,8 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
                 stream_tick,
                 tail,
             )?;
-        let output_run = (tail != VulkanResidentPlacedTokenTickTail::None)
+        let output_run = tail
+            .produces_logits()
             .then(|| self.output_transducer.completed_run());
         let sampler_run = if tail == VulkanResidentPlacedTokenTickTail::Sample {
             Some(
@@ -10420,6 +11698,167 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
         })
     }
 
+    pub fn run_speculative_cycle_on_bound_devices(
+        &self,
+        devices: &BTreeMap<String, Rc<VulkanComputeDevice>>,
+        initial_token_id: u32,
+        start_stream_tick: u64,
+        draft_token_count: usize,
+        stop_token_ids: &BTreeSet<u32>,
+    ) -> Result<VulkanSpeculativeCycleRun, VulkanResidentInProcessPlacedRuntimeError> {
+        if draft_token_count == 0 {
+            return Err(VulkanResidentInProcessPlacedRuntimeError::ZeroTickBudget);
+        }
+        let decoder = self.speculative_decoders.first().ok_or_else(|| {
+            VulkanResidentInProcessPlacedRuntimeError::Package(
+                VulkanResidentTokenModelPackageError::new(
+                    "resident model package has no mounted speculative decoder",
+                ),
+            )
+        })?;
+        let target_tick_count = draft_token_count
+            .checked_add(1)
+            .ok_or(VulkanResidentInProcessPlacedRuntimeError::StreamTickOverflow)?;
+        self.ensure_verification_state_transactions(devices, target_tick_count)?;
+        let input_device = devices.get(&self.model.input_device_id).ok_or_else(|| {
+            VulkanResidentInProcessPlacedRuntimeError::MissingBoundDevice {
+                device_id: self.model.input_device_id.clone(),
+            }
+        })?;
+        let draft_device = devices.get(&decoder.device_id).ok_or_else(|| {
+            VulkanResidentInProcessPlacedRuntimeError::MissingBoundDevice {
+                device_id: decoder.device_id.clone(),
+            }
+        })?;
+        let target_embedding = self
+            .device(&self.model.input_device_id)
+            .and_then(|slice| {
+                slice
+                    .mounted
+                    .boundary_io
+                    .input_buffer(&self.model.input_transducer_spec.output_signal_id)
+            })
+            .ok_or_else(|| {
+                VulkanResidentInProcessPlacedRuntimeError::Package(
+                    VulkanResidentTokenModelPackageError::new(format!(
+                        "placed package {:?} has no target embedding boundary {:?}",
+                        self.model.package_id, self.model.input_transducer_spec.output_signal_id
+                    )),
+                )
+            })?;
+
+        decoder.capture_baseline()?;
+        self.capture_verification_baseline()?;
+        let run = (|| {
+            let draft_start = Instant::now();
+            let mut draft_token_ids = Vec::with_capacity(draft_token_count);
+            let mut draft_input_token_id = initial_token_id;
+            for draft_index in 0..draft_token_count {
+                self.input_transducer
+                    .prepare_token_id_only(draft_input_token_id)
+                    .map_err(VulkanResidentInProcessPlacedRuntimeError::InputTransducer)?;
+                input_device
+                    .run_resident_kernel_dispatch(&self.input_transducer.resident_dispatch, &[])
+                    .map_err(|error| {
+                        VulkanResidentInProcessPlacedRuntimeError::InputTransducer(
+                            VulkanResidentInputEmbeddingTransducerRunnerError::Vulkan(error),
+                        )
+                    })?;
+                decoder.copy_target_embedding(
+                    &target_embedding.buffer,
+                    self.model.input_transducer_spec.output_frame_byte_capacity,
+                )?;
+                let stream_tick = start_stream_tick
+                    .checked_add(u64::try_from(draft_index).map_err(|_| {
+                        VulkanResidentInProcessPlacedRuntimeError::StreamTickOverflow
+                    })?)
+                    .ok_or(VulkanResidentInProcessPlacedRuntimeError::StreamTickOverflow)?;
+                let token_id =
+                    decoder.run_draft_step(draft_device.as_ref(), stream_tick, draft_index)?;
+                draft_token_ids.push(token_id);
+                draft_input_token_id = token_id;
+            }
+            let draft_time_ns = u64::try_from(draft_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+
+            let target_inputs = std::iter::once(initial_token_id)
+                .chain(draft_token_ids.iter().copied())
+                .collect::<Vec<_>>();
+            let target_start = Instant::now();
+            let (target_token_ids, target_hidden_frames) =
+                self.run_pipelined_target_candidates(devices, &target_inputs, start_stream_tick)?;
+            let target_verification_time_ns =
+                u64::try_from(target_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            let mut verification =
+                verify_speculative_token_prefix(&draft_token_ids, &target_token_ids)
+                    .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
+            truncate_speculative_verification_at_stop(&mut verification, stop_token_ids);
+            self.commit_verification_prefix(verification.committed_target_tick_count)?;
+            let catch_up_start = Instant::now();
+            decoder.restore_baseline()?;
+            for (catch_up_index, input_token_id) in std::iter::once(initial_token_id)
+                .chain(draft_token_ids.iter().copied())
+                .take(verification.committed_target_tick_count)
+                .enumerate()
+            {
+                self.input_transducer
+                    .prepare_token_id_only(input_token_id)
+                    .map_err(VulkanResidentInProcessPlacedRuntimeError::InputTransducer)?;
+                input_device
+                    .run_resident_kernel_dispatch(&self.input_transducer.resident_dispatch, &[])
+                    .map_err(|error| {
+                        VulkanResidentInProcessPlacedRuntimeError::InputTransducer(
+                            VulkanResidentInputEmbeddingTransducerRunnerError::Vulkan(error),
+                        )
+                    })?;
+                decoder.copy_target_embedding(
+                    &target_embedding.buffer,
+                    self.model.input_transducer_spec.output_frame_byte_capacity,
+                )?;
+                let hidden_source = if catch_up_index == 0 {
+                    VulkanDraftHiddenSource::PendingTarget
+                } else {
+                    self.output_transducer
+                        .normalized_frame_buffer()
+                        .write_bytes(&target_hidden_frames[catch_up_index - 1])
+                        .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
+                    VulkanDraftHiddenSource::Target
+                };
+                let stream_tick = start_stream_tick
+                    .checked_add(u64::try_from(catch_up_index).map_err(|_| {
+                        VulkanResidentInProcessPlacedRuntimeError::StreamTickOverflow
+                    })?)
+                    .ok_or(VulkanResidentInProcessPlacedRuntimeError::StreamTickOverflow)?;
+                decoder.run_state_step(draft_device.as_ref(), stream_tick, hidden_source)?;
+            }
+            let committed_hidden =
+                &target_hidden_frames[verification.committed_target_tick_count - 1];
+            self.output_transducer
+                .normalized_frame_buffer()
+                .write_bytes(committed_hidden)
+                .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
+            decoder.commit_target_hidden()?;
+            let draft_catch_up_time_ns =
+                u64::try_from(catch_up_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+
+            Ok(VulkanSpeculativeCycleRun {
+                decoder_id: decoder.id.clone(),
+                initial_token_id,
+                start_stream_tick,
+                draft_token_ids,
+                target_token_ids,
+                verification,
+                draft_time_ns,
+                target_verification_time_ns,
+                draft_catch_up_time_ns,
+            })
+        })();
+        if run.is_err() {
+            let _ = decoder.restore_baseline();
+            let _ = self.restore_verification_baseline();
+        }
+        run
+    }
+
     pub fn prompt_session_from_stream_tick(
         &self,
         start_stream_tick: u64,
@@ -10475,6 +11914,7 @@ pub struct VulkanResidentInProcessPlacedPromptEventRun {
     pub completed_stage_count: usize,
     pub transport_stats: VulkanPlacedCableTransportStats,
     pub output_source_stream_ticks: Vec<u64>,
+    pub speculative_decode: VulkanSpeculativeDecodeStats,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -10493,6 +11933,7 @@ struct VulkanResidentInProcessPlacedActivePromptEvent {
     generated_token_ids: Vec<u32>,
     output_source_stream_ticks: Vec<u64>,
     output_events: Vec<VulkanResidentTokenOutputEvent>,
+    speculative_decode: VulkanSpeculativeDecodeStats,
 }
 
 impl VulkanResidentInProcessPlacedActivePromptEvent {
@@ -10520,6 +11961,7 @@ impl VulkanResidentInProcessPlacedActivePromptEvent {
             scheduler_turn_count: 0,
             completed_stage_count: 0,
             transport_stats: VulkanPlacedCableTransportStats::default(),
+            speculative_decode: VulkanSpeculativeDecodeStats::default(),
         })
     }
 
@@ -10731,6 +12173,7 @@ impl VulkanResidentInProcessPlacedActivePromptEvent {
             completed_stage_count: self.completed_stage_count,
             transport_stats: self.transport_stats,
             output_source_stream_ticks: self.output_source_stream_ticks,
+            speculative_decode: self.speculative_decode,
         }
     }
 }
@@ -10822,6 +12265,7 @@ pub struct VulkanResidentInProcessPlacedPromptStream {
     session: VulkanResidentInProcessPlacedPromptSession,
     active_input_event: Option<VulkanResidentInProcessPlacedActivePromptEvent>,
     pending_input_events: VecDeque<VulkanResidentTokenInputEvent>,
+    speculative_draft_tokens: usize,
 }
 
 impl VulkanResidentInProcessPlacedPromptStream {
@@ -10839,6 +12283,7 @@ impl VulkanResidentInProcessPlacedPromptStream {
         runtime_model: VulkanResidentRuntimeModel,
         dynamic_state_capacity_activations: Option<usize>,
         random_seed: u32,
+        speculative_draft_tokens: usize,
     ) -> Result<Self, VulkanResidentInProcessPlacedRuntimeError> {
         let package = Arc::new(
             VulkanResidentInProcessPlacedModelPackage::from_runtime_model_for_bound_devices(
@@ -10846,9 +12291,12 @@ impl VulkanResidentInProcessPlacedPromptStream {
                 manifest_dir,
                 runtime_model,
                 dynamic_state_capacity_activations,
+                speculative_draft_tokens > 0,
             )?,
         );
-        Self::new(package, devices, random_seed)
+        let mut stream = Self::new(package, devices, random_seed)?;
+        stream.speculative_draft_tokens = speculative_draft_tokens;
+        Ok(stream)
     }
 
     pub fn from_package_devices_and_session(
@@ -10875,6 +12323,7 @@ impl VulkanResidentInProcessPlacedPromptStream {
             session,
             active_input_event: None,
             pending_input_events: VecDeque::new(),
+            speculative_draft_tokens: 2,
         })
     }
 
@@ -10965,6 +12414,8 @@ impl VulkanResidentInProcessPlacedPromptStream {
         let stream_tick = self.session.next_stream_tick;
         let tail = if activation.should_emit_public_output {
             VulkanResidentPlacedTokenTickTail::Sample
+        } else if self.processor.speculative_decoder_count() > 0 {
+            VulkanResidentPlacedTokenTickTail::Hidden
         } else {
             VulkanResidentPlacedTokenTickTail::None
         };
@@ -10992,6 +12443,8 @@ impl VulkanResidentInProcessPlacedPromptStream {
         } else {
             None
         };
+        self.processor
+            .synchronize_speculative_decoders_after_target_tick(&self.devices, stream_tick)?;
         let output_event = self
             .active_input_event
             .as_mut()
@@ -11106,6 +12559,16 @@ impl VulkanResidentInProcessPlacedPromptStream {
             return Ok(None);
         }
         loop {
+            if self.run_speculative_feedback_window_with_output(&mut on_output_event)? {
+                if self
+                    .active_input_event
+                    .as_ref()
+                    .is_some_and(VulkanResidentInProcessPlacedActivePromptEvent::is_complete)
+                {
+                    return Ok(Some(self.complete_active_input_event()?));
+                }
+                continue;
+            }
             if self.run_resident_feedback_window_with_output(&mut on_output_event)? {
                 if self
                     .active_input_event
@@ -11126,6 +12589,83 @@ impl VulkanResidentInProcessPlacedPromptStream {
                 return Ok(Some(completed_input_run));
             }
         }
+    }
+
+    fn run_speculative_feedback_window_with_output<F>(
+        &mut self,
+        on_output_event: &mut F,
+    ) -> Result<bool, VulkanResidentInProcessPlacedRuntimeError>
+    where
+        F: FnMut(VulkanResidentTokenOutputEvent),
+    {
+        if self.speculative_draft_tokens == 0
+            || self.processor.speculative_decoder_count() == 0
+            || self.package.device_count < 2
+        {
+            return Ok(false);
+        }
+        let Some(active) = self.active_input_event.as_ref() else {
+            return Ok(false);
+        };
+        let Some(activation) = active.next_activation() else {
+            return Ok(false);
+        };
+        if !activation.input_is_feedback
+            || activation.input_closes_loop_after_processing
+            || !activation.should_emit_public_output
+            || active.remaining_public_outputs < 2
+        {
+            return Ok(false);
+        }
+        let draft_token_count = self
+            .speculative_draft_tokens
+            .min(active.remaining_public_outputs - 1);
+        let stop_token_ids = active
+            .input_event
+            .stop_token_ids
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let start_stream_tick = self.session.next_stream_tick;
+        let cycle = self.processor.run_speculative_cycle_on_bound_devices(
+            &self.devices,
+            activation.input_token_id,
+            start_stream_tick,
+            draft_token_count,
+            &stop_token_ids,
+        )?;
+        self.active_input_event
+            .as_mut()
+            .expect("speculative feedback cycle requires an active input event")
+            .speculative_decode
+            .record_cycle(&cycle);
+        for sampled_token_id in cycle.verification.emitted_token_ids {
+            let stream_tick = self.session.next_stream_tick;
+            let output_event = {
+                let active = self
+                    .active_input_event
+                    .as_mut()
+                    .expect("speculative feedback cycle requires an active input event");
+                let activation = active
+                    .next_activation()
+                    .ok_or(VulkanResidentInProcessPlacedRuntimeError::MissingPrivateFeedback)?;
+                active.complete_activation(
+                    &activation,
+                    stream_tick,
+                    0,
+                    0,
+                    &VulkanPlacedCableTransportStats::default(),
+                    Some(sampled_token_id),
+                )?
+            };
+            self.session.next_stream_tick = stream_tick
+                .checked_add(1)
+                .ok_or(VulkanResidentInProcessPlacedRuntimeError::StreamTickOverflow)?;
+            if let Some(output_event) = output_event {
+                on_output_event(output_event);
+            }
+        }
+        Ok(true)
     }
 
     pub fn submit_input_event(
@@ -13076,6 +14616,70 @@ fn load_resident_package_transducer_parameter_buffers_for(
     Ok(transducer_parameter_buffers)
 }
 
+fn load_resident_package_parameter_buffers_for_tensors(
+    device: &VulkanComputeDevice,
+    device_id: &str,
+    tensor_index: &TensorIndex,
+    tensors: &[&str],
+) -> Result<VulkanPermanentParameterBuffers, VulkanResidentTokenModelPackageError> {
+    let mut parameters = Vec::with_capacity(tensors.len());
+    let mut total_byte_capacity = 0usize;
+    let mut unique = BTreeSet::new();
+    for tensor in tensors {
+        if !unique.insert(*tensor) {
+            return Err(VulkanResidentTokenModelPackageError::new(format!(
+                "resident parameter selection contains duplicate tensor {tensor:?}"
+            )));
+        }
+        let metadata = tensor_index.tensors.get(*tensor).ok_or_else(|| {
+            VulkanResidentTokenModelPackageError::new(format!(
+                "resident package tensor index has no tensor {tensor:?}"
+            ))
+        })?;
+        let byte_capacity = metadata.byte_count.ok_or_else(|| {
+            VulkanResidentTokenModelPackageError::new(format!(
+                "resident package tensor {tensor:?} has no byte count"
+            ))
+        })?;
+        total_byte_capacity = total_byte_capacity
+            .checked_add(byte_capacity)
+            .ok_or_else(|| {
+                VulkanResidentTokenModelPackageError::new(
+                    "selected resident parameter byte count overflowed",
+                )
+            })?;
+        parameters.push(VulkanPermanentParameterBuffer {
+            buffer_index: parameters.len(),
+            tensor: (*tensor).to_string(),
+            dtype: Some(metadata.dtype.clone()),
+            shape: Some(metadata.shape.clone()),
+            byte_capacity: Some(byte_capacity),
+            use_count: 1,
+        });
+    }
+    let plan = VulkanPermanentParameterBufferPlan {
+        backend_id: VULKAN_STREAM_CIRCUIT_BACKEND_ID.to_string(),
+        device_id: device_id.to_string(),
+        parameter_count: parameters.len(),
+        parameters,
+        total_byte_capacity: Some(total_byte_capacity),
+        unresolved_tensors: Vec::new(),
+    };
+    let buffers = plan.allocate_buffers(device).map_err(|error| {
+        VulkanResidentTokenModelPackageError::new(format!(
+            "failed to allocate selected resident parameter buffers on {device_id:?}: {error}"
+        ))
+    })?;
+    buffers
+        .load_from_tensor_index(tensor_index)
+        .map_err(|error| {
+            VulkanResidentTokenModelPackageError::new(format!(
+                "failed to load selected resident parameter buffers on {device_id:?}: {error}"
+            ))
+        })?;
+    Ok(buffers)
+}
+
 fn resident_package_reusable_kernel_manifest(
     placed_plan: &VulkanPlacedStreamCircuitPlan,
 ) -> VulkanReusableKernelArtifactManifest {
@@ -14014,6 +15618,34 @@ pub struct VulkanMountedPlacedResidentDispatchSegmentRunner {
     sequences: RefCell<BTreeMap<u8, VulkanResidentKernelSequence>>,
 }
 
+struct VulkanSubmittedResidentDispatchSegment<'a> {
+    device: &'a VulkanComputeDevice,
+    runner: &'a VulkanMountedPlacedResidentDispatchSegmentRunner,
+    sequence: Ref<'a, VulkanResidentKernelSequence>,
+    execution_start: Option<Instant>,
+}
+
+impl VulkanSubmittedResidentDispatchSegment<'_> {
+    fn wait(
+        self,
+    ) -> Result<
+        Vec<VulkanMountedPlacedResidentPedalRun>,
+        VulkanMountedPlacedResidentKernelDispatchError,
+    > {
+        self.device
+            .wait_resident_kernel_sequence(&self.sequence)
+            .map_err(VulkanMountedPlacedResidentKernelDispatchError::Vulkan)?;
+        Ok(self
+            .execution_start
+            .map(|start| {
+                let execution_time_ns =
+                    u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                self.runner.completed_pedal_runs(execution_time_ns)
+            })
+            .unwrap_or_default())
+    }
+}
+
 impl VulkanMountedPlacedResidentDispatchSegmentRunner {
     fn from_dispatch_stages(
         device: &VulkanComputeDevice,
@@ -14190,6 +15822,46 @@ impl VulkanMountedPlacedResidentDispatchSegmentRunner {
                 self.completed_pedal_runs(execution_time_ns)
             })
             .unwrap_or_default())
+    }
+
+    fn submit_recorded_with_stream_control<'a>(
+        &'a self,
+        device: &'a VulkanComputeDevice,
+        control: VulkanMountedPlacedStreamControl,
+        sequence_variant: u8,
+        capture_execution_trace: bool,
+    ) -> Result<
+        VulkanSubmittedResidentDispatchSegment<'a>,
+        VulkanMountedPlacedResidentKernelDispatchError,
+    > {
+        self.stream_control_buffer
+            .write_bytes_at(
+                VULKAN_STREAM_CONTROL_METADATA_OFFSET,
+                &stream_control_metadata_bytes(control),
+            )
+            .map_err(VulkanMountedPlacedResidentKernelDispatchError::Vulkan)?;
+        let sequences = self.sequences.borrow();
+        if !sequences.contains_key(&sequence_variant) {
+            return Err(VulkanMountedPlacedResidentKernelDispatchError::Vulkan(
+                VulkanError(format!(
+                    "resident sequence variant {sequence_variant} has not been recorded"
+                )),
+            ));
+        }
+        let sequence = Ref::map(sequences, |sequences| {
+            sequences
+                .get(&sequence_variant)
+                .expect("checked resident sequence variant must exist")
+        });
+        device
+            .submit_recorded_resident_kernel_sequence(&sequence)
+            .map_err(VulkanMountedPlacedResidentKernelDispatchError::Vulkan)?;
+        Ok(VulkanSubmittedResidentDispatchSegment {
+            device,
+            runner: self,
+            sequence,
+            execution_start: capture_execution_trace.then(Instant::now),
+        })
     }
 
     fn completed_pedal_runs(
@@ -19363,6 +21035,64 @@ mod tests {
     const FIXTURE_MODEL_LOGITS_BYTES: usize = 65_536 * 4;
     const FIXTURE_MODEL_SAMPLER_OUTPUT_BYTES: usize = 16;
     const FIXTURE_MODEL_EMBED_TOKENS_BYTES: usize = 65_536 * FIXTURE_MODEL_FRAME_BYTES;
+
+    #[test]
+    fn speculative_verification_commits_through_the_first_mismatch() {
+        let result = verify_speculative_token_prefix(&[11, 12, 13], &[11, 99, 88, 77]).unwrap();
+
+        assert_eq!(result.accepted_draft_count, 1);
+        assert_eq!(result.committed_target_tick_count, 2);
+        assert_eq!(result.emitted_token_ids, [11, 99]);
+    }
+
+    #[test]
+    fn speculative_verification_emits_the_bonus_token_when_all_drafts_match() {
+        let result = verify_speculative_token_prefix(&[11, 12], &[11, 12, 13]).unwrap();
+
+        assert_eq!(result.accepted_draft_count, 2);
+        assert_eq!(result.committed_target_tick_count, 3);
+        assert_eq!(result.emitted_token_ids, [11, 12, 13]);
+    }
+
+    #[test]
+    fn speculative_verification_rejects_incomplete_target_results() {
+        let error = verify_speculative_token_prefix(&[11, 12], &[11, 12]).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("2 draft tokens but 2 target predictions; expected 3")
+        );
+    }
+
+    #[test]
+    fn speculative_verification_stops_at_the_first_emitted_stop_token() {
+        let mut result = verify_speculative_token_prefix(&[11, 12], &[11, 12, 99]).unwrap();
+
+        truncate_speculative_verification_at_stop(&mut result, &BTreeSet::from([11]));
+
+        assert_eq!(result.accepted_draft_count, 1);
+        assert_eq!(result.committed_target_tick_count, 1);
+        assert_eq!(result.emitted_token_ids, [11]);
+    }
+
+    #[test]
+    fn pipeline_wave_assignments_fill_and_drain_three_stages() {
+        let assignments = (0..5)
+            .map(|wave| pipeline_wave_assignments(wave, 3, 3))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            assignments,
+            [
+                vec![(0, 0)],
+                vec![(0, 1), (1, 0)],
+                vec![(0, 2), (1, 1), (2, 0)],
+                vec![(1, 2), (2, 1)],
+                vec![(2, 2)],
+            ]
+        );
+    }
 
     fn selected_test_vulkan_device() -> Result<VulkanComputeDevice, VulkanError> {
         match std::env::var("LLMOOP_TEST_VULKAN_DEVICE_INDEX") {
@@ -28681,6 +30411,7 @@ mod tests {
                 runtime_model,
                 Some(4),
                 0,
+                0,
             )
             .unwrap();
         let submitted = stream
@@ -29056,6 +30787,7 @@ mod tests {
                 runtime_model,
                 Some(8),
                 0,
+                0,
             )
             .unwrap();
 
@@ -29112,6 +30844,7 @@ mod tests {
                 manifest_dir,
                 runtime_model,
                 Some(8),
+                0,
                 0,
             )
             .unwrap();
@@ -29180,6 +30913,7 @@ mod tests {
                 manifest_dir,
                 scalar_runtime_model,
                 Some(8),
+                0,
                 0,
             )
             .unwrap();
@@ -29289,6 +31023,7 @@ mod tests {
                 runtime_model,
                 Some(8),
                 0,
+                0,
             )
             .unwrap();
 
@@ -29361,6 +31096,7 @@ mod tests {
                 runtime_model,
                 Some(8),
                 0,
+                0,
             )
             .unwrap();
 
@@ -29410,6 +31146,7 @@ mod tests {
                 manifest_dir,
                 runtime_model,
                 Some(8),
+                0,
                 0,
             )
             .unwrap();
@@ -29502,6 +31239,7 @@ mod tests {
                 manifest_dir,
                 runtime_model,
                 Some(8),
+                false,
             )
             .unwrap(),
         );
@@ -29599,6 +31337,7 @@ mod tests {
                 runtime_model.clone(),
                 Some(8),
                 0,
+                0,
             )
             .unwrap();
         let stream_b =
@@ -29608,6 +31347,7 @@ mod tests {
                 runtime_model,
                 Some(8),
                 1,
+                0,
             )
             .unwrap();
 
@@ -29701,6 +31441,7 @@ mod tests {
                 runtime_model.clone(),
                 Some(8),
                 0,
+                0,
             )
             .unwrap();
         let stream_b =
@@ -29710,6 +31451,7 @@ mod tests {
                 runtime_model,
                 Some(8),
                 1,
+                0,
             )
             .unwrap();
 
@@ -29784,6 +31526,7 @@ mod tests {
                 manifest_dir,
                 runtime_model,
                 Some(8),
+                0,
                 0,
             )
             .unwrap();
@@ -29926,6 +31669,7 @@ mod tests {
                 manifest_dir,
                 source_model,
                 Some(4),
+                false,
             )
             .unwrap(),
         );
@@ -29964,6 +31708,7 @@ mod tests {
                 manifest_dir,
                 clone_model,
                 Some(4),
+                false,
             )
             .unwrap(),
         );

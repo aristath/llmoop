@@ -3126,6 +3126,13 @@ pub struct RuntimePlacedPromptRunReport {
     pub timing: RuntimePromptTimingReport,
     pub pedal_timings: Vec<RuntimePlacedPedalTimingReport>,
     pub pedal_timing_summaries: Vec<RuntimePlacedPedalTimingSummaryReport>,
+    pub speculative_cycle_count: usize,
+    pub proposed_draft_token_count: usize,
+    pub accepted_draft_token_count: usize,
+    pub speculative_emitted_token_count: usize,
+    pub speculative_draft_time_ns: u64,
+    pub speculative_target_verification_time_ns: u64,
+    pub speculative_draft_catch_up_time_ns: u64,
 }
 
 fn read_json<T: for<'de> Deserialize<'de>>(
@@ -4215,6 +4222,13 @@ mod tests {
                 average_tick_time_ns: Some(90),
                 average_dispatch_time_ns: Some(90),
             }],
+            speculative_cycle_count: 0,
+            proposed_draft_token_count: 0,
+            accepted_draft_token_count: 0,
+            speculative_emitted_token_count: 0,
+            speculative_draft_time_ns: 0,
+            speculative_target_verification_time_ns: 0,
+            speculative_draft_catch_up_time_ns: 0,
         };
         let benchmark_transport = RuntimePromptBenchmarkTransportTotalsReport {
             published_packet_count: 0,

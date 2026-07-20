@@ -331,6 +331,24 @@ impl VulkanResidentBuffer {
         Ok(byte_len)
     }
 
+    fn byte_range(&self, offset: usize, len: usize) -> Result<(), VulkanError> {
+        if len == 0 {
+            return Err(VulkanError(
+                "resident byte buffer range length must not be zero".to_string(),
+            ));
+        }
+        let end = offset
+            .checked_add(len)
+            .ok_or_else(|| VulkanError("resident byte buffer range overflowed".to_string()))?;
+        if end > self.byte_capacity as usize {
+            return Err(VulkanError(format!(
+                "resident byte buffer capacity {} cannot address {} bytes at offset {}",
+                self.byte_capacity, len, offset
+            )));
+        }
+        Ok(())
+    }
+
     fn descriptor_buffer(&self, len: usize) -> Result<vk::DescriptorBufferInfo, VulkanError> {
         Ok(vk::DescriptorBufferInfo {
             buffer: self.buffer,
@@ -566,6 +584,49 @@ pub struct VulkanResidentBufferCopy {
     byte_len: vk::DeviceSize,
 }
 
+pub struct VulkanResidentBufferCopyBatch {
+    device: ash::Device,
+    queue: vk::Queue,
+    command_pool: vk::CommandPool,
+    command_buffer: vk::CommandBuffer,
+    completion_fence: vk::Fence,
+    copy_count: usize,
+}
+
+#[derive(Clone, Copy)]
+pub struct VulkanResidentBufferRangeCopy<'a> {
+    source: &'a VulkanResidentBuffer,
+    destination: &'a VulkanResidentBuffer,
+    source_offset: vk::DeviceSize,
+    destination_offset: vk::DeviceSize,
+    byte_len: vk::DeviceSize,
+}
+
+impl<'a> VulkanResidentBufferRangeCopy<'a> {
+    pub fn new(
+        source: &'a VulkanResidentBuffer,
+        destination: &'a VulkanResidentBuffer,
+        source_offset: usize,
+        destination_offset: usize,
+        byte_len: usize,
+    ) -> Result<Self, VulkanError> {
+        if byte_len == 0 {
+            return Err(VulkanError(
+                "resident buffer range copy length must not be zero".to_string(),
+            ));
+        }
+        source.byte_range(source_offset, byte_len)?;
+        destination.byte_range(destination_offset, byte_len)?;
+        Ok(Self {
+            source,
+            destination,
+            source_offset: source_offset as vk::DeviceSize,
+            destination_offset: destination_offset as vk::DeviceSize,
+            byte_len: byte_len as vk::DeviceSize,
+        })
+    }
+}
+
 pub struct VulkanResidentMappedBufferCopy {
     source_address: usize,
     destination_address: usize,
@@ -635,9 +696,53 @@ impl VulkanResidentBufferCopy {
     }
 }
 
+impl VulkanResidentBufferCopyBatch {
+    pub fn copy_count(&self) -> usize {
+        self.copy_count
+    }
+
+    pub fn run(&self) -> Result<(), VulkanError> {
+        unsafe {
+            self.device
+                .reset_fences(&[self.completion_fence])
+                .map_err(|error| {
+                    VulkanError(format!(
+                        "failed to reset resident buffer copy batch fence: {error:?}"
+                    ))
+                })?;
+            let command_buffers = [self.command_buffer];
+            let submit_info = [vk::SubmitInfo::default().command_buffers(&command_buffers)];
+            self.device
+                .queue_submit(self.queue, &submit_info, self.completion_fence)
+                .map_err(|error| {
+                    VulkanError(format!(
+                        "failed to submit resident buffer copy batch: {error:?}"
+                    ))
+                })?;
+            self.device
+                .wait_for_fences(&[self.completion_fence], true, u64::MAX)
+                .map_err(|error| {
+                    VulkanError(format!(
+                        "failed waiting for resident buffer copy batch: {error:?}"
+                    ))
+                })?;
+        }
+        Ok(())
+    }
+}
+
 impl Drop for VulkanResidentBufferCopy {
     fn drop(&mut self) {
         unsafe {
+            self.device.destroy_command_pool(self.command_pool, None);
+        }
+    }
+}
+
+impl Drop for VulkanResidentBufferCopyBatch {
+    fn drop(&mut self) {
+        unsafe {
+            self.device.destroy_fence(self.completion_fence, None);
             self.device.destroy_command_pool(self.command_pool, None);
         }
     }
@@ -1030,6 +1135,90 @@ impl VulkanComputeDevice {
         }
     }
 
+    pub fn create_resident_buffer_copy_batch(
+        &self,
+        copies: &[VulkanResidentBufferRangeCopy<'_>],
+    ) -> Result<VulkanResidentBufferCopyBatch, VulkanError> {
+        if copies.is_empty() {
+            return Err(VulkanError(
+                "resident buffer copy batch must contain at least one copy".to_string(),
+            ));
+        }
+        unsafe {
+            let command_pool_info = vk::CommandPoolCreateInfo::default()
+                .queue_family_index(self.queue_family_index)
+                .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+            let command_pool = self
+                .device
+                .create_command_pool(&command_pool_info, None)
+                .map_err(|error| {
+                    VulkanError(format!(
+                        "failed to create resident buffer copy batch command pool: {error:?}"
+                    ))
+                })?;
+            let command_alloc_info = vk::CommandBufferAllocateInfo::default()
+                .command_pool(command_pool)
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .command_buffer_count(1);
+            let command_buffer = self
+                .device
+                .allocate_command_buffers(&command_alloc_info)
+                .map_err(|error| {
+                    self.device.destroy_command_pool(command_pool, None);
+                    VulkanError(format!(
+                        "failed to allocate resident buffer copy batch command buffer: {error:?}"
+                    ))
+                })?
+                .remove(0);
+            self.device
+                .begin_command_buffer(command_buffer, &vk::CommandBufferBeginInfo::default())
+                .map_err(|error| {
+                    self.device.destroy_command_pool(command_pool, None);
+                    VulkanError(format!(
+                        "failed to begin resident buffer copy batch command buffer: {error:?}"
+                    ))
+                })?;
+            for copy in copies {
+                let regions = [vk::BufferCopy {
+                    src_offset: copy.source_offset,
+                    dst_offset: copy.destination_offset,
+                    size: copy.byte_len,
+                }];
+                self.device.cmd_copy_buffer(
+                    command_buffer,
+                    copy.source.buffer,
+                    copy.destination.buffer,
+                    &regions,
+                );
+            }
+            self.device
+                .end_command_buffer(command_buffer)
+                .map_err(|error| {
+                    self.device.destroy_command_pool(command_pool, None);
+                    VulkanError(format!(
+                        "failed to end resident buffer copy batch command buffer: {error:?}"
+                    ))
+                })?;
+            let completion_fence = self
+                .device
+                .create_fence(&vk::FenceCreateInfo::default(), None)
+                .map_err(|error| {
+                    self.device.destroy_command_pool(command_pool, None);
+                    VulkanError(format!(
+                        "failed to create resident buffer copy batch fence: {error:?}"
+                    ))
+                })?;
+            Ok(VulkanResidentBufferCopyBatch {
+                device: self.device.clone(),
+                queue: self.queue,
+                command_pool,
+                command_buffer,
+                completion_fence,
+                copy_count: copies.len(),
+            })
+        }
+    }
+
     pub fn run_resident_buffer_copy(
         &self,
         binding: &VulkanResidentBufferCopy,
@@ -1247,15 +1436,31 @@ impl VulkanComputeDevice {
         &self,
         sequence: &VulkanResidentKernelSequence,
     ) -> Result<(), VulkanError> {
+        self.submit_recorded_resident_kernel_sequence(sequence)?;
+        self.wait_resident_kernel_sequence(sequence)
+    }
+
+    pub fn submit_recorded_resident_kernel_sequence(
+        &self,
+        sequence: &VulkanResidentKernelSequence,
+    ) -> Result<(), VulkanError> {
         if !sequence.has_recorded_commands() {
             return Err(VulkanError(
                 "resident kernel sequence has no recorded commands".to_string(),
             ));
         }
-        self.submit_resident_kernel_sequence_and_wait(sequence)
+        self.submit_resident_kernel_sequence(sequence)
     }
 
     fn submit_resident_kernel_sequence_and_wait(
+        &self,
+        sequence: &VulkanResidentKernelSequence,
+    ) -> Result<(), VulkanError> {
+        self.submit_resident_kernel_sequence(sequence)?;
+        self.wait_resident_kernel_sequence(sequence)
+    }
+
+    fn submit_resident_kernel_sequence(
         &self,
         sequence: &VulkanResidentKernelSequence,
     ) -> Result<(), VulkanError> {
@@ -1276,6 +1481,15 @@ impl VulkanComputeDevice {
                         "failed to submit resident kernel sequence: {error:?}"
                     ))
                 })?;
+        }
+        Ok(())
+    }
+
+    pub fn wait_resident_kernel_sequence(
+        &self,
+        sequence: &VulkanResidentKernelSequence,
+    ) -> Result<(), VulkanError> {
+        unsafe {
             self.device
                 .wait_for_fences(&[sequence.completion_fence], true, u64::MAX)
                 .map_err(|error| {

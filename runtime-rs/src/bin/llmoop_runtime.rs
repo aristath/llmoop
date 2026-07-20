@@ -45,6 +45,7 @@ struct Args {
     duplicate_after: Vec<(String, String)>,
     source_chain: Option<Vec<(String, String)>>,
     max_new_tokens: usize,
+    speculative_draft_tokens: usize,
     context_size: Option<usize>,
     vulkan_device_index: Option<usize>,
     random_seed: u32,
@@ -85,6 +86,7 @@ impl Default for Args {
             duplicate_after: Vec::new(),
             source_chain: None,
             max_new_tokens: 65_536,
+            speculative_draft_tokens: 2,
             context_size: None,
             vulkan_device_index: None,
             random_seed: 0,
@@ -731,6 +733,7 @@ fn run_placed_chat(
         runtime_model,
         Some(capacity),
         args.random_seed,
+        args.speculative_draft_tokens,
     )?;
     let mut engine = VulkanResidentInProcessPlacedPromptEngine::new();
     let stream_snapshot = engine.add_stream("main", stream)?;
@@ -825,6 +828,7 @@ fn execute_placed_prompt_run(
         runtime_model,
         Some(*capacity),
         args.random_seed,
+        args.speculative_draft_tokens,
     )?;
     let mut engine = VulkanResidentInProcessPlacedPromptEngine::new();
     let stream_snapshot = engine.add_stream("main", stream)?;
@@ -914,6 +918,13 @@ fn execute_placed_prompt_run(
         timing,
         pedal_timings,
         pedal_timing_summaries,
+        speculative_cycle_count: run.speculative_decode.cycle_count,
+        proposed_draft_token_count: run.speculative_decode.proposed_draft_token_count,
+        accepted_draft_token_count: run.speculative_decode.accepted_draft_token_count,
+        speculative_emitted_token_count: run.speculative_decode.emitted_token_count,
+        speculative_draft_time_ns: run.speculative_decode.draft_time_ns,
+        speculative_target_verification_time_ns: run.speculative_decode.target_verification_time_ns,
+        speculative_draft_catch_up_time_ns: run.speculative_decode.draft_catch_up_time_ns,
     })
 }
 
@@ -929,10 +940,44 @@ fn print_placed_prompt_report(
         print_text(&report.output_text);
         if args.profile {
             print_prompt_timing_profile(&report.timing);
+            print_speculative_profile(report);
             print_placed_pedal_timing_profile(&report.pedal_timing_summaries, 5);
         }
     }
     Ok(())
+}
+
+fn print_speculative_profile(report: &RuntimePlacedPromptRunReport) {
+    if report.speculative_cycle_count == 0 {
+        return;
+    }
+    let acceptance = if report.proposed_draft_token_count == 0 {
+        0.0
+    } else {
+        100.0 * report.accepted_draft_token_count as f64 / report.proposed_draft_token_count as f64
+    };
+    println!("speculative:");
+    println!("  cycles={}", report.speculative_cycle_count);
+    println!(
+        "  drafts proposed={} accepted={} acceptance={acceptance:.2}%",
+        report.proposed_draft_token_count, report.accepted_draft_token_count
+    );
+    println!(
+        "  emitted_tokens={}",
+        report.speculative_emitted_token_count
+    );
+    println!(
+        "  draft_ms={:.3}",
+        nanos_to_millis(report.speculative_draft_time_ns)
+    );
+    println!(
+        "  target_verification_ms={:.3}",
+        nanos_to_millis(report.speculative_target_verification_time_ns)
+    );
+    println!(
+        "  draft_catch_up_ms={:.3}",
+        nanos_to_millis(report.speculative_draft_catch_up_time_ns)
+    );
 }
 
 fn run_placed_prompt_benchmark(
@@ -2227,6 +2272,10 @@ fn parse_args() -> Result<Args, String> {
             "--max-new-tokens" => {
                 parsed.max_new_tokens = parse_next(&mut raw, "--max-new-tokens")?;
             }
+            "--speculative-draft-tokens" => {
+                parsed.speculative_draft_tokens =
+                    parse_next(&mut raw, "--speculative-draft-tokens")?;
+            }
             "--context-size" => {
                 parsed.context_size = Some(parse_next(&mut raw, "--context-size")?);
             }
@@ -2632,6 +2681,8 @@ Options:
   --inspect-device-slice <DEVICE_ID>
                              Mount and summarize only the runtime patch pedals assigned to DEVICE_ID.
   --max-new-tokens <N>       Generation stop condition, independent of context size. Default: 65536
+  --speculative-draft-tokens <N>
+                             MTP draft tokens proposed per verification cycle. Default: 2; 0 disables MTP.
   --context-size <N>         Runtime transient-state window. Default: auto, up to the model maximum.
   --vulkan-device-index <N>  Use Vulkan physical device index N as the default local target.
   --seed <U32>               Explicit sampler randomness seed. Default: 0
