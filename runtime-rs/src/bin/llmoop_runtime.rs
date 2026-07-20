@@ -20,11 +20,12 @@ use llmoop_runtime::{
     RuntimePromptBenchmarkTransportTotalsReport, RuntimePromptBenchmarkU64MetricReport,
     RuntimePromptBenchmarkUsizeMetricReport, RuntimePromptTimingReport,
     RuntimeRemoteCableBufferReport, RuntimeSourcePedal, RuntimeTokenizerOptionsReport,
-    RuntimeTopologyReport, VulkanComputeDevice, VulkanComputeDeviceInfo,
-    VulkanResidentHfTokenizerTextCodec, VulkanResidentInProcessPlacedPromptEngine,
-    VulkanResidentInProcessPlacedPromptStream, VulkanResidentModelPackageDeviceSlice,
-    VulkanResidentModelPackageManifest, VulkanResidentRuntimeModel, VulkanResidentTokenInputEvent,
-    VulkanResidentTokenTextCodec, VulkanReusableKernelArtifactManifest, discover_runtime_devices,
+    RuntimeTopologyReport, VulkanComputeDevice, VulkanComputeDeviceCatalog,
+    VulkanComputeDeviceInfo, VulkanResidentHfTokenizerTextCodec,
+    VulkanResidentInProcessPlacedPromptEngine, VulkanResidentInProcessPlacedPromptStream,
+    VulkanResidentModelPackageDeviceSlice, VulkanResidentModelPackageManifest,
+    VulkanResidentRuntimeModel, VulkanResidentTokenInputEvent, VulkanResidentTokenTextCodec,
+    VulkanReusableKernelArtifactManifest, discover_runtime_devices,
 };
 use minijinja::{Environment, Error as TemplateError, ErrorKind as TemplateErrorKind};
 use serde::Serialize;
@@ -1876,9 +1877,10 @@ fn runtime_bound_vulkan_devices(
     args: &Args,
     logical_device_ids: &[String],
 ) -> Result<RuntimeBoundVulkanDevices, Box<dyn Error>> {
-    let available_devices = VulkanComputeDevice::available_compute_devices()?;
+    let device_catalog = VulkanComputeDeviceCatalog::discover()?;
+    let available_devices = device_catalog.available_compute_devices();
     let requested_bindings =
-        runtime_physical_device_bindings_in(args, logical_device_ids, &available_devices)?;
+        runtime_physical_device_bindings_in(args, logical_device_ids, available_devices)?;
     let mut devices = BTreeMap::new();
     let mut physical_devices: BTreeMap<usize, Rc<VulkanComputeDevice>> = BTreeMap::new();
     let mut physical_device_indices = BTreeMap::new();
@@ -1899,9 +1901,7 @@ fn runtime_bound_vulkan_devices(
         let device = if let Some(device) = physical_devices.get(&physical_device_index) {
             Rc::clone(device)
         } else {
-            let device = Rc::new(VulkanComputeDevice::new_for_device_uuid(
-                available_device.device_uuid,
-            )?);
+            let device = Rc::new(device_catalog.open_device_uuid(available_device.device_uuid)?);
             physical_devices.insert(physical_device_index, Rc::clone(&device));
             device
         };
@@ -2137,10 +2137,22 @@ fn runtime_device_bindings_report(
     args: &Args,
     logical_device_ids: &[String],
 ) -> RuntimeDeviceBindings {
+    let all_logical_devices_are_explicitly_bound = logical_device_ids
+        .iter()
+        .all(|device_id| args.device_bindings.contains_key(device_id));
+    let default_physical_device_index = if all_logical_devices_are_explicitly_bound {
+        args.vulkan_device_index.or_else(|| {
+            args.default_device_id
+                .as_deref()
+                .and_then(|device_id| parse_vulkan_physical_device_ref(device_id).ok().flatten())
+        })
+    } else {
+        runtime_report_default_vulkan_physical_device_index(args)
+    };
     RuntimeDeviceBindings::from_vulkan_targets(
         logical_device_ids,
         &args.device_bindings,
-        runtime_report_default_vulkan_physical_device_index(args),
+        default_physical_device_index,
         resolve_runtime_vulkan_physical_device_ref,
     )
 }
@@ -2723,7 +2735,7 @@ mod tests {
         model_owned_assistant_turn_stop_token_id, normalize_chat_template_for_runtime,
         parse_device_binding_assignment, parse_source_chain, parse_vulkan_device_uuid_ref,
         resolve_runtime_context_size, resolve_runtime_vulkan_physical_device_ref,
-        runtime_physical_device_bindings_in,
+        runtime_device_bindings_report, runtime_physical_device_bindings_in,
     };
 
     fn formatter(template_source: &str) -> RuntimeChatFormatter {
@@ -2918,6 +2930,22 @@ mod tests {
         assert_eq!(split.get("board_a"), Some(&2));
         assert_eq!(split.get("board_b"), Some(&3));
         assert_eq!(split.values().collect::<BTreeSet<_>>().len(), 2);
+    }
+
+    #[test]
+    fn fully_explicit_device_binding_report_does_not_request_an_unused_default_gpu() {
+        let logical_device_ids = vec!["board_a".to_string(), "board_b".to_string()];
+        let mut args = Args::default();
+        args.device_bindings
+            .insert("board_a".to_string(), "vulkan:2".to_string());
+        args.device_bindings
+            .insert("board_b".to_string(), "vulkan:3".to_string());
+
+        let report = runtime_device_bindings_report(&args, &logical_device_ids);
+
+        assert_eq!(report.process_vulkan_device_index, None);
+        assert_eq!(report.default_vulkan_device_index, None);
+        assert_eq!(report.requested_vulkan_device_indices, vec![2, 3]);
     }
 
     #[test]

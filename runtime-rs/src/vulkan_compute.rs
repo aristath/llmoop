@@ -5,6 +5,7 @@ use std::ffi::CString;
 use std::fmt::{Display, Formatter};
 #[cfg(test)]
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Instant;
 
 use ash::{Entry, vk};
@@ -21,8 +22,7 @@ impl Display for VulkanError {
 impl Error for VulkanError {}
 
 pub struct VulkanComputeDevice {
-    _entry: Entry,
-    instance: ash::Instance,
+    context: Arc<VulkanInstanceContext>,
     physical_device: vk::PhysicalDevice,
     device: ash::Device,
     queue_family_index: u32,
@@ -31,6 +31,25 @@ pub struct VulkanComputeDevice {
     timestamp_period_ns: f32,
     generic_storage_pipelines: RefCell<HashMap<VulkanGenericPipelineKey, VulkanStoragePipeline>>,
     immediate_kernel_sequence: RefCell<Option<VulkanResidentKernelSequence>>,
+}
+
+struct VulkanInstanceContext {
+    _entry: Entry,
+    instance: ash::Instance,
+}
+
+impl Drop for VulkanInstanceContext {
+    fn drop(&mut self) {
+        unsafe {
+            self.instance.destroy_instance(None);
+        }
+    }
+}
+
+pub struct VulkanComputeDeviceCatalog {
+    context: Arc<VulkanInstanceContext>,
+    physical_devices: Vec<vk::PhysicalDevice>,
+    available_devices: Vec<VulkanComputeDeviceInfo>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -805,23 +824,18 @@ impl VulkanResidentKernelSequence {
     }
 }
 
-impl VulkanComputeDevice {
-    pub fn available_compute_devices() -> Result<Vec<VulkanComputeDeviceInfo>, VulkanError> {
+impl VulkanComputeDeviceCatalog {
+    pub fn discover() -> Result<Self, VulkanError> {
         unsafe {
             let entry = Entry::load()
                 .map_err(|error| VulkanError(format!("failed to load Vulkan: {error}")))?;
             let instance = create_llmoop_vulkan_instance(&entry)?;
-            let physical_devices = match instance.enumerate_physical_devices() {
-                Ok(physical_devices) => physical_devices,
-                Err(error) => {
-                    instance.destroy_instance(None);
-                    return Err(VulkanError(format!(
-                        "failed to enumerate Vulkan devices: {error:?}"
-                    )));
-                }
-            };
+            let physical_devices = instance.enumerate_physical_devices().map_err(|error| {
+                instance.destroy_instance(None);
+                VulkanError(format!("failed to enumerate Vulkan devices: {error:?}"))
+            })?;
             let selected_index = select_compute_device_index(&instance, &physical_devices);
-            let devices = physical_devices
+            let available_devices = physical_devices
                 .iter()
                 .enumerate()
                 .filter_map(|(physical_device_index, physical_device)| {
@@ -833,9 +847,86 @@ impl VulkanComputeDevice {
                     )
                 })
                 .collect::<Vec<_>>();
-            instance.destroy_instance(None);
-            Ok(devices)
+            Ok(Self {
+                context: Arc::new(VulkanInstanceContext {
+                    _entry: entry,
+                    instance,
+                }),
+                physical_devices,
+                available_devices,
+            })
         }
+    }
+
+    pub fn available_compute_devices(&self) -> &[VulkanComputeDeviceInfo] {
+        &self.available_devices
+    }
+
+    pub fn open_device_uuid(
+        &self,
+        device_uuid: [u8; vk::UUID_SIZE],
+    ) -> Result<VulkanComputeDevice, VulkanError> {
+        self.open_device(None, Some(device_uuid))
+    }
+
+    fn open_device(
+        &self,
+        requested_physical_device_index: Option<usize>,
+        requested_device_uuid: Option<[u8; vk::UUID_SIZE]>,
+    ) -> Result<VulkanComputeDevice, VulkanError> {
+        unsafe {
+            let instance = &self.context.instance;
+            let (physical_device, queue_family_index, device_name) =
+                if let Some(device_uuid) = requested_device_uuid {
+                    select_compute_device_by_uuid(instance, &self.physical_devices, device_uuid)?
+                } else if let Some(physical_device_index) = requested_physical_device_index {
+                    select_compute_device_by_index(
+                        instance,
+                        &self.physical_devices,
+                        physical_device_index,
+                    )?
+                } else {
+                    select_compute_device(instance, &self.physical_devices).ok_or_else(|| {
+                        VulkanError("no Vulkan device with a compute queue was found".to_string())
+                    })?
+                };
+
+            let queue_priorities = [1.0_f32];
+            let queue_info = [vk::DeviceQueueCreateInfo::default()
+                .queue_family_index(queue_family_index)
+                .queue_priorities(&queue_priorities)];
+            let device_info = vk::DeviceCreateInfo::default().queue_create_infos(&queue_info);
+            let device = instance
+                .create_device(physical_device, &device_info, None)
+                .map_err(|error| {
+                    VulkanError(format!("failed to create Vulkan device: {error:?}"))
+                })?;
+            let queue = device.get_device_queue(queue_family_index, 0);
+            let timestamp_period_ns = instance
+                .get_physical_device_properties(physical_device)
+                .limits
+                .timestamp_period;
+
+            Ok(VulkanComputeDevice {
+                context: Arc::clone(&self.context),
+                physical_device,
+                device,
+                queue_family_index,
+                queue,
+                device_name,
+                timestamp_period_ns,
+                generic_storage_pipelines: RefCell::new(HashMap::new()),
+                immediate_kernel_sequence: RefCell::new(None),
+            })
+        }
+    }
+}
+
+impl VulkanComputeDevice {
+    pub fn available_compute_devices() -> Result<Vec<VulkanComputeDeviceInfo>, VulkanError> {
+        Ok(VulkanComputeDeviceCatalog::discover()?
+            .available_devices
+            .clone())
     }
 
     pub fn new() -> Result<Self, VulkanError> {
@@ -856,55 +947,8 @@ impl VulkanComputeDevice {
         requested_physical_device_index: Option<usize>,
         requested_device_uuid: Option<[u8; vk::UUID_SIZE]>,
     ) -> Result<Self, VulkanError> {
-        unsafe {
-            let entry = Entry::load()
-                .map_err(|error| VulkanError(format!("failed to load Vulkan: {error}")))?;
-            let instance = create_llmoop_vulkan_instance(&entry)?;
-
-            let physical_devices = instance.enumerate_physical_devices().map_err(|error| {
-                VulkanError(format!("failed to enumerate Vulkan devices: {error:?}"))
-            })?;
-            let (physical_device, queue_family_index, device_name) = if let Some(device_uuid) =
-                requested_device_uuid
-            {
-                select_compute_device_by_uuid(&instance, &physical_devices, device_uuid)?
-            } else if let Some(physical_device_index) = requested_physical_device_index {
-                select_compute_device_by_index(&instance, &physical_devices, physical_device_index)?
-            } else {
-                select_compute_device(&instance, &physical_devices).ok_or_else(|| {
-                    VulkanError("no Vulkan device with a compute queue was found".to_string())
-                })?
-            };
-
-            let queue_priorities = [1.0_f32];
-            let queue_info = [vk::DeviceQueueCreateInfo::default()
-                .queue_family_index(queue_family_index)
-                .queue_priorities(&queue_priorities)];
-            let device_info = vk::DeviceCreateInfo::default().queue_create_infos(&queue_info);
-            let device = instance
-                .create_device(physical_device, &device_info, None)
-                .map_err(|error| {
-                    VulkanError(format!("failed to create Vulkan device: {error:?}"))
-                })?;
-            let queue = device.get_device_queue(queue_family_index, 0);
-            let timestamp_period_ns = instance
-                .get_physical_device_properties(physical_device)
-                .limits
-                .timestamp_period;
-
-            Ok(Self {
-                _entry: entry,
-                instance,
-                physical_device,
-                device,
-                queue_family_index,
-                queue,
-                device_name,
-                timestamp_period_ns,
-                generic_storage_pipelines: RefCell::new(HashMap::new()),
-                immediate_kernel_sequence: RefCell::new(None),
-            })
-        }
+        VulkanComputeDeviceCatalog::discover()?
+            .open_device(requested_physical_device_index, requested_device_uuid)
     }
 
     pub fn device_name(&self) -> &str {
@@ -993,7 +1037,7 @@ impl VulkanComputeDevice {
                 })?;
             let requirements = self.device.get_buffer_memory_requirements(buffer);
             let memory_type_index = find_memory_type(
-                &self.instance,
+                &self.context.instance,
                 self.physical_device,
                 requirements.memory_type_bits,
                 required_memory_flags,
@@ -1005,6 +1049,7 @@ impl VulkanComputeDevice {
                 ))
             })?;
             let memory_properties = self
+                .context
                 .instance
                 .get_physical_device_memory_properties(self.physical_device);
             let property_flags =
@@ -1017,7 +1062,7 @@ impl VulkanComputeDevice {
             } else {
                 Some(
                     find_memory_type(
-                        &self.instance,
+                        &self.context.instance,
                         self.physical_device,
                         u32::MAX,
                         vk::MemoryPropertyFlags::HOST_VISIBLE
@@ -2049,7 +2094,6 @@ impl Drop for VulkanComputeDevice {
                     .destroy_descriptor_set_layout(pipeline.descriptor_set_layout, None);
             }
             self.device.destroy_device(None);
-            self.instance.destroy_instance(None);
         }
     }
 }
