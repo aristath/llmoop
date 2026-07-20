@@ -32982,11 +32982,11 @@ mod tests {
             .unwrap();
         scalar.speculative_draft_tokens = 0;
         temporal.speculative_draft_tokens = 0;
-        let event = VulkanResidentTokenInputEvent::new(
-            "temporal-equivalence",
-            vec![760, 6_511, 314, 9_338, 369],
-            1,
-        );
+        let token_pattern = [760, 6_511, 314, 9_338, 369];
+        let prompt_tokens = (0..64)
+            .map(|index| token_pattern[index % token_pattern.len()])
+            .collect();
+        let event = VulkanResidentTokenInputEvent::new("temporal-equivalence", prompt_tokens, 1);
 
         scalar.enqueue_input_event(event.clone());
         let scalar_run = loop {

@@ -137,7 +137,7 @@ def test_compiler_selects_stateful_causal_scan_kernels() -> None:
                 "q16_kv4_d256_scale0.0625.comp"
             ),
             "local_size_x": attention_local_size,
-            "workgroup_count_x": 16,
+            "workgroup_count_x": 16 * 64,
         },
         {
             "shader_path": "shaders/append_kv_temporal_commit_bf16_kv4_d256.comp",
@@ -161,6 +161,9 @@ def test_compiler_renders_temporal_attention_stages(tmp_path: Path) -> None:
     assert "layout(set = 0, binding = 6) readonly buffer KvStateRead" in read_source
     assert "const uint ATTENTION_WINDOW = 32768u;" in read_source
     assert "absolute_tick >= batch_control.start_stream_tick_low" in read_source
+    assert "uint query_head = gl_WorkGroupID.x % QUERY_HEADS;" in read_source
+    assert "uint position = gl_WorkGroupID.x / QUERY_HEADS;" in read_source
+    assert "if (position >= batch_control.batch_width) return;" in read_source
     commit_source = next(tmp_path.glob("append_kv_temporal_commit_*.comp")).read_text()
     assert "layout(set = 0, binding = 7) buffer KvStateWrite" in commit_source
     assert "position * KV_WORD_COUNT + head_word" in commit_source

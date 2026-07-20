@@ -895,7 +895,7 @@ def causal_scan_batch_stages(shader_file: str, local_size_x: int) -> list[Json] 
         {
             "shader_path": f"shaders/{stem}",
             "local_size_x": local_size_x,
-            "workgroup_count_x": query_heads,
+            "workgroup_count_x": query_heads * CAUSAL_SCAN_LANE_TILE_WIDTH,
         },
         {
             "shader_path": (

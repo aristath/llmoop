@@ -134,17 +134,18 @@ float read_attention_sink(uint head) {
 #endif
 
 void main() {
-    uint query_head = gl_WorkGroupID.x;
+    uint query_head = gl_WorkGroupID.x % QUERY_HEADS;
+    uint position = gl_WorkGroupID.x / QUERY_HEADS;
     uint local_index = gl_LocalInvocationID.x;
     uint subgroups_per_token = (HEAD_WIDTH + gl_SubgroupSize - 1u) / gl_SubgroupSize;
     uint tile_entry = gl_SubgroupID / subgroups_per_token;
     uint subgroup_part = gl_SubgroupID % subgroups_per_token;
     uint dim = subgroup_part * gl_SubgroupSize + gl_SubgroupInvocationID;
-    if (query_head >= QUERY_HEADS) return;
+    if (position >= batch_control.batch_width) return;
 
     uint capacity = batch_control.dynamic_state_capacity;
     uint kv_head = query_head / QUERY_GROUPS_PER_KV_HEAD;
-    for (uint position = 0u; position < batch_control.batch_width; position++) {
+    {
         uint stream_tick = batch_control.start_stream_tick_low + position;
         uint tokens = capacity == 0u ? 0u : min(stream_tick + 1u, capacity);
         if (ATTENTION_WINDOW != 0u) tokens = min(tokens, ATTENTION_WINDOW);
