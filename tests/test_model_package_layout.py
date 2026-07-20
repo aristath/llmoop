@@ -20,6 +20,7 @@ from llmoop.model_package import (
     cooperative_bfloat16_batch_shader_file,
     cooperative_bfloat16_workgroup_count_x,
     copy_shader_templates,
+    frame_parallel_batch_shader_file,
     pedal_kernel_spec,
     required_vulkan_device_extensions,
     shader_file_for_node,
@@ -68,6 +69,36 @@ def test_compiler_selects_only_compatible_weight_shared_batch_kernels() -> None:
         "linear_fp8_e4m3_b127x128_5120x17408.comp"
     ) is None
     assert weight_shared_batch_shader_file("linear_paired_bf16_1023x1024.comp") is None
+    assert frame_parallel_batch_shader_file(
+        "rms_norm_batch16_bf16_h4096_eps1e-06_offset1.comp"
+    ) == "rms_norm_batch1_bf16_h4096_eps1e-06_offset1.comp"
+    assert frame_parallel_batch_shader_file(
+        "split_batch16_bf16_2x16x256_head_interleaved.comp"
+    ) == "split_batch1_bf16_2x16x256_head_interleaved.comp"
+    assert frame_parallel_batch_shader_file(
+        "linear_batch16_paired_bf16_4096x4096.comp"
+    ) is None
+
+
+def test_compiler_orders_frame_parallel_before_portable_batch_implementation() -> None:
+    spec = pedal_kernel_spec(
+        execution_index=0,
+        node={"id": "norm", "op": "rms_norm"},
+        shader_file="rms_norm_bf16_h4096_eps1e-06_offset1.comp",
+        local_size_x=64,
+        workgroup_count_x=1,
+    )
+
+    frame_parallel, portable = spec["batch_implementations"]
+    assert frame_parallel["lane_tile_width"] == 1
+    assert frame_parallel["device_requirements"] == {
+        "vulkan_device_extensions": [],
+        "subgroup_size": 64,
+    }
+    assert frame_parallel["stages"][0]["shader_path"] == (
+        "shaders/rms_norm_batch1_bf16_h4096_eps1e-06_offset1.comp"
+    )
+    assert portable["lane_tile_width"] == 16
 
 
 def test_compiler_selects_stateful_causal_scan_kernels() -> None:

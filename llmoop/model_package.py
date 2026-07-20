@@ -771,6 +771,11 @@ def pedal_kernel_spec(
         if scalar_batch_shader_file is not None
         else None
     )
+    frame_parallel_shader_file = (
+        frame_parallel_batch_shader_file(scalar_batch_shader_file)
+        if scalar_batch_shader_file is not None
+        else None
+    )
     spec = {
         "execution_index": execution_index,
         "node_id": node["id"],
@@ -819,6 +824,23 @@ def pedal_kernel_spec(
                     ],
                 }
             )
+        if frame_parallel_shader_file is not None:
+            spec["batch_implementations"].append(
+                {
+                    "lane_tile_width": 1,
+                    "device_requirements": {
+                        "vulkan_device_extensions": [],
+                        "subgroup_size": 64,
+                    },
+                    "stages": [
+                        {
+                            "shader_path": f"shaders/{frame_parallel_shader_file}",
+                            "local_size_x": local_size_x,
+                            "workgroup_count_x": workgroup_count_x,
+                        }
+                    ],
+                }
+            )
         spec["batch_implementations"].append(
             {
                 "lane_tile_width": SCALAR_BATCH_LANE_TILE_WIDTH,
@@ -835,6 +857,18 @@ def pedal_kernel_spec(
             }
         )
     return spec
+
+
+def frame_parallel_batch_shader_file(shader_file: str) -> str | None:
+    if re.fullmatch(
+        r"rms_norm_batch\d+_bf16_h\d+_eps[0-9eE+.-]+_offset[0-9eE+.-]+\.comp",
+        shader_file,
+    ) or re.fullmatch(
+        r"split_batch\d+_bf16_2x\d+x\d+_head_interleaved\.comp",
+        shader_file,
+    ):
+        return re.sub(r"_batch\d+_", "_batch1_", shader_file, count=1)
+    return None
 
 
 def causal_scan_batch_stages(shader_file: str, local_size_x: int) -> list[Json] | None:
