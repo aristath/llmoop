@@ -6069,45 +6069,45 @@ impl VulkanResidentPedalBatchSliceRunner {
                     None,
                     None,
                 )?;
-                let resident = device
-                    .create_resident_kernel_dispatch_2d(
-                        &batch_artifact.spirv_words,
-                        &bindings,
-                        batch_artifact.workgroup_count_x,
-                        match batch_artifact.batch_mode {
-                            VulkanResidentPedalKernelBatchMode::WeightShared => u32::try_from(
-                                lane_capacity
-                                    .checked_add(batch_artifact.lane_tile_width - 1)
-                                    .ok_or_else(|| {
-                                        VulkanResidentInProcessPlacedRuntimeError::BackendLoop(
-                                            VulkanError(
-                                                "pedal batch workgroup count overflowed"
-                                                    .to_string(),
-                                            ),
-                                        )
-                                    })?
-                                    / batch_artifact.lane_tile_width,
-                            )
-                            .map_err(|_| {
+                let workgroup_count_y = match batch_artifact.batch_mode {
+                    VulkanResidentPedalKernelBatchMode::WeightShared => u32::try_from(
+                        lane_capacity
+                            .checked_add(batch_artifact.lane_tile_width - 1)
+                            .ok_or_else(|| {
                                 VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(
-                                    "pedal batch workgroup count exceeds u32".to_string(),
+                                    "pedal batch workgroup count overflowed".to_string(),
                                 ))
-                            })?,
-                            VulkanResidentPedalKernelBatchMode::CausalScan => 1,
-                            VulkanResidentPedalKernelBatchMode::SerialLanes => unreachable!(
-                                "serial-lane kernels do not have pedal batch artifacts"
-                            ),
-                        },
-                        batch_artifact.local_size_x,
-                        VULKAN_PEDAL_BATCH_CONTROL_BYTE_CAPACITY,
+                            })?
+                            / batch_artifact.lane_tile_width,
                     )
-                    .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
-                steps.push(VulkanPedalBatchDispatchStep {
-                    dispatch: resident,
-                    push_constants: Vec::new(),
-                    lane_index: None,
-                    snapshot_state_buffer_indices: BTreeSet::new(),
-                });
+                    .map_err(|_| {
+                        VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(
+                            "pedal batch workgroup count exceeds u32".to_string(),
+                        ))
+                    })?,
+                    VulkanResidentPedalKernelBatchMode::CausalScan => 1,
+                    VulkanResidentPedalKernelBatchMode::SerialLanes => {
+                        unreachable!("serial-lane kernels do not have pedal batch artifacts")
+                    }
+                };
+                for stage in &batch_artifact.stages {
+                    let resident = device
+                        .create_resident_kernel_dispatch_2d(
+                            &stage.spirv_words,
+                            &bindings,
+                            stage.workgroup_count_x,
+                            workgroup_count_y,
+                            stage.local_size_x,
+                            VULKAN_PEDAL_BATCH_CONTROL_BYTE_CAPACITY,
+                        )
+                        .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
+                    steps.push(VulkanPedalBatchDispatchStep {
+                        dispatch: resident,
+                        push_constants: Vec::new(),
+                        lane_index: None,
+                        snapshot_state_buffer_indices: BTreeSet::new(),
+                    });
+                }
                 continue;
             }
 
@@ -9590,10 +9590,12 @@ fn validate_resident_package_paths(
         for kernel in &execution.kernels {
             validate_resident_package_relative_path("pedal kernel shader", &kernel.shader_path)?;
             for implementation in &kernel.batch_implementations {
-                validate_resident_package_relative_path(
-                    "pedal batch implementation shader",
-                    &implementation.shader_path,
-                )?;
+                for stage in &implementation.stages {
+                    validate_resident_package_relative_path(
+                        "pedal batch implementation stage shader",
+                        &stage.shader_path,
+                    )?;
+                }
             }
         }
     }
@@ -9613,10 +9615,12 @@ fn validate_resident_package_paths(
                     &kernel.shader_path,
                 )?;
                 for implementation in &kernel.batch_implementations {
-                    validate_resident_package_relative_path(
-                        "draft pedal batch implementation shader",
-                        &implementation.shader_path,
-                    )?;
+                    for stage in &implementation.stages {
+                        validate_resident_package_relative_path(
+                            "draft pedal batch implementation stage shader",
+                            &stage.shader_path,
+                        )?;
+                    }
                 }
             }
         }
@@ -9650,7 +9654,12 @@ fn validate_resident_package_artifact_integrity(
                 kernel
                     .batch_implementations
                     .iter()
-                    .map(|implementation| implementation.shader_path.clone()),
+                    .flat_map(|implementation| {
+                        implementation
+                            .stages
+                            .iter()
+                            .map(|stage| stage.shader_path.clone())
+                    }),
             )
         })
     });
@@ -9664,7 +9673,12 @@ fn validate_resident_package_artifact_integrity(
                         kernel
                             .batch_implementations
                             .iter()
-                            .map(|implementation| implementation.shader_path.clone()),
+                            .flat_map(|implementation| {
+                                implementation
+                                    .stages
+                                    .iter()
+                                    .map(|stage| stage.shader_path.clone())
+                            }),
                     )
                 })
             })
@@ -10475,11 +10489,16 @@ pub struct VulkanResidentPedalKernelSpec {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VulkanResidentPedalBatchImplementationSpec {
+    pub lane_tile_width: u32,
+    pub device_requirements: VulkanResidentVulkanDeviceRequirements,
+    pub stages: Vec<VulkanResidentPedalBatchStageSpec>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VulkanResidentPedalBatchStageSpec {
     pub shader_path: String,
     pub local_size_x: u32,
     pub workgroup_count_x: u32,
-    pub lane_tile_width: u32,
-    pub device_requirements: VulkanResidentVulkanDeviceRequirements,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -10564,6 +10583,10 @@ struct VulkanResidentPedalBatchKernelArtifact {
     node_id: String,
     batch_mode: VulkanResidentPedalKernelBatchMode,
     lane_tile_width: usize,
+    stages: Vec<VulkanResidentPedalBatchStageArtifact>,
+}
+
+struct VulkanResidentPedalBatchStageArtifact {
     spirv_words: Vec<u32>,
     local_size_x: u32,
     workgroup_count_x: u32,
@@ -16004,10 +16027,13 @@ fn validate_pedal_executions(
             let implementations_are_valid =
                 kernel.batch_implementations.iter().all(|implementation| {
                     let extensions = &implementation.device_requirements.vulkan_device_extensions;
-                    !implementation.shader_path.is_empty()
-                        && implementation.local_size_x > 0
-                        && implementation.workgroup_count_x > 0
-                        && implementation.lane_tile_width > 0
+                    implementation.lane_tile_width > 0
+                        && !implementation.stages.is_empty()
+                        && implementation.stages.iter().all(|stage| {
+                            !stage.shader_path.is_empty()
+                                && stage.local_size_x > 0
+                                && stage.workgroup_count_x > 0
+                        })
                         && extensions.iter().all(|extension| !extension.is_empty())
                         && extensions.windows(2).all(|pair| pair[0] < pair[1])
                         && implementation
@@ -17011,12 +17037,20 @@ fn load_resident_pedal_batch_kernels(
                 node_id: kernel.node_id.clone(),
                 batch_mode: kernel.batch_mode,
                 lane_tile_width: implementation.lane_tile_width as usize,
-                spirv_words: load_required_resident_model_package_shader(
-                    manifest_dir,
-                    &implementation.shader_path,
-                )?,
-                local_size_x: implementation.local_size_x,
-                workgroup_count_x: implementation.workgroup_count_x,
+                stages: implementation
+                    .stages
+                    .iter()
+                    .map(|stage| {
+                        Ok(VulkanResidentPedalBatchStageArtifact {
+                            spirv_words: load_required_resident_model_package_shader(
+                                manifest_dir,
+                                &stage.shader_path,
+                            )?,
+                            local_size_x: stage.local_size_x,
+                            workgroup_count_x: stage.workgroup_count_x,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, VulkanResidentTokenModelPackageError>>()?,
             })
         })
         .collect()
@@ -17026,7 +17060,10 @@ fn batch_implementation_is_supported(
     device: &VulkanComputeDevice,
     implementation: &VulkanResidentPedalBatchImplementationSpec,
 ) -> bool {
-    device.supports_compute_local_size_x(implementation.local_size_x)
+    implementation
+        .stages
+        .iter()
+        .all(|stage| device.supports_compute_local_size_x(stage.local_size_x))
         && implementation
             .device_requirements
             .vulkan_device_extensions
@@ -23388,11 +23425,13 @@ mod tests {
             let batch_implementations = batch_shader_path
                 .into_iter()
                 .map(|shader_path| VulkanResidentPedalBatchImplementationSpec {
-                    shader_path,
-                    local_size_x: 64,
-                    workgroup_count_x: 1,
                     lane_tile_width: 16,
                     device_requirements: VulkanResidentVulkanDeviceRequirements::default(),
+                    stages: vec![VulkanResidentPedalBatchStageSpec {
+                        shader_path,
+                        local_size_x: 64,
+                        workgroup_count_x: 1,
+                    }],
                 })
                 .collect();
             vec![VulkanResidentPedalExecutionSpec {

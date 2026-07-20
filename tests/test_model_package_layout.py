@@ -138,11 +138,6 @@ def test_projection_pedal_compiles_ordered_target_native_and_scalar_implementati
     assert "batch_lane_tile_width" not in spec
     cooperative, scalar = spec["batch_implementations"]
     assert cooperative == {
-        "shader_path": (
-            "shaders/linear_batch64_cooperative_paired_bf16_1024x4096.comp"
-        ),
-        "local_size_x": 256,
-        "workgroup_count_x": 64,
         "lane_tile_width": 64,
         "device_requirements": {
             "vulkan_device_extensions": [
@@ -152,13 +147,26 @@ def test_projection_pedal_compiles_ordered_target_native_and_scalar_implementati
             "cooperative_bfloat16_shape": [16, 16, 16],
             "subgroup_size": 64,
         },
+        "stages": [
+            {
+                "shader_path": (
+                    "shaders/linear_batch64_cooperative_paired_bf16_1024x4096.comp"
+                ),
+                "local_size_x": 256,
+                "workgroup_count_x": 64,
+            }
+        ],
     }
     assert scalar == {
-        "shader_path": "shaders/linear_batch16_paired_bf16_1024x4096.comp",
-        "local_size_x": 64,
-        "workgroup_count_x": 2048,
         "lane_tile_width": 16,
         "device_requirements": {"vulkan_device_extensions": []},
+        "stages": [
+            {
+                "shader_path": "shaders/linear_batch16_paired_bf16_1024x4096.comp",
+                "local_size_x": 64,
+                "workgroup_count_x": 2048,
+            }
+        ],
     }
 
 

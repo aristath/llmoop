@@ -642,10 +642,13 @@ class CompiledPackageTest(unittest.TestCase):
                 if kernel["batch_mode"] in {"weight_shared", "causal_scan"}:
                     self.assertGreaterEqual(len(kernel["batch_implementations"]), 1)
                     for implementation in kernel["batch_implementations"]:
-                        self.assertTrue(implementation["shader_path"].endswith(".spv"))
                         self.assertGreater(implementation["lane_tile_width"], 0)
-                        self.assertGreater(implementation["workgroup_count_x"], 0)
                         self.assertIn("device_requirements", implementation)
+                        self.assertGreaterEqual(len(implementation["stages"]), 1)
+                        for stage in implementation["stages"]:
+                            self.assertTrue(stage["shader_path"].endswith(".spv"))
+                            self.assertGreater(stage["local_size_x"], 0)
+                            self.assertGreater(stage["workgroup_count_x"], 0)
                 else:
                     self.assertEqual([], kernel["batch_implementations"])
                 if node["op"] in {
@@ -686,10 +689,11 @@ class CompiledPackageTest(unittest.TestCase):
                 for kernel in execution["kernels"]
             ),
             *(
-                implementation["shader_path"]
+                stage["shader_path"]
                 for execution in manifest["pedal_executions"]
                 for kernel in execution["kernels"]
                 for implementation in kernel["batch_implementations"]
+                for stage in implementation["stages"]
             ),
         ]
 

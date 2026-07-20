@@ -418,10 +418,11 @@ def build_vulkan_resident_package_manifest(
         shader_files,
     )
     optional_device_shader_files = {
-        implementation["shader_path"].removeprefix("shaders/")
+        stage["shader_path"].removeprefix("shaders/")
         for execution in all_pedal_executions
         for kernel in execution["kernels"]
         for implementation in kernel["batch_implementations"]
+        for stage in implementation["stages"]
         if implementation["device_requirements"]["vulkan_device_extensions"]
     }
     required_device_extensions = required_vulkan_device_extensions(
@@ -442,9 +443,8 @@ def build_vulkan_resident_package_manifest(
         for kernel in execution["kernels"]:
             kernel["shader_path"] = compiled_shader_path(kernel["shader_path"])
             for implementation in kernel["batch_implementations"]:
-                implementation["shader_path"] = compiled_shader_path(
-                    implementation["shader_path"]
-                )
+                for stage in implementation["stages"]:
+                    stage["shader_path"] = compiled_shader_path(stage["shader_path"])
     return {
         "schema": PACKAGE_SCHEMA,
         "package_id": package_id,
@@ -788,24 +788,25 @@ def pedal_kernel_spec(
     if causal_scan_shader_file is not None:
         spec["batch_implementations"].append(
             {
-                "shader_path": f"shaders/{causal_scan_shader_file}",
-                "local_size_x": local_size_x,
-                "workgroup_count_x": causal_scan_workgroup_count_x(shader_file),
                 "lane_tile_width": CAUSAL_SCAN_LANE_TILE_WIDTH,
                 "device_requirements": {
                     "vulkan_device_extensions": [],
                 },
+                "stages": [
+                    {
+                        "shader_path": f"shaders/{causal_scan_shader_file}",
+                        "local_size_x": local_size_x,
+                        "workgroup_count_x": causal_scan_workgroup_count_x(
+                            shader_file
+                        ),
+                    }
+                ],
             }
         )
     elif scalar_batch_shader_file is not None:
         if cooperative_shader_file is not None:
             spec["batch_implementations"].append(
                 {
-                    "shader_path": f"shaders/{cooperative_shader_file}",
-                    "local_size_x": 256,
-                    "workgroup_count_x": cooperative_bfloat16_workgroup_count_x(
-                        shader_file
-                    ),
                     "lane_tile_width": COOPERATIVE_BATCH_LANE_TILE_WIDTH,
                     "device_requirements": {
                         "vulkan_device_extensions": [
@@ -815,17 +816,30 @@ def pedal_kernel_spec(
                         "cooperative_bfloat16_shape": COOPERATIVE_BFLOAT16_SHAPE,
                         "subgroup_size": 64,
                     },
+                    "stages": [
+                        {
+                            "shader_path": f"shaders/{cooperative_shader_file}",
+                            "local_size_x": 256,
+                            "workgroup_count_x": cooperative_bfloat16_workgroup_count_x(
+                                shader_file
+                            ),
+                        }
+                    ],
                 }
             )
         spec["batch_implementations"].append(
             {
-                "shader_path": f"shaders/{scalar_batch_shader_file}",
-                "local_size_x": local_size_x,
-                "workgroup_count_x": workgroup_count_x,
                 "lane_tile_width": SCALAR_BATCH_LANE_TILE_WIDTH,
                 "device_requirements": {
                     "vulkan_device_extensions": [],
                 },
+                "stages": [
+                    {
+                        "shader_path": f"shaders/{scalar_batch_shader_file}",
+                        "local_size_x": local_size_x,
+                        "workgroup_count_x": workgroup_count_x,
+                    }
+                ],
             }
         )
     return spec
@@ -1834,10 +1848,11 @@ def required_shader_files(
             for kernel in pedal["kernels"]
         ),
         *(
-            implementation["shader_path"].removeprefix("shaders/")
+            stage["shader_path"].removeprefix("shaders/")
             for pedal in pedal_executions
             for kernel in pedal["kernels"]
             for implementation in kernel["batch_implementations"]
+            for stage in implementation["stages"]
         ),
     }
 
@@ -3955,18 +3970,14 @@ def valid_batch_implementation(implementation: Any) -> bool:
     )
     shape = requirements.get("cooperative_bfloat16_shape") if requirements else None
     subgroup_size = requirements.get("subgroup_size") if requirements else None
+    stages = implementation.get("stages")
     return (
-        isinstance(implementation.get("shader_path"), str)
-        and bool(implementation["shader_path"])
-        and isinstance(implementation.get("local_size_x"), int)
-        and not isinstance(implementation.get("local_size_x"), bool)
-        and implementation["local_size_x"] > 0
-        and isinstance(implementation.get("workgroup_count_x"), int)
-        and not isinstance(implementation.get("workgroup_count_x"), bool)
-        and implementation["workgroup_count_x"] > 0
-        and isinstance(implementation.get("lane_tile_width"), int)
+        isinstance(implementation.get("lane_tile_width"), int)
         and not isinstance(implementation.get("lane_tile_width"), bool)
         and implementation["lane_tile_width"] > 0
+        and isinstance(stages, list)
+        and bool(stages)
+        and all(valid_batch_stage(stage) for stage in stages)
         and isinstance(extensions, list)
         and all(isinstance(extension, str) and extension for extension in extensions)
         and extensions == sorted(set(extensions))
@@ -3991,6 +4002,20 @@ def valid_batch_implementation(implementation: Any) -> bool:
                 and subgroup_size > 0
             )
         )
+    )
+
+
+def valid_batch_stage(stage: Any) -> bool:
+    return (
+        isinstance(stage, dict)
+        and isinstance(stage.get("shader_path"), str)
+        and bool(stage["shader_path"])
+        and isinstance(stage.get("local_size_x"), int)
+        and not isinstance(stage.get("local_size_x"), bool)
+        and stage["local_size_x"] > 0
+        and isinstance(stage.get("workgroup_count_x"), int)
+        and not isinstance(stage.get("workgroup_count_x"), bool)
+        and stage["workgroup_count_x"] > 0
     )
 
 
