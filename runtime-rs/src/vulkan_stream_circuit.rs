@@ -25103,8 +25103,10 @@ mod tests {
         let row_offset = usize::try_from(token_id).unwrap() * FIXTURE_MODEL_FRAME_BYTES;
         let absolute_tensor_offset = data_start + row_offset;
         let source_file = metadata.source_file.as_ref().unwrap();
-        let data_base = safetensors_data_start(Path::new(source_file)).unwrap();
         let mut file = fs::File::open(source_file).unwrap();
+        let mut header_len_bytes = [0u8; 8];
+        file.read_exact(&mut header_len_bytes).unwrap();
+        let data_base = 8 + u64::from_le_bytes(header_len_bytes);
         file.seek(SeekFrom::Start(
             data_base + u64::try_from(absolute_tensor_offset).unwrap(),
         ))

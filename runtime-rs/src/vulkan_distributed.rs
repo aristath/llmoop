@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 
@@ -126,6 +126,142 @@ pub struct VulkanDistributedParameterFragment {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanDistributedParameterAllocationPlan {
+    pub allocations: Vec<VulkanDistributedParameterAllocation>,
+    pub allocation_count: usize,
+    pub tensor_count: usize,
+    pub total_byte_capacity: usize,
+}
+
+impl VulkanDistributedParameterAllocationPlan {
+    pub fn from_execution_plan(
+        execution_plan: &VulkanDistributedExecutionPlan,
+        tensor_index: &TensorIndex,
+    ) -> Result<Self, VulkanDistributedPlanError> {
+        let device_ids = execution_plan
+            .device_ids
+            .iter()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        let mut allocations = BTreeMap::<
+            VulkanDistributedParameterAllocationKey,
+            VulkanDistributedParameterAllocation,
+        >::new();
+
+        for dispatch in &execution_plan.dispatches {
+            for shard in &dispatch.shards {
+                if !device_ids.contains(shard.device_id.as_str()) {
+                    return Err(VulkanDistributedPlanError(format!(
+                        "distributed parameter shard for {}.{} uses device {:?} outside the execution pool",
+                        dispatch.pedal_id, dispatch.node_id, shard.device_id
+                    )));
+                }
+                for fragment in &shard.parameters {
+                    let metadata = tensor_index.tensors.get(&fragment.tensor).ok_or_else(|| {
+                        VulkanDistributedPlanError(format!(
+                            "distributed parameter fragment has no tensor metadata for {:?}",
+                            fragment.tensor
+                        ))
+                    })?;
+                    let tensor_byte_count = metadata.byte_count.ok_or_else(|| {
+                        VulkanDistributedPlanError(format!(
+                            "distributed parameter tensor {:?} has no byte count",
+                            fragment.tensor
+                        ))
+                    })?;
+                    if fragment.byte_count == 0 {
+                        return Err(VulkanDistributedPlanError(format!(
+                            "distributed parameter tensor {:?} has an empty fragment",
+                            fragment.tensor
+                        )));
+                    }
+                    let byte_end = fragment
+                        .byte_offset
+                        .checked_add(fragment.byte_count)
+                        .ok_or_else(|| {
+                            VulkanDistributedPlanError(format!(
+                                "distributed parameter tensor {:?} fragment range overflowed",
+                                fragment.tensor
+                            ))
+                        })?;
+                    if byte_end > tensor_byte_count {
+                        return Err(VulkanDistributedPlanError(format!(
+                            "distributed parameter tensor {:?} has {tensor_byte_count} bytes but a fragment ends at {byte_end}",
+                            fragment.tensor
+                        )));
+                    }
+                    let key = VulkanDistributedParameterAllocationKey {
+                        device_id: shard.device_id.clone(),
+                        tensor: fragment.tensor.clone(),
+                        byte_offset: fragment.byte_offset,
+                        byte_count: fragment.byte_count,
+                    };
+                    if let Some(allocation) = allocations.get_mut(&key) {
+                        allocation.use_count =
+                            allocation.use_count.checked_add(1).ok_or_else(|| {
+                                VulkanDistributedPlanError(format!(
+                                    "distributed parameter tensor {:?} use count overflowed",
+                                    fragment.tensor
+                                ))
+                            })?;
+                    } else {
+                        allocations.insert(
+                            key,
+                            VulkanDistributedParameterAllocation {
+                                device_id: shard.device_id.clone(),
+                                tensor: fragment.tensor.clone(),
+                                byte_offset: fragment.byte_offset,
+                                byte_count: fragment.byte_count,
+                                use_count: 1,
+                            },
+                        );
+                    }
+                }
+            }
+        }
+
+        validate_tensor_partition_coverage(allocations.values(), tensor_index)?;
+        let total_byte_capacity = allocations.values().try_fold(0usize, |total, allocation| {
+            total.checked_add(allocation.byte_count).ok_or_else(|| {
+                VulkanDistributedPlanError(
+                    "distributed parameter allocation byte count overflowed".to_string(),
+                )
+            })
+        })?;
+        let tensor_count = allocations
+            .values()
+            .map(|allocation| allocation.tensor.as_str())
+            .collect::<BTreeSet<_>>()
+            .len();
+        let allocations = allocations.into_values().collect::<Vec<_>>();
+
+        Ok(Self {
+            allocation_count: allocations.len(),
+            allocations,
+            tensor_count,
+            total_byte_capacity,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanDistributedParameterAllocation {
+    pub device_id: String,
+    pub tensor: String,
+    pub byte_offset: usize,
+    pub byte_count: usize,
+    pub use_count: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct VulkanDistributedParameterAllocationKey {
+    device_id: String,
+    tensor: String,
+    byte_offset: usize,
+    byte_count: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VulkanDistributedPlanError(pub String);
 
 impl Display for VulkanDistributedPlanError {
@@ -150,6 +286,49 @@ fn validate_device_pool(device_ids: &[String]) -> Result<(), VulkanDistributedPl
         return Err(VulkanDistributedPlanError(format!(
             "distributed execution device pool repeats {device_id:?}"
         )));
+    }
+    Ok(())
+}
+
+fn validate_tensor_partition_coverage<'a>(
+    allocations: impl Iterator<Item = &'a VulkanDistributedParameterAllocation>,
+    tensor_index: &TensorIndex,
+) -> Result<(), VulkanDistributedPlanError> {
+    let mut ranges_by_tensor = BTreeMap::<&str, BTreeSet<(usize, usize)>>::new();
+    for allocation in allocations {
+        ranges_by_tensor
+            .entry(&allocation.tensor)
+            .or_default()
+            .insert((allocation.byte_offset, allocation.byte_count));
+    }
+    for (tensor, ranges) in ranges_by_tensor {
+        let tensor_byte_count = tensor_index
+            .tensors
+            .get(tensor)
+            .and_then(|metadata| metadata.byte_count)
+            .ok_or_else(|| {
+                VulkanDistributedPlanError(format!(
+                    "distributed parameter tensor {tensor:?} has no byte count"
+                ))
+            })?;
+        let mut next_offset = 0usize;
+        for (byte_offset, byte_count) in ranges {
+            if byte_offset != next_offset {
+                return Err(VulkanDistributedPlanError(format!(
+                    "distributed parameter tensor {tensor:?} has a gap or overlap at byte {next_offset}"
+                )));
+            }
+            next_offset = next_offset.checked_add(byte_count).ok_or_else(|| {
+                VulkanDistributedPlanError(format!(
+                    "distributed parameter tensor {tensor:?} partition overflowed"
+                ))
+            })?;
+        }
+        if next_offset != tensor_byte_count {
+            return Err(VulkanDistributedPlanError(format!(
+                "distributed parameter tensor {tensor:?} partition covers {next_offset} of {tensor_byte_count} bytes"
+            )));
+        }
     }
     Ok(())
 }
@@ -549,6 +728,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn immutable_parameter_shards_are_reused_by_duplicated_pedals() {
+        let mut execution_plan = fixture_plan("row_major");
+        let mut duplicate = execution_plan.dispatches[0].clone();
+        duplicate.dispatch_index = 8;
+        duplicate.pedal_id = "duplicated-pedal".to_string();
+        duplicate.node_id = "duplicated-ffn".to_string();
+        execution_plan.dispatches.push(duplicate);
+
+        let allocation_plan = VulkanDistributedParameterAllocationPlan::from_execution_plan(
+            &execution_plan,
+            &fixture_tensor_index("row_major"),
+        )
+        .unwrap();
+
+        assert_eq!(allocation_plan.allocation_count, 8);
+        assert_eq!(allocation_plan.tensor_count, 2);
+        assert_eq!(allocation_plan.total_byte_capacity, 192);
+        assert!(
+            allocation_plan
+                .allocations
+                .iter()
+                .all(|allocation| allocation.use_count == 2)
+        );
+    }
+
     fn fixture_plan(layout: &str) -> VulkanDistributedExecutionPlan {
         fixture_plan_result(layout).unwrap()
     }
@@ -556,24 +761,7 @@ mod tests {
     fn fixture_plan_result(
         layout: &str,
     ) -> Result<VulkanDistributedExecutionPlan, VulkanDistributedPlanError> {
-        let metadata = |layout: &str| TensorMetadata {
-            dtype: "BF16".to_string(),
-            shape: vec![12, 4],
-            logical_shape: None,
-            parameter_count: Some(48),
-            byte_count: Some(96),
-            data_offsets: Some(vec![0, 96]),
-            source_file: Some("weights.safetensors".to_string()),
-            data_sha256: None,
-            layout: Some(layout.to_string()),
-        };
-        let tensor_index = TensorIndex {
-            schema: "llmoop.tensor_index.v1".to_string(),
-            tensors: BTreeMap::from([
-                ("gate".to_string(), metadata(layout)),
-                ("up".to_string(), metadata(layout)),
-            ]),
-        };
+        let tensor_index = fixture_tensor_index(layout);
         let activation =
             |binding, name: &str, signal: &str, bytes| VulkanMountedPlacedBoundDescriptor {
                 binding,
@@ -662,5 +850,26 @@ mod tests {
                 "helper-c".to_string(),
             ],
         )
+    }
+
+    fn fixture_tensor_index(layout: &str) -> TensorIndex {
+        let metadata = |layout: &str| TensorMetadata {
+            dtype: "BF16".to_string(),
+            shape: vec![12, 4],
+            logical_shape: None,
+            parameter_count: Some(48),
+            byte_count: Some(96),
+            data_offsets: Some(vec![0, 96]),
+            source_file: Some("weights.safetensors".to_string()),
+            data_sha256: None,
+            layout: Some(layout.to_string()),
+        };
+        TensorIndex {
+            schema: "llmoop.tensor_index.v1".to_string(),
+            tensors: BTreeMap::from([
+                ("gate".to_string(), metadata(layout)),
+                ("up".to_string(), metadata(layout)),
+            ]),
+        }
     }
 }
