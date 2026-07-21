@@ -3,6 +3,7 @@ use std::error::Error;
 use std::fmt::{Display, Formatter};
 
 use crate::stream_plan::{TensorIndex, TensorMetadata};
+use crate::tensor_storage::{TensorStorage, TensorStorageRange};
 use crate::vulkan_stream_circuit::{
     VulkanBoundDescriptorTarget, VulkanMountedPlacedBoundDescriptorTarget,
     VulkanMountedPlacedBoundDispatch, VulkanMountedPlacedBoundDispatchPlan,
@@ -242,6 +243,85 @@ impl VulkanDistributedParameterAllocationPlan {
             total_byte_capacity,
         })
     }
+
+    pub fn load_from_tensor_index<F>(
+        &self,
+        tensor_index: &TensorIndex,
+        mut write: F,
+    ) -> Result<VulkanDistributedParameterLoadReport, VulkanDistributedParameterLoadError>
+    where
+        F: FnMut(
+            &VulkanDistributedParameterAllocation,
+            &[u8],
+        ) -> Result<(), VulkanDistributedParameterLoadError>,
+    {
+        let mut allocations_by_tensor = BTreeMap::<
+            &str,
+            BTreeMap<(usize, usize), Vec<&VulkanDistributedParameterAllocation>>,
+        >::new();
+        for allocation in &self.allocations {
+            allocations_by_tensor
+                .entry(&allocation.tensor)
+                .or_default()
+                .entry((allocation.byte_offset, allocation.byte_count))
+                .or_default()
+                .push(allocation);
+        }
+
+        let mut total_bytes_read = 0usize;
+        let mut total_bytes_written = 0usize;
+        let mut write_count = 0usize;
+        let mut source_files = BTreeSet::new();
+        for (tensor, ranges) in allocations_by_tensor {
+            let storage = TensorStorage::from_index(tensor_index, tensor)
+                .map_err(|error| VulkanDistributedParameterLoadError(error.to_string()))?;
+            let storage_ranges = ranges
+                .keys()
+                .map(|(byte_offset, byte_count)| TensorStorageRange {
+                    byte_offset: *byte_offset,
+                    byte_count: *byte_count,
+                })
+                .collect::<Vec<_>>();
+            let payloads = storage
+                .read_partitions(&storage_ranges)
+                .map_err(|error| VulkanDistributedParameterLoadError(error.to_string()))?;
+            total_bytes_read = total_bytes_read
+                .checked_add(storage.byte_count)
+                .ok_or_else(|| {
+                    VulkanDistributedParameterLoadError(
+                        "distributed parameter read byte count overflowed".to_string(),
+                    )
+                })?;
+            source_files.insert(storage.source_file);
+
+            for (((_, _), allocations), payload) in ranges.into_iter().zip(payloads) {
+                for allocation in allocations {
+                    write(allocation, &payload)?;
+                    total_bytes_written = total_bytes_written
+                        .checked_add(payload.len())
+                        .ok_or_else(|| {
+                            VulkanDistributedParameterLoadError(
+                                "distributed parameter written byte count overflowed".to_string(),
+                            )
+                        })?;
+                    write_count = write_count.checked_add(1).ok_or_else(|| {
+                        VulkanDistributedParameterLoadError(
+                            "distributed parameter write count overflowed".to_string(),
+                        )
+                    })?;
+                }
+            }
+        }
+
+        Ok(VulkanDistributedParameterLoadReport {
+            tensor_count: self.tensor_count,
+            source_file_count: source_files.len(),
+            allocation_count: self.allocation_count,
+            write_count,
+            total_bytes_read,
+            total_bytes_written,
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -252,6 +332,27 @@ pub struct VulkanDistributedParameterAllocation {
     pub byte_count: usize,
     pub use_count: usize,
 }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanDistributedParameterLoadReport {
+    pub tensor_count: usize,
+    pub source_file_count: usize,
+    pub allocation_count: usize,
+    pub write_count: usize,
+    pub total_bytes_read: usize,
+    pub total_bytes_written: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanDistributedParameterLoadError(pub String);
+
+impl Display for VulkanDistributedParameterLoadError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl Error for VulkanDistributedParameterLoadError {}
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct VulkanDistributedParameterAllocationKey {
@@ -649,6 +750,11 @@ fn dispatch_error(
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use sha2::{Digest, Sha256};
 
     use super::*;
     use crate::stream_plan::TensorMetadata;
@@ -752,6 +858,41 @@ mod tests {
                 .iter()
                 .all(|allocation| allocation.use_count == 2)
         );
+    }
+
+    #[test]
+    fn loads_each_tensor_once_and_streams_verified_shards_to_devices() {
+        let execution_plan = fixture_plan("row_major");
+        let fixture = DistributedStorageFixture::new();
+        let allocation_plan = VulkanDistributedParameterAllocationPlan::from_execution_plan(
+            &execution_plan,
+            &fixture.tensor_index,
+        )
+        .unwrap();
+        let mut writes = Vec::new();
+
+        let report = allocation_plan
+            .load_from_tensor_index(&fixture.tensor_index, |allocation, bytes| {
+                writes.push((allocation.clone(), bytes.to_vec()));
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(report.tensor_count, 2);
+        assert_eq!(report.source_file_count, 1);
+        assert_eq!(report.allocation_count, 8);
+        assert_eq!(report.write_count, 8);
+        assert_eq!(report.total_bytes_read, 192);
+        assert_eq!(report.total_bytes_written, 192);
+        let (allocation, bytes) = writes
+            .iter()
+            .find(|(allocation, _)| {
+                allocation.device_id == "helper-a" && allocation.tensor == "gate"
+            })
+            .unwrap();
+        assert_eq!(allocation.byte_offset, 32);
+        assert_eq!(allocation.byte_count, 32);
+        assert_eq!(bytes, &fixture.gate_bytes[32..64]);
     }
 
     fn fixture_plan(layout: &str) -> VulkanDistributedExecutionPlan {
@@ -870,6 +1011,72 @@ mod tests {
                 ("gate".to_string(), metadata(layout)),
                 ("up".to_string(), metadata(layout)),
             ]),
+        }
+    }
+
+    struct DistributedStorageFixture {
+        root: PathBuf,
+        tensor_index: TensorIndex,
+        gate_bytes: Vec<u8>,
+    }
+
+    impl DistributedStorageFixture {
+        fn new() -> Self {
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let root = std::env::temp_dir().join(format!(
+                "llmoop-distributed-storage-{}-{unique}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&root).unwrap();
+            let source = root.join("weights.safetensors");
+            let gate_bytes = (0..96).map(|value| value as u8).collect::<Vec<_>>();
+            let up_bytes = (0..96)
+                .map(|value| 255u8.wrapping_sub(value as u8))
+                .collect::<Vec<_>>();
+            let header = b"{}";
+            let mut file_bytes = Vec::new();
+            file_bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
+            file_bytes.extend_from_slice(header);
+            file_bytes.extend_from_slice(&gate_bytes);
+            file_bytes.extend_from_slice(&up_bytes);
+            fs::write(&source, file_bytes).unwrap();
+            let metadata = |data_offsets: Vec<usize>, bytes: &[u8]| TensorMetadata {
+                dtype: "BF16".to_string(),
+                shape: vec![12, 4],
+                logical_shape: None,
+                parameter_count: Some(48),
+                byte_count: Some(96),
+                data_offsets: Some(data_offsets),
+                source_file: Some(source.to_string_lossy().into_owned()),
+                data_sha256: Some(
+                    Sha256::digest(bytes)
+                        .iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect(),
+                ),
+                layout: Some("row_major".to_string()),
+            };
+            let tensor_index = TensorIndex {
+                schema: "llmoop.tensor_index.v1".to_string(),
+                tensors: BTreeMap::from([
+                    ("gate".to_string(), metadata(vec![0, 96], &gate_bytes)),
+                    ("up".to_string(), metadata(vec![96, 192], &up_bytes)),
+                ]),
+            };
+            Self {
+                root,
+                tensor_index,
+                gate_bytes,
+            }
+        }
+    }
+
+    impl Drop for DistributedStorageFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
         }
     }
 }
