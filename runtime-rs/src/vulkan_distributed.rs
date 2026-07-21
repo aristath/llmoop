@@ -5,8 +5,7 @@ use std::fmt::{Display, Formatter};
 use crate::stream_plan::{TensorIndex, TensorMetadata};
 use crate::tensor_storage::{TensorStorage, TensorStorageRange};
 use crate::vulkan_stream_circuit::{
-    VulkanBoundDescriptorTarget, VulkanMountedPlacedBoundDescriptorTarget,
-    VulkanMountedPlacedBoundDispatch, VulkanMountedPlacedBoundDispatchPlan,
+    VulkanDescriptorResourceAddress, VulkanPreparedDispatch, VulkanPreparedDispatchPlan,
     VulkanReusableKernelArtifactManifest,
 };
 
@@ -23,8 +22,8 @@ pub struct VulkanDistributedExecutionPlan {
 }
 
 impl VulkanDistributedExecutionPlan {
-    pub fn from_bound_plans(
-        bound_plans: &[&VulkanMountedPlacedBoundDispatchPlan],
+    pub fn from_prepared_plans(
+        prepared_plans: &[(&str, &VulkanPreparedDispatchPlan)],
         tensor_index: &TensorIndex,
         artifact_manifest: &VulkanReusableKernelArtifactManifest,
         device_ids: &[String],
@@ -35,17 +34,20 @@ impl VulkanDistributedExecutionPlan {
         let mut shared_output_byte_capacity = 0usize;
         let mut distributed_parameter_byte_count = 0usize;
 
-        for bound_plan in bound_plans {
+        for (owner_device_id, prepared_plan) in prepared_plans {
             if device_ids.len() < 2 {
                 continue;
             }
-            if !device_ids.contains(&bound_plan.device_id) {
+            if !device_ids
+                .iter()
+                .any(|device_id| device_id == owner_device_id)
+            {
                 return Err(VulkanDistributedPlanError(format!(
                     "dispatch owner {:?} is absent from the distributed execution device pool",
-                    bound_plan.device_id
+                    owner_device_id
                 )));
             }
-            for dispatch in &bound_plan.dispatches {
+            for dispatch in &prepared_plan.dispatches {
                 if dispatch.op != DISTRIBUTABLE_PARALLEL_PROJECTION_OP {
                     continue;
                 }
@@ -60,7 +62,7 @@ impl VulkanDistributedExecutionPlan {
                         ))
                     })?;
                 let planned = plan_dispatch(
-                    &bound_plan.device_id,
+                    owner_device_id,
                     dispatch,
                     tensor_index,
                     device_ids,
@@ -103,8 +105,19 @@ pub struct VulkanDistributedDispatchPlan {
     pub output_rows: usize,
     pub input_width: usize,
     pub row_alignment: usize,
+    pub input_activation: VulkanDistributedActivationSlot,
+    pub output_activation: VulkanDistributedActivationSlot,
     pub distributed_parameter_byte_count: usize,
     pub shards: Vec<VulkanDistributedDispatchShard>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanDistributedActivationSlot {
+    pub pedal_id: String,
+    pub signal_id: String,
+    pub slot: usize,
+    pub byte_capacity: usize,
+    pub signal_byte_capacity: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -436,7 +449,7 @@ fn validate_tensor_partition_coverage<'a>(
 
 fn plan_dispatch(
     owner_device_id: &str,
-    dispatch: &VulkanMountedPlacedBoundDispatch,
+    dispatch: &VulkanPreparedDispatch,
     tensor_index: &TensorIndex,
     device_ids: &[String],
     artifact_workgroup_count_x: u32,
@@ -444,10 +457,10 @@ fn plan_dispatch(
     let parameter_descriptors = dispatch
         .descriptors
         .iter()
-        .filter_map(|descriptor| match &descriptor.target {
-            VulkanMountedPlacedBoundDescriptorTarget::Resident {
-                target: VulkanBoundDescriptorTarget::PermanentParameter { tensor, .. },
-            } => Some((descriptor.binding, tensor.as_str())),
+        .filter_map(|descriptor| match &descriptor.resource {
+            VulkanDescriptorResourceAddress::PermanentParameter { tensor, .. } => {
+                Some((descriptor.binding, tensor.as_str()))
+            }
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -504,8 +517,8 @@ fn plan_dispatch(
     let output_byte_capacity = output_rows
         .checked_mul(BF16_BYTE_COUNT)
         .ok_or_else(|| dispatch_error(dispatch, "output byte capacity overflowed".to_string()))?;
-    validate_signal_capacity(dispatch, 0, input_byte_capacity, "input")?;
-    validate_signal_capacity(dispatch, 1, output_byte_capacity, "output")?;
+    let input_activation = activation_slot(dispatch, 0, input_byte_capacity, "input")?;
+    let output_activation = activation_slot(dispatch, 1, output_byte_capacity, "output")?;
 
     let raw_shards = distribute_rows(output_rows, device_ids.len(), row_alignment)
         .map_err(|error| dispatch_error(dispatch, error))?;
@@ -571,6 +584,8 @@ fn plan_dispatch(
         output_rows,
         input_width,
         row_alignment,
+        input_activation,
+        output_activation,
         distributed_parameter_byte_count,
         shards,
     })
@@ -578,7 +593,7 @@ fn plan_dispatch(
 
 fn projection_metadata<'a>(
     tensor_index: &'a TensorIndex,
-    dispatch: &VulkanMountedPlacedBoundDispatch,
+    dispatch: &VulkanPreparedDispatch,
     tensor: &str,
 ) -> Result<&'a TensorMetadata, VulkanDistributedPlanError> {
     let metadata = tensor_index.tensors.get(tensor).ok_or_else(|| {
@@ -609,7 +624,7 @@ fn projection_metadata<'a>(
 }
 
 fn tensor_row_bytes(
-    dispatch: &VulkanMountedPlacedBoundDispatch,
+    dispatch: &VulkanPreparedDispatch,
     tensor: &str,
     metadata: &TensorMetadata,
     output_rows: usize,
@@ -636,24 +651,30 @@ fn tensor_row_bytes(
     Ok(byte_count / output_rows)
 }
 
-fn validate_signal_capacity(
-    dispatch: &VulkanMountedPlacedBoundDispatch,
+fn activation_slot(
+    dispatch: &VulkanPreparedDispatch,
     binding: usize,
     required: usize,
     role: &str,
-) -> Result<(), VulkanDistributedPlanError> {
-    let capacity = dispatch
+) -> Result<VulkanDistributedActivationSlot, VulkanDistributedPlanError> {
+    let activation = dispatch
         .descriptors
         .iter()
         .find(|descriptor| descriptor.binding == binding)
-        .and_then(|descriptor| match &descriptor.target {
-            VulkanMountedPlacedBoundDescriptorTarget::Resident {
-                target:
-                    VulkanBoundDescriptorTarget::ActivationSlot {
-                        signal_byte_capacity,
-                        ..
-                    },
-            } => Some(*signal_byte_capacity),
+        .and_then(|descriptor| match &descriptor.resource {
+            VulkanDescriptorResourceAddress::ActivationSlot {
+                pedal_id,
+                signal_id,
+                slot,
+                byte_capacity,
+                signal_byte_capacity,
+            } => Some(VulkanDistributedActivationSlot {
+                pedal_id: pedal_id.clone(),
+                signal_id: signal_id.clone(),
+                slot: *slot,
+                byte_capacity: *byte_capacity,
+                signal_byte_capacity: *signal_byte_capacity,
+            }),
             _ => None,
         })
         .ok_or_else(|| {
@@ -662,13 +683,16 @@ fn validate_signal_capacity(
                 format!("has no resident {role} activation at binding {binding}"),
             )
         })?;
-    if capacity < required {
+    if activation.signal_byte_capacity < required {
         return Err(dispatch_error(
             dispatch,
-            format!("{role} signal has {capacity} bytes but requires {required}"),
+            format!(
+                "{role} signal has {} bytes but requires {required}",
+                activation.signal_byte_capacity
+            ),
         ));
     }
-    Ok(())
+    Ok(activation)
 }
 
 fn distribute_rows(
@@ -709,7 +733,7 @@ fn parameter_fragment(
     row_bytes: usize,
     row_start: usize,
     row_count: usize,
-    dispatch: &VulkanMountedPlacedBoundDispatch,
+    dispatch: &VulkanPreparedDispatch,
 ) -> Result<VulkanDistributedParameterFragment, VulkanDistributedPlanError> {
     Ok(VulkanDistributedParameterFragment {
         binding,
@@ -738,7 +762,7 @@ fn greatest_common_divisor(mut left: usize, mut right: usize) -> usize {
 }
 
 fn dispatch_error(
-    dispatch: &VulkanMountedPlacedBoundDispatch,
+    dispatch: &VulkanPreparedDispatch,
     message: String,
 ) -> VulkanDistributedPlanError {
     VulkanDistributedPlanError(format!(
@@ -759,9 +783,7 @@ mod tests {
     use super::*;
     use crate::stream_plan::TensorMetadata;
     use crate::vulkan_stream_circuit::{
-        VulkanBoundDescriptorTarget, VulkanKernelDescriptorUsage,
-        VulkanMountedPlacedBoundDescriptor, VulkanMountedPlacedBoundDescriptorTarget,
-        VulkanReusableKernelArtifact,
+        VulkanKernelDescriptorUsage, VulkanResolvedDescriptorBinding, VulkanReusableKernelArtifact,
     };
 
     #[test]
@@ -775,6 +797,12 @@ mod tests {
         let dispatch = &plan.dispatches[0];
         assert_eq!(dispatch.owner_device_id, "owner");
         assert_eq!(dispatch.row_alignment, 2);
+        assert_eq!(dispatch.input_activation.pedal_id, "pedal");
+        assert_eq!(dispatch.input_activation.signal_id, "normalized");
+        assert_eq!(dispatch.input_activation.slot, 0);
+        assert_eq!(dispatch.output_activation.pedal_id, "pedal");
+        assert_eq!(dispatch.output_activation.signal_id, "hidden");
+        assert_eq!(dispatch.output_activation.slot, 1);
         assert_eq!(
             dispatch
                 .shards
@@ -904,7 +932,7 @@ mod tests {
     ) -> Result<VulkanDistributedExecutionPlan, VulkanDistributedPlanError> {
         let tensor_index = fixture_tensor_index(layout);
         let activation =
-            |binding, name: &str, signal: &str, bytes| VulkanMountedPlacedBoundDescriptor {
+            |binding, name: &str, signal: &str, bytes| VulkanResolvedDescriptorBinding {
                 binding,
                 usage: if binding == 0 {
                     VulkanKernelDescriptorUsage::InputSignal
@@ -912,34 +940,28 @@ mod tests {
                     VulkanKernelDescriptorUsage::OutputSignal
                 },
                 name: name.to_string(),
-                target: VulkanMountedPlacedBoundDescriptorTarget::Resident {
-                    target: VulkanBoundDescriptorTarget::ActivationSlot {
-                        buffer_index: binding,
-                        pedal_id: "pedal".to_string(),
-                        signal_id: signal.to_string(),
-                        circuit_id: "circuit".to_string(),
-                        slot: binding,
-                        byte_capacity: bytes,
-                        signal_byte_capacity: bytes,
-                    },
+                resource: VulkanDescriptorResourceAddress::ActivationSlot {
+                    pedal_id: "pedal".to_string(),
+                    signal_id: signal.to_string(),
+                    slot: binding,
+                    byte_capacity: bytes,
+                    signal_byte_capacity: bytes,
                 },
             };
-        let parameter = |binding, tensor: &str| VulkanMountedPlacedBoundDescriptor {
+        let parameter = |binding, tensor: &str| VulkanResolvedDescriptorBinding {
             binding,
             usage: VulkanKernelDescriptorUsage::Parameter,
             name: tensor.to_string(),
-            target: VulkanMountedPlacedBoundDescriptorTarget::Resident {
-                target: VulkanBoundDescriptorTarget::PermanentParameter {
-                    param_id: tensor.to_string(),
-                    tensor: tensor.to_string(),
-                    byte_count: Some(96),
-                },
+            resource: VulkanDescriptorResourceAddress::PermanentParameter {
+                param_id: tensor.to_string(),
+                tensor: tensor.to_string(),
+                byte_count: Some(96),
             },
         };
-        let bound_plan = VulkanMountedPlacedBoundDispatchPlan {
+        let prepared_plan = VulkanPreparedDispatchPlan {
             backend_id: "vulkan_stream_circuit".to_string(),
-            device_id: "owner".to_string(),
-            dispatches: vec![VulkanMountedPlacedBoundDispatch {
+            reusable_family_count: 1,
+            dispatches: vec![VulkanPreparedDispatch {
                 dispatch_index: 7,
                 kernel_id: "pedal.ffn".to_string(),
                 pedal_id: "pedal".to_string(),
@@ -961,12 +983,6 @@ mod tests {
                 uses_stream_tick: false,
             }],
             total_descriptor_count: 4,
-            resident_descriptor_count: 4,
-            model_boundary_descriptor_count: 0,
-            local_cable_descriptor_count: 0,
-            cable_endpoint_descriptor_count: 0,
-            incoming_cable_descriptor_count: 0,
-            outgoing_cable_descriptor_count: 0,
         };
         let artifact_manifest =
             VulkanReusableKernelArtifactManifest::new(vec![VulkanReusableKernelArtifact {
@@ -980,8 +996,8 @@ mod tests {
                 push_constants: Vec::new(),
                 uses_stream_tick: false,
             }]);
-        VulkanDistributedExecutionPlan::from_bound_plans(
-            &[&bound_plan],
+        VulkanDistributedExecutionPlan::from_prepared_plans(
+            &[("owner", &prepared_plan)],
             &tensor_index,
             &artifact_manifest,
             &[
