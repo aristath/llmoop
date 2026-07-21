@@ -6008,6 +6008,24 @@ fn select_pedal_batch_kernel_artifact<'a>(
     execution_mode: VulkanPedalBatchExecutionMode,
     lane_capacity: usize,
 ) -> Option<&'a VulkanResidentPedalBatchKernelArtifact> {
+    select_pedal_batch_kernel_artifact_where(
+        artifacts,
+        pedal_id,
+        node_id,
+        execution_mode,
+        lane_capacity,
+        |_| true,
+    )
+}
+
+fn select_pedal_batch_kernel_artifact_where<'a>(
+    artifacts: &'a [VulkanResidentPedalBatchKernelArtifact],
+    pedal_id: &str,
+    node_id: &str,
+    execution_mode: VulkanPedalBatchExecutionMode,
+    lane_capacity: usize,
+    compatible: impl Fn(&VulkanResidentPedalBatchKernelArtifact) -> bool,
+) -> Option<&'a VulkanResidentPedalBatchKernelArtifact> {
     artifacts
         .iter()
         .filter(|artifact| {
@@ -6017,6 +6035,7 @@ fn select_pedal_batch_kernel_artifact<'a>(
                     || execution_mode == VulkanPedalBatchExecutionMode::CausalSequence)
                 && (execution_mode == VulkanPedalBatchExecutionMode::CausalSequence
                     || artifact.exact_primary_equivalence)
+                && compatible(artifact)
         })
         .min_by_key(|artifact| {
             if execution_mode == VulkanPedalBatchExecutionMode::CausalSequence {
@@ -6728,6 +6747,15 @@ impl VulkanDistributedPedalBatchRunners {
     ) -> Result<Self, VulkanResidentInProcessPlacedRuntimeError> {
         let mut dispatches = Vec::with_capacity(execution_plan.dispatches.len());
         for planned in &execution_plan.dispatches {
+            for shard in &planned.shards {
+                if !devices.contains_key(&shard.device_id) {
+                    return Err(
+                        VulkanResidentInProcessPlacedRuntimeError::MissingBoundDevice {
+                            device_id: shard.device_id.clone(),
+                        },
+                    );
+                }
+            }
             let owner_index = placed_slices
                 .iter()
                 .position(|slice| slice.device_id == planned.owner_device_id)
@@ -6738,12 +6766,19 @@ impl VulkanDistributedPedalBatchRunners {
                 )?;
             let package_slice = &placed_slices[owner_index].package_slice;
             let batch_slice = &batch_slices[owner_index];
-            let artifact = select_pedal_batch_kernel_artifact(
+            let artifact = select_pedal_batch_kernel_artifact_where(
                 &package_slice.batch_kernels,
                 &planned.pedal_id,
                 &planned.node_id,
                 execution_mode,
                 lane_capacity,
+                |artifact| {
+                    planned.shards.iter().all(|shard| {
+                        devices.get(&shard.device_id).is_some_and(|device| {
+                            batch_kernel_artifact_is_supported(device, artifact)
+                        })
+                    })
+                },
             )
             .ok_or_else(|| {
                 VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(format!(
@@ -11294,6 +11329,7 @@ struct VulkanResidentPedalBatchKernelArtifact {
     batch_mode: VulkanResidentPedalKernelBatchMode,
     lane_tile_width: usize,
     exact_primary_equivalence: bool,
+    device_requirements: VulkanResidentVulkanDeviceRequirements,
     stages: Vec<VulkanResidentPedalBatchStageArtifact>,
 }
 
@@ -18134,6 +18170,7 @@ fn load_resident_pedal_batch_kernels(
                     batch_mode: kernel.batch_mode,
                     lane_tile_width: implementation.lane_tile_width as usize,
                     exact_primary_equivalence: implementation.exact_primary_equivalence,
+                    device_requirements: implementation.device_requirements.clone(),
                     stages: implementation
                         .stages
                         .iter()
@@ -18159,21 +18196,40 @@ fn batch_implementation_is_supported(
     device: &VulkanComputeDevice,
     implementation: &VulkanResidentPedalBatchImplementationSpec,
 ) -> bool {
-    implementation
-        .stages
-        .iter()
-        .all(|stage| device.supports_compute_local_size_x(stage.local_size_x))
-        && implementation
-            .device_requirements
+    batch_device_requirements_are_supported(
+        device,
+        &implementation.device_requirements,
+        implementation.stages.iter().map(|stage| stage.local_size_x),
+    )
+}
+
+fn batch_kernel_artifact_is_supported(
+    device: &VulkanComputeDevice,
+    artifact: &VulkanResidentPedalBatchKernelArtifact,
+) -> bool {
+    batch_device_requirements_are_supported(
+        device,
+        &artifact.device_requirements,
+        artifact.stages.iter().map(|stage| stage.local_size_x),
+    )
+}
+
+fn batch_device_requirements_are_supported(
+    device: &VulkanComputeDevice,
+    requirements: &VulkanResidentVulkanDeviceRequirements,
+    local_size_x_values: impl IntoIterator<Item = u32>,
+) -> bool {
+    local_size_x_values
+        .into_iter()
+        .all(|local_size_x| device.supports_compute_local_size_x(local_size_x))
+        && requirements
             .vulkan_device_extensions
             .iter()
             .all(|extension| device.has_enabled_device_extension(extension))
-        && implementation
-            .device_requirements
+        && requirements
             .cooperative_bfloat16_shape
             .is_none_or(|[m, n, k]| device.supports_cooperative_bfloat16_shape(m, n, k))
-        && implementation
-            .device_requirements
+        && requirements
             .subgroup_size
             .is_none_or(|subgroup_size| device.subgroup_size() == subgroup_size)
 }
@@ -24764,6 +24820,7 @@ mod tests {
                 batch_mode: VulkanResidentPedalKernelBatchMode::WeightShared,
                 lane_tile_width,
                 exact_primary_equivalence,
+                device_requirements: VulkanResidentVulkanDeviceRequirements::default(),
                 stages: Vec::new(),
             };
         let artifacts = vec![
@@ -24794,6 +24851,17 @@ mod tests {
         )
         .unwrap();
         assert_eq!(causal.lane_tile_width, 64);
+
+        let heterogeneous = select_pedal_batch_kernel_artifact_where(
+            &artifacts,
+            "processor",
+            "project",
+            VulkanPedalBatchExecutionMode::CausalSequence,
+            6,
+            |artifact| artifact.lane_tile_width != 64,
+        )
+        .unwrap();
+        assert_eq!(heterogeneous.lane_tile_width, 16);
     }
 
     #[test]
