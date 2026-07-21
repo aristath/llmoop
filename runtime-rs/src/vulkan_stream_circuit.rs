@@ -40,10 +40,11 @@ use crate::vulkan_compute::{
 };
 use crate::vulkan_distributed::{
     VulkanDistributedActivationBufferPlan, VulkanDistributedActivationBuffers,
-    VulkanDistributedDispatchPlan, VulkanDistributedDispatchRunnerError,
-    VulkanDistributedDispatchRunners, VulkanDistributedDispatchSubmission,
-    VulkanDistributedExecutionPlan, VulkanDistributedParameterAllocationPlan,
-    VulkanDistributedParameterBuffers, VulkanDistributedParameterExclusionPlan,
+    VulkanDistributedDispatchDistribution, VulkanDistributedDispatchPlan,
+    VulkanDistributedDispatchRunnerError, VulkanDistributedDispatchRunners,
+    VulkanDistributedDispatchSubmission, VulkanDistributedExecutionPlan,
+    VulkanDistributedParameterAllocationPlan, VulkanDistributedParameterBuffers,
+    VulkanDistributedParameterExclusionPlan,
 };
 
 pub const VULKAN_STREAM_CIRCUIT_BACKEND_ID: &str = "vulkan_stream_circuit_ir";
@@ -7111,7 +7112,10 @@ impl VulkanResidentPedalBatchSliceRunner {
             .iter()
             .filter(|dispatch| dispatch.owner_device_id == slice.device_id)
         {
-            for activation in [&dispatch.input_activation, &dispatch.output_activation] {
+            for activation in std::iter::once(&dispatch.input_activation)
+                .chain(&dispatch.auxiliary_input_activations)
+                .chain(std::iter::once(&dispatch.output_activation))
+            {
                 let key = VulkanPedalBatchSignalKey::Activation {
                     pedal_id: activation.pedal_id.clone(),
                     signal_id: activation.signal_id.clone(),
@@ -7775,6 +7779,14 @@ impl VulkanDistributedPedalBatchRunners {
                 pedal_id: planned.input_activation.pedal_id.clone(),
                 signal_id: planned.input_activation.signal_id.clone(),
             };
+            let auxiliary_input_keys = planned
+                .auxiliary_input_activations
+                .iter()
+                .map(|activation| VulkanPedalBatchSignalKey::Activation {
+                    pedal_id: activation.pedal_id.clone(),
+                    signal_id: activation.signal_id.clone(),
+                })
+                .collect::<Vec<_>>();
             let output_key = VulkanPedalBatchSignalKey::Activation {
                 pedal_id: planned.output_activation.pedal_id.clone(),
                 signal_id: planned.output_activation.signal_id.clone(),
@@ -7790,6 +7802,22 @@ impl VulkanDistributedPedalBatchRunners {
                         planned.pedal_id, planned.node_id
                     )),
                 ));
+            }
+            for (activation, key) in planned
+                .auxiliary_input_activations
+                .iter()
+                .zip(&auxiliary_input_keys)
+            {
+                if batch_slice.signal_buffer(key)?.frame_byte_capacity
+                    != activation.signal_byte_capacity
+                {
+                    return Err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop(
+                        VulkanError(format!(
+                            "distributed pedal batch {}.{} auxiliary signal {} differs from its physical plan",
+                            planned.pedal_id, planned.node_id, activation.signal_id
+                        )),
+                    ));
+                }
             }
             let input_byte_capacity = planned
                 .input_byte_capacity
@@ -7824,22 +7852,84 @@ impl VulkanDistributedPedalBatchRunners {
                 let input = batch_slice.distributed_signal_buffer(&input_key, &shard.device_id)?;
                 let output =
                     batch_slice.distributed_signal_buffer(&output_key, &shard.device_id)?;
-                let (output_byte_offset, output_byte_capacity) =
-                    distributed_batch_shard_output_binding_range(
-                        planned.output_byte_capacity,
-                        lane_capacity,
-                        shard.output_byte_offset,
-                        shard.output_byte_count,
-                    )?;
-                let mut bindings = Vec::with_capacity(2 + shard.parameters.len());
-                bindings.push(
-                    VulkanResidentKernelBufferBinding::new(0, input, input_byte_capacity)
-                        .with_access(VulkanResidentKernelBufferAccess::Read),
+                let (output_byte_offset, output_byte_capacity) = match planned.distribution {
+                    VulkanDistributedDispatchDistribution::OutputRows => {
+                        distributed_batch_shard_output_binding_range(
+                            planned.output_byte_capacity,
+                            lane_capacity,
+                            shard.output_byte_offset,
+                            shard.output_byte_count,
+                        )?
+                    }
+                    VulkanDistributedDispatchDistribution::ExpertRange => (
+                        0,
+                        planned
+                            .output_byte_capacity
+                            .checked_mul(lane_capacity)
+                            .ok_or_else(|| {
+                                VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(
+                                    "distributed expert output capacity overflowed".to_string(),
+                                ))
+                            })?,
+                    ),
+                };
+                let mut bindings = Vec::with_capacity(
+                    2 + planned.auxiliary_input_activations.len() + shard.parameters.len(),
                 );
                 bindings.push(
-                    VulkanResidentKernelBufferBinding::new(1, output, output_byte_capacity)
-                        .with_byte_offset(output_byte_offset)
-                        .with_access(VulkanResidentKernelBufferAccess::Write),
+                    VulkanResidentKernelBufferBinding::new(
+                        u32::try_from(planned.input_activation.binding).map_err(|_| {
+                            VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(
+                                "distributed pedal batch primary input binding exceeds u32"
+                                    .to_string(),
+                            ))
+                        })?,
+                        input,
+                        input_byte_capacity,
+                    )
+                    .with_access(VulkanResidentKernelBufferAccess::Read),
+                );
+                for (activation, key) in planned
+                    .auxiliary_input_activations
+                    .iter()
+                    .zip(&auxiliary_input_keys)
+                {
+                    let buffer = batch_slice.distributed_signal_buffer(key, &shard.device_id)?;
+                    let byte_capacity = activation
+                        .signal_byte_capacity
+                        .checked_mul(lane_capacity)
+                        .ok_or_else(|| {
+                            VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(
+                                "distributed pedal batch auxiliary input capacity overflowed"
+                                    .to_string(),
+                            ))
+                        })?;
+                    bindings.push(
+                        VulkanResidentKernelBufferBinding::new(
+                            u32::try_from(activation.binding).map_err(|_| {
+                                VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(
+                                    "distributed pedal batch auxiliary binding exceeds u32"
+                                        .to_string(),
+                                ))
+                            })?,
+                            buffer,
+                            byte_capacity,
+                        )
+                        .with_access(VulkanResidentKernelBufferAccess::Read),
+                    );
+                }
+                bindings.push(
+                    VulkanResidentKernelBufferBinding::new(
+                        u32::try_from(planned.output_activation.binding).map_err(|_| {
+                            VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(
+                                "distributed pedal batch output binding exceeds u32".to_string(),
+                            ))
+                        })?,
+                        output,
+                        output_byte_capacity,
+                    )
+                    .with_byte_offset(output_byte_offset)
+                    .with_access(VulkanResidentKernelBufferAccess::Write),
                 );
                 for fragment in &shard.parameters {
                     let allocation = parameter_buffers
@@ -7877,39 +7967,48 @@ impl VulkanDistributedPedalBatchRunners {
                 }
                 let mut resident_dispatches = Vec::with_capacity(artifact.stages.len());
                 for stage in &artifact.stages {
-                    let rows_per_workgroup = distributed_batch_rows_per_workgroup(
-                        planned.output_rows,
-                        stage.workgroup_count_x,
-                        &planned.pedal_id,
-                        &planned.node_id,
-                    )?;
-                    if !shard.row_start.is_multiple_of(rows_per_workgroup)
-                        || !shard.row_count.is_multiple_of(rows_per_workgroup)
-                    {
-                        return Err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop(
-                            VulkanError(format!(
-                                "distributed pedal batch {}.{} shard rows {}..{} do not align to {rows_per_workgroup} rows per workgroup",
-                                planned.pedal_id,
-                                planned.node_id,
-                                shard.row_start,
-                                shard.row_start + shard.row_count
-                            )),
-                        ));
-                    }
-                    let workgroup_count_x = u32::try_from(shard.row_count / rows_per_workgroup)
-                        .map_err(|_| {
-                            VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(
-                                "distributed pedal batch shard workgroup count exceeds u32"
-                                    .to_string(),
-                            ))
-                        })?;
+                    let workgroup_count_x = match planned.distribution {
+                        VulkanDistributedDispatchDistribution::ExpertRange => {
+                            stage.workgroup_count_x
+                        }
+                        VulkanDistributedDispatchDistribution::OutputRows => {
+                            let rows_per_workgroup = distributed_batch_rows_per_workgroup(
+                                planned.output_rows,
+                                stage.workgroup_count_x,
+                                &planned.pedal_id,
+                                &planned.node_id,
+                            )?;
+                            if !shard.row_start.is_multiple_of(rows_per_workgroup)
+                                || !shard.row_count.is_multiple_of(rows_per_workgroup)
+                            {
+                                return Err(
+                                    VulkanResidentInProcessPlacedRuntimeError::BackendLoop(
+                                        VulkanError(format!(
+                                            "distributed pedal batch {}.{} shard rows {}..{} do not align to {rows_per_workgroup} rows per workgroup",
+                                            planned.pedal_id,
+                                            planned.node_id,
+                                            shard.row_start,
+                                            shard.row_start + shard.row_count
+                                        )),
+                                    ),
+                                );
+                            }
+                            u32::try_from(shard.row_count / rows_per_workgroup).map_err(|_| {
+                                VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(
+                                    "distributed pedal batch shard workgroup count exceeds u32"
+                                        .to_string(),
+                                ))
+                            })?
+                        }
+                    };
                     resident_dispatches.push(
                         device
-                            .create_resident_kernel_dispatch_2d(
+                            .create_resident_kernel_dispatch_2d_with_base_z(
                                 &stage.spirv_words,
                                 &bindings,
                                 workgroup_count_x,
                                 workgroup_count_y,
+                                shard.base_workgroup_z,
                                 stage.local_size_x,
                                 VULKAN_PEDAL_BATCH_CONTROL_BYTE_CAPACITY,
                             )
@@ -14657,12 +14756,10 @@ impl VulkanResidentInProcessPlacedModelPackage {
             .iter()
             .map(|slice| (slice.device_id.as_str(), &slice.prepared_plan))
             .collect::<Vec<_>>();
-        let reusable_manifest =
-            resident_package_reusable_kernel_manifest_for_slice_plans(&device_slice_plans)
-                .map_err(VulkanResidentInProcessPlacedRuntimeError::Package)?;
         let distributed_loaded_manifest =
             resident_package_loaded_kernel_manifest_for_slice_plans(&device_slice_plans)
                 .map_err(VulkanResidentInProcessPlacedRuntimeError::Package)?;
+        let distributed_artifact_manifest = distributed_loaded_manifest.artifact_manifest();
         let storage_buffer_offset_alignment = device_ids
             .iter()
             .map(|device_id| {
@@ -14675,7 +14772,7 @@ impl VulkanResidentInProcessPlacedModelPackage {
         let distributed_execution_plan = VulkanDistributedExecutionPlan::from_prepared_plans(
             &prepared_plans,
             &tensor_index,
-            &reusable_manifest,
+            &distributed_artifact_manifest,
             &device_ids,
             storage_buffer_offset_alignment,
         )
@@ -20192,29 +20289,6 @@ fn resident_package_reusable_kernel_manifest(
     )
 }
 
-fn resident_package_reusable_kernel_manifest_for_slice_plans(
-    slice_plans: &[VulkanResidentModelPackageDeviceSlicePlan],
-) -> Result<VulkanReusableKernelArtifactManifest, VulkanResidentTokenModelPackageError> {
-    let mut artifacts_by_family = BTreeMap::new();
-    for slice in slice_plans {
-        for artifact in resident_package_reusable_kernel_manifest(&slice.placed_plan).artifacts {
-            if let Some(existing) = artifacts_by_family.get(&artifact.family_id) {
-                if existing != &artifact {
-                    return Err(VulkanResidentTokenModelPackageError::new(format!(
-                        "reusable Vulkan family {:?} has conflicting physical contracts across device slices",
-                        artifact.family_id
-                    )));
-                }
-            } else {
-                artifacts_by_family.insert(artifact.family_id.clone(), artifact);
-            }
-        }
-    }
-    Ok(VulkanReusableKernelArtifactManifest::new(
-        artifacts_by_family.into_values().collect(),
-    ))
-}
-
 fn resident_package_loaded_kernel_manifest_for_slice_plans(
     slice_plans: &[VulkanResidentModelPackageDeviceSlicePlan],
 ) -> Result<VulkanLoadedReusableKernelArtifactManifest, VulkanResidentTokenModelPackageError> {
@@ -23164,6 +23238,15 @@ impl VulkanLoadedReusableKernelArtifactManifest {
             .iter()
             .map(|artifact| artifact.artifact.family_id.as_str())
             .collect()
+    }
+
+    pub fn artifact_manifest(&self) -> VulkanReusableKernelArtifactManifest {
+        VulkanReusableKernelArtifactManifest::new(
+            self.artifacts
+                .iter()
+                .map(|loaded| loaded.artifact.clone())
+                .collect(),
+        )
     }
 }
 
@@ -28120,6 +28203,36 @@ mod tests {
     const FIXTURE_MODEL_INPUT_FRAME_SIGNAL: &str = "input_frame";
     const FIXTURE_MODEL_OUTPUT_FRAME_SIGNAL: &str = "output_frame";
     const FIXTURE_MODEL_HIDDEN_SIZE: usize = 1_024;
+
+    #[test]
+    fn loaded_artifact_manifest_preserves_compiled_launch_geometry() {
+        let loaded = VulkanLoadedReusableKernelArtifactManifest {
+            schema: VULKAN_REUSABLE_KERNEL_ARTIFACT_MANIFEST_SCHEMA.to_string(),
+            backend_id: VULKAN_STREAM_CIRCUIT_BACKEND_ID.to_string(),
+            artifacts: vec![VulkanLoadedReusableKernelArtifact {
+                artifact: VulkanReusableKernelArtifact {
+                    family_id: "sparse-moe-gate-up".to_string(),
+                    op: "sparse_moe_gate_up".to_string(),
+                    path: "kernels/sparse-moe-gate-up.spv".to_string(),
+                    entry_point: DEFAULT_SPIRV_ENTRY_POINT.to_string(),
+                    local_size_x: 64,
+                    workgroup_count_x: 2_048,
+                    descriptor_signature: Vec::new(),
+                    push_constants: Vec::new(),
+                    uses_stream_tick: false,
+                },
+                resolved_path: PathBuf::from("kernels/sparse-moe-gate-up.spv"),
+                words: vec![0x0723_0203],
+            }],
+            total_word_count: 1,
+        };
+
+        let physical = loaded.artifact_manifest();
+
+        assert_eq!(physical.artifacts.len(), 1);
+        assert_eq!(physical.artifacts[0].workgroup_count_x, 2_048);
+        assert_eq!(physical.artifacts[0].local_size_x, 64);
+    }
 
     #[test]
     fn pedal_batch_signal_liveness_reuses_only_compatible_dead_buffers() {

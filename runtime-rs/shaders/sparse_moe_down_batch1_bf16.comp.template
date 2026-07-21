@@ -18,6 +18,7 @@ const uint NUM_EXPERTS = {{NUM_EXPERTS}}u;
 const uint EXPERTS_PER_TOKEN = {{EXPERTS_PER_TOKEN}}u;
 const uint HIDDEN_WORDS = HIDDEN_SIZE / 2u;
 const uint INTERMEDIATE_WORDS = INTERMEDIATE_SIZE / 2u;
+const uint EXPERT_OUTPUT_WORDS = HIDDEN_SIZE * INTERMEDIATE_WORDS;
 
 shared float subgroup_lo[64];
 shared float subgroup_hi[64];
@@ -47,6 +48,12 @@ void main() {
     if (expert >= NUM_EXPERTS) {
         return;
     }
+    uint expert_start = gl_WorkGroupID.z;
+    uint expert_count = expert_output_weight.words.length() / EXPERT_OUTPUT_WORDS;
+    if (expert < expert_start || expert >= expert_start + expert_count) {
+        return;
+    }
+    expert -= expert_start;
     float route_weight = bf16_to_f32(packed_route >> 16u);
 
     uint lane = gl_LocalInvocationID.x;

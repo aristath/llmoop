@@ -821,6 +821,7 @@ pub struct VulkanResidentKernelDispatch {
     descriptor_count: usize,
     workgroup_count_x: u32,
     workgroup_count_y: u32,
+    base_workgroup_z: u32,
     push_constant_byte_count: u32,
     buffer_accesses: Vec<(vk::Buffer, VulkanResidentKernelBufferAccess)>,
 }
@@ -854,6 +855,7 @@ struct VulkanResidentKernelRecordedStep {
     descriptor_set: vk::DescriptorSet,
     workgroup_count_x: u32,
     workgroup_count_y: u32,
+    base_workgroup_z: u32,
     push_constants: Vec<u8>,
 }
 
@@ -2494,6 +2496,28 @@ impl VulkanComputeDevice {
         local_size_x: u32,
         push_constant_byte_count: u32,
     ) -> Result<VulkanResidentKernelDispatch, VulkanError> {
+        self.create_resident_kernel_dispatch_2d_with_base_z(
+            spirv_words,
+            buffers,
+            workgroup_count_x,
+            workgroup_count_y,
+            0,
+            local_size_x,
+            push_constant_byte_count,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_resident_kernel_dispatch_2d_with_base_z(
+        &self,
+        spirv_words: &[u32],
+        buffers: &[VulkanResidentKernelBufferBinding<'_>],
+        workgroup_count_x: u32,
+        workgroup_count_y: u32,
+        base_workgroup_z: u32,
+        local_size_x: u32,
+        push_constant_byte_count: u32,
+    ) -> Result<VulkanResidentKernelDispatch, VulkanError> {
         if spirv_words.is_empty() {
             return Err(VulkanError("SPIR-V module must not be empty".to_string()));
         }
@@ -2618,6 +2642,7 @@ impl VulkanComputeDevice {
                 descriptor_count: buffers.len(),
                 workgroup_count_x,
                 workgroup_count_y,
+                base_workgroup_z,
                 push_constant_byte_count,
                 buffer_accesses,
             })
@@ -3055,6 +3080,7 @@ impl VulkanComputeDevice {
                                     && recorded.descriptor_set == step.dispatch.descriptor_set
                                     && recorded.workgroup_count_x == step.dispatch.workgroup_count_x
                                     && recorded.workgroup_count_y == step.dispatch.workgroup_count_y
+                                    && recorded.base_workgroup_z == step.dispatch.base_workgroup_z
                                     && recorded.push_constants == step.push_constants
                             })
                     })
@@ -3281,12 +3307,24 @@ impl VulkanComputeDevice {
                             step.push_constants,
                         );
                     }
-                    self.device.cmd_dispatch(
-                        sequence.command_buffer,
-                        step.dispatch.workgroup_count_x,
-                        step.dispatch.workgroup_count_y,
-                        1,
-                    );
+                    if step.dispatch.base_workgroup_z == 0 {
+                        self.device.cmd_dispatch(
+                            sequence.command_buffer,
+                            step.dispatch.workgroup_count_x,
+                            step.dispatch.workgroup_count_y,
+                            1,
+                        );
+                    } else {
+                        self.device.cmd_dispatch_base(
+                            sequence.command_buffer,
+                            0,
+                            0,
+                            step.dispatch.base_workgroup_z,
+                            step.dispatch.workgroup_count_x,
+                            step.dispatch.workgroup_count_y,
+                            1,
+                        );
+                    }
                     for (current_buffer, current_access) in &step.dispatch.buffer_accesses {
                         if let Some((_, pending_access)) = pending_buffer_accesses
                             .iter_mut()
@@ -3401,6 +3439,7 @@ impl VulkanComputeDevice {
                                 descriptor_set: step.dispatch.descriptor_set,
                                 workgroup_count_x: step.dispatch.workgroup_count_x,
                                 workgroup_count_y: step.dispatch.workgroup_count_y,
+                                base_workgroup_z: step.dispatch.base_workgroup_z,
                                 push_constants: step.push_constants.to_vec(),
                             })
                             .collect(),

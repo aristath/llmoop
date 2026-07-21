@@ -24,6 +24,7 @@ const uint EXPERTS_PER_TOKEN = {{EXPERTS_PER_TOKEN}}u;
 const uint HIDDEN_WORDS = HIDDEN_SIZE / 2u;
 const uint INTERMEDIATE_WORDS = INTERMEDIATE_SIZE / 2u;
 const uint EXPERT_INPUT_ROWS = INTERMEDIATE_SIZE * 2u;
+const uint EXPERT_INPUT_WORDS = EXPERT_INPUT_ROWS * HIDDEN_SIZE / 4u;
 const uint SCALE_ROWS = (EXPERT_INPUT_ROWS + BLOCK_ROWS - 1u) / BLOCK_ROWS;
 const uint SCALE_COLUMNS = (HIDDEN_SIZE + BLOCK_COLUMNS - 1u) / BLOCK_COLUMNS;
 
@@ -106,6 +107,12 @@ void main() {
     if (expert >= NUM_EXPERTS) {
         return;
     }
+    uint expert_start = gl_WorkGroupID.z;
+    uint expert_count = expert_input_weight.words.length() / EXPERT_INPUT_WORDS;
+    if (expert < expert_start || expert >= expert_start + expert_count) {
+        return;
+    }
+    expert -= expert_start;
 
     uint lane = gl_LocalInvocationID.x;
     uint first = word * 2u;

@@ -19,6 +19,7 @@ use crate::vulkan_stream_circuit::{
 };
 
 const DISTRIBUTABLE_PARALLEL_PROJECTION_OP: &str = "parallel_linear_silu_multiply";
+const DISTRIBUTABLE_SPARSE_EXPERT_OPS: [&str; 2] = ["sparse_moe_gate_up", "sparse_moe_down"];
 const BF16_BYTE_COUNT: usize = 2;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -75,7 +76,9 @@ impl VulkanDistributedExecutionPlan {
                 )));
             }
             for dispatch in &prepared_plan.dispatches {
-                if dispatch.op != DISTRIBUTABLE_PARALLEL_PROJECTION_OP {
+                if dispatch.op != DISTRIBUTABLE_PARALLEL_PROJECTION_OP
+                    && !DISTRIBUTABLE_SPARSE_EXPERT_OPS.contains(&dispatch.op.as_str())
+                {
                     continue;
                 }
                 let artifact = artifact_manifest
@@ -138,13 +141,22 @@ pub struct VulkanDistributedDispatchPlan {
     pub input_width: usize,
     pub row_alignment: usize,
     pub input_activation: VulkanDistributedActivationSlot,
+    pub auxiliary_input_activations: Vec<VulkanDistributedActivationSlot>,
     pub output_activation: VulkanDistributedActivationSlot,
+    pub distribution: VulkanDistributedDispatchDistribution,
     pub distributed_parameter_byte_count: usize,
     pub shards: Vec<VulkanDistributedDispatchShard>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VulkanDistributedDispatchDistribution {
+    OutputRows,
+    ExpertRange,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VulkanDistributedActivationSlot {
+    pub binding: usize,
     pub pedal_id: String,
     pub signal_id: String,
     pub slot: usize,
@@ -210,6 +222,15 @@ impl VulkanDistributedActivationBufferPlan {
                 &participant_device_ids,
                 VulkanDistributedActivationAccess::Input,
             )?;
+            for activation in &dispatch.auxiliary_input_activations {
+                accumulate_activation_allocation(
+                    &mut allocations,
+                    &dispatch.owner_device_id,
+                    activation,
+                    &participant_device_ids,
+                    VulkanDistributedActivationAccess::Input,
+                )?;
+            }
             accumulate_activation_allocation(
                 &mut allocations,
                 &dispatch.owner_device_id,
@@ -486,6 +507,7 @@ pub struct VulkanDistributedDispatchShard {
     pub row_start: usize,
     pub row_count: usize,
     pub workgroup_count_x: u32,
+    pub base_workgroup_z: u32,
     pub output_byte_offset: usize,
     pub output_byte_count: usize,
     pub parameters: Vec<VulkanDistributedParameterFragment>,
@@ -900,18 +922,61 @@ impl VulkanDistributedDispatchRunners {
                             planned_shard.device_id
                         ))
                     })?;
-                let mut bindings = Vec::with_capacity(2 + planned_shard.parameters.len());
+                let mut bindings = Vec::with_capacity(
+                    2 + planned_dispatch.auxiliary_input_activations.len()
+                        + planned_shard.parameters.len(),
+                );
                 bindings.push(
                     VulkanResidentKernelBufferBinding::new(
-                        0,
+                        u32::try_from(planned_dispatch.input_activation.binding).map_err(|_| {
+                            VulkanDistributedDispatchRunnerError(
+                                "distributed primary input binding exceeds u32".to_string(),
+                            )
+                        })?,
                         input,
                         planned_dispatch.input_byte_capacity,
                     )
                     .with_access(VulkanResidentKernelBufferAccess::Read),
                 );
+                for auxiliary in &planned_dispatch.auxiliary_input_activations {
+                    let buffer = activation_buffers
+                        .activation_buffer(
+                            &planned_dispatch.owner_device_id,
+                            &auxiliary.pedal_id,
+                            auxiliary.slot,
+                            &planned_shard.device_id,
+                        )
+                        .ok_or_else(|| {
+                            VulkanDistributedDispatchRunnerError(format!(
+                                "distributed dispatch {}.{} has no auxiliary input {} on {:?}",
+                                planned_dispatch.pedal_id,
+                                planned_dispatch.node_id,
+                                auxiliary.signal_id,
+                                planned_shard.device_id
+                            ))
+                        })?;
+                    bindings.push(
+                        VulkanResidentKernelBufferBinding::new(
+                            u32::try_from(auxiliary.binding).map_err(|_| {
+                                VulkanDistributedDispatchRunnerError(
+                                    "distributed auxiliary input binding exceeds u32".to_string(),
+                                )
+                            })?,
+                            buffer,
+                            auxiliary.signal_byte_capacity,
+                        )
+                        .with_access(VulkanResidentKernelBufferAccess::Read),
+                    );
+                }
                 bindings.push(
                     VulkanResidentKernelBufferBinding::new(
-                        1,
+                        u32::try_from(planned_dispatch.output_activation.binding).map_err(
+                            |_| {
+                                VulkanDistributedDispatchRunnerError(
+                                    "distributed output binding exceeds u32".to_string(),
+                                )
+                            },
+                        )?,
                         output,
                         planned_shard.output_byte_count,
                     )
@@ -953,10 +1018,12 @@ impl VulkanDistributedDispatchRunners {
                     );
                 }
                 let resident_dispatch = device
-                    .create_resident_kernel_dispatch(
+                    .create_resident_kernel_dispatch_2d_with_base_z(
                         &artifact.words,
                         &bindings,
                         planned_shard.workgroup_count_x,
+                        1,
+                        planned_shard.base_workgroup_z,
                         artifact.artifact.local_size_x,
                         0,
                     )
@@ -1369,7 +1436,6 @@ impl VulkanDistributedDispatchRunners {
         if let Some(error) = first_wait_error {
             return Err(VulkanDistributedDispatchRunnerError(error));
         }
-
         Ok(VulkanDistributedDispatchRun {
             owner_device_id: owner_device_id.to_string(),
             dispatch_index,
@@ -1892,6 +1958,34 @@ fn plan_dispatch(
     artifact_workgroup_count_x: u32,
     storage_buffer_offset_alignment: usize,
 ) -> Result<Option<VulkanDistributedDispatchPlan>, VulkanDistributedPlanError> {
+    if DISTRIBUTABLE_SPARSE_EXPERT_OPS.contains(&dispatch.op.as_str()) {
+        return plan_sparse_expert_dispatch(
+            owner_device_id,
+            dispatch,
+            tensor_index,
+            device_ids,
+            artifact_workgroup_count_x,
+            storage_buffer_offset_alignment,
+        );
+    }
+    plan_parallel_projection_dispatch(
+        owner_device_id,
+        dispatch,
+        tensor_index,
+        device_ids,
+        artifact_workgroup_count_x,
+        storage_buffer_offset_alignment,
+    )
+}
+
+fn plan_parallel_projection_dispatch(
+    owner_device_id: &str,
+    dispatch: &VulkanPreparedDispatch,
+    tensor_index: &TensorIndex,
+    device_ids: &[String],
+    artifact_workgroup_count_x: u32,
+    storage_buffer_offset_alignment: usize,
+) -> Result<Option<VulkanDistributedDispatchPlan>, VulkanDistributedPlanError> {
     if !dispatch.push_constants.is_empty() {
         return Ok(None);
     }
@@ -2037,6 +2131,7 @@ fn plan_dispatch(
                 row_start,
                 row_count,
                 workgroup_count_x,
+                base_workgroup_z: 0,
                 output_byte_offset: row_start.checked_mul(BF16_BYTE_COUNT).ok_or_else(|| {
                     dispatch_error(dispatch, "shard output offset overflowed".to_string())
                 })?,
@@ -2060,7 +2155,168 @@ fn plan_dispatch(
         input_width,
         row_alignment,
         input_activation,
+        auxiliary_input_activations: Vec::new(),
         output_activation,
+        distribution: VulkanDistributedDispatchDistribution::OutputRows,
+        distributed_parameter_byte_count,
+        shards,
+    }))
+}
+
+fn plan_sparse_expert_dispatch(
+    owner_device_id: &str,
+    dispatch: &VulkanPreparedDispatch,
+    tensor_index: &TensorIndex,
+    device_ids: &[String],
+    artifact_workgroup_count_x: u32,
+    storage_buffer_offset_alignment: usize,
+) -> Result<Option<VulkanDistributedDispatchPlan>, VulkanDistributedPlanError> {
+    if !dispatch.push_constants.is_empty() || artifact_workgroup_count_x == 0 {
+        return Ok(None);
+    }
+    let parameter_descriptors = dispatch
+        .descriptors
+        .iter()
+        .filter_map(|descriptor| match &descriptor.resource {
+            VulkanDescriptorResourceAddress::PermanentParameter { tensor, .. } => {
+                Some((descriptor.binding, tensor.as_str()))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if parameter_descriptors.is_empty() {
+        return Ok(None);
+    }
+
+    let mut expert_count = None;
+    let mut expert_alignment = 1usize;
+    let mut parameters = Vec::with_capacity(parameter_descriptors.len());
+    for (binding, tensor) in parameter_descriptors {
+        let metadata = tensor_index.tensors.get(tensor).ok_or_else(|| {
+            dispatch_error(dispatch, format!("has no tensor metadata for {tensor:?}"))
+        })?;
+        if metadata.shape.len() < 2
+            || !matches!(
+                metadata.layout.as_deref(),
+                Some("row_major" | "vulkan_bf16_row_pair_u32")
+            )
+        {
+            return Ok(None);
+        }
+        let tensor_expert_count = metadata.shape[0];
+        if tensor_expert_count == 0
+            || expert_count.is_some_and(|expected| expected != tensor_expert_count)
+        {
+            return Err(dispatch_error(
+                dispatch,
+                format!(
+                    "expert tensor {tensor:?} has incompatible leading dimension {}",
+                    tensor_expert_count
+                ),
+            ));
+        }
+        expert_count = Some(tensor_expert_count);
+        let tensor_byte_count = metadata.byte_count.ok_or_else(|| {
+            dispatch_error(
+                dispatch,
+                format!("expert tensor {tensor:?} has no byte count"),
+            )
+        })?;
+        if tensor_byte_count == 0 || !tensor_byte_count.is_multiple_of(tensor_expert_count) {
+            return Err(dispatch_error(
+                dispatch,
+                format!(
+                    "expert tensor {tensor:?} byte count {tensor_byte_count} is not divisible by {tensor_expert_count} experts"
+                ),
+            ));
+        }
+        let bytes_per_expert = tensor_byte_count / tensor_expert_count;
+        let tensor_expert_alignment = storage_buffer_offset_alignment
+            / greatest_common_divisor(storage_buffer_offset_alignment, bytes_per_expert);
+        expert_alignment = least_common_multiple(expert_alignment, tensor_expert_alignment)
+            .ok_or_else(|| dispatch_error(dispatch, "expert alignment overflowed".to_string()))?;
+        parameters.push((binding, tensor, bytes_per_expert));
+    }
+    let expert_count = expert_count.expect("non-empty expert parameter set has a leading size");
+    let raw_shards = distribute_rows(expert_count, device_ids.len(), 1, expert_alignment)
+        .map_err(|error| dispatch_error(dispatch, error))?;
+    if raw_shards.len() < 2 {
+        return Ok(None);
+    }
+
+    let input_activation = activation_slot(dispatch, 0, 1, "primary input")?;
+    let routes_activation = activation_slot(dispatch, 1, 1, "expert routes")?;
+    let output_activation = activation_slot(dispatch, 2, 1, "output")?;
+    let input_byte_capacity = input_activation.signal_byte_capacity;
+    let output_byte_capacity = output_activation.signal_byte_capacity;
+    let shard_device_ids = std::iter::once(owner_device_id)
+        .chain(
+            device_ids
+                .iter()
+                .map(String::as_str)
+                .filter(|device_id| *device_id != owner_device_id),
+        )
+        .take(raw_shards.len())
+        .collect::<Vec<_>>();
+    let mut distributed_parameter_byte_count = 0usize;
+    let shards = shard_device_ids
+        .into_iter()
+        .zip(raw_shards)
+        .map(|(device_id, (expert_start, shard_expert_count))| {
+            let parameters = parameters
+                .iter()
+                .map(|(binding, tensor, bytes_per_expert)| {
+                    parameter_fragment(
+                        *binding,
+                        tensor,
+                        *bytes_per_expert,
+                        expert_start,
+                        shard_expert_count,
+                        dispatch,
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            distributed_parameter_byte_count = parameters.iter().try_fold(
+                distributed_parameter_byte_count,
+                |total, fragment| {
+                    total.checked_add(fragment.byte_count).ok_or_else(|| {
+                        dispatch_error(
+                            dispatch,
+                            "expert shard parameter byte count overflowed".to_string(),
+                        )
+                    })
+                },
+            )?;
+            Ok(VulkanDistributedDispatchShard {
+                device_id: device_id.to_string(),
+                row_start: expert_start,
+                row_count: shard_expert_count,
+                workgroup_count_x: artifact_workgroup_count_x,
+                base_workgroup_z: u32::try_from(expert_start).map_err(|_| {
+                    dispatch_error(dispatch, "expert start exceeds u32".to_string())
+                })?,
+                output_byte_offset: 0,
+                output_byte_count: output_byte_capacity,
+                parameters,
+            })
+        })
+        .collect::<Result<Vec<_>, VulkanDistributedPlanError>>()?;
+
+    Ok(Some(VulkanDistributedDispatchPlan {
+        owner_device_id: owner_device_id.to_string(),
+        dispatch_index: dispatch.dispatch_index,
+        pedal_id: dispatch.pedal_id.clone(),
+        node_id: dispatch.node_id.clone(),
+        reusable_family_id: dispatch.reusable_family_id.clone(),
+        input_byte_capacity,
+        output_byte_capacity,
+        output_rows: expert_count,
+        input_width: input_byte_capacity / BF16_BYTE_COUNT,
+        row_alignment: expert_alignment,
+        input_activation,
+        auxiliary_input_activations: vec![routes_activation],
+        output_activation,
+        distribution: VulkanDistributedDispatchDistribution::ExpertRange,
         distributed_parameter_byte_count,
         shards,
     }))
@@ -2144,6 +2400,7 @@ fn activation_slot(
                 byte_capacity,
                 signal_byte_capacity,
             } => Some(VulkanDistributedActivationSlot {
+                binding,
                 pedal_id: pedal_id.clone(),
                 signal_id: signal_id.clone(),
                 slot: *slot,
@@ -2346,6 +2603,160 @@ mod tests {
                 ))
                 .collect::<Vec<_>>(),
             vec![(2, "gate", 32, 32), (3, "up", 32, 32)]
+        );
+    }
+
+    #[test]
+    fn plans_sparse_expert_ranges_with_shared_routes_and_full_outputs() {
+        let activation = |binding, signal: &str, slot, bytes| VulkanResolvedDescriptorBinding {
+            binding,
+            usage: if binding == 2 {
+                VulkanKernelDescriptorUsage::OutputSignal
+            } else {
+                VulkanKernelDescriptorUsage::InputSignal
+            },
+            name: signal.to_string(),
+            resource: VulkanDescriptorResourceAddress::ActivationSlot {
+                pedal_id: "moe".to_string(),
+                signal_id: signal.to_string(),
+                slot,
+                byte_capacity: bytes,
+                signal_byte_capacity: bytes,
+            },
+        };
+        let parameter = |binding, tensor: &str, bytes| VulkanResolvedDescriptorBinding {
+            binding,
+            usage: VulkanKernelDescriptorUsage::Parameter,
+            name: tensor.to_string(),
+            resource: VulkanDescriptorResourceAddress::PermanentParameter {
+                param_id: tensor.to_string(),
+                tensor: tensor.to_string(),
+                byte_count: Some(bytes),
+            },
+        };
+        let prepared = VulkanPreparedDispatchPlan {
+            backend_id: "vulkan_stream_circuit".to_string(),
+            reusable_family_count: 1,
+            dispatches: vec![VulkanPreparedDispatch {
+                dispatch_index: 9,
+                kernel_id: "moe.sparse-down".to_string(),
+                pedal_id: "moe".to_string(),
+                circuit_id: "moe-circuit".to_string(),
+                node_index: 4,
+                node_id: "sparse-down".to_string(),
+                op: "sparse_moe_down".to_string(),
+                reusable_family_id: "sparse-family".to_string(),
+                artifact_path: "sparse.spv".to_string(),
+                entry_point: "main".to_string(),
+                local_size_x: 64,
+                descriptors: vec![
+                    activation(0, "intermediates", 0, 8192),
+                    activation(1, "routes", 1, 32),
+                    activation(2, "outputs", 2, 32768),
+                    parameter(3, "expert-weight", 256 * 2048 * 512),
+                    parameter(4, "expert-scale", 256 * 16 * 4 * 2),
+                ],
+                push_constants: Vec::new(),
+                uses_stream_tick: false,
+            }],
+            total_descriptor_count: 5,
+        };
+        let tensor_index = TensorIndex {
+            schema: "llmoop.tensor_index.v1".to_string(),
+            tensors: BTreeMap::from([
+                (
+                    "expert-weight".to_string(),
+                    TensorMetadata {
+                        dtype: "F8_E4M3".to_string(),
+                        shape: vec![256, 2048, 512],
+                        logical_shape: None,
+                        parameter_count: Some(256 * 2048 * 512),
+                        byte_count: Some(256 * 2048 * 512),
+                        data_offsets: Some(vec![0, 256 * 2048 * 512]),
+                        source_file: Some("weights.safetensors".to_string()),
+                        data_sha256: None,
+                        layout: Some("row_major".to_string()),
+                    },
+                ),
+                (
+                    "expert-scale".to_string(),
+                    TensorMetadata {
+                        dtype: "BF16".to_string(),
+                        shape: vec![256, 16, 4],
+                        logical_shape: None,
+                        parameter_count: Some(256 * 16 * 4),
+                        byte_count: Some(256 * 16 * 4 * 2),
+                        data_offsets: Some(vec![0, 256 * 16 * 4 * 2]),
+                        source_file: Some("weights.safetensors".to_string()),
+                        data_sha256: None,
+                        layout: Some("row_major".to_string()),
+                    },
+                ),
+            ]),
+        };
+        let artifacts =
+            VulkanReusableKernelArtifactManifest::new(vec![VulkanReusableKernelArtifact {
+                family_id: "sparse-family".to_string(),
+                op: "sparse_moe_down".to_string(),
+                path: "sparse.spv".to_string(),
+                entry_point: "main".to_string(),
+                local_size_x: 64,
+                workgroup_count_x: 8192,
+                descriptor_signature: Vec::new(),
+                push_constants: Vec::new(),
+                uses_stream_tick: false,
+            }]);
+
+        let plan = VulkanDistributedExecutionPlan::from_prepared_plans(
+            &[("owner", &prepared)],
+            &tensor_index,
+            &artifacts,
+            &["owner".to_string(), "helper".to_string()],
+            256,
+        )
+        .unwrap();
+
+        assert_eq!(plan.dispatches.len(), 1);
+        let dispatch = &plan.dispatches[0];
+        assert_eq!(
+            dispatch.distribution,
+            VulkanDistributedDispatchDistribution::ExpertRange
+        );
+        assert_eq!(dispatch.input_activation.binding, 0);
+        assert_eq!(dispatch.auxiliary_input_activations[0].binding, 1);
+        assert_eq!(dispatch.output_activation.binding, 2);
+        assert_eq!(dispatch.shards.len(), 2);
+        assert_eq!(dispatch.shards[0].device_id, "owner");
+        assert_eq!(dispatch.shards[0].row_start, 0);
+        assert_eq!(dispatch.shards[0].row_count, 128);
+        assert_eq!(dispatch.shards[0].base_workgroup_z, 0);
+        assert_eq!(dispatch.shards[1].device_id, "helper");
+        assert_eq!(dispatch.shards[1].row_start, 128);
+        assert_eq!(dispatch.shards[1].row_count, 128);
+        assert_eq!(dispatch.shards[1].base_workgroup_z, 128);
+        assert!(
+            dispatch
+                .shards
+                .iter()
+                .all(|shard| shard.workgroup_count_x == 8192
+                    && shard.output_byte_offset == 0
+                    && shard.output_byte_count == 32768)
+        );
+        assert_eq!(
+            dispatch.shards[1].parameters[0].byte_offset,
+            128 * 2048 * 512
+        );
+        assert_eq!(
+            dispatch.shards[1].parameters[0].byte_count,
+            128 * 2048 * 512
+        );
+        assert_eq!(
+            dispatch.shards[1].parameters[1].byte_offset,
+            128 * 16 * 4 * 2
+        );
+        assert_eq!(
+            dispatch.shards[1].parameters[1].byte_count,
+            128 * 16 * 4 * 2
         );
     }
 
