@@ -18436,7 +18436,9 @@ pub struct VulkanMountedPlacedResidentStreamTickExecutionPlan {
     pub tick_plan: Arc<VulkanMountedPlacedStreamTickPlan>,
     pub dispatch_segment_count: usize,
     pub dispatch_count: usize,
+    pub distributed_dispatch_count: usize,
     dispatch_segments: Vec<VulkanMountedPlacedResidentDispatchSegmentRunner>,
+    distributed_dispatch_stages: BTreeMap<usize, VulkanMountedPlacedStreamTickDispatch>,
 }
 
 impl VulkanMountedPlacedResidentStreamTickExecutionPlan {
@@ -18446,6 +18448,24 @@ impl VulkanMountedPlacedResidentStreamTickExecutionPlan {
         mounted_bound_plan: &VulkanMountedPlacedBoundDispatchPlan,
         loaded_manifest: &VulkanLoadedReusableKernelArtifactManifest,
         tick_plan: VulkanMountedPlacedStreamTickPlan,
+    ) -> Result<Self, VulkanMountedPlacedResidentKernelDispatchError> {
+        Self::from_tick_plan_with_distributed_dispatches(
+            device,
+            mounted,
+            mounted_bound_plan,
+            loaded_manifest,
+            tick_plan,
+            &BTreeSet::new(),
+        )
+    }
+
+    pub fn from_tick_plan_with_distributed_dispatches(
+        device: &VulkanComputeDevice,
+        mounted: &VulkanMountedPlacedStreamCircuit,
+        mounted_bound_plan: &VulkanMountedPlacedBoundDispatchPlan,
+        loaded_manifest: &VulkanLoadedReusableKernelArtifactManifest,
+        tick_plan: VulkanMountedPlacedStreamTickPlan,
+        distributed_dispatch_indices: &BTreeSet<usize>,
     ) -> Result<Self, VulkanMountedPlacedResidentKernelDispatchError> {
         if tick_plan.device_id != mounted.device_id() {
             return Err(
@@ -18464,8 +18484,14 @@ impl VulkanMountedPlacedResidentStreamTickExecutionPlan {
             );
         }
 
+        let distributed_dispatch_stages =
+            distributed_dispatch_stages(&tick_plan, distributed_dispatch_indices)?;
+
         let mut dispatch_segments = Vec::new();
-        for (start, end) in resident_dispatch_segment_stage_ranges(&tick_plan.stages) {
+        for (start, end) in resident_dispatch_segment_stage_ranges_excluding_dispatches(
+            &tick_plan.stages,
+            distributed_dispatch_indices,
+        ) {
             dispatch_segments.push(
                 VulkanMountedPlacedResidentDispatchSegmentRunner::from_dispatch_stages(
                     device,
@@ -18476,7 +18502,7 @@ impl VulkanMountedPlacedResidentStreamTickExecutionPlan {
                 )?,
             );
         }
-        if dispatch_segments.is_empty() {
+        if dispatch_segments.is_empty() && distributed_dispatch_stages.is_empty() {
             return Err(
                 VulkanMountedPlacedResidentKernelDispatchError::MissingExecutionDispatchSegments {
                     device_id: tick_plan.device_id.clone(),
@@ -18488,11 +18514,14 @@ impl VulkanMountedPlacedResidentStreamTickExecutionPlan {
             .map(|segment| segment.dispatch_count)
             .sum();
         let dispatch_segment_count = dispatch_segments.len();
+        let distributed_dispatch_count = distributed_dispatch_stages.len();
         Ok(Self {
             tick_plan: Arc::new(tick_plan),
             dispatch_segment_count,
             dispatch_count,
+            distributed_dispatch_count,
             dispatch_segments,
+            distributed_dispatch_stages,
         })
     }
 
@@ -18515,6 +18544,13 @@ impl VulkanMountedPlacedResidentStreamTickExecutionPlan {
         self.dispatch_segments
             .last()
             .map(|segment| segment.start_stage_index)
+    }
+
+    pub fn distributed_dispatch_at_stage(
+        &self,
+        stage_index: usize,
+    ) -> Option<&VulkanMountedPlacedStreamTickDispatch> {
+        self.distributed_dispatch_stages.get(&stage_index)
     }
 
     fn resident_stream_tick_cursor(
@@ -18540,31 +18576,77 @@ impl VulkanMountedPlacedResidentStreamTickExecutionPlan {
     }
 }
 
+#[cfg(test)]
 fn resident_dispatch_segment_stage_ranges(
     stages: &[VulkanMountedPlacedStreamTickStage],
+) -> Vec<(usize, usize)> {
+    resident_dispatch_segment_stage_ranges_excluding_dispatches(stages, &BTreeSet::new())
+}
+
+fn resident_dispatch_segment_stage_ranges_excluding_dispatches(
+    stages: &[VulkanMountedPlacedStreamTickStage],
+    excluded_dispatch_indices: &BTreeSet<usize>,
 ) -> Vec<(usize, usize)> {
     let mut ranges = Vec::new();
     let mut stage_index = 0usize;
     while stage_index < stages.len() {
-        if !matches!(
-            stages[stage_index],
-            VulkanMountedPlacedStreamTickStage::Dispatch { .. }
-        ) {
+        if !is_canonical_dispatch_stage(&stages[stage_index], excluded_dispatch_indices) {
             stage_index += 1;
             continue;
         }
         let start = stage_index;
         while stage_index < stages.len()
-            && matches!(
-                stages[stage_index],
-                VulkanMountedPlacedStreamTickStage::Dispatch { .. }
-            )
+            && is_canonical_dispatch_stage(&stages[stage_index], excluded_dispatch_indices)
         {
             stage_index += 1;
         }
         ranges.push((start, stage_index));
     }
     ranges
+}
+
+fn is_canonical_dispatch_stage(
+    stage: &VulkanMountedPlacedStreamTickStage,
+    excluded_dispatch_indices: &BTreeSet<usize>,
+) -> bool {
+    matches!(
+        stage,
+        VulkanMountedPlacedStreamTickStage::Dispatch { dispatch, .. }
+            if !excluded_dispatch_indices.contains(&dispatch.dispatch_index)
+    )
+}
+
+fn distributed_dispatch_stages(
+    tick_plan: &VulkanMountedPlacedStreamTickPlan,
+    distributed_dispatch_indices: &BTreeSet<usize>,
+) -> Result<
+    BTreeMap<usize, VulkanMountedPlacedStreamTickDispatch>,
+    VulkanMountedPlacedResidentKernelDispatchError,
+> {
+    let mut stages = BTreeMap::new();
+    let mut found = BTreeSet::new();
+    for stage in &tick_plan.stages {
+        let VulkanMountedPlacedStreamTickStage::Dispatch {
+            stage_index,
+            dispatch,
+        } = stage
+        else {
+            continue;
+        };
+        if distributed_dispatch_indices.contains(&dispatch.dispatch_index) {
+            found.insert(dispatch.dispatch_index);
+            stages.insert(*stage_index, dispatch.clone());
+        }
+    }
+    if let Some(dispatch_index) = distributed_dispatch_indices.difference(&found).next() {
+        return Err(
+            VulkanMountedPlacedResidentKernelDispatchError::MissingDistributedDispatchStage {
+                device_id: tick_plan.device_id.clone(),
+                dispatch_index: *dispatch_index,
+            },
+        );
+    }
+    Ok(stages)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -22072,6 +22154,10 @@ pub enum VulkanMountedPlacedResidentKernelDispatchError {
         device_id: String,
         stage_index: usize,
     },
+    MissingDistributedDispatchStage {
+        device_id: String,
+        dispatch_index: usize,
+    },
     MissingExecutionDispatchSegments {
         device_id: String,
     },
@@ -22189,6 +22275,13 @@ impl Display for VulkanMountedPlacedResidentKernelDispatchError {
             } => write!(
                 f,
                 "resident execution plan for device {device_id:?} has no dispatch segment beginning at stage {stage_index}"
+            ),
+            Self::MissingDistributedDispatchStage {
+                device_id,
+                dispatch_index,
+            } => write!(
+                f,
+                "resident execution plan for device {device_id:?} cannot replace missing dispatch {dispatch_index}"
             ),
             Self::MissingExecutionDispatchSegments { device_id } => write!(
                 f,
@@ -24037,6 +24130,18 @@ mod tests {
             resident_dispatch_segment_stage_ranges(&stages),
             vec![(0, 2), (4, 6)]
         );
+    }
+
+    #[test]
+    fn distributed_dispatches_split_resident_command_segments() {
+        let stages = (0..6).map(fixture_tick_dispatch_stage).collect::<Vec<_>>();
+
+        let ranges = resident_dispatch_segment_stage_ranges_excluding_dispatches(
+            &stages,
+            &BTreeSet::from([2, 4]),
+        );
+
+        assert_eq!(ranges, vec![(0, 2), (3, 4), (5, 6)]);
     }
 
     fn assert_bf16_bytes_close(actual: &[u8], expected: &[u8], max_absolute_error: f32) {
