@@ -1,13 +1,16 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
+use std::sync::Arc;
 
 use crate::stream_plan::{TensorIndex, TensorMetadata};
 use crate::tensor_storage::{TensorStorage, TensorStorageRange};
-use crate::vulkan_compute::{VulkanComputeDevice, VulkanError, VulkanResidentBuffer};
+use crate::vulkan_compute::{
+    VulkanComputeDevice, VulkanError, VulkanResidentBuffer, VulkanSharedHostAllocation,
+};
 use crate::vulkan_stream_circuit::{
-    VulkanDescriptorResourceAddress, VulkanPreparedDispatch, VulkanPreparedDispatchPlan,
-    VulkanReusableKernelArtifactManifest,
+    VulkanActivationSlotBufferOverride, VulkanDescriptorResourceAddress, VulkanPreparedDispatch,
+    VulkanPreparedDispatchPlan, VulkanReusableKernelArtifactManifest,
 };
 
 const DISTRIBUTABLE_PARALLEL_PROJECTION_OP: &str = "parallel_linear_silu_multiply";
@@ -263,6 +266,162 @@ pub struct VulkanDistributedActivationBufferAllocation {
     pub input_use_count: usize,
     pub output_use_count: usize,
 }
+
+pub struct VulkanDistributedActivationBuffers {
+    pub plan: VulkanDistributedActivationBufferPlan,
+    pub allocations: Vec<VulkanDistributedActivationBuffer>,
+    pub allocation_count: usize,
+    pub import_count: usize,
+    pub total_shared_byte_capacity: usize,
+}
+
+impl VulkanDistributedActivationBuffers {
+    pub fn allocate<'a, F, E>(
+        plan: &VulkanDistributedActivationBufferPlan,
+        mut device_for: F,
+    ) -> Result<Self, VulkanDistributedActivationBufferError>
+    where
+        F: FnMut(&str) -> Result<&'a VulkanComputeDevice, E>,
+        E: Display,
+    {
+        let mut allocations = Vec::with_capacity(plan.allocations.len());
+        let mut import_count = 0usize;
+        let mut total_shared_byte_capacity = 0usize;
+        for planned in &plan.allocations {
+            let owner = device_for(&planned.owner_device_id).map_err(|error| {
+                VulkanDistributedActivationBufferError(format!(
+                    "failed to resolve distributed activation owner {:?}: {error}",
+                    planned.owner_device_id
+                ))
+            })?;
+            let peers = planned
+                .device_ids
+                .iter()
+                .filter(|device_id| *device_id != &planned.owner_device_id)
+                .map(|device_id| {
+                    device_for(device_id).map_err(|error| {
+                        VulkanDistributedActivationBufferError(format!(
+                            "failed to resolve distributed activation participant {device_id:?}: {error}"
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let shared_allocation = owner
+                .create_shared_host_allocation(&peers, planned.byte_capacity)
+                .map_err(|error| {
+                    VulkanDistributedActivationBufferError(format!(
+                        "failed to allocate {} shared activation bytes for {}.slot_{}: {error}",
+                        planned.byte_capacity, planned.pedal_id, planned.slot
+                    ))
+                })?;
+            let mut device_buffers = BTreeMap::new();
+            for device_id in &planned.device_ids {
+                let device = device_for(device_id).map_err(|error| {
+                    VulkanDistributedActivationBufferError(format!(
+                        "failed to resolve distributed activation participant {device_id:?}: {error}"
+                    ))
+                })?;
+                let buffer = Arc::new(
+                    device
+                        .import_shared_host_buffer(Arc::clone(&shared_allocation))
+                        .map_err(|error| {
+                            VulkanDistributedActivationBufferError(format!(
+                                "failed to import {}.slot_{} on {device_id:?}: {error}",
+                                planned.pedal_id, planned.slot
+                            ))
+                        })?,
+                );
+                if device_buffers.insert(device_id.clone(), buffer).is_some() {
+                    return Err(VulkanDistributedActivationBufferError(format!(
+                        "distributed activation {}.slot_{} repeats device {device_id:?}",
+                        planned.pedal_id, planned.slot
+                    )));
+                }
+            }
+            import_count = import_count
+                .checked_add(device_buffers.len())
+                .ok_or_else(|| {
+                    VulkanDistributedActivationBufferError(
+                        "distributed activation import count overflowed".to_string(),
+                    )
+                })?;
+            total_shared_byte_capacity = total_shared_byte_capacity
+                .checked_add(planned.byte_capacity)
+                .ok_or_else(|| {
+                    VulkanDistributedActivationBufferError(
+                        "distributed activation byte capacity overflowed".to_string(),
+                    )
+                })?;
+            allocations.push(VulkanDistributedActivationBuffer {
+                planned: planned.clone(),
+                shared_allocation,
+                device_buffers,
+            });
+        }
+
+        Ok(Self {
+            plan: plan.clone(),
+            allocation_count: allocations.len(),
+            allocations,
+            import_count,
+            total_shared_byte_capacity,
+        })
+    }
+
+    pub fn activation_buffer(
+        &self,
+        owner_device_id: &str,
+        pedal_id: &str,
+        slot: usize,
+        device_id: &str,
+    ) -> Option<&Arc<VulkanResidentBuffer>> {
+        self.allocations
+            .iter()
+            .find(|allocation| {
+                allocation.planned.owner_device_id == owner_device_id
+                    && allocation.planned.pedal_id == pedal_id
+                    && allocation.planned.slot == slot
+            })
+            .and_then(|allocation| allocation.device_buffers.get(device_id))
+    }
+
+    pub fn activation_overrides_for_owner_device(
+        &self,
+        owner_device_id: &str,
+    ) -> Vec<VulkanActivationSlotBufferOverride> {
+        self.allocations
+            .iter()
+            .filter(|allocation| allocation.planned.owner_device_id == owner_device_id)
+            .filter_map(|allocation| {
+                allocation
+                    .device_buffers
+                    .get(owner_device_id)
+                    .map(|buffer| VulkanActivationSlotBufferOverride {
+                        pedal_id: allocation.planned.pedal_id.clone(),
+                        slot: allocation.planned.slot,
+                        buffer: Arc::clone(buffer),
+                    })
+            })
+            .collect()
+    }
+}
+
+pub struct VulkanDistributedActivationBuffer {
+    pub planned: VulkanDistributedActivationBufferAllocation,
+    pub shared_allocation: Arc<VulkanSharedHostAllocation>,
+    pub device_buffers: BTreeMap<String, Arc<VulkanResidentBuffer>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanDistributedActivationBufferError(pub String);
+
+impl Display for VulkanDistributedActivationBufferError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl Error for VulkanDistributedActivationBufferError {}
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct VulkanDistributedActivationBufferAllocationKey {

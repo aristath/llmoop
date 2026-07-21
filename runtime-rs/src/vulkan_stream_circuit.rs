@@ -2804,10 +2804,30 @@ impl VulkanMountedPlacedStreamCircuit {
         dynamic_state_capacity_activations: usize,
         parameter_buffers: Arc<VulkanPermanentParameterBuffers>,
     ) -> Result<Self, VulkanStreamCircuitMountError> {
+        Self::from_placed_plan_with_parameter_buffers_and_activation_overrides(
+            device,
+            placed_plan,
+            dynamic_state_capacity_activations,
+            parameter_buffers,
+            &[],
+        )
+    }
+
+    pub fn from_placed_plan_with_parameter_buffers_and_activation_overrides(
+        device: &VulkanComputeDevice,
+        placed_plan: VulkanPlacedStreamCircuitPlan,
+        dynamic_state_capacity_activations: usize,
+        parameter_buffers: Arc<VulkanPermanentParameterBuffers>,
+        activation_overrides: &[VulkanActivationSlotBufferOverride],
+    ) -> Result<Self, VulkanStreamCircuitMountError> {
         let buffers = placed_plan
             .placed_resident_plan
             .resident_plan
-            .allocate_stream_buffers(device, dynamic_state_capacity_activations)?;
+            .allocate_stream_buffers_with_activation_overrides(
+                device,
+                dynamic_state_capacity_activations,
+                activation_overrides,
+            )?;
         let boundary_io_plan = VulkanModelBoundaryBufferPlan::from_placed_plan(&placed_plan)?;
         let boundary_io = boundary_io_plan.allocate_buffers(device)?;
         let cable_io_plan =
@@ -10913,11 +10933,21 @@ impl VulkanResidentModelPackageDeviceSlice {
         &self,
         device: &VulkanComputeDevice,
     ) -> Result<VulkanMountedPlacedStreamCircuit, VulkanResidentTokenModelPackageError> {
-        VulkanMountedPlacedStreamCircuit::from_placed_plan_with_parameter_buffers(
+        self.create_mounted_stream_circuit_with_activation_overrides(device, &[])
+    }
+
+    pub fn create_mounted_stream_circuit_with_activation_overrides(
+        &self,
+        device: &VulkanComputeDevice,
+        activation_overrides: &[VulkanActivationSlotBufferOverride],
+    ) -> Result<VulkanMountedPlacedStreamCircuit, VulkanResidentTokenModelPackageError> {
+        VulkanMountedPlacedStreamCircuit::
+            from_placed_plan_with_parameter_buffers_and_activation_overrides(
             device,
             self.placed_plan.clone(),
             self.dynamic_state_capacity_activations,
             self.parameter_buffers.clone(),
+            activation_overrides,
         )
         .map_err(|error| {
             VulkanResidentTokenModelPackageError::new(format!(
