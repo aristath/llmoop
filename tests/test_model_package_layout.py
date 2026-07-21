@@ -207,6 +207,9 @@ def test_compiler_selects_cooperative_bfloat16_projection_kernels() -> None:
         "parallel_linear_3way_bf16_1024x1024_256_256.comp"
     ) == 24
     assert cooperative_bfloat16_workgroup_count_x(
+        "parallel_linear_2way_bf16_1024x1024_256.comp"
+    ) == 20
+    assert cooperative_bfloat16_workgroup_count_x(
         "parallel_linear_silu_multiply_bf16_1024x4096.comp"
     ) == 64
     assert cooperative_bfloat16_batch_shader_file(

@@ -987,6 +987,7 @@ def cooperative_bfloat16_workgroup_count_x(shader_file: str) -> int:
             (int(width) + COOPERATIVE_OUTPUT_TILE_WIDTH - 1)
             // COOPERATIVE_OUTPUT_TILE_WIDTH
             for width in parallel.groups()
+            if width is not None
         )
     fused = re.fullmatch(
         r"parallel_linear_silu_multiply_bf16_"
