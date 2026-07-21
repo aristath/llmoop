@@ -317,6 +317,7 @@ impl StreamCircuitResourcePlan {
                     state_type: state.state_type.clone(),
                     shape: state.shape.clone(),
                     elements_per_activation: state.elements_per_activation(),
+                    max_dynamic_activations: state.max_dynamic_activations,
                     update: state.update.clone(),
                     growth: state.growth.clone(),
                     sharing: state.sharing.clone(),
@@ -523,6 +524,7 @@ pub struct PlannedStateResource {
     pub state_type: String,
     pub shape: Option<Vec<usize>>,
     pub elements_per_activation: Option<usize>,
+    pub max_dynamic_activations: Option<usize>,
     pub update: Option<String>,
     pub growth: Option<String>,
     pub sharing: Option<String>,
@@ -869,6 +871,7 @@ pub struct PlannedStatePort {
     pub state_type: String,
     pub shape: Option<Vec<usize>>,
     pub elements_per_activation: Option<usize>,
+    pub max_dynamic_activations: Option<usize>,
 }
 
 impl PlannedStatePort {
@@ -878,6 +881,7 @@ impl PlannedStatePort {
             state_type: state.state_type.clone(),
             shape: state.shape.clone(),
             elements_per_activation: state.elements_per_activation(),
+            max_dynamic_activations: state.max_dynamic_activations,
         }
     }
 }

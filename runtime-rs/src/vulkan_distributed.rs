@@ -88,14 +88,17 @@ impl VulkanDistributedExecutionPlan {
                             dispatch.pedal_id, dispatch.node_id, dispatch.reusable_family_id
                         ))
                     })?;
-                let planned = plan_dispatch(
+                let Some(planned) = plan_dispatch(
                     owner_device_id,
                     dispatch,
                     tensor_index,
                     device_ids,
                     artifact.workgroup_count_x,
                     storage_buffer_offset_alignment,
-                )?;
+                )?
+                else {
+                    continue;
+                };
                 shared_input_byte_capacity =
                     shared_input_byte_capacity.max(planned.input_byte_capacity);
                 shared_output_byte_capacity =
@@ -1888,12 +1891,9 @@ fn plan_dispatch(
     device_ids: &[String],
     artifact_workgroup_count_x: u32,
     storage_buffer_offset_alignment: usize,
-) -> Result<VulkanDistributedDispatchPlan, VulkanDistributedPlanError> {
+) -> Result<Option<VulkanDistributedDispatchPlan>, VulkanDistributedPlanError> {
     if !dispatch.push_constants.is_empty() {
-        return Err(dispatch_error(
-            dispatch,
-            "cannot yet preserve push constants across physical shards".to_string(),
-        ));
+        return Ok(None);
     }
     let parameter_descriptors = dispatch
         .descriptors
@@ -1910,14 +1910,25 @@ fn plan_dispatch(
         (second_binding, second_tensor),
     ] = parameter_descriptors.as_slice()
     else {
-        return Err(dispatch_error(
-            dispatch,
-            format!(
-                "requires exactly two projection matrices, found {} parameters",
-                parameter_descriptors.len()
-            ),
-        ));
+        // Physical sharding is an optional optimization. Quantized projection
+        // families carry auxiliary scale/zero-point tensors in addition to
+        // their matrices and need a family-specific sharding contract. Keep
+        // those dispatches on their pedal's owner device until such a contract
+        // is available; layer placement still distributes the model itself.
+        return Ok(None);
     };
+    if ![first_tensor, second_tensor].iter().all(|tensor| {
+        tensor_index.tensors.get(**tensor).is_some_and(|metadata| {
+            metadata.dtype == "BF16"
+                && metadata.shape.len() == 2
+                && matches!(
+                    metadata.layout.as_deref(),
+                    Some("row_major" | "vulkan_bf16_row_pair_u32")
+                )
+        })
+    }) {
+        return Ok(None);
+    }
     let first = projection_metadata(tensor_index, dispatch, first_tensor)?;
     let second = projection_metadata(tensor_index, dispatch, second_tensor)?;
     if first.shape != second.shape {
@@ -1973,11 +1984,23 @@ fn plan_dispatch(
         row_alignment,
     )
     .map_err(|error| dispatch_error(dispatch, error))?;
+    if raw_shards.len() < 2 {
+        return Ok(None);
+    }
+    let shard_device_ids = std::iter::once(owner_device_id)
+        .chain(
+            device_ids
+                .iter()
+                .map(String::as_str)
+                .filter(|device_id| *device_id != owner_device_id),
+        )
+        .take(raw_shards.len())
+        .collect::<Vec<_>>();
     let first_row_bytes = tensor_row_bytes(dispatch, first_tensor, first, output_rows)?;
     let second_row_bytes = tensor_row_bytes(dispatch, second_tensor, second, output_rows)?;
     let mut distributed_parameter_byte_count = 0usize;
-    let shards = device_ids
-        .iter()
+    let shards = shard_device_ids
+        .into_iter()
         .zip(raw_shards)
         .map(|(device_id, (row_start, row_count))| {
             let workgroup_count_x =
@@ -2010,7 +2033,7 @@ fn plan_dispatch(
                     )
                 })?;
             Ok(VulkanDistributedDispatchShard {
-                device_id: device_id.clone(),
+                device_id: device_id.to_string(),
                 row_start,
                 row_count,
                 workgroup_count_x,
@@ -2025,7 +2048,7 @@ fn plan_dispatch(
         })
         .collect::<Result<Vec<_>, VulkanDistributedPlanError>>()?;
 
-    Ok(VulkanDistributedDispatchPlan {
+    Ok(Some(VulkanDistributedDispatchPlan {
         owner_device_id: owner_device_id.to_string(),
         dispatch_index: dispatch.dispatch_index,
         pedal_id: dispatch.pedal_id.clone(),
@@ -2040,7 +2063,7 @@ fn plan_dispatch(
         output_activation,
         distributed_parameter_byte_count,
         shards,
-    })
+    }))
 }
 
 fn projection_metadata<'a>(
@@ -2327,6 +2350,52 @@ mod tests {
     }
 
     #[test]
+    fn distributed_shards_always_start_with_the_dispatch_owner() {
+        let tensor_index = fixture_tensor_index("row_major");
+        let prepared_plan = fixture_prepared_plan();
+        let artifact_manifest = fixture_artifact_manifest();
+        let plan = VulkanDistributedExecutionPlan::from_prepared_plans(
+            &[("owner", &prepared_plan)],
+            &tensor_index,
+            &artifact_manifest,
+            &[
+                "helper-a".to_string(),
+                "helper-b".to_string(),
+                "owner".to_string(),
+            ],
+            4,
+        )
+        .unwrap();
+
+        assert_eq!(plan.dispatches.len(), 1);
+        assert_eq!(plan.dispatches[0].shards[0].device_id, "owner");
+        assert!(
+            plan.dispatches[0]
+                .shards
+                .iter()
+                .any(|shard| shard.device_id != "owner")
+        );
+    }
+
+    #[test]
+    fn distributed_planner_keeps_unsplittable_dispatch_on_its_owner() {
+        let tensor_index = fixture_tensor_index("row_major");
+        let prepared_plan = fixture_prepared_plan();
+        let artifact_manifest = fixture_artifact_manifest();
+        let plan = VulkanDistributedExecutionPlan::from_prepared_plans(
+            &[("owner", &prepared_plan)],
+            &tensor_index,
+            &artifact_manifest,
+            &["helper".to_string(), "owner".to_string()],
+            1024,
+        )
+        .unwrap();
+
+        assert!(plan.dispatches.is_empty());
+        assert_eq!(plan.distributed_parameter_byte_count, 0);
+    }
+
+    #[test]
     fn preserves_packed_row_pairs_at_shard_boundaries() {
         let plan = fixture_plan("vulkan_bf16_row_pair_u32");
 
@@ -2476,7 +2545,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_distributed_dispatches_that_cannot_preserve_push_constants() {
+    fn keeps_push_constant_dispatches_on_their_owner_device() {
         let mut prepared_plan = fixture_prepared_plan();
         prepared_plan.dispatches[0].push_constants = vec![VulkanKernelScalarBinding {
             name: "stream_tick".to_string(),
@@ -2484,20 +2553,76 @@ mod tests {
             source: VulkanKernelScalarSource::PushConstant,
         }];
 
-        let error = VulkanDistributedExecutionPlan::from_prepared_plans(
+        let plan = VulkanDistributedExecutionPlan::from_prepared_plans(
             &[("owner", &prepared_plan)],
             &fixture_tensor_index("row_major"),
             &fixture_artifact_manifest(),
             &["owner".to_string(), "helper".to_string()],
             4,
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert!(
-            error
-                .to_string()
-                .contains("cannot yet preserve push constants across physical shards")
-        );
+        assert!(plan.dispatches.is_empty());
+        assert_eq!(plan.distributed_parameter_byte_count, 0);
+    }
+
+    #[test]
+    fn keeps_quantized_parallel_projections_on_their_owner_device() {
+        let mut prepared_plan = fixture_prepared_plan();
+        let gate = prepared_plan.dispatches[0].descriptors[2].clone();
+        let up = prepared_plan.dispatches[0].descriptors[3].clone();
+        let parameter =
+            |binding, param_id: &str, tensor: &str, byte_count| VulkanResolvedDescriptorBinding {
+                binding,
+                usage: VulkanKernelDescriptorUsage::Parameter,
+                name: param_id.to_string(),
+                resource: VulkanDescriptorResourceAddress::PermanentParameter {
+                    param_id: param_id.to_string(),
+                    tensor: tensor.to_string(),
+                    byte_count: Some(byte_count),
+                },
+            };
+        prepared_plan.dispatches[0].descriptors = vec![
+            prepared_plan.dispatches[0].descriptors[0].clone(),
+            prepared_plan.dispatches[0].descriptors[1].clone(),
+            VulkanResolvedDescriptorBinding { binding: 2, ..gate },
+            parameter(3, "gate_scale", "gate_scale", 2),
+            VulkanResolvedDescriptorBinding { binding: 4, ..up },
+            parameter(5, "up_scale", "up_scale", 2),
+        ];
+        let mut tensor_index = fixture_tensor_index("row_major");
+        for tensor in ["gate", "up"] {
+            let metadata = tensor_index.tensors.get_mut(tensor).unwrap();
+            metadata.dtype = "F8_E4M3".to_string();
+            metadata.byte_count = Some(48);
+        }
+        let scale = TensorMetadata {
+            dtype: "BF16".to_string(),
+            shape: vec![1, 1],
+            logical_shape: None,
+            parameter_count: Some(1),
+            byte_count: Some(2),
+            data_offsets: Some(vec![0, 2]),
+            source_file: Some("weights.safetensors".to_string()),
+            data_sha256: None,
+            layout: Some("row_major".to_string()),
+        };
+        tensor_index
+            .tensors
+            .insert("gate_scale".to_string(), scale.clone());
+        tensor_index.tensors.insert("up_scale".to_string(), scale);
+
+        let plan = VulkanDistributedExecutionPlan::from_prepared_plans(
+            &[("owner", &prepared_plan)],
+            &tensor_index,
+            &fixture_artifact_manifest(),
+            &["owner".to_string(), "helper".to_string()],
+            4,
+        )
+        .unwrap();
+
+        assert!(plan.dispatches.is_empty());
+        assert_eq!(plan.distributed_parameter_byte_count, 0);
     }
 
     #[test]

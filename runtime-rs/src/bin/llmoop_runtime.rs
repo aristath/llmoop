@@ -24,13 +24,13 @@ use llmoop_runtime::{
     VulkanComputeDeviceInfo, VulkanResidentHfTokenizerTextCodec,
     VulkanResidentInProcessPlacedPromptEngine, VulkanResidentInProcessPlacedPromptStream,
     VulkanResidentModelPackageDeviceSlice, VulkanResidentModelPackageManifest,
-    VulkanResidentRuntimeModel, VulkanResidentTokenInputEvent, VulkanResidentTokenTextCodec,
-    VulkanReusableKernelArtifactManifest, discover_runtime_devices,
+    VulkanResidentRuntimeModel, VulkanResidentSamplerRuntimeConfig, VulkanResidentTokenInputEvent,
+    VulkanResidentTokenTextCodec, VulkanReusableKernelArtifactManifest, discover_runtime_devices,
 };
 use minijinja::{Environment, Error as TemplateError, ErrorKind as TemplateErrorKind};
 use serde::Serialize;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 struct Args {
     package_manifest: Option<PathBuf>,
     prompt: Option<String>,
@@ -51,6 +51,12 @@ struct Args {
     context_size: Option<usize>,
     vulkan_device_index: Option<usize>,
     random_seed: u32,
+    temperature: Option<f32>,
+    top_k: Option<u32>,
+    top_p: Option<f32>,
+    min_p: Option<f32>,
+    presence_penalty: Option<f32>,
+    repetition_penalty: Option<f32>,
     add_special_tokens: bool,
     skip_special_tokens: bool,
     generated_only: bool,
@@ -93,6 +99,12 @@ impl Default for Args {
             context_size: None,
             vulkan_device_index: None,
             random_seed: 0,
+            temperature: None,
+            top_k: None,
+            top_p: None,
+            min_p: None,
+            presence_penalty: None,
+            repetition_penalty: None,
             add_special_tokens: true,
             skip_special_tokens: true,
             generated_only: false,
@@ -100,6 +112,17 @@ impl Default for Args {
             profile_runs: 1,
             json: false,
         }
+    }
+}
+
+fn sampler_runtime_config(args: &Args) -> VulkanResidentSamplerRuntimeConfig {
+    VulkanResidentSamplerRuntimeConfig {
+        temperature: args.temperature,
+        top_k: args.top_k,
+        top_p: args.top_p,
+        min_p: args.min_p,
+        presence_penalty: args.presence_penalty,
+        repetition_penalty: args.repetition_penalty,
     }
 }
 
@@ -328,7 +351,17 @@ fn incremental_chat_token_delta(
     rendered_continuation_suffix_token_ids: &[u32],
     stop_token_ids: &[u32],
 ) -> Result<Vec<u32>, io::Error> {
-    if !rendered_continuation_suffix_token_ids.starts_with(rendered_history_suffix_token_ids) {
+    let stop_index = rendered_history_suffix_token_ids
+        .iter()
+        .position(|token_id| stop_token_ids.contains(token_id))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "chat template assistant turn suffix does not contain a configured stop token",
+            )
+        })?;
+    let committed_history_suffix = &rendered_history_suffix_token_ids[..=stop_index];
+    if !rendered_continuation_suffix_token_ids.starts_with(committed_history_suffix) {
         let common_prefix_len = rendered_history_suffix_token_ids
             .iter()
             .zip(rendered_continuation_suffix_token_ids)
@@ -341,15 +374,6 @@ fn incremental_chat_token_delta(
             ),
         ));
     }
-    let stop_index = rendered_history_suffix_token_ids
-        .iter()
-        .position(|token_id| stop_token_ids.contains(token_id))
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "chat template assistant turn suffix does not contain a configured stop token",
-            )
-        })?;
     Ok(rendered_continuation_suffix_token_ids[stop_index + 1..].to_vec())
 }
 
@@ -780,13 +804,14 @@ fn run_placed_chat(
     let transcript_codec = chat_transcript_codec(tokenizer_dir)?;
     let logical_device_ids = runtime_model.placement_device_ids();
     let bound_devices = runtime_bound_vulkan_devices(args, &logical_device_ids)?;
-    let stream = VulkanResidentInProcessPlacedPromptStream::from_runtime_model_for_bound_devices(
+    let stream = VulkanResidentInProcessPlacedPromptStream::from_runtime_model_for_bound_devices_with_sampler_config(
         bound_devices.devices.clone(),
         manifest_dir,
         runtime_model,
         Some(capacity),
         args.random_seed,
         args.speculative_draft_tokens,
+        sampler_runtime_config(args),
     )?;
     let mut engine = VulkanResidentInProcessPlacedPromptEngine::new();
     let stream_snapshot = engine.add_stream("main", stream)?;
@@ -875,13 +900,14 @@ fn execute_placed_prompt_run(
     let logical_device_ids = runtime_model.placement_device_ids();
     let placement = runtime_model_placement(manifest_dir, &runtime_model)?;
     let bound_devices = runtime_bound_vulkan_devices(args, &logical_device_ids)?;
-    let stream = VulkanResidentInProcessPlacedPromptStream::from_runtime_model_for_bound_devices(
+    let stream = VulkanResidentInProcessPlacedPromptStream::from_runtime_model_for_bound_devices_with_sampler_config(
         bound_devices.devices.clone(),
         manifest_dir,
         runtime_model,
         Some(*capacity),
         args.random_seed,
         args.speculative_draft_tokens,
+        sampler_runtime_config(args),
     )?;
     let mut engine = VulkanResidentInProcessPlacedPromptEngine::new();
     let stream_snapshot = engine.add_stream("main", stream)?;
@@ -2360,6 +2386,24 @@ fn parse_args() -> Result<Args, String> {
             "--seed" => {
                 parsed.random_seed = parse_next(&mut raw, "--seed")?;
             }
+            "--temperature" => {
+                parsed.temperature = Some(parse_next(&mut raw, "--temperature")?);
+            }
+            "--top-k" => {
+                parsed.top_k = Some(parse_next(&mut raw, "--top-k")?);
+            }
+            "--top-p" => {
+                parsed.top_p = Some(parse_next(&mut raw, "--top-p")?);
+            }
+            "--min-p" => {
+                parsed.min_p = Some(parse_next(&mut raw, "--min-p")?);
+            }
+            "--presence-penalty" => {
+                parsed.presence_penalty = Some(parse_next(&mut raw, "--presence-penalty")?);
+            }
+            "--repetition-penalty" => {
+                parsed.repetition_penalty = Some(parse_next(&mut raw, "--repetition-penalty")?);
+            }
             "--no-special-tokens" => {
                 parsed.add_special_tokens = false;
             }
@@ -2427,6 +2471,39 @@ fn parse_args() -> Result<Args, String> {
     }
     if parsed.profile_runs == 0 {
         return Err("--profile-runs must be at least 1".to_string());
+    }
+    if parsed
+        .temperature
+        .is_some_and(|value| !value.is_finite() || value <= 0.0)
+    {
+        return Err("--temperature must be finite and greater than zero".to_string());
+    }
+    if parsed.top_k == Some(0) {
+        return Err("--top-k must be at least 1".to_string());
+    }
+    if parsed
+        .top_p
+        .is_some_and(|value| !(0.0..=1.0).contains(&value) || value == 0.0)
+    {
+        return Err("--top-p must be finite and in (0, 1]".to_string());
+    }
+    if parsed
+        .min_p
+        .is_some_and(|value| !(0.0..=1.0).contains(&value))
+    {
+        return Err("--min-p must be finite and in [0, 1]".to_string());
+    }
+    if parsed
+        .presence_penalty
+        .is_some_and(|value| !value.is_finite())
+    {
+        return Err("--presence-penalty must be finite".to_string());
+    }
+    if parsed
+        .repetition_penalty
+        .is_some_and(|value| !value.is_finite() || value <= 0.0)
+    {
+        return Err("--repetition-penalty must be finite and greater than zero".to_string());
     }
 
     Ok(parsed)
@@ -2796,6 +2873,12 @@ Options:
   --context-size <N>         Runtime transient-state window. Default: auto, up to the model maximum.
   --vulkan-device-index <N>  Use Vulkan physical device index N as the default local target.
   --seed <U32>               Explicit sampler randomness seed. Default: 0
+  --temperature <F32>        Override the compiled sampler temperature for this stream.
+  --top-k <N>                Override top-k, up to the package's compiled runtime capacity.
+  --top-p <F32>              Override nucleus probability in (0, 1].
+  --min-p <F32>              Override minimum relative token probability in [0, 1].
+  --presence-penalty <F32>   Subtract this value once from logits of previously seen tokens.
+  --repetition-penalty <F32> Override the positive multiplicative repetition penalty.
   --no-special-tokens        Do not add tokenizer special tokens to raw --prompt input.
                              Chat templates always own their complete special-token framing.
   --keep-special-tokens      Keep tokenizer special tokens in decoded output text.
@@ -3217,9 +3300,10 @@ mod tests {
             .unwrap(),
             vec![10, 13, 14, 15]
         );
-        let error = incremental_chat_token_delta(&[50, 98], &rendered_continuation_suffix, &[99])
-            .unwrap_err()
-            .to_string();
+        let error =
+            incremental_chat_token_delta(&rendered_history_suffix, &[50, 98, 10, 13], &[99])
+                .unwrap_err()
+                .to_string();
         assert!(
             error.contains("rewrote the completed assistant turn suffix at token 1"),
             "{error}"
@@ -3228,6 +3312,22 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("does not contain a configured stop token"));
+    }
+
+    #[test]
+    fn incremental_chat_delta_ignores_history_only_tokens_after_the_turn_stop() {
+        let rendered_history_suffix = vec![50, 99, 10, 100];
+        let rendered_continuation_suffix = vec![50, 99, 10, 13, 14, 15];
+
+        assert_eq!(
+            incremental_chat_token_delta(
+                &rendered_history_suffix,
+                &rendered_continuation_suffix,
+                &[99],
+            )
+            .unwrap(),
+            vec![10, 13, 14, 15]
+        );
     }
 
     #[test]

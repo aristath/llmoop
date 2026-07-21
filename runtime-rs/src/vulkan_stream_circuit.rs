@@ -201,6 +201,7 @@ impl VulkanStreamCircuitResidentPlan {
                 layout: state.layout.clone(),
                 static_elements,
                 elements_per_activation: state.elements_per_activation,
+                max_dynamic_activations: state.max_dynamic_activations,
                 static_bytes: optional_mul(static_elements, state_element_bytes)?,
                 bytes_per_activation: optional_mul(
                     state.elements_per_activation,
@@ -1174,6 +1175,7 @@ pub struct VulkanResidentStateBuffer {
     pub layout: Option<String>,
     pub static_elements: Option<usize>,
     pub elements_per_activation: Option<usize>,
+    pub max_dynamic_activations: Option<usize>,
     pub static_bytes: Option<usize>,
     pub bytes_per_activation: Option<usize>,
     pub clone_from: Option<(String, String)>,
@@ -4180,7 +4182,16 @@ pub struct VulkanResidentSamplerRunner {
     output_buffer: VulkanResidentBuffer,
     _scratch_buffer: Option<VulkanResidentBuffer>,
     _sampler_seed_buffer: Option<VulkanResidentBuffer>,
+    _seen_token_buffer: Option<VulkanResidentBuffer>,
+    _seen_token_snapshot_buffer: Option<VulkanResidentBuffer>,
+    capture_seen_token_copy: Option<VulkanResidentBufferCopy>,
+    restore_seen_token_copy: Option<VulkanResidentBufferCopy>,
+    _sampler_parameter_buffer: Option<VulkanResidentBuffer>,
+    seen_token_batch_buffer: Option<VulkanResidentBuffer>,
     _stream_control_buffer: Arc<VulkanResidentBuffer>,
+    input_tracking_dispatches: Vec<VulkanResidentKernelDispatch>,
+    seen_token_batch_dispatch: Option<VulkanResidentKernelDispatch>,
+    seen_token_batch_sequence: Option<VulkanResidentKernelSequence>,
     resident_dispatches: Vec<VulkanResidentKernelDispatch>,
     sequence: VulkanResidentKernelSequence,
 }
@@ -4192,9 +4203,130 @@ pub struct VulkanResidentSamplerSpec {
     pub temperature: f32,
     pub top_k: u32,
     pub top_p: f32,
+    pub min_p: f32,
+    pub presence_penalty: f32,
+    pub repetition_penalty: f32,
+    pub top_k_capacity: u32,
+    pub runtime_parameterized: bool,
     pub logits_byte_capacity: usize,
     pub output_byte_capacity: usize,
     pub scratch_byte_capacity: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct VulkanResidentSamplerRuntimeConfig {
+    pub temperature: Option<f32>,
+    pub top_k: Option<u32>,
+    pub top_p: Option<f32>,
+    pub min_p: Option<f32>,
+    pub presence_penalty: Option<f32>,
+    pub repetition_penalty: Option<f32>,
+}
+
+impl VulkanResidentSamplerRuntimeConfig {
+    pub fn is_empty(self) -> bool {
+        self.temperature.is_none()
+            && self.top_k.is_none()
+            && self.top_p.is_none()
+            && self.min_p.is_none()
+            && self.presence_penalty.is_none()
+            && self.repetition_penalty.is_none()
+    }
+
+    fn apply_to(
+        self,
+        default: &VulkanResidentSamplerSpec,
+    ) -> Result<VulkanResidentSamplerSpec, VulkanResidentSamplerRunnerError> {
+        if self.is_empty() {
+            return Ok(default.clone());
+        }
+        let mut effective = default.clone();
+        let requests_sampled_decoding = self.temperature.is_some()
+            || self.top_k.is_some()
+            || self.top_p.is_some()
+            || self.min_p.is_some();
+        if default.method == "greedy" && requests_sampled_decoding {
+            effective.sampler_id = "runtime_temperature_top_k_top_p_sampler".to_string();
+            effective.method = "temperature_top_k_top_p".to_string();
+            effective.temperature = 1.0;
+            effective.top_k = effective.top_k_capacity.min(50);
+            effective.top_p = 1.0;
+            effective.min_p = 0.0;
+        }
+        if let Some(value) = self.temperature {
+            effective.temperature = value;
+        }
+        if let Some(value) = self.top_k {
+            effective.top_k = value;
+        }
+        if let Some(value) = self.top_p {
+            effective.top_p = value;
+        }
+        if let Some(value) = self.min_p {
+            effective.min_p = value;
+        }
+        if let Some(value) = self.presence_penalty {
+            effective.presence_penalty = value;
+        }
+        if let Some(value) = self.repetition_penalty {
+            effective.repetition_penalty = value;
+        }
+        let valid_common = effective.presence_penalty.is_finite()
+            && effective.repetition_penalty.is_finite()
+            && effective.repetition_penalty > 0.0;
+        let valid_method = match effective.method.as_str() {
+            "greedy" => effective.min_p == 0.0 && valid_common,
+            "temperature_top_k_top_p" => {
+                effective.temperature.is_finite()
+                    && effective.temperature > 0.0
+                    && effective.top_k > 0
+                    && effective.top_k <= effective.top_k_capacity
+                    && effective.top_p.is_finite()
+                    && effective.top_p > 0.0
+                    && effective.top_p <= 1.0
+                    && effective.min_p.is_finite()
+                    && effective.min_p >= 0.0
+                    && effective.min_p <= 1.0
+                    && valid_common
+            }
+            _ => false,
+        };
+        if !valid_method {
+            return Err(
+                VulkanResidentSamplerRunnerError::UnsupportedRuntimeSamplingOverride(format!(
+                    "runtime sampler override is invalid for method {:?}: temperature={}, top_k={} (capacity {}), top_p={}, min_p={}, presence_penalty={}, repetition_penalty={}",
+                    effective.method,
+                    effective.temperature,
+                    effective.top_k,
+                    effective.top_k_capacity,
+                    effective.top_p,
+                    effective.min_p,
+                    effective.presence_penalty,
+                    effective.repetition_penalty,
+                )),
+            );
+        }
+        effective.runtime_parameterized = true;
+        Ok(effective)
+    }
+}
+
+fn sampler_kernel_role_matches(role: &str, runtime_parameterized: bool, method: &str) -> bool {
+    matches!(
+        (runtime_parameterized, method, role),
+        (false, "greedy", "sample_logits")
+            | (true, "greedy", "runtime_sample_logits")
+            | (
+                false,
+                "temperature_top_k_top_p",
+                "partition_top_k" | "sample_candidates"
+            )
+            | (
+                true,
+                "temperature_top_k_top_p",
+                "runtime_partition_top_k" | "runtime_sample_candidates",
+            )
+    )
 }
 
 pub struct VulkanResidentSamplerKernelArtifact {
@@ -4258,25 +4390,82 @@ impl VulkanResidentSamplerRunner {
             return Err(VulkanResidentSamplerRunnerError::ZeroHistoryCapacity);
         }
         let vocabulary_size = logits_byte_capacity / std::mem::size_of::<f32>();
-        let sampled_kernel_plan_is_valid = kernels.len() == 2
-            && kernels[0].role == "partition_top_k"
-            && kernels[0].local_size_x > 0
-            && kernels[0].workgroup_count_x > 0
-            && kernels[1].role == "sample_candidates"
-            && kernels[1].local_size_x >= kernels[0].workgroup_count_x
-            && kernels[1].workgroup_count_x == 1
-            && usize::try_from(kernels[0].workgroup_count_x)
+        let runtime_parameterized = spec.runtime_parameterized;
+        let sampling_kernels = kernels
+            .iter()
+            .filter(|kernel| {
+                sampler_kernel_role_matches(
+                    kernel.role.as_str(),
+                    runtime_parameterized,
+                    spec.method.as_str(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let token_state_is_active = spec.repetition_penalty != 1.0 || spec.presence_penalty != 0.0;
+        let current_token_role = if runtime_parameterized {
+            "runtime_record_current_token"
+        } else {
+            "record_current_token"
+        };
+        let token_batch_role = if runtime_parameterized {
+            "runtime_record_token_batch"
+        } else {
+            "record_token_batch"
+        };
+        let current_token_kernel = kernels
+            .iter()
+            .find(|kernel| kernel.role == current_token_role);
+        let token_batch_kernel = kernels
+            .iter()
+            .find(|kernel| kernel.role == token_batch_role);
+        let tracking_kernel_plan_is_valid = if token_state_is_active {
+            current_token_kernel
+                .is_some_and(|kernel| kernel.local_size_x == 1 && kernel.workgroup_count_x == 1)
+                && token_batch_kernel.is_some_and(|kernel| {
+                    kernel.local_size_x == VULKAN_BACKEND_LOOP_MAX_WINDOW as u32
+                        && kernel.workgroup_count_x == 1
+                })
+        } else {
+            true
+        };
+        let sampled_kernel_plan_is_valid = sampling_kernels.len() == 2
+            && matches!(
+                sampling_kernels[0].role.as_str(),
+                "partition_top_k" | "runtime_partition_top_k"
+            )
+            && sampling_kernels[0].local_size_x > 0
+            && sampling_kernels[0].workgroup_count_x > 0
+            && matches!(
+                sampling_kernels[1].role.as_str(),
+                "sample_candidates" | "runtime_sample_candidates"
+            )
+            && sampling_kernels[1].local_size_x >= sampling_kernels[0].workgroup_count_x
+            && sampling_kernels[1].workgroup_count_x == 1
+            && usize::try_from(sampling_kernels[0].workgroup_count_x)
                 .ok()
-                .and_then(|partitions| partitions.checked_mul(spec.top_k as usize))
+                .and_then(|partitions| {
+                    partitions.checked_mul(if runtime_parameterized {
+                        spec.top_k_capacity as usize
+                    } else {
+                        spec.top_k as usize
+                    })
+                })
                 .and_then(|candidates| candidates.checked_mul(2 * std::mem::size_of::<u32>()))
-                == Some(spec.scratch_byte_capacity);
+                .is_some_and(|required| required <= spec.scratch_byte_capacity);
         match spec.method.as_str() {
             "greedy"
-                if spec.scratch_byte_capacity == 0
-                    && kernels.len() == 1
-                    && kernels[0].role == "sample_logits"
-                    && kernels[0].local_size_x > 0
-                    && kernels[0].workgroup_count_x == 1 => {}
+                if spec.min_p == 0.0
+                    && spec.presence_penalty.is_finite()
+                    && spec.repetition_penalty.is_finite()
+                    && spec.repetition_penalty > 0.0
+                    && tracking_kernel_plan_is_valid
+                    && sampling_kernels.len() == 1
+                    && matches!(
+                        sampling_kernels[0].role.as_str(),
+                        "sample_logits" | "runtime_sample_logits"
+                    )
+                    && sampling_kernels[0].local_size_x > 0
+                    && sampling_kernels[0].workgroup_count_x == 1 => {}
             "temperature_top_k_top_p"
                 if spec.temperature.is_finite()
                     && spec.temperature > 0.0
@@ -4285,6 +4474,14 @@ impl VulkanResidentSamplerRunner {
                     && spec.top_p.is_finite()
                     && spec.top_p > 0.0
                     && spec.top_p <= 1.0
+                    && spec.min_p.is_finite()
+                    && spec.min_p >= 0.0
+                    && spec.min_p <= 1.0
+                    && spec.presence_penalty.is_finite()
+                    && spec.repetition_penalty.is_finite()
+                    && spec.repetition_penalty > 0.0
+                    && spec.top_k <= spec.top_k_capacity
+                    && tracking_kernel_plan_is_valid
                     && sampled_kernel_plan_is_valid => {}
             _ => {
                 return Err(VulkanResidentSamplerRunnerError::InvalidSamplingSpec {
@@ -4292,6 +4489,9 @@ impl VulkanResidentSamplerRunner {
                     temperature: spec.temperature,
                     top_k: spec.top_k,
                     top_p: spec.top_p,
+                    min_p: spec.min_p,
+                    presence_penalty: spec.presence_penalty,
+                    repetition_penalty: spec.repetition_penalty,
                 });
             }
         }
@@ -4309,13 +4509,132 @@ impl VulkanResidentSamplerRunner {
         } else {
             None
         };
-        let scratch_buffer = (spec.scratch_byte_capacity > 0)
+        let scratch_buffer = (spec.method == "temperature_top_k_top_p")
             .then(|| device.create_resident_buffer(spec.scratch_byte_capacity))
             .transpose()?;
-        let mut resident_dispatches = Vec::with_capacity(kernels.len());
-        for kernel in kernels {
-            let bindings = match kernel.role.as_str() {
-                "sample_logits" => vec![
+        let seen_token_byte_capacity = vocabulary_size
+            .div_ceil(32)
+            .checked_mul(std::mem::size_of::<u32>())
+            .ok_or(VulkanResidentSamplerRunnerError::HistoryCapacityOverflow)?;
+        let seen_token_buffer = if token_state_is_active || runtime_parameterized {
+            let buffer = device.create_resident_buffer(seen_token_byte_capacity)?;
+            buffer.write_bytes(&vec![0; seen_token_byte_capacity])?;
+            Some(buffer)
+        } else {
+            None
+        };
+        let seen_token_snapshot_buffer = if token_state_is_active {
+            Some(device.create_resident_buffer(seen_token_byte_capacity)?)
+        } else {
+            None
+        };
+        let capture_seen_token_copy = seen_token_buffer
+            .as_ref()
+            .zip(seen_token_snapshot_buffer.as_ref())
+            .map(|(source, destination)| {
+                device.create_resident_buffer_copy(source, destination, seen_token_byte_capacity)
+            })
+            .transpose()?;
+        let restore_seen_token_copy = seen_token_snapshot_buffer
+            .as_ref()
+            .zip(seen_token_buffer.as_ref())
+            .map(|(source, destination)| {
+                device.create_resident_buffer_copy(source, destination, seen_token_byte_capacity)
+            })
+            .transpose()?;
+        let seen_token_batch_buffer = if token_state_is_active {
+            let mut buffer = device.create_host_visible_resident_buffer(
+                VULKAN_BACKEND_LOOP_MAX_WINDOW * std::mem::size_of::<u32>(),
+            )?;
+            buffer.persistently_map()?;
+            Some(buffer)
+        } else {
+            None
+        };
+        let sampler_parameter_buffer = if runtime_parameterized {
+            let words = [
+                spec.temperature.to_bits(),
+                spec.top_k,
+                spec.top_p.to_bits(),
+                spec.min_p.to_bits(),
+                spec.presence_penalty.to_bits(),
+                spec.repetition_penalty.to_bits(),
+            ];
+            let bytes = words
+                .into_iter()
+                .flat_map(u32::to_le_bytes)
+                .collect::<Vec<_>>();
+            let buffer = device.create_resident_buffer(bytes.len())?;
+            buffer.write_bytes(&bytes)?;
+            Some(buffer)
+        } else {
+            None
+        };
+        let mut input_tracking_dispatches = Vec::with_capacity(usize::from(token_state_is_active));
+        if token_state_is_active && let Some(kernel) = current_token_kernel {
+            input_tracking_dispatches.push(
+                device.create_resident_kernel_dispatch(
+                    &kernel.spirv_words,
+                    &[
+                        VulkanResidentKernelBufferBinding::new(
+                            0,
+                            &stream_control_buffer,
+                            VULKAN_STREAM_CONTROL_BYTE_CAPACITY,
+                        )
+                        .with_access(VulkanResidentKernelBufferAccess::Read),
+                        VulkanResidentKernelBufferBinding::new(
+                            1,
+                            seen_token_buffer
+                                .as_ref()
+                                .expect("validated repetition sampler has seen-token state"),
+                            seen_token_byte_capacity,
+                        )
+                        .with_access(VulkanResidentKernelBufferAccess::ReadWrite),
+                    ],
+                    kernel.workgroup_count_x,
+                    kernel.local_size_x,
+                    0,
+                )?,
+            );
+        }
+        let seen_token_batch_dispatch = token_state_is_active
+            .then_some(token_batch_kernel)
+            .flatten()
+            .map(|kernel| {
+                device.create_resident_kernel_dispatch(
+                    &kernel.spirv_words,
+                    &[
+                        VulkanResidentKernelBufferBinding::new(
+                            0,
+                            seen_token_batch_buffer
+                                .as_ref()
+                                .expect("validated repetition sampler has batch input state"),
+                            VULKAN_BACKEND_LOOP_MAX_WINDOW * std::mem::size_of::<u32>(),
+                        )
+                        .with_access(VulkanResidentKernelBufferAccess::Read),
+                        VulkanResidentKernelBufferBinding::new(
+                            1,
+                            seen_token_buffer
+                                .as_ref()
+                                .expect("validated repetition sampler has seen-token state"),
+                            seen_token_byte_capacity,
+                        )
+                        .with_access(VulkanResidentKernelBufferAccess::ReadWrite),
+                    ],
+                    kernel.workgroup_count_x,
+                    kernel.local_size_x,
+                    std::mem::size_of::<u32>() as u32,
+                )
+            })
+            .transpose()?;
+        let seen_token_batch_sequence = seen_token_batch_dispatch
+            .as_ref()
+            .map(|_| device.create_resident_kernel_sequence())
+            .transpose()?;
+        let mut resident_dispatches = Vec::with_capacity(sampling_kernels.len());
+        for kernel in sampling_kernels {
+            let mut bindings = match kernel.role.as_str() {
+                "sample_logits" | "runtime_sample_logits" => vec![
                     VulkanResidentKernelBufferBinding::new(0, logits_buffer, logits_byte_capacity)
                         .with_access(VulkanResidentKernelBufferAccess::Read),
                     VulkanResidentKernelBufferBinding::new(
@@ -4331,7 +4650,7 @@ impl VulkanResidentSamplerRunner {
                     )
                     .with_access(VulkanResidentKernelBufferAccess::ReadWrite),
                 ],
-                "partition_top_k" => vec![
+                "partition_top_k" | "runtime_partition_top_k" => vec![
                     VulkanResidentKernelBufferBinding::new(0, logits_buffer, logits_byte_capacity)
                         .with_access(VulkanResidentKernelBufferAccess::Read),
                     VulkanResidentKernelBufferBinding::new(
@@ -4341,7 +4660,7 @@ impl VulkanResidentSamplerRunner {
                     )
                     .with_access(VulkanResidentKernelBufferAccess::Write),
                 ],
-                "sample_candidates" => vec![
+                "sample_candidates" | "runtime_sample_candidates" => vec![
                     VulkanResidentKernelBufferBinding::new(
                         0,
                         scratch_buffer.as_ref().expect("sampling plan has scratch"),
@@ -4371,6 +4690,37 @@ impl VulkanResidentSamplerRunner {
                 ],
                 _ => unreachable!("sampling plan roles were validated"),
             };
+            if let Some(seen_token_buffer) = &seen_token_buffer {
+                let binding = match kernel.role.as_str() {
+                    "sample_logits" | "runtime_sample_logits" => 3,
+                    "partition_top_k" | "runtime_partition_top_k" => 2,
+                    _ => u32::MAX,
+                };
+                if binding != u32::MAX {
+                    bindings.push(
+                        VulkanResidentKernelBufferBinding::new(
+                            binding,
+                            seen_token_buffer,
+                            seen_token_byte_capacity,
+                        )
+                        .with_access(VulkanResidentKernelBufferAccess::Read),
+                    );
+                }
+            }
+            if let Some(parameter_buffer) = &sampler_parameter_buffer {
+                let binding = match kernel.role.as_str() {
+                    "runtime_sample_logits" => 4,
+                    "runtime_partition_top_k" => 3,
+                    "runtime_sample_candidates" => 4,
+                    _ => u32::MAX,
+                };
+                if binding != u32::MAX {
+                    bindings.push(
+                        VulkanResidentKernelBufferBinding::new(binding, parameter_buffer, 24)
+                            .with_access(VulkanResidentKernelBufferAccess::Read),
+                    );
+                }
+            }
             resident_dispatches.push(device.create_resident_kernel_dispatch(
                 &kernel.spirv_words,
                 &bindings,
@@ -4381,16 +4731,19 @@ impl VulkanResidentSamplerRunner {
         }
         let descriptor_count = resident_dispatches
             .iter()
+            .chain(input_tracking_dispatches.iter())
             .map(VulkanResidentKernelDispatch::descriptor_count)
             .sum();
         let workgroup_count_x = resident_dispatches
             .iter()
+            .chain(input_tracking_dispatches.iter())
             .try_fold(0u32, |total, dispatch| {
                 total.checked_add(dispatch.workgroup_count_x())
             })
             .ok_or(VulkanResidentSamplerRunnerError::WorkgroupCountOverflow)?;
         let push_constant_byte_count = resident_dispatches
             .iter()
+            .chain(input_tracking_dispatches.iter())
             .try_fold(0u32, |total, dispatch| {
                 total.checked_add(dispatch.push_constant_byte_count())
             })
@@ -4401,7 +4754,7 @@ impl VulkanResidentSamplerRunner {
             sampler_id: spec.sampler_id.clone(),
             logits_byte_capacity,
             output_byte_capacity: spec.output_byte_capacity,
-            dispatch_count: resident_dispatches.len(),
+            dispatch_count: resident_dispatches.len() + input_tracking_dispatches.len(),
             descriptor_count,
             workgroup_count_x,
             push_constant_byte_count,
@@ -4409,7 +4762,16 @@ impl VulkanResidentSamplerRunner {
             output_buffer,
             _scratch_buffer: scratch_buffer,
             _sampler_seed_buffer: sampler_seed_buffer,
+            _seen_token_buffer: seen_token_buffer,
+            _seen_token_snapshot_buffer: seen_token_snapshot_buffer,
+            capture_seen_token_copy,
+            restore_seen_token_copy,
+            _sampler_parameter_buffer: sampler_parameter_buffer,
+            seen_token_batch_buffer,
             _stream_control_buffer: stream_control_buffer,
+            input_tracking_dispatches,
+            seen_token_batch_dispatch,
+            seen_token_batch_sequence,
             resident_dispatches,
             sequence,
         })
@@ -4430,6 +4792,67 @@ impl VulkanResidentSamplerRunner {
 
     fn resident_dispatches(&self) -> &[VulkanResidentKernelDispatch] {
         &self.resident_dispatches
+    }
+
+    fn input_tracking_dispatches(&self) -> &[VulkanResidentKernelDispatch] {
+        &self.input_tracking_dispatches
+    }
+
+    fn record_input_tokens(
+        &self,
+        device: &VulkanComputeDevice,
+        token_ids: &[u32],
+    ) -> Result<(), VulkanResidentSamplerRunnerError> {
+        let Some(dispatch) = &self.seen_token_batch_dispatch else {
+            return Ok(());
+        };
+        if token_ids.is_empty() || token_ids.len() > VULKAN_BACKEND_LOOP_MAX_WINDOW {
+            return Err(
+                VulkanResidentSamplerRunnerError::TokenBatchCapacityExceeded {
+                    requested: token_ids.len(),
+                    capacity: VULKAN_BACKEND_LOOP_MAX_WINDOW,
+                },
+            );
+        }
+        let mut bytes = Vec::with_capacity(std::mem::size_of_val(token_ids));
+        for token_id in token_ids {
+            bytes.extend_from_slice(&token_id.to_le_bytes());
+        }
+        self.seen_token_batch_buffer
+            .as_ref()
+            .expect("repetition token batch dispatch has an input buffer")
+            .write_bytes(&bytes)?;
+        device.run_resident_kernel_sequence(
+            self.seen_token_batch_sequence
+                .as_ref()
+                .expect("repetition token batch dispatch has a sequence"),
+            &[VulkanResidentKernelSequenceStep::new(
+                dispatch,
+                &u32::try_from(token_ids.len())
+                    .map_err(
+                        |_| VulkanResidentSamplerRunnerError::TokenBatchCapacityExceeded {
+                            requested: token_ids.len(),
+                            capacity: VULKAN_BACKEND_LOOP_MAX_WINDOW,
+                        },
+                    )?
+                    .to_le_bytes(),
+            )],
+        )?;
+        Ok(())
+    }
+
+    fn capture_token_state(&self) -> Result<(), VulkanResidentSamplerRunnerError> {
+        if let Some(copy) = &self.capture_seen_token_copy {
+            copy.run(copy.byte_len())?;
+        }
+        Ok(())
+    }
+
+    fn restore_token_state(&self) -> Result<(), VulkanResidentSamplerRunnerError> {
+        if let Some(copy) = &self.restore_seen_token_copy {
+            copy.run(copy.byte_len())?;
+        }
+        Ok(())
     }
 
     fn completed_run(&self) -> Result<VulkanResidentSamplerRun, VulkanResidentSamplerRunnerError> {
@@ -4489,22 +4912,104 @@ impl VulkanResidentSamplerRunner {
         kernels: &[VulkanResidentSamplerKernelArtifact],
         spec: &VulkanResidentSamplerSpec,
     ) -> Result<VulkanResidentSamplerLogitsView, VulkanResidentSamplerRunnerError> {
-        let scratch_buffer = (spec.scratch_byte_capacity > 0)
+        let scratch_buffer = (spec.method == "temperature_top_k_top_p")
             .then(|| device.create_resident_buffer(spec.scratch_byte_capacity))
             .transpose()?;
         let mut stream_control_buffer =
             device.create_host_visible_resident_buffer(VULKAN_STREAM_CONTROL_BYTE_CAPACITY)?;
         stream_control_buffer.persistently_map()?;
         stream_control_buffer.write_bytes(&[0; VULKAN_STREAM_CONTROL_BYTE_CAPACITY])?;
-        let mut resident_dispatches = Vec::with_capacity(kernels.len());
-        for kernel in kernels {
+        let runtime_parameterized = spec.runtime_parameterized;
+        let seen_token_buffer = self
+            ._seen_token_buffer
+            .as_ref()
+            .map(|source| {
+                let destination = device.create_resident_buffer(source.byte_capacity())?;
+                destination.write_bytes(&vec![0; source.byte_capacity()])?;
+                Ok::<_, VulkanError>(destination)
+            })
+            .transpose()?;
+        let seen_token_copy = self
+            ._seen_token_buffer
+            .as_ref()
+            .zip(seen_token_buffer.as_ref())
+            .map(|(source, destination)| {
+                device.create_resident_buffer_copy(source, destination, source.byte_capacity())
+            })
+            .transpose()?;
+        let token_state_is_active = spec.repetition_penalty != 1.0 || spec.presence_penalty != 0.0;
+        let token_batch_role = if runtime_parameterized {
+            "runtime_record_token_batch"
+        } else {
+            "record_token_batch"
+        };
+        let token_batch_kernel = token_state_is_active
+            .then(|| {
+                kernels
+                    .iter()
+                    .find(|kernel| kernel.role == token_batch_role)
+            })
+            .flatten();
+        let seen_token_batch_buffer = if token_batch_kernel.is_some() {
+            let mut buffer = device.create_host_visible_resident_buffer(
+                VULKAN_BACKEND_LOOP_MAX_WINDOW * std::mem::size_of::<u32>(),
+            )?;
+            buffer.persistently_map()?;
+            Some(buffer)
+        } else {
+            None
+        };
+        let seen_token_batch_dispatch = token_batch_kernel
+            .map(|kernel| {
+                device.create_resident_kernel_dispatch(
+                    &kernel.spirv_words,
+                    &[
+                        VulkanResidentKernelBufferBinding::new(
+                            0,
+                            seen_token_batch_buffer
+                                .as_ref()
+                                .expect("token-state view has prefix input buffer"),
+                            VULKAN_BACKEND_LOOP_MAX_WINDOW * std::mem::size_of::<u32>(),
+                        )
+                        .with_access(VulkanResidentKernelBufferAccess::Read),
+                        VulkanResidentKernelBufferBinding::new(
+                            1,
+                            seen_token_buffer
+                                .as_ref()
+                                .expect("token-state view has private seen-token state"),
+                            seen_token_buffer
+                                .as_ref()
+                                .expect("token-state view has private seen-token state")
+                                .byte_capacity(),
+                        )
+                        .with_access(VulkanResidentKernelBufferAccess::ReadWrite),
+                    ],
+                    kernel.workgroup_count_x,
+                    kernel.local_size_x,
+                    std::mem::size_of::<u32>() as u32,
+                )
+            })
+            .transpose()?;
+        let seen_token_batch_sequence = seen_token_batch_dispatch
+            .as_ref()
+            .map(|_| device.create_resident_kernel_sequence())
+            .transpose()?;
+        let sampling_kernels = kernels.iter().filter(|kernel| {
+            sampler_kernel_role_matches(
+                kernel.role.as_str(),
+                runtime_parameterized,
+                spec.method.as_str(),
+            )
+        });
+        let mut resident_dispatches = Vec::new();
+        for kernel in sampling_kernels {
             let logits_binding = || {
                 VulkanResidentKernelBufferBinding::new(0, logits_buffer, self.logits_byte_capacity)
                     .with_byte_offset(logits_byte_offset)
                     .with_access(VulkanResidentKernelBufferAccess::Read)
             };
-            let bindings = match kernel.role.as_str() {
-                "sample_logits" => vec![
+            let mut bindings = match kernel.role.as_str() {
+                "sample_logits" | "runtime_sample_logits" => vec![
                     logits_binding(),
                     VulkanResidentKernelBufferBinding::new(
                         1,
@@ -4519,7 +5024,7 @@ impl VulkanResidentSamplerRunner {
                     )
                     .with_access(VulkanResidentKernelBufferAccess::ReadWrite),
                 ],
-                "partition_top_k" => vec![
+                "partition_top_k" | "runtime_partition_top_k" => vec![
                     logits_binding(),
                     VulkanResidentKernelBufferBinding::new(
                         1,
@@ -4530,7 +5035,7 @@ impl VulkanResidentSamplerRunner {
                     )
                     .with_access(VulkanResidentKernelBufferAccess::Write),
                 ],
-                "sample_candidates" => vec![
+                "sample_candidates" | "runtime_sample_candidates" => vec![
                     VulkanResidentKernelBufferBinding::new(
                         0,
                         scratch_buffer
@@ -4566,6 +5071,37 @@ impl VulkanResidentSamplerRunner {
                     ));
                 }
             };
+            if let Some(seen_token_buffer) = &seen_token_buffer {
+                let binding = match kernel.role.as_str() {
+                    "sample_logits" | "runtime_sample_logits" => Some(3),
+                    "partition_top_k" | "runtime_partition_top_k" => Some(2),
+                    _ => None,
+                };
+                if let Some(binding) = binding {
+                    bindings.push(
+                        VulkanResidentKernelBufferBinding::new(
+                            binding,
+                            seen_token_buffer,
+                            seen_token_buffer.byte_capacity(),
+                        )
+                        .with_access(VulkanResidentKernelBufferAccess::Read),
+                    );
+                }
+            }
+            if let Some(parameter_buffer) = &self._sampler_parameter_buffer {
+                let binding = match kernel.role.as_str() {
+                    "runtime_sample_logits" => Some(4),
+                    "runtime_partition_top_k" => Some(3),
+                    "runtime_sample_candidates" => Some(4),
+                    _ => None,
+                };
+                if let Some(binding) = binding {
+                    bindings.push(
+                        VulkanResidentKernelBufferBinding::new(binding, parameter_buffer, 24)
+                            .with_access(VulkanResidentKernelBufferAccess::Read),
+                    );
+                }
+            }
             resident_dispatches.push(device.create_resident_kernel_dispatch(
                 &kernel.spirv_words,
                 &bindings,
@@ -4579,6 +5115,11 @@ impl VulkanResidentSamplerRunner {
             sequence: device.create_resident_kernel_sequence()?,
             _scratch_buffer: scratch_buffer,
             stream_control_buffer,
+            _seen_token_buffer: seen_token_buffer,
+            seen_token_copy,
+            seen_token_batch_buffer,
+            seen_token_batch_dispatch,
+            seen_token_batch_sequence,
         })
     }
 }
@@ -4588,9 +5129,60 @@ struct VulkanResidentSamplerLogitsView {
     sequence: VulkanResidentKernelSequence,
     _scratch_buffer: Option<VulkanResidentBuffer>,
     stream_control_buffer: VulkanResidentBuffer,
+    _seen_token_buffer: Option<VulkanResidentBuffer>,
+    seen_token_copy: Option<VulkanResidentBufferCopy>,
+    seen_token_batch_buffer: Option<VulkanResidentBuffer>,
+    seen_token_batch_dispatch: Option<VulkanResidentKernelDispatch>,
+    seen_token_batch_sequence: Option<VulkanResidentKernelSequence>,
 }
 
 impl VulkanResidentSamplerLogitsView {
+    fn prepare_token_state(
+        &self,
+        device: &VulkanComputeDevice,
+        prefix_token_ids: &[u32],
+    ) -> Result<(), VulkanResidentSamplerRunnerError> {
+        if let Some(copy) = &self.seen_token_copy {
+            copy.run(copy.byte_len())?;
+        }
+        let Some(dispatch) = &self.seen_token_batch_dispatch else {
+            return Ok(());
+        };
+        if prefix_token_ids.is_empty() || prefix_token_ids.len() > VULKAN_BACKEND_LOOP_MAX_WINDOW {
+            return Err(
+                VulkanResidentSamplerRunnerError::TokenBatchCapacityExceeded {
+                    requested: prefix_token_ids.len(),
+                    capacity: VULKAN_BACKEND_LOOP_MAX_WINDOW,
+                },
+            );
+        }
+        let mut bytes = Vec::with_capacity(std::mem::size_of_val(prefix_token_ids));
+        for token_id in prefix_token_ids {
+            bytes.extend_from_slice(&token_id.to_le_bytes());
+        }
+        self.seen_token_batch_buffer
+            .as_ref()
+            .expect("token-state view tracker has input buffer")
+            .write_bytes(&bytes)?;
+        device.run_resident_kernel_sequence(
+            self.seen_token_batch_sequence
+                .as_ref()
+                .expect("token-state view tracker has sequence"),
+            &[VulkanResidentKernelSequenceStep::new(
+                dispatch,
+                &u32::try_from(prefix_token_ids.len())
+                    .map_err(
+                        |_| VulkanResidentSamplerRunnerError::TokenBatchCapacityExceeded {
+                            requested: prefix_token_ids.len(),
+                            capacity: VULKAN_BACKEND_LOOP_MAX_WINDOW,
+                        },
+                    )?
+                    .to_le_bytes(),
+            )],
+        )?;
+        Ok(())
+    }
+
     fn prepare_stream_tick(
         &self,
         stream_tick: u64,
@@ -4638,12 +5230,20 @@ pub enum VulkanResidentSamplerRunnerError {
     HistoryCapacityOverflow,
     WorkgroupCountOverflow,
     PushConstantByteCountOverflow,
+    TokenBatchCapacityExceeded {
+        requested: usize,
+        capacity: usize,
+    },
     InvalidKernelRole(String),
+    UnsupportedRuntimeSamplingOverride(String),
     InvalidSamplingSpec {
         method: String,
         temperature: f32,
         top_k: u32,
         top_p: f32,
+        min_p: f32,
+        presence_penalty: f32,
+        repetition_penalty: f32,
     },
     Vulkan(VulkanError),
 }
@@ -4666,17 +5266,28 @@ impl Display for VulkanResidentSamplerRunnerError {
             Self::PushConstantByteCountOverflow => {
                 f.write_str("sampler push constant byte count overflowed")
             }
+            Self::TokenBatchCapacityExceeded {
+                requested,
+                capacity,
+            } => write!(
+                f,
+                "sampler repetition-state batch requests {requested} tokens, capacity is {capacity}"
+            ),
             Self::InvalidKernelRole(role) => {
                 write!(f, "invalid resident sampler kernel role {role:?}")
             }
+            Self::UnsupportedRuntimeSamplingOverride(message) => f.write_str(message),
             Self::InvalidSamplingSpec {
                 method,
                 temperature,
                 top_k,
                 top_p,
+                min_p,
+                presence_penalty,
+                repetition_penalty,
             } => write!(
                 f,
-                "invalid resident sampling spec method={method:?} temperature={temperature} top_k={top_k} top_p={top_p}"
+                "invalid resident sampling spec method={method:?} temperature={temperature} top_k={top_k} top_p={top_p} min_p={min_p} presence_penalty={presence_penalty} repetition_penalty={repetition_penalty}"
             ),
             Self::Vulkan(error) => Display::fmt(error, f),
         }
@@ -4926,10 +5537,11 @@ impl VulkanResidentBatchedOutputProjectionRunner {
     fn sample_batch(
         &self,
         device: &VulkanComputeDevice,
-        batch_width: usize,
+        input_token_ids: &[u32],
         start_stream_tick: u64,
         dynamic_state_capacity_activations: u32,
     ) -> Result<(), VulkanResidentInProcessPlacedRuntimeError> {
+        let batch_width = input_token_ids.len();
         if batch_width == 0 || batch_width > self.sampler_views.len() {
             return Err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop(
                 VulkanError(format!(
@@ -4940,6 +5552,8 @@ impl VulkanResidentBatchedOutputProjectionRunner {
         }
         let submission_batch = VulkanResidentQueueSubmissionBatch::new();
         for (batch_index, view) in self.sampler_views.iter().take(batch_width).enumerate() {
+            view.prepare_token_state(device, &input_token_ids[..=batch_index])
+                .map_err(VulkanResidentInProcessPlacedRuntimeError::Sampler)?;
             let stream_tick =
                 start_stream_tick
                     .checked_add(u64::try_from(batch_index).map_err(|_| {
@@ -4984,6 +5598,13 @@ pub struct VulkanResidentSingleTokenTickRunner {
     completed_output_run: Arc<VulkanResidentOutputTransducerRun>,
     sequence: VulkanResidentKernelSequence,
     feedback_sequence: VulkanResidentKernelSequence,
+}
+
+struct VulkanResidentSingleTokenTickExecution<'a> {
+    input_token_is_resident: bool,
+    emit_output: bool,
+    input_tracking_dispatches: &'a [VulkanResidentKernelDispatch],
+    tail_dispatches: &'a [VulkanResidentKernelDispatch],
 }
 
 impl VulkanResidentSingleTokenTickRunner {
@@ -5036,7 +5657,17 @@ impl VulkanResidentSingleTokenTickRunner {
         token_id: u32,
         control: VulkanMountedPlacedStreamControl,
     ) -> Result<VulkanResidentSingleTokenTickRun, VulkanResidentSingleTokenTickRunnerError> {
-        self.run_token_id_with_stream_control_and_tail(device, token_id, control, false, true, &[])
+        self.run_token_id_with_stream_control_and_tail(
+            device,
+            token_id,
+            control,
+            VulkanResidentSingleTokenTickExecution {
+                input_token_is_resident: false,
+                emit_output: true,
+                input_tracking_dispatches: &[],
+                tail_dispatches: &[],
+            },
+        )
     }
 
     fn run_token_id_with_stream_control_and_tail(
@@ -5044,11 +5675,9 @@ impl VulkanResidentSingleTokenTickRunner {
         device: &VulkanComputeDevice,
         token_id: u32,
         control: VulkanMountedPlacedStreamControl,
-        input_token_is_resident: bool,
-        emit_output: bool,
-        tail_dispatches: &[VulkanResidentKernelDispatch],
+        execution: VulkanResidentSingleTokenTickExecution<'_>,
     ) -> Result<VulkanResidentSingleTokenTickRun, VulkanResidentSingleTokenTickRunnerError> {
-        if !input_token_is_resident {
+        if !execution.input_token_is_resident {
             self.stream_control_buffer
                 .write_bytes(&stream_control_bytes(token_id, control))?;
         }
@@ -5062,11 +5691,21 @@ impl VulkanResidentSingleTokenTickRunner {
             }
         }
 
-        let mut sequence_steps = Vec::with_capacity(self.dispatch_count + tail_dispatches.len());
+        let mut sequence_steps = Vec::with_capacity(
+            self.dispatch_count
+                + execution.input_tracking_dispatches.len()
+                + execution.tail_dispatches.len(),
+        );
         sequence_steps.push(VulkanResidentKernelSequenceStep::new(
             &self.input_transducer.resident_dispatch,
             &[],
         ));
+        sequence_steps.extend(
+            execution
+                .input_tracking_dispatches
+                .iter()
+                .map(|dispatch| VulkanResidentKernelSequenceStep::new(dispatch, &[])),
+        );
         let mut pedal_push_constant_index = 0usize;
         for pedal in &self.pedalboard.pedals {
             for dispatch in &pedal.dispatches {
@@ -5077,7 +5716,7 @@ impl VulkanResidentSingleTokenTickRunner {
                 pedal_push_constant_index += 1;
             }
         }
-        if emit_output {
+        if execution.emit_output {
             sequence_steps.push(VulkanResidentKernelSequenceStep::new(
                 &self.output_transducer.embedding_norm_dispatch,
                 &[],
@@ -5087,7 +5726,7 @@ impl VulkanResidentSingleTokenTickRunner {
                 &[],
             ));
         }
-        for tail_dispatch in tail_dispatches {
+        for tail_dispatch in execution.tail_dispatches {
             sequence_steps.push(VulkanResidentKernelSequenceStep::new(tail_dispatch, &[]));
         }
 
@@ -5097,17 +5736,17 @@ impl VulkanResidentSingleTokenTickRunner {
             u64::try_from(execution_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
 
         let input_run = self.input_transducer.completed_run(token_id);
-        let dispatch_count = if emit_output {
+        let dispatch_count = if execution.emit_output {
             self.dispatch_count
         } else {
             self.dispatch_count - self.output_transducer.dispatch_count
         };
-        let total_descriptor_count = if emit_output {
+        let total_descriptor_count = if execution.emit_output {
             self.total_descriptor_count
         } else {
             self.total_descriptor_count - self.output_transducer.total_descriptor_count
         };
-        let total_push_constant_byte_count = if emit_output {
+        let total_push_constant_byte_count = if execution.emit_output {
             self.total_push_constant_byte_count
         } else {
             self.total_push_constant_byte_count
@@ -5118,7 +5757,9 @@ impl VulkanResidentSingleTokenTickRunner {
             token_id,
             input_run,
             pedalboard_run: self.completed_pedalboard_run.clone(),
-            output_run: emit_output.then(|| self.completed_output_run.clone()),
+            output_run: execution
+                .emit_output
+                .then(|| self.completed_output_run.clone()),
             dispatch_count,
             total_descriptor_count,
             total_push_constant_byte_count,
@@ -5280,9 +5921,12 @@ impl VulkanResidentFeedbackLoopRunner {
                     control_flags: 0,
                     dynamic_state_capacity_activations,
                 },
-                tick_index != 0,
-                true,
-                sampler_dispatches,
+                VulkanResidentSingleTokenTickExecution {
+                    input_token_is_resident: tick_index != 0,
+                    emit_output: true,
+                    input_tracking_dispatches: self.sampler.input_tracking_dispatches(),
+                    tail_dispatches: sampler_dispatches,
+                },
             )?;
             let sampler_run = self.sampler.completed_run()?;
             let sampled_token_id = sampler_run.token_id;
@@ -5349,6 +5993,12 @@ impl VulkanResidentFeedbackLoopRunner {
                 &self.tick_runner.input_transducer.resident_dispatch,
                 &[],
             ));
+            sequence_steps.extend(
+                self.sampler
+                    .input_tracking_dispatches()
+                    .iter()
+                    .map(|dispatch| VulkanResidentKernelSequenceStep::new(dispatch, &[])),
+            );
             for pedal in &self.tick_runner.pedalboard.pedals {
                 for dispatch in &pedal.dispatches {
                     sequence_steps.push(VulkanResidentKernelSequenceStep::new(
@@ -5498,12 +6148,15 @@ impl VulkanResidentFeedbackLoopRunner {
                     control_flags: 0,
                     dynamic_state_capacity_activations,
                 },
-                matches!(
-                    input_route,
-                    VulkanResidentPromptEventInputRoute::PrivateFeedback
-                ),
-                should_emit_public_output,
-                tail_dispatches,
+                VulkanResidentSingleTokenTickExecution {
+                    input_token_is_resident: matches!(
+                        input_route,
+                        VulkanResidentPromptEventInputRoute::PrivateFeedback
+                    ),
+                    emit_output: should_emit_public_output,
+                    input_tracking_dispatches: self.sampler.input_tracking_dispatches(),
+                    tail_dispatches,
+                },
             )?;
 
             let mut public_output_token_id = None;
@@ -6323,14 +6976,117 @@ struct VulkanResidentPedalBatchSliceRunner {
     signal_buffer_indices: BTreeMap<VulkanPedalBatchSignalKey, usize>,
     stream_control_buffers: Vec<VulkanResidentBuffer>,
     steps: Vec<VulkanPedalBatchDispatchStep>,
-    distributed_barriers: Vec<VulkanPedalBatchDistributedBarrier>,
+    execution_units: Vec<VulkanPedalBatchExecutionUnit>,
     sequences: Vec<VulkanResidentKernelSequence>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct VulkanPedalBatchDistributedBarrier {
-    step_index: usize,
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum VulkanPedalBatchExecutionUnit {
+    LocalPedal {
+        pedal_id: String,
+        step_start: usize,
+        step_end: usize,
+    },
+    DistributedDispatch {
+        dispatch_index: usize,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct VulkanPedalBatchDispatchSpan {
+    pedal_id: String,
     dispatch_index: usize,
+    step_start: usize,
+    step_end: usize,
+    distributed: bool,
+}
+
+fn finish_pedal_batch_local_execution_unit(
+    execution_units: &mut Vec<VulkanPedalBatchExecutionUnit>,
+    pedal_id: &str,
+    step_start: usize,
+    step_end: usize,
+) {
+    if step_start < step_end {
+        execution_units.push(VulkanPedalBatchExecutionUnit::LocalPedal {
+            pedal_id: pedal_id.to_string(),
+            step_start,
+            step_end,
+        });
+    }
+}
+
+fn pedal_batch_execution_units(
+    dispatch_spans: &[VulkanPedalBatchDispatchSpan],
+) -> Result<Vec<VulkanPedalBatchExecutionUnit>, VulkanError> {
+    let mut execution_units = Vec::new();
+    let mut current_pedal_id = None::<&str>;
+    let mut local_step_start = 0usize;
+    let mut expected_step_start = 0usize;
+    let mut previous_dispatch_index = None;
+    for span in dispatch_spans {
+        if span.step_start != expected_step_start {
+            return Err(VulkanError(format!(
+                "pedal batch dispatch {} starts at step {}, expected {expected_step_start}",
+                span.dispatch_index, span.step_start
+            )));
+        }
+        if previous_dispatch_index.is_some_and(|previous| previous >= span.dispatch_index) {
+            return Err(VulkanError(format!(
+                "pedal batch dispatch indices are not strictly increasing at {}",
+                span.dispatch_index
+            )));
+        }
+        if span.distributed && span.step_end != span.step_start {
+            return Err(VulkanError(format!(
+                "distributed pedal batch dispatch {} owns local steps {}..{}",
+                span.dispatch_index, span.step_start, span.step_end
+            )));
+        }
+        if !span.distributed && span.step_end <= span.step_start {
+            return Err(VulkanError(format!(
+                "local pedal batch dispatch {} has no executable steps",
+                span.dispatch_index
+            )));
+        }
+        previous_dispatch_index = Some(span.dispatch_index);
+        expected_step_start = span.step_end;
+        if span.distributed {
+            if let Some(pedal_id) = current_pedal_id.take() {
+                finish_pedal_batch_local_execution_unit(
+                    &mut execution_units,
+                    pedal_id,
+                    local_step_start,
+                    span.step_start,
+                );
+            }
+            execution_units.push(VulkanPedalBatchExecutionUnit::DistributedDispatch {
+                dispatch_index: span.dispatch_index,
+            });
+            continue;
+        }
+        if current_pedal_id != Some(span.pedal_id.as_str()) {
+            if let Some(pedal_id) = current_pedal_id {
+                finish_pedal_batch_local_execution_unit(
+                    &mut execution_units,
+                    pedal_id,
+                    local_step_start,
+                    span.step_start,
+                );
+            }
+            current_pedal_id = Some(&span.pedal_id);
+            local_step_start = span.step_start;
+        }
+    }
+    if let (Some(pedal_id), Some(last_span)) = (current_pedal_id, dispatch_spans.last()) {
+        finish_pedal_batch_local_execution_unit(
+            &mut execution_units,
+            pedal_id,
+            local_step_start,
+            last_span.step_end,
+        );
+    }
+    Ok(execution_units)
 }
 
 impl VulkanResidentPedalBatchSliceRunner {
@@ -6471,8 +7227,9 @@ impl VulkanResidentPedalBatchSliceRunner {
             })
             .collect::<Result<Vec<_>, _>>()?;
         let mut steps = Vec::new();
-        let mut distributed_barriers = Vec::new();
+        let mut dispatch_spans = Vec::with_capacity(slice.mounted_bound.dispatches.len());
         for dispatch in &slice.mounted_bound.dispatches {
+            let dispatch_step_start = steps.len();
             if distributed_execution_plan
                 .dispatches
                 .iter()
@@ -6481,9 +7238,12 @@ impl VulkanResidentPedalBatchSliceRunner {
                         && distributed.dispatch_index == dispatch.dispatch_index
                 })
             {
-                distributed_barriers.push(VulkanPedalBatchDistributedBarrier {
-                    step_index: steps.len(),
+                dispatch_spans.push(VulkanPedalBatchDispatchSpan {
+                    pedal_id: dispatch.pedal_id.clone(),
                     dispatch_index: dispatch.dispatch_index,
+                    step_start: dispatch_step_start,
+                    step_end: dispatch_step_start,
+                    distributed: true,
                 });
                 continue;
             }
@@ -6577,6 +7337,13 @@ impl VulkanResidentPedalBatchSliceRunner {
                         snapshot_state_buffer_indices: BTreeSet::new(),
                     });
                 }
+                dispatch_spans.push(VulkanPedalBatchDispatchSpan {
+                    pedal_id: dispatch.pedal_id.clone(),
+                    dispatch_index: dispatch.dispatch_index,
+                    step_start: dispatch_step_start,
+                    step_end: steps.len(),
+                    distributed: false,
+                });
                 continue;
             }
 
@@ -6646,9 +7413,21 @@ impl VulkanResidentPedalBatchSliceRunner {
                     snapshot_state_buffer_indices: snapshot_state_buffer_indices.clone(),
                 });
             }
+            dispatch_spans.push(VulkanPedalBatchDispatchSpan {
+                pedal_id: dispatch.pedal_id.clone(),
+                dispatch_index: dispatch.dispatch_index,
+                step_start: dispatch_step_start,
+                step_end: steps.len(),
+                distributed: false,
+            });
         }
+        let execution_units = pedal_batch_execution_units(&dispatch_spans)
+            .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
 
-        let sequences = (0..=distributed_barriers.len())
+        let sequences = (0..execution_units
+            .iter()
+            .filter(|unit| matches!(unit, VulkanPedalBatchExecutionUnit::LocalPedal { .. }))
+            .count())
             .map(|_| {
                 device
                     .create_resident_kernel_sequence()
@@ -6661,7 +7440,7 @@ impl VulkanResidentPedalBatchSliceRunner {
             signal_buffer_indices,
             stream_control_buffers,
             steps,
-            distributed_barriers,
+            execution_units,
             sequences,
         })
     }
@@ -6672,7 +7451,7 @@ impl VulkanResidentPedalBatchSliceRunner {
         device: &VulkanComputeDevice,
         mounted: &VulkanMountedPlacedStreamCircuit,
         transaction: &VulkanResidentStateTransactionBank,
-        batch_width: usize,
+        input_token_ids: &[u32],
         start_stream_tick: u64,
         dynamic_state_capacity_activations: u32,
         run_distributed: impl FnMut(
@@ -6684,7 +7463,7 @@ impl VulkanResidentPedalBatchSliceRunner {
             device,
             mounted,
             VulkanPedalBatchStateSemantics::IndependentCandidates(transaction),
-            batch_width,
+            input_token_ids,
             start_stream_tick,
             dynamic_state_capacity_activations,
             run_distributed,
@@ -6695,7 +7474,7 @@ impl VulkanResidentPedalBatchSliceRunner {
         &self,
         device: &VulkanComputeDevice,
         mounted: &VulkanMountedPlacedStreamCircuit,
-        batch_width: usize,
+        input_token_ids: &[u32],
         start_stream_tick: u64,
         dynamic_state_capacity_activations: u32,
         run_distributed: impl FnMut(
@@ -6707,7 +7486,7 @@ impl VulkanResidentPedalBatchSliceRunner {
             device,
             mounted,
             VulkanPedalBatchStateSemantics::CausalSequence,
-            batch_width,
+            input_token_ids,
             start_stream_tick,
             dynamic_state_capacity_activations,
             run_distributed,
@@ -6720,7 +7499,7 @@ impl VulkanResidentPedalBatchSliceRunner {
         device: &VulkanComputeDevice,
         mounted: &VulkanMountedPlacedStreamCircuit,
         state_semantics: VulkanPedalBatchStateSemantics<'_>,
-        batch_width: usize,
+        input_token_ids: &[u32],
         start_stream_tick: u64,
         dynamic_state_capacity_activations: u32,
         mut run_distributed: impl FnMut(
@@ -6729,6 +7508,7 @@ impl VulkanResidentPedalBatchSliceRunner {
         )
             -> Result<(), VulkanResidentInProcessPlacedRuntimeError>,
     ) -> Result<(), VulkanResidentInProcessPlacedRuntimeError> {
+        let batch_width = input_token_ids.len();
         if batch_width == 0 || batch_width > self.lane_capacity {
             return Err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop(
                 VulkanError(format!(
@@ -6737,22 +7517,16 @@ impl VulkanResidentPedalBatchSliceRunner {
                 )),
             ));
         }
-        for lane_index in 0..batch_width {
-            let stream_tick =
-                start_stream_tick
-                    .checked_add(u64::try_from(lane_index).map_err(|_| {
-                        VulkanResidentInProcessPlacedRuntimeError::StreamTickOverflow
-                    })?)
-                    .ok_or(VulkanResidentInProcessPlacedRuntimeError::StreamTickOverflow)?;
-            self.stream_control_buffers[lane_index]
-                .write_bytes_at(
-                    VULKAN_STREAM_CONTROL_METADATA_OFFSET,
-                    &stream_control_metadata_bytes(VulkanMountedPlacedStreamControl {
-                        stream_tick,
-                        control_flags: 0,
-                        dynamic_state_capacity_activations,
-                    }),
-                )
+        let lane_controls = pedal_batch_lane_stream_control_bytes(
+            input_token_ids,
+            start_stream_tick,
+            dynamic_state_capacity_activations,
+        )?;
+        for (stream_control_buffer, control_bytes) in
+            self.stream_control_buffers.iter().zip(&lane_controls)
+        {
+            stream_control_buffer
+                .write_bytes(control_bytes)
                 .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
         }
 
@@ -6766,35 +7540,35 @@ impl VulkanResidentPedalBatchSliceRunner {
             start_stream_tick,
             dynamic_state_capacity_activations,
         );
-        let mut segment_start = 0usize;
-        for (segment_index, barrier) in self.distributed_barriers.iter().enumerate() {
-            self.run_segment(
-                device,
-                mounted,
-                state_semantics,
-                batch_width,
-                start_stream_tick,
-                dynamic_state_capacity_activations,
-                &batch_control,
-                segment_index,
-                segment_start,
-                barrier.step_index,
-            )?;
-            run_distributed(barrier.dispatch_index, &batch_control)?;
-            segment_start = barrier.step_index;
+        let mut sequence_index = 0usize;
+        for unit in &self.execution_units {
+            match unit {
+                VulkanPedalBatchExecutionUnit::LocalPedal {
+                    step_start,
+                    step_end,
+                    ..
+                } => {
+                    self.run_segment(
+                        device,
+                        mounted,
+                        state_semantics,
+                        batch_width,
+                        start_stream_tick,
+                        dynamic_state_capacity_activations,
+                        &batch_control,
+                        sequence_index,
+                        *step_start,
+                        *step_end,
+                    )?;
+                    sequence_index += 1;
+                }
+                VulkanPedalBatchExecutionUnit::DistributedDispatch { dispatch_index } => {
+                    run_distributed(*dispatch_index, &batch_control)?;
+                }
+            }
         }
-        self.run_segment(
-            device,
-            mounted,
-            state_semantics,
-            batch_width,
-            start_stream_tick,
-            dynamic_state_capacity_activations,
-            &batch_control,
-            self.distributed_barriers.len(),
-            segment_start,
-            self.steps.len(),
-        )
+        debug_assert_eq!(sequence_index, self.sequences.len());
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -7494,7 +8268,7 @@ impl VulkanResidentPlacedPedalBatchRunner {
         device_index: usize,
         owner_device_id: &str,
         mounted: &VulkanMountedPlacedStreamCircuit,
-        batch_width: usize,
+        input_token_ids: &[u32],
         start_stream_tick: u64,
         dynamic_state_capacity_activations: u32,
     ) -> Result<(), VulkanResidentInProcessPlacedRuntimeError> {
@@ -7506,7 +8280,7 @@ impl VulkanResidentPlacedPedalBatchRunner {
         self.slice(device_index)?.run_causal_sequence(
             device,
             mounted,
-            batch_width,
+            input_token_ids,
             start_stream_tick,
             dynamic_state_capacity_activations,
             |dispatch_index, batch_control| {
@@ -7528,7 +8302,7 @@ impl VulkanResidentPlacedPedalBatchRunner {
         owner_device_id: &str,
         mounted: &VulkanMountedPlacedStreamCircuit,
         transaction: &VulkanResidentStateTransactionBank,
-        batch_width: usize,
+        input_token_ids: &[u32],
         start_stream_tick: u64,
         dynamic_state_capacity_activations: u32,
     ) -> Result<(), VulkanResidentInProcessPlacedRuntimeError> {
@@ -7541,7 +8315,7 @@ impl VulkanResidentPlacedPedalBatchRunner {
             device,
             mounted,
             transaction,
-            batch_width,
+            input_token_ids,
             start_stream_tick,
             dynamic_state_capacity_activations,
             |dispatch_index, batch_control| {
@@ -8109,12 +8883,19 @@ impl VulkanResidentRunningStream {
                         .processor
                         .dynamic_state_capacity_activations_u32()?,
                 },
-                matches!(
-                    &input_signal,
-                    VulkanResidentRunningStreamInputSignal::PrivateFeedback(_)
-                ),
-                should_emit_public_output,
-                tail_dispatches,
+                VulkanResidentSingleTokenTickExecution {
+                    input_token_is_resident: matches!(
+                        &input_signal,
+                        VulkanResidentRunningStreamInputSignal::PrivateFeedback(_)
+                    ),
+                    emit_output: should_emit_public_output,
+                    input_tracking_dispatches: self
+                        .processor
+                        .loop_runner
+                        .sampler
+                        .input_tracking_dispatches(),
+                    tail_dispatches,
+                },
             )?;
         self.next_stream_tick = self
             .next_stream_tick
@@ -12537,7 +13318,10 @@ impl VulkanResidentSpeculativeDecoderProcessor {
     fn capture_baseline(&self) -> Result<(), VulkanResidentInProcessPlacedRuntimeError> {
         self.state_transaction
             .capture_baseline(&self.mounted.buffers)
-            .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)
+            .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
+        self.sampler
+            .capture_token_state()
+            .map_err(VulkanResidentInProcessPlacedRuntimeError::Sampler)
     }
 
     fn restore_baseline(&self) -> Result<(), VulkanResidentInProcessPlacedRuntimeError> {
@@ -12546,7 +13330,10 @@ impl VulkanResidentSpeculativeDecoderProcessor {
             .map_err(VulkanResidentInProcessPlacedRuntimeError::FeedbackCable)?;
         self.state_transaction
             .restore_baseline(&self.mounted.buffers)
-            .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)
+            .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
+        self.sampler
+            .restore_token_state()
+            .map_err(VulkanResidentInProcessPlacedRuntimeError::Sampler)
     }
 
     fn run_draft_step(
@@ -12673,7 +13460,8 @@ impl VulkanResidentSpeculativeDecoderProcessor {
         };
         let mut steps = Vec::with_capacity(
             1usize
-                .checked_add(decoder_dispatches.len())
+                .checked_add(self.sampler.input_tracking_dispatches().len())
+                .and_then(|count| count.checked_add(decoder_dispatches.len()))
                 .and_then(|count| count.checked_add(output_dispatch_count))
                 .ok_or_else(|| {
                     VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(
@@ -12685,6 +13473,12 @@ impl VulkanResidentSpeculativeDecoderProcessor {
             &self.input_transducer.resident_dispatch,
             &[],
         ));
+        steps.extend(
+            self.sampler
+                .input_tracking_dispatches()
+                .iter()
+                .map(|dispatch| VulkanResidentKernelSequenceStep::new(dispatch, &[])),
+        );
         steps.extend(decoder_dispatches.iter().zip(&decoder_push_constants).map(
             |(dispatch, push_constants)| {
                 VulkanResidentKernelSequenceStep::new(&dispatch.resident_dispatch, push_constants)
@@ -12849,21 +13643,10 @@ impl VulkanResidentInProcessPlacedFeedbackLoopEligibility {
     }
 }
 
-enum VulkanResidentInProcessPlacedFeedbackLoopExecution {
-    Monolithic {
-        sequence: Box<VulkanResidentKernelSequence>,
-        static_state_snapshots: Box<VulkanResidentStateTransactionBank>,
-        steps_per_tick: usize,
-    },
-    Placed {
-        static_state_snapshots: Vec<VulkanResidentStateTransactionBank>,
-        feedback_synchronization: Option<Box<VulkanResidentPlacedFeedbackTimelineSynchronization>>,
-        output_synchronization: Box<VulkanResidentPlacedOutputTimelineSynchronization>,
-    },
-}
-
 struct VulkanResidentInProcessPlacedFeedbackLoop {
-    execution: VulkanResidentInProcessPlacedFeedbackLoopExecution,
+    static_state_snapshots: Vec<VulkanResidentStateTransactionBank>,
+    feedback_synchronization: Option<Box<VulkanResidentPlacedFeedbackTimelineSynchronization>>,
+    output_synchronization: Box<VulkanResidentPlacedOutputTimelineSynchronization>,
     window_width: usize,
     scheduler_turn_count_per_tick: usize,
     completed_stage_count_per_tick: usize,
@@ -13207,72 +13990,31 @@ impl VulkanResidentInProcessPlacedFeedbackLoop {
         let Some(window_width) = eligibility.window_width() else {
             return Ok(None);
         };
-        let monolithic = device_slices.first().filter(|slice| {
-            device_slices.len() == 1
-                && model.input_device_id == model.output_device_id
-                && model.input_device_id == slice.device_id
-                && activation_schedule.turns.len() == 1
-                && slice.resident_execution_plan.dispatch_segment_count == 1
-                && slice.resident_execution_plan.tick_plan.receive_stage_count == 0
-                && slice.resident_execution_plan.tick_plan.publish_stage_count == 0
-        });
-        let execution = if let Some(slice) = monolithic {
-            let segment = slice
-                .resident_execution_plan
-                .dispatch_segments
-                .first()
-                .expect("monolithic feedback eligibility requires one segment");
-            let steps_per_tick = 1usize
-                .checked_add(segment.dispatch_count)
-                .and_then(|count| count.checked_add(output_transducer.dispatch_count))
-                .and_then(|count| count.checked_add(sampler.dispatch_count))
-                .ok_or_else(|| {
-                    VulkanError("placed feedback-loop step count overflowed".to_string())
+        let static_state_snapshots = device_slices
+            .iter()
+            .map(|slice| {
+                let device = device_for(&slice.device_id).map_err(|error| {
+                    VulkanError(format!("feedback device resolution failed: {error}"))
                 })?;
-            let device = device_for(&slice.device_id).map_err(|error| {
-                VulkanError(format!("feedback device resolution failed: {error}"))
-            })?;
-            VulkanResidentInProcessPlacedFeedbackLoopExecution::Monolithic {
-                sequence: Box::new(device.create_resident_kernel_sequence()?),
-                static_state_snapshots: Box::new(VulkanResidentStateTransactionBank::new(
+                VulkanResidentStateTransactionBank::new(
                     device,
                     &slice.mounted.buffers,
                     window_width,
-                )?),
-                steps_per_tick,
-            }
-        } else {
-            let static_state_snapshots = device_slices
-                .iter()
-                .map(|slice| {
-                    let device = device_for(&slice.device_id).map_err(|error| {
-                        VulkanError(format!("feedback device resolution failed: {error}"))
-                    })?;
-                    VulkanResidentStateTransactionBank::new(
-                        device,
-                        &slice.mounted.buffers,
-                        window_width,
-                    )
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let input_device = device_for(&model.input_device_id).map_err(|error| {
-                VulkanError(format!("feedback input device resolution failed: {error}"))
-            })?;
-            let output_device = device_for(&model.output_device_id).map_err(|error| {
-                VulkanError(format!("feedback output device resolution failed: {error}"))
-            })?;
-            VulkanResidentInProcessPlacedFeedbackLoopExecution::Placed {
-                static_state_snapshots,
-                feedback_synchronization: VulkanResidentPlacedFeedbackTimelineSynchronization::new(
-                    input_device,
-                    output_device,
-                )?
-                .map(Box::new),
-                output_synchronization: Box::new(
-                    VulkanResidentPlacedOutputTimelineSynchronization::new(output_device)?,
-                ),
-            }
-        };
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let input_device = device_for(&model.input_device_id).map_err(|error| {
+            VulkanError(format!("feedback input device resolution failed: {error}"))
+        })?;
+        let output_device = device_for(&model.output_device_id).map_err(|error| {
+            VulkanError(format!("feedback output device resolution failed: {error}"))
+        })?;
+        let feedback_synchronization =
+            VulkanResidentPlacedFeedbackTimelineSynchronization::new(input_device, output_device)?
+                .map(Box::new);
+        let output_synchronization = Box::new(
+            VulkanResidentPlacedOutputTimelineSynchronization::new(output_device)?,
+        );
         let completed_stage_count_per_tick =
             device_slices.iter().try_fold(0usize, |total, slice| {
                 total
@@ -13282,7 +14024,9 @@ impl VulkanResidentInProcessPlacedFeedbackLoop {
                     })
             })?;
         Ok(Some(Self {
-            execution,
+            static_state_snapshots,
+            feedback_synchronization,
+            output_synchronization,
             window_width,
             scheduler_turn_count_per_tick: activation_schedule.turns.len(),
             completed_stage_count_per_tick,
@@ -14709,7 +15453,7 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
         available_token_count: usize,
     ) -> Result<usize, VulkanResidentInProcessPlacedRuntimeError> {
         const SIGNAL_MEMORY_BUDGET_PER_DEVICE: usize = 256 * 1024 * 1024;
-        const RECORDED_DISPATCH_BUDGET_PER_DEVICE: usize = 65_536;
+        const RECORDED_DISPATCH_BUDGET_PER_SUBMISSION: usize = 65_536;
 
         if available_token_count == 0 {
             return Err(VulkanResidentInProcessPlacedRuntimeError::ZeroTickBudget);
@@ -14749,19 +15493,23 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
                 width = width.min(causal_scan_tile_width);
             }
 
-            let scalar_dispatches_per_lane = slice
-                .mounted_bound
-                .dispatches
-                .iter()
-                .filter(|dispatch| {
-                    !slice.package_slice.batch_kernels.iter().any(|artifact| {
-                        artifact.pedal_id == dispatch.pedal_id
-                            && artifact.node_id == dispatch.node_id
-                    })
-                })
-                .count();
+            let mut scalar_dispatches_per_lane_by_pedal = BTreeMap::<&str, usize>::new();
+            for dispatch in &slice.mounted_bound.dispatches {
+                if !slice.package_slice.batch_kernels.iter().any(|artifact| {
+                    artifact.pedal_id == dispatch.pedal_id && artifact.node_id == dispatch.node_id
+                }) {
+                    *scalar_dispatches_per_lane_by_pedal
+                        .entry(&dispatch.pedal_id)
+                        .or_default() += 1;
+                }
+            }
+            let scalar_dispatches_per_lane = scalar_dispatches_per_lane_by_pedal
+                .values()
+                .copied()
+                .max()
+                .unwrap_or_default();
             if let Some(dispatch_width) =
-                RECORDED_DISPATCH_BUDGET_PER_DEVICE.checked_div(scalar_dispatches_per_lane)
+                RECORDED_DISPATCH_BUDGET_PER_SUBMISSION.checked_div(scalar_dispatches_per_lane)
             {
                 width = width.min(dispatch_width.max(1));
             }
@@ -14965,6 +15713,14 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
             }
         })?;
         runner.input_embedding.run(input_device, input_token_ids)?;
+        let output_device = devices.get(&self.model.output_device_id).ok_or_else(|| {
+            VulkanResidentInProcessPlacedRuntimeError::MissingBoundDevice {
+                device_id: self.model.output_device_id.clone(),
+            }
+        })?;
+        self.sampler
+            .record_input_tokens(output_device, input_token_ids)
+            .map_err(VulkanResidentInProcessPlacedRuntimeError::Sampler)?;
 
         let mut transport_stats = VulkanPlacedCableTransportStats::default();
         for (pipeline_index, device_index) in runner.pipeline.iter().copied().enumerate() {
@@ -14974,7 +15730,7 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
                 device_index,
                 &slice.device_id,
                 &slice.mounted,
-                input_token_ids.len(),
+                input_token_ids,
                 start_stream_tick,
                 capacity,
             )?;
@@ -15162,7 +15918,7 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
                     &slice.device_id,
                     &slice.mounted,
                     transaction,
-                    input_token_ids.len(),
+                    input_token_ids,
                     start_stream_tick,
                     capacity,
                 )?;
@@ -15259,12 +16015,7 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
             .as_ref()
             .expect("batched output projection runner was initialized");
         batch_runner.project(output_device, input_token_ids.len())?;
-        batch_runner.sample_batch(
-            output_device,
-            input_token_ids.len(),
-            start_stream_tick,
-            capacity,
-        )?;
+        batch_runner.sample_batch(output_device, input_token_ids, start_stream_tick, capacity)?;
         let mut target_token_ids = Vec::with_capacity(input_token_ids.len());
         for batch_index in 0..input_token_ids.len() {
             let stream_tick =
@@ -15363,6 +16114,11 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
                     dispatch_extensions
                         .prefix_dispatches
                         .push(&self.input_transducer.resident_dispatch);
+                }
+                if slice.device_id == self.model.output_device_id {
+                    dispatch_extensions
+                        .prefix_dispatches
+                        .extend(self.sampler.input_tracking_dispatches());
                 }
                 if slice.device_id == self.model.output_device_id {
                     dispatch_extensions
@@ -15519,72 +16275,58 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
                 )),
             ));
         }
-        match &feedback_loop.execution {
-            VulkanResidentInProcessPlacedFeedbackLoopExecution::Monolithic {
-                sequence,
-                static_state_snapshots,
-                steps_per_tick,
-            } => {
-                let slice = self.device_slices.first().ok_or_else(|| {
-                    VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(
-                        "placed resident feedback loop has no device slice".to_string(),
-                    ))
-                })?;
-                let segment = slice
-                    .resident_execution_plan
-                    .dispatch_segments
-                    .first()
-                    .ok_or_else(|| {
-                        VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(
-                            "placed resident feedback loop has no dispatch segment".to_string(),
-                        ))
-                    })?;
-                let total_steps = steps_per_tick.checked_mul(tick_count).ok_or_else(|| {
-                    VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(
-                        "placed resident feedback-loop sequence size overflowed".to_string(),
-                    ))
-                })?;
-                let mut steps = Vec::with_capacity(total_steps);
-                for _ in 0..tick_count {
-                    steps.push(VulkanResidentKernelSequenceStep::new(
-                        &self.input_transducer.resident_dispatch,
-                        &[],
-                    ));
-                    steps.extend(segment.dispatches.iter().map(|dispatch| {
-                        VulkanResidentKernelSequenceStep::new(&dispatch.resident_dispatch, &[])
-                    }));
-                    steps.push(VulkanResidentKernelSequenceStep::new(
-                        &self.output_transducer.embedding_norm_dispatch,
-                        &[],
-                    ));
-                    steps.push(VulkanResidentKernelSequenceStep::new(
-                        &self.output_transducer.tied_projection_dispatch,
-                        &[],
-                    ));
-                    steps.extend(
-                        self.sampler
-                            .resident_dispatches()
-                            .iter()
-                            .map(|dispatch| VulkanResidentKernelSequenceStep::new(dispatch, &[])),
+        let output_timeline_values =
+            if let Some(replay) = submission_replay.as_deref_mut().and_then(Option::as_mut) {
+                replay
+                    .validate_tick_count(tick_count)
+                    .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
+                let output_timeline_values = self.advance_resident_feedback_submission_replay(
+                    feedback_loop.feedback_synchronization.as_deref(),
+                    &feedback_loop.output_synchronization,
+                    tick_count,
+                )?;
+                replay
+                    .submit_next(tick_count)
+                    .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
+                output_timeline_values
+            } else {
+                let (submission_template, output_timeline_values) = self
+                    .mount_resident_feedback_submission_template(
+                        devices,
+                        start_stream_tick,
+                        tick_count,
+                        &feedback_loop.static_state_snapshots,
+                        feedback_loop.feedback_synchronization.as_deref(),
+                        &feedback_loop.output_synchronization,
+                    )?;
+                submission_template
+                    .submit_with_timeline_value_offset(0)
+                    .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
+                if let Some(replay_slot) = submission_replay {
+                    *replay_slot = Some(
+                        VulkanResidentPlacedFeedbackSubmissionReplay::new(
+                            submission_template,
+                            tick_count,
+                        )
+                        .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?,
                     );
                 }
-                debug_assert_eq!(steps.len(), total_steps);
-                let snapshot_copies = static_state_snapshots
-                    .copies_for_cycle(&slice.mounted.buffers, *steps_per_tick, tick_count)
-                    .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
-                let device = devices.get(&slice.device_id).ok_or_else(|| {
-                    VulkanResidentInProcessPlacedRuntimeError::MissingBoundDevice {
-                        device_id: slice.device_id.clone(),
-                    }
-                })?;
-                device
-                    .run_resident_kernel_sequence_with_snapshot_copies(
-                        sequence,
-                        &steps,
-                        &snapshot_copies,
-                    )
-                    .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
-                for tick_index in 0..tick_count {
+                output_timeline_values
+            };
+        let output_device = devices.get(&self.model.output_device_id).ok_or_else(|| {
+            VulkanResidentInProcessPlacedRuntimeError::MissingBoundDevice {
+                device_id: self.model.output_device_id.clone(),
+            }
+        })?;
+        let output_result: Result<(), VulkanResidentInProcessPlacedRuntimeError> =
+            output_timeline_values
+                .into_iter()
+                .enumerate()
+                .try_for_each(|(tick_index, value)| {
+                    feedback_loop
+                        .output_synchronization
+                        .wait_for_turn(output_device, value)
+                        .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
                     let stream_tick = start_stream_tick
                         .checked_add(u64::try_from(tick_index).map_err(|_| {
                             VulkanResidentInProcessPlacedRuntimeError::StreamTickOverflow
@@ -15600,88 +16342,10 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
                         sampled_token_id,
                         feedback_loop.scheduler_turn_count_per_tick,
                         feedback_loop.completed_stage_count_per_tick,
-                    )?;
-                }
-            }
-            VulkanResidentInProcessPlacedFeedbackLoopExecution::Placed {
-                static_state_snapshots,
-                feedback_synchronization,
-                output_synchronization,
-            } => {
-                let output_timeline_values = if let Some(replay) =
-                    submission_replay.as_deref_mut().and_then(Option::as_mut)
-                {
-                    replay
-                        .validate_tick_count(tick_count)
-                        .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
-                    let output_timeline_values = self.advance_resident_feedback_submission_replay(
-                        feedback_synchronization.as_deref(),
-                        output_synchronization,
-                        tick_count,
-                    )?;
-                    replay
-                        .submit_next(tick_count)
-                        .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
-                    output_timeline_values
-                } else {
-                    let (submission_template, output_timeline_values) = self
-                        .mount_resident_feedback_submission_template(
-                            devices,
-                            start_stream_tick,
-                            tick_count,
-                            static_state_snapshots,
-                            feedback_synchronization.as_deref(),
-                            output_synchronization,
-                        )?;
-                    submission_template
-                        .submit_with_timeline_value_offset(0)
-                        .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
-                    if let Some(replay_slot) = submission_replay {
-                        *replay_slot = Some(
-                            VulkanResidentPlacedFeedbackSubmissionReplay::new(
-                                submission_template,
-                                tick_count,
-                            )
-                            .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?,
-                        );
-                    }
-                    output_timeline_values
-                };
-                let output_device = devices.get(&self.model.output_device_id).ok_or_else(|| {
-                    VulkanResidentInProcessPlacedRuntimeError::MissingBoundDevice {
-                        device_id: self.model.output_device_id.clone(),
-                    }
-                })?;
-                let output_result: Result<(), VulkanResidentInProcessPlacedRuntimeError> =
-                    output_timeline_values.into_iter().enumerate().try_for_each(
-                        |(tick_index, value)| {
-                            output_synchronization
-                                .wait_for_turn(output_device, value)
-                                .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
-                            let stream_tick = start_stream_tick
-                                .checked_add(u64::try_from(tick_index).map_err(|_| {
-                                    VulkanResidentInProcessPlacedRuntimeError::StreamTickOverflow
-                                })?)
-                                .ok_or(
-                                    VulkanResidentInProcessPlacedRuntimeError::StreamTickOverflow,
-                                )?;
-                            let sampled_token_id = self
-                                .sampler
-                                .completed_run_at(stream_tick)
-                                .map(|run| run.token_id)
-                                .map_err(VulkanResidentInProcessPlacedRuntimeError::Sampler)?;
-                            on_sampled_token(
-                                tick_index,
-                                sampled_token_id,
-                                feedback_loop.scheduler_turn_count_per_tick,
-                                feedback_loop.completed_stage_count_per_tick,
-                            )
-                        },
-                    );
-                self.wait_resident_feedback_terminal_work(devices, tick_count - 1)?;
-                output_result?;
-            }
-        }
+                    )
+                });
+        self.wait_resident_feedback_terminal_work(devices, tick_count - 1)?;
+        output_result?;
         Ok(())
     }
 
@@ -15694,39 +16358,21 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
                 "placed resident feedback loop is not mounted".to_string(),
             ))
         })?;
-        match &feedback_loop.execution {
-            VulkanResidentInProcessPlacedFeedbackLoopExecution::Monolithic {
-                static_state_snapshots,
-                ..
-            } => {
-                let slice = self.device_slices.first().ok_or_else(|| {
-                    VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(
-                        "placed resident feedback loop has no device slice".to_string(),
-                    ))
-                })?;
-                static_state_snapshots
-                    .commit_prefix(&slice.mounted.buffers, tick_index + 1)
-                    .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)
-            }
-            VulkanResidentInProcessPlacedFeedbackLoopExecution::Placed {
-                static_state_snapshots,
-                ..
-            } => {
-                if static_state_snapshots.len() != self.device_slices.len() {
-                    return Err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop(
-                        VulkanError(
-                            "placed resident feedback snapshot topology changed".to_string(),
-                        ),
-                    ));
-                }
-                for (snapshots, slice) in static_state_snapshots.iter().zip(&self.device_slices) {
-                    snapshots
-                        .commit_prefix(&slice.mounted.buffers, tick_index + 1)
-                        .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
-                }
-                Ok(())
-            }
+        if feedback_loop.static_state_snapshots.len() != self.device_slices.len() {
+            return Err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop(
+                VulkanError("placed resident feedback snapshot topology changed".to_string()),
+            ));
         }
+        for (snapshots, slice) in feedback_loop
+            .static_state_snapshots
+            .iter()
+            .zip(&self.device_slices)
+        {
+            snapshots
+                .commit_prefix(&slice.mounted.buffers, tick_index + 1)
+                .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
+        }
+        Ok(())
     }
 
     pub fn mounted_device(&self, device_id: &str) -> Option<&VulkanMountedPlacedStreamCircuit> {
@@ -15858,6 +16504,11 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
                     .prefix_dispatches
                     .push(&self.input_transducer.resident_dispatch);
             }
+            if slice.device_id == self.model.output_device_id {
+                dispatch_extensions
+                    .prefix_dispatches
+                    .extend(self.sampler.input_tracking_dispatches());
+            }
             if slice.device_id == self.model.output_device_id
                 && tail != VulkanResidentPlacedTokenTickTail::None
             {
@@ -15980,6 +16631,11 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
                 dispatch_extensions
                     .prefix_dispatches
                     .push(&self.input_transducer.resident_dispatch);
+            }
+            if slice.device_id == self.model.output_device_id {
+                dispatch_extensions
+                    .prefix_dispatches
+                    .extend(self.sampler.input_tracking_dispatches());
             }
             if slice.device_id == self.model.output_device_id
                 && tail != VulkanResidentPlacedTokenTickTail::None
@@ -16287,6 +16943,9 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
 
         decoder.capture_baseline()?;
         self.capture_verification_baseline()?;
+        self.sampler
+            .capture_token_state()
+            .map_err(VulkanResidentInProcessPlacedRuntimeError::Sampler)?;
         let run = (|| {
             let draft_start = Instant::now();
             let mut draft_token_ids = Vec::with_capacity(draft_token_count);
@@ -16321,6 +16980,17 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
                     .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
             truncate_speculative_verification_at_stop(&mut verification, stop_token_ids);
             self.commit_verification_prefix(verification.committed_target_tick_count)?;
+            let output_device = devices.get(&self.model.output_device_id).ok_or_else(|| {
+                VulkanResidentInProcessPlacedRuntimeError::MissingBoundDevice {
+                    device_id: self.model.output_device_id.clone(),
+                }
+            })?;
+            self.sampler
+                .record_input_tokens(
+                    output_device,
+                    &target_inputs[..verification.committed_target_tick_count],
+                )
+                .map_err(VulkanResidentInProcessPlacedRuntimeError::Sampler)?;
             let catch_up_start = Instant::now();
             decoder.restore_baseline()?;
             let batched_output = self.batched_output_projection.borrow();
@@ -16368,6 +17038,7 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
         if run.is_err() {
             let _ = decoder.restore_baseline();
             let _ = self.restore_verification_baseline();
+            let _ = self.sampler.restore_token_state();
         }
         run
     }
@@ -16798,6 +17469,29 @@ impl VulkanResidentInProcessPlacedPromptStream {
         random_seed: u32,
         speculative_draft_tokens: usize,
     ) -> Result<Self, VulkanResidentInProcessPlacedRuntimeError> {
+        Self::from_runtime_model_for_bound_devices_with_sampler_config(
+            devices,
+            manifest_dir,
+            runtime_model,
+            dynamic_state_capacity_activations,
+            random_seed,
+            speculative_draft_tokens,
+            VulkanResidentSamplerRuntimeConfig::default(),
+        )
+    }
+
+    pub fn from_runtime_model_for_bound_devices_with_sampler_config(
+        devices: BTreeMap<String, Rc<VulkanComputeDevice>>,
+        manifest_dir: impl AsRef<Path>,
+        mut runtime_model: VulkanResidentRuntimeModel,
+        dynamic_state_capacity_activations: Option<usize>,
+        random_seed: u32,
+        speculative_draft_tokens: usize,
+        sampler_config: VulkanResidentSamplerRuntimeConfig,
+    ) -> Result<Self, VulkanResidentInProcessPlacedRuntimeError> {
+        runtime_model.package.sampler.spec = sampler_config
+            .apply_to(&runtime_model.package.sampler.spec)
+            .map_err(VulkanResidentInProcessPlacedRuntimeError::Sampler)?;
         let package = Arc::new(
             VulkanResidentInProcessPlacedModelPackage::from_runtime_model_for_bound_devices(
                 &devices,
@@ -18920,6 +19614,21 @@ fn validate_generation_execution_contract(
             .and_then(Value::as_f64)
             .map(|value| value as f32)
             == Some(sampler_spec.top_p)
+        && sampler_attrs
+            .and_then(|attrs| attrs.get("min_p"))
+            .and_then(Value::as_f64)
+            .map(|value| value as f32)
+            == Some(sampler_spec.min_p)
+        && sampler_attrs
+            .and_then(|attrs| attrs.get("presence_penalty"))
+            .and_then(Value::as_f64)
+            .map(|value| value as f32)
+            == Some(sampler_spec.presence_penalty)
+        && sampler_attrs
+            .and_then(|attrs| attrs.get("repetition_penalty"))
+            .and_then(Value::as_f64)
+            .map(|value| value as f32)
+            == Some(sampler_spec.repetition_penalty)
         && !manifest.sampler.kernels.is_empty();
     if !sampler_matches {
         return Err(VulkanResidentTokenModelPackageError::new(format!(
@@ -21323,6 +22032,35 @@ fn stream_control_metadata_bytes(
     bytes
 }
 
+fn pedal_batch_lane_stream_control_bytes(
+    input_token_ids: &[u32],
+    start_stream_tick: u64,
+    dynamic_state_capacity_activations: u32,
+) -> Result<Vec<[u8; VULKAN_STREAM_CONTROL_BYTE_CAPACITY]>, VulkanResidentInProcessPlacedRuntimeError>
+{
+    input_token_ids
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(lane_index, token_id)| {
+            let stream_tick =
+                start_stream_tick
+                    .checked_add(u64::try_from(lane_index).map_err(|_| {
+                        VulkanResidentInProcessPlacedRuntimeError::StreamTickOverflow
+                    })?)
+                    .ok_or(VulkanResidentInProcessPlacedRuntimeError::StreamTickOverflow)?;
+            Ok(stream_control_bytes(
+                token_id,
+                VulkanMountedPlacedStreamControl {
+                    stream_tick,
+                    control_flags: 0,
+                    dynamic_state_capacity_activations,
+                },
+            ))
+        })
+        .collect()
+}
+
 fn pedal_batch_control_bytes(
     batch_width: u32,
     start_stream_tick: u64,
@@ -22082,8 +22820,12 @@ fn descriptor_state_byte_capacity(
                     state.pedal_id, state.state_id
                 )));
             }
+            let state_capacity = state
+                .max_dynamic_activations
+                .map(|limit| limit.min(dynamic_state_capacity_activations))
+                .unwrap_or(dynamic_state_capacity_activations);
             bytes_per_activation
-                .checked_mul(dynamic_state_capacity_activations)
+                .checked_mul(state_capacity)
                 .ok_or_else(|| {
                     VulkanDescriptorResourcePlanError(format!(
                         "{}.{} dynamic state byte capacity overflowed",
@@ -22127,26 +22869,15 @@ impl VulkanReusableKernelPlan {
                 .push(VulkanKernelDispatchRef::from_command(command));
         }
 
-        let mut op_family_indices = BTreeMap::new();
         let families = grouped
             .into_iter()
-            .map(|(key, command_refs)| {
-                let op_family_index = op_family_indices.entry(key.op.clone()).or_insert(0usize);
-                let family_id = if *op_family_index == 0 {
-                    key.op.clone()
-                } else {
-                    format!("{}.signature_{}", key.op, op_family_index)
-                };
-                *op_family_index += 1;
-
-                VulkanReusableKernelFamily {
-                    family_id,
-                    op: key.op,
-                    descriptor_signature: key.descriptor_signature,
-                    push_constants: key.push_constants,
-                    uses_stream_tick: key.uses_stream_tick,
-                    command_refs,
-                }
+            .map(|(key, command_refs)| VulkanReusableKernelFamily {
+                family_id: key.family_id(),
+                op: key.op,
+                descriptor_signature: key.descriptor_signature,
+                push_constants: key.push_constants,
+                uses_stream_tick: key.uses_stream_tick,
+                command_refs,
             })
             .collect();
 
@@ -26584,7 +27315,7 @@ impl VulkanKernelDispatchRef {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 struct VulkanReusableKernelKey {
     op: String,
     specialization: String,
@@ -26606,6 +27337,18 @@ impl VulkanReusableKernelKey {
             push_constants: command.push_constants.clone(),
             uses_stream_tick: command.uses_stream_tick,
         }
+    }
+
+    fn family_id(&self) -> String {
+        let contract = serde_json::to_vec(self)
+            .expect("reusable Vulkan kernel contract contains only serializable values");
+        let digest = Sha256::digest(contract);
+        let contract_id = digest
+            .iter()
+            .take(12)
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        format!("{}.{}", self.op, contract_id)
     }
 }
 
@@ -27303,8 +28046,12 @@ fn stream_state_byte_capacity(
                     state.pedal_id, state.state_id
                 )));
             }
+            let state_capacity = state
+                .max_dynamic_activations
+                .map(|limit| limit.min(dynamic_state_capacity_activations))
+                .unwrap_or(dynamic_state_capacity_activations);
             bytes_per_activation
-                .checked_mul(dynamic_state_capacity_activations)
+                .checked_mul(state_capacity)
                 .ok_or_else(|| {
                     VulkanError(format!(
                         "{}.{} dynamic state byte capacity overflowed",
@@ -27429,6 +28176,108 @@ mod tests {
             indices[&VulkanPedalBatchSignalKey::IncomingCable(7)]
         );
     }
+
+    #[test]
+    fn pedal_batch_execution_uses_standalone_pedal_submissions() {
+        let span = |pedal_id: &str,
+                    dispatch_index: usize,
+                    step_start: usize,
+                    step_end: usize,
+                    distributed: bool| VulkanPedalBatchDispatchSpan {
+            pedal_id: pedal_id.to_string(),
+            dispatch_index,
+            step_start,
+            step_end,
+            distributed,
+        };
+        let spans = vec![
+            span("layer_00", 0, 0, 2, false),
+            span("layer_00", 1, 2, 5, false),
+            span("layer_01", 2, 5, 7, false),
+            span("layer_01", 3, 7, 7, true),
+            span("layer_01", 4, 7, 10, false),
+            span("layer_02", 5, 10, 12, false),
+        ];
+
+        assert_eq!(
+            pedal_batch_execution_units(&spans).unwrap(),
+            vec![
+                VulkanPedalBatchExecutionUnit::LocalPedal {
+                    pedal_id: "layer_00".to_string(),
+                    step_start: 0,
+                    step_end: 5,
+                },
+                VulkanPedalBatchExecutionUnit::LocalPedal {
+                    pedal_id: "layer_01".to_string(),
+                    step_start: 5,
+                    step_end: 7,
+                },
+                VulkanPedalBatchExecutionUnit::DistributedDispatch { dispatch_index: 3 },
+                VulkanPedalBatchExecutionUnit::LocalPedal {
+                    pedal_id: "layer_01".to_string(),
+                    step_start: 7,
+                    step_end: 10,
+                },
+                VulkanPedalBatchExecutionUnit::LocalPedal {
+                    pedal_id: "layer_02".to_string(),
+                    step_start: 10,
+                    step_end: 12,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn pedal_batch_execution_does_not_create_empty_local_submissions() {
+        let spans = vec![
+            VulkanPedalBatchDispatchSpan {
+                pedal_id: "layer_00".to_string(),
+                dispatch_index: 0,
+                step_start: 0,
+                step_end: 0,
+                distributed: true,
+            },
+            VulkanPedalBatchDispatchSpan {
+                pedal_id: "layer_01".to_string(),
+                dispatch_index: 1,
+                step_start: 0,
+                step_end: 0,
+                distributed: true,
+            },
+        ];
+
+        assert_eq!(
+            pedal_batch_execution_units(&spans).unwrap(),
+            vec![
+                VulkanPedalBatchExecutionUnit::DistributedDispatch { dispatch_index: 0 },
+                VulkanPedalBatchExecutionUnit::DistributedDispatch { dispatch_index: 1 },
+            ]
+        );
+    }
+
+    #[test]
+    fn pedal_batch_execution_rejects_noncontiguous_dispatch_steps() {
+        let spans = vec![
+            VulkanPedalBatchDispatchSpan {
+                pedal_id: "layer_00".to_string(),
+                dispatch_index: 0,
+                step_start: 0,
+                step_end: 2,
+                distributed: false,
+            },
+            VulkanPedalBatchDispatchSpan {
+                pedal_id: "layer_00".to_string(),
+                dispatch_index: 1,
+                step_start: 3,
+                step_end: 4,
+                distributed: false,
+            },
+        ];
+
+        let error = pedal_batch_execution_units(&spans).unwrap_err();
+        assert!(error.to_string().contains("starts at step 3, expected 2"));
+    }
+
     const FIXTURE_MODEL_FRAME_BYTES: usize = FIXTURE_MODEL_HIDDEN_SIZE * 2;
     const FIXTURE_MODEL_LOGITS_BYTES: usize = 65_536 * 4;
     const FIXTURE_MODEL_SAMPLER_OUTPUT_BYTES: usize = 16;
@@ -28058,6 +28907,7 @@ mod tests {
         .replace("{{TEMPERATURE}}", &temperature.to_string())
         .replace("{{TOP_K}}", &top_k.to_string())
         .replace("{{TOP_P}}", &top_p.to_string())
+        .replace("{{MIN_P}}", "0.0")
         .replace("{{PARTITION_COUNT}}", &partition_count.to_string())
         .replace("{{LOCAL_SIZE_X}}", &local_size_x.to_string());
         let compile = |suffix: &str, source: String| {
@@ -28079,6 +28929,130 @@ mod tests {
             },
             VulkanResidentSamplerKernelArtifact {
                 role: "sample_candidates".to_string(),
+                spirv_words: compile("sample", sampler)?,
+                local_size_x,
+                workgroup_count_x: 1,
+            },
+        ])
+    }
+
+    fn compile_repetition_temperature_sampler_test_kernels(
+        vocab_size: usize,
+        repetition_penalty: f32,
+        top_k: u32,
+        partition_count: u32,
+        local_size_x: u32,
+    ) -> Option<Vec<VulkanResidentSamplerKernelArtifact>> {
+        let shader_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("shaders");
+        let render = |template: &str| std::fs::read_to_string(shader_dir.join(template)).ok();
+        let tracker = render("record_seen_token.comp.template")?
+            .replace("{{VOCAB_SIZE}}", &vocab_size.to_string());
+        let batch_tracker = render("record_seen_tokens_batch64.comp.template")?
+            .replace("{{VOCAB_SIZE}}", &vocab_size.to_string());
+        let candidates = render("temperature_top_k_candidates_repetition_f32.comp.template")?
+            .replace("{{VOCAB_SIZE}}", &vocab_size.to_string())
+            .replace("{{REPETITION_PENALTY}}", &repetition_penalty.to_string())
+            .replace("{{PRESENCE_PENALTY}}", "0.0")
+            .replace("{{TOP_K}}", &top_k.to_string())
+            .replace("{{PARTITION_COUNT}}", &partition_count.to_string())
+            .replace("{{LOCAL_SIZE_X}}", &local_size_x.to_string());
+        let sampler = render("temperature_top_k_top_p_sampler_f32.comp.template")?
+            .replace("{{TEMPERATURE}}", "1.0")
+            .replace("{{TOP_K}}", &top_k.to_string())
+            .replace("{{TOP_P}}", "1.0")
+            .replace("{{MIN_P}}", "0.0")
+            .replace("{{PARTITION_COUNT}}", &partition_count.to_string())
+            .replace("{{LOCAL_SIZE_X}}", &local_size_x.to_string());
+        let compile = |suffix: &str, source: String| {
+            let path = std::env::temp_dir().join(format!(
+                "llmoop-repetition-sampling-test-{}-{suffix}.comp",
+                std::process::id()
+            ));
+            std::fs::write(&path, source).ok()?;
+            let words = crate::vulkan_compute::compile_shader_words_from_source_path(&path);
+            let _ = std::fs::remove_file(path);
+            words
+        };
+        Some(vec![
+            VulkanResidentSamplerKernelArtifact {
+                role: "record_current_token".to_string(),
+                spirv_words: compile("tracker", tracker)?,
+                local_size_x: 1,
+                workgroup_count_x: 1,
+            },
+            VulkanResidentSamplerKernelArtifact {
+                role: "record_token_batch".to_string(),
+                spirv_words: compile("batch-tracker", batch_tracker)?,
+                local_size_x: VULKAN_BACKEND_LOOP_MAX_WINDOW as u32,
+                workgroup_count_x: 1,
+            },
+            VulkanResidentSamplerKernelArtifact {
+                role: "partition_top_k".to_string(),
+                spirv_words: compile("candidates", candidates)?,
+                local_size_x,
+                workgroup_count_x: partition_count,
+            },
+            VulkanResidentSamplerKernelArtifact {
+                role: "sample_candidates".to_string(),
+                spirv_words: compile("sample", sampler)?,
+                local_size_x,
+                workgroup_count_x: 1,
+            },
+        ])
+    }
+
+    fn compile_runtime_temperature_sampler_test_kernels(
+        vocab_size: usize,
+        top_k_capacity: u32,
+        partition_count: u32,
+        local_size_x: u32,
+    ) -> Option<Vec<VulkanResidentSamplerKernelArtifact>> {
+        let shader_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("shaders");
+        let render = |template: &str| std::fs::read_to_string(shader_dir.join(template)).ok();
+        let tracker = render("record_seen_token.comp.template")?
+            .replace("{{VOCAB_SIZE}}", &vocab_size.to_string());
+        let batch_tracker = render("record_seen_tokens_batch64.comp.template")?
+            .replace("{{VOCAB_SIZE}}", &vocab_size.to_string());
+        let candidates = render("temperature_top_k_candidates_runtime_f32.comp.template")?
+            .replace("{{VOCAB_SIZE}}", &vocab_size.to_string())
+            .replace("{{TOP_K_CAPACITY}}", &top_k_capacity.to_string())
+            .replace("{{PARTITION_COUNT}}", &partition_count.to_string())
+            .replace("{{LOCAL_SIZE_X}}", &local_size_x.to_string());
+        let sampler = render("temperature_top_k_top_p_sampler_runtime_f32.comp.template")?
+            .replace("{{TOP_K_CAPACITY}}", &top_k_capacity.to_string())
+            .replace("{{PARTITION_COUNT}}", &partition_count.to_string())
+            .replace("{{LOCAL_SIZE_X}}", &local_size_x.to_string());
+        let compile = |suffix: &str, source: String| {
+            let path = std::env::temp_dir().join(format!(
+                "llmoop-runtime-sampling-test-{}-{suffix}.comp",
+                std::process::id()
+            ));
+            std::fs::write(&path, source).ok()?;
+            let words = crate::vulkan_compute::compile_shader_words_from_source_path(&path);
+            let _ = std::fs::remove_file(path);
+            words
+        };
+        Some(vec![
+            VulkanResidentSamplerKernelArtifact {
+                role: "runtime_record_current_token".to_string(),
+                spirv_words: compile("tracker", tracker)?,
+                local_size_x: 1,
+                workgroup_count_x: 1,
+            },
+            VulkanResidentSamplerKernelArtifact {
+                role: "runtime_record_token_batch".to_string(),
+                spirv_words: compile("batch-tracker", batch_tracker)?,
+                local_size_x: VULKAN_BACKEND_LOOP_MAX_WINDOW as u32,
+                workgroup_count_x: 1,
+            },
+            VulkanResidentSamplerKernelArtifact {
+                role: "runtime_partition_top_k".to_string(),
+                spirv_words: compile("candidates", candidates)?,
+                local_size_x,
+                workgroup_count_x: partition_count,
+            },
+            VulkanResidentSamplerKernelArtifact {
+                role: "runtime_sample_candidates".to_string(),
                 spirv_words: compile("sample", sampler)?,
                 local_size_x,
                 workgroup_count_x: 1,
@@ -29062,10 +30036,78 @@ mod tests {
             temperature: 1.0,
             top_k: 0,
             top_p: 1.0,
+            min_p: 0.0,
+            presence_penalty: 0.0,
+            repetition_penalty: 1.0,
+            top_k_capacity: 1,
+            runtime_parameterized: false,
             logits_byte_capacity: FIXTURE_MODEL_LOGITS_BYTES,
             output_byte_capacity: FIXTURE_MODEL_SAMPLER_OUTPUT_BYTES,
             scratch_byte_capacity: 0,
         }
+    }
+
+    #[test]
+    fn runtime_sampling_overrides_promote_compiled_greedy_without_recompilation() {
+        let mut compiled = fixture_model_greedy_sampler_spec();
+        compiled.top_k = 1;
+        compiled.top_k_capacity = 256;
+        compiled.scratch_byte_capacity = 128 * 256 * 8;
+
+        let sampled = VulkanResidentSamplerRuntimeConfig {
+            temperature: Some(0.7),
+            top_k: Some(40),
+            top_p: Some(0.95),
+            min_p: Some(0.02),
+            presence_penalty: Some(0.5),
+            repetition_penalty: Some(1.1),
+        }
+        .apply_to(&compiled)
+        .unwrap();
+
+        assert_eq!(sampled.method, "temperature_top_k_top_p");
+        assert_eq!(
+            sampled.sampler_id,
+            "runtime_temperature_top_k_top_p_sampler"
+        );
+        assert_eq!(sampled.temperature, 0.7);
+        assert_eq!(sampled.top_k, 40);
+        assert_eq!(sampled.top_p, 0.95);
+        assert_eq!(sampled.min_p, 0.02);
+        assert_eq!(sampled.presence_penalty, 0.5);
+        assert_eq!(sampled.repetition_penalty, 1.1);
+        assert!(sampled.runtime_parameterized);
+        assert!(sampler_kernel_role_matches(
+            "runtime_partition_top_k",
+            true,
+            sampled.method.as_str(),
+        ));
+        assert!(!sampler_kernel_role_matches(
+            "runtime_sample_logits",
+            true,
+            sampled.method.as_str(),
+        ));
+
+        let penalized_greedy = VulkanResidentSamplerRuntimeConfig {
+            presence_penalty: Some(0.25),
+            ..VulkanResidentSamplerRuntimeConfig::default()
+        }
+        .apply_to(&compiled)
+        .unwrap();
+        assert_eq!(penalized_greedy.method, "greedy");
+        assert!(sampler_kernel_role_matches(
+            "runtime_sample_logits",
+            true,
+            penalized_greedy.method.as_str(),
+        ));
+
+        let error = VulkanResidentSamplerRuntimeConfig {
+            top_k: Some(257),
+            ..VulkanResidentSamplerRuntimeConfig::default()
+        }
+        .apply_to(&compiled)
+        .unwrap_err();
+        assert!(error.to_string().contains("capacity 256"));
     }
 
     fn fixture_model_resident_greedy_model(
@@ -30086,6 +31128,49 @@ mod tests {
     }
 
     #[test]
+    fn bounds_each_dynamic_state_buffer_by_its_own_activation_limit() {
+        let mut graph = fixture_model_execution_graph();
+        let artifact = graph
+            .circuits
+            .iter_mut()
+            .find(|artifact| artifact.pedal.id == "layer_02")
+            .unwrap();
+        artifact
+            .state
+            .state_ports
+            .iter_mut()
+            .find(|state| state.id == "kv_memory")
+            .unwrap()
+            .max_dynamic_activations = Some(2);
+        artifact
+            .circuit
+            .state_ports
+            .iter_mut()
+            .find(|state| state.id == "kv_memory")
+            .unwrap()
+            .max_dynamic_activations = Some(2);
+
+        let tensor_index = TensorIndex::from_json_file(fixture_model_tensor_index_path()).unwrap();
+        let resource_plan =
+            StreamCircuitResourcePlan::from_graph_with_tensor_index(&graph, &tensor_index).unwrap();
+        let resident_plan = VulkanStreamCircuitResidentPlan::from_resource_plan(
+            &resource_plan,
+            Some(&tensor_index),
+            Some(2),
+        )
+        .unwrap();
+        let state = resident_plan
+            .stream_state_buffers
+            .iter()
+            .find(|state| state.pedal_id == "layer_02" && state.state_id == "kv_memory")
+            .unwrap();
+
+        assert_eq!(state.max_dynamic_activations, Some(2));
+        assert_eq!(stream_state_byte_capacity(state, 4).unwrap(), 4_096);
+        assert_eq!(descriptor_state_byte_capacity(state, 4).unwrap(), 4_096);
+    }
+
+    #[test]
     fn placed_resident_plan_hosts_only_the_pedals_assigned_to_a_device() {
         let graph = fixture_model_execution_graph();
         let tensor_index = TensorIndex::from_json_file(fixture_model_tensor_index_path()).unwrap();
@@ -30696,7 +31781,7 @@ mod tests {
 
     #[test]
     fn resident_greedy_sampler_selects_largest_logit() {
-        let device = match VulkanComputeDevice::new() {
+        let device = match selected_test_vulkan_device() {
             Ok(device) => device,
             Err(error) => {
                 eprintln!("skipping resident sampler: {error}");
@@ -30846,6 +31931,11 @@ mod tests {
             temperature: 1.0,
             top_k: 4,
             top_p: 1.0,
+            min_p: 0.0,
+            presence_penalty: 0.0,
+            repetition_penalty: 1.0,
+            top_k_capacity: 4,
+            runtime_parameterized: false,
             logits_byte_capacity: LOGITS_BYTE_CAPACITY,
             output_byte_capacity: FIXTURE_MODEL_SAMPLER_OUTPUT_BYTES,
             scratch_byte_capacity: partition_count as usize * 4 * 8,
@@ -30904,6 +31994,457 @@ mod tests {
                 .iter()
                 .all(|token_id| selected_tokens.contains(token_id))
         );
+    }
+
+    #[test]
+    fn resident_repetition_sampler_tracks_prompt_and_feedback_tokens_on_gpu() {
+        const VOCAB_SIZE: usize = 64;
+        const LOGITS_BYTE_CAPACITY: usize = VOCAB_SIZE * std::mem::size_of::<f32>();
+        const PARTITION_COUNT: u32 = 4;
+        const REPETITION_PENALTY: f32 = 1.1;
+
+        let device = match selected_test_vulkan_device() {
+            Ok(device) => device,
+            Err(error) => {
+                eprintln!("skipping resident repetition sampler: {error}");
+                return;
+            }
+        };
+        let Some(kernels) = compile_repetition_temperature_sampler_test_kernels(
+            VOCAB_SIZE,
+            REPETITION_PENALTY,
+            1,
+            PARTITION_COUNT,
+            16,
+        ) else {
+            eprintln!("skipping resident repetition sampler: no GLSL to SPIR-V compiler found");
+            return;
+        };
+        let logits_buffer = device.create_resident_buffer(LOGITS_BYTE_CAPACITY).unwrap();
+        let write_logits = |values: &[f32]| {
+            logits_buffer
+                .write_bytes(
+                    &values
+                        .iter()
+                        .flat_map(|value| value.to_le_bytes())
+                        .collect::<Vec<_>>(),
+                )
+                .unwrap();
+        };
+        let stream_control_buffer = Arc::new(
+            device
+                .create_host_visible_resident_buffer(VULKAN_STREAM_CONTROL_BYTE_CAPACITY)
+                .unwrap(),
+        );
+        stream_control_buffer
+            .write_bytes(&stream_control_bytes(
+                0,
+                VulkanMountedPlacedStreamControl {
+                    stream_tick: 0,
+                    control_flags: 0,
+                    dynamic_state_capacity_activations: 32,
+                },
+            ))
+            .unwrap();
+        let spec = VulkanResidentSamplerSpec {
+            sampler_id: "repetition_sampler".to_string(),
+            method: "temperature_top_k_top_p".to_string(),
+            temperature: 1.0,
+            top_k: 1,
+            top_p: 1.0,
+            min_p: 0.0,
+            presence_penalty: 0.0,
+            repetition_penalty: REPETITION_PENALTY,
+            top_k_capacity: 1,
+            runtime_parameterized: false,
+            logits_byte_capacity: LOGITS_BYTE_CAPACITY,
+            output_byte_capacity: FIXTURE_MODEL_SAMPLER_OUTPUT_BYTES,
+            scratch_byte_capacity: PARTITION_COUNT as usize * 8,
+        };
+        let runner = VulkanResidentSamplerRunner::from_logits_buffer(
+            &device,
+            stream_control_buffer.clone(),
+            &logits_buffer,
+            LOGITS_BYTE_CAPACITY,
+            &kernels,
+            &spec,
+            VulkanResidentSamplerStreamConfig {
+                history_capacity_activations: 32,
+                random_seed: 7,
+            },
+        )
+        .unwrap();
+        assert_eq!(runner.dispatch_count, 3);
+        assert_eq!(runner.descriptor_count, 9);
+        assert_eq!(runner.workgroup_count_x, 6);
+
+        let mut logits = vec![-100.0; VOCAB_SIZE];
+        logits[7] = 10.0;
+        logits[8] = 9.6;
+        write_logits(&logits);
+        assert_eq!(runner.run(&device).unwrap().token_id, 7);
+
+        runner.record_input_tokens(&device, &[7]).unwrap();
+        assert_eq!(runner.run(&device).unwrap().token_id, 8);
+
+        logits.fill(-100.0);
+        logits[7] = -1.0;
+        logits[8] = -1.05;
+        write_logits(&logits);
+        assert_eq!(runner.run(&device).unwrap().token_id, 8);
+
+        logits.fill(-100.0);
+        logits[9] = 5.0;
+        logits[10] = 4.8;
+        write_logits(&logits);
+        stream_control_buffer
+            .write_bytes(&9u32.to_le_bytes())
+            .unwrap();
+        device
+            .run_resident_kernel_dispatch(&runner.input_tracking_dispatches()[0], &[])
+            .unwrap();
+        assert_eq!(runner.run(&device).unwrap().token_id, 10);
+    }
+
+    #[test]
+    fn resident_runtime_sampler_applies_presence_penalty_from_gpu_state() {
+        const VOCAB_SIZE: usize = 64;
+        const PARTITION_COUNT: u32 = 4;
+        const TOP_K_CAPACITY: u32 = 8;
+        const LOGITS_BYTE_CAPACITY: usize = VOCAB_SIZE * std::mem::size_of::<f32>();
+
+        let device = match selected_test_vulkan_device() {
+            Ok(device) => device,
+            Err(error) => {
+                eprintln!("skipping runtime presence sampler: {error}");
+                return;
+            }
+        };
+        let Some(kernels) = compile_runtime_temperature_sampler_test_kernels(
+            VOCAB_SIZE,
+            TOP_K_CAPACITY,
+            PARTITION_COUNT,
+            16,
+        ) else {
+            eprintln!("skipping runtime presence sampler: no GLSL to SPIR-V compiler found");
+            return;
+        };
+        let logits_buffer = device.create_resident_buffer(LOGITS_BYTE_CAPACITY).unwrap();
+        let write_logits = |values: &[f32]| {
+            logits_buffer
+                .write_bytes(
+                    &values
+                        .iter()
+                        .flat_map(|value| value.to_le_bytes())
+                        .collect::<Vec<_>>(),
+                )
+                .unwrap();
+        };
+        let stream_control_buffer = Arc::new(
+            device
+                .create_host_visible_resident_buffer(VULKAN_STREAM_CONTROL_BYTE_CAPACITY)
+                .unwrap(),
+        );
+        stream_control_buffer
+            .write_bytes(&stream_control_bytes(
+                0,
+                VulkanMountedPlacedStreamControl {
+                    stream_tick: 0,
+                    control_flags: 0,
+                    dynamic_state_capacity_activations: 32,
+                },
+            ))
+            .unwrap();
+        let spec = VulkanResidentSamplerSpec {
+            sampler_id: "runtime_sampler".to_string(),
+            method: "temperature_top_k_top_p".to_string(),
+            temperature: 1.0,
+            top_k: 1,
+            top_p: 1.0,
+            min_p: 0.0,
+            presence_penalty: 1.5,
+            repetition_penalty: 1.0,
+            top_k_capacity: TOP_K_CAPACITY,
+            runtime_parameterized: true,
+            logits_byte_capacity: LOGITS_BYTE_CAPACITY,
+            output_byte_capacity: FIXTURE_MODEL_SAMPLER_OUTPUT_BYTES,
+            scratch_byte_capacity: PARTITION_COUNT as usize
+                * TOP_K_CAPACITY as usize
+                * 2
+                * std::mem::size_of::<u32>(),
+        };
+        let runner = VulkanResidentSamplerRunner::from_logits_buffer(
+            &device,
+            stream_control_buffer,
+            &logits_buffer,
+            LOGITS_BYTE_CAPACITY,
+            &kernels,
+            &spec,
+            VulkanResidentSamplerStreamConfig {
+                history_capacity_activations: 32,
+                random_seed: 7,
+            },
+        )
+        .unwrap();
+
+        let mut logits = vec![-100.0; VOCAB_SIZE];
+        logits[7] = 10.0;
+        logits[8] = 9.0;
+        write_logits(&logits);
+        assert_eq!(runner.run(&device).unwrap().token_id, 7);
+
+        runner.record_input_tokens(&device, &[7]).unwrap();
+        assert_eq!(runner.run(&device).unwrap().token_id, 8);
+
+        logits.fill(-100.0);
+        logits[7] = -1.0;
+        logits[9] = -1.25;
+        write_logits(&logits);
+        assert_eq!(runner.run(&device).unwrap().token_id, 9);
+
+        runner.capture_token_state().unwrap();
+        runner.record_input_tokens(&device, &[11]).unwrap();
+        logits.fill(-100.0);
+        logits[11] = 10.0;
+        logits[12] = 9.0;
+        write_logits(&logits);
+        assert_eq!(runner.run(&device).unwrap().token_id, 12);
+        runner.restore_token_state().unwrap();
+        assert_eq!(runner.run(&device).unwrap().token_id, 11);
+    }
+
+    #[test]
+    fn speculative_sampler_views_isolate_hypothetical_presence_state() {
+        const VOCAB_SIZE: usize = 64;
+        const PARTITION_COUNT: u32 = 4;
+        const TOP_K_CAPACITY: u32 = 8;
+        const LOGITS_BYTE_CAPACITY: usize = VOCAB_SIZE * std::mem::size_of::<f32>();
+
+        let device = match selected_test_vulkan_device() {
+            Ok(device) => device,
+            Err(error) => {
+                eprintln!("skipping speculative presence sampler: {error}");
+                return;
+            }
+        };
+        let Some(kernels) = compile_runtime_temperature_sampler_test_kernels(
+            VOCAB_SIZE,
+            TOP_K_CAPACITY,
+            PARTITION_COUNT,
+            16,
+        ) else {
+            eprintln!("skipping speculative presence sampler: no GLSL compiler found");
+            return;
+        };
+        let logits_buffer = device.create_resident_buffer(LOGITS_BYTE_CAPACITY).unwrap();
+        let stream_control_buffer = Arc::new(
+            device
+                .create_host_visible_resident_buffer(VULKAN_STREAM_CONTROL_BYTE_CAPACITY)
+                .unwrap(),
+        );
+        stream_control_buffer
+            .write_bytes(&stream_control_bytes(
+                0,
+                VulkanMountedPlacedStreamControl {
+                    stream_tick: 0,
+                    control_flags: 0,
+                    dynamic_state_capacity_activations: 32,
+                },
+            ))
+            .unwrap();
+        let spec = VulkanResidentSamplerSpec {
+            sampler_id: "runtime_sampler".to_string(),
+            method: "temperature_top_k_top_p".to_string(),
+            temperature: 1.0,
+            top_k: 1,
+            top_p: 1.0,
+            min_p: 0.0,
+            presence_penalty: 1.5,
+            repetition_penalty: 1.0,
+            top_k_capacity: TOP_K_CAPACITY,
+            runtime_parameterized: true,
+            logits_byte_capacity: LOGITS_BYTE_CAPACITY,
+            output_byte_capacity: FIXTURE_MODEL_SAMPLER_OUTPUT_BYTES,
+            scratch_byte_capacity: PARTITION_COUNT as usize
+                * TOP_K_CAPACITY as usize
+                * 2
+                * std::mem::size_of::<u32>(),
+        };
+        let runner = VulkanResidentSamplerRunner::from_logits_buffer(
+            &device,
+            stream_control_buffer,
+            &logits_buffer,
+            LOGITS_BYTE_CAPACITY,
+            &kernels,
+            &spec,
+            VulkanResidentSamplerStreamConfig {
+                history_capacity_activations: 32,
+                random_seed: 7,
+            },
+        )
+        .unwrap();
+        runner.record_input_tokens(&device, &[7]).unwrap();
+
+        let batched_logits = device
+            .create_resident_buffer(2 * LOGITS_BYTE_CAPACITY)
+            .unwrap();
+        let mut lane_zero = vec![-100.0f32; VOCAB_SIZE];
+        lane_zero[8] = 10.0;
+        lane_zero[11] = 9.0;
+        let mut lane_one = vec![-100.0f32; VOCAB_SIZE];
+        lane_one[10] = 10.0;
+        lane_one[12] = 9.0;
+        let batched_bytes = lane_zero
+            .iter()
+            .chain(&lane_one)
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        batched_logits.write_bytes(&batched_bytes).unwrap();
+
+        let view_zero = runner
+            .create_logits_view(&device, &batched_logits, 0, &kernels, &spec)
+            .unwrap();
+        view_zero.prepare_token_state(&device, &[8]).unwrap();
+        view_zero.prepare_stream_tick(0, 32).unwrap();
+        view_zero.record(&device).unwrap();
+        device
+            .run_recorded_resident_kernel_sequence(&view_zero.sequence)
+            .unwrap();
+        assert_eq!(runner.completed_run_at(0).unwrap().token_id, 11);
+
+        let view_one = runner
+            .create_logits_view(
+                &device,
+                &batched_logits,
+                LOGITS_BYTE_CAPACITY,
+                &kernels,
+                &spec,
+            )
+            .unwrap();
+        view_one.prepare_token_state(&device, &[9, 10]).unwrap();
+        view_one.prepare_stream_tick(1, 32).unwrap();
+        view_one.record(&device).unwrap();
+        device
+            .run_recorded_resident_kernel_sequence(&view_one.sequence)
+            .unwrap();
+        assert_eq!(runner.completed_run_at(1).unwrap().token_id, 12);
+
+        logits_buffer
+            .write_bytes(
+                &lane_zero
+                    .iter()
+                    .flat_map(|value| value.to_le_bytes())
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        assert_eq!(runner.run(&device).unwrap().token_id, 8);
+    }
+
+    #[test]
+    fn resident_temperature_top_64_sampler_matches_explicit_random_signal() {
+        const VOCAB_SIZE: usize = 262_144;
+        const TOP_K: u32 = 64;
+        const PARTITION_COUNT: u32 = 128;
+        const LOCAL_SIZE_X: u32 = 256;
+        const SEED: u32 = 46;
+        const HISTORY_CAPACITY: usize = 32;
+        const LOGITS_BYTE_CAPACITY: usize = VOCAB_SIZE * std::mem::size_of::<f32>();
+
+        let Some(device_index) = std::env::var("LLMOOP_TEST_VULKAN_DEVICE_INDEX")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+        else {
+            eprintln!("skipping resident top-64 sampler: LLMOOP_TEST_VULKAN_DEVICE_INDEX is unset");
+            return;
+        };
+        let device = match VulkanComputeDevice::new_for_physical_device_index(device_index) {
+            Ok(device) => device,
+            Err(error) => {
+                eprintln!("skipping resident top-64 sampler: {error}");
+                return;
+            }
+        };
+        let Some(sampler_kernels) = compile_temperature_top_k_top_p_sampler_test_kernels(
+            VOCAB_SIZE,
+            1.0,
+            TOP_K,
+            0.95,
+            PARTITION_COUNT,
+            LOCAL_SIZE_X,
+        ) else {
+            eprintln!("skipping resident top-64 sampler: no GLSL to SPIR-V compiler found");
+            return;
+        };
+
+        let mut top_tokens = (0..TOP_K)
+            .map(|index| (index * 4_093 + 7) % VOCAB_SIZE as u32)
+            .collect::<Vec<_>>();
+        top_tokens.sort_unstable();
+        let mut logits = vec![-100.0f32; VOCAB_SIZE];
+        for token_id in &top_tokens {
+            logits[*token_id as usize] = 2.0;
+        }
+        let logits_buffer = device.create_resident_buffer(LOGITS_BYTE_CAPACITY).unwrap();
+        logits_buffer
+            .write_bytes(
+                &logits
+                    .iter()
+                    .flat_map(|value| value.to_le_bytes())
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        let stream_control_buffer = Arc::new(
+            device
+                .create_host_visible_resident_buffer(VULKAN_STREAM_CONTROL_BYTE_CAPACITY)
+                .unwrap(),
+        );
+        stream_control_buffer
+            .write_bytes(&stream_control_bytes(
+                0,
+                VulkanMountedPlacedStreamControl {
+                    stream_tick: 0,
+                    control_flags: 0,
+                    dynamic_state_capacity_activations: HISTORY_CAPACITY as u32,
+                },
+            ))
+            .unwrap();
+        let spec = VulkanResidentSamplerSpec {
+            sampler_id: "temperature_top_k_top_p_sampler".to_string(),
+            method: "temperature_top_k_top_p".to_string(),
+            temperature: 1.0,
+            top_k: TOP_K,
+            top_p: 0.95,
+            min_p: 0.0,
+            presence_penalty: 0.0,
+            repetition_penalty: 1.0,
+            top_k_capacity: TOP_K,
+            runtime_parameterized: false,
+            logits_byte_capacity: LOGITS_BYTE_CAPACITY,
+            output_byte_capacity: FIXTURE_MODEL_SAMPLER_OUTPUT_BYTES,
+            scratch_byte_capacity: PARTITION_COUNT as usize * TOP_K as usize * 8,
+        };
+        let runner = VulkanResidentSamplerRunner::from_logits_buffer(
+            &device,
+            stream_control_buffer,
+            &logits_buffer,
+            LOGITS_BYTE_CAPACITY,
+            &sampler_kernels,
+            &spec,
+            VulkanResidentSamplerStreamConfig {
+                history_capacity_activations: HISTORY_CAPACITY,
+                random_seed: SEED,
+            },
+        )
+        .unwrap();
+
+        // With 64 equal top-k weights, top-p=0.95 retains the first 61.
+        for stream_tick in 0..16u32 {
+            let run = runner.run(&device).unwrap();
+            let random_bits = sampler_test_hash_u32(SEED ^ stream_tick);
+            let selected_index = (((random_bits >> 8) as u64 * 61) >> 24) as usize;
+            assert_eq!(run.token_id, top_tokens[selected_index]);
+            assert_eq!(run.selected_logit_bits, 2.0f32.to_bits());
+        }
     }
 
     #[test]
@@ -34228,7 +35769,8 @@ mod tests {
             .reusable_kernel_plan
             .family(operator_norm_family_id)
             .unwrap();
-        assert_eq!(operator_norm_family_id, "rms_norm.signature_1");
+        assert_eq!(rms_norm_family.op, "rms_norm");
+        assert!(operator_norm_family_id.starts_with("rms_norm."));
         let rms_norm_loaded_manifest = VulkanLoadedReusableKernelArtifactManifest {
             schema: VULKAN_REUSABLE_KERNEL_ARTIFACT_MANIFEST_SCHEMA.to_string(),
             backend_id: VULKAN_STREAM_CIRCUIT_BACKEND_ID.to_string(),
@@ -34386,7 +35928,7 @@ mod tests {
                     {
                         let split_dispatch =
                             mounted_bound.dispatch("layer_00", "split_b_c_x").unwrap();
-                        assert_eq!(split_dispatch.reusable_family_id, "split");
+                        assert!(split_dispatch.reusable_family_id.starts_with("split."));
                         let split_bindings = mounted
                             .resident_kernel_buffer_bindings_for_bound_dispatch(split_dispatch)
                             .unwrap();
@@ -34454,9 +35996,10 @@ mod tests {
                         {
                             let multiply_dispatch =
                                 mounted_bound.dispatch("layer_00", "input_gate").unwrap();
-                            assert_eq!(
-                                multiply_dispatch.reusable_family_id,
-                                "multiply.signature_1"
+                            assert!(
+                                multiply_dispatch
+                                    .reusable_family_id
+                                    .starts_with("multiply.")
                             );
                             let multiply_bindings = mounted
                                 .resident_kernel_buffer_bindings_for_bound_dispatch(
@@ -34471,6 +36014,7 @@ mod tests {
                                 .reusable_kernel_plan
                                 .family(&multiply_dispatch.reusable_family_id)
                                 .unwrap();
+                            let multiply_artifact_path = artifact_path_for_family(multiply_family);
                             let multiply_kernel_manifest =
                                 VulkanLoadedReusableKernelArtifactManifest {
                                     schema: VULKAN_REUSABLE_KERNEL_ARTIFACT_MANIFEST_SCHEMA
@@ -34480,11 +36024,9 @@ mod tests {
                                     artifacts: vec![VulkanLoadedReusableKernelArtifact {
                                         artifact: VulkanReusableKernelArtifact::from_family(
                                             multiply_family,
-                                            "kernels/multiply.signature_1.spv",
+                                            multiply_artifact_path.clone(),
                                         ),
-                                        resolved_path: PathBuf::from(
-                                            "kernels/multiply.signature_1.spv",
-                                        ),
+                                        resolved_path: PathBuf::from(multiply_artifact_path),
                                         words: multiply_spirv_words,
                                     }],
                                 };
@@ -37896,7 +39438,7 @@ mod tests {
     }
 
     #[test]
-    fn placed_prompt_stream_runs_single_device_feedback_as_resident_window() {
+    fn placed_prompt_stream_runs_resident_feedback_across_bridged_slices() {
         let device = match selected_test_vulkan_device() {
             Ok(device) => device,
             Err(error) => {
@@ -37975,30 +39517,30 @@ mod tests {
         assert!(stream.is_idle());
         drop(stream);
 
-        let scalar_runtime_model = fixture_model_runtime_model_with_placement(
+        let bridged_runtime_model = fixture_model_runtime_model_with_placement(
             StreamCircuitPlacementSpec::new("gpu0").with_pedal_device("layer_02", "gpu1"),
         );
-        let scalar_devices = BTreeMap::from([
+        let bridged_devices = BTreeMap::from([
             ("gpu0".to_string(), device.clone()),
             ("gpu1".to_string(), device),
         ]);
-        let mut scalar_stream =
+        let mut bridged_stream =
             VulkanResidentInProcessPlacedPromptStream::from_runtime_model_for_bound_devices(
-                scalar_devices,
+                bridged_devices,
                 manifest_dir,
-                scalar_runtime_model,
+                bridged_runtime_model,
                 Some(8),
                 0,
                 0,
             )
             .unwrap();
-        assert_eq!(scalar_stream.processor.resident_feedback_window_width(), 0);
-        let scalar_first = scalar_stream
+        assert!(bridged_stream.processor.resident_feedback_window_width() >= 3);
+        let bridged_first = bridged_stream
             .submit_input_event(
                 VulkanResidentTokenInputEvent::new("event", vec![1], 4).with_stop_tokens(vec![558]),
             )
             .unwrap();
-        let scalar_second = scalar_stream
+        let bridged_second = bridged_stream
             .submit_input_event(VulkanResidentTokenInputEvent::new(
                 "event_after_eos",
                 vec![36_309],
@@ -38008,42 +39550,42 @@ mod tests {
 
         assert_eq!(
             resident_first.generated_token_ids,
-            scalar_first.generated_token_ids
+            bridged_first.generated_token_ids
         );
-        assert_eq!(resident_first.output_events, scalar_first.output_events);
+        assert_eq!(resident_first.output_events, bridged_first.output_events);
         assert_eq!(
             resident_first.session_run.run.output_token_ids,
-            scalar_first.session_run.run.output_token_ids
+            bridged_first.session_run.run.output_token_ids
         );
         assert_eq!(
             resident_first.session_run.run.stop_reason,
-            scalar_first.session_run.run.stop_reason
+            bridged_first.session_run.run.stop_reason
         );
         assert_eq!(
             resident_first.session_run.run.output_source_stream_ticks,
-            scalar_first.session_run.run.output_source_stream_ticks
+            bridged_first.session_run.run.output_source_stream_ticks
         );
         assert_eq!(
             resident_second.generated_token_ids,
-            scalar_second.generated_token_ids
+            bridged_second.generated_token_ids
         );
-        assert_eq!(resident_second.output_events, scalar_second.output_events);
+        assert_eq!(resident_second.output_events, bridged_second.output_events);
         assert_eq!(
             resident_second.session_run.run.output_token_ids,
-            scalar_second.session_run.run.output_token_ids
+            bridged_second.session_run.run.output_token_ids
         );
         assert_eq!(
             resident_second.session_run.run.stop_reason,
-            scalar_second.session_run.run.stop_reason
+            bridged_second.session_run.run.stop_reason
         );
         assert_eq!(
             resident_second.session_run.run.output_source_stream_ticks,
-            scalar_second.session_run.run.output_source_stream_ticks
+            bridged_second.session_run.run.output_source_stream_ticks
         );
         assert_eq!(resident_first.session_run.run.scheduler_turn_count, 4);
-        assert_eq!(scalar_first.session_run.run.scheduler_turn_count, 8);
+        assert_eq!(bridged_first.session_run.run.scheduler_turn_count, 8);
         assert_eq!(resident_second.session_run.run.scheduler_turn_count, 4);
-        assert_eq!(scalar_second.session_run.run.scheduler_turn_count, 8);
+        assert_eq!(bridged_second.session_run.run.scheduler_turn_count, 8);
         assert_eq!(
             resident_first.session_run.run.transport_stats,
             VulkanPlacedCableTransportStats::default()
@@ -38053,22 +39595,22 @@ mod tests {
             VulkanPlacedCableTransportStats::default()
         );
         assert_eq!(
-            scalar_first
+            bridged_first
                 .session_run
                 .run
                 .transport_stats
                 .direct_copy_count,
-            8
+            2
         );
         assert_eq!(
-            scalar_second
+            bridged_second
                 .session_run
                 .run
                 .transport_stats
                 .direct_copy_count,
-            8
+            4
         );
-        assert!(scalar_stream.is_idle());
+        assert!(bridged_stream.is_idle());
     }
 
     #[test]
@@ -39262,6 +40804,19 @@ mod tests {
     }
 
     #[test]
+    fn pedal_batch_lane_controls_preserve_each_token_identity() {
+        let controls = pedal_batch_lane_stream_control_bytes(&[9259, 1902], 41, 65_536).unwrap();
+
+        assert_eq!(controls.len(), 2);
+        assert_eq!(&controls[0][0..4], &9259u32.to_le_bytes());
+        assert_eq!(&controls[0][4..12], &41u64.to_le_bytes());
+        assert_eq!(&controls[1][0..4], &1902u32.to_le_bytes());
+        assert_eq!(&controls[1][4..12], &42u64.to_le_bytes());
+        assert_eq!(&controls[0][16..20], &65_536u32.to_le_bytes());
+        assert_eq!(&controls[1][16..20], &65_536u32.to_le_bytes());
+    }
+
+    #[test]
     fn recurrent_gate_kernel_receives_stream_control_metadata() {
         let metadata = VulkanKernelStreamMetadata::for_op("rg_lru_step");
 
@@ -39585,6 +41140,25 @@ mod tests {
                 .iter()
                 .all(|family| family.command_refs.len() == 1)
         );
+
+        let reversed_dispatch_plan = VulkanKernelDispatchPlan {
+            backend_id: VULKAN_STREAM_CIRCUIT_BACKEND_ID.to_string(),
+            commands: dispatch_plan.commands.iter().rev().cloned().collect(),
+        };
+        let reversed_reusable_plan =
+            VulkanReusableKernelPlan::from_dispatch_plan(&reversed_dispatch_plan);
+        assert_eq!(
+            reusable_plan
+                .families
+                .iter()
+                .map(|family| family.family_id.as_str())
+                .collect::<BTreeSet<_>>(),
+            reversed_reusable_plan
+                .families
+                .iter()
+                .map(|family| family.family_id.as_str())
+                .collect::<BTreeSet<_>>()
+        );
     }
 
     #[test]
@@ -39669,7 +41243,11 @@ mod tests {
             "layer_13.conv_in_projection"
         );
 
-        let rope = reusable_plan.family("rotary_position_embedding").unwrap();
+        let rope = reusable_plan
+            .families_for_op("rotary_position_embedding")
+            .into_iter()
+            .find(|family| family.command_refs.len() == 6)
+            .unwrap();
         assert_eq!(rope.command_refs.len(), 6);
         assert_eq!(
             reusable_plan
@@ -39682,7 +41260,11 @@ mod tests {
         assert!(rope.uses_stream_tick);
         assert!(rope.push_constants.is_empty());
 
-        let append = reusable_plan.family("append_state_update").unwrap();
+        let append = reusable_plan
+            .families_for_op("append_state_update")
+            .into_iter()
+            .find(|family| family.command_refs.len() == 6)
+            .unwrap();
         assert_eq!(append.command_refs.len(), 6);
         assert!(append.uses_stream_tick);
         assert_eq!(
@@ -39744,7 +41326,11 @@ mod tests {
             ]
         );
 
-        let split = reusable_plan.family("split").unwrap();
+        let split = reusable_plan
+            .families_for_op("split")
+            .into_iter()
+            .find(|family| family.command_refs.len() == 8)
+            .unwrap();
         assert_eq!(split.command_refs.len(), 8);
         assert_eq!(split.descriptor_signature.len(), 4);
     }
@@ -39791,7 +41377,10 @@ mod tests {
                 .any(|family| family.family_id == conv_in_family_id && family.command_count == 8)
         );
 
-        let partial_family_ids = [conv_in_family_id, "rms_norm.signature_1"];
+        let rms_norm_family_id = reusable_plan.families_for_op("rms_norm")[1]
+            .family_id
+            .as_str();
+        let partial_family_ids = [conv_in_family_id, rms_norm_family_id];
         let partial_covered_command_count = partial_family_ids
             .iter()
             .map(|family_id| reusable_plan.family(family_id).unwrap().command_refs.len())
@@ -39976,7 +41565,7 @@ mod tests {
             partial_link
                 .missing_families()
                 .iter()
-                .any(|family| family.family_id == "append_state_update")
+                .any(|family| family.op == "append_state_update")
         );
 
         let mut bad_linear = VulkanReusableKernelArtifact::from_family(linear, "")
@@ -40078,10 +41667,11 @@ mod tests {
         assert_eq!(prepared.total_descriptor_count, 794);
 
         let first = prepared.dispatch("layer_00", "operator_norm").unwrap();
+        let first_family = reusable_family_with_kernel(&reusable_plan, "layer_00.operator_norm");
         assert_eq!(first.dispatch_index, 0);
         assert_eq!(first.kernel_id, "layer_00.operator_norm");
-        assert_eq!(first.reusable_family_id, "rms_norm.signature_1");
-        assert_eq!(first.artifact_path, "kernels/rms_norm.signature_1.spv");
+        assert_eq!(first.reusable_family_id, first_family.family_id);
+        assert_eq!(first.artifact_path, artifact_path_for_family(first_family));
         assert_eq!(first.entry_point, DEFAULT_SPIRV_ENTRY_POINT);
         assert_eq!(first.local_size_x, DEFAULT_COMPUTE_LOCAL_SIZE_X);
         assert_eq!(first.descriptors.len(), 3);
@@ -40093,9 +41683,14 @@ mod tests {
         assert_eq!(linear.descriptors.len(), 3);
 
         let kv_append = prepared.dispatch("layer_02", "kv_memory_append").unwrap();
+        let kv_append_family =
+            reusable_family_with_kernel(&reusable_plan, "layer_02.kv_memory_append");
         assert_eq!(kv_append.dispatch_index, 40);
-        assert_eq!(kv_append.reusable_family_id, "append_state_update");
-        assert_eq!(kv_append.artifact_path, "kernels/append_state_update.spv");
+        assert_eq!(kv_append.reusable_family_id, kv_append_family.family_id);
+        assert_eq!(
+            kv_append.artifact_path,
+            artifact_path_for_family(kv_append_family)
+        );
         assert!(kv_append.uses_stream_tick);
         assert_eq!(kv_append.descriptors.len(), 9);
         assert!(matches!(
@@ -40144,6 +41739,7 @@ mod tests {
         let descriptor_plan =
             VulkanDescriptorResourcePlan::from_plans(&dispatch_plan, &resident_plan, 4).unwrap();
         let linear = reusable_family_with_kernel(&reusable_plan, "layer_00.conv_in_projection");
+        let append = reusable_family_with_kernel(&reusable_plan, "layer_02.kv_memory_append");
         let partial_manifest = VulkanReusableKernelArtifactManifest::empty().with_artifact(
             VulkanReusableKernelArtifact::from_family(linear, artifact_path_for_family(linear)),
         );
@@ -40165,7 +41761,7 @@ mod tests {
         assert_eq!(link_plan.missing_command_count, 242 - 8);
         assert!(
             link_plan
-                .family("append_state_update")
+                .family(&append.family_id)
                 .is_some_and(|family| family.status == VulkanReusableKernelLinkStatus::Missing)
         );
     }

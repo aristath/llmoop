@@ -1483,13 +1483,18 @@ impl VulkanComputeDeviceCatalog {
                 enabled_shader_features
                     .insert(VulkanShaderFeature::ShaderBfloat16CooperativeMatrix);
             }
-            let mut enabled_core_features = vk::PhysicalDeviceFeatures::default();
-            enabled_core_features.shader_float64 =
-                bool32(enabled_shader_features.contains(&VulkanShaderFeature::ShaderFloat64));
-            enabled_core_features.shader_int16 =
-                bool32(enabled_shader_features.contains(&VulkanShaderFeature::ShaderInt16));
-            enabled_core_features.shader_int64 =
-                bool32(enabled_shader_features.contains(&VulkanShaderFeature::ShaderInt64));
+            let enabled_core_features = vk::PhysicalDeviceFeatures {
+                shader_float64: bool32(
+                    enabled_shader_features.contains(&VulkanShaderFeature::ShaderFloat64),
+                ),
+                shader_int16: bool32(
+                    enabled_shader_features.contains(&VulkanShaderFeature::ShaderInt16),
+                ),
+                shader_int64: bool32(
+                    enabled_shader_features.contains(&VulkanShaderFeature::ShaderInt64),
+                ),
+                ..Default::default()
+            };
             let mut shader_float16_int8_features =
                 vk::PhysicalDeviceShaderFloat16Int8Features::default()
                     .shader_float16(
@@ -3125,15 +3130,27 @@ impl VulkanComputeDevice {
 
             if !command_buffer_matches {
                 if input_copies.is_empty() {
-                    let host_write_barrier = [vk::MemoryBarrier::default()
-                        .src_access_mask(vk::AccessFlags::HOST_WRITE)
-                        .dst_access_mask(vk::AccessFlags::SHADER_READ)];
+                    // A resident sequence is an independently submitted circuit unit. Its
+                    // inputs may have been produced by the host, a transfer, or an earlier
+                    // compute sequence on this queue, so establish the full producer-to-
+                    // consumer dependency at the sequence boundary.
+                    let input_visibility_barrier = [vk::MemoryBarrier::default()
+                        .src_access_mask(
+                            vk::AccessFlags::HOST_WRITE
+                                | vk::AccessFlags::TRANSFER_WRITE
+                                | vk::AccessFlags::SHADER_WRITE,
+                        )
+                        .dst_access_mask(
+                            vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+                        )];
                     self.device.cmd_pipeline_barrier(
                         sequence.command_buffer,
-                        vk::PipelineStageFlags::HOST,
+                        vk::PipelineStageFlags::HOST
+                            | vk::PipelineStageFlags::TRANSFER
+                            | vk::PipelineStageFlags::COMPUTE_SHADER,
                         vk::PipelineStageFlags::COMPUTE_SHADER,
                         vk::DependencyFlags::empty(),
-                        &host_write_barrier,
+                        &input_visibility_barrier,
                         &[],
                         &[],
                     );
@@ -4969,6 +4986,53 @@ mod tests {
         assert_eq!(
             bytes_to_u32(&buffer.read_bytes(12).unwrap()),
             vec![5, 6, 45]
+        );
+    }
+
+    #[test]
+    fn separate_resident_sequences_publish_compute_writes_to_the_next_sequence() {
+        let Some(spirv_words) = compile_test_shader_words() else {
+            eprintln!("skipping Vulkan sequence boundary test: no GLSL to SPIR-V compiler found");
+            return;
+        };
+        let Some(device_index) = std::env::var("LLMOOP_TEST_VULKAN_DEVICE_INDEX")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+        else {
+            eprintln!("skipping Vulkan sequence boundary test: explicit Vulkan device index unset");
+            return;
+        };
+        let device = VulkanComputeDevice::new_for_physical_device_index(device_index).unwrap();
+        let buffer = device.create_resident_buffer(12).unwrap();
+        buffer.write_bytes(&u32_bytes(&[1, 2, 41])).unwrap();
+        let dispatch = device
+            .create_resident_kernel_dispatch(
+                &spirv_words,
+                &[VulkanResidentKernelBufferBinding::new(0, &buffer, 12)],
+                1,
+                64,
+                0,
+            )
+            .unwrap();
+        let producer = device.create_resident_kernel_sequence().unwrap();
+        let consumer = device.create_resident_kernel_sequence().unwrap();
+
+        device
+            .run_resident_kernel_sequence(
+                &producer,
+                &[VulkanResidentKernelSequenceStep::new(&dispatch, &[])],
+            )
+            .unwrap();
+        device
+            .run_resident_kernel_sequence(
+                &consumer,
+                &[VulkanResidentKernelSequenceStep::new(&dispatch, &[])],
+            )
+            .unwrap();
+
+        assert_eq!(
+            bytes_to_u32(&buffer.read_bytes(12).unwrap()),
+            vec![3, 4, 43]
         );
     }
 

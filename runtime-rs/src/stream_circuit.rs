@@ -89,6 +89,8 @@ pub struct StatePort {
     #[serde(default)]
     pub growth: Option<String>,
     #[serde(default)]
+    pub max_dynamic_activations: Option<usize>,
+    #[serde(default)]
     pub sharing: Option<String>,
     #[serde(default)]
     pub owner: Option<String>,
@@ -230,6 +232,21 @@ impl StreamCircuit {
         let state_ids: BTreeSet<_> = self.state_ports.iter().map(|state| &state.id).collect();
         if state_ids.len() != self.state_ports.len() {
             issues.push(format!("{} has duplicate state port ids", self.id));
+        }
+        for state in &self.state_ports {
+            if state.max_dynamic_activations == Some(0) {
+                issues.push(format!(
+                    "state port {:?} max_dynamic_activations must be positive",
+                    state.id
+                ));
+            }
+            if state.max_dynamic_activations.is_some() && state.elements_per_activation().is_none()
+            {
+                issues.push(format!(
+                    "state port {:?} bounds dynamic activations but has no per-activation shape",
+                    state.id
+                ));
+            }
         }
         let param_ids: BTreeSet<_> = self.parameters.refs.keys().collect();
         let mut node_ids = BTreeSet::new();
@@ -668,21 +685,9 @@ impl ResolvedCircuitArtifact {
                 self.pedal.id
             )));
         }
-        if self
-            .state
-            .state_ports
-            .iter()
-            .map(|state| &state.id)
-            .collect::<BTreeSet<_>>()
-            != self
-                .circuit
-                .state_ports
-                .iter()
-                .map(|state| &state.id)
-                .collect::<BTreeSet<_>>()
-        {
+        if self.state.state_ports != self.circuit.state_ports {
             return Err(CircuitArtifactError(format!(
-                "{} state ports do not match circuit state ports",
+                "{} state port contracts do not match circuit state ports",
                 self.pedal.id
             )));
         }
