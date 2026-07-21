@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
@@ -33,7 +33,7 @@ use crate::vulkan_compute::{
     VulkanResidentBufferCopyBatch, VulkanResidentBufferRangeCopy, VulkanResidentKernelBufferAccess,
     VulkanResidentKernelBufferBinding, VulkanResidentKernelDispatch, VulkanResidentKernelSequence,
     VulkanResidentKernelSequenceSnapshotCopy, VulkanResidentKernelSequenceStep,
-    VulkanResidentMappedBufferCopy, VulkanTimelineSemaphorePoint,
+    VulkanResidentMappedBufferCopy, VulkanTimelineSemaphore, VulkanTimelineSemaphorePoint,
 };
 use crate::vulkan_distributed::{
     VulkanDistributedActivationBufferPlan, VulkanDistributedActivationBuffers,
@@ -1523,10 +1523,57 @@ impl VulkanPlacedCableIoPlan {
         &self,
         device: &VulkanComputeDevice,
     ) -> Result<VulkanPlacedCableIoBuffers, VulkanError> {
+        self.allocate_buffers_with_endpoint_overrides(device, &[])
+    }
+
+    pub fn allocate_buffers_with_endpoint_overrides(
+        &self,
+        device: &VulkanComputeDevice,
+        endpoint_overrides: &[VulkanPlacedCableEndpointBufferOverride],
+    ) -> Result<VulkanPlacedCableIoBuffers, VulkanError> {
         let mut local_buffers = Vec::with_capacity(self.local_cable_count);
         let mut incoming_buffers = Vec::with_capacity(self.incoming_endpoint_count);
         let mut outgoing_buffers = Vec::with_capacity(self.outgoing_endpoint_count);
         let mut total_byte_capacity = 0usize;
+        let mut overrides = BTreeMap::new();
+
+        for endpoint_override in endpoint_overrides {
+            let key = (endpoint_override.direction, endpoint_override.cable_index);
+            if overrides.insert(key, endpoint_override).is_some() {
+                return Err(VulkanError(format!(
+                    "cable endpoint buffer override repeats {:?} cable {} on {:?}",
+                    endpoint_override.direction, endpoint_override.cable_index, self.device_id
+                )));
+            }
+            if !device.owns_resident_buffer(&endpoint_override.buffer) {
+                return Err(VulkanError(format!(
+                    "cable endpoint buffer override for cable {} on {:?} belongs to a different Vulkan logical device",
+                    endpoint_override.cable_index, self.device_id
+                )));
+            }
+            let endpoint = self
+                .endpoint(endpoint_override.direction, endpoint_override.cable_index)
+                .ok_or_else(|| {
+                    VulkanError(format!(
+                        "cable endpoint buffer override does not address {:?} cable {} on {:?}",
+                        endpoint_override.direction, endpoint_override.cable_index, self.device_id
+                    ))
+                })?;
+            let required_byte_capacity = endpoint.byte_capacity.ok_or_else(|| {
+                VulkanError(format!(
+                    "{} endpoint {} for cable {} has unknown byte capacity",
+                    self.device_id, endpoint.endpoint_id, endpoint.cable_index
+                ))
+            })?;
+            if endpoint_override.buffer.byte_capacity() < required_byte_capacity {
+                return Err(VulkanError(format!(
+                    "cable endpoint buffer override for cable {} on {:?} has {} bytes, needs {required_byte_capacity}",
+                    endpoint_override.cable_index,
+                    self.device_id,
+                    endpoint_override.buffer.byte_capacity()
+                )));
+            }
+        }
 
         for cable in &self.local_cables {
             let byte_capacity = cable.byte_capacity.ok_or_else(|| {
@@ -1559,8 +1606,15 @@ impl VulkanPlacedCableIoPlan {
                 byte_capacity,
                 "placed cable endpoint buffer allocation",
             )?;
-            let mut buffer = device.create_host_visible_resident_buffer(byte_capacity)?;
-            buffer.persistently_map()?;
+            let buffer = if let Some(endpoint_override) =
+                overrides.get(&(endpoint.direction, endpoint.cable_index))
+            {
+                endpoint_override.buffer.clone()
+            } else {
+                let mut buffer = device.create_host_visible_resident_buffer(byte_capacity)?;
+                buffer.persistently_map()?;
+                Arc::new(buffer)
+            };
             let allocation = VulkanPlacedCableBufferAllocation {
                 endpoint: endpoint.clone(),
                 byte_capacity,
@@ -1806,7 +1860,7 @@ fn cable_byte_capacity(
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum VulkanPlacedCableDirection {
     Incoming,
     Outgoing,
@@ -1887,7 +1941,13 @@ pub struct VulkanPlacedLocalCableBufferAllocation {
 pub struct VulkanPlacedCableBufferAllocation {
     pub endpoint: VulkanPlacedCableEndpoint,
     pub byte_capacity: usize,
-    pub buffer: VulkanResidentBuffer,
+    pub buffer: Arc<VulkanResidentBuffer>,
+}
+
+pub struct VulkanPlacedCableEndpointBufferOverride {
+    pub direction: VulkanPlacedCableDirection,
+    pub cable_index: usize,
+    pub buffer: Arc<VulkanResidentBuffer>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -2008,7 +2068,7 @@ pub struct VulkanPlacedCableDirectCopy {
     pub source_pedal_id: String,
     pub destination_pedal_id: String,
     pub byte_count: usize,
-    copy: VulkanResidentMappedBufferCopy,
+    copy: Option<VulkanResidentMappedBufferCopy>,
 }
 
 impl VulkanInProcessPlacedCableTransport {
@@ -2054,6 +2114,12 @@ impl VulkanInProcessPlacedCableTransport {
         self.direct_copies.len()
     }
 
+    fn cable_uses_shared_allocation(&self, key: &VulkanPlacedCablePacketKey) -> bool {
+        self.direct_copies
+            .get(key)
+            .is_some_and(|direct_copy| direct_copy.copy.is_none())
+    }
+
     pub fn reset_tick_state(&mut self) {
         self.packets.clear();
         self.ready_direct_cables.clear();
@@ -2090,13 +2156,23 @@ impl VulkanInProcessPlacedCableTransport {
                 incoming_byte_capacity: incoming.byte_capacity,
             });
         }
-        let copy = outgoing
-            .buffer
-            .create_persistently_mapped_copy_to(&incoming.buffer, outgoing.byte_capacity)
-            .map_err(|error| VulkanPlacedCableTransportError::Vulkan {
-                operation: "create persistently mapped cable buffer copy",
-                error,
-            })?;
+        let copy = if Arc::ptr_eq(&outgoing.buffer, &incoming.buffer)
+            || outgoing
+                .buffer
+                .shares_host_allocation_with(&incoming.buffer)
+        {
+            None
+        } else {
+            Some(
+                outgoing
+                    .buffer
+                    .create_persistently_mapped_copy_to(&incoming.buffer, outgoing.byte_capacity)
+                    .map_err(|error| VulkanPlacedCableTransportError::Vulkan {
+                        operation: "create persistently mapped cable buffer copy",
+                        error,
+                    })?,
+            )
+        };
         self.direct_copies.insert(
             outgoing_key.clone(),
             VulkanPlacedCableDirectCopy {
@@ -2125,13 +2201,14 @@ impl VulkanInProcessPlacedCableTransport {
             })?;
         let key = VulkanPlacedCablePacketKey::from_outgoing_endpoint(&outgoing.endpoint);
         if let Some(direct_copy) = self.direct_copies.get(&key) {
-            direct_copy
-                .copy
-                .run(direct_copy.byte_count)
-                .map_err(|error| VulkanPlacedCableTransportError::Vulkan {
-                    operation: "run direct cable buffer copy",
-                    error,
+            if let Some(copy) = &direct_copy.copy {
+                copy.run(direct_copy.byte_count).map_err(|error| {
+                    VulkanPlacedCableTransportError::Vulkan {
+                        operation: "run direct cable buffer copy",
+                        error,
+                    }
                 })?;
+            }
             self.ready_direct_cables.insert(key);
             self.direct_copy_count += 1;
             self.direct_copy_byte_count += direct_copy.byte_count;
@@ -2823,6 +2900,24 @@ impl VulkanMountedPlacedStreamCircuit {
         parameter_buffers: Arc<VulkanPermanentParameterBuffers>,
         activation_overrides: &[VulkanActivationSlotBufferOverride],
     ) -> Result<Self, VulkanStreamCircuitMountError> {
+        Self::from_placed_plan_with_parameter_buffers_and_buffer_overrides(
+            device,
+            placed_plan,
+            dynamic_state_capacity_activations,
+            parameter_buffers,
+            activation_overrides,
+            &[],
+        )
+    }
+
+    pub fn from_placed_plan_with_parameter_buffers_and_buffer_overrides(
+        device: &VulkanComputeDevice,
+        placed_plan: VulkanPlacedStreamCircuitPlan,
+        dynamic_state_capacity_activations: usize,
+        parameter_buffers: Arc<VulkanPermanentParameterBuffers>,
+        activation_overrides: &[VulkanActivationSlotBufferOverride],
+        cable_endpoint_overrides: &[VulkanPlacedCableEndpointBufferOverride],
+    ) -> Result<Self, VulkanStreamCircuitMountError> {
         let buffers = placed_plan
             .placed_resident_plan
             .resident_plan
@@ -2835,7 +2930,8 @@ impl VulkanMountedPlacedStreamCircuit {
         let boundary_io = boundary_io_plan.allocate_buffers(device)?;
         let cable_io_plan =
             VulkanPlacedCableIoPlan::from_placed_resident_plan(&placed_plan.placed_resident_plan)?;
-        let cable_io = cable_io_plan.allocate_buffers(device)?;
+        let cable_io = cable_io_plan
+            .allocate_buffers_with_endpoint_overrides(device, cable_endpoint_overrides)?;
         let mut stream_control_buffer =
             device.create_host_visible_resident_buffer(VULKAN_STREAM_CONTROL_BYTE_CAPACITY)?;
         stream_control_buffer.persistently_map()?;
@@ -3152,7 +3248,7 @@ impl VulkanMountedPlacedStreamCircuit {
                             buffer_index: endpoint.buffer_index,
                         }
                     })?;
-                (&allocation.buffer, endpoint.byte_capacity)
+                (allocation.buffer.as_ref(), endpoint.byte_capacity)
             }
             VulkanMountedPlacedBoundDescriptorTarget::OutgoingCableBuffer { endpoint } => {
                 let allocation = self
@@ -3167,7 +3263,7 @@ impl VulkanMountedPlacedStreamCircuit {
                             buffer_index: endpoint.buffer_index,
                         }
                     })?;
-                (&allocation.buffer, endpoint.byte_capacity)
+                (allocation.buffer.as_ref(), endpoint.byte_capacity)
             }
         };
 
@@ -11613,13 +11709,23 @@ impl VulkanResidentModelPackageDeviceSlice {
         device: &VulkanComputeDevice,
         activation_overrides: &[VulkanActivationSlotBufferOverride],
     ) -> Result<VulkanMountedPlacedStreamCircuit, VulkanResidentTokenModelPackageError> {
+        self.create_mounted_stream_circuit_with_buffer_overrides(device, activation_overrides, &[])
+    }
+
+    pub fn create_mounted_stream_circuit_with_buffer_overrides(
+        &self,
+        device: &VulkanComputeDevice,
+        activation_overrides: &[VulkanActivationSlotBufferOverride],
+        cable_endpoint_overrides: &[VulkanPlacedCableEndpointBufferOverride],
+    ) -> Result<VulkanMountedPlacedStreamCircuit, VulkanResidentTokenModelPackageError> {
         VulkanMountedPlacedStreamCircuit::
-            from_placed_plan_with_parameter_buffers_and_activation_overrides(
+            from_placed_plan_with_parameter_buffers_and_buffer_overrides(
             device,
             self.placed_plan.clone(),
             self.dynamic_state_capacity_activations,
             self.parameter_buffers.clone(),
             activation_overrides,
+            cable_endpoint_overrides,
         )
         .map_err(|error| {
             VulkanResidentTokenModelPackageError::new(format!(
@@ -11846,6 +11952,7 @@ impl VulkanResidentSpeculativeDecoderModelPackage {
 pub struct VulkanResidentInProcessPlacedStreamProcessor {
     distributed_dispatch_runners: VulkanDistributedDispatchRunners,
     _distributed_activation_buffers: VulkanDistributedActivationBuffers,
+    cable_synchronizations: VulkanPlacedCableTimelineSynchronizations,
     model: Arc<VulkanResidentInProcessPlacedModelPackage>,
     input_transducer: VulkanResidentInputEmbeddingTransducerRunner,
     output_transducer: VulkanResidentOutputTransducerRunner,
@@ -12468,6 +12575,267 @@ impl VulkanResidentPlacedTokenInput {
     }
 }
 
+fn pair_placed_cable_endpoints(
+    plans: &[VulkanPlacedCableIoPlan],
+) -> Result<Vec<(VulkanPlacedCableEndpoint, VulkanPlacedCableEndpoint)>, VulkanError> {
+    let mut incoming_by_key = BTreeMap::new();
+    for plan in plans {
+        for endpoint in plan
+            .endpoints
+            .iter()
+            .filter(|endpoint| endpoint.direction == VulkanPlacedCableDirection::Incoming)
+        {
+            let key = VulkanPlacedCablePacketKey::from_incoming_endpoint(endpoint);
+            if incoming_by_key
+                .insert(key.clone(), endpoint.clone())
+                .is_some()
+            {
+                return Err(VulkanError(format!(
+                    "placed pedalboard repeats incoming cable endpoint {key:?}"
+                )));
+            }
+        }
+    }
+
+    let mut pairs = Vec::with_capacity(incoming_by_key.len());
+    let mut outgoing_keys = BTreeSet::new();
+    for plan in plans {
+        for outgoing in plan
+            .endpoints
+            .iter()
+            .filter(|endpoint| endpoint.direction == VulkanPlacedCableDirection::Outgoing)
+        {
+            let key = VulkanPlacedCablePacketKey::from_outgoing_endpoint(outgoing);
+            if !outgoing_keys.insert(key.clone()) {
+                return Err(VulkanError(format!(
+                    "placed pedalboard repeats outgoing cable endpoint {key:?}"
+                )));
+            }
+            let incoming = incoming_by_key.remove(&key).ok_or_else(|| {
+                VulkanError(format!(
+                    "placed pedalboard has no incoming endpoint for cable {key:?}"
+                ))
+            })?;
+            let outgoing_byte_capacity = outgoing.byte_capacity.ok_or_else(|| {
+                VulkanError(format!("outgoing cable {key:?} has unknown byte capacity"))
+            })?;
+            let incoming_byte_capacity = incoming.byte_capacity.ok_or_else(|| {
+                VulkanError(format!("incoming cable {key:?} has unknown byte capacity"))
+            })?;
+            if outgoing_byte_capacity != incoming_byte_capacity {
+                return Err(VulkanError(format!(
+                    "placed cable {key:?} has outgoing capacity {outgoing_byte_capacity} and incoming capacity {incoming_byte_capacity}"
+                )));
+            }
+            pairs.push((outgoing.clone(), incoming));
+        }
+    }
+    if let Some(key) = incoming_by_key.keys().next() {
+        return Err(VulkanError(format!(
+            "placed pedalboard has no outgoing endpoint for cable {key:?}"
+        )));
+    }
+    Ok(pairs)
+}
+
+struct VulkanPlacedCableDeviceLinks {
+    endpoint_overrides: BTreeMap<String, Vec<VulkanPlacedCableEndpointBufferOverride>>,
+    synchronizations: VulkanPlacedCableTimelineSynchronizations,
+}
+
+#[derive(Default)]
+struct VulkanPlacedCableTimelineSynchronizations {
+    cables: BTreeMap<VulkanPlacedCablePacketKey, VulkanPlacedCableTimelineSynchronization>,
+}
+
+struct VulkanPlacedCableTimelineSynchronization {
+    source_signal: VulkanTimelineSemaphore,
+    destination_wait: VulkanTimelineSemaphore,
+    next_value: Cell<u64>,
+    pending_value: Cell<Option<u64>>,
+}
+
+impl VulkanPlacedCableTimelineSynchronizations {
+    fn prepare_source_signal<'a>(
+        &'a self,
+        endpoint: &VulkanPlacedCableEndpoint,
+    ) -> Result<Option<VulkanTimelineSemaphorePoint<'a>>, VulkanError> {
+        let key = VulkanPlacedCablePacketKey::from_outgoing_endpoint(endpoint);
+        let Some(synchronization) = self.cables.get(&key) else {
+            return Ok(None);
+        };
+        if synchronization.pending_value.get().is_some() {
+            return Err(VulkanError(format!(
+                "cross-device cable {key:?} already has an unconsumed timeline dependency"
+            )));
+        }
+        let value = synchronization.next_value.get();
+        let next = value.checked_add(1).ok_or_else(|| {
+            VulkanError(format!(
+                "cross-device cable {key:?} exhausted its timeline semaphore values"
+            ))
+        })?;
+        synchronization.next_value.set(next);
+        synchronization.pending_value.set(Some(value));
+        Ok(Some(VulkanTimelineSemaphorePoint::new(
+            &synchronization.source_signal,
+            value,
+        )))
+    }
+
+    fn take_destination_wait<'a>(
+        &'a self,
+        endpoint: &VulkanPlacedCableEndpoint,
+    ) -> Result<Option<VulkanTimelineSemaphorePoint<'a>>, VulkanError> {
+        let key = VulkanPlacedCablePacketKey::from_incoming_endpoint(endpoint);
+        let Some(synchronization) = self.cables.get(&key) else {
+            return Ok(None);
+        };
+        let value = synchronization.pending_value.take().ok_or_else(|| {
+            VulkanError(format!(
+                "cross-device cable {key:?} has no queued timeline dependency"
+            ))
+        })?;
+        Ok(Some(VulkanTimelineSemaphorePoint::new(
+            &synchronization.destination_wait,
+            value,
+        )))
+    }
+
+    fn has_pending_dependencies(&self) -> bool {
+        self.cables
+            .values()
+            .any(|synchronization| synchronization.pending_value.get().is_some())
+    }
+}
+
+fn create_shared_placed_cable_endpoint_overrides<'a, F>(
+    device_slices: &[Arc<VulkanResidentModelPackageDeviceSlice>],
+    device_for: &F,
+) -> Result<VulkanPlacedCableDeviceLinks, VulkanResidentInProcessPlacedRuntimeError>
+where
+    F: Fn(&str) -> Result<&'a VulkanComputeDevice, VulkanResidentInProcessPlacedRuntimeError>,
+{
+    let plans = device_slices
+        .iter()
+        .map(|slice| {
+            VulkanPlacedCableIoPlan::from_placed_resident_plan(
+                &slice.placed_plan.placed_resident_plan,
+            )
+            .map_err(|error| {
+                VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(format!(
+                    "failed to plan shared cable endpoints for {:?}: {error}",
+                    slice.device_id
+                )))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let cable_pairs = pair_placed_cable_endpoints(&plans)
+        .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
+
+    let mut endpoint_overrides =
+        BTreeMap::<String, Vec<VulkanPlacedCableEndpointBufferOverride>>::new();
+    let mut synchronizations = BTreeMap::new();
+    for (outgoing, incoming) in cable_pairs {
+        let outgoing_byte_capacity = outgoing
+            .byte_capacity
+            .expect("paired outgoing cable capacity was validated");
+        let source_device = device_for(&outgoing.local_device_id)?;
+        let destination_device = device_for(&incoming.local_device_id)?;
+        let devices_share_queue = source_device.shares_logical_device_with(destination_device);
+        let (outgoing_buffer, incoming_buffer) = if devices_share_queue {
+            let buffer = Arc::new(
+                source_device
+                    .create_resident_buffer(outgoing_byte_capacity)
+                    .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?,
+            );
+            (buffer.clone(), buffer)
+        } else {
+            let allocation = source_device
+                .create_shared_host_allocation(&[destination_device], outgoing_byte_capacity)
+                .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
+            let outgoing_buffer = Arc::new(
+                source_device
+                    .import_shared_host_buffer(Arc::clone(&allocation))
+                    .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?,
+            );
+            let incoming_buffer = Arc::new(
+                destination_device
+                    .import_shared_host_buffer(allocation)
+                    .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?,
+            );
+            (outgoing_buffer, incoming_buffer)
+        };
+        if !devices_share_queue {
+            if !source_device.supports_opaque_fd_timeline_semaphores()
+                || !destination_device.supports_opaque_fd_timeline_semaphores()
+            {
+                return Err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop(
+                    VulkanError(format!(
+                        "cross-device cable {:?} requires persistent opaque-file timeline semaphores",
+                        VulkanPlacedCablePacketKey::from_outgoing_endpoint(&outgoing)
+                    )),
+                ));
+            }
+            let source_signal = source_device
+                .create_opaque_fd_exportable_timeline_semaphore(0)
+                .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
+            let destination_wait = destination_device
+                .create_timeline_semaphore(0)
+                .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
+            destination_device
+                .import_timeline_semaphore_opaque_fd(
+                    &destination_wait,
+                    source_device
+                        .export_timeline_semaphore_opaque_fd(&source_signal)
+                        .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?,
+                )
+                .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
+            let key = VulkanPlacedCablePacketKey::from_outgoing_endpoint(&outgoing);
+            if synchronizations
+                .insert(
+                    key.clone(),
+                    VulkanPlacedCableTimelineSynchronization {
+                        source_signal,
+                        destination_wait,
+                        next_value: Cell::new(1),
+                        pending_value: Cell::new(None),
+                    },
+                )
+                .is_some()
+            {
+                return Err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop(
+                    VulkanError(format!(
+                        "cross-device cable synchronization repeats {key:?}"
+                    )),
+                ));
+            }
+        }
+        endpoint_overrides
+            .entry(outgoing.local_device_id.clone())
+            .or_default()
+            .push(VulkanPlacedCableEndpointBufferOverride {
+                direction: VulkanPlacedCableDirection::Outgoing,
+                cable_index: outgoing.cable_index,
+                buffer: outgoing_buffer,
+            });
+        endpoint_overrides
+            .entry(incoming.local_device_id.clone())
+            .or_default()
+            .push(VulkanPlacedCableEndpointBufferOverride {
+                direction: VulkanPlacedCableDirection::Incoming,
+                cable_index: incoming.cable_index,
+                buffer: incoming_buffer,
+            });
+    }
+    Ok(VulkanPlacedCableDeviceLinks {
+        endpoint_overrides,
+        synchronizations: VulkanPlacedCableTimelineSynchronizations {
+            cables: synchronizations,
+        },
+    })
+}
+
 impl VulkanResidentInProcessPlacedModelPackage {
     pub fn from_manifest_file(
         device: &VulkanComputeDevice,
@@ -12980,15 +13348,23 @@ impl VulkanResidentInProcessPlacedModelPackage {
                 )),
             )
         })?;
+        let VulkanPlacedCableDeviceLinks {
+            endpoint_overrides: shared_cable_endpoint_overrides,
+            synchronizations: cable_synchronizations,
+        } = create_shared_placed_cable_endpoint_overrides(&self.device_slices, &device_for)?;
         let mut devices = Vec::with_capacity(self.device_slices.len());
         for package_slice in &self.device_slices {
             let device = device_for(&package_slice.device_id)?;
             let activation_overrides = distributed_activation_buffers
                 .activation_overrides_for_owner_device(&package_slice.device_id);
             let mounted = package_slice
-                .create_mounted_stream_circuit_with_activation_overrides(
+                .create_mounted_stream_circuit_with_buffer_overrides(
                     device,
                     &activation_overrides,
+                    shared_cable_endpoint_overrides
+                        .get(&package_slice.device_id)
+                        .map(Vec::as_slice)
+                        .unwrap_or_default(),
                 )
                 .map_err(VulkanResidentInProcessPlacedRuntimeError::Package)?;
             mounted.buffers.zero_state_buffers().map_err(|error| {
@@ -13179,6 +13555,7 @@ impl VulkanResidentInProcessPlacedModelPackage {
             model: self.clone(),
             distributed_dispatch_runners,
             _distributed_activation_buffers: distributed_activation_buffers,
+            cable_synchronizations,
             input_transducer,
             output_transducer,
             sampler,
@@ -14276,6 +14653,7 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
             transport,
             &self.activation_schedule,
             Some(&self.distributed_dispatch_runners),
+            Some(&self.cable_synchronizations),
         )
         .map_err(VulkanResidentInProcessPlacedRuntimeError::Tick)
     }
@@ -14331,6 +14709,7 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
             transport,
             &self.activation_schedule,
             Some(&self.distributed_dispatch_runners),
+            Some(&self.cable_synchronizations),
         )
         .map_err(VulkanResidentInProcessPlacedRuntimeError::Tick)
     }
@@ -14390,6 +14769,7 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
             transport,
             &self.activation_schedule,
             Some(&self.distributed_dispatch_runners),
+            Some(&self.cable_synchronizations),
         )
         .map_err(VulkanResidentInProcessPlacedRuntimeError::Tick)?;
         if placed_run.status != VulkanMountedPlacedResidentInProcessStreamTickRunStatus::Completed {
@@ -14511,6 +14891,7 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
             transport,
             &self.activation_schedule,
             Some(&self.distributed_dispatch_runners),
+            Some(&self.cable_synchronizations),
         )
         .map_err(VulkanResidentInProcessPlacedRuntimeError::Tick)?;
         if placed_run.status != VulkanMountedPlacedResidentInProcessStreamTickRunStatus::Completed {
@@ -22769,6 +23150,7 @@ fn advance_compact_slice_with_distributed_dependencies(
     device_by_id: &BTreeMap<String, &VulkanComputeDevice>,
     transport: &mut VulkanInProcessPlacedCableTransport,
     distributed_runners: &VulkanDistributedDispatchRunners,
+    cable_synchronizations: &VulkanPlacedCableTimelineSynchronizations,
 ) -> Result<usize, VulkanMountedPlacedResidentInProcessStreamTickError> {
     debug_assert!(!slice.cursor.capture_execution_trace);
     let dynamic_state_capacity_activations =
@@ -22803,20 +23185,51 @@ fn advance_compact_slice_with_distributed_dependencies(
         None;
     let mut ready_dependency = None;
     let mut completion_dependency = None;
+    let mut pending_cable_wait_points = Vec::new();
 
     while slice.cursor.next_stage_index < slice.cursor.tick_plan.stages.len() {
         let stage = &slice.cursor.tick_plan.stages[slice.cursor.next_stage_index];
         match stage {
             VulkanMountedPlacedStreamTickStage::ReceiveCable { cable_index, .. } => {
-                wait_for_compact_slice_submitted_work(
-                    slice,
-                    device_by_id,
-                    distributed_runners,
-                    last_submitted_segment.take(),
-                    completion_dependency.take(),
-                )?;
+                let incoming = slice
+                    .mounted
+                    .cable_io
+                    .incoming_buffer(*cable_index)
+                    .ok_or_else(|| {
+                        VulkanMountedPlacedResidentInProcessStreamTickError::StreamTick(
+                            VulkanMountedPlacedResidentStreamTickError::Transport(
+                                VulkanPlacedCableTransportError::MissingIncomingCable {
+                                    device_id: slice.device_id().to_string(),
+                                    cable_index: *cable_index,
+                                },
+                            ),
+                        )
+                    })?;
+                let cable_key =
+                    VulkanPlacedCablePacketKey::from_incoming_endpoint(&incoming.endpoint);
+                let uses_shared_allocation = transport.cable_uses_shared_allocation(&cable_key);
+                if !uses_shared_allocation {
+                    wait_for_compact_slice_submitted_work(
+                        slice,
+                        device_by_id,
+                        distributed_runners,
+                        last_submitted_segment.take(),
+                        completion_dependency.take(),
+                    )?;
+                }
                 match transport.receive_incoming_cable(slice.mounted, *cable_index) {
-                    Ok(_) => slice.cursor.complete_current_stage(),
+                    Ok(_) => {
+                        if uses_shared_allocation
+                            && let Some(wait_point) = cable_synchronizations
+                                .take_destination_wait(&incoming.endpoint)
+                                .map_err(
+                                    VulkanMountedPlacedResidentInProcessStreamTickError::Schedule,
+                                )?
+                        {
+                            pending_cable_wait_points.push(wait_point);
+                        }
+                        slice.cursor.complete_current_stage();
+                    }
                     Err(VulkanPlacedCableTransportError::MissingPacket { .. }) => break,
                     Err(error) => {
                         return Err(
@@ -22944,7 +23357,7 @@ fn advance_compact_slice_with_distributed_dependencies(
                     .execution_plan
                     .distributed_dispatch_at_stage(segment.end_stage_index)
                     .map(|dispatch| dispatch.dispatch_index);
-                let wait_points = match completion_dependency
+                let mut wait_points = match completion_dependency
                     .map(|(dispatch_index, dependency_value)| {
                         distributed_runners.owner_completion_wait_points(
                             slice.device_id(),
@@ -22968,6 +23381,7 @@ fn advance_compact_slice_with_distributed_dependencies(
                         );
                     }
                 };
+                wait_points.append(&mut pending_cable_wait_points);
                 let next_dependency = match next_distributed
                     .map(|dispatch_index| {
                         distributed_runners
@@ -22990,7 +23404,7 @@ fn advance_compact_slice_with_distributed_dependencies(
                         );
                     }
                 };
-                let signal_points = match next_dependency
+                let mut signal_points = match next_dependency
                     .map(|(dispatch_index, dependency_value)| {
                         distributed_runners.owner_ready_signal_points(
                             slice.device_id(),
@@ -23014,6 +23428,36 @@ fn advance_compact_slice_with_distributed_dependencies(
                         );
                     }
                 };
+                if let Some(VulkanMountedPlacedStreamTickStage::PublishCable {
+                    cable_index, ..
+                }) = slice.cursor.tick_plan.stages.get(segment.end_stage_index)
+                {
+                    let outgoing = slice
+                        .mounted
+                        .cable_io
+                        .outgoing_buffer(*cable_index)
+                        .ok_or_else(|| {
+                            VulkanMountedPlacedResidentInProcessStreamTickError::StreamTick(
+                                VulkanMountedPlacedResidentStreamTickError::Transport(
+                                    VulkanPlacedCableTransportError::MissingOutgoingCable {
+                                        device_id: slice.device_id().to_string(),
+                                        cable_index: *cable_index,
+                                    },
+                                ),
+                            )
+                        })?;
+                    let cable_key =
+                        VulkanPlacedCablePacketKey::from_outgoing_endpoint(&outgoing.endpoint);
+                    if transport.cable_uses_shared_allocation(&cable_key)
+                        && let Some(signal_point) = cable_synchronizations
+                            .prepare_source_signal(&outgoing.endpoint)
+                            .map_err(
+                                VulkanMountedPlacedResidentInProcessStreamTickError::Schedule,
+                            )?
+                    {
+                        signal_points.push(signal_point);
+                    }
+                }
                 let submission = segment.submit_with_stream_control_and_timeline_semaphores(
                     slice.device,
                     control,
@@ -23057,13 +23501,31 @@ fn advance_compact_slice_with_distributed_dependencies(
                 }
             }
             VulkanMountedPlacedStreamTickStage::PublishCable { cable_index, .. } => {
-                wait_for_compact_slice_submitted_work(
-                    slice,
-                    device_by_id,
-                    distributed_runners,
-                    last_submitted_segment.take(),
-                    completion_dependency.take(),
-                )?;
+                let outgoing = slice
+                    .mounted
+                    .cable_io
+                    .outgoing_buffer(*cable_index)
+                    .ok_or_else(|| {
+                        VulkanMountedPlacedResidentInProcessStreamTickError::StreamTick(
+                            VulkanMountedPlacedResidentStreamTickError::Transport(
+                                VulkanPlacedCableTransportError::MissingOutgoingCable {
+                                    device_id: slice.device_id().to_string(),
+                                    cable_index: *cable_index,
+                                },
+                            ),
+                        )
+                    })?;
+                let cable_key =
+                    VulkanPlacedCablePacketKey::from_outgoing_endpoint(&outgoing.endpoint);
+                if !transport.cable_uses_shared_allocation(&cable_key) {
+                    wait_for_compact_slice_submitted_work(
+                        slice,
+                        device_by_id,
+                        distributed_runners,
+                        last_submitted_segment.take(),
+                        completion_dependency.take(),
+                    )?;
+                }
                 transport
                     .publish_outgoing_cable(slice.mounted, *cable_index)
                     .map_err(|error| {
@@ -23074,6 +23536,15 @@ fn advance_compact_slice_with_distributed_dependencies(
                 slice.cursor.complete_current_stage();
             }
         }
+    }
+    if !pending_cable_wait_points.is_empty() {
+        return Err(
+            VulkanMountedPlacedResidentInProcessStreamTickError::Schedule(VulkanError(format!(
+                "device {:?} completed without consuming {} cable timeline dependencies",
+                slice.device_id(),
+                pending_cable_wait_points.len()
+            ))),
+        );
     }
     wait_for_compact_slice_submitted_work(
         slice,
@@ -23112,7 +23583,7 @@ fn run_mounted_placed_resident_stream_tick_slices_in_process_with_schedule(
     VulkanMountedPlacedResidentInProcessStreamTickError,
 > {
     run_mounted_placed_resident_stream_tick_slices_in_process_with_schedule_and_distributed(
-        slices, transport, schedule, None,
+        slices, transport, schedule, None, None,
     )
 }
 
@@ -23121,6 +23592,7 @@ fn run_mounted_placed_resident_stream_tick_slices_in_process_with_schedule_and_d
     transport: &mut VulkanInProcessPlacedCableTransport,
     schedule: &VulkanMountedPlacedResidentInProcessSchedule,
     distributed_runners: Option<&VulkanDistributedDispatchRunners>,
+    cable_synchronizations: Option<&VulkanPlacedCableTimelineSynchronizations>,
 ) -> Result<
     VulkanMountedPlacedResidentInProcessStreamTickRun,
     VulkanMountedPlacedResidentInProcessStreamTickError,
@@ -23130,6 +23602,15 @@ fn run_mounted_placed_resident_stream_tick_slices_in_process_with_schedule_and_d
         .map_err(VulkanMountedPlacedResidentInProcessStreamTickError::Schedule)?;
     transport.reset_tick_state();
     register_in_process_direct_cable_copies(slices, transport)?;
+    if cable_synchronizations
+        .is_some_and(VulkanPlacedCableTimelineSynchronizations::has_pending_dependencies)
+    {
+        return Err(
+            VulkanMountedPlacedResidentInProcessStreamTickError::Schedule(VulkanError(
+                "placed cable timeline state leaked across stream ticks".to_string(),
+            )),
+        );
+    }
 
     let mut completed_stage_delta = 0usize;
     let device_by_id = slices
@@ -23142,12 +23623,19 @@ fn run_mounted_placed_resident_stream_tick_slices_in_process_with_schedule_and_d
             if let Some(runners) = distributed_runners
                 && !slices[*device_index].cursor.capture_execution_trace
             {
+                let cable_synchronizations = cable_synchronizations.ok_or_else(|| {
+                    VulkanMountedPlacedResidentInProcessStreamTickError::Schedule(VulkanError(
+                        "compact placed execution requires mounted cable timeline synchronization"
+                            .to_string(),
+                    ))
+                })?;
                 let device_completed_stage_delta =
                     advance_compact_slice_with_distributed_dependencies(
                         &mut slices[*device_index],
                         &device_by_id,
                         transport,
                         runners,
+                        cable_synchronizations,
                     )?;
                 if device_completed_stage_delta == 0 {
                     return Err(
@@ -23261,6 +23749,15 @@ fn run_mounted_placed_resident_stream_tick_slices_in_process_with_schedule_and_d
                 "placed activation schedule ended with pending devices {:?}",
                 pending_in_process_stream_tick_device_ids(slices)
             ))),
+        );
+    }
+    if cable_synchronizations
+        .is_some_and(VulkanPlacedCableTimelineSynchronizations::has_pending_dependencies)
+    {
+        return Err(
+            VulkanMountedPlacedResidentInProcessStreamTickError::Schedule(VulkanError(
+                "placed cable timeline dependencies were not consumed".to_string(),
+            )),
         );
     }
 
@@ -28089,6 +28586,34 @@ mod tests {
         assert_eq!(lan.hosted_pedal_ids, vec!["layer_03".to_string()]);
         assert_eq!(lan.resident_plan.permanent_parameters.len(), 8);
         assert_eq!(lan.resident_plan.state_view_signal_count, 1);
+
+        let cable_plans = vec![
+            gpu0_cable_io,
+            gpu1_cable_io,
+            VulkanPlacedCableIoPlan::from_placed_resident_plan(&cpu0).unwrap(),
+            VulkanPlacedCableIoPlan::from_placed_resident_plan(&lan).unwrap(),
+        ];
+        let cable_pairs = pair_placed_cable_endpoints(&cable_plans).unwrap();
+        assert_eq!(cable_pairs.len(), 4);
+        assert!(cable_pairs.iter().all(|(outgoing, incoming)| {
+            VulkanPlacedCablePacketKey::from_outgoing_endpoint(outgoing)
+                == VulkanPlacedCablePacketKey::from_incoming_endpoint(incoming)
+                && outgoing.byte_capacity == incoming.byte_capacity
+        }));
+
+        let mut incomplete_plans = cable_plans;
+        let plan_with_incoming = incomplete_plans
+            .iter_mut()
+            .find(|plan| plan.incoming_endpoint_count > 0)
+            .unwrap();
+        let incoming_index = plan_with_incoming
+            .endpoints
+            .iter()
+            .position(|endpoint| endpoint.direction == VulkanPlacedCableDirection::Incoming)
+            .unwrap();
+        plan_with_incoming.endpoints.remove(incoming_index);
+        let error = pair_placed_cable_endpoints(&incomplete_plans).unwrap_err();
+        assert!(error.to_string().contains("has no incoming endpoint"));
     }
 
     #[test]

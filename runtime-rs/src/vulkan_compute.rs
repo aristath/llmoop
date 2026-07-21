@@ -312,6 +312,13 @@ impl VulkanResidentBuffer {
         self._shared_host_allocation.is_some()
     }
 
+    pub fn shares_host_allocation_with(&self, other: &Self) -> bool {
+        self._shared_host_allocation
+            .as_ref()
+            .zip(other._shared_host_allocation.as_ref())
+            .is_some_and(|(left, right)| Arc::ptr_eq(left, right))
+    }
+
     pub fn is_persistently_mapped(&self) -> bool {
         self.persistent_mapping.is_some()
     }
@@ -1230,6 +1237,10 @@ impl VulkanComputeDevice {
 
     pub fn owns_resident_buffer(&self, buffer: &VulkanResidentBuffer) -> bool {
         self.device.handle() == buffer.device.handle()
+    }
+
+    pub fn shares_logical_device_with(&self, other: &Self) -> bool {
+        self.device.handle() == other.device.handle()
     }
 
     pub fn create_shared_host_allocation(
