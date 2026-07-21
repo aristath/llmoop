@@ -3526,7 +3526,7 @@ impl VulkanResidentBatchedInputEmbeddingRunner {
                 )),
             ));
         }
-        let mut bytes = Vec::with_capacity(token_ids.len() * std::mem::size_of::<u32>());
+        let mut bytes = Vec::with_capacity(std::mem::size_of_val(token_ids));
         for token_id in token_ids {
             bytes.extend_from_slice(&token_id.to_le_bytes());
         }
@@ -13465,8 +13465,10 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
                                 ))
                             })
                     })?;
-            if signal_bytes_per_lane > 0 {
-                width = width.min((SIGNAL_MEMORY_BUDGET_PER_DEVICE / signal_bytes_per_lane).max(1));
+            if let Some(memory_width) =
+                SIGNAL_MEMORY_BUDGET_PER_DEVICE.checked_div(signal_bytes_per_lane)
+            {
+                width = width.min(memory_width.max(1));
             }
 
             if let Some(causal_scan_tile_width) = slice
@@ -13493,9 +13495,10 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
                     })
                 })
                 .count();
-            if scalar_dispatches_per_lane > 0 {
-                width = width
-                    .min((RECORDED_DISPATCH_BUDGET_PER_DEVICE / scalar_dispatches_per_lane).max(1));
+            if let Some(dispatch_width) =
+                RECORDED_DISPATCH_BUDGET_PER_DEVICE.checked_div(scalar_dispatches_per_lane)
+            {
+                width = width.min(dispatch_width.max(1));
             }
         }
         Ok(width.max(1))
@@ -13725,10 +13728,8 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
                     next_device_index,
                     outgoing.endpoint.cable_index,
                 )?;
-                let transferred_bytes = outgoing
-                    .byte_capacity
-                    .checked_mul(input_token_ids.len())
-                    .unwrap_or(usize::MAX);
+                let transferred_bytes =
+                    outgoing.byte_capacity.saturating_mul(input_token_ids.len());
                 transport_stats.direct_copy_count =
                     transport_stats.direct_copy_count.saturating_add(1);
                 transport_stats.direct_copy_byte_count = transport_stats
@@ -15497,16 +15498,14 @@ impl VulkanResidentInProcessPlacedPromptStream {
             sample_last,
         )?;
 
-        for block_index in 0..block_width {
+        for (block_index, input_token_id) in input_token_ids.iter().enumerate() {
             let stream_tick = self.session.next_stream_tick;
             let activation = self
                 .active_input_event
                 .as_ref()
                 .and_then(VulkanResidentInProcessPlacedActivePromptEvent::next_activation)
                 .ok_or(VulkanResidentInProcessPlacedRuntimeError::MissingPrivateFeedback)?;
-            if activation.input_is_feedback
-                || activation.input_token_id != input_token_ids[block_index]
-            {
+            if activation.input_is_feedback || activation.input_token_id != *input_token_id {
                 return Err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop(
                     VulkanError(
                         "temporal block diverged from the external input queue".to_string(),
