@@ -305,6 +305,14 @@ def build_vulkan_resident_package_manifest(
         f"{vocab_size}x{hidden_size}_scale{shader_float_token(output_scale)}_to_f32.comp"
     )
     norm_shader_file = rms_norm_shader_file(hidden_size, norm_eps, norm_weight_offset)
+    norm_batch_lane_tile_width = projection_batch_lane_tile_width
+    norm_batch_shader_file = weight_shared_batch_shader_file(
+        norm_shader_file, tile_width=norm_batch_lane_tile_width
+    )
+    if norm_batch_shader_file is None:
+        raise ModelCompileError(
+            f"output normalization shader {norm_shader_file!r} has no batch implementation"
+        )
 
     source_circuits = {}
     compiled_circuits = {}
@@ -388,6 +396,7 @@ def build_vulkan_resident_package_manifest(
         projection_shader_file=projection_shader_file,
         projection_batch_shader_file=projection_batch_shader_file,
         norm_shader_file=norm_shader_file,
+        norm_batch_shader_file=norm_batch_shader_file,
         sampler_shader_files={
             kernel["shader_path"].removeprefix("shaders/").removesuffix(".spv")
             + ".comp"
@@ -508,6 +517,10 @@ def build_vulkan_resident_package_manifest(
             "embedding_norm_shader_path": compiled_shader_path(
                 f"shaders/{norm_shader_file}"
             ),
+            "embedding_norm_batch_shader_path": compiled_shader_path(
+                f"shaders/{norm_batch_shader_file}"
+            ),
+            "embedding_norm_batch_lane_tile_width": norm_batch_lane_tile_width,
             "projection_shader_path": compiled_shader_path(
                 f"shaders/{projection_shader_file}"
             ),
@@ -1899,10 +1912,12 @@ def required_shader_files(
     projection_shader_file: str,
     projection_batch_shader_file: str,
     norm_shader_file: str,
+    norm_batch_shader_file: str,
     sampler_shader_files: set[str],
 ) -> set[str]:
     return {
         norm_shader_file,
+        norm_batch_shader_file,
         *sampler_shader_files,
         embedding_shader_file,
         embedding_batch_shader_file,
@@ -4354,10 +4369,18 @@ def validate_compiled_generation_contract(
             not isinstance(output_package.get(field), str) or not output_package[field]
             for field in (
                 "embedding_norm_shader_path",
+                "embedding_norm_batch_shader_path",
                 "projection_shader_path",
                 "projection_batch_shader_path",
             )
         )
+        or not isinstance(
+            output_package.get("embedding_norm_batch_lane_tile_width"), int
+        )
+        or isinstance(
+            output_package.get("embedding_norm_batch_lane_tile_width"), bool
+        )
+        or output_package["embedding_norm_batch_lane_tile_width"] <= 0
         or not isinstance(output_package.get("projection_batch_lane_tile_width"), int)
         or isinstance(output_package.get("projection_batch_lane_tile_width"), bool)
         or output_package["projection_batch_lane_tile_width"] <= 0

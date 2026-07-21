@@ -374,6 +374,8 @@ def minimal_package(root: Path) -> dict[str, object]:
                 "input_signal_id": "output_frame",
             },
             "embedding_norm_shader_path": "shaders/kernel.spv",
+            "embedding_norm_batch_shader_path": "shaders/kernel.spv",
+            "embedding_norm_batch_lane_tile_width": 4,
             "projection_shader_path": "shaders/kernel.spv",
             "projection_batch_shader_path": "shaders/kernel.spv",
             "projection_batch_lane_tile_width": 4,
