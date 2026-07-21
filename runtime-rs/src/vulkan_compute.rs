@@ -1045,15 +1045,29 @@ impl VulkanComputeDeviceCatalog {
                     physical_device,
                     ash::khr::external_semaphore_fd::NAME,
                 )? && physical_device_supports_opaque_fd_semaphore(instance, physical_device);
+            let (timeline_semaphore_supported, synchronization2_supported) =
+                physical_device_supports_modern_submission(instance, physical_device);
+            if !timeline_semaphore_supported || !synchronization2_supported {
+                return Err(VulkanError(format!(
+                    "Vulkan device {device_name:?} does not support the required timeline-semaphore and synchronization2 execution contract"
+                )));
+            }
             let mut shader_float8_features =
                 VulkanPhysicalDeviceShaderFloat8FeaturesExt::disabled();
             let mut shader_bfloat16_features =
                 VulkanPhysicalDeviceShaderBfloat16FeaturesKhr::disabled();
             let mut cooperative_matrix_features =
                 vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default();
+            let mut timeline_semaphore_features =
+                vk::PhysicalDeviceTimelineSemaphoreFeatures::default().timeline_semaphore(true);
+            let mut synchronization2_features =
+                vk::PhysicalDeviceSynchronization2Features::default().synchronization2(true);
             let mut extension_names = Vec::new();
             let mut enabled_device_extensions = BTreeSet::new();
-            let mut device_info = vk::DeviceCreateInfo::default().queue_create_infos(&queue_info);
+            let mut device_info = vk::DeviceCreateInfo::default()
+                .queue_create_infos(&queue_info)
+                .push_next(&mut timeline_semaphore_features)
+                .push_next(&mut synchronization2_features);
             if shader_float8_supported {
                 shader_float8_features.shader_float8 = vk::TRUE;
                 extension_names.push(VK_EXT_SHADER_FLOAT8_NAME.as_ptr());
@@ -2189,15 +2203,22 @@ impl VulkanComputeDevice {
         for semaphore in wait_semaphores.iter().chain(signal_semaphores) {
             self.validate_local_queue_semaphore(semaphore)?;
         }
-        let wait_handles = wait_semaphores
+        let wait_infos = wait_semaphores
             .iter()
-            .map(|semaphore| semaphore.semaphore)
+            .map(|semaphore| {
+                vk::SemaphoreSubmitInfo::default()
+                    .semaphore(semaphore.semaphore)
+                    .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+            })
             .collect::<Vec<_>>();
-        let signal_handles = signal_semaphores
+        let signal_infos = signal_semaphores
             .iter()
-            .map(|semaphore| semaphore.semaphore)
+            .map(|semaphore| {
+                vk::SemaphoreSubmitInfo::default()
+                    .semaphore(semaphore.semaphore)
+                    .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+            })
             .collect::<Vec<_>>();
-        let wait_stage_masks = vec![vk::PipelineStageFlags::ALL_COMMANDS; wait_handles.len()];
         unsafe {
             self.device
                 .reset_fences(&[completion_fence])
@@ -2206,14 +2227,15 @@ impl VulkanComputeDevice {
                         "failed to reset {label} completion fence: {error:?}"
                     ))
                 })?;
-            let command_buffers = [command_buffer];
-            let submit_info = [vk::SubmitInfo::default()
-                .wait_semaphores(&wait_handles)
-                .wait_dst_stage_mask(&wait_stage_masks)
-                .command_buffers(&command_buffers)
-                .signal_semaphores(&signal_handles)];
+            let command_buffers = [
+                vk::CommandBufferSubmitInfo::default().command_buffer(command_buffer),
+            ];
+            let submit_info = [vk::SubmitInfo2::default()
+                .wait_semaphore_infos(&wait_infos)
+                .command_buffer_infos(&command_buffers)
+                .signal_semaphore_infos(&signal_infos)];
             self.device
-                .queue_submit(self.queue, &submit_info, completion_fence)
+                .queue_submit2(self.queue, &submit_info, completion_fence)
                 .map_err(|error| VulkanError(format!("failed to submit {label}: {error:?}")))?;
         }
         Ok(())
@@ -2960,6 +2982,24 @@ fn physical_device_supports_opaque_fd_semaphore(
     ) && properties
         .compatible_handle_types
         .contains(VULKAN_PERSISTENT_CROSS_DEVICE_SYNC_HANDLE_TYPE)
+}
+
+fn physical_device_supports_modern_submission(
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+) -> (bool, bool) {
+    let mut timeline_semaphore = vk::PhysicalDeviceTimelineSemaphoreFeatures::default();
+    let mut synchronization2 = vk::PhysicalDeviceSynchronization2Features::default();
+    let mut features = vk::PhysicalDeviceFeatures2::default()
+        .push_next(&mut timeline_semaphore)
+        .push_next(&mut synchronization2);
+    unsafe {
+        instance.get_physical_device_features2(physical_device, &mut features);
+    }
+    (
+        timeline_semaphore.timeline_semaphore == vk::TRUE,
+        synchronization2.synchronization2 == vk::TRUE,
+    )
 }
 
 fn physical_device_supports_shader_float8(
