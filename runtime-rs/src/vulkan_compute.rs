@@ -19,8 +19,6 @@ const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_BFLOAT16_FEATURES_KHR: i32 = 1_00
 const VK_COMPONENT_TYPE_BFLOAT16_KHR: i32 = 1_000_141_000;
 const VULKAN_SHARED_HOST_MEMORY_HANDLE_TYPE: vk::ExternalMemoryHandleTypeFlags =
     vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT;
-const VULKAN_TRANSIENT_CROSS_DEVICE_SYNC_HANDLE_TYPE: vk::ExternalSemaphoreHandleTypeFlags =
-    vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD;
 const VULKAN_PERSISTENT_CROSS_DEVICE_SYNC_HANDLE_TYPE: vk::ExternalSemaphoreHandleTypeFlags =
     vk::ExternalSemaphoreHandleTypeFlags::OPAQUE_FD;
 
@@ -93,7 +91,6 @@ pub struct VulkanComputeDevice {
     device_name: String,
     enabled_device_extensions: BTreeSet<String>,
     shared_host_memory_alignment: Option<usize>,
-    sync_fd_semaphore_supported: bool,
     opaque_fd_semaphore_supported: bool,
     cooperative_bfloat16_shapes: BTreeSet<(u32, u32, u32)>,
     subgroup_size: u32,
@@ -184,9 +181,7 @@ pub struct VulkanQueueSemaphore {
     device: ash::Device,
     device_handle: vk::Device,
     semaphore: vk::Semaphore,
-    external_export_handle_type: Option<vk::ExternalSemaphoreHandleTypeFlags>,
-    pending_sync_fd_signal: Cell<bool>,
-    temporary_sync_fd_imported: Cell<bool>,
+    opaque_fd_exportable: bool,
     permanent_opaque_fd_imported: Cell<bool>,
 }
 
@@ -1044,12 +1039,6 @@ impl VulkanComputeDeviceCatalog {
                 } else {
                     None
                 };
-            let sync_fd_semaphore_supported =
-                physical_device_supports_extension(
-                    instance,
-                    physical_device,
-                    ash::khr::external_semaphore_fd::NAME,
-                )? && physical_device_supports_sync_fd_semaphore(instance, physical_device);
             let opaque_fd_semaphore_supported =
                 physical_device_supports_extension(
                     instance,
@@ -1093,7 +1082,7 @@ impl VulkanComputeDeviceCatalog {
                         .into_owned(),
                 );
             }
-            if sync_fd_semaphore_supported || opaque_fd_semaphore_supported {
+            if opaque_fd_semaphore_supported {
                 extension_names.push(ash::khr::external_semaphore_fd::NAME.as_ptr());
                 enabled_device_extensions.insert(
                     ash::khr::external_semaphore_fd::NAME
@@ -1135,7 +1124,6 @@ impl VulkanComputeDeviceCatalog {
                 device_name,
                 enabled_device_extensions,
                 shared_host_memory_alignment,
-                sync_fd_semaphore_supported,
                 opaque_fd_semaphore_supported,
                 cooperative_bfloat16_shapes,
                 subgroup_size,
@@ -1207,10 +1195,6 @@ impl VulkanComputeDevice {
 
     pub fn supports_shared_host_memory(&self) -> bool {
         self.shared_host_memory_alignment.is_some()
-    }
-
-    pub fn supports_sync_fd_semaphores(&self) -> bool {
-        self.sync_fd_semaphore_supported
     }
 
     pub fn supports_opaque_fd_semaphores(&self) -> bool {
@@ -1414,21 +1398,7 @@ impl VulkanComputeDevice {
     }
 
     pub fn create_queue_semaphore(&self) -> Result<VulkanQueueSemaphore, VulkanError> {
-        self.create_queue_semaphore_with_external_export(None)
-    }
-
-    pub fn create_sync_fd_exportable_queue_semaphore(
-        &self,
-    ) -> Result<VulkanQueueSemaphore, VulkanError> {
-        if !self.sync_fd_semaphore_supported {
-            return Err(VulkanError(format!(
-                "Vulkan device {:?} cannot export sync-file semaphores",
-                self.device_name
-            )));
-        }
-        self.create_queue_semaphore_with_external_export(Some(
-            VULKAN_TRANSIENT_CROSS_DEVICE_SYNC_HANDLE_TYPE,
-        ))
+        self.create_queue_semaphore_with_opaque_fd_export(false)
     }
 
     pub fn create_opaque_fd_exportable_queue_semaphore(
@@ -1440,18 +1410,16 @@ impl VulkanComputeDevice {
                 self.device_name
             )));
         }
-        self.create_queue_semaphore_with_external_export(Some(
-            VULKAN_PERSISTENT_CROSS_DEVICE_SYNC_HANDLE_TYPE,
-        ))
+        self.create_queue_semaphore_with_opaque_fd_export(true)
     }
 
-    fn create_queue_semaphore_with_external_export(
+    fn create_queue_semaphore_with_opaque_fd_export(
         &self,
-        external_export_handle_type: Option<vk::ExternalSemaphoreHandleTypeFlags>,
+        opaque_fd_exportable: bool,
     ) -> Result<VulkanQueueSemaphore, VulkanError> {
-        let semaphore = if let Some(handle_type) = external_export_handle_type {
-            let mut export_info =
-                vk::ExportSemaphoreCreateInfo::default().handle_types(handle_type);
+        let semaphore = if opaque_fd_exportable {
+            let mut export_info = vk::ExportSemaphoreCreateInfo::default()
+                .handle_types(VULKAN_PERSISTENT_CROSS_DEVICE_SYNC_HANDLE_TYPE);
             let create_info = vk::SemaphoreCreateInfo::default().push_next(&mut export_info);
             unsafe { self.device.create_semaphore(&create_info, None) }
         } else {
@@ -1465,76 +1433,9 @@ impl VulkanComputeDevice {
             device: self.device.clone(),
             device_handle: self.device.handle(),
             semaphore,
-            external_export_handle_type,
-            pending_sync_fd_signal: Cell::new(false),
-            temporary_sync_fd_imported: Cell::new(false),
+            opaque_fd_exportable,
             permanent_opaque_fd_imported: Cell::new(false),
         })
-    }
-
-    pub fn export_pending_queue_semaphore_sync_fd(
-        &self,
-        semaphore: &VulkanQueueSemaphore,
-    ) -> Result<OwnedFd, VulkanError> {
-        self.validate_local_queue_semaphore(semaphore)?;
-        if semaphore.external_export_handle_type
-            != Some(VULKAN_TRANSIENT_CROSS_DEVICE_SYNC_HANDLE_TYPE)
-        {
-            return Err(VulkanError(
-                "queue semaphore was not created for sync-file export".to_string(),
-            ));
-        }
-        if !semaphore.pending_sync_fd_signal.get() {
-            return Err(VulkanError(
-                "sync-file export requires a pending queue signal operation".to_string(),
-            ));
-        }
-        let loader =
-            ash::khr::external_semaphore_fd::Device::new(&self.context.instance, &self.device);
-        let get_info = vk::SemaphoreGetFdInfoKHR::default()
-            .semaphore(semaphore.semaphore)
-            .handle_type(VULKAN_TRANSIENT_CROSS_DEVICE_SYNC_HANDLE_TYPE);
-        let fd = unsafe { loader.get_semaphore_fd(&get_info) }.map_err(|error| {
-            VulkanError(format!(
-                "failed to export pending queue semaphore as sync file: {error:?}"
-            ))
-        })?;
-        semaphore.pending_sync_fd_signal.set(false);
-        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
-    }
-
-    pub fn import_queue_semaphore_sync_fd(
-        &self,
-        semaphore: &VulkanQueueSemaphore,
-        fd: OwnedFd,
-    ) -> Result<(), VulkanError> {
-        self.validate_local_queue_semaphore(semaphore)?;
-        if !self.sync_fd_semaphore_supported {
-            return Err(VulkanError(format!(
-                "Vulkan device {:?} cannot import sync-file semaphores",
-                self.device_name
-            )));
-        }
-        if semaphore.temporary_sync_fd_imported.get() {
-            return Err(VulkanError(
-                "queue semaphore already has an unconsumed temporary sync-file payload".to_string(),
-            ));
-        }
-        let import_info = vk::ImportSemaphoreFdInfoKHR::default()
-            .semaphore(semaphore.semaphore)
-            .flags(vk::SemaphoreImportFlags::TEMPORARY)
-            .handle_type(VULKAN_TRANSIENT_CROSS_DEVICE_SYNC_HANDLE_TYPE)
-            .fd(fd.as_raw_fd());
-        let loader =
-            ash::khr::external_semaphore_fd::Device::new(&self.context.instance, &self.device);
-        unsafe { loader.import_semaphore_fd(&import_info) }.map_err(|error| {
-            VulkanError(format!(
-                "failed to import queue semaphore sync file: {error:?}"
-            ))
-        })?;
-        let _fd_owned_by_vulkan = fd.into_raw_fd();
-        semaphore.temporary_sync_fd_imported.set(true);
-        Ok(())
     }
 
     pub fn export_queue_semaphore_opaque_fd(
@@ -1542,9 +1443,7 @@ impl VulkanComputeDevice {
         semaphore: &VulkanQueueSemaphore,
     ) -> Result<OwnedFd, VulkanError> {
         self.validate_local_queue_semaphore(semaphore)?;
-        if semaphore.external_export_handle_type
-            != Some(VULKAN_PERSISTENT_CROSS_DEVICE_SYNC_HANDLE_TYPE)
-        {
+        if !semaphore.opaque_fd_exportable {
             return Err(VulkanError(
                 "queue semaphore was not created for persistent opaque-file export".to_string(),
             ));
@@ -2290,16 +2189,6 @@ impl VulkanComputeDevice {
         for semaphore in wait_semaphores.iter().chain(signal_semaphores) {
             self.validate_local_queue_semaphore(semaphore)?;
         }
-        if signal_semaphores.iter().any(|semaphore| {
-            semaphore.external_export_handle_type
-                == Some(VULKAN_TRANSIENT_CROSS_DEVICE_SYNC_HANDLE_TYPE)
-                && semaphore.pending_sync_fd_signal.get()
-        }) {
-            return Err(VulkanError(
-                "cannot signal a sync-file semaphore before exporting its pending payload"
-                    .to_string(),
-            ));
-        }
         let wait_handles = wait_semaphores
             .iter()
             .map(|semaphore| semaphore.semaphore)
@@ -2326,18 +2215,6 @@ impl VulkanComputeDevice {
             self.device
                 .queue_submit(self.queue, &submit_info, completion_fence)
                 .map_err(|error| VulkanError(format!("failed to submit {label}: {error:?}")))?;
-        }
-        for semaphore in signal_semaphores {
-            if semaphore.external_export_handle_type
-                == Some(VULKAN_TRANSIENT_CROSS_DEVICE_SYNC_HANDLE_TYPE)
-            {
-                semaphore.pending_sync_fd_signal.set(true);
-            }
-        }
-        for semaphore in wait_semaphores {
-            if semaphore.temporary_sync_fd_imported.get() {
-                semaphore.temporary_sync_fd_imported.set(false);
-            }
         }
         Ok(())
     }
@@ -3063,34 +2940,12 @@ fn physical_device_shared_host_memory_alignment(
     Ok(alignment)
 }
 
-fn physical_device_supports_sync_fd_semaphore(
-    instance: &ash::Instance,
-    physical_device: vk::PhysicalDevice,
-) -> bool {
-    physical_device_supports_external_semaphore_handle(
-        instance,
-        physical_device,
-        VULKAN_TRANSIENT_CROSS_DEVICE_SYNC_HANDLE_TYPE,
-    )
-}
-
 fn physical_device_supports_opaque_fd_semaphore(
     instance: &ash::Instance,
     physical_device: vk::PhysicalDevice,
 ) -> bool {
-    physical_device_supports_external_semaphore_handle(
-        instance,
-        physical_device,
-        VULKAN_PERSISTENT_CROSS_DEVICE_SYNC_HANDLE_TYPE,
-    )
-}
-
-fn physical_device_supports_external_semaphore_handle(
-    instance: &ash::Instance,
-    physical_device: vk::PhysicalDevice,
-    handle_type: vk::ExternalSemaphoreHandleTypeFlags,
-) -> bool {
-    let info = vk::PhysicalDeviceExternalSemaphoreInfo::default().handle_type(handle_type);
+    let info = vk::PhysicalDeviceExternalSemaphoreInfo::default()
+        .handle_type(VULKAN_PERSISTENT_CROSS_DEVICE_SYNC_HANDLE_TYPE);
     let mut properties = vk::ExternalSemaphoreProperties::default();
     unsafe {
         instance.get_physical_device_external_semaphore_properties(
@@ -3102,7 +2957,9 @@ fn physical_device_supports_external_semaphore_handle(
     properties.external_semaphore_features.contains(
         vk::ExternalSemaphoreFeatureFlags::EXPORTABLE
             | vk::ExternalSemaphoreFeatureFlags::IMPORTABLE,
-    ) && properties.compatible_handle_types.contains(handle_type)
+    ) && properties
+        .compatible_handle_types
+        .contains(VULKAN_PERSISTENT_CROSS_DEVICE_SYNC_HANDLE_TYPE)
 }
 
 fn physical_device_supports_shader_float8(
@@ -3878,7 +3735,7 @@ mod tests {
     }
 
     #[test]
-    fn cross_device_shared_host_memory_uses_sync_file_dependencies() {
+    fn cross_device_shared_host_memory_reuses_persistent_semaphore_dependencies() {
         let Some(spirv_words) = compile_test_shader_words() else {
             eprintln!("skipping cross-device Vulkan test: no GLSL to SPIR-V compiler found");
             return;
@@ -3900,8 +3757,8 @@ mod tests {
         let worker = VulkanComputeDevice::new_for_physical_device_index(worker_index).unwrap();
         assert!(owner.supports_shared_host_memory());
         assert!(worker.supports_shared_host_memory());
-        assert!(owner.supports_sync_fd_semaphores());
-        assert!(worker.supports_sync_fd_semaphores());
+        assert!(owner.supports_opaque_fd_semaphores());
+        assert!(worker.supports_opaque_fd_semaphores());
 
         let allocation = owner.create_shared_host_allocation(&[&worker], 12).unwrap();
         let owner_buffer = owner
@@ -3954,53 +3811,57 @@ mod tests {
             )
             .unwrap();
 
-        let ready_source = owner.create_sync_fd_exportable_queue_semaphore().unwrap();
+        let ready_source = owner.create_opaque_fd_exportable_queue_semaphore().unwrap();
         let ready_wait = worker.create_queue_semaphore().unwrap();
-        let done_source = worker.create_sync_fd_exportable_queue_semaphore().unwrap();
-        let done_wait = owner.create_queue_semaphore().unwrap();
-
-        owner
-            .submit_recorded_resident_kernel_sequence_with_semaphores(
-                &owner_first,
-                &[],
-                &[&ready_source],
-            )
-            .unwrap();
         worker
-            .import_queue_semaphore_sync_fd(
+            .import_queue_semaphore_opaque_fd(
                 &ready_wait,
                 owner
-                    .export_pending_queue_semaphore_sync_fd(&ready_source)
+                    .export_queue_semaphore_opaque_fd(&ready_source)
                     .unwrap(),
             )
             .unwrap();
-        worker
-            .submit_recorded_resident_kernel_sequence_with_semaphores(
-                &worker_sequence,
-                &[&ready_wait],
-                &[&done_source],
-            )
+        let done_source = worker
+            .create_opaque_fd_exportable_queue_semaphore()
             .unwrap();
+        let done_wait = owner.create_queue_semaphore().unwrap();
         owner
-            .import_queue_semaphore_sync_fd(
+            .import_queue_semaphore_opaque_fd(
                 &done_wait,
                 worker
-                    .export_pending_queue_semaphore_sync_fd(&done_source)
+                    .export_queue_semaphore_opaque_fd(&done_source)
                     .unwrap(),
             )
             .unwrap();
-        owner
-            .submit_recorded_resident_kernel_sequence_with_semaphores(
-                &owner_last,
-                &[&done_wait],
-                &[],
-            )
-            .unwrap();
-        owner.wait_resident_kernel_sequence(&owner_last).unwrap();
+
+        for _ in 0..2 {
+            owner
+                .submit_recorded_resident_kernel_sequence_with_semaphores(
+                    &owner_first,
+                    &[],
+                    &[&ready_source],
+                )
+                .unwrap();
+            worker
+                .submit_recorded_resident_kernel_sequence_with_semaphores(
+                    &worker_sequence,
+                    &[&ready_wait],
+                    &[&done_source],
+                )
+                .unwrap();
+            owner
+                .submit_recorded_resident_kernel_sequence_with_semaphores(
+                    &owner_last,
+                    &[&done_wait],
+                    &[],
+                )
+                .unwrap();
+            owner.wait_resident_kernel_sequence(&owner_last).unwrap();
+        }
 
         assert_eq!(
             bytes_to_u32(&owner_buffer.read_bytes(12).unwrap()),
-            vec![4, 5, 44]
+            vec![7, 8, 47]
         );
     }
 

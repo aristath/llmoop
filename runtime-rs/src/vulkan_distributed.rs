@@ -1008,31 +1008,51 @@ impl VulkanDistributedDispatchRunners {
                         planned_shard.device_id
                     ))
                 })?;
-                if !owner_device.supports_sync_fd_semaphores()
-                    || !helper_device.supports_sync_fd_semaphores()
+                if !owner_device.supports_opaque_fd_semaphores()
+                    || !helper_device.supports_opaque_fd_semaphores()
                 {
                     return Err(VulkanDistributedDispatchRunnerError(format!(
-                        "distributed dispatch {}.{} requires sync-file semaphores on owner {:?} and helper {:?}",
+                        "distributed dispatch {}.{} requires persistent opaque-file semaphores on owner {:?} and helper {:?}",
                         planned_dispatch.pedal_id,
                         planned_dispatch.node_id,
                         planned_dispatch.owner_device_id,
                         planned_shard.device_id
                     )));
                 }
+                let ready_source = owner_device
+                    .create_opaque_fd_exportable_queue_semaphore()
+                    .map_err(VulkanDistributedDispatchRunnerError::from)?;
+                let ready_wait = helper_device
+                    .create_queue_semaphore()
+                    .map_err(VulkanDistributedDispatchRunnerError::from)?;
+                helper_device
+                    .import_queue_semaphore_opaque_fd(
+                        &ready_wait,
+                        owner_device
+                            .export_queue_semaphore_opaque_fd(&ready_source)
+                            .map_err(VulkanDistributedDispatchRunnerError::from)?,
+                    )
+                    .map_err(VulkanDistributedDispatchRunnerError::from)?;
+                let done_source = helper_device
+                    .create_opaque_fd_exportable_queue_semaphore()
+                    .map_err(VulkanDistributedDispatchRunnerError::from)?;
+                let done_wait = owner_device
+                    .create_queue_semaphore()
+                    .map_err(VulkanDistributedDispatchRunnerError::from)?;
+                owner_device
+                    .import_queue_semaphore_opaque_fd(
+                        &done_wait,
+                        helper_device
+                            .export_queue_semaphore_opaque_fd(&done_source)
+                            .map_err(VulkanDistributedDispatchRunnerError::from)?,
+                    )
+                    .map_err(VulkanDistributedDispatchRunnerError::from)?;
                 helper_synchronization.push(VulkanDistributedDispatchHelperSynchronization {
                     device_id: planned_shard.device_id.clone(),
-                    ready_source: owner_device
-                        .create_sync_fd_exportable_queue_semaphore()
-                        .map_err(VulkanDistributedDispatchRunnerError::from)?,
-                    ready_wait: helper_device
-                        .create_queue_semaphore()
-                        .map_err(VulkanDistributedDispatchRunnerError::from)?,
-                    done_source: helper_device
-                        .create_sync_fd_exportable_queue_semaphore()
-                        .map_err(VulkanDistributedDispatchRunnerError::from)?,
-                    done_wait: owner_device
-                        .create_queue_semaphore()
-                        .map_err(VulkanDistributedDispatchRunnerError::from)?,
+                    ready_source,
+                    ready_wait,
+                    done_source,
+                    done_wait,
                 });
             }
             dispatches.push(VulkanDistributedDispatchRunner {
@@ -1111,11 +1131,6 @@ impl VulkanDistributedDispatchRunners {
                 "distributed runner has no dispatch {dispatch_index} owned by {owner_device_id:?}"
             ))
         })?;
-        let owner_device = device_for(owner_device_id).map_err(|error| {
-            VulkanDistributedDispatchRunnerError(format!(
-                "failed to resolve distributed owner device {owner_device_id:?}: {error}"
-            ))
-        })?;
         let resolved_shards = dispatch
             .shards
             .iter()
@@ -1130,22 +1145,6 @@ impl VulkanDistributedDispatchRunners {
                     })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        if consume_owner_ready_signal {
-            for synchronization in &dispatch.helper_synchronization {
-                let helper_device = resolved_shards
-                    .iter()
-                    .find(|(shard, _)| shard.planned.device_id == synchronization.device_id)
-                    .map(|(_, device)| *device)
-                    .expect("every helper synchronization belongs to a resolved shard");
-                let ready_fd = owner_device
-                    .export_pending_queue_semaphore_sync_fd(&synchronization.ready_source)
-                    .map_err(VulkanDistributedDispatchRunnerError::from)?;
-                helper_device
-                    .import_queue_semaphore_sync_fd(&synchronization.ready_wait, ready_fd)
-                    .map_err(VulkanDistributedDispatchRunnerError::from)?;
-            }
-        }
-
         let mut submitted: Vec<(&VulkanComputeDevice, &VulkanDistributedDispatchShardRunner)> =
             Vec::with_capacity(dispatch.shards.len());
         for (shard, device) in resolved_shards {
@@ -1176,37 +1175,6 @@ impl VulkanDistributedDispatchRunners {
                 )));
             }
             submitted.push((device, shard));
-        }
-
-        if prepare_owner_continuation {
-            for synchronization in &dispatch.helper_synchronization {
-                let helper_device = submitted
-                    .iter()
-                    .find(|(_, shard)| shard.planned.device_id == synchronization.device_id)
-                    .map(|(device, _)| *device)
-                    .expect("every helper synchronization belongs to a submitted shard");
-                let done_fd = match helper_device
-                    .export_pending_queue_semaphore_sync_fd(&synchronization.done_source)
-                {
-                    Ok(fd) => fd,
-                    Err(error) => {
-                        for (submitted_device, submitted_shard) in &submitted {
-                            let _ = submitted_device
-                                .wait_resident_kernel_sequence(&submitted_shard.sequence);
-                        }
-                        return Err(VulkanDistributedDispatchRunnerError::from(error));
-                    }
-                };
-                if let Err(error) =
-                    owner_device.import_queue_semaphore_sync_fd(&synchronization.done_wait, done_fd)
-                {
-                    for (submitted_device, submitted_shard) in &submitted {
-                        let _ = submitted_device
-                            .wait_resident_kernel_sequence(&submitted_shard.sequence);
-                    }
-                    return Err(VulkanDistributedDispatchRunnerError::from(error));
-                }
-            }
         }
 
         Ok(VulkanDistributedDispatchRun {
