@@ -2843,13 +2843,15 @@ impl VulkanComputeDevice {
                         );
                     }
                     let transfer_to_compute = [vk::MemoryBarrier::default()
-                        .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                        .src_access_mask(
+                            vk::AccessFlags::TRANSFER_WRITE | vk::AccessFlags::HOST_WRITE,
+                        )
                         .dst_access_mask(
                             vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
                         )];
                     self.device.cmd_pipeline_barrier(
                         sequence.command_buffer,
-                        vk::PipelineStageFlags::TRANSFER,
+                        vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::HOST,
                         vk::PipelineStageFlags::COMPUTE_SHADER,
                         vk::DependencyFlags::empty(),
                         &transfer_to_compute,
