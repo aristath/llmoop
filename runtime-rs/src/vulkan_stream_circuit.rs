@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::fs;
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -26,6 +26,7 @@ use crate::stream_plan::{
     CircuitActivationPlan, PlannedNode, PlannedParameterResource, PlannedPort, SignalProducer,
     SignalStorage, StreamCircuitExecutionPlan, StreamCircuitResourcePlan, TensorIndex,
 };
+use crate::tensor_storage::TensorStorage;
 use crate::vulkan::{DEFAULT_COMPUTE_LOCAL_SIZE_X, DEFAULT_SPIRV_ENTRY_POINT, read_spirv_words};
 use crate::vulkan_compute::{
     VulkanComputeDevice, VulkanError, VulkanResidentBuffer, VulkanResidentBufferCopy,
@@ -643,132 +644,29 @@ fn load_parameter_allocation_from_tensor_index(
     tensor_index: &TensorIndex,
 ) -> Result<VulkanPermanentParameterLoadRecord, VulkanPermanentParameterLoadError> {
     let tensor = &allocation.parameter.tensor;
-    let metadata = tensor_index.tensors.get(tensor).ok_or_else(|| {
+    let storage = TensorStorage::from_index(tensor_index, tensor).map_err(|error| {
         VulkanPermanentParameterLoadError(format!(
-            "tensor index has no metadata for mounted parameter tensor {tensor:?}"
+            "failed to resolve mounted parameter tensor {tensor:?}: {error}"
         ))
     })?;
-    let source_file = metadata.source_file.as_ref().ok_or_else(|| {
-        VulkanPermanentParameterLoadError(format!(
-            "tensor metadata for {tensor:?} has no source_file"
-        ))
-    })?;
-    let offsets = metadata.data_offsets.as_ref().ok_or_else(|| {
-        VulkanPermanentParameterLoadError(format!(
-            "tensor metadata for {tensor:?} has no data_offsets"
-        ))
-    })?;
-    if offsets.len() != 2 {
+    if storage.byte_count != allocation.byte_capacity {
         return Err(VulkanPermanentParameterLoadError(format!(
-            "tensor metadata for {tensor:?} has invalid data_offsets {:?}",
-            offsets
+            "tensor {tensor:?} byte count {} does not match mounted buffer capacity {}",
+            storage.byte_count, allocation.byte_capacity
         )));
     }
-    let data_start = offsets[0];
-    let data_end = offsets[1];
-    if data_end < data_start {
-        return Err(VulkanPermanentParameterLoadError(format!(
-            "tensor metadata for {tensor:?} has reversed data_offsets {:?}",
-            offsets
-        )));
-    }
-    let byte_count = data_end - data_start;
-    if byte_count != allocation.byte_capacity {
-        return Err(VulkanPermanentParameterLoadError(format!(
-            "tensor {tensor:?} byte count {byte_count} does not match mounted buffer capacity {}",
-            allocation.byte_capacity
-        )));
-    }
-    if metadata.byte_count != Some(byte_count) {
-        return Err(VulkanPermanentParameterLoadError(format!(
-            "tensor {tensor:?} metadata byte_count {:?} does not match data_offsets byte count {byte_count}",
-            metadata.byte_count
-        )));
-    }
-
-    let source_path = Path::new(source_file);
-    let data_base = safetensors_data_start(source_path)?;
-    let absolute_start = data_base
-        .checked_add(u64::try_from(data_start).map_err(|_| {
-            VulkanPermanentParameterLoadError(format!(
-                "tensor {tensor:?} data_start {data_start} cannot fit in u64"
-            ))
-        })?)
-        .ok_or_else(|| {
-            VulkanPermanentParameterLoadError(format!(
-                "tensor {tensor:?} absolute data offset overflowed"
-            ))
-        })?;
-    let mut file = fs::File::open(source_path).map_err(|error| {
-        VulkanPermanentParameterLoadError(format!(
-            "failed to open safetensors source {source_file:?}: {error}"
-        ))
-    })?;
-    file.seek(SeekFrom::Start(absolute_start))
-        .map_err(|error| {
-            VulkanPermanentParameterLoadError(format!(
-                "failed to seek safetensors source {source_file:?} to tensor {tensor:?}: {error}"
-            ))
-        })?;
-    let mut bytes = vec![0u8; byte_count];
-    file.read_exact(&mut bytes).map_err(|error| {
-        VulkanPermanentParameterLoadError(format!(
-            "failed to read tensor {tensor:?} from safetensors source {source_file:?}: {error}"
-        ))
-    })?;
-    validate_tensor_data_sha256(tensor, metadata.data_sha256.as_deref(), &bytes)?;
+    let bytes = storage
+        .read_all()
+        .map_err(|error| VulkanPermanentParameterLoadError(error.to_string()))?;
     allocation.buffer.write_bytes(&bytes)?;
 
     Ok(VulkanPermanentParameterLoadRecord {
         tensor: tensor.clone(),
         buffer_index: allocation.parameter.buffer_index,
-        source_file: source_file.clone(),
-        data_start,
-        data_end,
-        byte_count,
-    })
-}
-
-fn validate_tensor_data_sha256(
-    tensor: &str,
-    expected: Option<&str>,
-    bytes: &[u8],
-) -> Result<(), VulkanPermanentParameterLoadError> {
-    let Some(expected) = expected else {
-        return Ok(());
-    };
-    let actual = Sha256::digest(bytes)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    if actual != expected {
-        return Err(VulkanPermanentParameterLoadError(format!(
-            "tensor {tensor:?} data SHA-256 does not match its compiled package contract"
-        )));
-    }
-    Ok(())
-}
-
-fn safetensors_data_start(path: &Path) -> Result<u64, VulkanPermanentParameterLoadError> {
-    let mut file = fs::File::open(path).map_err(|error| {
-        VulkanPermanentParameterLoadError(format!(
-            "failed to open safetensors file {:?}: {error}",
-            path
-        ))
-    })?;
-    let mut header_len_bytes = [0u8; 8];
-    file.read_exact(&mut header_len_bytes).map_err(|error| {
-        VulkanPermanentParameterLoadError(format!(
-            "failed to read safetensors header length from {:?}: {error}",
-            path
-        ))
-    })?;
-    let header_len = u64::from_le_bytes(header_len_bytes);
-    8u64.checked_add(header_len).ok_or_else(|| {
-        VulkanPermanentParameterLoadError(format!(
-            "safetensors data start overflowed for {:?}",
-            path
-        ))
+        source_file: storage.source_file.to_string_lossy().into_owned(),
+        data_start: storage.data_start,
+        data_end: storage.data_end,
+        byte_count: storage.byte_count,
     })
 }
 
@@ -23390,6 +23288,7 @@ fn checked_mul(left: usize, right: usize, label: &str) -> Result<usize, VulkanRe
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Read, Seek, SeekFrom};
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -24080,18 +23979,6 @@ mod tests {
             std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
             std::fs::copy(source_root.join(relative_path), destination).unwrap();
         }
-    }
-
-    #[test]
-    fn tensor_data_digest_rejects_same_length_parameter_corruption() {
-        let expected = "9a129038d9a00aed0cf6a7ea059ca50a813449061ab87848cf1a13eafdf33b2c";
-
-        validate_tensor_data_sha256("weight", Some(expected), b"weights").unwrap();
-        let error = validate_tensor_data_sha256("weight", Some(expected), b"WeightS")
-            .unwrap_err()
-            .to_string();
-
-        assert!(error.contains("does not match its compiled package contract"));
     }
 
     #[test]

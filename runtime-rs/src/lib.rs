@@ -2,6 +2,7 @@
 pub mod editor;
 pub mod stream_circuit;
 pub mod stream_plan;
+pub mod tensor_storage;
 #[cfg(test)]
 pub(crate) mod test_support;
 #[cfg(feature = "tui")]
@@ -18,6 +19,7 @@ pub mod vulkan_stream_circuit;
 pub use editor::*;
 pub use stream_circuit::*;
 pub use stream_plan::*;
+pub use tensor_storage::*;
 pub use vulkan::*;
 #[cfg(feature = "vulkan")]
 pub use vulkan_compute::*;
