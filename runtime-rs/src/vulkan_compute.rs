@@ -2201,7 +2201,27 @@ impl VulkanComputeDevice {
         }
         self.submit_command_buffer_with_timeline_semaphores(
             sequence.command_buffer,
-            sequence.completion_fence,
+            Some(sequence.completion_fence),
+            wait_points,
+            signal_points,
+            "resident kernel sequence",
+        )
+    }
+
+    pub fn submit_recorded_resident_kernel_sequence_unfenced_with_timeline_semaphores(
+        &self,
+        sequence: &VulkanResidentKernelSequence,
+        wait_points: &[VulkanTimelineSemaphorePoint<'_>],
+        signal_points: &[VulkanTimelineSemaphorePoint<'_>],
+    ) -> Result<(), VulkanError> {
+        if !sequence.has_recorded_commands() {
+            return Err(VulkanError(
+                "resident kernel sequence has no recorded commands".to_string(),
+            ));
+        }
+        self.submit_command_buffer_with_timeline_semaphores(
+            sequence.command_buffer,
+            None,
             wait_points,
             signal_points,
             "resident kernel sequence",
@@ -2222,7 +2242,7 @@ impl VulkanComputeDevice {
     ) -> Result<(), VulkanError> {
         self.submit_command_buffer_with_timeline_semaphores(
             sequence.command_buffer,
-            sequence.completion_fence,
+            Some(sequence.completion_fence),
             &[],
             &[],
             "resident kernel sequence",
@@ -2232,7 +2252,7 @@ impl VulkanComputeDevice {
     fn submit_command_buffer_with_timeline_semaphores(
         &self,
         command_buffer: vk::CommandBuffer,
-        completion_fence: vk::Fence,
+        completion_fence: Option<vk::Fence>,
         wait_points: &[VulkanTimelineSemaphorePoint<'_>],
         signal_points: &[VulkanTimelineSemaphorePoint<'_>],
         label: &str,
@@ -2259,13 +2279,15 @@ impl VulkanComputeDevice {
             })
             .collect::<Vec<_>>();
         unsafe {
-            self.device
-                .reset_fences(&[completion_fence])
-                .map_err(|error| {
-                    VulkanError(format!(
-                        "failed to reset {label} completion fence: {error:?}"
-                    ))
-                })?;
+            if let Some(completion_fence) = completion_fence {
+                self.device
+                    .reset_fences(&[completion_fence])
+                    .map_err(|error| {
+                        VulkanError(format!(
+                            "failed to reset {label} completion fence: {error:?}"
+                        ))
+                    })?;
+            }
             let command_buffers =
                 [vk::CommandBufferSubmitInfo::default().command_buffer(command_buffer)];
             let submit_info = [vk::SubmitInfo2::default()
@@ -2273,7 +2295,11 @@ impl VulkanComputeDevice {
                 .command_buffer_infos(&command_buffers)
                 .signal_semaphore_infos(&signal_infos)];
             self.device
-                .queue_submit2(self.queue, &submit_info, completion_fence)
+                .queue_submit2(
+                    self.queue,
+                    &submit_info,
+                    completion_fence.unwrap_or(vk::Fence::null()),
+                )
                 .map_err(|error| VulkanError(format!("failed to submit {label}: {error:?}")))?;
         }
         Ok(())
@@ -2407,7 +2433,8 @@ impl VulkanComputeDevice {
                         ))
                     })?;
 
-                let command_begin = vk::CommandBufferBeginInfo::default();
+                let command_begin = vk::CommandBufferBeginInfo::default()
+                    .flags(vk::CommandBufferUsageFlags::SIMULTANEOUS_USE);
                 self.device
                     .begin_command_buffer(sequence.command_buffer, &command_begin)
                     .map_err(|error| {
