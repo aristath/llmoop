@@ -4,6 +4,7 @@ use std::fmt::{Display, Formatter};
 
 use crate::stream_plan::{TensorIndex, TensorMetadata};
 use crate::tensor_storage::{TensorStorage, TensorStorageRange};
+use crate::vulkan_compute::{VulkanComputeDevice, VulkanError, VulkanResidentBuffer};
 use crate::vulkan_stream_circuit::{
     VulkanDescriptorResourceAddress, VulkanPreparedDispatch, VulkanPreparedDispatchPlan,
     VulkanReusableKernelArtifactManifest,
@@ -502,6 +503,125 @@ pub struct VulkanDistributedParameterAllocation {
     pub use_count: usize,
 }
 
+pub struct VulkanDistributedParameterBuffers {
+    pub plan: VulkanDistributedParameterAllocationPlan,
+    pub buffers: Vec<VulkanDistributedParameterBufferAllocation>,
+    pub total_byte_capacity: usize,
+}
+
+impl VulkanDistributedParameterBuffers {
+    pub fn allocate_and_load<'a, F, E>(
+        plan: &VulkanDistributedParameterAllocationPlan,
+        tensor_index: &TensorIndex,
+        mut device_for: F,
+    ) -> Result<Self, VulkanDistributedParameterBufferError>
+    where
+        F: FnMut(&str) -> Result<&'a VulkanComputeDevice, E>,
+        E: Display,
+    {
+        let mut buffers = Vec::with_capacity(plan.allocations.len());
+        let mut buffer_index = BTreeMap::new();
+        let mut total_byte_capacity = 0usize;
+        for allocation in &plan.allocations {
+            let device = device_for(&allocation.device_id).map_err(|error| {
+                VulkanDistributedParameterBufferError(format!(
+                    "failed to resolve distributed parameter device {:?}: {error}",
+                    allocation.device_id
+                ))
+            })?;
+            let buffer = device
+                .create_resident_buffer(allocation.byte_count)
+                .map_err(|error| {
+                    VulkanDistributedParameterBufferError(format!(
+                        "failed to allocate {} distributed bytes for tensor {:?} on {:?}: {error}",
+                        allocation.byte_count, allocation.tensor, allocation.device_id
+                    ))
+                })?;
+            total_byte_capacity = total_byte_capacity
+                .checked_add(allocation.byte_count)
+                .ok_or_else(|| {
+                    VulkanDistributedParameterBufferError(
+                        "distributed parameter buffer byte capacity overflowed".to_string(),
+                    )
+                })?;
+            let key = VulkanDistributedParameterAllocationKey::from(allocation);
+            if buffer_index.insert(key, buffers.len()).is_some() {
+                return Err(VulkanDistributedParameterBufferError(format!(
+                    "distributed parameter buffer repeats tensor {:?} range {}..{} on {:?}",
+                    allocation.tensor,
+                    allocation.byte_offset,
+                    allocation.byte_offset + allocation.byte_count,
+                    allocation.device_id
+                )));
+            }
+            buffers.push(VulkanDistributedParameterBufferAllocation {
+                allocation: allocation.clone(),
+                buffer,
+            });
+        }
+        plan.load_from_tensor_index(tensor_index, |allocation, bytes| {
+            let key = VulkanDistributedParameterAllocationKey::from(allocation);
+            let index = *buffer_index.get(&key).ok_or_else(|| {
+                VulkanDistributedParameterLoadError(format!(
+                    "distributed parameter buffer for tensor {:?} range {}..{} on {:?} is missing",
+                    allocation.tensor,
+                    allocation.byte_offset,
+                    allocation.byte_offset + allocation.byte_count,
+                    allocation.device_id
+                ))
+            })?;
+            buffers[index]
+                .buffer
+                .write_bytes(bytes)
+                .map_err(|error| VulkanDistributedParameterLoadError(error.to_string()))
+        })
+        .map_err(|error| VulkanDistributedParameterBufferError(error.to_string()))?;
+
+        Ok(Self {
+            plan: plan.clone(),
+            buffers,
+            total_byte_capacity,
+        })
+    }
+
+    pub fn parameter_buffer(
+        &self,
+        device_id: &str,
+        tensor: &str,
+        byte_offset: usize,
+        byte_count: usize,
+    ) -> Option<&VulkanDistributedParameterBufferAllocation> {
+        self.buffers.iter().find(|buffer| {
+            buffer.allocation.device_id == device_id
+                && buffer.allocation.tensor == tensor
+                && buffer.allocation.byte_offset == byte_offset
+                && buffer.allocation.byte_count == byte_count
+        })
+    }
+}
+
+pub struct VulkanDistributedParameterBufferAllocation {
+    pub allocation: VulkanDistributedParameterAllocation,
+    pub buffer: VulkanResidentBuffer,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanDistributedParameterBufferError(pub String);
+
+impl Display for VulkanDistributedParameterBufferError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl Error for VulkanDistributedParameterBufferError {}
+
+impl From<VulkanError> for VulkanDistributedParameterBufferError {
+    fn from(error: VulkanError) -> Self {
+        Self(error.to_string())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VulkanDistributedParameterExclusionPlan {
     pub devices: Vec<VulkanDistributedDeviceParameterExclusions>,
@@ -734,6 +854,17 @@ struct VulkanDistributedParameterAllocationKey {
     tensor: String,
     byte_offset: usize,
     byte_count: usize,
+}
+
+impl From<&VulkanDistributedParameterAllocation> for VulkanDistributedParameterAllocationKey {
+    fn from(allocation: &VulkanDistributedParameterAllocation) -> Self {
+        Self {
+            device_id: allocation.device_id.clone(),
+            tensor: allocation.tensor.clone(),
+            byte_offset: allocation.byte_offset,
+            byte_count: allocation.byte_count,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
