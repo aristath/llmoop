@@ -44,6 +44,51 @@ GLSL_VULKAN_DEVICE_EXTENSION_REQUIREMENTS = {
     "GL_EXT_bfloat16": "VK_KHR_shader_bfloat16",
     "GL_KHR_cooperative_matrix": "VK_KHR_cooperative_matrix",
 }
+SPIRV_MAGIC = 0x07230203
+SPIRV_OP_CAPABILITY = 17
+SPIRV_CAPABILITY_VULKAN_FEATURE_REQUIREMENTS = {
+    9: "shader_float16",
+    10: "shader_float64",
+    11: "shader_int64",
+    22: "shader_int16",
+    39: "shader_int8",
+    4212: "shader_float8",
+    4213: "shader_float8_cooperative_matrix",
+    4433: "storage_buffer16_bit_access",
+    4434: "uniform_and_storage_buffer16_bit_access",
+    4435: "storage_push_constant16",
+    4436: "storage_input_output16",
+    4448: "storage_buffer8_bit_access",
+    4449: "uniform_and_storage_buffer8_bit_access",
+    4450: "storage_push_constant8",
+    5116: "shader_bfloat16_type",
+    5117: "shader_bfloat16_dot_product",
+    5118: "shader_bfloat16_cooperative_matrix",
+    5345: "vulkan_memory_model",
+    5346: "vulkan_memory_model_device_scope",
+    6022: "cooperative_matrix",
+}
+KNOWN_VULKAN_FEATURES = frozenset(
+    SPIRV_CAPABILITY_VULKAN_FEATURE_REQUIREMENTS.values()
+)
+SPIRV_CAPABILITY_VULKAN_SUBGROUP_OPERATION_REQUIREMENTS = {
+    61: "basic",
+    62: "vote",
+    63: "arithmetic",
+    64: "ballot",
+    65: "shuffle",
+    66: "shuffle_relative",
+    67: "clustered",
+    68: "quad",
+}
+KNOWN_VULKAN_SUBGROUP_OPERATIONS = frozenset(
+    SPIRV_CAPABILITY_VULKAN_SUBGROUP_OPERATION_REQUIREMENTS.values()
+)
+SUPPORTED_SPIRV_CAPABILITIES = frozenset(
+    {0, 1}
+    | SPIRV_CAPABILITY_VULKAN_FEATURE_REQUIREMENTS.keys()
+    | SPIRV_CAPABILITY_VULKAN_SUBGROUP_OPERATION_REQUIREMENTS.keys()
+)
 COOPERATIVE_BFLOAT16_SHAPE = [16, 16, 16]
 COOPERATIVE_BATCH_LANE_TILE_WIDTH = 64
 COOPERATIVE_OUTPUT_TILE_WIDTH = 64
@@ -422,16 +467,28 @@ def build_vulkan_resident_package_manifest(
         package_dir / "shaders",
         shader_files,
     )
+    for execution in all_pedal_executions:
+        for kernel in execution["kernels"]:
+            for implementation in kernel["batch_implementations"]:
+                implementation["device_requirements"][
+                    "vulkan_device_extensions"
+                ] = required_vulkan_device_extensions(
+                    package_dir / "shaders",
+                    {
+                        stage["shader_path"].removeprefix("shaders/")
+                        for stage in implementation["stages"]
+                    },
+                )
     optional_device_shader_files = {
         stage["shader_path"].removeprefix("shaders/")
         for execution in all_pedal_executions
         for kernel in execution["kernels"]
         for implementation in kernel["batch_implementations"]
         for stage in implementation["stages"]
-        if implementation["device_requirements"]["vulkan_device_extensions"]
     }
+    mandatory_shader_files = shader_files - optional_device_shader_files
     required_device_extensions = required_vulkan_device_extensions(
-        package_dir / "shaders", shader_files - optional_device_shader_files
+        package_dir / "shaders", mandatory_shader_files
     )
     compile_shader_artifacts(
         package_dir / "shaders",
@@ -444,10 +501,40 @@ def build_vulkan_resident_package_manifest(
         ),
         cancel_requested=cancel_requested,
     )
+    # The bytecode is authoritative. Requirements are discovered from the SPIR-V
+    # emitted by the compiler rather than inferred from model or kernel names.
+    mandatory_spirv_files = {
+        str(Path(shader_file).with_suffix(".spv"))
+        for shader_file in mandatory_shader_files
+    }
+    required_device_features = required_vulkan_features(
+        package_dir / "shaders",
+        mandatory_spirv_files,
+    )
+    required_subgroup_operations = required_vulkan_subgroup_operations(
+        package_dir / "shaders",
+        mandatory_spirv_files,
+    )
     for execution in all_pedal_executions:
         for kernel in execution["kernels"]:
             kernel["shader_path"] = compiled_shader_path(kernel["shader_path"])
             for implementation in kernel["batch_implementations"]:
+                implementation_spirv_files = {
+                    Path(compiled_shader_path(stage["shader_path"])).name
+                    for stage in implementation["stages"]
+                }
+                implementation["device_requirements"]["vulkan_features"] = (
+                    required_vulkan_features(
+                        package_dir / "shaders",
+                        implementation_spirv_files,
+                    )
+                )
+                implementation["device_requirements"]["subgroup_operations"] = (
+                    required_vulkan_subgroup_operations(
+                        package_dir / "shaders",
+                        implementation_spirv_files,
+                    )
+                )
                 for stage in implementation["stages"]:
                     stage["shader_path"] = compiled_shader_path(stage["shader_path"])
     return {
@@ -463,6 +550,8 @@ def build_vulkan_resident_package_manifest(
         "activation_element_bytes": dtype_bytes,
         "max_context_activations": max_context_activations,
         "required_vulkan_device_extensions": required_device_extensions,
+        "required_vulkan_features": required_device_features,
+        "required_vulkan_subgroup_operations": required_subgroup_operations,
         "input_transducer": {
             "spec": {
                 "transducer_id": "input_transducer.token_embedding",
@@ -806,6 +895,8 @@ def pedal_kernel_spec(
                 "exact_primary_equivalence": False,
                 "device_requirements": {
                     "vulkan_device_extensions": [],
+                    "vulkan_features": [],
+                    "subgroup_operations": [],
                 },
                 "stages": causal_scan_stages,
             }
@@ -817,10 +908,9 @@ def pedal_kernel_spec(
                     "lane_tile_width": COOPERATIVE_BATCH_LANE_TILE_WIDTH,
                     "exact_primary_equivalence": False,
                     "device_requirements": {
-                        "vulkan_device_extensions": [
-                            "VK_KHR_cooperative_matrix",
-                            "VK_KHR_shader_bfloat16",
-                        ],
+                        "vulkan_device_extensions": [],
+                        "vulkan_features": [],
+                        "subgroup_operations": [],
                         "cooperative_bfloat16_shape": COOPERATIVE_BFLOAT16_SHAPE,
                         "subgroup_size": 64,
                     },
@@ -842,6 +932,8 @@ def pedal_kernel_spec(
                     "exact_primary_equivalence": True,
                     "device_requirements": {
                         "vulkan_device_extensions": [],
+                        "vulkan_features": [],
+                        "subgroup_operations": [],
                         "subgroup_size": 64,
                     },
                     "stages": [
@@ -867,6 +959,8 @@ def pedal_kernel_spec(
                     "exact_primary_equivalence": True,
                     "device_requirements": {
                         "vulkan_device_extensions": [],
+                        "vulkan_features": [],
+                        "subgroup_operations": [],
                     },
                     "stages": [
                         {
@@ -1957,6 +2051,95 @@ def required_vulkan_device_extensions(
             if glsl_extension in required_glsl_extensions
         }
     )
+
+
+def required_vulkan_features(shader_dir: Path, shader_files: set[str]) -> list[str]:
+    features = set()
+    for shader_file in shader_files:
+        for capability in spirv_capabilities(shader_dir / shader_file):
+            feature = SPIRV_CAPABILITY_VULKAN_FEATURE_REQUIREMENTS.get(capability)
+            if feature is not None:
+                features.add(feature)
+    return sorted(features)
+
+
+def required_vulkan_subgroup_operations(
+    shader_dir: Path, shader_files: set[str]
+) -> list[str]:
+    operations = set()
+    for shader_file in shader_files:
+        for capability in spirv_capabilities(shader_dir / shader_file):
+            operation = SPIRV_CAPABILITY_VULKAN_SUBGROUP_OPERATION_REQUIREMENTS.get(
+                capability
+            )
+            if operation is not None:
+                operations.add(operation)
+    return sorted(operations)
+
+
+def spirv_capabilities(shader_path: Path) -> set[int]:
+    payload = shader_path.read_bytes()
+    if len(payload) < 20 or len(payload) % 4 != 0:
+        raise ModelCompileError(
+            f"compiled shader is not a complete SPIR-V module: {shader_path}"
+        )
+    words = struct.unpack(f"<{len(payload) // 4}I", payload)
+    if words[0] != SPIRV_MAGIC:
+        raise ModelCompileError(
+            f"compiled shader has an invalid SPIR-V magic word: {shader_path}"
+        )
+    capabilities = set()
+    cursor = 5
+    while cursor < len(words):
+        instruction = words[cursor]
+        word_count = instruction >> 16
+        opcode = instruction & 0xFFFF
+        if word_count == 0 or cursor + word_count > len(words):
+            raise ModelCompileError(
+                f"compiled shader has a malformed SPIR-V instruction at word {cursor}: {shader_path}"
+            )
+        if opcode == SPIRV_OP_CAPABILITY:
+            if word_count != 2:
+                raise ModelCompileError(
+                    f"compiled shader has a malformed OpCapability at word {cursor}: {shader_path}"
+                )
+            capabilities.add(words[cursor + 1])
+        cursor += word_count
+    unsupported = capabilities - SUPPORTED_SPIRV_CAPABILITIES
+    if unsupported:
+        raise ModelCompileError(
+            "compiled shader declares SPIR-V capabilities without a runtime device "
+            f"contract {sorted(unsupported)}: {shader_path}"
+        )
+    return capabilities
+
+
+def spirv_vulkan_requirements(
+    package_dir: Path, shader_paths: set[str]
+) -> tuple[list[str], list[str]]:
+    capabilities = set()
+    for shader_path in shader_paths:
+        capabilities.update(
+            spirv_capabilities(
+                package_artifact_path(package_dir, shader_path, "shader")
+            )
+        )
+    features = sorted(
+        {
+            SPIRV_CAPABILITY_VULKAN_FEATURE_REQUIREMENTS[capability]
+            for capability in capabilities
+            if capability in SPIRV_CAPABILITY_VULKAN_FEATURE_REQUIREMENTS
+        }
+    )
+    subgroup_operations = sorted(
+        {
+            SPIRV_CAPABILITY_VULKAN_SUBGROUP_OPERATION_REQUIREMENTS[capability]
+            for capability in capabilities
+            if capability
+            in SPIRV_CAPABILITY_VULKAN_SUBGROUP_OPERATION_REQUIREMENTS
+        }
+    )
+    return features, subgroup_operations
 
 
 def rms_norm_shader_file(hidden_size: int, eps: float, weight_offset: float) -> str:
@@ -3469,6 +3652,30 @@ def validate_compiled_package(package_dir: Path, manifest: Json) -> None:
         raise ModelCompileError(
             "compiled package required Vulkan device extensions must be unique sorted names"
         )
+    required_features = manifest.get("required_vulkan_features")
+    if (
+        not isinstance(required_features, list)
+        or any(feature not in KNOWN_VULKAN_FEATURES for feature in required_features)
+        or required_features != sorted(set(required_features))
+    ):
+        raise ModelCompileError(
+            "compiled package required Vulkan features must be unique sorted known names"
+        )
+    required_subgroup_operations = manifest.get(
+        "required_vulkan_subgroup_operations"
+    )
+    if (
+        not isinstance(required_subgroup_operations, list)
+        or any(
+            operation not in KNOWN_VULKAN_SUBGROUP_OPERATIONS
+            for operation in required_subgroup_operations
+        )
+        or required_subgroup_operations
+        != sorted(set(required_subgroup_operations))
+    ):
+        raise ModelCompileError(
+            "compiled package required Vulkan subgroup operations must be unique sorted known names"
+        )
     required_files = (
         package_artifact_path(package_dir, manifest.get("config_path"), "config"),
         package_artifact_path(
@@ -3593,6 +3800,74 @@ def validate_compiled_package(package_dir: Path, manifest: Json) -> None:
                 f"compiled package shader is not valid SPIR-V: {shader}"
             )
     validate_package_artifact_integrity(package_dir, manifest)
+    validate_compiled_spirv_requirements(package_dir, manifest)
+
+
+def validate_compiled_spirv_requirements(package_dir: Path, manifest: Json) -> None:
+    speculative_decoders = manifest.get("speculative_decoders", [])
+    executions = list(manifest["pedal_executions"])
+    executions.extend(
+        execution
+        for decoder in speculative_decoders
+        for execution in decoder["pedal_executions"]
+    )
+    mandatory_shader_paths = {
+        manifest["input_transducer"]["shader_path"],
+        manifest["input_transducer"]["batch_shader_path"],
+        manifest["output_transducer"]["embedding_norm_shader_path"],
+        manifest["output_transducer"]["embedding_norm_batch_shader_path"],
+        manifest["output_transducer"]["projection_shader_path"],
+        manifest["output_transducer"]["projection_batch_shader_path"],
+        *(
+            kernel["shader_path"]
+            for kernel in manifest["sampler"]["kernels"]
+        ),
+        *(
+            decoder["output_transducer"]["norm_shader_path"]
+            for decoder in speculative_decoders
+        ),
+        *(
+            decoder["output_transducer"]["projection_shader_path"]
+            for decoder in speculative_decoders
+        ),
+    }
+    for execution in executions:
+        for kernel in execution["kernels"]:
+            mandatory_shader_paths.add(kernel["shader_path"])
+            for implementation in kernel["batch_implementations"]:
+                actual_features, actual_subgroup_operations = (
+                    spirv_vulkan_requirements(
+                        package_dir,
+                        {
+                            stage["shader_path"]
+                            for stage in implementation["stages"]
+                        },
+                    )
+                )
+                requirements = implementation["device_requirements"]
+                if (
+                    requirements["vulkan_features"] != actual_features
+                    or requirements["subgroup_operations"]
+                    != actual_subgroup_operations
+                ):
+                    raise ModelCompileError(
+                        "compiled batch implementation "
+                        f"{execution['pedal_id']}.{kernel['node_id']} does not declare "
+                        "the Vulkan requirements of its SPIR-V artifacts"
+                    )
+
+    actual_features, actual_subgroup_operations = spirv_vulkan_requirements(
+        package_dir, mandatory_shader_paths
+    )
+    if (
+        manifest["required_vulkan_features"] != actual_features
+        or manifest["required_vulkan_subgroup_operations"]
+        != actual_subgroup_operations
+    ):
+        raise ModelCompileError(
+            "compiled package does not declare the Vulkan requirements of its "
+            "mandatory SPIR-V artifacts"
+        )
 
 
 def build_package_artifact_integrity(package_dir: Path) -> Json:
@@ -4145,6 +4420,10 @@ def valid_batch_implementation(implementation: Any) -> bool:
         if isinstance(requirements, dict)
         else None
     )
+    features = requirements.get("vulkan_features") if requirements else None
+    subgroup_operations = (
+        requirements.get("subgroup_operations") if requirements else None
+    )
     shape = requirements.get("cooperative_bfloat16_shape") if requirements else None
     subgroup_size = requirements.get("subgroup_size") if requirements else None
     stages = implementation.get("stages")
@@ -4159,6 +4438,15 @@ def valid_batch_implementation(implementation: Any) -> bool:
         and isinstance(extensions, list)
         and all(isinstance(extension, str) and extension for extension in extensions)
         and extensions == sorted(set(extensions))
+        and isinstance(features, list)
+        and all(feature in KNOWN_VULKAN_FEATURES for feature in features)
+        and features == sorted(set(features))
+        and isinstance(subgroup_operations, list)
+        and all(
+            operation in KNOWN_VULKAN_SUBGROUP_OPERATIONS
+            for operation in subgroup_operations
+        )
+        and subgroup_operations == sorted(set(subgroup_operations))
         and (
             shape is None
             or (

@@ -34,8 +34,9 @@ use crate::vulkan_compute::{
     VulkanResidentKernelBufferBinding, VulkanResidentKernelDispatch, VulkanResidentKernelSequence,
     VulkanResidentKernelSequenceInputCopy, VulkanResidentKernelSequenceSnapshotCopy,
     VulkanResidentKernelSequenceStep, VulkanResidentMappedBufferCopy,
-    VulkanResidentQueueSubmissionBatch, VulkanResidentQueueSubmissionTemplate,
-    VulkanTimelineSemaphore, VulkanTimelineSemaphorePoint,
+    VulkanResidentQueueSubmissionBatch, VulkanResidentQueueSubmissionTemplate, VulkanShaderFeature,
+    VulkanSubgroupOperation, VulkanTimelineSemaphore, VulkanTimelineSemaphorePoint,
+    vulkan_spirv_requirements,
 };
 use crate::vulkan_distributed::{
     VulkanDistributedActivationBufferPlan, VulkanDistributedActivationBuffers,
@@ -49,7 +50,7 @@ pub const VULKAN_STREAM_CIRCUIT_BACKEND_ID: &str = "vulkan_stream_circuit_ir";
 pub const VULKAN_REUSABLE_KERNEL_ARTIFACT_MANIFEST_SCHEMA: &str =
     "llmoop.vulkan_reusable_kernel_artifacts.v1";
 pub const VULKAN_RESIDENT_MODEL_PACKAGE_MANIFEST_SCHEMA: &str =
-    "llmoop.vulkan_resident_model_package.v1";
+    "llmoop.vulkan_resident_model_package.v2";
 const CONTRACT_DIGEST_ALGORITHM: &str = "llmoop.json_tree_sha256.v1";
 const VULKAN_STREAM_CONTROL_BYTE_CAPACITY: usize = 5 * std::mem::size_of::<u32>();
 const VULKAN_STREAM_CONTROL_TOKEN_BYTE_CAPACITY: usize = std::mem::size_of::<u32>();
@@ -10025,6 +10026,8 @@ pub struct VulkanResidentModelPackageManifest {
     pub activation_element_bytes: Option<usize>,
     pub max_context_activations: usize,
     pub required_vulkan_device_extensions: Vec<String>,
+    pub required_vulkan_features: Vec<VulkanShaderFeature>,
+    pub required_vulkan_subgroup_operations: Vec<VulkanSubgroupOperation>,
     pub input_transducer: VulkanResidentInputEmbeddingTransducerPackageSpec,
     pub output_transducer: VulkanResidentOutputTransducerPackageSpec,
     pub sampler: VulkanResidentSamplerPackageSpec,
@@ -10709,6 +10712,145 @@ fn validate_resident_package_artifact_integrity(
     Ok(())
 }
 
+fn resident_package_spirv_requirements<'a>(
+    package_root: &Path,
+    shader_paths: impl IntoIterator<Item = &'a str>,
+) -> io::Result<(
+    BTreeSet<VulkanShaderFeature>,
+    BTreeSet<VulkanSubgroupOperation>,
+)> {
+    let mut features = BTreeSet::new();
+    let mut subgroup_operations = BTreeSet::new();
+    for shader_path in shader_paths {
+        let resolved = resolve_resident_model_package_path(package_root, shader_path);
+        let words = read_spirv_words(&resolved).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "failed to inspect compiled Vulkan shader {:?}: {error}",
+                    resolved
+                ),
+            )
+        })?;
+        let requirements = vulkan_spirv_requirements(&words).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "compiled Vulkan shader {:?} has no valid runtime device contract: {error}",
+                    resolved
+                ),
+            )
+        })?;
+        features.extend(requirements.shader_features);
+        subgroup_operations.extend(requirements.subgroup_operations);
+    }
+    Ok((features, subgroup_operations))
+}
+
+fn validate_resident_package_spirv_requirements(
+    package_root: &Path,
+    manifest: &VulkanResidentModelPackageManifest,
+) -> io::Result<()> {
+    let executions = manifest.pedal_executions.iter().chain(
+        manifest
+            .speculative_decoders
+            .iter()
+            .flat_map(|decoder| decoder.pedal_executions.iter()),
+    );
+    let mut mandatory_shader_paths = BTreeSet::from([
+        manifest.input_transducer.shader_path.as_str(),
+        manifest.input_transducer.batch_shader_path.as_str(),
+        manifest
+            .output_transducer
+            .embedding_norm_shader_path
+            .as_str(),
+        manifest
+            .output_transducer
+            .embedding_norm_batch_shader_path
+            .as_str(),
+        manifest.output_transducer.projection_shader_path.as_str(),
+        manifest
+            .output_transducer
+            .projection_batch_shader_path
+            .as_str(),
+    ]);
+    mandatory_shader_paths.extend(
+        manifest
+            .sampler
+            .kernels
+            .iter()
+            .map(|kernel| kernel.shader_path.as_str()),
+    );
+    for decoder in &manifest.speculative_decoders {
+        mandatory_shader_paths.insert(decoder.output_transducer.norm_shader_path.as_str());
+        mandatory_shader_paths.insert(decoder.output_transducer.projection_shader_path.as_str());
+    }
+
+    for execution in executions {
+        for kernel in &execution.kernels {
+            mandatory_shader_paths.insert(kernel.shader_path.as_str());
+            for implementation in &kernel.batch_implementations {
+                let (actual_features, actual_subgroup_operations) =
+                    resident_package_spirv_requirements(
+                        package_root,
+                        implementation
+                            .stages
+                            .iter()
+                            .map(|stage| stage.shader_path.as_str()),
+                    )?;
+                let declared_features = implementation
+                    .device_requirements
+                    .vulkan_features
+                    .iter()
+                    .copied()
+                    .collect::<BTreeSet<_>>();
+                let declared_subgroup_operations = implementation
+                    .device_requirements
+                    .subgroup_operations
+                    .iter()
+                    .copied()
+                    .collect::<BTreeSet<_>>();
+                if declared_features != actual_features
+                    || declared_subgroup_operations != actual_subgroup_operations
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "compiled batch implementation {}.{} does not declare the Vulkan requirements of its SPIR-V artifacts",
+                            execution.pedal_id, kernel.node_id
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+
+    let (actual_features, actual_subgroup_operations) =
+        resident_package_spirv_requirements(package_root, mandatory_shader_paths)?;
+    let declared_features = manifest
+        .required_vulkan_features
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let declared_subgroup_operations = manifest
+        .required_vulkan_subgroup_operations
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    if declared_features != actual_features
+        || declared_subgroup_operations != actual_subgroup_operations
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "resident model package {:?} does not declare the Vulkan requirements of its mandatory SPIR-V artifacts",
+                manifest.package_id
+            ),
+        ));
+    }
+    Ok(())
+}
+
 impl VulkanResidentModelPackageManifest {
     pub fn from_json_file(path: impl AsRef<Path>) -> io::Result<Self> {
         let path = path.as_ref();
@@ -10742,6 +10884,7 @@ impl VulkanResidentModelPackageManifest {
         validate_behavioral_validation_artifact(path, &manifest, &raw_manifest)?;
         validate_resident_package_artifact_integrity(path, &manifest)?;
         let package_root = path.parent().unwrap_or_else(|| Path::new("."));
+        validate_resident_package_spirv_requirements(package_root, &manifest)?;
         let source_graph = manifest
             .resolved_source_graph(package_root)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
@@ -11460,6 +11603,8 @@ pub struct VulkanResidentPedalBatchStageSpec {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VulkanResidentVulkanDeviceRequirements {
     pub vulkan_device_extensions: Vec<String>,
+    pub vulkan_features: Vec<VulkanShaderFeature>,
+    pub subgroup_operations: Vec<VulkanSubgroupOperation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cooperative_bfloat16_shape: Option<[u32; 3]>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -11629,6 +11774,34 @@ impl VulkanResidentModelPackageDeviceSlicePlan {
                 "resident model package {:?} requires unavailable Vulkan device extensions: {}",
                 runtime_model.package.package_id,
                 missing_device_extensions.join(", ")
+            )));
+        }
+        let missing_device_features = runtime_model
+            .package
+            .required_vulkan_features
+            .iter()
+            .filter(|feature| !device.has_enabled_shader_feature(**feature))
+            .map(|feature| feature.label())
+            .collect::<Vec<_>>();
+        if !missing_device_features.is_empty() {
+            return Err(VulkanResidentTokenModelPackageError::new(format!(
+                "resident model package {:?} requires Vulkan features that are not enabled on the logical device: {}",
+                runtime_model.package.package_id,
+                missing_device_features.join(", ")
+            )));
+        }
+        let missing_subgroup_operations = runtime_model
+            .package
+            .required_vulkan_subgroup_operations
+            .iter()
+            .filter(|operation| !device.supports_subgroup_operation(**operation))
+            .map(|operation| operation.label())
+            .collect::<Vec<_>>();
+        if !missing_subgroup_operations.is_empty() {
+            return Err(VulkanResidentTokenModelPackageError::new(format!(
+                "resident model package {:?} requires unsupported Vulkan subgroup operations: {}",
+                runtime_model.package.package_id,
+                missing_subgroup_operations.join(", ")
             )));
         }
         validate_pedal_executions(
@@ -18361,6 +18534,17 @@ fn validate_pedal_executions(
             let implementations_are_valid =
                 kernel.batch_implementations.iter().all(|implementation| {
                     let extensions = &implementation.device_requirements.vulkan_device_extensions;
+                    let features = &implementation.device_requirements.vulkan_features;
+                    let feature_names = features
+                        .iter()
+                        .map(|feature| feature.label())
+                        .collect::<Vec<_>>();
+                    let subgroup_operations =
+                        &implementation.device_requirements.subgroup_operations;
+                    let subgroup_operation_names = subgroup_operations
+                        .iter()
+                        .map(|operation| operation.label())
+                        .collect::<Vec<_>>();
                     implementation.lane_tile_width > 0
                         && !implementation.stages.is_empty()
                         && implementation.stages.iter().all(|stage| {
@@ -18370,6 +18554,13 @@ fn validate_pedal_executions(
                         })
                         && extensions.iter().all(|extension| !extension.is_empty())
                         && extensions.windows(2).all(|pair| pair[0] < pair[1])
+                        && features.iter().collect::<BTreeSet<_>>().len() == features.len()
+                        && feature_names.windows(2).all(|pair| pair[0] < pair[1])
+                        && subgroup_operations.iter().collect::<BTreeSet<_>>().len()
+                            == subgroup_operations.len()
+                        && subgroup_operation_names
+                            .windows(2)
+                            .all(|pair| pair[0] < pair[1])
                         && implementation
                             .device_requirements
                             .cooperative_bfloat16_shape
@@ -18420,6 +18611,46 @@ fn validate_generation_execution_contract(
     {
         return Err(VulkanResidentTokenModelPackageError::new(format!(
             "resident model package {:?} has invalid required Vulkan device extensions",
+            manifest.package_id
+        )));
+    }
+    let required_feature_names = manifest
+        .required_vulkan_features
+        .iter()
+        .map(|feature| feature.label())
+        .collect::<Vec<_>>();
+    if manifest
+        .required_vulkan_features
+        .iter()
+        .collect::<BTreeSet<_>>()
+        .len()
+        != manifest.required_vulkan_features.len()
+        || !required_feature_names
+            .windows(2)
+            .all(|pair| pair[0] < pair[1])
+    {
+        return Err(VulkanResidentTokenModelPackageError::new(format!(
+            "resident model package {:?} has invalid required Vulkan features",
+            manifest.package_id
+        )));
+    }
+    let required_subgroup_operation_names = manifest
+        .required_vulkan_subgroup_operations
+        .iter()
+        .map(|operation| operation.label())
+        .collect::<Vec<_>>();
+    if manifest
+        .required_vulkan_subgroup_operations
+        .iter()
+        .collect::<BTreeSet<_>>()
+        .len()
+        != manifest.required_vulkan_subgroup_operations.len()
+        || !required_subgroup_operation_names
+            .windows(2)
+            .all(|pair| pair[0] < pair[1])
+    {
+        return Err(VulkanResidentTokenModelPackageError::new(format!(
+            "resident model package {:?} has invalid required Vulkan subgroup operations",
             manifest.package_id
         )));
     }
@@ -19520,6 +19751,14 @@ fn batch_device_requirements_are_supported(
             .vulkan_device_extensions
             .iter()
             .all(|extension| device.has_enabled_device_extension(extension))
+        && requirements
+            .vulkan_features
+            .iter()
+            .all(|feature| device.has_enabled_shader_feature(*feature))
+        && requirements
+            .subgroup_operations
+            .iter()
+            .all(|operation| device.supports_subgroup_operation(*operation))
         && requirements
             .cooperative_bfloat16_shape
             .is_none_or(|[m, n, k]| device.supports_cooperative_bfloat16_shape(m, n, k))

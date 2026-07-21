@@ -21,10 +21,74 @@ from llmoop.model_package import (
     frame_parallel_batch_shader_file,
     pedal_kernel_spec,
     required_vulkan_device_extensions,
+    required_vulkan_features,
+    required_vulkan_subgroup_operations,
     shader_file_for_node,
+    spirv_capabilities,
     weight_shared_batch_shader_file,
     write_compiled_tensor,
 )
+
+
+def write_spirv_module(path: Path, capabilities: list[int]) -> None:
+    words = [0x07230203, 0x00010600, 0, 1, 0]
+    for capability in capabilities:
+        words.extend([(2 << 16) | 17, capability])
+    words.extend([(3 << 16) | 14, 0, 3 if 5345 in capabilities else 1])
+    path.write_bytes(struct.pack(f"<{len(words)}I", *words))
+
+
+def test_compiler_derives_vulkan_features_from_compiled_spirv(tmp_path: Path) -> None:
+    shader = tmp_path / "cooperative.spv"
+    write_spirv_module(
+        shader, [1, 9, 22, 61, 63, 4433, 5116, 5118, 5345, 6022]
+    )
+
+    assert spirv_capabilities(shader) == {
+        1,
+        9,
+        22,
+        61,
+        63,
+        4433,
+        5116,
+        5118,
+        5345,
+        6022,
+    }
+    assert required_vulkan_features(tmp_path, {shader.name}) == [
+        "cooperative_matrix",
+        "shader_bfloat16_cooperative_matrix",
+        "shader_bfloat16_type",
+        "shader_float16",
+        "shader_int16",
+        "storage_buffer16_bit_access",
+        "vulkan_memory_model",
+    ]
+    assert required_vulkan_subgroup_operations(tmp_path, {shader.name}) == [
+        "arithmetic",
+        "basic",
+    ]
+
+
+def test_compiler_rejects_malformed_spirv_during_requirement_derivation(
+    tmp_path: Path,
+) -> None:
+    shader = tmp_path / "malformed.spv"
+    shader.write_bytes(struct.pack("<6I", 0x07230203, 0x00010600, 0, 1, 0, 4 << 16))
+
+    with pytest.raises(ModelCompileError, match="malformed SPIR-V instruction"):
+        spirv_capabilities(shader)
+
+
+def test_compiler_fails_closed_for_unmodeled_spirv_capabilities(
+    tmp_path: Path,
+) -> None:
+    shader = tmp_path / "unknown.spv"
+    write_spirv_module(shader, [1, 65535])
+
+    with pytest.raises(ModelCompileError, match="without a runtime device contract"):
+        spirv_capabilities(shader)
 
 
 def test_compiler_selects_only_compatible_weight_shared_batch_kernels() -> None:
@@ -95,6 +159,8 @@ def test_compiler_orders_frame_parallel_before_portable_batch_implementation() -
     assert frame_parallel["exact_primary_equivalence"] is True
     assert frame_parallel["device_requirements"] == {
         "vulkan_device_extensions": [],
+        "vulkan_features": [],
+        "subgroup_operations": [],
         "subgroup_size": 64,
     }
     assert frame_parallel["stages"][0]["shader_path"] == (
@@ -234,10 +300,9 @@ def test_projection_pedal_compiles_ordered_target_native_and_scalar_implementati
         "lane_tile_width": 64,
         "exact_primary_equivalence": False,
         "device_requirements": {
-            "vulkan_device_extensions": [
-                "VK_KHR_cooperative_matrix",
-                "VK_KHR_shader_bfloat16",
-            ],
+            "vulkan_device_extensions": [],
+            "vulkan_features": [],
+            "subgroup_operations": [],
             "cooperative_bfloat16_shape": [16, 16, 16],
             "subgroup_size": 64,
         },
@@ -262,7 +327,11 @@ def test_projection_pedal_compiles_ordered_target_native_and_scalar_implementati
         assert implementation == {
             "lane_tile_width": tile_width,
             "exact_primary_equivalence": True,
-            "device_requirements": {"vulkan_device_extensions": []},
+            "device_requirements": {
+                "vulkan_device_extensions": [],
+                "vulkan_features": [],
+                "subgroup_operations": [],
+            },
             "stages": [
                 {
                     "shader_path": (

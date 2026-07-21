@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use ash::{Entry, vk};
+use serde::{Deserialize, Serialize};
 
 const VK_EXT_SHADER_FLOAT8_NAME: &CStr = c"VK_EXT_shader_float8";
 const VK_KHR_SHADER_BFLOAT16_NAME: &CStr = c"VK_KHR_shader_bfloat16";
@@ -21,6 +22,132 @@ const VULKAN_SHARED_HOST_MEMORY_HANDLE_TYPE: vk::ExternalMemoryHandleTypeFlags =
     vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT;
 const VULKAN_PERSISTENT_CROSS_DEVICE_SYNC_HANDLE_TYPE: vk::ExternalSemaphoreHandleTypeFlags =
     vk::ExternalSemaphoreHandleTypeFlags::OPAQUE_FD;
+const SPIRV_MAGIC: u32 = 0x0723_0203;
+const SPIRV_OP_MEMORY_MODEL: u16 = 14;
+const SPIRV_OP_CAPABILITY: u16 = 17;
+const SPIRV_MEMORY_MODEL_VULKAN: u32 = 3;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VulkanShaderFeature {
+    ShaderFloat16,
+    ShaderFloat64,
+    ShaderInt8,
+    ShaderInt16,
+    ShaderInt64,
+    StorageBuffer16BitAccess,
+    UniformAndStorageBuffer16BitAccess,
+    StoragePushConstant16,
+    StorageInputOutput16,
+    StorageBuffer8BitAccess,
+    UniformAndStorageBuffer8BitAccess,
+    StoragePushConstant8,
+    ShaderFloat8,
+    ShaderFloat8CooperativeMatrix,
+    ShaderBfloat16Type,
+    ShaderBfloat16DotProduct,
+    ShaderBfloat16CooperativeMatrix,
+    VulkanMemoryModel,
+    VulkanMemoryModelDeviceScope,
+    CooperativeMatrix,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VulkanSubgroupOperation {
+    Basic,
+    Vote,
+    Arithmetic,
+    Ballot,
+    Shuffle,
+    ShuffleRelative,
+    Clustered,
+    Quad,
+}
+
+impl VulkanSubgroupOperation {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Basic => "basic",
+            Self::Vote => "vote",
+            Self::Arithmetic => "arithmetic",
+            Self::Ballot => "ballot",
+            Self::Shuffle => "shuffle",
+            Self::ShuffleRelative => "shuffle_relative",
+            Self::Clustered => "clustered",
+            Self::Quad => "quad",
+        }
+    }
+
+    fn flag(self) -> vk::SubgroupFeatureFlags {
+        match self {
+            Self::Basic => vk::SubgroupFeatureFlags::BASIC,
+            Self::Vote => vk::SubgroupFeatureFlags::VOTE,
+            Self::Arithmetic => vk::SubgroupFeatureFlags::ARITHMETIC,
+            Self::Ballot => vk::SubgroupFeatureFlags::BALLOT,
+            Self::Shuffle => vk::SubgroupFeatureFlags::SHUFFLE,
+            Self::ShuffleRelative => vk::SubgroupFeatureFlags::SHUFFLE_RELATIVE,
+            Self::Clustered => vk::SubgroupFeatureFlags::CLUSTERED,
+            Self::Quad => vk::SubgroupFeatureFlags::QUAD,
+        }
+    }
+}
+
+impl VulkanShaderFeature {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ShaderFloat16 => "shader_float16",
+            Self::ShaderFloat64 => "shader_float64",
+            Self::ShaderInt8 => "shader_int8",
+            Self::ShaderInt16 => "shader_int16",
+            Self::ShaderInt64 => "shader_int64",
+            Self::StorageBuffer16BitAccess => "storage_buffer16_bit_access",
+            Self::UniformAndStorageBuffer16BitAccess => "uniform_and_storage_buffer16_bit_access",
+            Self::StoragePushConstant16 => "storage_push_constant16",
+            Self::StorageInputOutput16 => "storage_input_output16",
+            Self::StorageBuffer8BitAccess => "storage_buffer8_bit_access",
+            Self::UniformAndStorageBuffer8BitAccess => "uniform_and_storage_buffer8_bit_access",
+            Self::StoragePushConstant8 => "storage_push_constant8",
+            Self::ShaderFloat8 => "shader_float8",
+            Self::ShaderFloat8CooperativeMatrix => "shader_float8_cooperative_matrix",
+            Self::ShaderBfloat16Type => "shader_bfloat16_type",
+            Self::ShaderBfloat16DotProduct => "shader_bfloat16_dot_product",
+            Self::ShaderBfloat16CooperativeMatrix => "shader_bfloat16_cooperative_matrix",
+            Self::VulkanMemoryModel => "vulkan_memory_model",
+            Self::VulkanMemoryModelDeviceScope => "vulkan_memory_model_device_scope",
+            Self::CooperativeMatrix => "cooperative_matrix",
+        }
+    }
+}
+
+impl Display for VulkanShaderFeature {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct VulkanSpirvRequirements {
+    pub shader_features: BTreeSet<VulkanShaderFeature>,
+    pub subgroup_operations: BTreeSet<VulkanSubgroupOperation>,
+    uses_subgroups: bool,
+    vulkan_memory_model_capability: bool,
+    vulkan_memory_model_device_scope_capability: bool,
+    memory_model: Option<u32>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct VulkanShaderFloat8Support {
+    shader_float8: bool,
+    shader_float8_cooperative_matrix: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct VulkanShaderBfloat16Support {
+    shader_bfloat16_type: bool,
+    shader_bfloat16_dot_product: bool,
+    shader_bfloat16_cooperative_matrix: bool,
+}
 
 // ash 0.38 is generated from Vulkan 1.3.281 headers, while shader-float8 was
 // added later. Keep this ABI-compatible definition local until ash publishes
@@ -90,10 +217,13 @@ pub struct VulkanComputeDevice {
     queue: vk::Queue,
     device_name: String,
     enabled_device_extensions: BTreeSet<String>,
+    enabled_shader_features: BTreeSet<VulkanShaderFeature>,
     shared_host_memory_alignment: Option<usize>,
     opaque_fd_timeline_semaphore_supported: bool,
     cooperative_bfloat16_shapes: BTreeSet<(u32, u32, u32)>,
     subgroup_size: u32,
+    subgroup_supported_stages: vk::ShaderStageFlags,
+    subgroup_supported_operations: vk::SubgroupFeatureFlags,
     max_compute_work_group_invocations: u32,
     max_compute_work_group_size_x: u32,
     min_storage_buffer_offset_alignment: usize,
@@ -1259,15 +1389,37 @@ impl VulkanComputeDeviceCatalog {
             let queue_info = [vk::DeviceQueueCreateInfo::default()
                 .queue_family_index(queue_family_index)
                 .queue_priorities(&queue_priorities)];
-            let shader_float8_supported =
-                physical_device_supports_extension(
-                    instance,
-                    physical_device,
-                    VK_EXT_SHADER_FLOAT8_NAME,
-                )? && physical_device_supports_shader_float8(instance, physical_device);
-            let cooperative_bfloat16_feature_supported =
-                physical_device_supports_cooperative_bfloat16(instance, physical_device)?;
-            let cooperative_bfloat16_shapes = if cooperative_bfloat16_feature_supported {
+            let shader_float8_extension_supported = physical_device_supports_extension(
+                instance,
+                physical_device,
+                VK_EXT_SHADER_FLOAT8_NAME,
+            )?;
+            let shader_float8_support = if shader_float8_extension_supported {
+                physical_device_shader_float8_support(instance, physical_device)
+            } else {
+                VulkanShaderFloat8Support::default()
+            };
+            let cooperative_matrix_extension_supported = physical_device_supports_extension(
+                instance,
+                physical_device,
+                ash::khr::cooperative_matrix::NAME,
+            )?;
+            let cooperative_matrix_supported = cooperative_matrix_extension_supported
+                && physical_device_supports_cooperative_matrix(instance, physical_device);
+            let shader_bfloat16_extension_supported = physical_device_supports_extension(
+                instance,
+                physical_device,
+                VK_KHR_SHADER_BFLOAT16_NAME,
+            )?;
+            let shader_bfloat16_support = if shader_bfloat16_extension_supported {
+                physical_device_shader_bfloat16_support(instance, physical_device)
+            } else {
+                VulkanShaderBfloat16Support::default()
+            };
+            let cooperative_bfloat16_features_supported = cooperative_matrix_supported
+                && shader_bfloat16_support.shader_bfloat16_type
+                && shader_bfloat16_support.shader_bfloat16_cooperative_matrix;
+            let cooperative_bfloat16_shapes = if cooperative_bfloat16_features_supported {
                 physical_device_cooperative_bfloat16_shapes(
                     &self.context._entry,
                     instance,
@@ -1276,7 +1428,6 @@ impl VulkanComputeDeviceCatalog {
             } else {
                 BTreeSet::new()
             };
-            let cooperative_bfloat16_supported = !cooperative_bfloat16_shapes.is_empty();
             let shared_host_memory_alignment =
                 if physical_device_supports_extension(
                     instance,
@@ -1304,6 +1455,84 @@ impl VulkanComputeDeviceCatalog {
                     "Vulkan device {device_name:?} does not support the required timeline-semaphore and synchronization2 execution contract"
                 )));
             }
+            // Logical-device features cannot be added later. Enable every supported
+            // feature in the runtime's SPIR-V contract so this device can safely
+            // host different compiled pedal packages without being recreated.
+            let mut enabled_shader_features =
+                physical_device_standard_shader_features(instance, physical_device);
+            if shader_float8_support.shader_float8 {
+                enabled_shader_features.insert(VulkanShaderFeature::ShaderFloat8);
+            }
+            if shader_float8_support.shader_float8_cooperative_matrix
+                && cooperative_matrix_supported
+            {
+                enabled_shader_features.insert(VulkanShaderFeature::ShaderFloat8CooperativeMatrix);
+            }
+            if cooperative_matrix_supported {
+                enabled_shader_features.insert(VulkanShaderFeature::CooperativeMatrix);
+            }
+            if shader_bfloat16_support.shader_bfloat16_type {
+                enabled_shader_features.insert(VulkanShaderFeature::ShaderBfloat16Type);
+            }
+            if shader_bfloat16_support.shader_bfloat16_dot_product {
+                enabled_shader_features.insert(VulkanShaderFeature::ShaderBfloat16DotProduct);
+            }
+            if shader_bfloat16_support.shader_bfloat16_cooperative_matrix
+                && cooperative_matrix_supported
+            {
+                enabled_shader_features
+                    .insert(VulkanShaderFeature::ShaderBfloat16CooperativeMatrix);
+            }
+            let mut enabled_core_features = vk::PhysicalDeviceFeatures::default();
+            enabled_core_features.shader_float64 =
+                bool32(enabled_shader_features.contains(&VulkanShaderFeature::ShaderFloat64));
+            enabled_core_features.shader_int16 =
+                bool32(enabled_shader_features.contains(&VulkanShaderFeature::ShaderInt16));
+            enabled_core_features.shader_int64 =
+                bool32(enabled_shader_features.contains(&VulkanShaderFeature::ShaderInt64));
+            let mut shader_float16_int8_features =
+                vk::PhysicalDeviceShaderFloat16Int8Features::default()
+                    .shader_float16(
+                        enabled_shader_features.contains(&VulkanShaderFeature::ShaderFloat16),
+                    )
+                    .shader_int8(
+                        enabled_shader_features.contains(&VulkanShaderFeature::ShaderInt8),
+                    );
+            let mut storage16_features = vk::PhysicalDevice16BitStorageFeatures::default()
+                .storage_buffer16_bit_access(
+                    enabled_shader_features
+                        .contains(&VulkanShaderFeature::StorageBuffer16BitAccess),
+                )
+                .uniform_and_storage_buffer16_bit_access(
+                    enabled_shader_features
+                        .contains(&VulkanShaderFeature::UniformAndStorageBuffer16BitAccess),
+                )
+                .storage_push_constant16(
+                    enabled_shader_features.contains(&VulkanShaderFeature::StoragePushConstant16),
+                )
+                .storage_input_output16(
+                    enabled_shader_features.contains(&VulkanShaderFeature::StorageInputOutput16),
+                );
+            let mut storage8_features = vk::PhysicalDevice8BitStorageFeatures::default()
+                .storage_buffer8_bit_access(
+                    enabled_shader_features.contains(&VulkanShaderFeature::StorageBuffer8BitAccess),
+                )
+                .uniform_and_storage_buffer8_bit_access(
+                    enabled_shader_features
+                        .contains(&VulkanShaderFeature::UniformAndStorageBuffer8BitAccess),
+                )
+                .storage_push_constant8(
+                    enabled_shader_features.contains(&VulkanShaderFeature::StoragePushConstant8),
+                );
+            let mut vulkan_memory_model_features =
+                vk::PhysicalDeviceVulkanMemoryModelFeatures::default()
+                    .vulkan_memory_model(
+                        enabled_shader_features.contains(&VulkanShaderFeature::VulkanMemoryModel),
+                    )
+                    .vulkan_memory_model_device_scope(
+                        enabled_shader_features
+                            .contains(&VulkanShaderFeature::VulkanMemoryModelDeviceScope),
+                    );
             let mut shader_float8_features =
                 VulkanPhysicalDeviceShaderFloat8FeaturesExt::disabled();
             let mut shader_bfloat16_features =
@@ -1318,25 +1547,47 @@ impl VulkanComputeDeviceCatalog {
             let mut enabled_device_extensions = BTreeSet::new();
             let mut device_info = vk::DeviceCreateInfo::default()
                 .queue_create_infos(&queue_info)
+                .enabled_features(&enabled_core_features)
                 .push_next(&mut timeline_semaphore_features)
-                .push_next(&mut synchronization2_features);
-            if shader_float8_supported {
-                shader_float8_features.shader_float8 = vk::TRUE;
+                .push_next(&mut synchronization2_features)
+                .push_next(&mut shader_float16_int8_features)
+                .push_next(&mut storage16_features)
+                .push_next(&mut storage8_features)
+                .push_next(&mut vulkan_memory_model_features);
+            if shader_float8_support.shader_float8
+                || shader_float8_support.shader_float8_cooperative_matrix
+            {
+                shader_float8_features.shader_float8 = bool32(shader_float8_support.shader_float8);
+                shader_float8_features.shader_float8_cooperative_matrix = bool32(
+                    shader_float8_support.shader_float8_cooperative_matrix
+                        && cooperative_matrix_supported,
+                );
                 extension_names.push(VK_EXT_SHADER_FLOAT8_NAME.as_ptr());
                 enabled_device_extensions
                     .insert(VK_EXT_SHADER_FLOAT8_NAME.to_string_lossy().into_owned());
             }
-            if cooperative_bfloat16_supported {
+            if cooperative_matrix_supported {
                 cooperative_matrix_features.cooperative_matrix = vk::TRUE;
-                shader_bfloat16_features.shader_bfloat16_type = vk::TRUE;
-                shader_bfloat16_features.shader_bfloat16_cooperative_matrix = vk::TRUE;
                 extension_names.push(ash::khr::cooperative_matrix::NAME.as_ptr());
-                extension_names.push(VK_KHR_SHADER_BFLOAT16_NAME.as_ptr());
                 enabled_device_extensions.insert(
                     ash::khr::cooperative_matrix::NAME
                         .to_string_lossy()
                         .into_owned(),
                 );
+            }
+            if shader_bfloat16_support.shader_bfloat16_type
+                || shader_bfloat16_support.shader_bfloat16_dot_product
+                || shader_bfloat16_support.shader_bfloat16_cooperative_matrix
+            {
+                shader_bfloat16_features.shader_bfloat16_type =
+                    bool32(shader_bfloat16_support.shader_bfloat16_type);
+                shader_bfloat16_features.shader_bfloat16_dot_product =
+                    bool32(shader_bfloat16_support.shader_bfloat16_dot_product);
+                shader_bfloat16_features.shader_bfloat16_cooperative_matrix = bool32(
+                    shader_bfloat16_support.shader_bfloat16_cooperative_matrix
+                        && cooperative_matrix_supported,
+                );
+                extension_names.push(VK_KHR_SHADER_BFLOAT16_NAME.as_ptr());
                 enabled_device_extensions
                     .insert(VK_KHR_SHADER_BFLOAT16_NAME.to_string_lossy().into_owned());
             }
@@ -1356,14 +1607,21 @@ impl VulkanComputeDeviceCatalog {
                         .into_owned(),
                 );
             }
-            if shader_float8_supported {
+            if shader_float8_support.shader_float8
+                || shader_float8_support.shader_float8_cooperative_matrix
+            {
                 shader_float8_features.p_next = device_info.p_next.cast_mut();
                 device_info.p_next = std::ptr::from_ref(&shader_float8_features).cast();
             }
-            if cooperative_bfloat16_supported {
+            if shader_bfloat16_support.shader_bfloat16_type
+                || shader_bfloat16_support.shader_bfloat16_dot_product
+                || shader_bfloat16_support.shader_bfloat16_cooperative_matrix
+            {
                 shader_bfloat16_features.p_next = device_info.p_next.cast_mut();
-                cooperative_matrix_features.p_next =
-                    std::ptr::from_mut(&mut shader_bfloat16_features).cast();
+                device_info.p_next = std::ptr::from_ref(&shader_bfloat16_features).cast();
+            }
+            if cooperative_matrix_supported {
+                cooperative_matrix_features.p_next = device_info.p_next.cast_mut();
                 device_info.p_next = std::ptr::from_ref(&cooperative_matrix_features).cast();
             }
             device_info = device_info.enabled_extension_names(&extension_names);
@@ -1380,7 +1638,8 @@ impl VulkanComputeDeviceCatalog {
                 usize::try_from(limits.min_storage_buffer_offset_alignment).map_err(|_| {
                     VulkanError("Vulkan storage-buffer offset alignment exceeds usize".to_string())
                 })?;
-            let subgroup_size = physical_device_subgroup_size(instance, physical_device);
+            let subgroup_support = physical_device_subgroup_support(instance, physical_device);
+            let subgroup_size = subgroup_support.subgroup_size;
 
             Ok(VulkanComputeDevice {
                 context: Arc::clone(&self.context),
@@ -1390,10 +1649,13 @@ impl VulkanComputeDeviceCatalog {
                 queue,
                 device_name,
                 enabled_device_extensions,
+                enabled_shader_features,
                 shared_host_memory_alignment,
                 opaque_fd_timeline_semaphore_supported,
                 cooperative_bfloat16_shapes,
                 subgroup_size,
+                subgroup_supported_stages: subgroup_support.supported_stages,
+                subgroup_supported_operations: subgroup_support.supported_operations,
                 max_compute_work_group_invocations: limits.max_compute_work_group_invocations,
                 max_compute_work_group_size_x: limits.max_compute_work_group_size[0],
                 min_storage_buffer_offset_alignment,
@@ -1440,6 +1702,18 @@ impl VulkanComputeDevice {
 
     pub fn has_enabled_device_extension(&self, extension_name: &str) -> bool {
         self.enabled_device_extensions.contains(extension_name)
+    }
+
+    pub fn has_enabled_shader_feature(&self, feature: VulkanShaderFeature) -> bool {
+        self.enabled_shader_features.contains(&feature)
+    }
+
+    pub fn supports_subgroup_operation(&self, operation: VulkanSubgroupOperation) -> bool {
+        self.subgroup_supported_stages
+            .contains(vk::ShaderStageFlags::COMPUTE)
+            && self
+                .subgroup_supported_operations
+                .contains(operation.flag())
     }
 
     pub fn supports_cooperative_bfloat16_shape(&self, m: u32, n: u32, k: u32) -> bool {
@@ -3166,6 +3440,12 @@ impl VulkanComputeDevice {
         push_constant_byte_count: u32,
         local_size_x: u32,
     ) -> Result<(vk::DescriptorSetLayout, vk::PipelineLayout, vk::Pipeline), VulkanError> {
+        validate_spirv_device_contract(
+            spirv_words,
+            &self.enabled_shader_features,
+            self.subgroup_supported_stages,
+            self.subgroup_supported_operations,
+        )?;
         let key = VulkanGenericPipelineKey {
             spirv_words: spirv_words.to_vec(),
             descriptor_bindings: descriptor_bindings.to_vec(),
@@ -3521,6 +3801,169 @@ fn physical_device_supports_opaque_fd_timeline_semaphore(
         .contains(VULKAN_PERSISTENT_CROSS_DEVICE_SYNC_HANDLE_TYPE)
 }
 
+fn vulkan_shader_feature_for_spirv_capability(capability: u32) -> Option<VulkanShaderFeature> {
+    Some(match capability {
+        9 => VulkanShaderFeature::ShaderFloat16,
+        10 => VulkanShaderFeature::ShaderFloat64,
+        11 => VulkanShaderFeature::ShaderInt64,
+        22 => VulkanShaderFeature::ShaderInt16,
+        39 => VulkanShaderFeature::ShaderInt8,
+        4212 => VulkanShaderFeature::ShaderFloat8,
+        4213 => VulkanShaderFeature::ShaderFloat8CooperativeMatrix,
+        4433 => VulkanShaderFeature::StorageBuffer16BitAccess,
+        4434 => VulkanShaderFeature::UniformAndStorageBuffer16BitAccess,
+        4435 => VulkanShaderFeature::StoragePushConstant16,
+        4436 => VulkanShaderFeature::StorageInputOutput16,
+        4448 => VulkanShaderFeature::StorageBuffer8BitAccess,
+        4449 => VulkanShaderFeature::UniformAndStorageBuffer8BitAccess,
+        4450 => VulkanShaderFeature::StoragePushConstant8,
+        5116 => VulkanShaderFeature::ShaderBfloat16Type,
+        5117 => VulkanShaderFeature::ShaderBfloat16DotProduct,
+        5118 => VulkanShaderFeature::ShaderBfloat16CooperativeMatrix,
+        5345 => VulkanShaderFeature::VulkanMemoryModel,
+        5346 => VulkanShaderFeature::VulkanMemoryModelDeviceScope,
+        6022 => VulkanShaderFeature::CooperativeMatrix,
+        _ => return None,
+    })
+}
+
+fn vulkan_subgroup_operation_for_spirv_capability(
+    capability: u32,
+) -> Option<VulkanSubgroupOperation> {
+    Some(match capability {
+        61 => VulkanSubgroupOperation::Basic,
+        62 => VulkanSubgroupOperation::Vote,
+        63 => VulkanSubgroupOperation::Arithmetic,
+        64 => VulkanSubgroupOperation::Ballot,
+        65 => VulkanSubgroupOperation::Shuffle,
+        66 => VulkanSubgroupOperation::ShuffleRelative,
+        67 => VulkanSubgroupOperation::Clustered,
+        68 => VulkanSubgroupOperation::Quad,
+        _ => return None,
+    })
+}
+
+pub fn vulkan_spirv_requirements(
+    spirv_words: &[u32],
+) -> Result<VulkanSpirvRequirements, VulkanError> {
+    if spirv_words.len() < 5 || spirv_words[0] != SPIRV_MAGIC {
+        return Err(VulkanError(
+            "shader artifact is not a valid little-endian SPIR-V module".to_string(),
+        ));
+    }
+
+    let mut requirements = VulkanSpirvRequirements::default();
+    let mut cursor = 5usize;
+    while cursor < spirv_words.len() {
+        let instruction = spirv_words[cursor];
+        let word_count = (instruction >> 16) as usize;
+        let opcode = (instruction & 0xffff) as u16;
+        if word_count == 0 || cursor + word_count > spirv_words.len() {
+            return Err(VulkanError(format!(
+                "shader artifact has a malformed SPIR-V instruction at word {cursor}"
+            )));
+        }
+        match opcode {
+            SPIRV_OP_CAPABILITY => {
+                if word_count != 2 {
+                    return Err(VulkanError(format!(
+                        "shader artifact has a malformed OpCapability at word {cursor}"
+                    )));
+                }
+                let capability = spirv_words[cursor + 1];
+                if matches!(capability, 0 | 1) {
+                    // Matrix and Shader are baseline compute-shader capabilities.
+                } else if let Some(feature) = vulkan_shader_feature_for_spirv_capability(capability)
+                {
+                    requirements.shader_features.insert(feature);
+                } else if let Some(operation) =
+                    vulkan_subgroup_operation_for_spirv_capability(capability)
+                {
+                    requirements.uses_subgroups = true;
+                    requirements.subgroup_operations.insert(operation);
+                } else {
+                    return Err(VulkanError(format!(
+                        "shader artifact declares SPIR-V capability {capability}, but the runtime has no device contract for it"
+                    )));
+                }
+                requirements.vulkan_memory_model_capability |= capability == 5345;
+                requirements.vulkan_memory_model_device_scope_capability |= capability == 5346;
+            }
+            SPIRV_OP_MEMORY_MODEL => {
+                if word_count != 3 || requirements.memory_model.is_some() {
+                    return Err(VulkanError(format!(
+                        "shader artifact has an invalid OpMemoryModel at word {cursor}"
+                    )));
+                }
+                requirements.memory_model = Some(spirv_words[cursor + 2]);
+            }
+            _ => {}
+        }
+        cursor += word_count;
+    }
+
+    let memory_model = requirements.memory_model.ok_or_else(|| {
+        VulkanError("shader artifact does not declare an SPIR-V memory model".to_string())
+    })?;
+    if requirements.vulkan_memory_model_capability != (memory_model == SPIRV_MEMORY_MODEL_VULKAN) {
+        return Err(VulkanError(
+            "shader artifact has an inconsistent Vulkan SPIR-V memory-model contract".to_string(),
+        ));
+    }
+    if requirements.vulkan_memory_model_device_scope_capability
+        && !requirements.vulkan_memory_model_capability
+    {
+        return Err(VulkanError(
+            "shader artifact declares VulkanMemoryModelDeviceScope without VulkanMemoryModel"
+                .to_string(),
+        ));
+    }
+    Ok(requirements)
+}
+
+fn validate_spirv_device_contract(
+    spirv_words: &[u32],
+    enabled_shader_features: &BTreeSet<VulkanShaderFeature>,
+    subgroup_supported_stages: vk::ShaderStageFlags,
+    subgroup_supported_operations: vk::SubgroupFeatureFlags,
+) -> Result<(), VulkanError> {
+    let requirements = vulkan_spirv_requirements(spirv_words)?;
+    let missing_features = requirements
+        .shader_features
+        .difference(enabled_shader_features)
+        .copied()
+        .map(VulkanShaderFeature::label)
+        .collect::<Vec<_>>();
+    if !missing_features.is_empty() {
+        return Err(VulkanError(format!(
+            "shader artifact requires Vulkan features that were not enabled on the logical device: {}",
+            missing_features.join(", ")
+        )));
+    }
+    if requirements.uses_subgroups
+        && !subgroup_supported_stages.contains(vk::ShaderStageFlags::COMPUTE)
+    {
+        return Err(VulkanError(
+            "shader artifact uses subgroup operations, but the device does not support them in compute shaders"
+                .to_string(),
+        ));
+    }
+    let missing_subgroup_operations = requirements
+        .subgroup_operations
+        .iter()
+        .copied()
+        .filter(|operation| !subgroup_supported_operations.contains(operation.flag()))
+        .map(VulkanSubgroupOperation::label)
+        .collect::<Vec<_>>();
+    if !missing_subgroup_operations.is_empty() {
+        return Err(VulkanError(format!(
+            "shader artifact requires unsupported Vulkan subgroup operations: {}",
+            missing_subgroup_operations.join(", ")
+        )));
+    }
+    Ok(())
+}
+
 fn physical_device_supports_modern_submission(
     instance: &ash::Instance,
     physical_device: vk::PhysicalDevice,
@@ -3539,10 +3982,87 @@ fn physical_device_supports_modern_submission(
     )
 }
 
-fn physical_device_supports_shader_float8(
+fn bool32(value: bool) -> vk::Bool32 {
+    if value { vk::TRUE } else { vk::FALSE }
+}
+
+fn physical_device_standard_shader_features(
     instance: &ash::Instance,
     physical_device: vk::PhysicalDevice,
-) -> bool {
+) -> BTreeSet<VulkanShaderFeature> {
+    let core = unsafe { instance.get_physical_device_features(physical_device) };
+    let mut float16_int8 = vk::PhysicalDeviceShaderFloat16Int8Features::default();
+    let mut storage16 = vk::PhysicalDevice16BitStorageFeatures::default();
+    let mut storage8 = vk::PhysicalDevice8BitStorageFeatures::default();
+    let mut memory_model = vk::PhysicalDeviceVulkanMemoryModelFeatures::default();
+    let mut features = vk::PhysicalDeviceFeatures2::default()
+        .push_next(&mut float16_int8)
+        .push_next(&mut storage16)
+        .push_next(&mut storage8)
+        .push_next(&mut memory_model);
+    unsafe {
+        instance.get_physical_device_features2(physical_device, &mut features);
+    }
+
+    let mut supported = BTreeSet::new();
+    let mut insert = |available: vk::Bool32, feature| {
+        if available == vk::TRUE {
+            supported.insert(feature);
+        }
+    };
+    insert(
+        float16_int8.shader_float16,
+        VulkanShaderFeature::ShaderFloat16,
+    );
+    insert(float16_int8.shader_int8, VulkanShaderFeature::ShaderInt8);
+    insert(core.shader_float64, VulkanShaderFeature::ShaderFloat64);
+    insert(core.shader_int16, VulkanShaderFeature::ShaderInt16);
+    insert(core.shader_int64, VulkanShaderFeature::ShaderInt64);
+    insert(
+        storage16.storage_buffer16_bit_access,
+        VulkanShaderFeature::StorageBuffer16BitAccess,
+    );
+    insert(
+        storage16.uniform_and_storage_buffer16_bit_access,
+        VulkanShaderFeature::UniformAndStorageBuffer16BitAccess,
+    );
+    insert(
+        storage16.storage_push_constant16,
+        VulkanShaderFeature::StoragePushConstant16,
+    );
+    insert(
+        storage16.storage_input_output16,
+        VulkanShaderFeature::StorageInputOutput16,
+    );
+    insert(
+        storage8.storage_buffer8_bit_access,
+        VulkanShaderFeature::StorageBuffer8BitAccess,
+    );
+    insert(
+        storage8.uniform_and_storage_buffer8_bit_access,
+        VulkanShaderFeature::UniformAndStorageBuffer8BitAccess,
+    );
+    insert(
+        storage8.storage_push_constant8,
+        VulkanShaderFeature::StoragePushConstant8,
+    );
+    insert(
+        memory_model.vulkan_memory_model,
+        VulkanShaderFeature::VulkanMemoryModel,
+    );
+    if memory_model.vulkan_memory_model == vk::TRUE {
+        insert(
+            memory_model.vulkan_memory_model_device_scope,
+            VulkanShaderFeature::VulkanMemoryModelDeviceScope,
+        );
+    }
+    supported
+}
+
+fn physical_device_shader_float8_support(
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+) -> VulkanShaderFloat8Support {
     let mut shader_float8 = VulkanPhysicalDeviceShaderFloat8FeaturesExt::disabled();
     let mut features = vk::PhysicalDeviceFeatures2 {
         p_next: std::ptr::from_mut(&mut shader_float8).cast(),
@@ -3551,30 +4071,18 @@ fn physical_device_supports_shader_float8(
     unsafe {
         instance.get_physical_device_features2(physical_device, &mut features);
     }
-    shader_float8.shader_float8 == vk::TRUE
+    VulkanShaderFloat8Support {
+        shader_float8: shader_float8.shader_float8 == vk::TRUE,
+        shader_float8_cooperative_matrix: shader_float8.shader_float8_cooperative_matrix
+            == vk::TRUE,
+    }
 }
 
-fn physical_device_supports_cooperative_bfloat16(
+fn physical_device_supports_cooperative_matrix(
     instance: &ash::Instance,
     physical_device: vk::PhysicalDevice,
-) -> Result<bool, VulkanError> {
-    if !physical_device_supports_extension(
-        instance,
-        physical_device,
-        ash::khr::cooperative_matrix::NAME,
-    )? || !physical_device_supports_extension(
-        instance,
-        physical_device,
-        VK_KHR_SHADER_BFLOAT16_NAME,
-    )? {
-        return Ok(false);
-    }
-
-    let mut shader_bfloat16 = VulkanPhysicalDeviceShaderBfloat16FeaturesKhr::disabled();
-    let mut cooperative_matrix = vk::PhysicalDeviceCooperativeMatrixFeaturesKHR {
-        p_next: std::ptr::from_mut(&mut shader_bfloat16).cast(),
-        ..Default::default()
-    };
+) -> bool {
+    let mut cooperative_matrix = vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default();
     let mut features = vk::PhysicalDeviceFeatures2 {
         p_next: std::ptr::from_mut(&mut cooperative_matrix).cast(),
         ..Default::default()
@@ -3582,9 +4090,27 @@ fn physical_device_supports_cooperative_bfloat16(
     unsafe {
         instance.get_physical_device_features2(physical_device, &mut features);
     }
-    Ok(cooperative_matrix.cooperative_matrix == vk::TRUE
-        && shader_bfloat16.shader_bfloat16_type == vk::TRUE
-        && shader_bfloat16.shader_bfloat16_cooperative_matrix == vk::TRUE)
+    cooperative_matrix.cooperative_matrix == vk::TRUE
+}
+
+fn physical_device_shader_bfloat16_support(
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+) -> VulkanShaderBfloat16Support {
+    let mut shader_bfloat16 = VulkanPhysicalDeviceShaderBfloat16FeaturesKhr::disabled();
+    let mut features = vk::PhysicalDeviceFeatures2 {
+        p_next: std::ptr::from_mut(&mut shader_bfloat16).cast(),
+        ..Default::default()
+    };
+    unsafe {
+        instance.get_physical_device_features2(physical_device, &mut features);
+    }
+    VulkanShaderBfloat16Support {
+        shader_bfloat16_type: shader_bfloat16.shader_bfloat16_type == vk::TRUE,
+        shader_bfloat16_dot_product: shader_bfloat16.shader_bfloat16_dot_product == vk::TRUE,
+        shader_bfloat16_cooperative_matrix: shader_bfloat16.shader_bfloat16_cooperative_matrix
+            == vk::TRUE,
+    }
 }
 
 fn physical_device_cooperative_bfloat16_shapes(
@@ -3616,10 +4142,10 @@ fn physical_device_cooperative_bfloat16_shapes(
         .collect())
 }
 
-fn physical_device_subgroup_size(
+fn physical_device_subgroup_support(
     instance: &ash::Instance,
     physical_device: vk::PhysicalDevice,
-) -> u32 {
+) -> vk::PhysicalDeviceSubgroupProperties<'static> {
     let mut subgroup = vk::PhysicalDeviceSubgroupProperties::default();
     let mut properties = vk::PhysicalDeviceProperties2 {
         p_next: std::ptr::from_mut(&mut subgroup).cast(),
@@ -3628,7 +4154,7 @@ fn physical_device_subgroup_size(
     unsafe {
         instance.get_physical_device_properties2(physical_device, &mut properties);
     }
-    subgroup.subgroup_size
+    subgroup
 }
 
 unsafe fn inspect_compute_device(
@@ -4098,6 +4624,134 @@ fn test_command_exists(command: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn spirv_test_module(capabilities: &[u32], memory_model: u32) -> Vec<u32> {
+        let mut words = vec![SPIRV_MAGIC, 0x0001_0600, 0, 1, 0];
+        for capability in capabilities {
+            words.extend([(2u32 << 16) | u32::from(SPIRV_OP_CAPABILITY), *capability]);
+        }
+        words.extend([
+            (3u32 << 16) | u32::from(SPIRV_OP_MEMORY_MODEL),
+            0,
+            memory_model,
+        ]);
+        words
+    }
+
+    #[test]
+    fn spirv_contract_extracts_every_feature_used_by_cooperative_bfloat16() {
+        let words = spirv_test_module(&[1, 9, 22, 4433, 5116, 5118, 5345, 6022], 3);
+
+        let requirements = vulkan_spirv_requirements(&words).unwrap();
+
+        assert_eq!(
+            requirements.shader_features,
+            BTreeSet::from([
+                VulkanShaderFeature::ShaderFloat16,
+                VulkanShaderFeature::ShaderInt16,
+                VulkanShaderFeature::StorageBuffer16BitAccess,
+                VulkanShaderFeature::ShaderBfloat16Type,
+                VulkanShaderFeature::ShaderBfloat16CooperativeMatrix,
+                VulkanShaderFeature::VulkanMemoryModel,
+                VulkanShaderFeature::CooperativeMatrix,
+            ])
+        );
+    }
+
+    #[test]
+    fn spirv_contract_rejects_missing_device_features_before_gpu_submission() {
+        let words = spirv_test_module(&[1, 5345], 3);
+
+        let error = validate_spirv_device_contract(
+            &words,
+            &BTreeSet::new(),
+            vk::ShaderStageFlags::COMPUTE,
+            vk::SubgroupFeatureFlags::empty(),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            VulkanError(
+                "shader artifact requires Vulkan features that were not enabled on the logical device: vulkan_memory_model"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn spirv_contract_accepts_a_fully_provisioned_device_contract() {
+        let words = spirv_test_module(&[1, 61, 63, 5345], 3);
+
+        validate_spirv_device_contract(
+            &words,
+            &BTreeSet::from([VulkanShaderFeature::VulkanMemoryModel]),
+            vk::ShaderStageFlags::COMPUTE,
+            vk::SubgroupFeatureFlags::BASIC | vk::SubgroupFeatureFlags::ARITHMETIC,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn spirv_contract_rejects_unsupported_subgroup_operations() {
+        let words = spirv_test_module(&[1, 61, 63], 1);
+
+        let error = validate_spirv_device_contract(
+            &words,
+            &BTreeSet::new(),
+            vk::ShaderStageFlags::COMPUTE,
+            vk::SubgroupFeatureFlags::BASIC,
+        )
+        .unwrap_err();
+
+        assert!(error.0.contains("arithmetic"));
+    }
+
+    #[test]
+    fn package_capability_names_match_the_compiler_contract() {
+        assert_eq!(
+            serde_json::to_string(&VulkanShaderFeature::VulkanMemoryModel).unwrap(),
+            "\"vulkan_memory_model\""
+        );
+        assert_eq!(
+            serde_json::to_string(&VulkanShaderFeature::StorageBuffer16BitAccess).unwrap(),
+            "\"storage_buffer16_bit_access\""
+        );
+        assert_eq!(
+            serde_json::to_string(&VulkanSubgroupOperation::ShuffleRelative).unwrap(),
+            "\"shuffle_relative\""
+        );
+    }
+
+    #[test]
+    fn spirv_contract_rejects_inconsistent_memory_model_declarations() {
+        let vulkan_without_capability = spirv_test_module(&[1], 3);
+        let capability_without_vulkan = spirv_test_module(&[1, 5345], 1);
+
+        assert!(vulkan_spirv_requirements(&vulkan_without_capability).is_err());
+        assert!(vulkan_spirv_requirements(&capability_without_vulkan).is_err());
+    }
+
+    #[test]
+    fn spirv_contract_fails_closed_for_unmodeled_capabilities() {
+        let words = spirv_test_module(&[1, 65_535], 1);
+
+        assert_eq!(
+            vulkan_spirv_requirements(&words).unwrap_err(),
+            VulkanError(
+                "shader artifact declares SPIR-V capability 65535, but the runtime has no device contract for it"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn spirv_contract_rejects_truncated_instructions() {
+        let mut words = spirv_test_module(&[1], 1);
+        words.push((4u32 << 16) | 54);
+
+        assert!(vulkan_spirv_requirements(&words).is_err());
+    }
 
     #[test]
     fn timeline_replay_offsets_preserve_values_and_reject_overflow() {

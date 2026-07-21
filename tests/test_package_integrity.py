@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import struct
 from hashlib import sha256
 from io import BytesIO
 from pathlib import Path
@@ -29,7 +30,21 @@ def minimal_package(root: Path) -> dict[str, object]:
     (root / "config.json").write_text("{}")
     (root / "tokenizer" / "tokenizer.json").write_text("{}")
     (root / "weights" / "model.safetensors").write_bytes(b"weights")
-    (root / "shaders" / "kernel.spv").write_bytes(b"\x03\x02#\x07payload")
+    shader_words = [
+        0x07230203,
+        0x00010600,
+        0,
+        1,
+        0,
+        (2 << 16) | 17,
+        1,
+        (3 << 16) | 14,
+        0,
+        1,
+    ]
+    (root / "shaders" / "kernel.spv").write_bytes(
+        struct.pack(f"<{len(shader_words)}I", *shader_words)
+    )
     (root / "tensors.json").write_text(
         json.dumps(
             {
@@ -266,6 +281,8 @@ def minimal_package(root: Path) -> dict[str, object]:
         "package_id": "fixture_package",
         "max_context_activations": 1024,
         "required_vulkan_device_extensions": [],
+        "required_vulkan_features": [],
+        "required_vulkan_subgroup_operations": [],
         "circuit_graph": {
             "wiring": "explicit_graph",
             "cables": [
@@ -435,6 +452,10 @@ def test_package_integrity_accepts_a_complete_compiler_boundary(tmp_path: Path) 
         ("sampler_contract", "sampler execution does not match"),
         ("batch_contract", "invalid batch execution contract"),
         ("device_extensions", "required Vulkan device extensions"),
+        ("device_features", "required Vulkan features"),
+        ("subgroup_operations", "required Vulkan subgroup operations"),
+        ("device_feature_drift", "mandatory SPIR-V artifacts"),
+        ("subgroup_operation_drift", "mandatory SPIR-V artifacts"),
         ("generation_boundary", "boundaries must expose"),
         ("compiler_placement", "must not contain runtime placement fields"),
         ("path_escape", "must stay inside the package"),
@@ -494,6 +515,14 @@ def test_package_integrity_rejects_corrupt_or_incomplete_artifacts(
             "VK_EXT_shader_float8",
             "VK_EXT_shader_float8",
         ]
+    elif corruption == "device_features":
+        manifest["required_vulkan_features"] = ["unknown_feature"]
+    elif corruption == "subgroup_operations":
+        manifest["required_vulkan_subgroup_operations"] = ["basic", "basic"]
+    elif corruption == "device_feature_drift":
+        manifest["required_vulkan_features"] = ["shader_int8"]
+    elif corruption == "subgroup_operation_drift":
+        manifest["required_vulkan_subgroup_operations"] = ["basic"]
     elif corruption == "generation_boundary":
         manifest["circuit_graph"]["boundary"]["public_outputs"][0]["endpoint"] = {
             "pedal_id": "output",
@@ -509,6 +538,35 @@ def test_package_integrity_rejects_corrupt_or_incomplete_artifacts(
         manifest["config_path"] = "../config.json"
 
     with pytest.raises(ModelCompileError, match=message):
+        validate_compiled_package(tmp_path, manifest)
+
+
+def test_package_integrity_rejects_batch_requirements_that_do_not_match_spirv(
+    tmp_path: Path,
+) -> None:
+    manifest = minimal_package(tmp_path)
+    kernel = manifest["pedal_executions"][0]["kernels"][0]
+    kernel["batch_mode"] = "weight_shared"
+    kernel["batch_implementations"] = [
+        {
+            "lane_tile_width": 4,
+            "exact_primary_equivalence": True,
+            "device_requirements": {
+                "vulkan_device_extensions": [],
+                "vulkan_features": ["shader_int8"],
+                "subgroup_operations": [],
+            },
+            "stages": [
+                {
+                    "shader_path": "shaders/kernel.spv",
+                    "local_size_x": 64,
+                    "workgroup_count_x": 1,
+                }
+            ],
+        }
+    ]
+
+    with pytest.raises(ModelCompileError, match="compiled batch implementation"):
         validate_compiled_package(tmp_path, manifest)
 
 
