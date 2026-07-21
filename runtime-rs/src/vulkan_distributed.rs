@@ -1105,6 +1105,28 @@ impl VulkanDistributedDispatchRunners {
             .reserve(owner_device_id, dispatch_index)
     }
 
+    pub fn advance_replayed_dependency_values(
+        &self,
+        count: usize,
+    ) -> Result<(), VulkanDistributedDispatchRunnerError> {
+        let count = u64::try_from(count).map_err(|_| {
+            VulkanDistributedDispatchRunnerError(
+                "distributed replay dependency count exceeds u64".to_string(),
+            )
+        })?;
+        for dispatch in &self.dispatches {
+            dispatch.dependency_clock.validate_advance(
+                count,
+                &dispatch.planned.owner_device_id,
+                dispatch.planned.dispatch_index,
+            )?;
+        }
+        for dispatch in &self.dispatches {
+            dispatch.dependency_clock.advance(count);
+        }
+        Ok(())
+    }
+
     pub fn owner_ready_signal_points(
         &self,
         owner_device_id: &str,
@@ -1395,6 +1417,29 @@ impl VulkanDistributedDependencyClock {
         })?;
         self.next_value.set(next);
         Ok(value)
+    }
+
+    fn validate_advance(
+        &self,
+        count: u64,
+        owner_device_id: &str,
+        dispatch_index: usize,
+    ) -> Result<(), VulkanDistributedDispatchRunnerError> {
+        self.next_value.get().checked_add(count).ok_or_else(|| {
+            VulkanDistributedDispatchRunnerError(format!(
+                "distributed dispatch {dispatch_index} owned by {owner_device_id:?} exhausts its timeline semaphore values during replay"
+            ))
+        })?;
+        Ok(())
+    }
+
+    fn advance(&self, count: u64) {
+        self.next_value.set(
+            self.next_value
+                .get()
+                .checked_add(count)
+                .expect("distributed replay dependency advance was validated"),
+        );
     }
 }
 
@@ -2218,6 +2263,9 @@ mod tests {
 
         assert_eq!(clock.reserve("owner", 7).unwrap(), 1);
         assert_eq!(clock.reserve("owner", 7).unwrap(), 2);
+        clock.validate_advance(64, "owner", 7).unwrap();
+        clock.advance(64);
+        assert_eq!(clock.reserve("owner", 7).unwrap(), 67);
 
         clock.next_value.set(u64::MAX);
         let error = clock.reserve("owner", 7).unwrap_err();

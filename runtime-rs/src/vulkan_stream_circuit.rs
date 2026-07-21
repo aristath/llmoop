@@ -33,8 +33,8 @@ use crate::vulkan_compute::{
     VulkanResidentBufferCopyBatch, VulkanResidentBufferRangeCopy, VulkanResidentKernelBufferAccess,
     VulkanResidentKernelBufferBinding, VulkanResidentKernelDispatch, VulkanResidentKernelSequence,
     VulkanResidentKernelSequenceSnapshotCopy, VulkanResidentKernelSequenceStep,
-    VulkanResidentMappedBufferCopy, VulkanResidentQueueSubmissionBatch, VulkanTimelineSemaphore,
-    VulkanTimelineSemaphorePoint,
+    VulkanResidentMappedBufferCopy, VulkanResidentQueueSubmissionBatch,
+    VulkanResidentQueueSubmissionTemplate, VulkanTimelineSemaphore, VulkanTimelineSemaphorePoint,
 };
 use crate::vulkan_distributed::{
     VulkanDistributedActivationBufferPlan, VulkanDistributedActivationBuffers,
@@ -12452,6 +12452,12 @@ struct VulkanPlacedOutputTimelineTurn<'a> {
     value: u64,
 }
 
+struct VulkanResidentPlacedFeedbackSubmissionReplay<'a> {
+    template: VulkanResidentQueueSubmissionTemplate<'a>,
+    tick_count: usize,
+    next_timeline_value_offset: u64,
+}
+
 impl VulkanResidentPlacedFeedbackTimelineSynchronization {
     fn new(
         input_device: &VulkanComputeDevice,
@@ -12502,6 +12508,32 @@ impl VulkanResidentPlacedFeedbackTimelineSynchronization {
             output_signal: VulkanTimelineSemaphorePoint::new(&self.output_signal, value),
         })
     }
+
+    fn advance_replayed_turns(&self, count: usize) -> Result<(), VulkanError> {
+        let count = u64::try_from(count)
+            .map_err(|_| VulkanError("resident feedback replay width exceeds u64".to_string()))?;
+        if count == 0 {
+            return Err(VulkanError(
+                "resident feedback replay width must not be zero".to_string(),
+            ));
+        }
+        let first_value = self.next_value.get();
+        let expected_pending = first_value.checked_sub(1).ok_or_else(|| {
+            VulkanError("resident feedback replay has no preceding timeline value".to_string())
+        })?;
+        if self.pending_value.get() != Some(expected_pending) {
+            return Err(VulkanError(format!(
+                "resident feedback replay expected pending timeline value {expected_pending}, found {:?}",
+                self.pending_value.get()
+            )));
+        }
+        let next_value = first_value.checked_add(count).ok_or_else(|| {
+            VulkanError("resident feedback replay exhausted timeline values".to_string())
+        })?;
+        self.next_value.set(next_value);
+        self.pending_value.set(Some(next_value - 1));
+        Ok(())
+    }
 }
 
 impl VulkanResidentPlacedOutputTimelineSynchronization {
@@ -12533,6 +12565,62 @@ impl VulkanResidentPlacedOutputTimelineSynchronization {
         value: u64,
     ) -> Result<(), VulkanError> {
         output_device.wait_timeline_semaphore_value(&self.signal, value)
+    }
+
+    fn reserve_replayed_turns(&self, count: usize) -> Result<Vec<u64>, VulkanError> {
+        let count = u64::try_from(count)
+            .map_err(|_| VulkanError("resident output replay width exceeds u64".to_string()))?;
+        if count == 0 {
+            return Err(VulkanError(
+                "resident output replay width must not be zero".to_string(),
+            ));
+        }
+        let first_value = self.next_value.get();
+        let next_value = first_value.checked_add(count).ok_or_else(|| {
+            VulkanError("resident output replay exhausted timeline values".to_string())
+        })?;
+        self.next_value.set(next_value);
+        Ok((first_value..next_value).collect())
+    }
+}
+
+impl<'a> VulkanResidentPlacedFeedbackSubmissionReplay<'a> {
+    fn new(
+        template: VulkanResidentQueueSubmissionTemplate<'a>,
+        tick_count: usize,
+    ) -> Result<Self, VulkanError> {
+        let next_timeline_value_offset = u64::try_from(tick_count)
+            .map_err(|_| VulkanError("resident feedback replay width exceeds u64".to_string()))?;
+        Ok(Self {
+            template,
+            tick_count,
+            next_timeline_value_offset,
+        })
+    }
+
+    fn validate_tick_count(&self, tick_count: usize) -> Result<(), VulkanError> {
+        if tick_count != self.tick_count {
+            return Err(VulkanError(format!(
+                "resident feedback replay was mounted for {} ticks, received {tick_count}",
+                self.tick_count
+            )));
+        }
+        Ok(())
+    }
+
+    fn submit_next(&mut self, tick_count: usize) -> Result<usize, VulkanError> {
+        self.validate_tick_count(tick_count)?;
+        let offset = self.next_timeline_value_offset;
+        let next_offset = offset
+            .checked_add(u64::try_from(tick_count).map_err(|_| {
+                VulkanError("resident feedback replay width exceeds u64".to_string())
+            })?)
+            .ok_or_else(|| {
+                VulkanError("resident feedback replay offset exhausted u64".to_string())
+            })?;
+        let submitted = self.template.submit_with_timeline_value_offset(offset)?;
+        self.next_timeline_value_offset = next_offset;
+        Ok(submitted)
     }
 }
 
@@ -12895,6 +12983,37 @@ struct VulkanPlacedCableTimelineSynchronization {
 }
 
 impl VulkanPlacedCableTimelineSynchronizations {
+    fn advance_replayed_dependencies(&self, count: usize) -> Result<(), VulkanError> {
+        let count = u64::try_from(count)
+            .map_err(|_| VulkanError("placed cable replay width exceeds u64".to_string()))?;
+        for (key, synchronization) in &self.cables {
+            if synchronization.pending_value.get().is_some() {
+                return Err(VulkanError(format!(
+                    "cross-device cable {key:?} cannot replay with an unconsumed timeline dependency"
+                )));
+            }
+            synchronization
+                .next_value
+                .get()
+                .checked_add(count)
+                .ok_or_else(|| {
+                    VulkanError(format!(
+                        "cross-device cable {key:?} exhausts its timeline values during replay"
+                    ))
+                })?;
+        }
+        for synchronization in self.cables.values() {
+            synchronization.next_value.set(
+                synchronization
+                    .next_value
+                    .get()
+                    .checked_add(count)
+                    .expect("placed cable replay advance was validated"),
+            );
+        }
+        Ok(())
+    }
+
     fn prepare_source_signal<'a>(
         &'a self,
         endpoint: &VulkanPlacedCableEndpoint,
@@ -14762,11 +14881,185 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
             .unwrap_or(0)
     }
 
-    fn run_resident_feedback_window<F>(
-        &self,
-        devices: &BTreeMap<String, Rc<VulkanComputeDevice>>,
+    fn mount_resident_feedback_submission_template<'a>(
+        &'a self,
+        devices: &'a BTreeMap<String, Rc<VulkanComputeDevice>>,
         start_stream_tick: u64,
         tick_count: usize,
+        static_state_snapshots: &'a [VulkanResidentStateTransactionBank],
+        feedback_synchronization: Option<&'a VulkanResidentPlacedFeedbackTimelineSynchronization>,
+        output_synchronization: &'a VulkanResidentPlacedOutputTimelineSynchronization,
+    ) -> Result<
+        (VulkanResidentQueueSubmissionTemplate<'a>, Vec<u64>),
+        VulkanResidentInProcessPlacedRuntimeError,
+    > {
+        let mut transport = VulkanInProcessPlacedCableTransport::new();
+        let submission_batch = VulkanResidentQueueSubmissionBatch::new();
+        let mut output_timeline_values = Vec::with_capacity(tick_count);
+        for tick_index in 0..tick_count {
+            let stream_tick =
+                start_stream_tick
+                    .checked_add(u64::try_from(tick_index).map_err(|_| {
+                        VulkanResidentInProcessPlacedRuntimeError::StreamTickOverflow
+                    })?)
+                    .ok_or(VulkanResidentInProcessPlacedRuntimeError::StreamTickOverflow)?;
+            let mut slices = SmallVec::<
+                [VulkanMountedPlacedResidentInProcessStreamTickSlice<'_>; 4],
+            >::with_capacity(self.device_slices.len());
+            for slice in &self.device_slices {
+                let device = devices.get(&slice.device_id).ok_or_else(|| {
+                    VulkanResidentInProcessPlacedRuntimeError::MissingBoundDevice {
+                        device_id: slice.device_id.clone(),
+                    }
+                })?;
+                let mut dispatch_extensions =
+                    VulkanMountedPlacedResidentStreamTickDispatchExtensions {
+                        sequence_variant: VulkanResidentPlacedTokenTickTail::Sample
+                            .sequence_variant(),
+                        ..Default::default()
+                    };
+                if slice.device_id == self.model.input_device_id {
+                    dispatch_extensions
+                        .prefix_dispatches
+                        .push(&self.input_transducer.resident_dispatch);
+                }
+                if slice.device_id == self.model.output_device_id {
+                    dispatch_extensions
+                        .suffix_dispatches
+                        .push(&self.output_transducer.embedding_norm_dispatch);
+                    dispatch_extensions
+                        .suffix_dispatches
+                        .push(&self.output_transducer.tied_projection_dispatch);
+                    dispatch_extensions
+                        .suffix_dispatches
+                        .extend(self.sampler.resident_dispatches());
+                }
+                slices.push(
+                    VulkanMountedPlacedResidentInProcessStreamTickSlice::new_with_dispatch_extensions(
+                        device,
+                        &slice.mounted,
+                        &slice.resident_execution_plan,
+                        dispatch_extensions,
+                        stream_tick,
+                    ),
+                );
+            }
+            let completes_window = tick_index + 1 == tick_count;
+            let feedback_turn = feedback_synchronization
+                .map(|synchronization| {
+                    synchronization
+                        .prepare_turn(&self.model.input_device_id, &self.model.output_device_id)
+                })
+                .transpose()
+                .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
+            let output_turn = output_synchronization
+                .prepare_turn(&self.model.output_device_id)
+                .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
+            output_timeline_values.push(output_turn.value);
+            let run = run_mounted_placed_resident_stream_tick_slices_in_process_with_schedule_and_distributed(
+                &mut slices,
+                &mut transport,
+                &self.activation_schedule,
+                Some(&self.distributed_dispatch_runners),
+                Some(&self.cable_synchronizations),
+                VulkanPlacedSubmissionContext {
+                    policy: VulkanPlacedSubmissionPolicy {
+                        write_stream_control: false,
+                        signal_completion: completes_window,
+                        wait_for_completion: false,
+                        feedback_lane: Some(tick_index),
+                    },
+                    state_transactions: Some(static_state_snapshots),
+                    feedback_turn,
+                    output_turn: Some(output_turn),
+                    submission_batch: Some(&submission_batch),
+                },
+            )
+            .map_err(VulkanResidentInProcessPlacedRuntimeError::Tick)?;
+            if run.status != VulkanMountedPlacedResidentInProcessStreamTickRunStatus::Completed {
+                return Err(VulkanResidentInProcessPlacedRuntimeError::IncompleteTick(
+                    run.status,
+                ));
+            }
+        }
+        let queued_submission_count = submission_batch.pending_submission_count();
+        let submission_template = submission_batch
+            .mount()
+            .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
+        debug_assert_eq!(
+            submission_template.submission_count(),
+            queued_submission_count
+        );
+        Ok((submission_template, output_timeline_values))
+    }
+
+    fn advance_resident_feedback_submission_replay(
+        &self,
+        feedback_synchronization: Option<&VulkanResidentPlacedFeedbackTimelineSynchronization>,
+        output_synchronization: &VulkanResidentPlacedOutputTimelineSynchronization,
+        tick_count: usize,
+    ) -> Result<Vec<u64>, VulkanResidentInProcessPlacedRuntimeError> {
+        // Feedback eligibility requires a completed, bridged traversal of the
+        // same board for every tick. Each feedback edge, remote cable, and
+        // distributed dispatch therefore advances once per replayed tick, so
+        // the mounted queue template can use one uniform timeline offset.
+        if let Some(feedback_synchronization) = feedback_synchronization {
+            feedback_synchronization
+                .advance_replayed_turns(tick_count)
+                .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
+        }
+        self.cable_synchronizations
+            .advance_replayed_dependencies(tick_count)
+            .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
+        self.distributed_dispatch_runners
+            .advance_replayed_dependency_values(tick_count)
+            .map_err(|error| {
+                VulkanResidentInProcessPlacedRuntimeError::Tick(
+                    VulkanMountedPlacedResidentInProcessStreamTickError::Distributed(error),
+                )
+            })?;
+        output_synchronization
+            .reserve_replayed_turns(tick_count)
+            .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)
+    }
+
+    fn wait_resident_feedback_terminal_work(
+        &self,
+        devices: &BTreeMap<String, Rc<VulkanComputeDevice>>,
+        feedback_lane: usize,
+    ) -> Result<(), VulkanResidentInProcessPlacedRuntimeError> {
+        let device_by_id = devices
+            .iter()
+            .map(|(device_id, device)| (device_id.clone(), device.as_ref()))
+            .collect::<BTreeMap<_, _>>();
+        for slice in &self.device_slices {
+            let device = device_by_id.get(&slice.device_id).copied().ok_or_else(|| {
+                VulkanResidentInProcessPlacedRuntimeError::MissingBoundDevice {
+                    device_id: slice.device_id.clone(),
+                }
+            })?;
+            wait_for_compact_execution_plan_terminal_work(
+                &slice.device_id,
+                device,
+                &slice.resident_execution_plan,
+                VulkanResidentPlacedTokenTickTail::Sample.sequence_variant(),
+                &device_by_id,
+                &self.distributed_dispatch_runners,
+                Some(feedback_lane),
+            )
+            .map_err(VulkanResidentInProcessPlacedRuntimeError::Tick)?;
+        }
+        Ok(())
+    }
+
+    fn run_resident_feedback_window<'a, F>(
+        &'a self,
+        devices: &'a BTreeMap<String, Rc<VulkanComputeDevice>>,
+        start_stream_tick: u64,
+        tick_count: usize,
+        mut submission_replay: Option<
+            &mut Option<VulkanResidentPlacedFeedbackSubmissionReplay<'a>>,
+        >,
         mut on_sampled_token: F,
     ) -> Result<(), VulkanResidentInProcessPlacedRuntimeError>
     where
@@ -14874,115 +15167,45 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
                 feedback_synchronization,
                 output_synchronization,
             } => {
-                let mut transport = VulkanInProcessPlacedCableTransport::new();
-                let submission_batch = VulkanResidentQueueSubmissionBatch::new();
-                let mut final_slices = None;
-                let mut output_timeline_values = Vec::with_capacity(tick_count);
-                for tick_index in 0..tick_count {
-                    let stream_tick = start_stream_tick
-                        .checked_add(u64::try_from(tick_index).map_err(|_| {
-                            VulkanResidentInProcessPlacedRuntimeError::StreamTickOverflow
-                        })?)
-                        .ok_or(VulkanResidentInProcessPlacedRuntimeError::StreamTickOverflow)?;
-                    let mut slices = SmallVec::<
-                        [VulkanMountedPlacedResidentInProcessStreamTickSlice<'_>; 4],
-                    >::with_capacity(self.device_slices.len());
-                    for slice in &self.device_slices {
-                        let device = devices.get(&slice.device_id).ok_or_else(|| {
-                            VulkanResidentInProcessPlacedRuntimeError::MissingBoundDevice {
-                                device_id: slice.device_id.clone(),
-                            }
-                        })?;
-                        let mut dispatch_extensions =
-                            VulkanMountedPlacedResidentStreamTickDispatchExtensions {
-                                sequence_variant: VulkanResidentPlacedTokenTickTail::Sample
-                                    .sequence_variant(),
-                                ..Default::default()
-                            };
-                        if slice.device_id == self.model.input_device_id {
-                            dispatch_extensions
-                                .prefix_dispatches
-                                .push(&self.input_transducer.resident_dispatch);
-                        }
-                        if slice.device_id == self.model.output_device_id {
-                            dispatch_extensions
-                                .suffix_dispatches
-                                .push(&self.output_transducer.embedding_norm_dispatch);
-                            dispatch_extensions
-                                .suffix_dispatches
-                                .push(&self.output_transducer.tied_projection_dispatch);
-                            dispatch_extensions
-                                .suffix_dispatches
-                                .extend(self.sampler.resident_dispatches());
-                        }
-                        slices.push(
-                            VulkanMountedPlacedResidentInProcessStreamTickSlice::new_with_dispatch_extensions(
-                                device,
-                                &slice.mounted,
-                                &slice.resident_execution_plan,
-                                dispatch_extensions,
-                                stream_tick,
-                            ),
+                let output_timeline_values = if let Some(replay) =
+                    submission_replay.as_deref_mut().and_then(Option::as_mut)
+                {
+                    replay
+                        .validate_tick_count(tick_count)
+                        .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
+                    let output_timeline_values = self.advance_resident_feedback_submission_replay(
+                        feedback_synchronization.as_deref(),
+                        output_synchronization,
+                        tick_count,
+                    )?;
+                    replay
+                        .submit_next(tick_count)
+                        .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
+                    output_timeline_values
+                } else {
+                    let (submission_template, output_timeline_values) = self
+                        .mount_resident_feedback_submission_template(
+                            devices,
+                            start_stream_tick,
+                            tick_count,
+                            static_state_snapshots,
+                            feedback_synchronization.as_deref(),
+                            output_synchronization,
+                        )?;
+                    submission_template
+                        .submit_with_timeline_value_offset(0)
+                        .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
+                    if let Some(replay_slot) = submission_replay {
+                        *replay_slot = Some(
+                            VulkanResidentPlacedFeedbackSubmissionReplay::new(
+                                submission_template,
+                                tick_count,
+                            )
+                            .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?,
                         );
                     }
-                    let completes_window = tick_index + 1 == tick_count;
-                    let feedback_turn = feedback_synchronization
-                        .as_ref()
-                        .map(|synchronization| {
-                            synchronization.prepare_turn(
-                                &self.model.input_device_id,
-                                &self.model.output_device_id,
-                            )
-                        })
-                        .transpose()
-                        .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
-                    let output_turn = output_synchronization
-                        .prepare_turn(&self.model.output_device_id)
-                        .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
-                    output_timeline_values.push(output_turn.value);
-                    let run = run_mounted_placed_resident_stream_tick_slices_in_process_with_schedule_and_distributed(
-                        &mut slices,
-                        &mut transport,
-                        &self.activation_schedule,
-                        Some(&self.distributed_dispatch_runners),
-                        Some(&self.cable_synchronizations),
-                        VulkanPlacedSubmissionContext {
-                            policy: VulkanPlacedSubmissionPolicy {
-                                write_stream_control: false,
-                                signal_completion: completes_window,
-                                wait_for_completion: false,
-                                feedback_lane: Some(tick_index),
-                            },
-                            state_transactions: Some(static_state_snapshots),
-                            feedback_turn,
-                            output_turn: Some(output_turn),
-                            submission_batch: Some(&submission_batch),
-                        },
-                    )
-                    .map_err(VulkanResidentInProcessPlacedRuntimeError::Tick)?;
-                    if run.status
-                        != VulkanMountedPlacedResidentInProcessStreamTickRunStatus::Completed
-                    {
-                        return Err(VulkanResidentInProcessPlacedRuntimeError::IncompleteTick(
-                            run.status,
-                        ));
-                    }
-                    if completes_window {
-                        final_slices = Some(slices);
-                    }
-                }
-                let queued_submission_count = submission_batch.pending_submission_count();
-                let submission_template = submission_batch
-                    .mount()
-                    .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
-                debug_assert_eq!(
-                    submission_template.submission_count(),
-                    queued_submission_count
-                );
-                let submitted_submission_count = submission_template
-                    .submit_with_timeline_value_offset(0)
-                    .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
-                debug_assert_eq!(submitted_submission_count, queued_submission_count);
+                    output_timeline_values
+                };
                 let output_device = devices.get(&self.model.output_device_id).ok_or_else(|| {
                     VulkanResidentInProcessPlacedRuntimeError::MissingBoundDevice {
                         device_id: self.model.output_device_id.clone(),
@@ -15014,24 +15237,7 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
                             )
                         },
                     );
-                let final_slices = final_slices.ok_or_else(|| {
-                    VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(
-                        "placed resident feedback window has no terminal slices".to_string(),
-                    ))
-                })?;
-                let device_by_id = final_slices
-                    .iter()
-                    .map(|slice| (slice.device_id().to_string(), slice.device))
-                    .collect::<BTreeMap<_, _>>();
-                for slice in &final_slices {
-                    wait_for_compact_slice_terminal_work(
-                        slice,
-                        &device_by_id,
-                        &self.distributed_dispatch_runners,
-                        Some(tick_count - 1),
-                    )
-                    .map_err(VulkanResidentInProcessPlacedRuntimeError::Tick)?;
-                }
+                self.wait_resident_feedback_terminal_work(devices, tick_count - 1)?;
                 output_result?;
             }
         }
@@ -16766,85 +16972,88 @@ impl VulkanResidentInProcessPlacedPromptStream {
     where
         F: FnMut(VulkanResidentTokenOutputEvent),
     {
-        let tick_count = self
-            .active_input_event
-            .as_ref()
-            .map(|event| {
-                event.resident_feedback_window_tick_count(
-                    self.processor.resident_feedback_window_width(),
-                )
-            })
-            .unwrap_or(0);
-        if tick_count == 0 {
-            return Ok(false);
-        }
-        let tick_delta = u64::try_from(tick_count)
-            .map_err(|_| VulkanResidentInProcessPlacedRuntimeError::StreamTickOverflow)?;
-        self.session
-            .next_stream_tick
-            .checked_add(tick_delta)
-            .ok_or(VulkanResidentInProcessPlacedRuntimeError::StreamTickOverflow)?;
-        let feedback_depth_delta = u32::try_from(tick_count)
-            .map_err(|_| VulkanResidentInProcessPlacedRuntimeError::FeedbackDepthOverflow)?;
-        self.active_input_event
-            .as_ref()
-            .and_then(VulkanResidentInProcessPlacedActivePromptEvent::next_activation)
-            .ok_or(VulkanResidentInProcessPlacedRuntimeError::MissingPrivateFeedback)?
-            .input_feedback_depth
-            .checked_add(feedback_depth_delta)
-            .ok_or(VulkanResidentInProcessPlacedRuntimeError::FeedbackDepthOverflow)?;
-        let start_stream_tick = self.session.next_stream_tick;
-        let mut restore_after_tick = None;
         let processor = &self.processor;
         let devices = &self.devices;
         let active_input_event = &mut self.active_input_event;
         let session = &mut self.session;
-        processor.run_resident_feedback_window(
-            devices,
-            start_stream_tick,
-            tick_count,
-            |tick_index, sampled_token_id, scheduler_turn_count, completed_stage_count| {
-                if restore_after_tick.is_some() {
-                    return Ok(());
-                }
-                let stream_tick = session.next_stream_tick;
-                let (output_event, closes_loop) = {
-                    let active_input_event = active_input_event
-                        .as_mut()
-                        .expect("resident feedback window requires an active input event");
-                    let activation = active_input_event
-                        .next_activation()
-                        .ok_or(VulkanResidentInProcessPlacedRuntimeError::MissingPrivateFeedback)?;
-                    let closes_loop = activation.input_closes_loop_after_processing;
-                    let output_event = active_input_event.complete_activation(
-                        &activation,
-                        stream_tick,
-                        scheduler_turn_count,
-                        completed_stage_count,
-                        &VulkanPlacedCableTransportStats::default(),
-                        activation
-                            .should_emit_public_output
-                            .then_some(sampled_token_id),
-                    )?;
-                    (output_event, closes_loop)
-                };
-                session.next_stream_tick = stream_tick
-                    .checked_add(1)
-                    .ok_or(VulkanResidentInProcessPlacedRuntimeError::StreamTickOverflow)?;
-                if let Some(output_event) = output_event {
-                    on_output_event(output_event);
-                }
-                if closes_loop {
-                    restore_after_tick = Some(tick_index);
-                }
-                Ok(())
-            },
-        )?;
-        if let Some(tick_index) = restore_after_tick {
-            self.processor
-                .restore_resident_feedback_state_after_tick(tick_index)?;
+        let window_width = processor.resident_feedback_window_width();
+        let mut submission_replay = None;
+        let mut ran_window = false;
+        loop {
+            let tick_count = active_input_event
+                .as_ref()
+                .map(|event| event.resident_feedback_window_tick_count(window_width))
+                .unwrap_or(0);
+            if tick_count == 0 {
+                break;
+            }
+            let tick_delta = u64::try_from(tick_count)
+                .map_err(|_| VulkanResidentInProcessPlacedRuntimeError::StreamTickOverflow)?;
+            session
+                .next_stream_tick
+                .checked_add(tick_delta)
+                .ok_or(VulkanResidentInProcessPlacedRuntimeError::StreamTickOverflow)?;
+            let feedback_depth_delta = u32::try_from(tick_count)
+                .map_err(|_| VulkanResidentInProcessPlacedRuntimeError::FeedbackDepthOverflow)?;
+            active_input_event
+                .as_ref()
+                .and_then(VulkanResidentInProcessPlacedActivePromptEvent::next_activation)
+                .ok_or(VulkanResidentInProcessPlacedRuntimeError::MissingPrivateFeedback)?
+                .input_feedback_depth
+                .checked_add(feedback_depth_delta)
+                .ok_or(VulkanResidentInProcessPlacedRuntimeError::FeedbackDepthOverflow)?;
+            let start_stream_tick = session.next_stream_tick;
+            let mut restore_after_tick = None;
+            let replay_slot = (tick_count == window_width).then_some(&mut submission_replay);
+            processor.run_resident_feedback_window(
+                devices,
+                start_stream_tick,
+                tick_count,
+                replay_slot,
+                |tick_index, sampled_token_id, scheduler_turn_count, completed_stage_count| {
+                    if restore_after_tick.is_some() {
+                        return Ok(());
+                    }
+                    let stream_tick = session.next_stream_tick;
+                    let (output_event, closes_loop) = {
+                        let active_input_event = active_input_event
+                            .as_mut()
+                            .expect("resident feedback window requires an active input event");
+                        let activation = active_input_event.next_activation().ok_or(
+                            VulkanResidentInProcessPlacedRuntimeError::MissingPrivateFeedback,
+                        )?;
+                        let closes_loop = activation.input_closes_loop_after_processing;
+                        let output_event = active_input_event.complete_activation(
+                            &activation,
+                            stream_tick,
+                            scheduler_turn_count,
+                            completed_stage_count,
+                            &VulkanPlacedCableTransportStats::default(),
+                            activation
+                                .should_emit_public_output
+                                .then_some(sampled_token_id),
+                        )?;
+                        (output_event, closes_loop)
+                    };
+                    session.next_stream_tick = stream_tick
+                        .checked_add(1)
+                        .ok_or(VulkanResidentInProcessPlacedRuntimeError::StreamTickOverflow)?;
+                    if let Some(output_event) = output_event {
+                        on_output_event(output_event);
+                    }
+                    if closes_loop {
+                        restore_after_tick = Some(tick_index);
+                    }
+                    Ok(())
+                },
+            )?;
+            ran_window = true;
+            if let Some(tick_index) = restore_after_tick {
+                processor.restore_resident_feedback_state_after_tick(tick_index)?;
+                break;
+            }
         }
-        Ok(true)
+        Ok(ran_window)
     }
 
     fn complete_active_input_event(
@@ -23742,9 +23951,28 @@ fn wait_for_compact_slice_terminal_work(
     distributed_runners: &VulkanDistributedDispatchRunners,
     feedback_lane: Option<usize>,
 ) -> Result<(), VulkanMountedPlacedResidentInProcessStreamTickError> {
-    let terminal_segment = slice.execution_plan.dispatch_segments.last();
-    let terminal_distributed = slice
-        .execution_plan
+    wait_for_compact_execution_plan_terminal_work(
+        slice.device_id(),
+        slice.device,
+        slice.execution_plan,
+        slice.dispatch_extensions.sequence_variant,
+        device_by_id,
+        distributed_runners,
+        feedback_lane,
+    )
+}
+
+fn wait_for_compact_execution_plan_terminal_work(
+    device_id: &str,
+    device: &VulkanComputeDevice,
+    execution_plan: &VulkanMountedPlacedResidentStreamTickExecutionPlan,
+    sequence_variant: u8,
+    device_by_id: &BTreeMap<String, &VulkanComputeDevice>,
+    distributed_runners: &VulkanDistributedDispatchRunners,
+    feedback_lane: Option<usize>,
+) -> Result<(), VulkanMountedPlacedResidentInProcessStreamTickError> {
+    let terminal_segment = execution_plan.dispatch_segments.last();
+    let terminal_distributed = execution_plan
         .distributed_dispatch_stages
         .iter()
         .next_back();
@@ -23753,10 +23981,10 @@ fn wait_for_compact_slice_terminal_work(
     }) {
         let (_, dispatch) = terminal_distributed.expect("terminal distributed stage exists");
         return distributed_runners
-            .wait_dispatch(slice.device_id(), dispatch.dispatch_index, |device_id| {
-                device_by_id.get(device_id).copied().ok_or_else(|| {
+            .wait_dispatch(device_id, dispatch.dispatch_index, |shard_device_id| {
+                device_by_id.get(shard_device_id).copied().ok_or_else(|| {
                     VulkanError(format!(
-                        "distributed shard device {device_id:?} is not mounted"
+                        "distributed shard device {shard_device_id:?} is not mounted"
                     ))
                 })
             })
@@ -23764,11 +23992,7 @@ fn wait_for_compact_slice_terminal_work(
     }
     if let Some(segment) = terminal_segment {
         segment
-            .wait_submitted(
-                slice.device,
-                slice.dispatch_extensions.sequence_variant,
-                feedback_lane,
-            )
+            .wait_submitted(device, sequence_variant, feedback_lane)
             .map_err(|error| {
                 VulkanMountedPlacedResidentInProcessStreamTickError::StreamTick(
                     VulkanMountedPlacedResidentStreamTickError::Dispatch(error),
@@ -36923,6 +37147,58 @@ mod tests {
         )
         .unwrap();
         assert_eq!(eos.resident_feedback_window_tick_count(64), 0);
+    }
+
+    #[test]
+    fn placed_active_prompt_event_exposes_repeated_full_feedback_windows() {
+        let mut active = VulkanResidentInProcessPlacedActivePromptEvent::new(
+            VulkanResidentTokenInputEvent::new("long-generation", vec![10], 130),
+            0,
+        )
+        .unwrap();
+        let prompt = active.next_activation().unwrap();
+        active
+            .complete_activation(
+                &prompt,
+                0,
+                1,
+                1,
+                &VulkanPlacedCableTransportStats::default(),
+                Some(20),
+            )
+            .unwrap();
+        assert_eq!(active.resident_feedback_window_tick_count(64), 64);
+
+        for stream_tick in 1..=64 {
+            let activation = active.next_activation().unwrap();
+            active
+                .complete_activation(
+                    &activation,
+                    stream_tick,
+                    1,
+                    1,
+                    &VulkanPlacedCableTransportStats::default(),
+                    Some(20),
+                )
+                .unwrap();
+        }
+        assert_eq!(active.resident_feedback_window_tick_count(64), 64);
+
+        for stream_tick in 65..=128 {
+            let activation = active.next_activation().unwrap();
+            active
+                .complete_activation(
+                    &activation,
+                    stream_tick,
+                    1,
+                    1,
+                    &VulkanPlacedCableTransportStats::default(),
+                    Some(20),
+                )
+                .unwrap();
+        }
+        assert_eq!(active.resident_feedback_window_tick_count(64), 0);
+        assert_eq!(active.remaining_public_outputs, 1);
     }
 
     #[test]
