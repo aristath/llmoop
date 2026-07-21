@@ -6781,40 +6781,6 @@ impl VulkanResidentPedalBatchSliceRunner {
             .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)
     }
 
-    fn write_frames(
-        &self,
-        key: &VulkanPedalBatchSignalKey,
-        frames: &[Vec<u8>],
-    ) -> Result<(), VulkanResidentInProcessPlacedRuntimeError> {
-        if frames.is_empty() || frames.len() > self.lane_capacity {
-            return Err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop(
-                VulkanError(format!(
-                    "pedal batch capacity {} cannot accept {} frames",
-                    self.lane_capacity,
-                    frames.len()
-                )),
-            ));
-        }
-        let allocation = self.signal_buffer(key)?;
-        let mut packed = Vec::with_capacity(allocation.frame_byte_capacity * frames.len());
-        for (index, frame) in frames.iter().enumerate() {
-            if frame.len() != allocation.frame_byte_capacity {
-                return Err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop(
-                    VulkanError(format!(
-                        "pedal batch frame {index} for {key:?} has {} bytes, expected {}",
-                        frame.len(),
-                        allocation.frame_byte_capacity
-                    )),
-                ));
-            }
-            packed.extend_from_slice(frame);
-        }
-        allocation
-            .buffer
-            .write_bytes(&packed)
-            .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)
-    }
-
     fn read_frames(
         &self,
         key: &VulkanPedalBatchSignalKey,
@@ -12054,6 +12020,7 @@ pub struct VulkanResidentInProcessPlacedStreamProcessor {
     speculative_decoders: Vec<VulkanResidentSpeculativeDecoderProcessor>,
     verification_state_transactions: RefCell<Option<Vec<VulkanResidentStateTransactionBank>>>,
     pedal_batch_execution: RefCell<Option<VulkanResidentPlacedPedalBatchRunner>>,
+    verification_input_embedding: RefCell<Option<VulkanResidentBatchedInputEmbeddingRunner>>,
     temporal_block_execution: RefCell<Option<VulkanResidentPlacedTemporalBlockRunner>>,
     batched_output_projection: RefCell<Option<VulkanResidentBatchedOutputProjectionRunner>>,
 }
@@ -14072,6 +14039,7 @@ impl VulkanResidentInProcessPlacedModelPackage {
             speculative_decoders,
             verification_state_transactions: RefCell::new(None),
             pedal_batch_execution: RefCell::new(None),
+            verification_input_embedding: RefCell::new(None),
             temporal_block_execution: RefCell::new(None),
             batched_output_projection: RefCell::new(None),
         })
@@ -14132,7 +14100,15 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
             .borrow()
             .as_ref()
             .is_some_and(|runner| runner.lane_capacity >= transaction_width);
-        if transactions_are_sufficient && batch_execution_is_sufficient {
+        let input_embedding_is_sufficient = self
+            .verification_input_embedding
+            .borrow()
+            .as_ref()
+            .is_some_and(|runner| runner.batch_capacity >= transaction_width);
+        if transactions_are_sufficient
+            && batch_execution_is_sufficient
+            && input_embedding_is_sufficient
+        {
             return Ok(());
         }
         if !transactions_are_sufficient {
@@ -14152,6 +14128,7 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
             )?;
             *self.verification_state_transactions.borrow_mut() = Some(transactions);
             // Recorded batch sequences contain copies into the transaction's snapshot buffers.
+            *self.verification_input_embedding.borrow_mut() = None;
             *self.pedal_batch_execution.borrow_mut() = None;
         }
         if self
@@ -14160,6 +14137,7 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
             .as_ref()
             .is_none_or(|runner| runner.lane_capacity < transaction_width)
         {
+            *self.verification_input_embedding.borrow_mut() = None;
             let runner = VulkanResidentPlacedPedalBatchRunner::new(
                 devices,
                 &self.device_slices,
@@ -14169,6 +14147,56 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
                 &self.model.distributed_parameter_buffers,
             )?;
             *self.pedal_batch_execution.borrow_mut() = Some(runner);
+        }
+        if self
+            .verification_input_embedding
+            .borrow()
+            .as_ref()
+            .is_none_or(|runner| runner.batch_capacity < transaction_width)
+        {
+            let first_device_index =
+                *self
+                    .linear_pipeline_device_indices()?
+                    .first()
+                    .ok_or_else(|| {
+                        VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(
+                            "placed verification pipeline is empty".to_string(),
+                        ))
+                    })?;
+            let input_device = devices.get(&self.model.input_device_id).ok_or_else(|| {
+                VulkanResidentInProcessPlacedRuntimeError::MissingBoundDevice {
+                    device_id: self.model.input_device_id.clone(),
+                }
+            })?;
+            let embedding_weight = self
+                .model
+                .input_transducer_parameter_buffers
+                .parameter_buffer(&self.model.input_transducer_spec.parameter_tensor)
+                .ok_or_else(|| {
+                    VulkanResidentInProcessPlacedRuntimeError::InputTransducer(
+                        VulkanResidentInputEmbeddingTransducerRunnerError::MissingTransducerParameterBuffer {
+                            tensor: self.model.input_transducer_spec.parameter_tensor.clone(),
+                        },
+                    )
+                })?;
+            let batch_execution = self.pedal_batch_execution.borrow();
+            let input_signal = batch_execution
+                .as_ref()
+                .expect("verification pedal batch was initialized")
+                .slice(first_device_index)?
+                .signal_buffer(&VulkanPedalBatchSignalKey::ModelInput(
+                    self.model.input_transducer_spec.output_signal_id.clone(),
+                ))?;
+            let input_embedding = VulkanResidentBatchedInputEmbeddingRunner::new(
+                input_device,
+                transaction_width,
+                embedding_weight,
+                &input_signal.buffer,
+                &self.model.input_transducer_batch_spirv_words,
+                &self.model.input_transducer_spec,
+            )?;
+            drop(batch_execution);
+            *self.verification_input_embedding.borrow_mut() = Some(input_embedding);
         }
         Ok(())
     }
@@ -14720,45 +14748,20 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
                     "placed verification context capacity exceeds u32".to_string(),
                 ))
             })?;
-        let first_device_index = *pipeline.first().ok_or_else(|| {
-            VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(
-                "placed verification pipeline is empty".to_string(),
-            ))
-        })?;
         let input_device = devices.get(&self.model.input_device_id).ok_or_else(|| {
             VulkanResidentInProcessPlacedRuntimeError::MissingBoundDevice {
                 device_id: self.model.input_device_id.clone(),
             }
         })?;
-        let target_embedding = self.device_slices[first_device_index]
-            .mounted
-            .boundary_io
-            .input_buffer(&self.model.input_transducer_spec.output_signal_id)
+        self.verification_input_embedding
+            .borrow()
+            .as_ref()
             .ok_or_else(|| {
-                VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(format!(
-                    "placed verification input device has no boundary {:?}",
-                    self.model.input_transducer_spec.output_signal_id
-                )))
-            })?;
-        let mut input_frames = Vec::with_capacity(input_token_ids.len());
-        for token_id in input_token_ids {
-            self.input_transducer
-                .prepare_token_id_only(*token_id)
-                .map_err(VulkanResidentInProcessPlacedRuntimeError::InputTransducer)?;
-            input_device
-                .run_resident_kernel_dispatch(&self.input_transducer.resident_dispatch, &[])
-                .map_err(|error| {
-                    VulkanResidentInProcessPlacedRuntimeError::InputTransducer(
-                        VulkanResidentInputEmbeddingTransducerRunnerError::Vulkan(error),
-                    )
-                })?;
-            input_frames.push(
-                target_embedding
-                    .buffer
-                    .read_bytes(self.model.input_transducer_spec.output_frame_byte_capacity)
-                    .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?,
-            );
-        }
+                VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(
+                    "verification input embedding is not mounted".to_string(),
+                ))
+            })?
+            .run(input_device, input_token_ids)?;
 
         let raw_target_hidden_frames = {
             let transaction_guard = self.verification_state_transactions.borrow();
@@ -14773,12 +14776,6 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
                     "pedal batch execution is not mounted".to_string(),
                 ))
             })?;
-            batch_execution.slice(first_device_index)?.write_frames(
-                &VulkanPedalBatchSignalKey::ModelInput(
-                    self.model.input_transducer_spec.output_signal_id.clone(),
-                ),
-                &input_frames,
-            )?;
             let mut raw_target_hidden_frames = Vec::new();
             for (pipeline_index, device_index) in pipeline.iter().copied().enumerate() {
                 let slice = &self.device_slices[device_index];
