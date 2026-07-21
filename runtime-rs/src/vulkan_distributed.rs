@@ -979,6 +979,77 @@ impl VulkanDistributedDispatchRunners {
                 && dispatch.planned.dispatch_index == dispatch_index
         })
     }
+
+    pub fn run_dispatch<'a, F, E>(
+        &self,
+        owner_device_id: &str,
+        dispatch_index: usize,
+        mut device_for: F,
+    ) -> Result<VulkanDistributedDispatchRun, VulkanDistributedDispatchRunnerError>
+    where
+        F: FnMut(&str) -> Result<&'a VulkanComputeDevice, E>,
+        E: Display,
+    {
+        let dispatch = self
+            .dispatch(owner_device_id, dispatch_index)
+            .ok_or_else(|| {
+                VulkanDistributedDispatchRunnerError(format!(
+                    "distributed runner has no dispatch {dispatch_index} owned by {owner_device_id:?}"
+                ))
+            })?;
+        let mut submitted: Vec<(&VulkanComputeDevice, &VulkanDistributedDispatchShardRunner)> =
+            Vec::with_capacity(dispatch.shards.len());
+        for shard in &dispatch.shards {
+            let device = device_for(&shard.planned.device_id).map_err(|error| {
+                VulkanDistributedDispatchRunnerError(format!(
+                    "failed to resolve distributed shard device {:?}: {error}",
+                    shard.planned.device_id
+                ))
+            })?;
+            if let Err(error) = device.submit_recorded_resident_kernel_sequence(&shard.sequence) {
+                for (submitted_device, submitted_shard) in &submitted {
+                    let _ =
+                        submitted_device.wait_resident_kernel_sequence(&submitted_shard.sequence);
+                }
+                return Err(VulkanDistributedDispatchRunnerError(format!(
+                    "failed to submit distributed dispatch {}.{} shard on {:?}: {error}",
+                    dispatch.planned.pedal_id, dispatch.planned.node_id, shard.planned.device_id
+                )));
+            }
+            submitted.push((device, shard));
+        }
+        let mut first_wait_error = None;
+        for (device, shard) in &submitted {
+            if let Err(error) = device.wait_resident_kernel_sequence(&shard.sequence)
+                && first_wait_error.is_none()
+            {
+                first_wait_error = Some(format!(
+                    "failed waiting for distributed dispatch {}.{} shard on {:?}: {error}",
+                    dispatch.planned.pedal_id, dispatch.planned.node_id, shard.planned.device_id
+                ));
+            }
+        }
+        if let Some(error) = first_wait_error {
+            return Err(VulkanDistributedDispatchRunnerError(error));
+        }
+
+        Ok(VulkanDistributedDispatchRun {
+            owner_device_id: owner_device_id.to_string(),
+            dispatch_index,
+            pedal_id: dispatch.planned.pedal_id.clone(),
+            node_id: dispatch.planned.node_id.clone(),
+            shard_count: dispatch.shards.len(),
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanDistributedDispatchRun {
+    pub owner_device_id: String,
+    pub dispatch_index: usize,
+    pub pedal_id: String,
+    pub node_id: String,
+    pub shard_count: usize,
 }
 
 pub struct VulkanDistributedDispatchRunner {
