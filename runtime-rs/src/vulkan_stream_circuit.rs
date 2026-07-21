@@ -2388,6 +2388,25 @@ impl VulkanPlacedStreamCircuitPlan {
             reusable_kernel_plan,
         })
     }
+
+    pub fn prepared_dispatch_plan(
+        &self,
+        manifest: &VulkanReusableKernelArtifactManifest,
+        dynamic_state_capacity_activations: usize,
+    ) -> Result<VulkanPreparedDispatchPlan, VulkanPreparedDispatchPlanError> {
+        let descriptor_plan = VulkanDescriptorResourcePlan::from_plans(
+            &self.dispatch_plan,
+            &self.placed_resident_plan.resident_plan,
+            dynamic_state_capacity_activations,
+        )
+        .map_err(VulkanPreparedDispatchPlanError::DescriptorResource)?;
+        VulkanPreparedDispatchPlan::from_plans(
+            &self.dispatch_plan,
+            &self.reusable_kernel_plan,
+            &descriptor_plan,
+            manifest,
+        )
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -10556,6 +10575,7 @@ pub struct VulkanResidentModelPackageDeviceSlice {
     pub permanent_parameter_bytes: usize,
     pub reusable_kernel_word_count: usize,
     placed_plan: VulkanPlacedStreamCircuitPlan,
+    prepared_plan: VulkanPreparedDispatchPlan,
     loaded_manifest: VulkanLoadedReusableKernelArtifactManifest,
     batch_kernels: Vec<VulkanResidentPedalBatchKernelArtifact>,
     parameter_buffers: Arc<VulkanPermanentParameterBuffers>,
@@ -10646,6 +10666,36 @@ impl VulkanResidentModelPackageDeviceSlice {
                 runtime_model.package.package_id
             )));
         }
+        let reusable_manifest = resident_package_reusable_kernel_manifest(&placed_plan);
+        let prepared_plan = placed_plan
+            .prepared_dispatch_plan(&reusable_manifest, capacity)
+            .map_err(|error| {
+                VulkanResidentTokenModelPackageError::new(format!(
+                    "failed to prepare Vulkan dispatch plan for device {device_id:?}: {error}"
+                ))
+            })?;
+        validate_pedal_executions_cover_prepared_dispatches(
+            &runtime_model.package.package_id,
+            &runtime_model.pedal_executions,
+            &prepared_plan,
+        )?;
+        let pedal_kernel_shaders =
+            resident_package_pedal_kernel_shader_refs_for_prepared_dispatches(
+                &runtime_model.pedal_executions,
+                &prepared_plan,
+            );
+        let loaded_manifest = loaded_kernel_pack_from_package_shader_refs(
+            manifest_dir,
+            &placed_plan,
+            &prepared_plan,
+            &pedal_kernel_shaders,
+        )?;
+        let batch_kernels = load_resident_pedal_batch_kernels(
+            device,
+            manifest_dir,
+            &runtime_model.pedal_executions,
+            &prepared_plan,
+        )?;
 
         let parameter_buffer_plan = VulkanPermanentParameterBufferPlan::from_placed_resident_plan(
             &placed_plan.placed_resident_plan,
@@ -10670,60 +10720,18 @@ impl VulkanResidentModelPackageDeviceSlice {
                 ))
             })?;
 
-        let probe_mounted =
-            VulkanMountedPlacedStreamCircuit::from_placed_plan_with_parameter_buffers(
-                device,
-                placed_plan.clone(),
-                capacity,
-                parameter_buffers.clone(),
-            )
-            .map_err(|error| {
-                VulkanResidentTokenModelPackageError::new(format!(
-                    "failed to mount Vulkan stream circuit for device {device_id:?}: {error}"
-                ))
-            })?;
-        let reusable_manifest =
-            resident_package_reusable_kernel_manifest(&probe_mounted.placed_plan);
-        let mounted_bound = probe_mounted
-            .mounted_placed_bound_dispatch_plan(&reusable_manifest)
-            .map_err(|error| {
-                VulkanResidentTokenModelPackageError::new(format!(
-                    "failed to bind Vulkan stream circuit dispatch plan for device {device_id:?}: {error}"
-                ))
-            })?;
-        validate_pedal_executions_cover_mounted_dispatches(
-            &runtime_model.package.package_id,
-            &runtime_model.pedal_executions,
-            &mounted_bound,
-        )?;
-        let pedal_kernel_shaders = resident_package_pedal_kernel_shader_refs_for_mounted_dispatches(
-            &runtime_model.pedal_executions,
-            &mounted_bound,
-        );
-        let loaded_manifest = loaded_kernel_pack_from_package_shader_refs(
-            manifest_dir,
-            &probe_mounted,
-            &mounted_bound,
-            &pedal_kernel_shaders,
-        )?;
-        let batch_kernels = load_resident_pedal_batch_kernels(
-            device,
-            manifest_dir,
-            &runtime_model.pedal_executions,
-            &mounted_bound,
-        )?;
-
         Ok(Self {
             package_id: runtime_model.package.package_id.clone(),
             device_id: device_id.to_string(),
             dynamic_state_capacity_activations: capacity,
             hosted_pedal_count,
-            incoming_cable_count: probe_mounted.cable_io.incoming_buffers.len(),
-            outgoing_cable_count: probe_mounted.cable_io.outgoing_buffers.len(),
+            incoming_cable_count: placed_plan.placed_resident_plan.incoming_cables.len(),
+            outgoing_cable_count: placed_plan.placed_resident_plan.outgoing_cables.len(),
             permanent_parameter_count: parameter_buffers.plan.parameter_count,
             permanent_parameter_bytes: parameter_buffers.total_byte_capacity,
             reusable_kernel_word_count: loaded_manifest.total_word_count,
             placed_plan,
+            prepared_plan,
             loaded_manifest,
             batch_kernels,
             parameter_buffers,
@@ -10750,6 +10758,10 @@ impl VulkanResidentModelPackageDeviceSlice {
 
     pub fn loaded_manifest(&self) -> &VulkanLoadedReusableKernelArtifactManifest {
         &self.loaded_manifest
+    }
+
+    pub fn prepared_plan(&self) -> &VulkanPreparedDispatchPlan {
+        &self.prepared_plan
     }
 }
 
@@ -15755,6 +15767,13 @@ impl VulkanResidentModelPackage {
             })?;
         let reusable_manifest =
             resident_package_reusable_kernel_manifest(&probe_mounted.placed_plan);
+        let prepared_plan = placed_plan
+            .prepared_dispatch_plan(&reusable_manifest, capacity)
+            .map_err(|error| {
+                VulkanResidentTokenModelPackageError::new(format!(
+                    "failed to prepare Vulkan dispatch plan: {error}"
+                ))
+            })?;
         let mounted_bound = probe_mounted
             .mounted_placed_bound_dispatch_plan(&reusable_manifest)
             .map_err(|error| {
@@ -15771,8 +15790,8 @@ impl VulkanResidentModelPackage {
             resident_package_pedal_kernel_shader_refs(&runtime_model.pedal_executions);
         let loaded_manifest = loaded_kernel_pack_from_package_shader_refs(
             manifest_dir,
-            &probe_mounted,
-            &mounted_bound,
+            &placed_plan,
+            &prepared_plan,
             &pedal_kernel_shaders,
         )?;
 
@@ -16505,16 +16524,16 @@ fn validate_pedal_executions_against_mounted_dispatches(
     Ok(())
 }
 
-fn validate_pedal_executions_cover_mounted_dispatches(
+fn validate_pedal_executions_cover_prepared_dispatches(
     package_id: &str,
     pedal_executions: &[VulkanResidentPedalExecutionSpec],
-    mounted_bound: &VulkanMountedPlacedBoundDispatchPlan,
+    prepared_plan: &VulkanPreparedDispatchPlan,
 ) -> Result<(), VulkanResidentTokenModelPackageError> {
     let declared_pedals = pedal_executions
         .iter()
         .map(|pedal| pedal.pedal_id.as_str())
         .collect::<BTreeSet<_>>();
-    let mounted_pedals = mounted_bound
+    let mounted_pedals = prepared_plan
         .dispatches
         .iter()
         .map(|dispatch| dispatch.pedal_id.as_str())
@@ -16536,7 +16555,7 @@ fn validate_pedal_executions_cover_mounted_dispatches(
         .iter()
         .filter(|pedal| mounted_pedals.contains(pedal.pedal_id.as_str()))
     {
-        let mounted_dispatches = mounted_bound
+        let mounted_dispatches = prepared_plan
             .dispatches
             .iter()
             .filter(|dispatch| dispatch.pedal_id == pedal.pedal_id)
@@ -16892,14 +16911,14 @@ fn resident_package_pedal_kernel_shader_refs(
         .collect()
 }
 
-fn resident_package_pedal_kernel_shader_refs_for_mounted_dispatches(
+fn resident_package_pedal_kernel_shader_refs_for_prepared_dispatches(
     pedal_executions: &[VulkanResidentPedalExecutionSpec],
-    mounted_bound: &VulkanMountedPlacedBoundDispatchPlan,
+    prepared_plan: &VulkanPreparedDispatchPlan,
 ) -> Vec<VulkanResidentPedalKernelShaderRef> {
     resident_package_pedal_kernel_shader_refs(pedal_executions)
         .into_iter()
         .filter(|shader| {
-            mounted_bound
+            prepared_plan
                 .dispatch(&shader.pedal_id, &shader.node_id)
                 .is_some()
         })
@@ -16908,8 +16927,8 @@ fn resident_package_pedal_kernel_shader_refs_for_mounted_dispatches(
 
 fn loaded_kernel_pack_from_package_shader_refs(
     manifest_dir: &Path,
-    mounted: &VulkanMountedPlacedStreamCircuit,
-    mounted_bound: &VulkanMountedPlacedBoundDispatchPlan,
+    placed_plan: &VulkanPlacedStreamCircuitPlan,
+    prepared_plan: &VulkanPreparedDispatchPlan,
     dispatch_shaders: &[VulkanResidentPedalKernelShaderRef],
 ) -> Result<VulkanLoadedReusableKernelArtifactManifest, VulkanResidentTokenModelPackageError> {
     let mut loaded_artifacts = Vec::new();
@@ -16917,7 +16936,7 @@ fn loaded_kernel_pack_from_package_shader_refs(
     let mut total_word_count = 0usize;
 
     for shader in dispatch_shaders {
-        let dispatch = mounted_bound
+        let dispatch = prepared_plan
             .dispatch(&shader.pedal_id, &shader.node_id)
             .ok_or_else(|| {
                 VulkanResidentTokenModelPackageError::new(format!(
@@ -16937,8 +16956,7 @@ fn loaded_kernel_pack_from_package_shader_refs(
                     "reusable kernel artifact word count overflowed",
                 )
             })?;
-        let family = mounted
-            .placed_plan
+        let family = placed_plan
             .reusable_kernel_plan
             .family(&dispatch.reusable_family_id)
             .ok_or_else(|| {
@@ -16956,8 +16974,7 @@ fn loaded_kernel_pack_from_package_shader_refs(
         });
     }
 
-    let required_families: BTreeSet<&str> = mounted
-        .placed_plan
+    let required_families: BTreeSet<&str> = placed_plan
         .reusable_kernel_plan
         .families
         .iter()
@@ -16990,7 +17007,7 @@ fn load_resident_pedal_batch_kernels(
     device: &VulkanComputeDevice,
     manifest_dir: &Path,
     pedal_executions: &[VulkanResidentPedalExecutionSpec],
-    mounted_bound: &VulkanMountedPlacedBoundDispatchPlan,
+    prepared_plan: &VulkanPreparedDispatchPlan,
 ) -> Result<Vec<VulkanResidentPedalBatchKernelArtifact>, VulkanResidentTokenModelPackageError> {
     let mut artifacts = Vec::new();
     for pedal in pedal_executions {
@@ -16999,7 +17016,7 @@ fn load_resident_pedal_batch_kernels(
                 kernel.batch_mode,
                 VulkanResidentPedalKernelBatchMode::WeightShared
                     | VulkanResidentPedalKernelBatchMode::CausalScan
-            ) || mounted_bound
+            ) || prepared_plan
                 .dispatch(&pedal.pedal_id, &kernel.node_id)
                 .is_none()
             {
@@ -25998,6 +26015,20 @@ mod tests {
             gpu1_plan
                 .dispatch_plan
                 .command("layer_00", "operator_norm")
+                .is_none()
+        );
+
+        let gpu1_manifest = resident_package_reusable_kernel_manifest(&gpu1_plan);
+        let gpu1_prepared = gpu1_plan.prepared_dispatch_plan(&gpu1_manifest, 4).unwrap();
+        assert_eq!(gpu1_prepared.dispatches.len(), 19);
+        assert!(
+            gpu1_prepared
+                .dispatch("layer_02", "operator_norm")
+                .is_some()
+        );
+        assert!(
+            gpu1_prepared
+                .dispatch("layer_00", "operator_norm")
                 .is_none()
         );
 
