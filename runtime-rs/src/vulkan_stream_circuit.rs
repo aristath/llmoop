@@ -19134,12 +19134,6 @@ impl VulkanMountedPlacedResidentDispatchSegmentRunner {
         wait_semaphores: &[&VulkanQueueSemaphore],
         signal_semaphores: &[&VulkanQueueSemaphore],
     ) -> Result<(), VulkanMountedPlacedResidentKernelDispatchError> {
-        self.stream_control_buffer
-            .write_bytes_at(
-                VULKAN_STREAM_CONTROL_METADATA_OFFSET,
-                &stream_control_metadata_bytes(control),
-            )
-            .map_err(VulkanMountedPlacedResidentKernelDispatchError::Vulkan)?;
         if !self.sequences.borrow().contains_key(&sequence_variant) {
             let sequence = device
                 .create_resident_kernel_sequence()
@@ -19148,6 +19142,19 @@ impl VulkanMountedPlacedResidentDispatchSegmentRunner {
                 .borrow_mut()
                 .entry(sequence_variant)
                 .or_insert(sequence);
+        }
+        let sequences = self.sequences.borrow();
+        let sequence = sequences
+            .get(&sequence_variant)
+            .expect("resident sequence variant was initialized");
+        if self.can_replay_recorded_commands(sequence, prefix_dispatches, suffix_dispatches) {
+            return device
+                .submit_recorded_resident_kernel_sequence_with_semaphores(
+                    sequence,
+                    wait_semaphores,
+                    signal_semaphores,
+                )
+                .map_err(VulkanMountedPlacedResidentKernelDispatchError::Vulkan);
         }
         let push_constants = self
             .dispatches
@@ -19172,10 +19179,6 @@ impl VulkanMountedPlacedResidentDispatchSegmentRunner {
                 .iter()
                 .map(|dispatch| VulkanResidentKernelSequenceStep::new(dispatch, &[])),
         );
-        let sequences = self.sequences.borrow();
-        let sequence = sequences
-            .get(&sequence_variant)
-            .expect("resident sequence variant was initialized");
         device
             .record_resident_kernel_sequence(sequence, &steps)
             .map_err(VulkanMountedPlacedResidentKernelDispatchError::Vulkan)?;
@@ -19186,6 +19189,26 @@ impl VulkanMountedPlacedResidentDispatchSegmentRunner {
                 signal_semaphores,
             )
             .map_err(VulkanMountedPlacedResidentKernelDispatchError::Vulkan)
+    }
+
+    fn can_replay_recorded_commands(
+        &self,
+        sequence: &VulkanResidentKernelSequence,
+        prefix_dispatches: &[&VulkanResidentKernelDispatch],
+        suffix_dispatches: &[&VulkanResidentKernelDispatch],
+    ) -> bool {
+        std::env::var_os("LLMOOP_VK_PERF_LOGGER").is_none()
+            && sequence.has_recorded_commands()
+            && self
+                .dispatches
+                .iter()
+                .all(|dispatch| dispatch.push_constants.is_empty())
+            && prefix_dispatches
+                .iter()
+                .all(|dispatch| dispatch.push_constant_byte_count() == 0)
+            && suffix_dispatches
+                .iter()
+                .all(|dispatch| dispatch.push_constant_byte_count() == 0)
     }
 
     fn wait_submitted(
@@ -19235,21 +19258,8 @@ impl VulkanMountedPlacedResidentDispatchSegmentRunner {
             .get(&sequence_variant)
             .expect("resident sequence variant was initialized");
 
-        let can_replay_recorded_commands = std::env::var_os("LLMOOP_VK_PERF_LOGGER").is_none()
-            && sequence.has_recorded_commands()
-            && self
-                .dispatches
-                .iter()
-                .all(|dispatch| dispatch.push_constants.is_empty())
-            && prefix_dispatches
-                .iter()
-                .all(|dispatch| dispatch.push_constant_byte_count() == 0)
-            && suffix_dispatches
-                .iter()
-                .all(|dispatch| dispatch.push_constant_byte_count() == 0);
-
         let execution_start = capture_execution_trace.then(Instant::now);
-        if can_replay_recorded_commands {
+        if self.can_replay_recorded_commands(sequence, prefix_dispatches, suffix_dispatches) {
             device
                 .run_recorded_resident_kernel_sequence(sequence)
                 .map_err(VulkanMountedPlacedResidentKernelDispatchError::Vulkan)?;
@@ -22775,6 +22785,20 @@ fn advance_compact_slice_with_distributed_dependencies(
         control_flags: 0,
         dynamic_state_capacity_activations,
     };
+    slice
+        .mounted
+        .stream_control_buffer
+        .write_bytes_at(
+            VULKAN_STREAM_CONTROL_METADATA_OFFSET,
+            &stream_control_metadata_bytes(control),
+        )
+        .map_err(|error| {
+            VulkanMountedPlacedResidentInProcessStreamTickError::StreamTick(
+                VulkanMountedPlacedResidentStreamTickError::Dispatch(
+                    VulkanMountedPlacedResidentKernelDispatchError::Vulkan(error),
+                ),
+            )
+        })?;
     let completed_before = slice.cursor.completed_stage_count;
     let mut last_submitted_segment: Option<&VulkanMountedPlacedResidentDispatchSegmentRunner> =
         None;
