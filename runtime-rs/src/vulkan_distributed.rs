@@ -133,6 +133,150 @@ pub struct VulkanDistributedActivationSlot {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanDistributedActivationBufferPlan {
+    pub allocations: Vec<VulkanDistributedActivationBufferAllocation>,
+    pub allocation_count: usize,
+    pub import_count: usize,
+    pub reference_count: usize,
+    pub total_shared_byte_capacity: usize,
+}
+
+impl VulkanDistributedActivationBufferPlan {
+    pub fn from_execution_plan(
+        execution_plan: &VulkanDistributedExecutionPlan,
+    ) -> Result<Self, VulkanDistributedPlanError> {
+        let device_ids = execution_plan
+            .device_ids
+            .iter()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        let mut allocations = BTreeMap::<
+            VulkanDistributedActivationBufferAllocationKey,
+            VulkanDistributedActivationBufferAllocation,
+        >::new();
+
+        for dispatch in &execution_plan.dispatches {
+            let participant_device_ids = dispatch
+                .shards
+                .iter()
+                .map(|shard| shard.device_id.as_str())
+                .collect::<BTreeSet<_>>();
+            if participant_device_ids.is_empty() {
+                return Err(VulkanDistributedPlanError(format!(
+                    "distributed dispatch {}.{} has no device shards",
+                    dispatch.pedal_id, dispatch.node_id
+                )));
+            }
+            if !participant_device_ids.contains(dispatch.owner_device_id.as_str()) {
+                return Err(VulkanDistributedPlanError(format!(
+                    "distributed dispatch {}.{} does not include its owner {:?}",
+                    dispatch.pedal_id, dispatch.node_id, dispatch.owner_device_id
+                )));
+            }
+            if let Some(device_id) = participant_device_ids
+                .iter()
+                .find(|device_id| !device_ids.contains(**device_id))
+            {
+                return Err(VulkanDistributedPlanError(format!(
+                    "distributed dispatch {}.{} uses device {device_id:?} outside the execution pool",
+                    dispatch.pedal_id, dispatch.node_id
+                )));
+            }
+
+            accumulate_activation_allocation(
+                &mut allocations,
+                &dispatch.owner_device_id,
+                &dispatch.input_activation,
+                &participant_device_ids,
+                VulkanDistributedActivationAccess::Input,
+            )?;
+            accumulate_activation_allocation(
+                &mut allocations,
+                &dispatch.owner_device_id,
+                &dispatch.output_activation,
+                &participant_device_ids,
+                VulkanDistributedActivationAccess::Output,
+            )?;
+        }
+
+        let import_count = allocations.values().try_fold(0usize, |total, allocation| {
+            total
+                .checked_add(allocation.device_ids.len())
+                .ok_or_else(|| {
+                    VulkanDistributedPlanError(
+                        "distributed activation import count overflowed".to_string(),
+                    )
+                })
+        })?;
+        let reference_count = allocations.values().try_fold(0usize, |total, allocation| {
+            total
+                .checked_add(allocation.input_use_count)
+                .and_then(|count| count.checked_add(allocation.output_use_count))
+                .ok_or_else(|| {
+                    VulkanDistributedPlanError(
+                        "distributed activation reference count overflowed".to_string(),
+                    )
+                })
+        })?;
+        let total_shared_byte_capacity =
+            allocations.values().try_fold(0usize, |total, allocation| {
+                total.checked_add(allocation.byte_capacity).ok_or_else(|| {
+                    VulkanDistributedPlanError(
+                        "distributed activation byte capacity overflowed".to_string(),
+                    )
+                })
+            })?;
+        let allocations = allocations.into_values().collect::<Vec<_>>();
+
+        Ok(Self {
+            allocation_count: allocations.len(),
+            allocations,
+            import_count,
+            reference_count,
+            total_shared_byte_capacity,
+        })
+    }
+
+    pub fn allocation(
+        &self,
+        owner_device_id: &str,
+        pedal_id: &str,
+        slot: usize,
+    ) -> Option<&VulkanDistributedActivationBufferAllocation> {
+        self.allocations.iter().find(|allocation| {
+            allocation.owner_device_id == owner_device_id
+                && allocation.pedal_id == pedal_id
+                && allocation.slot == slot
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanDistributedActivationBufferAllocation {
+    pub owner_device_id: String,
+    pub pedal_id: String,
+    pub slot: usize,
+    pub byte_capacity: usize,
+    pub signal_ids: Vec<String>,
+    pub device_ids: Vec<String>,
+    pub input_use_count: usize,
+    pub output_use_count: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct VulkanDistributedActivationBufferAllocationKey {
+    owner_device_id: String,
+    pedal_id: String,
+    slot: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VulkanDistributedActivationAccess {
+    Input,
+    Output,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VulkanDistributedDispatchShard {
     pub device_id: String,
     pub row_start: usize,
@@ -412,6 +556,96 @@ fn validate_device_pool(device_ids: &[String]) -> Result<(), VulkanDistributedPl
         return Err(VulkanDistributedPlanError(format!(
             "distributed execution device pool repeats {device_id:?}"
         )));
+    }
+    Ok(())
+}
+
+fn accumulate_activation_allocation(
+    allocations: &mut BTreeMap<
+        VulkanDistributedActivationBufferAllocationKey,
+        VulkanDistributedActivationBufferAllocation,
+    >,
+    owner_device_id: &str,
+    activation: &VulkanDistributedActivationSlot,
+    participant_device_ids: &BTreeSet<&str>,
+    access: VulkanDistributedActivationAccess,
+) -> Result<(), VulkanDistributedPlanError> {
+    if activation.byte_capacity == 0 {
+        return Err(VulkanDistributedPlanError(format!(
+            "distributed activation {}.slot_{} has zero capacity",
+            activation.pedal_id, activation.slot
+        )));
+    }
+    if activation.signal_byte_capacity == 0
+        || activation.signal_byte_capacity > activation.byte_capacity
+    {
+        return Err(VulkanDistributedPlanError(format!(
+            "distributed activation {}.slot_{} has signal {:?} capacity {} outside its {}-byte slot",
+            activation.pedal_id,
+            activation.slot,
+            activation.signal_id,
+            activation.signal_byte_capacity,
+            activation.byte_capacity
+        )));
+    }
+    let key = VulkanDistributedActivationBufferAllocationKey {
+        owner_device_id: owner_device_id.to_string(),
+        pedal_id: activation.pedal_id.clone(),
+        slot: activation.slot,
+    };
+    let allocation =
+        allocations
+            .entry(key)
+            .or_insert_with(|| VulkanDistributedActivationBufferAllocation {
+                owner_device_id: owner_device_id.to_string(),
+                pedal_id: activation.pedal_id.clone(),
+                slot: activation.slot,
+                byte_capacity: activation.byte_capacity,
+                signal_ids: Vec::new(),
+                device_ids: Vec::new(),
+                input_use_count: 0,
+                output_use_count: 0,
+            });
+    if allocation.byte_capacity != activation.byte_capacity {
+        return Err(VulkanDistributedPlanError(format!(
+            "distributed activation {}.slot_{} has conflicting capacities {} and {}",
+            activation.pedal_id,
+            activation.slot,
+            allocation.byte_capacity,
+            activation.byte_capacity
+        )));
+    }
+    if !allocation.signal_ids.contains(&activation.signal_id) {
+        allocation.signal_ids.push(activation.signal_id.clone());
+        allocation.signal_ids.sort();
+    }
+    for device_id in participant_device_ids {
+        if !allocation
+            .device_ids
+            .iter()
+            .any(|existing| existing == device_id)
+        {
+            allocation.device_ids.push((*device_id).to_string());
+        }
+    }
+    allocation.device_ids.sort();
+    match access {
+        VulkanDistributedActivationAccess::Input => {
+            allocation.input_use_count =
+                allocation.input_use_count.checked_add(1).ok_or_else(|| {
+                    VulkanDistributedPlanError(
+                        "distributed activation input use count overflowed".to_string(),
+                    )
+                })?;
+        }
+        VulkanDistributedActivationAccess::Output => {
+            allocation.output_use_count =
+                allocation.output_use_count.checked_add(1).ok_or_else(|| {
+                    VulkanDistributedPlanError(
+                        "distributed activation output use count overflowed".to_string(),
+                    )
+                })?;
+        }
     }
     Ok(())
 }
@@ -919,6 +1153,85 @@ mod tests {
                 .output_byte_offset
                 .is_multiple_of(plan.storage_buffer_offset_alignment)
         }));
+    }
+
+    #[test]
+    fn plans_one_shared_allocation_per_owner_activation_slot() {
+        let execution_plan = fixture_plan("row_major");
+
+        let activation_plan =
+            VulkanDistributedActivationBufferPlan::from_execution_plan(&execution_plan).unwrap();
+
+        assert_eq!(activation_plan.allocation_count, 2);
+        assert_eq!(activation_plan.import_count, 8);
+        assert_eq!(activation_plan.reference_count, 2);
+        assert_eq!(activation_plan.total_shared_byte_capacity, 32);
+        assert_eq!(
+            activation_plan.allocation("owner", "pedal", 0).unwrap(),
+            &VulkanDistributedActivationBufferAllocation {
+                owner_device_id: "owner".to_string(),
+                pedal_id: "pedal".to_string(),
+                slot: 0,
+                byte_capacity: 8,
+                signal_ids: vec!["normalized".to_string()],
+                device_ids: vec![
+                    "helper-a".to_string(),
+                    "helper-b".to_string(),
+                    "helper-c".to_string(),
+                    "owner".to_string(),
+                ],
+                input_use_count: 1,
+                output_use_count: 0,
+            }
+        );
+        assert_eq!(
+            activation_plan
+                .allocation("owner", "pedal", 1)
+                .unwrap()
+                .output_use_count,
+            1
+        );
+    }
+
+    #[test]
+    fn reuses_shared_activation_allocations_across_repeated_dispatches() {
+        let mut execution_plan = fixture_plan("row_major");
+        let mut repeated = execution_plan.dispatches[0].clone();
+        repeated.dispatch_index = 8;
+        repeated.input_activation.signal_id = "normalized-again".to_string();
+        execution_plan.dispatches.push(repeated);
+
+        let activation_plan =
+            VulkanDistributedActivationBufferPlan::from_execution_plan(&execution_plan).unwrap();
+
+        assert_eq!(activation_plan.allocation_count, 2);
+        assert_eq!(activation_plan.import_count, 8);
+        assert_eq!(activation_plan.reference_count, 4);
+        assert_eq!(activation_plan.total_shared_byte_capacity, 32);
+        let input = activation_plan.allocation("owner", "pedal", 0).unwrap();
+        assert_eq!(input.input_use_count, 2);
+        assert_eq!(
+            input.signal_ids,
+            vec!["normalized".to_string(), "normalized-again".to_string()]
+        );
+    }
+
+    #[test]
+    fn rejects_conflicting_capacities_for_the_same_activation_slot() {
+        let mut execution_plan = fixture_plan("row_major");
+        let mut repeated = execution_plan.dispatches[0].clone();
+        repeated.dispatch_index = 8;
+        repeated.input_activation.byte_capacity = 16;
+        execution_plan.dispatches.push(repeated);
+
+        let error = VulkanDistributedActivationBufferPlan::from_execution_plan(&execution_plan)
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("activation pedal.slot_0 has conflicting capacities 8 and 16")
+        );
     }
 
     #[test]
