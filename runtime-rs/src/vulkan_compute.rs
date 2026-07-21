@@ -166,6 +166,7 @@ pub struct VulkanResidentBuffer {
     memory_access: VulkanResidentMemoryAccess,
     byte_capacity: vk::DeviceSize,
     persistent_mapping: Option<usize>,
+    persistent_mapping_requires_unmap: bool,
     _shared_host_allocation: Option<Arc<VulkanSharedHostAllocation>>,
 }
 
@@ -301,6 +302,7 @@ impl VulkanResidentBuffer {
                 })?
         };
         self.persistent_mapping = Some(pointer as usize);
+        self.persistent_mapping_requires_unmap = true;
         Ok(())
     }
 
@@ -523,7 +525,7 @@ impl Drop for VulkanTimelineSemaphore {
 impl Drop for VulkanResidentBuffer {
     fn drop(&mut self) {
         unsafe {
-            if self.persistent_mapping.is_some() {
+            if self.persistent_mapping_requires_unmap {
                 self.device.unmap_memory(self.memory);
             }
             self.device.destroy_buffer(self.buffer, None);
@@ -1429,7 +1431,8 @@ impl VulkanComputeDevice {
                 memory,
                 memory_access,
                 byte_capacity: allocation.byte_capacity as vk::DeviceSize,
-                persistent_mapping: None,
+                persistent_mapping: Some(allocation.address),
+                persistent_mapping_requires_unmap: false,
                 _shared_host_allocation: Some(allocation),
             })
         }
@@ -1619,6 +1622,7 @@ impl VulkanComputeDevice {
             memory_access,
             byte_capacity,
             persistent_mapping: None,
+            persistent_mapping_requires_unmap: false,
             _shared_host_allocation: None,
         })
     }
@@ -1644,6 +1648,7 @@ impl VulkanComputeDevice {
             memory_access,
             byte_capacity,
             persistent_mapping: None,
+            persistent_mapping_requires_unmap: false,
             _shared_host_allocation: None,
         })
     }

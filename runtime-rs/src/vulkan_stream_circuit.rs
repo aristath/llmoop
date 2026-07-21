@@ -2907,6 +2907,7 @@ impl VulkanMountedPlacedStreamCircuit {
             parameter_buffers,
             activation_overrides,
             &[],
+            None,
         )
     }
 
@@ -2917,6 +2918,7 @@ impl VulkanMountedPlacedStreamCircuit {
         parameter_buffers: Arc<VulkanPermanentParameterBuffers>,
         activation_overrides: &[VulkanActivationSlotBufferOverride],
         cable_endpoint_overrides: &[VulkanPlacedCableEndpointBufferOverride],
+        stream_control_override: Option<Arc<VulkanResidentBuffer>>,
     ) -> Result<Self, VulkanStreamCircuitMountError> {
         let buffers = placed_plan
             .placed_resident_plan
@@ -2932,17 +2934,39 @@ impl VulkanMountedPlacedStreamCircuit {
             VulkanPlacedCableIoPlan::from_placed_resident_plan(&placed_plan.placed_resident_plan)?;
         let cable_io = cable_io_plan
             .allocate_buffers_with_endpoint_overrides(device, cable_endpoint_overrides)?;
-        let mut stream_control_buffer =
-            device.create_host_visible_resident_buffer(VULKAN_STREAM_CONTROL_BYTE_CAPACITY)?;
-        stream_control_buffer.persistently_map()?;
-        stream_control_buffer.write_bytes(&[0; VULKAN_STREAM_CONTROL_BYTE_CAPACITY])?;
+        let stream_control_buffer = if let Some(stream_control_buffer) = stream_control_override {
+            if !device.owns_resident_buffer(&stream_control_buffer) {
+                return Err(VulkanStreamCircuitMountError::Vulkan(VulkanError(
+                    "stream-control buffer override belongs to a different Vulkan logical device"
+                        .to_string(),
+                )));
+            }
+            if stream_control_buffer.byte_capacity() < VULKAN_STREAM_CONTROL_BYTE_CAPACITY {
+                return Err(VulkanStreamCircuitMountError::Vulkan(VulkanError(format!(
+                    "stream-control buffer override has {} bytes, needs {VULKAN_STREAM_CONTROL_BYTE_CAPACITY}",
+                    stream_control_buffer.byte_capacity()
+                ))));
+            }
+            if !stream_control_buffer.is_persistently_mapped() {
+                return Err(VulkanStreamCircuitMountError::Vulkan(VulkanError(
+                    "stream-control buffer override is not persistently host mapped".to_string(),
+                )));
+            }
+            stream_control_buffer
+        } else {
+            let mut stream_control_buffer =
+                device.create_host_visible_resident_buffer(VULKAN_STREAM_CONTROL_BYTE_CAPACITY)?;
+            stream_control_buffer.persistently_map()?;
+            stream_control_buffer.write_bytes(&[0; VULKAN_STREAM_CONTROL_BYTE_CAPACITY])?;
+            Arc::new(stream_control_buffer)
+        };
         Ok(Self {
             placed_plan,
             parameter_buffers,
             buffers,
             boundary_io,
             cable_io,
-            stream_control_buffer: Arc::new(stream_control_buffer),
+            stream_control_buffer,
         })
     }
 
@@ -11709,7 +11733,12 @@ impl VulkanResidentModelPackageDeviceSlice {
         device: &VulkanComputeDevice,
         activation_overrides: &[VulkanActivationSlotBufferOverride],
     ) -> Result<VulkanMountedPlacedStreamCircuit, VulkanResidentTokenModelPackageError> {
-        self.create_mounted_stream_circuit_with_buffer_overrides(device, activation_overrides, &[])
+        self.create_mounted_stream_circuit_with_buffer_overrides(
+            device,
+            activation_overrides,
+            &[],
+            None,
+        )
     }
 
     pub fn create_mounted_stream_circuit_with_buffer_overrides(
@@ -11717,6 +11746,7 @@ impl VulkanResidentModelPackageDeviceSlice {
         device: &VulkanComputeDevice,
         activation_overrides: &[VulkanActivationSlotBufferOverride],
         cable_endpoint_overrides: &[VulkanPlacedCableEndpointBufferOverride],
+        stream_control_override: Option<Arc<VulkanResidentBuffer>>,
     ) -> Result<VulkanMountedPlacedStreamCircuit, VulkanResidentTokenModelPackageError> {
         VulkanMountedPlacedStreamCircuit::
             from_placed_plan_with_parameter_buffers_and_buffer_overrides(
@@ -11726,6 +11756,7 @@ impl VulkanResidentModelPackageDeviceSlice {
             self.parameter_buffers.clone(),
             activation_overrides,
             cable_endpoint_overrides,
+            stream_control_override,
         )
         .map_err(|error| {
             VulkanResidentTokenModelPackageError::new(format!(
@@ -11957,7 +11988,6 @@ pub struct VulkanResidentInProcessPlacedStreamProcessor {
     input_transducer: VulkanResidentInputEmbeddingTransducerRunner,
     output_transducer: VulkanResidentOutputTransducerRunner,
     sampler: VulkanResidentSamplerRunner,
-    feedback_token_cable: Option<VulkanResidentMappedBufferCopy>,
     resident_feedback_loop: Option<VulkanResidentInProcessPlacedFeedbackLoop>,
     activation_schedule: VulkanMountedPlacedResidentInProcessSchedule,
     device_slices: Vec<VulkanResidentInProcessPlacedStreamProcessorDevice>,
@@ -12638,9 +12668,10 @@ fn pair_placed_cable_endpoints(
     Ok(pairs)
 }
 
-struct VulkanPlacedCableDeviceLinks {
+struct VulkanPlacedDeviceLinks {
     endpoint_overrides: BTreeMap<String, Vec<VulkanPlacedCableEndpointBufferOverride>>,
     synchronizations: VulkanPlacedCableTimelineSynchronizations,
+    stream_control_buffers: BTreeMap<String, Arc<VulkanResidentBuffer>>,
 }
 
 #[derive(Default)]
@@ -12709,10 +12740,10 @@ impl VulkanPlacedCableTimelineSynchronizations {
     }
 }
 
-fn create_shared_placed_cable_endpoint_overrides<'a, F>(
+fn create_placed_device_links<'a, F>(
     device_slices: &[Arc<VulkanResidentModelPackageDeviceSlice>],
     device_for: &F,
-) -> Result<VulkanPlacedCableDeviceLinks, VulkanResidentInProcessPlacedRuntimeError>
+) -> Result<VulkanPlacedDeviceLinks, VulkanResidentInProcessPlacedRuntimeError>
 where
     F: Fn(&str) -> Result<&'a VulkanComputeDevice, VulkanResidentInProcessPlacedRuntimeError>,
 {
@@ -12828,11 +12859,62 @@ where
                 buffer: incoming_buffer,
             });
     }
-    Ok(VulkanPlacedCableDeviceLinks {
+    let mut unique_devices = Vec::<(&VulkanComputeDevice, Vec<String>)>::new();
+    for slice in device_slices {
+        let device = device_for(&slice.device_id)?;
+        if let Some((_, device_ids)) = unique_devices
+            .iter_mut()
+            .find(|(candidate, _)| candidate.shares_logical_device_with(device))
+        {
+            device_ids.push(slice.device_id.clone());
+        } else {
+            unique_devices.push((device, vec![slice.device_id.clone()]));
+        }
+    }
+    let mut stream_control_buffers = BTreeMap::new();
+    if let Some((owner_device, _)) = unique_devices.first() {
+        let buffers = if unique_devices.len() == 1 {
+            let mut buffer = owner_device
+                .create_host_visible_resident_buffer(VULKAN_STREAM_CONTROL_BYTE_CAPACITY)
+                .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
+            buffer
+                .persistently_map()
+                .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
+            vec![Arc::new(buffer)]
+        } else {
+            let peers = unique_devices
+                .iter()
+                .skip(1)
+                .map(|(device, _)| *device)
+                .collect::<Vec<_>>();
+            let allocation = owner_device
+                .create_shared_host_allocation(&peers, VULKAN_STREAM_CONTROL_BYTE_CAPACITY)
+                .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
+            unique_devices
+                .iter()
+                .map(|(device, _)| {
+                    device
+                        .import_shared_host_buffer(Arc::clone(&allocation))
+                        .map(Arc::new)
+                        .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        buffers[0]
+            .write_bytes(&[0; VULKAN_STREAM_CONTROL_BYTE_CAPACITY])
+            .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
+        for ((_, device_ids), buffer) in unique_devices.iter().zip(buffers) {
+            for device_id in device_ids {
+                stream_control_buffers.insert(device_id.clone(), buffer.clone());
+            }
+        }
+    }
+    Ok(VulkanPlacedDeviceLinks {
         endpoint_overrides,
         synchronizations: VulkanPlacedCableTimelineSynchronizations {
             cables: synchronizations,
         },
+        stream_control_buffers,
     })
 }
 
@@ -13348,10 +13430,11 @@ impl VulkanResidentInProcessPlacedModelPackage {
                 )),
             )
         })?;
-        let VulkanPlacedCableDeviceLinks {
+        let VulkanPlacedDeviceLinks {
             endpoint_overrides: shared_cable_endpoint_overrides,
             synchronizations: cable_synchronizations,
-        } = create_shared_placed_cable_endpoint_overrides(&self.device_slices, &device_for)?;
+            stream_control_buffers,
+        } = create_placed_device_links(&self.device_slices, &device_for)?;
         let mut devices = Vec::with_capacity(self.device_slices.len());
         for package_slice in &self.device_slices {
             let device = device_for(&package_slice.device_id)?;
@@ -13365,6 +13448,9 @@ impl VulkanResidentInProcessPlacedModelPackage {
                         .get(&package_slice.device_id)
                         .map(Vec::as_slice)
                         .unwrap_or_default(),
+                    stream_control_buffers
+                        .get(&package_slice.device_id)
+                        .cloned(),
                 )
                 .map_err(VulkanResidentInProcessPlacedRuntimeError::Package)?;
             mounted.buffers.zero_state_buffers().map_err(|error| {
@@ -13502,18 +13588,6 @@ impl VulkanResidentInProcessPlacedModelPackage {
             random_seed,
         )
         .map_err(VulkanResidentInProcessPlacedRuntimeError::Sampler)?;
-        let feedback_token_cable = (self.input_device_id != self.output_device_id)
-            .then(|| {
-                output_slice
-                    .mounted
-                    .stream_control_buffer
-                    .create_persistently_mapped_copy_to(
-                        &input_slice.mounted.stream_control_buffer,
-                        VULKAN_STREAM_CONTROL_TOKEN_BYTE_CAPACITY,
-                    )
-            })
-            .transpose()
-            .map_err(VulkanResidentInProcessPlacedRuntimeError::FeedbackCable)?;
         let resident_feedback_loop = VulkanResidentInProcessPlacedFeedbackLoop::new_if_supported(
             input_device,
             self,
@@ -13559,7 +13633,6 @@ impl VulkanResidentInProcessPlacedModelPackage {
             input_transducer,
             output_transducer,
             sampler,
-            feedback_token_cable,
             resident_feedback_loop,
             activation_schedule,
             device_slices: devices,
@@ -14466,11 +14539,6 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
                 Ok(self.input_transducer.completed_run(token_id))
             }
             VulkanResidentPlacedTokenInput::CableFeedback(_) => {
-                self.feedback_token_cable
-                    .as_ref()
-                    .ok_or(VulkanResidentInProcessPlacedRuntimeError::MissingFeedbackCable)?
-                    .run(VULKAN_STREAM_CONTROL_TOKEN_BYTE_CAPACITY)
-                    .map_err(VulkanResidentInProcessPlacedRuntimeError::FeedbackCable)?;
                 Ok(self.input_transducer.completed_run(token_id))
             }
         }
@@ -16951,7 +17019,6 @@ pub enum VulkanResidentInProcessPlacedRuntimeError {
     EmptyPromptEvent,
     PromptStreamBusy,
     MissingPrivateFeedback,
-    MissingFeedbackCable,
     MissingFusedSamplerRun,
     MissingBoundDevice { device_id: String },
     StreamTickOverflow,
@@ -16981,9 +17048,6 @@ impl Display for VulkanResidentInProcessPlacedRuntimeError {
             }
             Self::MissingPrivateFeedback => {
                 f.write_str("placed feedback loop is missing private feedback")
-            }
-            Self::MissingFeedbackCable => {
-                f.write_str("placed feedback loop is missing its cross-device token cable")
             }
             Self::MissingFusedSamplerRun => {
                 f.write_str("placed token tick completed without its fused sampler result")
@@ -23182,6 +23246,63 @@ fn wait_for_compact_slice_terminal_work(
     Ok(())
 }
 
+fn prepare_compact_shared_stream_control(
+    slices: &[VulkanMountedPlacedResidentInProcessStreamTickSlice<'_>],
+) -> Result<(), VulkanMountedPlacedResidentInProcessStreamTickError> {
+    let mut compact_slices = slices
+        .iter()
+        .filter(|slice| !slice.cursor.capture_execution_trace);
+    let Some(first) = compact_slices.next() else {
+        return Ok(());
+    };
+    let dynamic_state_capacity_activations =
+        u32::try_from(first.mounted.buffers.dynamic_state_capacity_activations).map_err(|_| {
+            VulkanMountedPlacedResidentInProcessStreamTickError::StreamTick(
+                VulkanMountedPlacedResidentStreamTickError::DynamicStateCapacityOverflow {
+                    capacity: first.mounted.buffers.dynamic_state_capacity_activations,
+                },
+            )
+        })?;
+    for slice in compact_slices {
+        let buffers_alias = Arc::ptr_eq(
+            &first.mounted.stream_control_buffer,
+            &slice.mounted.stream_control_buffer,
+        ) || first
+            .mounted
+            .stream_control_buffer
+            .shares_host_allocation_with(&slice.mounted.stream_control_buffer);
+        if !buffers_alias
+            || slice.cursor.stream_tick != first.cursor.stream_tick
+            || slice.mounted.buffers.dynamic_state_capacity_activations
+                != first.mounted.buffers.dynamic_state_capacity_activations
+        {
+            return Err(
+                VulkanMountedPlacedResidentInProcessStreamTickError::Schedule(VulkanError(
+                    "compact placed slices do not share one stream-control timeline".to_string(),
+                )),
+            );
+        }
+    }
+    first
+        .mounted
+        .stream_control_buffer
+        .write_bytes_at(
+            VULKAN_STREAM_CONTROL_METADATA_OFFSET,
+            &stream_control_metadata_bytes(VulkanMountedPlacedStreamControl {
+                stream_tick: first.cursor.stream_tick,
+                control_flags: 0,
+                dynamic_state_capacity_activations,
+            }),
+        )
+        .map_err(|error| {
+            VulkanMountedPlacedResidentInProcessStreamTickError::StreamTick(
+                VulkanMountedPlacedResidentStreamTickError::Dispatch(
+                    VulkanMountedPlacedResidentKernelDispatchError::Vulkan(error),
+                ),
+            )
+        })
+}
+
 fn advance_compact_slice_with_distributed_dependencies(
     slice: &mut VulkanMountedPlacedResidentInProcessStreamTickSlice<'_>,
     device_by_id: &BTreeMap<String, &VulkanComputeDevice>,
@@ -23203,20 +23324,6 @@ fn advance_compact_slice_with_distributed_dependencies(
         control_flags: 0,
         dynamic_state_capacity_activations,
     };
-    slice
-        .mounted
-        .stream_control_buffer
-        .write_bytes_at(
-            VULKAN_STREAM_CONTROL_METADATA_OFFSET,
-            &stream_control_metadata_bytes(control),
-        )
-        .map_err(|error| {
-            VulkanMountedPlacedResidentInProcessStreamTickError::StreamTick(
-                VulkanMountedPlacedResidentStreamTickError::Dispatch(
-                    VulkanMountedPlacedResidentKernelDispatchError::Vulkan(error),
-                ),
-            )
-        })?;
     let completed_before = slice.cursor.completed_stage_count;
     let mut last_submitted_segment: Option<&VulkanMountedPlacedResidentDispatchSegmentRunner> =
         None;
@@ -23640,6 +23747,9 @@ fn run_mounted_placed_resident_stream_tick_slices_in_process_with_schedule_and_d
                 "placed cable timeline state leaked across stream ticks".to_string(),
             )),
         );
+    }
+    if distributed_runners.is_some() {
+        prepare_compact_shared_stream_control(slices)?;
     }
 
     let mut completed_stage_delta = 0usize;
