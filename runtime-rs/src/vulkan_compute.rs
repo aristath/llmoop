@@ -206,6 +206,13 @@ pub struct VulkanResidentQueueSubmissionBatch<'a> {
     groups: RefCell<Vec<VulkanResidentQueueSubmissionGroup<'a>>>,
 }
 
+/// A mounted queue-submission topology. Command buffers, queue ordering, and
+/// semaphore edges stay fixed; replay only advances timeline values.
+pub struct VulkanResidentQueueSubmissionTemplate<'a> {
+    groups: Vec<VulkanResidentQueueSubmissionGroup<'a>>,
+    submission_count: usize,
+}
+
 struct VulkanResidentQueueSubmissionGroup<'a> {
     device: &'a VulkanComputeDevice,
     submissions: Vec<VulkanPreparedResidentQueueSubmission>,
@@ -287,21 +294,55 @@ impl<'a> VulkanResidentQueueSubmissionBatch<'a> {
             .sum()
     }
 
-    pub fn submit_all(&self) -> Result<usize, VulkanError> {
-        let groups = std::mem::take(&mut *self.groups.borrow_mut());
-        let mut submitted = 0usize;
-        for group in groups {
+    pub fn mount(self) -> Result<VulkanResidentQueueSubmissionTemplate<'a>, VulkanError> {
+        let groups = self.groups.into_inner();
+        let submission_count = groups.iter().try_fold(0usize, |total, group| {
+            total.checked_add(group.submissions.len()).ok_or_else(|| {
+                VulkanError("resident queue submission count overflowed".to_string())
+            })
+        })?;
+        Ok(VulkanResidentQueueSubmissionTemplate {
+            groups,
+            submission_count,
+        })
+    }
+}
+
+impl VulkanResidentQueueSubmissionTemplate<'_> {
+    pub fn submission_count(&self) -> usize {
+        self.submission_count
+    }
+
+    pub fn submit_with_timeline_value_offset(
+        &self,
+        timeline_value_offset: u64,
+    ) -> Result<usize, VulkanError> {
+        for group in &self.groups {
+            for submission in &group.submissions {
+                for (_, value) in submission
+                    .wait_points
+                    .iter()
+                    .chain(&submission.signal_points)
+                {
+                    offset_timeline_value(*value, timeline_value_offset)?;
+                }
+            }
+        }
+        for group in &self.groups {
             group
                 .device
-                .submit_prepared_resident_queue_batch(&group.submissions)?;
-            submitted = submitted
-                .checked_add(group.submissions.len())
-                .ok_or_else(|| {
-                    VulkanError("resident queue submission count overflowed".to_string())
-                })?;
+                .submit_prepared_resident_queue_batch(&group.submissions, timeline_value_offset)?;
         }
-        Ok(submitted)
+        Ok(self.submission_count)
     }
+}
+
+fn offset_timeline_value(value: u64, offset: u64) -> Result<u64, VulkanError> {
+    value.checked_add(offset).ok_or_else(|| {
+        VulkanError(format!(
+            "timeline semaphore value {value} overflows with replay offset {offset}"
+        ))
+    })
 }
 
 #[derive(Clone)]
@@ -2432,6 +2473,7 @@ impl VulkanComputeDevice {
     fn submit_prepared_resident_queue_batch(
         &self,
         submissions: &[VulkanPreparedResidentQueueSubmission],
+        timeline_value_offset: u64,
     ) -> Result<(), VulkanError> {
         if submissions.is_empty() {
             return Ok(());
@@ -2445,7 +2487,10 @@ impl VulkanComputeDevice {
                     .map(|(semaphore, value)| {
                         vk::SemaphoreSubmitInfo::default()
                             .semaphore(*semaphore)
-                            .value(*value)
+                            .value(
+                                offset_timeline_value(*value, timeline_value_offset)
+                                    .expect("resident submission template offsets were validated"),
+                            )
                             .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
                     })
                     .collect::<Vec<_>>()
@@ -2468,7 +2513,10 @@ impl VulkanComputeDevice {
                     .map(|(semaphore, value)| {
                         vk::SemaphoreSubmitInfo::default()
                             .semaphore(*semaphore)
-                            .value(*value)
+                            .value(
+                                offset_timeline_value(*value, timeline_value_offset)
+                                    .expect("resident submission template offsets were validated"),
+                            )
                             .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
                     })
                     .collect::<Vec<_>>()
@@ -3864,6 +3912,13 @@ fn test_command_exists(command: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn timeline_replay_offsets_preserve_values_and_reject_overflow() {
+        assert_eq!(offset_timeline_value(17, 64).unwrap(), 81);
+        assert_eq!(offset_timeline_value(u64::MAX, 0).unwrap(), u64::MAX);
+        assert!(offset_timeline_value(u64::MAX, 1).is_err());
+    }
 
     #[test]
     fn cooperative_bfloat16_matrix_shader_preserves_matrix_orientation() {

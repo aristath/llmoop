@@ -14972,8 +14972,15 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
                     }
                 }
                 let queued_submission_count = submission_batch.pending_submission_count();
-                let submitted_submission_count = submission_batch
-                    .submit_all()
+                let submission_template = submission_batch
+                    .mount()
+                    .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
+                debug_assert_eq!(
+                    submission_template.submission_count(),
+                    queued_submission_count
+                );
+                let submitted_submission_count = submission_template
+                    .submit_with_timeline_value_offset(0)
                     .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
                 debug_assert_eq!(submitted_submission_count, queued_submission_count);
                 let output_device = devices.get(&self.model.output_device_id).ok_or_else(|| {
