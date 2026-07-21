@@ -6,11 +6,14 @@ use std::sync::Arc;
 use crate::stream_plan::{TensorIndex, TensorMetadata};
 use crate::tensor_storage::{TensorStorage, TensorStorageRange};
 use crate::vulkan_compute::{
-    VulkanComputeDevice, VulkanError, VulkanResidentBuffer, VulkanSharedHostAllocation,
+    VulkanComputeDevice, VulkanError, VulkanResidentBuffer, VulkanResidentKernelBufferAccess,
+    VulkanResidentKernelBufferBinding, VulkanResidentKernelDispatch, VulkanResidentKernelSequence,
+    VulkanResidentKernelSequenceStep, VulkanSharedHostAllocation,
 };
 use crate::vulkan_stream_circuit::{
-    VulkanActivationSlotBufferOverride, VulkanDescriptorResourceAddress, VulkanPreparedDispatch,
-    VulkanPreparedDispatchPlan, VulkanReusableKernelArtifactManifest,
+    VulkanActivationSlotBufferOverride, VulkanDescriptorResourceAddress,
+    VulkanLoadedReusableKernelArtifactManifest, VulkanPreparedDispatch, VulkanPreparedDispatchPlan,
+    VulkanReusableKernelArtifactManifest,
 };
 
 const DISTRIBUTABLE_PARALLEL_PROJECTION_OP: &str = "parallel_linear_silu_multiply";
@@ -781,6 +784,225 @@ impl From<VulkanError> for VulkanDistributedParameterBufferError {
     }
 }
 
+pub struct VulkanDistributedDispatchRunners {
+    pub dispatches: Vec<VulkanDistributedDispatchRunner>,
+    pub dispatch_count: usize,
+    pub shard_count: usize,
+}
+
+impl VulkanDistributedDispatchRunners {
+    pub fn create<'a, F, E>(
+        execution_plan: &VulkanDistributedExecutionPlan,
+        parameter_buffers: &VulkanDistributedParameterBuffers,
+        activation_buffers: &VulkanDistributedActivationBuffers,
+        loaded_manifest: &VulkanLoadedReusableKernelArtifactManifest,
+        mut device_for: F,
+    ) -> Result<Self, VulkanDistributedDispatchRunnerError>
+    where
+        F: FnMut(&str) -> Result<&'a VulkanComputeDevice, E>,
+        E: Display,
+    {
+        let mut dispatches = Vec::with_capacity(execution_plan.dispatches.len());
+        let mut shard_count = 0usize;
+        for planned_dispatch in &execution_plan.dispatches {
+            let artifact = loaded_manifest
+                .artifact(&planned_dispatch.reusable_family_id)
+                .ok_or_else(|| {
+                    VulkanDistributedDispatchRunnerError(format!(
+                        "distributed dispatch {}.{} is missing loaded family {:?}",
+                        planned_dispatch.pedal_id,
+                        planned_dispatch.node_id,
+                        planned_dispatch.reusable_family_id
+                    ))
+                })?;
+            let mut shards = Vec::with_capacity(planned_dispatch.shards.len());
+            for planned_shard in &planned_dispatch.shards {
+                let device = device_for(&planned_shard.device_id).map_err(|error| {
+                    VulkanDistributedDispatchRunnerError(format!(
+                        "failed to resolve distributed shard device {:?}: {error}",
+                        planned_shard.device_id
+                    ))
+                })?;
+                let input = activation_buffers
+                    .activation_buffer(
+                        &planned_dispatch.owner_device_id,
+                        &planned_dispatch.input_activation.pedal_id,
+                        planned_dispatch.input_activation.slot,
+                        &planned_shard.device_id,
+                    )
+                    .ok_or_else(|| {
+                        VulkanDistributedDispatchRunnerError(format!(
+                            "distributed dispatch {}.{} has no input activation on {:?}",
+                            planned_dispatch.pedal_id,
+                            planned_dispatch.node_id,
+                            planned_shard.device_id
+                        ))
+                    })?;
+                let output = activation_buffers
+                    .activation_buffer(
+                        &planned_dispatch.owner_device_id,
+                        &planned_dispatch.output_activation.pedal_id,
+                        planned_dispatch.output_activation.slot,
+                        &planned_shard.device_id,
+                    )
+                    .ok_or_else(|| {
+                        VulkanDistributedDispatchRunnerError(format!(
+                            "distributed dispatch {}.{} has no output activation on {:?}",
+                            planned_dispatch.pedal_id,
+                            planned_dispatch.node_id,
+                            planned_shard.device_id
+                        ))
+                    })?;
+                let mut bindings = Vec::with_capacity(2 + planned_shard.parameters.len());
+                bindings.push(
+                    VulkanResidentKernelBufferBinding::new(
+                        0,
+                        input,
+                        planned_dispatch.input_byte_capacity,
+                    )
+                    .with_access(VulkanResidentKernelBufferAccess::Read),
+                );
+                bindings.push(
+                    VulkanResidentKernelBufferBinding::new(
+                        1,
+                        output,
+                        planned_shard.output_byte_count,
+                    )
+                    .with_byte_offset(planned_shard.output_byte_offset)
+                    .with_access(VulkanResidentKernelBufferAccess::Write),
+                );
+                for fragment in &planned_shard.parameters {
+                    let allocation = parameter_buffers
+                        .parameter_buffer(
+                            &planned_shard.device_id,
+                            &fragment.tensor,
+                            fragment.byte_offset,
+                            fragment.byte_count,
+                        )
+                        .ok_or_else(|| {
+                            VulkanDistributedDispatchRunnerError(format!(
+                                "distributed dispatch {}.{} has no tensor {:?} range at byte {} with length {} on {:?}",
+                                planned_dispatch.pedal_id,
+                                planned_dispatch.node_id,
+                                fragment.tensor,
+                                fragment.byte_offset,
+                                fragment.byte_count,
+                                planned_shard.device_id
+                            ))
+                        })?;
+                    let binding = u32::try_from(fragment.binding).map_err(|_| {
+                        VulkanDistributedDispatchRunnerError(format!(
+                            "distributed descriptor binding {} exceeds u32",
+                            fragment.binding
+                        ))
+                    })?;
+                    bindings.push(
+                        VulkanResidentKernelBufferBinding::new(
+                            binding,
+                            &allocation.buffer,
+                            fragment.byte_count,
+                        )
+                        .with_access(VulkanResidentKernelBufferAccess::Read),
+                    );
+                }
+                let resident_dispatch = device
+                    .create_resident_kernel_dispatch(
+                        &artifact.words,
+                        &bindings,
+                        planned_shard.workgroup_count_x,
+                        artifact.artifact.local_size_x,
+                        0,
+                    )
+                    .map_err(|error| {
+                        VulkanDistributedDispatchRunnerError(format!(
+                            "failed to create distributed dispatch {}.{} shard on {:?}: {error}",
+                            planned_dispatch.pedal_id,
+                            planned_dispatch.node_id,
+                            planned_shard.device_id
+                        ))
+                    })?;
+                let sequence = device.create_resident_kernel_sequence().map_err(|error| {
+                    VulkanDistributedDispatchRunnerError(format!(
+                        "failed to create distributed sequence {}.{} shard on {:?}: {error}",
+                        planned_dispatch.pedal_id,
+                        planned_dispatch.node_id,
+                        planned_shard.device_id
+                    ))
+                })?;
+                device
+                    .record_resident_kernel_sequence(
+                        &sequence,
+                        &[VulkanResidentKernelSequenceStep::new(
+                            &resident_dispatch,
+                            &[],
+                        )],
+                    )
+                    .map_err(|error| {
+                        VulkanDistributedDispatchRunnerError(format!(
+                            "failed to record distributed dispatch {}.{} shard on {:?}: {error}",
+                            planned_dispatch.pedal_id,
+                            planned_dispatch.node_id,
+                            planned_shard.device_id
+                        ))
+                    })?;
+                shards.push(VulkanDistributedDispatchShardRunner {
+                    planned: planned_shard.clone(),
+                    resident_dispatch,
+                    sequence,
+                });
+                shard_count = shard_count.checked_add(1).ok_or_else(|| {
+                    VulkanDistributedDispatchRunnerError(
+                        "distributed dispatch shard count overflowed".to_string(),
+                    )
+                })?;
+            }
+            dispatches.push(VulkanDistributedDispatchRunner {
+                planned: planned_dispatch.clone(),
+                shards,
+            });
+        }
+
+        Ok(Self {
+            dispatch_count: dispatches.len(),
+            dispatches,
+            shard_count,
+        })
+    }
+
+    pub fn dispatch(
+        &self,
+        owner_device_id: &str,
+        dispatch_index: usize,
+    ) -> Option<&VulkanDistributedDispatchRunner> {
+        self.dispatches.iter().find(|dispatch| {
+            dispatch.planned.owner_device_id == owner_device_id
+                && dispatch.planned.dispatch_index == dispatch_index
+        })
+    }
+}
+
+pub struct VulkanDistributedDispatchRunner {
+    pub planned: VulkanDistributedDispatchPlan,
+    pub shards: Vec<VulkanDistributedDispatchShardRunner>,
+}
+
+pub struct VulkanDistributedDispatchShardRunner {
+    pub planned: VulkanDistributedDispatchShard,
+    pub resident_dispatch: VulkanResidentKernelDispatch,
+    pub sequence: VulkanResidentKernelSequence,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanDistributedDispatchRunnerError(pub String);
+
+impl Display for VulkanDistributedDispatchRunnerError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl Error for VulkanDistributedDispatchRunnerError {}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VulkanDistributedParameterExclusionPlan {
     pub devices: Vec<VulkanDistributedDeviceParameterExclusions>,
@@ -1196,6 +1418,12 @@ fn plan_dispatch(
     artifact_workgroup_count_x: u32,
     storage_buffer_offset_alignment: usize,
 ) -> Result<VulkanDistributedDispatchPlan, VulkanDistributedPlanError> {
+    if !dispatch.push_constants.is_empty() {
+        return Err(dispatch_error(
+            dispatch,
+            "cannot yet preserve push constants across physical shards".to_string(),
+        ));
+    }
     let parameter_descriptors = dispatch
         .descriptors
         .iter()
@@ -1554,7 +1782,8 @@ mod tests {
     use super::*;
     use crate::stream_plan::TensorMetadata;
     use crate::vulkan_stream_circuit::{
-        VulkanKernelDescriptorUsage, VulkanResolvedDescriptorBinding, VulkanReusableKernelArtifact,
+        VulkanKernelDescriptorUsage, VulkanKernelScalarBinding, VulkanKernelScalarSource,
+        VulkanResolvedDescriptorBinding, VulkanReusableKernelArtifact,
     };
 
     #[test]
@@ -1737,6 +1966,31 @@ mod tests {
             error
                 .to_string()
                 .contains("tensor \"gate\" has non-shardable layout Some(\"column_major\")")
+        );
+    }
+
+    #[test]
+    fn rejects_distributed_dispatches_that_cannot_preserve_push_constants() {
+        let mut prepared_plan = fixture_prepared_plan();
+        prepared_plan.dispatches[0].push_constants = vec![VulkanKernelScalarBinding {
+            name: "stream_tick".to_string(),
+            scalar_type: "u64".to_string(),
+            source: VulkanKernelScalarSource::PushConstant,
+        }];
+
+        let error = VulkanDistributedExecutionPlan::from_prepared_plans(
+            &[("owner", &prepared_plan)],
+            &fixture_tensor_index("row_major"),
+            &fixture_artifact_manifest(),
+            &["owner".to_string(), "helper".to_string()],
+            4,
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("cannot yet preserve push constants across physical shards")
         );
     }
 
