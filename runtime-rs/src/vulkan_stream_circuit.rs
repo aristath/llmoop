@@ -36,9 +36,11 @@ use crate::vulkan_compute::{
     VulkanResidentMappedBufferCopy,
 };
 use crate::vulkan_distributed::{
-    VulkanDistributedActivationBufferPlan, VulkanDistributedDispatchRunnerError,
+    VulkanDistributedActivationBufferPlan, VulkanDistributedActivationBuffers,
+    VulkanDistributedDispatchPlan, VulkanDistributedDispatchRunnerError,
     VulkanDistributedDispatchRunners, VulkanDistributedExecutionPlan,
-    VulkanDistributedParameterAllocationPlan, VulkanDistributedParameterExclusionPlan,
+    VulkanDistributedParameterAllocationPlan, VulkanDistributedParameterBuffers,
+    VulkanDistributedParameterExclusionPlan,
 };
 
 pub const VULKAN_STREAM_CIRCUIT_BACKEND_ID: &str = "vulkan_stream_circuit_ir";
@@ -5840,7 +5842,8 @@ enum VulkanPedalBatchSignalKey {
 
 struct VulkanPedalBatchSignalBuffer {
     frame_byte_capacity: usize,
-    buffer: VulkanResidentBuffer,
+    buffer: Arc<VulkanResidentBuffer>,
+    shared_device_buffers: BTreeMap<String, Arc<VulkanResidentBuffer>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -5986,6 +5989,7 @@ struct VulkanPedalBatchDispatchStep {
     snapshot_state_buffer_indices: BTreeSet<usize>,
 }
 
+#[derive(Clone, Copy)]
 enum VulkanPedalBatchStateSemantics<'a> {
     IndependentCandidates(&'a VulkanResidentStateTransactionBank),
     CausalSequence,
@@ -6031,15 +6035,24 @@ struct VulkanResidentPedalBatchSliceRunner {
     signal_buffer_indices: BTreeMap<VulkanPedalBatchSignalKey, usize>,
     stream_control_buffers: Vec<VulkanResidentBuffer>,
     steps: Vec<VulkanPedalBatchDispatchStep>,
-    sequence: VulkanResidentKernelSequence,
+    distributed_barriers: Vec<VulkanPedalBatchDistributedBarrier>,
+    sequences: Vec<VulkanResidentKernelSequence>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct VulkanPedalBatchDistributedBarrier {
+    step_index: usize,
+    dispatch_index: usize,
 }
 
 impl VulkanResidentPedalBatchSliceRunner {
     fn new(
+        devices: &BTreeMap<String, Rc<VulkanComputeDevice>>,
         device: &VulkanComputeDevice,
         slice: &VulkanResidentInProcessPlacedStreamProcessorDevice,
         lane_capacity: usize,
         execution_mode: VulkanPedalBatchExecutionMode,
+        distributed_execution_plan: &VulkanDistributedExecutionPlan,
     ) -> Result<Self, VulkanResidentInProcessPlacedRuntimeError> {
         if lane_capacity == 0 {
             return Err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop(
@@ -6048,8 +6061,30 @@ impl VulkanResidentPedalBatchSliceRunner {
         }
         let (signal_buffer_indices, signal_buffer_plan) =
             pedal_batch_signal_buffer_plan(&slice.mounted, &slice.mounted_bound.dispatches)?;
+        let mut shared_device_ids_by_buffer = BTreeMap::<usize, BTreeSet<String>>::new();
+        for dispatch in distributed_execution_plan
+            .dispatches
+            .iter()
+            .filter(|dispatch| dispatch.owner_device_id == slice.device_id)
+        {
+            for activation in [&dispatch.input_activation, &dispatch.output_activation] {
+                let key = VulkanPedalBatchSignalKey::Activation {
+                    pedal_id: activation.pedal_id.clone(),
+                    signal_id: activation.signal_id.clone(),
+                };
+                let buffer_index = *signal_buffer_indices.get(&key).ok_or_else(|| {
+                    VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(format!(
+                        "distributed pedal batch has no signal buffer for {key:?}"
+                    )))
+                })?;
+                shared_device_ids_by_buffer
+                    .entry(buffer_index)
+                    .or_default()
+                    .extend(dispatch.shards.iter().map(|shard| shard.device_id.clone()));
+            }
+        }
         let mut signal_buffers = Vec::<VulkanPedalBatchSignalBuffer>::new();
-        for allocation in signal_buffer_plan {
+        for (buffer_index, allocation) in signal_buffer_plan.into_iter().enumerate() {
             let byte_capacity = allocation
                 .frame_byte_capacity
                 .checked_mul(lane_capacity)
@@ -6058,23 +6093,81 @@ impl VulkanResidentPedalBatchSliceRunner {
                         "pedal batch signal capacity overflowed".to_string(),
                     ))
                 })?;
-            let mut buffer = if allocation.host_visible {
-                // Cross-device cables are the one place where the batch must be
-                // host-addressable. The cable still moves once per device boundary,
-                // as one contiguous frame batch.
-                device.create_host_visible_resident_buffer(byte_capacity)
-            } else {
-                device.create_resident_buffer(byte_capacity)
-            }
-            .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
+            let shared_device_ids = shared_device_ids_by_buffer.get(&buffer_index);
+            let (mut buffer, shared_device_buffers) =
+                if let Some(shared_device_ids) = shared_device_ids {
+                    if !shared_device_ids.contains(&slice.device_id) {
+                        return Err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop(
+                            VulkanError(format!(
+                                "distributed pedal batch buffer {buffer_index} omits owner {:?}",
+                                slice.device_id
+                            )),
+                        ));
+                    }
+                    let peers = shared_device_ids
+                        .iter()
+                        .filter(|device_id| *device_id != &slice.device_id)
+                        .map(|device_id| {
+                            devices
+                                .get(device_id)
+                                .map(|device| device.as_ref())
+                                .ok_or_else(|| {
+                                    VulkanResidentInProcessPlacedRuntimeError::MissingBoundDevice {
+                                        device_id: device_id.clone(),
+                                    }
+                                })
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let shared_allocation = device
+                        .create_shared_host_allocation(&peers, byte_capacity)
+                        .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
+                    let mut shared_device_buffers = BTreeMap::new();
+                    for device_id in shared_device_ids {
+                        let import_device = devices.get(device_id).ok_or_else(|| {
+                            VulkanResidentInProcessPlacedRuntimeError::MissingBoundDevice {
+                                device_id: device_id.clone(),
+                            }
+                        })?;
+                        let imported = Arc::new(
+                            import_device
+                                .import_shared_host_buffer(Arc::clone(&shared_allocation))
+                                .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?,
+                        );
+                        shared_device_buffers.insert(device_id.clone(), imported);
+                    }
+                    let owner_buffer = Arc::clone(
+                        shared_device_buffers
+                            .get(&slice.device_id)
+                            .expect("validated distributed batch owner was imported"),
+                    );
+                    (owner_buffer, shared_device_buffers)
+                } else {
+                    let buffer = if allocation.host_visible {
+                        // Cross-device cables are the one place where the batch must be
+                        // host-addressable. The cable still moves once per device boundary,
+                        // as one contiguous frame batch.
+                        device.create_host_visible_resident_buffer(byte_capacity)
+                    } else {
+                        device.create_resident_buffer(byte_capacity)
+                    }
+                    .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
+                    (Arc::new(buffer), BTreeMap::new())
+                };
             if allocation.host_visible {
-                buffer
+                Arc::get_mut(&mut buffer)
+                    .ok_or_else(|| {
+                        VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(
+                            "host-visible pedal batch cable buffer is unexpectedly shared"
+                                .to_string(),
+                        ))
+                    })?
                     .persistently_map()
                     .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
             }
             signal_buffers.push(VulkanPedalBatchSignalBuffer {
                 frame_byte_capacity: allocation.frame_byte_capacity,
                 buffer,
+                shared_device_buffers,
             });
         }
 
@@ -6090,7 +6183,22 @@ impl VulkanResidentPedalBatchSliceRunner {
             })
             .collect::<Result<Vec<_>, _>>()?;
         let mut steps = Vec::new();
+        let mut distributed_barriers = Vec::new();
         for dispatch in &slice.mounted_bound.dispatches {
+            if distributed_execution_plan
+                .dispatches
+                .iter()
+                .any(|distributed| {
+                    distributed.owner_device_id == slice.device_id
+                        && distributed.dispatch_index == dispatch.dispatch_index
+                })
+            {
+                distributed_barriers.push(VulkanPedalBatchDistributedBarrier {
+                    step_index: steps.len(),
+                    dispatch_index: dispatch.dispatch_index,
+                });
+                continue;
+            }
             let batch_artifact = select_pedal_batch_kernel_artifact(
                 &slice.package_slice.batch_kernels,
                 &dispatch.pedal_id,
@@ -6252,18 +6360,25 @@ impl VulkanResidentPedalBatchSliceRunner {
             }
         }
 
+        let sequences = (0..=distributed_barriers.len())
+            .map(|_| {
+                device
+                    .create_resident_kernel_sequence()
+                    .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
             lane_capacity,
             signal_buffers,
             signal_buffer_indices,
             stream_control_buffers,
             steps,
-            sequence: device
-                .create_resident_kernel_sequence()
-                .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?,
+            distributed_barriers,
+            sequences,
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn run_independent_candidates(
         &self,
         device: &VulkanComputeDevice,
@@ -6272,6 +6387,10 @@ impl VulkanResidentPedalBatchSliceRunner {
         batch_width: usize,
         start_stream_tick: u64,
         dynamic_state_capacity_activations: u32,
+        run_distributed: impl FnMut(
+            usize,
+            &[u8],
+        ) -> Result<(), VulkanResidentInProcessPlacedRuntimeError>,
     ) -> Result<(), VulkanResidentInProcessPlacedRuntimeError> {
         self.run(
             device,
@@ -6280,6 +6399,7 @@ impl VulkanResidentPedalBatchSliceRunner {
             batch_width,
             start_stream_tick,
             dynamic_state_capacity_activations,
+            run_distributed,
         )
     }
 
@@ -6290,6 +6410,10 @@ impl VulkanResidentPedalBatchSliceRunner {
         batch_width: usize,
         start_stream_tick: u64,
         dynamic_state_capacity_activations: u32,
+        run_distributed: impl FnMut(
+            usize,
+            &[u8],
+        ) -> Result<(), VulkanResidentInProcessPlacedRuntimeError>,
     ) -> Result<(), VulkanResidentInProcessPlacedRuntimeError> {
         self.run(
             device,
@@ -6298,9 +6422,11 @@ impl VulkanResidentPedalBatchSliceRunner {
             batch_width,
             start_stream_tick,
             dynamic_state_capacity_activations,
+            run_distributed,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn run(
         &self,
         device: &VulkanComputeDevice,
@@ -6309,6 +6435,11 @@ impl VulkanResidentPedalBatchSliceRunner {
         batch_width: usize,
         start_stream_tick: u64,
         dynamic_state_capacity_activations: u32,
+        mut run_distributed: impl FnMut(
+            usize,
+            &[u8],
+        )
+            -> Result<(), VulkanResidentInProcessPlacedRuntimeError>,
     ) -> Result<(), VulkanResidentInProcessPlacedRuntimeError> {
         if batch_width == 0 || batch_width > self.lane_capacity {
             return Err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop(
@@ -6347,9 +6478,54 @@ impl VulkanResidentPedalBatchSliceRunner {
             start_stream_tick,
             dynamic_state_capacity_activations,
         );
+        let mut segment_start = 0usize;
+        for (segment_index, barrier) in self.distributed_barriers.iter().enumerate() {
+            self.run_segment(
+                device,
+                mounted,
+                state_semantics,
+                batch_width,
+                start_stream_tick,
+                dynamic_state_capacity_activations,
+                &batch_control,
+                segment_index,
+                segment_start,
+                barrier.step_index,
+            )?;
+            run_distributed(barrier.dispatch_index, &batch_control)?;
+            segment_start = barrier.step_index;
+        }
+        self.run_segment(
+            device,
+            mounted,
+            state_semantics,
+            batch_width,
+            start_stream_tick,
+            dynamic_state_capacity_activations,
+            &batch_control,
+            self.distributed_barriers.len(),
+            segment_start,
+            self.steps.len(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_segment(
+        &self,
+        device: &VulkanComputeDevice,
+        mounted: &VulkanMountedPlacedStreamCircuit,
+        state_semantics: VulkanPedalBatchStateSemantics<'_>,
+        batch_width: usize,
+        start_stream_tick: u64,
+        dynamic_state_capacity_activations: u32,
+        batch_control: &[u8],
+        segment_index: usize,
+        step_start: usize,
+        step_end: usize,
+    ) -> Result<(), VulkanResidentInProcessPlacedRuntimeError> {
         let mut push_constant_storage = Vec::<Vec<u8>>::new();
         let mut active_steps = Vec::<&VulkanPedalBatchDispatchStep>::new();
-        for step in &self.steps {
+        for step in &self.steps[step_start..step_end] {
             if step.lane_index.is_some_and(|lane| lane >= batch_width) {
                 continue;
             }
@@ -6377,6 +6553,9 @@ impl VulkanResidentPedalBatchSliceRunner {
             };
             push_constant_storage.push(push_constants);
             active_steps.push(step);
+        }
+        if active_steps.is_empty() {
+            return Ok(());
         }
         let sequence_steps = active_steps
             .iter()
@@ -6409,7 +6588,7 @@ impl VulkanResidentPedalBatchSliceRunner {
         }
         device
             .run_resident_kernel_sequence_with_snapshot_copies(
-                &self.sequence,
+                &self.sequences[segment_index],
                 &sequence_steps,
                 &snapshot_copies,
             )
@@ -6495,12 +6674,386 @@ impl VulkanResidentPedalBatchSliceRunner {
                 )))
             })
     }
+
+    fn distributed_signal_buffer(
+        &self,
+        key: &VulkanPedalBatchSignalKey,
+        device_id: &str,
+    ) -> Result<&Arc<VulkanResidentBuffer>, VulkanResidentInProcessPlacedRuntimeError> {
+        let allocation = self.signal_buffer_indices.get(key).and_then(|index| {
+            self.signal_buffers
+                .get(*index)
+                .and_then(|buffer| buffer.shared_device_buffers.get(device_id))
+        });
+        allocation.ok_or_else(|| {
+            VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(format!(
+                "distributed pedal batch signal {key:?} is not imported on {device_id:?}"
+            )))
+        })
+    }
 }
 
 struct VulkanResidentPlacedPedalBatchRunner {
+    distributed_dispatches: VulkanDistributedPedalBatchRunners,
     lane_capacity: usize,
     slices: Vec<VulkanResidentPedalBatchSliceRunner>,
     cable_transfers: Vec<VulkanPedalBatchCableTransfer>,
+}
+
+struct VulkanDistributedPedalBatchRunners {
+    dispatches: Vec<VulkanDistributedPedalBatchDispatchRunner>,
+}
+
+struct VulkanDistributedPedalBatchDispatchRunner {
+    planned: VulkanDistributedDispatchPlan,
+    shards: Vec<VulkanDistributedPedalBatchShardRunner>,
+}
+
+struct VulkanDistributedPedalBatchShardRunner {
+    device_id: String,
+    dispatches: Vec<VulkanResidentKernelDispatch>,
+    sequence: VulkanResidentKernelSequence,
+}
+
+impl VulkanDistributedPedalBatchRunners {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        devices: &BTreeMap<String, Rc<VulkanComputeDevice>>,
+        placed_slices: &[VulkanResidentInProcessPlacedStreamProcessorDevice],
+        batch_slices: &[VulkanResidentPedalBatchSliceRunner],
+        execution_plan: &VulkanDistributedExecutionPlan,
+        parameter_buffers: &VulkanDistributedParameterBuffers,
+        lane_capacity: usize,
+        execution_mode: VulkanPedalBatchExecutionMode,
+    ) -> Result<Self, VulkanResidentInProcessPlacedRuntimeError> {
+        let mut dispatches = Vec::with_capacity(execution_plan.dispatches.len());
+        for planned in &execution_plan.dispatches {
+            let owner_index = placed_slices
+                .iter()
+                .position(|slice| slice.device_id == planned.owner_device_id)
+                .ok_or_else(
+                    || VulkanResidentInProcessPlacedRuntimeError::MissingBoundDevice {
+                        device_id: planned.owner_device_id.clone(),
+                    },
+                )?;
+            let package_slice = &placed_slices[owner_index].package_slice;
+            let batch_slice = &batch_slices[owner_index];
+            let artifact = select_pedal_batch_kernel_artifact(
+                &package_slice.batch_kernels,
+                &planned.pedal_id,
+                &planned.node_id,
+                execution_mode,
+                lane_capacity,
+            )
+            .ok_or_else(|| {
+                VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(format!(
+                    "distributed pedal batch {}.{} has no compatible batch artifact",
+                    planned.pedal_id, planned.node_id
+                )))
+            })?;
+            if artifact.batch_mode != VulkanResidentPedalKernelBatchMode::WeightShared {
+                return Err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop(
+                    VulkanError(format!(
+                        "distributed pedal batch {}.{} requires a weight-shared artifact",
+                        planned.pedal_id, planned.node_id
+                    )),
+                ));
+            }
+            let input_key = VulkanPedalBatchSignalKey::Activation {
+                pedal_id: planned.input_activation.pedal_id.clone(),
+                signal_id: planned.input_activation.signal_id.clone(),
+            };
+            let output_key = VulkanPedalBatchSignalKey::Activation {
+                pedal_id: planned.output_activation.pedal_id.clone(),
+                signal_id: planned.output_activation.signal_id.clone(),
+            };
+            let input_frame_capacity = batch_slice.signal_buffer(&input_key)?.frame_byte_capacity;
+            let output_frame_capacity = batch_slice.signal_buffer(&output_key)?.frame_byte_capacity;
+            if input_frame_capacity != planned.input_byte_capacity
+                || output_frame_capacity != planned.output_byte_capacity
+            {
+                return Err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop(
+                    VulkanError(format!(
+                        "distributed pedal batch {}.{} signal capacities differ from its physical plan",
+                        planned.pedal_id, planned.node_id
+                    )),
+                ));
+            }
+            let input_byte_capacity = planned
+                .input_byte_capacity
+                .checked_mul(lane_capacity)
+                .ok_or_else(|| {
+                    VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(
+                        "distributed pedal batch input capacity overflowed".to_string(),
+                    ))
+                })?;
+            let workgroup_count_y = u32::try_from(
+                lane_capacity
+                    .checked_add(artifact.lane_tile_width - 1)
+                    .ok_or_else(|| {
+                        VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(
+                            "distributed pedal batch lane count overflowed".to_string(),
+                        ))
+                    })?
+                    / artifact.lane_tile_width,
+            )
+            .map_err(|_| {
+                VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(
+                    "distributed pedal batch workgroup count exceeds u32".to_string(),
+                ))
+            })?;
+            let mut shards = Vec::with_capacity(planned.shards.len());
+            for shard in &planned.shards {
+                let device = devices.get(&shard.device_id).ok_or_else(|| {
+                    VulkanResidentInProcessPlacedRuntimeError::MissingBoundDevice {
+                        device_id: shard.device_id.clone(),
+                    }
+                })?;
+                let input = batch_slice.distributed_signal_buffer(&input_key, &shard.device_id)?;
+                let output =
+                    batch_slice.distributed_signal_buffer(&output_key, &shard.device_id)?;
+                let (output_byte_offset, output_byte_capacity) =
+                    distributed_batch_shard_output_binding_range(
+                        planned.output_byte_capacity,
+                        lane_capacity,
+                        shard.output_byte_offset,
+                        shard.output_byte_count,
+                    )?;
+                let mut bindings = Vec::with_capacity(2 + shard.parameters.len());
+                bindings.push(
+                    VulkanResidentKernelBufferBinding::new(0, input, input_byte_capacity)
+                        .with_access(VulkanResidentKernelBufferAccess::Read),
+                );
+                bindings.push(
+                    VulkanResidentKernelBufferBinding::new(1, output, output_byte_capacity)
+                        .with_byte_offset(output_byte_offset)
+                        .with_access(VulkanResidentKernelBufferAccess::Write),
+                );
+                for fragment in &shard.parameters {
+                    let allocation = parameter_buffers
+                        .parameter_buffer(
+                            &shard.device_id,
+                            &fragment.tensor,
+                            fragment.byte_offset,
+                            fragment.byte_count,
+                        )
+                        .ok_or_else(|| {
+                            VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(
+                                format!(
+                                    "distributed pedal batch {}.{} is missing tensor {:?} range {}..{} on {:?}",
+                                    planned.pedal_id,
+                                    planned.node_id,
+                                    fragment.tensor,
+                                    fragment.byte_offset,
+                                    fragment.byte_offset + fragment.byte_count,
+                                    shard.device_id
+                                ),
+                            ))
+                        })?;
+                    bindings.push(
+                        VulkanResidentKernelBufferBinding::new(
+                            u32::try_from(fragment.binding).map_err(|_| {
+                                VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(
+                                    "distributed pedal batch binding exceeds u32".to_string(),
+                                ))
+                            })?,
+                            &allocation.buffer,
+                            fragment.byte_count,
+                        )
+                        .with_access(VulkanResidentKernelBufferAccess::Read),
+                    );
+                }
+                let mut resident_dispatches = Vec::with_capacity(artifact.stages.len());
+                for stage in &artifact.stages {
+                    let rows_per_workgroup = distributed_batch_rows_per_workgroup(
+                        planned.output_rows,
+                        stage.workgroup_count_x,
+                        &planned.pedal_id,
+                        &planned.node_id,
+                    )?;
+                    if !shard.row_start.is_multiple_of(rows_per_workgroup)
+                        || !shard.row_count.is_multiple_of(rows_per_workgroup)
+                    {
+                        return Err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop(
+                            VulkanError(format!(
+                                "distributed pedal batch {}.{} shard rows {}..{} do not align to {rows_per_workgroup} rows per workgroup",
+                                planned.pedal_id,
+                                planned.node_id,
+                                shard.row_start,
+                                shard.row_start + shard.row_count
+                            )),
+                        ));
+                    }
+                    let workgroup_count_x = u32::try_from(shard.row_count / rows_per_workgroup)
+                        .map_err(|_| {
+                            VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(
+                                "distributed pedal batch shard workgroup count exceeds u32"
+                                    .to_string(),
+                            ))
+                        })?;
+                    resident_dispatches.push(
+                        device
+                            .create_resident_kernel_dispatch_2d(
+                                &stage.spirv_words,
+                                &bindings,
+                                workgroup_count_x,
+                                workgroup_count_y,
+                                stage.local_size_x,
+                                VULKAN_PEDAL_BATCH_CONTROL_BYTE_CAPACITY,
+                            )
+                            .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?,
+                    );
+                }
+                let sequence = device
+                    .create_resident_kernel_sequence()
+                    .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
+                shards.push(VulkanDistributedPedalBatchShardRunner {
+                    device_id: shard.device_id.clone(),
+                    dispatches: resident_dispatches,
+                    sequence,
+                });
+            }
+            dispatches.push(VulkanDistributedPedalBatchDispatchRunner {
+                planned: planned.clone(),
+                shards,
+            });
+        }
+        Ok(Self { dispatches })
+    }
+
+    fn run_dispatch(
+        &self,
+        devices: &BTreeMap<String, Rc<VulkanComputeDevice>>,
+        owner_device_id: &str,
+        dispatch_index: usize,
+        batch_control: &[u8],
+    ) -> Result<(), VulkanResidentInProcessPlacedRuntimeError> {
+        let dispatch = self
+            .dispatches
+            .iter()
+            .find(|dispatch| {
+                dispatch.planned.owner_device_id == owner_device_id
+                    && dispatch.planned.dispatch_index == dispatch_index
+            })
+            .ok_or_else(|| {
+                VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(format!(
+                    "distributed pedal batch has no dispatch {dispatch_index} owned by {owner_device_id:?}"
+                )))
+            })?;
+        for shard in &dispatch.shards {
+            let device = devices.get(&shard.device_id).ok_or_else(|| {
+                VulkanResidentInProcessPlacedRuntimeError::MissingBoundDevice {
+                    device_id: shard.device_id.clone(),
+                }
+            })?;
+            let steps = shard
+                .dispatches
+                .iter()
+                .map(|resident| VulkanResidentKernelSequenceStep::new(resident, batch_control))
+                .collect::<Vec<_>>();
+            device
+                .record_resident_kernel_sequence(&shard.sequence, &steps)
+                .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
+        }
+        let mut submitted = Vec::<(
+            &VulkanComputeDevice,
+            &VulkanDistributedPedalBatchShardRunner,
+        )>::with_capacity(dispatch.shards.len());
+        for shard in &dispatch.shards {
+            let device = devices.get(&shard.device_id).ok_or_else(|| {
+                VulkanResidentInProcessPlacedRuntimeError::MissingBoundDevice {
+                    device_id: shard.device_id.clone(),
+                }
+            })?;
+            if let Err(error) = device.submit_recorded_resident_kernel_sequence(&shard.sequence) {
+                for (submitted_device, submitted_shard) in &submitted {
+                    let _ =
+                        submitted_device.wait_resident_kernel_sequence(&submitted_shard.sequence);
+                }
+                return Err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop(
+                    error,
+                ));
+            }
+            submitted.push((device.as_ref(), shard));
+        }
+        let mut first_error = None;
+        for (device, shard) in submitted {
+            if let Err(error) = device.wait_resident_kernel_sequence(&shard.sequence)
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+        }
+        if let Some(error) = first_error {
+            return Err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop(
+                error,
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn distributed_batch_shard_output_binding_range(
+    frame_byte_capacity: usize,
+    lane_capacity: usize,
+    shard_byte_offset: usize,
+    shard_byte_count: usize,
+) -> Result<(usize, usize), VulkanResidentInProcessPlacedRuntimeError> {
+    if lane_capacity == 0 || shard_byte_count == 0 {
+        return Err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop(
+            VulkanError("distributed pedal batch output range is empty".to_string()),
+        ));
+    }
+    let shard_end = shard_byte_offset
+        .checked_add(shard_byte_count)
+        .ok_or_else(|| {
+            VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(
+                "distributed pedal batch shard output end overflowed".to_string(),
+            ))
+        })?;
+    if shard_end > frame_byte_capacity {
+        return Err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop(
+            VulkanError(format!(
+                "distributed pedal batch shard output range {shard_byte_offset}..{shard_end} exceeds frame capacity {frame_byte_capacity}"
+            )),
+        ));
+    }
+    let preceding_lanes = frame_byte_capacity
+        .checked_mul(lane_capacity - 1)
+        .ok_or_else(|| {
+            VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(
+                "distributed pedal batch output lane span overflowed".to_string(),
+            ))
+        })?;
+    let binding_byte_capacity = preceding_lanes
+        .checked_add(shard_byte_count)
+        .ok_or_else(|| {
+            VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(
+                "distributed pedal batch output binding span overflowed".to_string(),
+            ))
+        })?;
+    Ok((shard_byte_offset, binding_byte_capacity))
+}
+
+fn distributed_batch_rows_per_workgroup(
+    output_rows: usize,
+    full_workgroup_count_x: u32,
+    pedal_id: &str,
+    node_id: &str,
+) -> Result<usize, VulkanResidentInProcessPlacedRuntimeError> {
+    let full_workgroup_count_x = usize::try_from(full_workgroup_count_x).map_err(|_| {
+        VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(
+            "distributed pedal batch workgroup count exceeds usize".to_string(),
+        ))
+    })?;
+    if full_workgroup_count_x == 0 || !output_rows.is_multiple_of(full_workgroup_count_x) {
+        return Err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop(
+            VulkanError(format!(
+                "distributed pedal batch {pedal_id}.{node_id} cannot partition {output_rows} rows across {full_workgroup_count_x} workgroups"
+            )),
+        ));
+    }
+    Ok(output_rows / full_workgroup_count_x)
 }
 
 struct VulkanResidentPlacedTemporalBlockRunner {
@@ -6549,6 +7102,8 @@ impl VulkanResidentPlacedPedalBatchRunner {
         placed_slices: &[VulkanResidentInProcessPlacedStreamProcessorDevice],
         lane_capacity: usize,
         execution_mode: VulkanPedalBatchExecutionMode,
+        distributed_execution_plan: &VulkanDistributedExecutionPlan,
+        distributed_parameter_buffers: &VulkanDistributedParameterBuffers,
     ) -> Result<Self, VulkanResidentInProcessPlacedRuntimeError> {
         let slices = placed_slices
             .iter()
@@ -6559,13 +7114,24 @@ impl VulkanResidentPlacedPedalBatchRunner {
                     }
                 })?;
                 VulkanResidentPedalBatchSliceRunner::new(
+                    devices,
                     device,
                     slice,
                     lane_capacity,
                     execution_mode,
+                    distributed_execution_plan,
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let distributed_dispatches = VulkanDistributedPedalBatchRunners::new(
+            devices,
+            placed_slices,
+            &slices,
+            distributed_execution_plan,
+            distributed_parameter_buffers,
+            lane_capacity,
+            execution_mode,
+        )?;
         let mut cable_transfers = Vec::new();
         for (source_device_index, placed_slice) in placed_slices.iter().enumerate() {
             for outgoing in &placed_slice.mounted.cable_io.outgoing_buffers {
@@ -6643,6 +7209,7 @@ impl VulkanResidentPlacedPedalBatchRunner {
             }
         }
         Ok(Self {
+            distributed_dispatches,
             lane_capacity,
             slices,
             cable_transfers,
@@ -6680,6 +7247,74 @@ impl VulkanResidentPlacedPedalBatchRunner {
                 )))
             })?
             .run()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_causal_sequence(
+        &self,
+        devices: &BTreeMap<String, Rc<VulkanComputeDevice>>,
+        device_index: usize,
+        owner_device_id: &str,
+        mounted: &VulkanMountedPlacedStreamCircuit,
+        batch_width: usize,
+        start_stream_tick: u64,
+        dynamic_state_capacity_activations: u32,
+    ) -> Result<(), VulkanResidentInProcessPlacedRuntimeError> {
+        let device = devices.get(owner_device_id).ok_or_else(|| {
+            VulkanResidentInProcessPlacedRuntimeError::MissingBoundDevice {
+                device_id: owner_device_id.to_string(),
+            }
+        })?;
+        self.slice(device_index)?.run_causal_sequence(
+            device,
+            mounted,
+            batch_width,
+            start_stream_tick,
+            dynamic_state_capacity_activations,
+            |dispatch_index, batch_control| {
+                self.distributed_dispatches.run_dispatch(
+                    devices,
+                    owner_device_id,
+                    dispatch_index,
+                    batch_control,
+                )
+            },
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_independent_candidates(
+        &self,
+        devices: &BTreeMap<String, Rc<VulkanComputeDevice>>,
+        device_index: usize,
+        owner_device_id: &str,
+        mounted: &VulkanMountedPlacedStreamCircuit,
+        transaction: &VulkanResidentStateTransactionBank,
+        batch_width: usize,
+        start_stream_tick: u64,
+        dynamic_state_capacity_activations: u32,
+    ) -> Result<(), VulkanResidentInProcessPlacedRuntimeError> {
+        let device = devices.get(owner_device_id).ok_or_else(|| {
+            VulkanResidentInProcessPlacedRuntimeError::MissingBoundDevice {
+                device_id: owner_device_id.to_string(),
+            }
+        })?;
+        self.slice(device_index)?.run_independent_candidates(
+            device,
+            mounted,
+            transaction,
+            batch_width,
+            start_stream_tick,
+            dynamic_state_capacity_activations,
+            |dispatch_index, batch_control| {
+                self.distributed_dispatches.run_dispatch(
+                    devices,
+                    owner_device_id,
+                    dispatch_index,
+                    batch_control,
+                )
+            },
+        )
     }
 }
 
@@ -10995,6 +11630,8 @@ pub struct VulkanResidentInProcessPlacedModelPackage {
     distributed_activation_plan: VulkanDistributedActivationBufferPlan,
     distributed_parameter_allocation_plan: VulkanDistributedParameterAllocationPlan,
     distributed_parameter_exclusion_plan: VulkanDistributedParameterExclusionPlan,
+    distributed_loaded_manifest: VulkanLoadedReusableKernelArtifactManifest,
+    distributed_parameter_buffers: Arc<VulkanDistributedParameterBuffers>,
 }
 
 pub struct VulkanResidentSpeculativeDecoderModelPackage {
@@ -11171,6 +11808,8 @@ impl VulkanResidentSpeculativeDecoderModelPackage {
 }
 
 pub struct VulkanResidentInProcessPlacedStreamProcessor {
+    distributed_dispatch_runners: VulkanDistributedDispatchRunners,
+    _distributed_activation_buffers: VulkanDistributedActivationBuffers,
     model: Arc<VulkanResidentInProcessPlacedModelPackage>,
     input_transducer: VulkanResidentInputEmbeddingTransducerRunner,
     output_transducer: VulkanResidentOutputTransducerRunner,
@@ -12013,6 +12652,9 @@ impl VulkanResidentInProcessPlacedModelPackage {
         let reusable_manifest =
             resident_package_reusable_kernel_manifest_for_slice_plans(&device_slice_plans)
                 .map_err(VulkanResidentInProcessPlacedRuntimeError::Package)?;
+        let distributed_loaded_manifest =
+            resident_package_loaded_kernel_manifest_for_slice_plans(&device_slice_plans)
+                .map_err(VulkanResidentInProcessPlacedRuntimeError::Package)?;
         let storage_buffer_offset_alignment = device_ids
             .iter()
             .map(|device_id| {
@@ -12070,12 +12712,28 @@ impl VulkanResidentInProcessPlacedModelPackage {
                     )),
                 )
             })?;
+        let distributed_parameter_buffers = Arc::new(
+            VulkanDistributedParameterBuffers::allocate_and_load(
+                &distributed_parameter_allocation_plan,
+                &tensor_index,
+                |device_id| device_for(device_id),
+            )
+            .map_err(|error| {
+                VulkanResidentInProcessPlacedRuntimeError::Package(
+                    VulkanResidentTokenModelPackageError::new(format!(
+                        "failed to allocate distributed Vulkan parameter shards: {error}"
+                    )),
+                )
+            })?,
+        );
 
         let mut device_slices = Vec::with_capacity(device_slice_plans.len());
         for package_slice in device_slice_plans {
             let slice_device = device_for(&package_slice.device_id)?;
+            let excluded_tensors =
+                distributed_parameter_exclusion_plan.tensors_for_device(&package_slice.device_id);
             let package_slice = package_slice
-                .materialize(slice_device, &tensor_index, &BTreeSet::new())
+                .materialize(slice_device, &tensor_index, &excluded_tensors)
                 .map_err(VulkanResidentInProcessPlacedRuntimeError::Package)?;
             device_slices.push(Arc::new(package_slice));
         }
@@ -12159,6 +12817,8 @@ impl VulkanResidentInProcessPlacedModelPackage {
             distributed_activation_plan,
             distributed_parameter_allocation_plan,
             distributed_parameter_exclusion_plan,
+            distributed_loaded_manifest,
+            distributed_parameter_buffers,
         })
     }
 
@@ -12273,11 +12933,27 @@ impl VulkanResidentInProcessPlacedModelPackage {
                 )),
             ));
         }
+        let distributed_activation_buffers = VulkanDistributedActivationBuffers::allocate(
+            &self.distributed_activation_plan,
+            |device_id| device_for(device_id),
+        )
+        .map_err(|error| {
+            VulkanResidentInProcessPlacedRuntimeError::Package(
+                VulkanResidentTokenModelPackageError::new(format!(
+                    "failed to allocate distributed Vulkan activation cables: {error}"
+                )),
+            )
+        })?;
         let mut devices = Vec::with_capacity(self.device_slices.len());
         for package_slice in &self.device_slices {
             let device = device_for(&package_slice.device_id)?;
+            let activation_overrides = distributed_activation_buffers
+                .activation_overrides_for_owner_device(&package_slice.device_id);
             let mounted = package_slice
-                .create_mounted_stream_circuit(device)
+                .create_mounted_stream_circuit_with_activation_overrides(
+                    device,
+                    &activation_overrides,
+                )
                 .map_err(VulkanResidentInProcessPlacedRuntimeError::Package)?;
             mounted.buffers.zero_state_buffers().map_err(|error| {
                 VulkanResidentInProcessPlacedRuntimeError::Package(
@@ -12293,13 +12969,21 @@ impl VulkanResidentInProcessPlacedModelPackage {
                 .map_err(VulkanResidentInProcessPlacedRuntimeError::BoundDispatchPlan)?;
             let tick_plan =
                 VulkanMountedPlacedStreamTickPlan::from_mounted_bound_plan(&mounted_bound);
+            let distributed_dispatch_indices = self
+                .distributed_execution_plan
+                .dispatches
+                .iter()
+                .filter(|dispatch| dispatch.owner_device_id == package_slice.device_id)
+                .map(|dispatch| dispatch.dispatch_index)
+                .collect::<BTreeSet<_>>();
             let resident_execution_plan =
-                VulkanMountedPlacedResidentStreamTickExecutionPlan::from_tick_plan(
+                VulkanMountedPlacedResidentStreamTickExecutionPlan::from_tick_plan_with_distributed_dispatches(
                     device,
                     &mounted,
                     &mounted_bound,
                     package_slice.loaded_manifest(),
                     tick_plan,
+                    &distributed_dispatch_indices,
                 )
                 .map_err(VulkanResidentInProcessPlacedRuntimeError::ResidentDispatch)?;
             devices.push(VulkanResidentInProcessPlacedStreamProcessorDevice {
@@ -12314,6 +12998,20 @@ impl VulkanResidentInProcessPlacedModelPackage {
                 resident_execution_plan,
             });
         }
+        let distributed_dispatch_runners = VulkanDistributedDispatchRunners::create(
+            &self.distributed_execution_plan,
+            &self.distributed_parameter_buffers,
+            &distributed_activation_buffers,
+            &self.distributed_loaded_manifest,
+            |device_id| device_for(device_id),
+        )
+        .map_err(|error| {
+            VulkanResidentInProcessPlacedRuntimeError::Package(
+                VulkanResidentTokenModelPackageError::new(format!(
+                    "failed to mount distributed Vulkan dispatches: {error}"
+                )),
+            )
+        })?;
         let inherited = source
             .map(|source| inherit_matching_placed_stream_state(&devices, &source.device_slices))
             .transpose()
@@ -12443,6 +13141,8 @@ impl VulkanResidentInProcessPlacedModelPackage {
         }
         Ok(VulkanResidentInProcessPlacedStreamProcessor {
             model: self.clone(),
+            distributed_dispatch_runners,
+            _distributed_activation_buffers: distributed_activation_buffers,
             input_transducer,
             output_transducer,
             sampler,
@@ -12564,6 +13264,8 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
                 &self.device_slices,
                 transaction_width,
                 VulkanPedalBatchExecutionMode::IndependentCandidates,
+                &self.model.distributed_execution_plan,
+                &self.model.distributed_parameter_buffers,
             )?;
             *self.pedal_batch_execution.borrow_mut() = Some(runner);
         }
@@ -12786,6 +13488,8 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
             &self.device_slices,
             block_width,
             VulkanPedalBatchExecutionMode::CausalSequence,
+            &self.model.distributed_execution_plan,
+            &self.model.distributed_parameter_buffers,
         )?;
         let input_device = devices.get(&self.model.input_device_id).ok_or_else(|| {
             VulkanResidentInProcessPlacedRuntimeError::MissingBoundDevice {
@@ -12960,13 +13664,10 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
         let mut transport_stats = VulkanPlacedCableTransportStats::default();
         for (pipeline_index, device_index) in runner.pipeline.iter().copied().enumerate() {
             let slice = &self.device_slices[device_index];
-            let device = devices.get(&slice.device_id).ok_or_else(|| {
-                VulkanResidentInProcessPlacedRuntimeError::MissingBoundDevice {
-                    device_id: slice.device_id.clone(),
-                }
-            })?;
-            runner.pedalboard.slice(device_index)?.run_causal_sequence(
-                device,
+            runner.pedalboard.run_causal_sequence(
+                devices,
+                device_index,
+                &slice.device_id,
                 &slice.mounted,
                 input_token_ids.len(),
                 start_stream_tick,
@@ -13175,19 +13876,16 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
             let mut raw_target_hidden_frames = Vec::new();
             for (pipeline_index, device_index) in pipeline.iter().copied().enumerate() {
                 let slice = &self.device_slices[device_index];
-                let device = devices.get(&slice.device_id).ok_or_else(|| {
-                    VulkanResidentInProcessPlacedRuntimeError::MissingBoundDevice {
-                        device_id: slice.device_id.clone(),
-                    }
-                })?;
                 let transaction = transactions.get(device_index).ok_or_else(|| {
                     VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(format!(
                         "verification state transaction has no device index {device_index}"
                     )))
                 })?;
                 let batch_slice = batch_execution.slice(device_index)?;
-                batch_slice.run_independent_candidates(
-                    device,
+                batch_execution.run_independent_candidates(
+                    devices,
+                    device_index,
+                    &slice.device_id,
                     &slice.mounted,
                     transaction,
                     input_token_ids.len(),
@@ -13536,10 +14234,11 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
             ));
         }
 
-        run_mounted_placed_resident_stream_tick_slices_in_process_with_schedule(
+        run_mounted_placed_resident_stream_tick_slices_in_process_with_schedule_and_distributed(
             &mut tick_slices,
             transport,
             &self.activation_schedule,
+            Some(&self.distributed_dispatch_runners),
         )
         .map_err(VulkanResidentInProcessPlacedRuntimeError::Tick)
     }
@@ -13590,10 +14289,11 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
             ));
         }
 
-        run_mounted_placed_resident_stream_tick_slices_in_process_with_schedule(
+        run_mounted_placed_resident_stream_tick_slices_in_process_with_schedule_and_distributed(
             &mut tick_slices,
             transport,
             &self.activation_schedule,
+            Some(&self.distributed_dispatch_runners),
         )
         .map_err(VulkanResidentInProcessPlacedRuntimeError::Tick)
     }
@@ -13648,10 +14348,11 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
                 ),
             );
         }
-        let placed_run = run_mounted_placed_resident_stream_tick_slices_in_process_with_schedule(
+        let placed_run = run_mounted_placed_resident_stream_tick_slices_in_process_with_schedule_and_distributed(
             &mut tick_slices,
             transport,
             &self.activation_schedule,
+            Some(&self.distributed_dispatch_runners),
         )
         .map_err(VulkanResidentInProcessPlacedRuntimeError::Tick)?;
         if placed_run.status != VulkanMountedPlacedResidentInProcessStreamTickRunStatus::Completed {
@@ -13768,10 +14469,11 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
                 ),
             );
         }
-        let placed_run = run_mounted_placed_resident_stream_tick_slices_in_process_with_schedule(
+        let placed_run = run_mounted_placed_resident_stream_tick_slices_in_process_with_schedule_and_distributed(
             &mut tick_slices,
             transport,
             &self.activation_schedule,
+            Some(&self.distributed_dispatch_runners),
         )
         .map_err(VulkanResidentInProcessPlacedRuntimeError::Tick)?;
         if placed_run.status != VulkanMountedPlacedResidentInProcessStreamTickRunStatus::Completed {
@@ -17241,6 +17943,44 @@ fn resident_package_reusable_kernel_manifest_for_slice_plans(
     Ok(VulkanReusableKernelArtifactManifest::new(
         artifacts_by_family.into_values().collect(),
     ))
+}
+
+fn resident_package_loaded_kernel_manifest_for_slice_plans(
+    slice_plans: &[VulkanResidentModelPackageDeviceSlicePlan],
+) -> Result<VulkanLoadedReusableKernelArtifactManifest, VulkanResidentTokenModelPackageError> {
+    let mut artifacts_by_family = BTreeMap::<String, VulkanLoadedReusableKernelArtifact>::new();
+    for slice in slice_plans {
+        for artifact in &slice.loaded_manifest.artifacts {
+            if let Some(existing) = artifacts_by_family.get(&artifact.artifact.family_id) {
+                let mut existing_contract = existing.artifact.clone();
+                existing_contract.path.clear();
+                let mut candidate_contract = artifact.artifact.clone();
+                candidate_contract.path.clear();
+                if existing_contract != candidate_contract || existing.words != artifact.words {
+                    return Err(VulkanResidentTokenModelPackageError::new(format!(
+                        "loaded reusable Vulkan family {:?} conflicts across device slices",
+                        artifact.artifact.family_id
+                    )));
+                }
+            } else {
+                artifacts_by_family.insert(artifact.artifact.family_id.clone(), artifact.clone());
+            }
+        }
+    }
+    let artifacts = artifacts_by_family.into_values().collect::<Vec<_>>();
+    let total_word_count = artifacts.iter().try_fold(0usize, |total, artifact| {
+        total.checked_add(artifact.words.len()).ok_or_else(|| {
+            VulkanResidentTokenModelPackageError::new(
+                "combined reusable Vulkan kernel word count overflowed",
+            )
+        })
+    })?;
+    Ok(VulkanLoadedReusableKernelArtifactManifest {
+        schema: VULKAN_REUSABLE_KERNEL_ARTIFACT_MANIFEST_SCHEMA.to_string(),
+        backend_id: VULKAN_STREAM_CIRCUIT_BACKEND_ID.to_string(),
+        artifacts,
+        total_word_count,
+    })
 }
 
 fn resident_package_pedal_kernel_shader_refs(
@@ -24136,6 +24876,40 @@ mod tests {
         assert_eq!(&bytes[0..4], &64u32.to_le_bytes());
         assert_eq!(&bytes[4..12], &0x1122_3344_5566_7788u64.to_le_bytes());
         assert_eq!(&bytes[12..16], &65_536u32.to_le_bytes());
+    }
+
+    #[test]
+    fn distributed_batch_output_binding_repeats_the_full_lane_stride() {
+        let (offset, byte_capacity) =
+            distributed_batch_shard_output_binding_range(8_192, 4, 2_048, 2_048).unwrap();
+
+        assert_eq!(offset, 2_048);
+        assert_eq!(byte_capacity, 26_624);
+        assert_eq!(offset + byte_capacity, 28_672);
+        assert!(offset + byte_capacity <= 4 * 8_192);
+    }
+
+    #[test]
+    fn distributed_batch_output_binding_rejects_a_shard_past_the_frame() {
+        let error =
+            distributed_batch_shard_output_binding_range(8_192, 4, 7_168, 2_048).unwrap_err();
+
+        assert!(error.to_string().contains("exceeds frame capacity 8192"));
+    }
+
+    #[test]
+    fn distributed_batch_workgroups_preserve_the_compiled_row_granularity() {
+        assert_eq!(
+            distributed_batch_rows_per_workgroup(32_768, 512, "layer", "ffn").unwrap(),
+            64
+        );
+
+        let error = distributed_batch_rows_per_workgroup(32_769, 512, "layer", "ffn").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("cannot partition 32769 rows across 512 workgroups")
+        );
     }
 
     fn selected_test_vulkan_device() -> Result<VulkanComputeDevice, VulkanError> {
