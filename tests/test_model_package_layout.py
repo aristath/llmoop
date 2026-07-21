@@ -159,6 +159,20 @@ def test_compiler_selects_only_compatible_weight_shared_batch_kernels() -> None:
     assert (
         frame_parallel_batch_shader_file("linear_batch16_bf16_4096x4096.comp") is None
     )
+    assert (
+        frame_parallel_batch_shader_file("moe_topk_bf16_e256_k8.comp")
+        == "moe_topk_batch1_bf16_e256_k8.comp"
+    )
+    assert (
+        frame_parallel_batch_shader_file(
+            "sparse_moe_gate_up_fp8_e4m3_b128x128_h2048_i512_e256_k8.comp"
+        )
+        == "sparse_moe_gate_up_batch1_fp8_e4m3_b128x128_h2048_i512_e256_k8.comp"
+    )
+    assert (
+        frame_parallel_batch_shader_file("moe_reduce_bf16_h2048_k8.comp")
+        == "moe_reduce_batch1_bf16_h2048_k8.comp"
+    )
 
 
 def test_compiler_orders_frame_parallel_before_portable_batch_implementation() -> None:
@@ -979,9 +993,13 @@ def test_compiler_renders_native_block_scaled_fp8_sparse_experts(
     shader_source_dir = Path(__file__).parents[1] / "runtime-rs" / "shaders"
     shader_files = {
         "moe_topk_bf16_e256_k8.comp",
+        "moe_topk_batch1_bf16_e256_k8.comp",
         "sparse_moe_gate_up_fp8_e4m3_b128x128_h2048_i512_e256_k8.comp",
+        "sparse_moe_gate_up_batch1_fp8_e4m3_b128x128_h2048_i512_e256_k8.comp",
         "sparse_moe_down_fp8_e4m3_b128x128_h2048_i512_e256_k8.comp",
+        "sparse_moe_down_batch1_fp8_e4m3_b128x128_h2048_i512_e256_k8.comp",
         "moe_reduce_bf16_h2048_k8.comp",
+        "moe_reduce_batch1_bf16_h2048_k8.comp",
         "sigmoid_scalar_multiply_bf16_2048.comp",
     }
 
@@ -1005,6 +1023,13 @@ def test_compiler_renders_native_block_scaled_fp8_sparse_experts(
     assert "route < EXPERTS_PER_TOKEN" in reduce_shader
     assert all("{{" not in source for source in (gate_up_shader, down_shader))
     assert (
+        "gl_WorkGroupID.y"
+        in (
+            tmp_path
+            / "sparse_moe_gate_up_batch1_fp8_e4m3_b128x128_h2048_i512_e256_k8.comp"
+        ).read_text()
+    )
+    assert (
         "const uint HIDDEN_SIZE = 2048u;"
         in (tmp_path / "sigmoid_scalar_multiply_bf16_2048.comp").read_text()
     )
@@ -1026,6 +1051,29 @@ def test_compiler_parallelizes_only_selected_sparse_expert_routes() -> None:
         workgroup_count_x_for_node({}, {"op": "sparse_moe_down", "attrs": attrs}, {})
         == 8192
     )
+
+    spec = pedal_kernel_spec(
+        execution_index=0,
+        node={"id": "sparse_moe_gate_up", "op": "sparse_moe_gate_up"},
+        shader_file=("sparse_moe_gate_up_fp8_e4m3_b128x128_h2048_i512_e256_k8.comp"),
+        local_size_x=64,
+        workgroup_count_x=2048,
+    )
+    assert spec["batch_mode"] == "weight_shared"
+    assert [
+        implementation["lane_tile_width"]
+        for implementation in spec["batch_implementations"]
+    ] == [1]
+    assert spec["batch_implementations"][0]["stages"] == [
+        {
+            "shader_path": (
+                "shaders/sparse_moe_gate_up_batch1_fp8_e4m3_b128x128_"
+                "h2048_i512_e256_k8.comp"
+            ),
+            "local_size_x": 64,
+            "workgroup_count_x": 2048,
+        }
+    ]
 
 
 def test_compiler_renders_attention_pedals_from_discovered_dimensions(
@@ -1294,7 +1342,9 @@ def test_compiler_renders_sparse_moe_and_scaled_residual_pedals(tmp_path: Path) 
         "scaled_add_bf16_1024_scale0.22.comp",
         "moe_topk_bf16_e32_k8.comp",
         "sparse_moe_gate_up_bf16_h1024_i512_e32_k8.comp",
+        "sparse_moe_gate_up_batch1_bf16_h1024_i512_e32_k8.comp",
         "sparse_moe_down_bf16_h1024_i512_e32_k8.comp",
+        "sparse_moe_down_batch1_bf16_h1024_i512_e32_k8.comp",
         "moe_reduce_bf16_h1024_k8.comp",
     }
 

@@ -957,9 +957,15 @@ def pedal_kernel_spec(
     workgroup_count_x: int,
 ) -> Json:
     causal_scan_stages = causal_scan_batch_stages(shader_file, local_size_x)
+    direct_frame_parallel_shader_file = (
+        None
+        if causal_scan_stages is not None
+        else frame_parallel_batch_shader_file(shader_file)
+    )
     scalar_batch_shader_file = (
         None
         if causal_scan_stages is not None
+        or direct_frame_parallel_shader_file is not None
         else weight_shared_batch_shader_file(shader_file)
     )
     cooperative_shader_file = (
@@ -967,7 +973,7 @@ def pedal_kernel_spec(
         if scalar_batch_shader_file is not None
         else None
     )
-    frame_parallel_shader_file = (
+    frame_parallel_shader_file = direct_frame_parallel_shader_file or (
         frame_parallel_batch_shader_file(scalar_batch_shader_file)
         if scalar_batch_shader_file is not None
         else None
@@ -983,7 +989,7 @@ def pedal_kernel_spec(
             "causal_scan"
             if causal_scan_stages
             else "weight_shared"
-            if scalar_batch_shader_file
+            if scalar_batch_shader_file or frame_parallel_shader_file
             else "serial_lanes"
         ),
         "batch_implementations": [],
@@ -1001,8 +1007,8 @@ def pedal_kernel_spec(
                 "stages": causal_scan_stages,
             }
         )
-    elif scalar_batch_shader_file is not None:
-        if cooperative_shader_file is not None:
+    elif scalar_batch_shader_file is not None or frame_parallel_shader_file is not None:
+        if scalar_batch_shader_file is not None and cooperative_shader_file is not None:
             spec["batch_implementations"].append(
                 {
                     "lane_tile_width": COOPERATIVE_BATCH_LANE_TILE_WIDTH,
@@ -1045,7 +1051,9 @@ def pedal_kernel_spec(
                     ],
                 }
             )
-        for tile_width in EXACT_BATCH_LANE_TILE_WIDTHS:
+        for tile_width in (
+            EXACT_BATCH_LANE_TILE_WIDTHS if scalar_batch_shader_file is not None else ()
+        ):
             exact_shader_file = weight_shared_batch_shader_file(
                 shader_file, tile_width=tile_width
             )
@@ -1075,6 +1083,18 @@ def pedal_kernel_spec(
 
 
 def frame_parallel_batch_shader_file(shader_file: str) -> str | None:
+    if re.fullmatch(r"moe_topk_bf16_e\d+_k\d+\.comp", shader_file):
+        return shader_file.replace("moe_topk_", "moe_topk_batch1_", 1)
+    if re.fullmatch(
+        r"sparse_moe_(?:gate_up|down)_(?:bf16|fp8_e4m3_b\d+x\d+)_"
+        r"h\d+_i\d+_e\d+_k\d+\.comp",
+        shader_file,
+    ):
+        return shader_file.replace("_bf16_", "_batch1_bf16_", 1).replace(
+            "_fp8_e4m3_", "_batch1_fp8_e4m3_", 1
+        )
+    if re.fullmatch(r"moe_reduce_bf16_h\d+_k\d+\.comp", shader_file):
+        return shader_file.replace("moe_reduce_", "moe_reduce_batch1_", 1)
     if re.fullmatch(
         r"rms_norm_batch\d+_bf16_h\d+_eps[0-9eE+.-]+_offset[0-9eE+.-]+\.comp",
         shader_file,
@@ -3443,16 +3463,27 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
             },
         )
 
-    moe_topk_shape = re.fullmatch(r"moe_topk_bf16_e(\d+)_k(\d+)\.comp", shader_file)
+    moe_topk_shape = re.fullmatch(
+        r"moe_topk(?:_batch(\d+))?_bf16_e(\d+)_k(\d+)\.comp", shader_file
+    )
     if moe_topk_shape is not None:
-        num_experts, experts_per_token = map(int, moe_topk_shape.groups())
+        batch_tile, num_experts, experts_per_token = moe_topk_shape.groups()
+        if batch_tile not in {None, "1"}:
+            raise ModelCompileError(
+                "sparse routing supports only frame-parallel batch tiles"
+            )
+        num_experts, experts_per_token = map(int, (num_experts, experts_per_token))
         if not 0 < experts_per_token <= num_experts <= 4096:
             raise ModelCompileError(
                 f"invalid sparse expert routing e{num_experts} k{experts_per_token}"
             )
         return render_shader_template(
             source_dir,
-            "moe_topk_bf16.comp.template",
+            (
+                "moe_topk_bf16.comp.template"
+                if batch_tile is None
+                else "moe_topk_batch1_bf16.comp.template"
+            ),
             {
                 "NUM_EXPERTS": str(num_experts),
                 "EXPERTS_PER_TOKEN": str(experts_per_token),
@@ -3460,12 +3491,14 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
         )
 
     sparse_moe_fp8_shape = re.fullmatch(
-        r"sparse_moe_(gate_up|down)_fp8_e4m3_b(\d+)x(\d+)_h(\d+)_i(\d+)_e(\d+)_k(\d+)\.comp",
+        r"sparse_moe_(gate_up|down)(?:_batch(\d+))?_fp8_e4m3_"
+        r"b(\d+)x(\d+)_h(\d+)_i(\d+)_e(\d+)_k(\d+)\.comp",
         shader_file,
     )
     if sparse_moe_fp8_shape is not None:
         (
             stage,
+            batch_tile,
             block_rows,
             block_columns,
             hidden_size,
@@ -3473,6 +3506,10 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
             num_experts,
             experts_per_token,
         ) = sparse_moe_fp8_shape.groups()
+        if batch_tile not in {None, "1"}:
+            raise ModelCompileError(
+                "FP8 sparse experts support only frame-parallel batch tiles"
+            )
         (
             block_rows,
             block_columns,
@@ -3501,7 +3538,11 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
             )
         return render_shader_template(
             source_dir,
-            f"sparse_moe_{stage}_fp8_e4m3.comp.template",
+            (
+                f"sparse_moe_{stage}_fp8_e4m3.comp.template"
+                if batch_tile is None
+                else f"sparse_moe_{stage}_batch1_fp8_e4m3.comp.template"
+            ),
             {
                 "BLOCK_ROWS": str(block_rows),
                 "BLOCK_COLUMNS": str(block_columns),
@@ -3513,13 +3554,19 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
         )
 
     sparse_moe_shape = re.fullmatch(
-        r"sparse_moe_(gate_up|down)_bf16_h(\d+)_i(\d+)_e(\d+)_k(\d+)\.comp",
+        r"sparse_moe_(gate_up|down)(?:_batch(\d+))?_bf16_"
+        r"h(\d+)_i(\d+)_e(\d+)_k(\d+)\.comp",
         shader_file,
     )
     if sparse_moe_shape is not None:
         stage = sparse_moe_shape.group(1)
+        batch_tile = sparse_moe_shape.group(2)
+        if batch_tile not in {None, "1"}:
+            raise ModelCompileError(
+                "BF16 sparse experts support only frame-parallel batch tiles"
+            )
         hidden_size, intermediate_size, num_experts, experts_per_token = map(
-            int, sparse_moe_shape.groups()[1:]
+            int, sparse_moe_shape.groups()[2:]
         )
         if hidden_size % 2 or intermediate_size % 2:
             raise ModelCompileError(
@@ -3531,7 +3578,11 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
             )
         return render_shader_template(
             source_dir,
-            f"sparse_moe_{stage}_bf16.comp.template",
+            (
+                f"sparse_moe_{stage}_bf16.comp.template"
+                if batch_tile is None
+                else f"sparse_moe_{stage}_batch1_bf16.comp.template"
+            ),
             {
                 "HIDDEN_SIZE": str(hidden_size),
                 "INTERMEDIATE_SIZE": str(intermediate_size),
@@ -3540,12 +3591,23 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
             },
         )
 
-    moe_reduce_shape = re.fullmatch(r"moe_reduce_bf16_h(\d+)_k(\d+)\.comp", shader_file)
+    moe_reduce_shape = re.fullmatch(
+        r"moe_reduce(?:_batch(\d+))?_bf16_h(\d+)_k(\d+)\.comp", shader_file
+    )
     if moe_reduce_shape is not None:
-        hidden_size, experts_per_token = map(int, moe_reduce_shape.groups())
+        batch_tile, hidden_size, experts_per_token = moe_reduce_shape.groups()
+        if batch_tile not in {None, "1"}:
+            raise ModelCompileError(
+                "sparse reduction supports only frame-parallel batch tiles"
+            )
+        hidden_size, experts_per_token = map(int, (hidden_size, experts_per_token))
         return render_shader_template(
             source_dir,
-            "moe_reduce_bf16.comp.template",
+            (
+                "moe_reduce_bf16.comp.template"
+                if batch_tile is None
+                else "moe_reduce_batch1_bf16.comp.template"
+            ),
             {
                 "HIDDEN_SIZE": str(hidden_size),
                 "EXPERTS_PER_TOKEN": str(experts_per_token),

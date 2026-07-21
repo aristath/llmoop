@@ -1,0 +1,129 @@
+#version 450
+
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer HiddenFrames { uint words[]; } hidden_frames;
+layout(set = 0, binding = 1) readonly buffer ExpertRoutes { uint words[]; } expert_routes;
+layout(set = 0, binding = 2) buffer ExpertIntermediates { uint words[]; } expert_intermediates;
+layout(set = 0, binding = 3) readonly buffer ExpertInputWeight { uint words[]; } expert_input_weight;
+
+layout(push_constant) uniform BatchControl { uint batch_width; } batch_control;
+
+const uint HIDDEN_SIZE = {{HIDDEN_SIZE}}u;
+const uint INTERMEDIATE_SIZE = {{INTERMEDIATE_SIZE}}u;
+const uint NUM_EXPERTS = {{NUM_EXPERTS}}u;
+const uint EXPERTS_PER_TOKEN = {{EXPERTS_PER_TOKEN}}u;
+const uint HIDDEN_WORDS = HIDDEN_SIZE / 2u;
+const uint INTERMEDIATE_WORDS = INTERMEDIATE_SIZE / 2u;
+const uint EXPERT_INPUT_ROWS = INTERMEDIATE_SIZE * 2u;
+
+shared float subgroup_gate_lo[64];
+shared float subgroup_gate_hi[64];
+shared float subgroup_up_lo[64];
+shared float subgroup_up_hi[64];
+
+float bf16_to_f32(uint value) { return uintBitsToFloat((value & 0xffffu) << 16); }
+
+uint f32_to_bf16(float value) {
+    uint bits = floatBitsToUint(value);
+    uint lsb = (bits >> 16) & 1u;
+    return (bits + 0x7fffu + lsb) >> 16;
+}
+
+float round_bf16(float value) { return bf16_to_f32(f32_to_bf16(value)); }
+
+void accumulate_row_pair(
+    uint expert,
+    uint row,
+    uint column_word,
+    float input_lo,
+    float input_hi,
+    inout float lo,
+    inout float hi
+) {
+    uint lo_offset = (expert * EXPERT_INPUT_ROWS + row) * HIDDEN_WORDS;
+    uint hi_offset = lo_offset + HIDDEN_WORDS;
+    uint lo_weight = expert_input_weight.words[lo_offset + column_word];
+    uint hi_weight = expert_input_weight.words[hi_offset + column_word];
+    lo = fma(input_lo, bf16_to_f32(lo_weight), lo);
+    lo = fma(input_hi, bf16_to_f32(lo_weight >> 16u), lo);
+    hi = fma(input_lo, bf16_to_f32(hi_weight), hi);
+    hi = fma(input_hi, bf16_to_f32(hi_weight >> 16u), hi);
+}
+
+void main() {
+    uint batch_index = gl_WorkGroupID.y;
+    uint group = gl_WorkGroupID.x;
+    uint route = group / INTERMEDIATE_WORDS;
+    uint word = group % INTERMEDIATE_WORDS;
+    if (batch_index >= batch_control.batch_width || route >= EXPERTS_PER_TOKEN) {
+        return;
+    }
+    uint expert = expert_routes.words[
+        batch_index * EXPERTS_PER_TOKEN + route
+    ] & 0xffffu;
+    if (expert >= NUM_EXPERTS) {
+        return;
+    }
+
+    uint lane = gl_LocalInvocationID.x;
+    uint first = word * 2u;
+    float gate_lo = 0.0;
+    float gate_hi = 0.0;
+    float up_lo = 0.0;
+    float up_hi = 0.0;
+    uint input_offset = batch_index * HIDDEN_WORDS;
+    for (uint column_word = lane; column_word < HIDDEN_WORDS; column_word += 64u) {
+        uint input_pair = hidden_frames.words[input_offset + column_word];
+        float input_lo = bf16_to_f32(input_pair);
+        float input_hi = bf16_to_f32(input_pair >> 16u);
+        accumulate_row_pair(expert, first, column_word, input_lo, input_hi, gate_lo, gate_hi);
+        accumulate_row_pair(
+            expert,
+            INTERMEDIATE_SIZE + first,
+            column_word,
+            input_lo,
+            input_hi,
+            up_lo,
+            up_hi
+        );
+    }
+
+    gate_lo = subgroupAdd(gate_lo);
+    gate_hi = subgroupAdd(gate_hi);
+    up_lo = subgroupAdd(up_lo);
+    up_hi = subgroupAdd(up_hi);
+    if (gl_NumSubgroups > 1u && gl_SubgroupInvocationID == 0u) {
+        subgroup_gate_lo[gl_SubgroupID] = gate_lo;
+        subgroup_gate_hi[gl_SubgroupID] = gate_hi;
+        subgroup_up_lo[gl_SubgroupID] = up_lo;
+        subgroup_up_hi[gl_SubgroupID] = up_hi;
+    }
+    barrier();
+    if (lane == 0u) {
+        if (gl_NumSubgroups > 1u) {
+            gate_lo = 0.0;
+            gate_hi = 0.0;
+            up_lo = 0.0;
+            up_hi = 0.0;
+            for (uint subgroup = 0u; subgroup < gl_NumSubgroups; subgroup++) {
+                gate_lo += subgroup_gate_lo[subgroup];
+                gate_hi += subgroup_gate_hi[subgroup];
+                up_lo += subgroup_up_lo[subgroup];
+                up_hi += subgroup_up_hi[subgroup];
+            }
+        }
+        gate_lo = round_bf16(gate_lo);
+        gate_hi = round_bf16(gate_hi);
+        up_lo = round_bf16(up_lo);
+        up_hi = round_bf16(up_hi);
+        float hidden_lo = round_bf16(round_bf16(gate_lo / (1.0 + exp(-gate_lo))) * up_lo);
+        float hidden_hi = round_bf16(round_bf16(gate_hi / (1.0 + exp(-gate_hi))) * up_hi);
+        uint output_offset = batch_index * EXPERTS_PER_TOKEN * INTERMEDIATE_WORDS;
+        expert_intermediates.words[output_offset + route * INTERMEDIATE_WORDS + word] =
+            (f32_to_bf16(hidden_hi) << 16u) | f32_to_bf16(hidden_lo);
+    }
+}
