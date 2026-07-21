@@ -554,7 +554,8 @@ def test_discovers_sparse_moe_and_model_specific_numerics_by_structure() -> None
         "num_experts": 32,
         "experts_per_token": 8,
     }
-    assert nodes["sparse_moe_experts"]["params"] == ["moe_input", "moe_output"]
+    assert nodes["sparse_moe_gate_up"]["params"] == ["moe_input"]
+    assert nodes["sparse_moe_down"]["params"] == ["moe_output"]
     assert nodes["moe_reduce"]["outputs"] == ["ffn_out"]
 
 

@@ -6,9 +6,9 @@ layout(set = 0, binding = 0) readonly buffer RouterLogits {
     uint words[];
 } router_logits;
 
-layout(set = 0, binding = 1) buffer RoutingWeights {
+layout(set = 0, binding = 1) buffer ExpertRoutes {
     uint words[];
-} routing_weights;
+} expert_routes;
 
 const uint NUM_EXPERTS = {{NUM_EXPERTS}}u;
 const uint EXPERTS_PER_TOKEN = {{EXPERTS_PER_TOKEN}}u;
@@ -44,9 +44,6 @@ void main() {
         return;
     }
 
-    for (uint word = 0u; word < (NUM_EXPERTS + 1u) / 2u; word++) {
-        routing_weights.words[word] = 0u;
-    }
     for (uint route = 0u; route < EXPERTS_PER_TOKEN; route++) {
         float best_score = -uintBitsToFloat(0x7f800000u);
         uint best_expert = 0u;
@@ -65,12 +62,23 @@ void main() {
     for (uint route = 0u; route < EXPERTS_PER_TOKEN; route++) {
         denominator += exp(read_router(top_indices[route]) - maximum);
     }
+
+    // Preserve the original expert-index reduction order while keeping the
+    // route signal compact. The score-order denominator above is unchanged.
+    for (uint route = 1u; route < EXPERTS_PER_TOKEN; route++) {
+        uint expert = top_indices[route];
+        uint insertion = route;
+        while (insertion > 0u && top_indices[insertion - 1u] > expert) {
+            top_indices[insertion] = top_indices[insertion - 1u];
+            insertion--;
+        }
+        top_indices[insertion] = expert;
+    }
     for (uint route = 0u; route < EXPERTS_PER_TOKEN; route++) {
         uint expert = top_indices[route];
-        uint value = f32_to_bf16(
+        uint weight = f32_to_bf16(
             exp(read_router(expert) - maximum) / denominator
         );
-        uint word = expert >> 1u;
-        routing_weights.words[word] |= (expert & 1u) == 0u ? value : value << 16;
+        expert_routes.words[route] = (weight << 16u) | expert;
     }
 }

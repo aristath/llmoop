@@ -1121,13 +1121,19 @@ fn infer_node_output_shapes(
             Ok(repeat_shape(output_shape, outputs))
         }
         "moe_topk" => {
-            let output_shape = attr_usize(node, "num_experts").map(|experts| vec![experts]);
+            let output_shape = attr_usize(node, "experts_per_token").map(|routes| vec![routes, 2]);
             Ok(repeat_shape(output_shape, outputs))
         }
-        "sparse_moe_experts" => {
-            let output_shape = attr_usize(node, "num_experts")
+        "sparse_moe_gate_up" => {
+            let output_shape = attr_usize(node, "experts_per_token")
+                .zip(attr_usize(node, "intermediate_size"))
+                .map(|(routes, intermediate)| vec![routes, intermediate]);
+            Ok(repeat_shape(output_shape, outputs))
+        }
+        "sparse_moe_down" => {
+            let output_shape = attr_usize(node, "experts_per_token")
                 .zip(attr_usize(node, "hidden_size"))
-                .map(|(experts, hidden)| vec![experts, hidden]);
+                .map(|(routes, hidden)| vec![routes, hidden]);
             Ok(repeat_shape(output_shape, outputs))
         }
         "moe_reduce" => {
@@ -1606,6 +1612,56 @@ mod tests {
         assert_eq!(
             infer_split_output_shapes("layer_00", &node, &signals).unwrap(),
             vec![Some(vec![16]), Some(vec![8]), Some(vec![8])]
+        );
+    }
+
+    #[test]
+    fn sparse_moe_signal_shapes_scale_with_selected_routes_not_all_experts() {
+        let signals = BTreeMap::new();
+        let params = BTreeMap::new();
+        let attrs = serde_json::json!({
+            "hidden_size": 2048,
+            "intermediate_size": 512,
+            "num_experts": 256,
+            "experts_per_token": 8
+        });
+        let node = |op: &str| crate::stream_circuit::CircuitNode {
+            id: op.to_string(),
+            op: op.to_string(),
+            inputs: Vec::new(),
+            outputs: vec!["output".to_string()],
+            params: Vec::new(),
+            state_reads: Vec::new(),
+            state_writes: Vec::new(),
+            attrs: attrs.clone(),
+        };
+
+        assert_eq!(
+            infer_node_output_shapes("layer_00", &node("moe_topk"), &signals, &params, None)
+                .unwrap(),
+            vec![Some(vec![8, 2])]
+        );
+        assert_eq!(
+            infer_node_output_shapes(
+                "layer_00",
+                &node("sparse_moe_gate_up"),
+                &signals,
+                &params,
+                None,
+            )
+            .unwrap(),
+            vec![Some(vec![8, 512])]
+        );
+        assert_eq!(
+            infer_node_output_shapes(
+                "layer_00",
+                &node("sparse_moe_down"),
+                &signals,
+                &params,
+                None,
+            )
+            .unwrap(),
+            vec![Some(vec![8, 2048])]
         );
     }
 

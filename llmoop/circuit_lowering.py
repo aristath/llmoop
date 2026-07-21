@@ -1456,17 +1456,17 @@ def _ffn_tail(
                 "id": "moe_topk",
                 "op": "moe_topk",
                 "inputs": ["moe_router_logits"],
-                "outputs": ["moe_routing_weights"],
+                "outputs": ["moe_routes"],
                 "attrs": {
                     "num_experts": int(feed_forward["num_experts"]),
                     "experts_per_token": int(feed_forward["experts_per_token"]),
                 },
             },
             {
-                "id": "sparse_moe_experts",
-                "op": "sparse_moe_experts",
-                "inputs": ["ffn_norm_out", "moe_routing_weights"],
-                "outputs": ["moe_expert_outputs"],
+                "id": "sparse_moe_gate_up",
+                "op": "sparse_moe_gate_up",
+                "inputs": ["ffn_norm_out", "moe_routes"],
+                "outputs": ["moe_expert_intermediates"],
                 "params": [
                     "moe_input",
                     *(
@@ -1474,6 +1474,20 @@ def _ffn_tail(
                         if "moe_input_scale_inv" in parameters
                         else []
                     ),
+                ],
+                "attrs": {
+                    "hidden_size": int(feed_forward.get("hidden_size", 0)),
+                    "intermediate_size": int(feed_forward["intermediate_size"]),
+                    "num_experts": int(feed_forward["num_experts"]),
+                    "experts_per_token": int(feed_forward["experts_per_token"]),
+                },
+            },
+            {
+                "id": "sparse_moe_down",
+                "op": "sparse_moe_down",
+                "inputs": ["moe_expert_intermediates", "moe_routes"],
+                "outputs": ["moe_expert_outputs"],
+                "params": [
                     "moe_output",
                     *(
                         ["moe_output_scale_inv"]
@@ -1495,7 +1509,7 @@ def _ffn_tail(
                 "outputs": ["moe_out" if has_shared_expert else "ffn_out"],
                 "attrs": {
                     "hidden_size": int(feed_forward["hidden_size"]),
-                    "num_experts": int(feed_forward["num_experts"]),
+                    "experts_per_token": int(feed_forward["experts_per_token"]),
                 },
             },
         ]

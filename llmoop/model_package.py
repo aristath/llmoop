@@ -68,9 +68,7 @@ SPIRV_CAPABILITY_VULKAN_FEATURE_REQUIREMENTS = {
     5346: "vulkan_memory_model_device_scope",
     6022: "cooperative_matrix",
 }
-KNOWN_VULKAN_FEATURES = frozenset(
-    SPIRV_CAPABILITY_VULKAN_FEATURE_REQUIREMENTS.values()
-)
+KNOWN_VULKAN_FEATURES = frozenset(SPIRV_CAPABILITY_VULKAN_FEATURE_REQUIREMENTS.values())
 SPIRV_CAPABILITY_VULKAN_SUBGROUP_OPERATION_REQUIREMENTS = {
     61: "basic",
     62: "vote",
@@ -260,9 +258,7 @@ def build_vulkan_resident_package_manifest(
         vocab_size,
         max(256, int(sampling.get("top_k", 1))),
     )
-    sampler_scratch_byte_capacity = (
-        sampler_partition_count * sampler_top_k_capacity * 8
-    )
+    sampler_scratch_byte_capacity = sampler_partition_count * sampler_top_k_capacity * 8
     sampler_state_kernels = []
     if sampler_uses_token_state:
         sampler_state_kernels = [
@@ -567,14 +563,14 @@ def build_vulkan_resident_package_manifest(
     for execution in all_pedal_executions:
         for kernel in execution["kernels"]:
             for implementation in kernel["batch_implementations"]:
-                implementation["device_requirements"][
-                    "vulkan_device_extensions"
-                ] = required_vulkan_device_extensions(
-                    package_dir / "shaders",
-                    {
-                        stage["shader_path"].removeprefix("shaders/")
-                        for stage in implementation["stages"]
-                    },
+                implementation["device_requirements"]["vulkan_device_extensions"] = (
+                    required_vulkan_device_extensions(
+                        package_dir / "shaders",
+                        {
+                            stage["shader_path"].removeprefix("shaders/")
+                            for stage in implementation["stages"]
+                        },
+                    )
                 )
     optional_device_shader_files = {
         stage["shader_path"].removeprefix("shaders/")
@@ -986,7 +982,9 @@ def pedal_kernel_spec(
         "batch_mode": (
             "causal_scan"
             if causal_scan_stages
-            else "weight_shared" if scalar_batch_shader_file else "serial_lanes"
+            else "weight_shared"
+            if scalar_batch_shader_file
+            else "serial_lanes"
         ),
         "batch_implementations": [],
     }
@@ -1138,10 +1136,7 @@ def cooperative_bfloat16_batch_shader_file(shader_file: str) -> str | None:
     )
     if linear is not None:
         operation, input_size, output_size = linear.groups()
-        return (
-            f"{operation}_batch64_cooperative_bf16_"
-            f"{input_size}x{output_size}.comp"
-        )
+        return f"{operation}_batch64_cooperative_bf16_{input_size}x{output_size}.comp"
     parallel = re.fullmatch(
         r"parallel_linear_[23]way_bf16_\d+x.+\.comp",
         shader_file,
@@ -1278,7 +1273,11 @@ def weight_shared_batch_shader_file(
     )
     if fp8 is not None:
         operation, block_rows, block_columns, input_size, _ = fp8.groups()
-        if int(block_rows) % 2 == 0 and int(block_columns) % 4 == 0 and int(input_size) % 4 == 0:
+        if (
+            int(block_rows) % 2 == 0
+            and int(block_columns) % 4 == 0
+            and int(input_size) % 4 == 0
+        ):
             return shader_file.replace(
                 f"{operation}_fp8_e4m3_",
                 f"{operation}_batch{tile}_fp8_e4m3_",
@@ -1291,10 +1290,7 @@ def weight_shared_batch_shader_file(
     if bf16 is not None:
         operation, input_size, output_size = bf16.groups()
         if int(input_size) % 2 == 0 and int(output_size) % 2 == 0:
-            return (
-                f"{operation}_batch{tile}_bf16_"
-                f"{input_size}x{output_size}.comp"
-            )
+            return f"{operation}_batch{tile}_bf16_{input_size}x{output_size}.comp"
     parallel = re.fullmatch(
         r"parallel_linear_[23]way_bf16_(\d+)x.+\.comp",
         shader_file,
@@ -1572,10 +1568,7 @@ def shader_file_for_node(
                 "parallel_linear_silu_multiply_fp8_e4m3_"
                 f"b{block_rows}x{block_columns}_{input_width}x{output_width}.comp"
             )
-        return (
-            "parallel_linear_silu_multiply_bf16_"
-            f"{input_width}x{output_width}.comp"
-        )
+        return f"parallel_linear_silu_multiply_bf16_{input_width}x{output_width}.comp"
     if op == "linear_split_3way":
         parameter_shape = parameter_shape_for_node(circuit, node, tensor_index)
         out_features, in_features = map(int, parameter_shape)
@@ -1983,30 +1976,34 @@ def shader_file_for_node(
         return (
             f"moe_topk_bf16_e{attrs['num_experts']}_k{attrs['experts_per_token']}.comp"
         )
-    if op == "sparse_moe_experts":
+    if op in {"sparse_moe_gate_up", "sparse_moe_down"}:
         attrs = node["attrs"]
         parameter_dtype = parameter_dtype_for_node(circuit, node, tensor_index)
+        stage = "gate_up" if op == "sparse_moe_gate_up" else "down"
         if parameter_dtype == "F8_E4M3":
-            block_rows, block_columns = fp8_moe_block_shape_for_node(
-                circuit, node, tensor_index
+            block_rows, block_columns = fp8_moe_block_shape_for_stage(
+                circuit, node, tensor_index, stage=stage
             )
             return (
-                f"sparse_moe_experts_fp8_e4m3_b{block_rows}x{block_columns}_"
+                f"sparse_moe_{stage}_fp8_e4m3_b{block_rows}x{block_columns}_"
                 f"h{attrs['hidden_size']}_i{attrs['intermediate_size']}_"
                 f"e{attrs['num_experts']}_k{attrs['experts_per_token']}.comp"
             )
         if parameter_dtype != "BF16":
             raise ModelCompileError(
-                f"sparse MoE node {node['id']!r} has unsupported expert dtype "
+                f"sparse MoE {stage} node {node['id']!r} has unsupported expert dtype "
                 f"{parameter_dtype}"
             )
         return (
-            f"sparse_moe_experts_bf16_h{attrs['hidden_size']}_i{attrs['intermediate_size']}"
+            f"sparse_moe_{stage}_bf16_h{attrs['hidden_size']}_i{attrs['intermediate_size']}"
             f"_e{attrs['num_experts']}_k{attrs['experts_per_token']}.comp"
         )
     if op == "moe_reduce":
         attrs = node["attrs"]
-        return f"moe_reduce_bf16_h{attrs['hidden_size']}_e{attrs['num_experts']}.comp"
+        return (
+            f"moe_reduce_bf16_h{attrs['hidden_size']}"
+            f"_k{attrs['experts_per_token']}.comp"
+        )
 
     raise ModelCompileError(
         f"no Vulkan shader selector for op {op!r} in node {node['id']!r}"
@@ -2050,8 +2047,14 @@ def workgroup_count_x_for_node(circuit: Json, node: Json, tensor_index: Json) ->
         return int(node["attrs"]["value_heads"])
     if node["op"] == "rg_lru_step":
         return int(node["attrs"]["heads"])
-    if node["op"] == "sparse_moe_experts":
-        return int(node["attrs"]["num_experts"])
+    if node["op"] == "sparse_moe_gate_up":
+        attrs = node["attrs"]
+        return int(attrs["experts_per_token"]) * (
+            (int(attrs["intermediate_size"]) + 1) // 2
+        )
+    if node["op"] == "sparse_moe_down":
+        attrs = node["attrs"]
+        return int(attrs["experts_per_token"]) * ((int(attrs["hidden_size"]) + 1) // 2)
     if node["op"] in {
         "rms_norm_per_head",
         "rms_norm_per_head_unscaled",
@@ -2078,8 +2081,6 @@ def local_size_x_for_node(node: Json) -> int:
         return int(node["attrs"]["value_head_width"])
     if node["op"] == "rg_lru_step":
         return int(node["attrs"]["block_width"])
-    if node["op"] == "sparse_moe_experts":
-        return 256
     return 64
 
 
@@ -2144,7 +2145,9 @@ def required_vulkan_device_extensions(
     for shader_file in shader_files:
         source = (shader_dir / shader_file).read_text()
         required_glsl_extensions.update(
-            re.findall(r"^\s*#extension\s+(\S+)\s*:\s*require\s*$", source, re.MULTILINE)
+            re.findall(
+                r"^\s*#extension\s+(\S+)\s*:\s*require\s*$", source, re.MULTILINE
+            )
         )
     return sorted(
         {
@@ -2239,8 +2242,7 @@ def spirv_vulkan_requirements(
         {
             SPIRV_CAPABILITY_VULKAN_SUBGROUP_OPERATION_REQUIREMENTS[capability]
             for capability in capabilities
-            if capability
-            in SPIRV_CAPABILITY_VULKAN_SUBGROUP_OPERATION_REQUIREMENTS
+            if capability in SPIRV_CAPABILITY_VULKAN_SUBGROUP_OPERATION_REQUIREMENTS
         }
     )
     return features, subgroup_operations
@@ -2329,8 +2331,7 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
             for label, width in zip(labels, output_widths, strict=True)
         )
         tile_counts = [
-            (width + COOPERATIVE_OUTPUT_TILE_WIDTH - 1)
-            // COOPERATIVE_OUTPUT_TILE_WIDTH
+            (width + COOPERATIVE_OUTPUT_TILE_WIDTH - 1) // COOPERATIVE_OUTPUT_TILE_WIDTH
             for width in output_widths
         ]
         branch_lines = []
@@ -2350,9 +2351,7 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
             f"    if (branch == {index}u) return weight_{label.lower()}.values[index];"
             for index, label in enumerate(labels[:-1])
         )
-        weight_reads += (
-            "\n    return weight_" + labels[-1].lower() + ".values[index];"
-        )
+        weight_reads += "\n    return weight_" + labels[-1].lower() + ".values[index];"
         output_size_selection = "\n".join(
             f"    if (branch == {index}u) return OUTPUT_{label}_SIZE;"
             for index, label in enumerate(labels[:-1])
@@ -3068,7 +3067,14 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
         (
             r"temperature_top_k_top_p_sampler_f32_t([0-9eE+.-]+)_k(\d+)_p([0-9eE+.-]+)_m([0-9eE+.-]+)_g(\d+)_l(\d+)\.comp",
             "temperature_top_k_top_p_sampler_f32.comp.template",
-            ("TEMPERATURE", "TOP_K", "TOP_P", "MIN_P", "PARTITION_COUNT", "LOCAL_SIZE_X"),
+            (
+                "TEMPERATURE",
+                "TOP_K",
+                "TOP_P",
+                "MIN_P",
+                "PARTITION_COUNT",
+                "LOCAL_SIZE_X",
+            ),
         ),
         (
             r"temperature_top_k_top_p_sampler_runtime_f32_kc(\d+)_g(\d+)_l(\d+)\.comp",
@@ -3454,10 +3460,19 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
         )
 
     sparse_moe_fp8_shape = re.fullmatch(
-        r"sparse_moe_experts_fp8_e4m3_b(\d+)x(\d+)_h(\d+)_i(\d+)_e(\d+)_k(\d+)\.comp",
+        r"sparse_moe_(gate_up|down)_fp8_e4m3_b(\d+)x(\d+)_h(\d+)_i(\d+)_e(\d+)_k(\d+)\.comp",
         shader_file,
     )
     if sparse_moe_fp8_shape is not None:
+        (
+            stage,
+            block_rows,
+            block_columns,
+            hidden_size,
+            intermediate_size,
+            num_experts,
+            experts_per_token,
+        ) = sparse_moe_fp8_shape.groups()
         (
             block_rows,
             block_columns,
@@ -3465,7 +3480,17 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
             intermediate_size,
             num_experts,
             experts_per_token,
-        ) = map(int, sparse_moe_fp8_shape.groups())
+        ) = map(
+            int,
+            (
+                block_rows,
+                block_columns,
+                hidden_size,
+                intermediate_size,
+                num_experts,
+                experts_per_token,
+            ),
+        )
         if hidden_size % 2 or intermediate_size % 2:
             raise ModelCompileError(
                 "packed BF16 activations for FP8 sparse experts require even dimensions"
@@ -3476,7 +3501,7 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
             )
         return render_shader_template(
             source_dir,
-            "sparse_moe_experts_fp8_e4m3.comp.template",
+            f"sparse_moe_{stage}_fp8_e4m3.comp.template",
             {
                 "BLOCK_ROWS": str(block_rows),
                 "BLOCK_COLUMNS": str(block_columns),
@@ -3488,12 +3513,13 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
         )
 
     sparse_moe_shape = re.fullmatch(
-        r"sparse_moe_experts_bf16_h(\d+)_i(\d+)_e(\d+)_k(\d+)\.comp",
+        r"sparse_moe_(gate_up|down)_bf16_h(\d+)_i(\d+)_e(\d+)_k(\d+)\.comp",
         shader_file,
     )
     if sparse_moe_shape is not None:
+        stage = sparse_moe_shape.group(1)
         hidden_size, intermediate_size, num_experts, experts_per_token = map(
-            int, sparse_moe_shape.groups()
+            int, sparse_moe_shape.groups()[1:]
         )
         if hidden_size % 2 or intermediate_size % 2:
             raise ModelCompileError(
@@ -3505,7 +3531,7 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
             )
         return render_shader_template(
             source_dir,
-            "sparse_moe_experts_bf16.comp.template",
+            f"sparse_moe_{stage}_bf16.comp.template",
             {
                 "HIDDEN_SIZE": str(hidden_size),
                 "INTERMEDIATE_SIZE": str(intermediate_size),
@@ -3514,15 +3540,15 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
             },
         )
 
-    moe_reduce_shape = re.fullmatch(r"moe_reduce_bf16_h(\d+)_e(\d+)\.comp", shader_file)
+    moe_reduce_shape = re.fullmatch(r"moe_reduce_bf16_h(\d+)_k(\d+)\.comp", shader_file)
     if moe_reduce_shape is not None:
-        hidden_size, num_experts = map(int, moe_reduce_shape.groups())
+        hidden_size, experts_per_token = map(int, moe_reduce_shape.groups())
         return render_shader_template(
             source_dir,
             "moe_reduce_bf16.comp.template",
             {
                 "HIDDEN_SIZE": str(hidden_size),
-                "NUM_EXPERTS": str(num_experts),
+                "EXPERTS_PER_TOKEN": str(experts_per_token),
             },
         )
 
@@ -3833,17 +3859,14 @@ def validate_compiled_package(package_dir: Path, manifest: Json) -> None:
         raise ModelCompileError(
             "compiled package required Vulkan features must be unique sorted known names"
         )
-    required_subgroup_operations = manifest.get(
-        "required_vulkan_subgroup_operations"
-    )
+    required_subgroup_operations = manifest.get("required_vulkan_subgroup_operations")
     if (
         not isinstance(required_subgroup_operations, list)
         or any(
             operation not in KNOWN_VULKAN_SUBGROUP_OPERATIONS
             for operation in required_subgroup_operations
         )
-        or required_subgroup_operations
-        != sorted(set(required_subgroup_operations))
+        or required_subgroup_operations != sorted(set(required_subgroup_operations))
     ):
         raise ModelCompileError(
             "compiled package required Vulkan subgroup operations must be unique sorted known names"
@@ -3990,10 +4013,7 @@ def validate_compiled_spirv_requirements(package_dir: Path, manifest: Json) -> N
         manifest["output_transducer"]["embedding_norm_batch_shader_path"],
         manifest["output_transducer"]["projection_shader_path"],
         manifest["output_transducer"]["projection_batch_shader_path"],
-        *(
-            kernel["shader_path"]
-            for kernel in manifest["sampler"]["kernels"]
-        ),
+        *(kernel["shader_path"] for kernel in manifest["sampler"]["kernels"]),
         *(
             decoder["output_transducer"]["norm_shader_path"]
             for decoder in speculative_decoders
@@ -4007,20 +4027,14 @@ def validate_compiled_spirv_requirements(package_dir: Path, manifest: Json) -> N
         for kernel in execution["kernels"]:
             mandatory_shader_paths.add(kernel["shader_path"])
             for implementation in kernel["batch_implementations"]:
-                actual_features, actual_subgroup_operations = (
-                    spirv_vulkan_requirements(
-                        package_dir,
-                        {
-                            stage["shader_path"]
-                            for stage in implementation["stages"]
-                        },
-                    )
+                actual_features, actual_subgroup_operations = spirv_vulkan_requirements(
+                    package_dir,
+                    {stage["shader_path"] for stage in implementation["stages"]},
                 )
                 requirements = implementation["device_requirements"]
                 if (
                     requirements["vulkan_features"] != actual_features
-                    or requirements["subgroup_operations"]
-                    != actual_subgroup_operations
+                    or requirements["subgroup_operations"] != actual_subgroup_operations
                 ):
                     raise ModelCompileError(
                         "compiled batch implementation "
@@ -4033,8 +4047,7 @@ def validate_compiled_spirv_requirements(package_dir: Path, manifest: Json) -> N
     )
     if (
         manifest["required_vulkan_features"] != actual_features
-        or manifest["required_vulkan_subgroup_operations"]
-        != actual_subgroup_operations
+        or manifest["required_vulkan_subgroup_operations"] != actual_subgroup_operations
     ):
         raise ModelCompileError(
             "compiled package does not declare the Vulkan requirements of its "
@@ -4571,11 +4584,14 @@ def validate_compiled_pedal_executions(
             batch_implementations = kernel.get("batch_implementations")
             if batch_mode == "serial_lanes" and batch_implementations == []:
                 continue
-            if batch_mode in {"weight_shared", "causal_scan"} and isinstance(
-                batch_implementations, list
-            ) and batch_implementations and all(
-                valid_batch_implementation(implementation)
-                for implementation in batch_implementations
+            if (
+                batch_mode in {"weight_shared", "causal_scan"}
+                and isinstance(batch_implementations, list)
+                and batch_implementations
+                and all(
+                    valid_batch_implementation(implementation)
+                    for implementation in batch_implementations
+                )
             ):
                 continue
             raise ModelCompileError(
@@ -4838,9 +4854,7 @@ def validate_compiled_generation_contract(
         or not isinstance(
             output_package.get("embedding_norm_batch_lane_tile_width"), int
         )
-        or isinstance(
-            output_package.get("embedding_norm_batch_lane_tile_width"), bool
-        )
+        or isinstance(output_package.get("embedding_norm_batch_lane_tile_width"), bool)
         or output_package["embedding_norm_batch_lane_tile_width"] <= 0
         or not isinstance(output_package.get("projection_batch_lane_tile_width"), int)
         or isinstance(output_package.get("projection_batch_lane_tile_width"), bool)
@@ -5057,14 +5071,10 @@ def can_fuse_parallel_linear_silu_multiply(
                 parameter_layout_for_id(circuit, parameter_id, tensor_index)
                 for parameter_id in weight_ids
             }
-            supported_parameters = (
-                {
-                    parameter_dtype_for_id(circuit, parameter_id, tensor_index)
-                    for parameter_id in weight_ids
-                }
-                == {"BF16"}
-                and layouts == {ROW_MAJOR_LAYOUT}
-            )
+            supported_parameters = {
+                parameter_dtype_for_id(circuit, parameter_id, tensor_index)
+                for parameter_id in weight_ids
+            } == {"BF16"} and layouts == {ROW_MAJOR_LAYOUT}
         except ModelCompileError:
             return False
     elif len(params) == 4:
@@ -5588,72 +5598,56 @@ def fp8_block_shape_for_node(
     return block_rows, block_columns
 
 
-def fp8_moe_block_shape_for_node(
-    circuit: Json, node: Json, tensor_index: Json
+def fp8_moe_block_shape_for_stage(
+    circuit: Json,
+    node: Json,
+    tensor_index: Json,
+    *,
+    stage: str,
 ) -> tuple[int, int]:
-    expected_params = [
-        "moe_input",
-        "moe_input_scale_inv",
-        "moe_output",
-        "moe_output_scale_inv",
-    ]
+    if stage == "gate_up":
+        weight_id = "moe_input"
+        scale_id = "moe_input_scale_inv"
+    elif stage == "down":
+        weight_id = "moe_output"
+        scale_id = "moe_output_scale_inv"
+    else:
+        raise ModelCompileError(f"unknown sparse MoE stage {stage!r}")
+    expected_params = [weight_id, scale_id]
     if node.get("params") != expected_params:
         raise ModelCompileError(
-            f"FP8 sparse MoE node {node['id']!r} must bind {expected_params}; "
+            f"FP8 sparse MoE {stage} node {node['id']!r} must bind {expected_params}; "
             f"got {node.get('params')}"
         )
     attrs = node["attrs"]
     experts = int(attrs["num_experts"])
     hidden = int(attrs["hidden_size"])
     intermediate = int(attrs["intermediate_size"])
-    input_shape = parameter_shape_for_id(circuit, "moe_input", tensor_index)
-    output_shape = parameter_shape_for_id(circuit, "moe_output", tensor_index)
-    input_scale_shape = parameter_shape_for_id(
-        circuit, "moe_input_scale_inv", tensor_index
+    expected_weight_shape = (
+        [experts, intermediate * 2, hidden]
+        if stage == "gate_up"
+        else [experts, hidden, intermediate]
     )
-    output_scale_shape = parameter_shape_for_id(
-        circuit, "moe_output_scale_inv", tensor_index
-    )
-    if input_shape != [experts, intermediate * 2, hidden]:
+    weight_shape = parameter_shape_for_id(circuit, weight_id, tensor_index)
+    scale_shape = parameter_shape_for_id(circuit, scale_id, tensor_index)
+    if weight_shape != expected_weight_shape:
         raise ModelCompileError(
-            f"FP8 sparse MoE input shape {input_shape} does not match "
-            f"{[experts, intermediate * 2, hidden]}"
+            f"FP8 sparse MoE {stage} weight shape {weight_shape} does not match "
+            f"{expected_weight_shape}"
         )
-    if output_shape != [experts, hidden, intermediate]:
+    if parameter_layout_for_id(circuit, weight_id, tensor_index) != ROW_MAJOR_LAYOUT:
         raise ModelCompileError(
-            f"FP8 sparse MoE output shape {output_shape} does not match "
-            f"{[experts, hidden, intermediate]}"
+            f"FP8 sparse MoE {stage} weight {weight_id!r} must be row-major"
         )
-    for parameter_id in ("moe_input_scale_inv", "moe_output_scale_inv"):
-        if parameter_dtype_for_id(circuit, parameter_id, tensor_index) != "BF16":
-            raise ModelCompileError(
-                f"FP8 sparse MoE scale {parameter_id!r} must be BF16"
-            )
-        if (
-            parameter_layout_for_id(circuit, parameter_id, tensor_index)
-            != ROW_MAJOR_LAYOUT
-        ):
-            raise ModelCompileError(
-                f"FP8 sparse MoE scale {parameter_id!r} must be row-major"
-            )
-    if len(input_scale_shape) != 3 or input_scale_shape[0] != experts:
+    if parameter_dtype_for_id(circuit, scale_id, tensor_index) != "BF16":
+        raise ModelCompileError(f"FP8 sparse MoE scale {scale_id!r} must be BF16")
+    if parameter_layout_for_id(circuit, scale_id, tensor_index) != ROW_MAJOR_LAYOUT:
+        raise ModelCompileError(f"FP8 sparse MoE scale {scale_id!r} must be row-major")
+    if len(scale_shape) != 3 or scale_shape[0] != experts:
         raise ModelCompileError(
-            f"FP8 sparse MoE input scale shape is invalid: {input_scale_shape}"
+            f"FP8 sparse MoE {stage} scale shape is invalid: {scale_shape}"
         )
-    block_rows, block_columns = regular_block_shape(
-        [intermediate * 2, hidden], input_scale_shape[1:]
-    )
-    expected_output_scale = [
-        experts,
-        (hidden + block_rows - 1) // block_rows,
-        (intermediate + block_columns - 1) // block_columns,
-    ]
-    if output_scale_shape != expected_output_scale:
-        raise ModelCompileError(
-            f"FP8 sparse MoE output scale shape {output_scale_shape} does not "
-            f"match {expected_output_scale}"
-        )
-    return block_rows, block_columns
+    return regular_block_shape(expected_weight_shape[1:], scale_shape[1:])
 
 
 def regular_block_shape(

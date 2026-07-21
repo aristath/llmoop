@@ -11,7 +11,7 @@ layout(set = 0, binding = 1) buffer OutputFrame {
 } output_frame;
 
 const uint HIDDEN_SIZE = {{HIDDEN_SIZE}}u;
-const uint NUM_EXPERTS = {{NUM_EXPERTS}}u;
+const uint EXPERTS_PER_TOKEN = {{EXPERTS_PER_TOKEN}}u;
 const uint HIDDEN_WORDS = HIDDEN_SIZE / 2u;
 
 float bf16_to_f32(uint value) {
@@ -32,8 +32,8 @@ void main() {
     for (uint word = gl_LocalInvocationID.x; word < HIDDEN_WORDS; word += 64u) {
         float lo = 0.0;
         float hi = 0.0;
-        for (uint expert = 0u; expert < NUM_EXPERTS; expert++) {
-            uint contribution = expert_outputs.words[expert * HIDDEN_WORDS + word];
+        for (uint route = 0u; route < EXPERTS_PER_TOKEN; route++) {
+            uint contribution = expert_outputs.words[route * HIDDEN_WORDS + word];
             lo = add_bf16(lo, bf16_to_f32(contribution));
             hi = add_bf16(hi, bf16_to_f32(contribution >> 16));
         }

@@ -25,6 +25,7 @@ from llmoop.model_package import (
     required_vulkan_subgroup_operations,
     shader_file_for_node,
     spirv_capabilities,
+    workgroup_count_x_for_node,
     weight_shared_batch_shader_file,
     write_compiled_tensor,
 )
@@ -40,9 +41,7 @@ def write_spirv_module(path: Path, capabilities: list[int]) -> None:
 
 def test_compiler_derives_vulkan_features_from_compiled_spirv(tmp_path: Path) -> None:
     shader = tmp_path / "cooperative.spv"
-    write_spirv_module(
-        shader, [1, 9, 22, 61, 63, 4433, 5116, 5118, 5345, 6022]
-    )
+    write_spirv_module(shader, [1, 9, 22, 61, 63, 4433, 5116, 5118, 5345, 6022])
 
     assert spirv_capabilities(shader) == {
         1,
@@ -93,56 +92,73 @@ def test_compiler_fails_closed_for_unmodeled_spirv_capabilities(
 
 def test_compiler_selects_only_compatible_weight_shared_batch_kernels() -> None:
     assert SCALAR_BATCH_LANE_TILE_WIDTH == 16
-    assert weight_shared_batch_shader_file(
-        "rms_norm_bf16_h5120_eps1e-06_offset1.comp"
-    ) == "rms_norm_batch16_bf16_h5120_eps1e-06_offset1.comp"
-    assert weight_shared_batch_shader_file(
-        "linear_fp8_e4m3_b128x128_5120x17408.comp"
-    ) == "linear_batch16_fp8_e4m3_b128x128_5120x17408.comp"
-    assert weight_shared_batch_shader_file(
-        "linear_residual_fp8_e4m3_b128x128_17408x5120.comp"
-    ) == "linear_residual_batch16_fp8_e4m3_b128x128_17408x5120.comp"
-    assert weight_shared_batch_shader_file(
-        "parallel_linear_2way_bf16_1024x2560_2560.comp"
-    ) == "parallel_linear_batch16_2way_bf16_1024x2560_2560.comp"
-    assert weight_shared_batch_shader_file(
-        "parallel_linear_silu_multiply_fp8_e4m3_b128x128_5120x17408.comp"
-    ) == (
-        "parallel_linear_silu_multiply_batch16_fp8_e4m3_"
-        "b128x128_5120x17408.comp"
+    assert (
+        weight_shared_batch_shader_file("rms_norm_bf16_h5120_eps1e-06_offset1.comp")
+        == "rms_norm_batch16_bf16_h5120_eps1e-06_offset1.comp"
+    )
+    assert (
+        weight_shared_batch_shader_file("linear_fp8_e4m3_b128x128_5120x17408.comp")
+        == "linear_batch16_fp8_e4m3_b128x128_5120x17408.comp"
+    )
+    assert (
+        weight_shared_batch_shader_file(
+            "linear_residual_fp8_e4m3_b128x128_17408x5120.comp"
+        )
+        == "linear_residual_batch16_fp8_e4m3_b128x128_17408x5120.comp"
+    )
+    assert (
+        weight_shared_batch_shader_file("parallel_linear_2way_bf16_1024x2560_2560.comp")
+        == "parallel_linear_batch16_2way_bf16_1024x2560_2560.comp"
     )
     assert weight_shared_batch_shader_file(
-        "linear_bf16_1024x1024.comp"
-    ) == "linear_batch16_bf16_1024x1024.comp"
-    assert weight_shared_batch_shader_file(
-        "linear_bf16_1024x1024.comp", tile_width=4
-    ) == "linear_batch4_bf16_1024x1024.comp"
-    assert weight_shared_batch_shader_file(
-        "linear_residual_bf16_1024x1024.comp"
-    ) == "linear_residual_batch16_bf16_1024x1024.comp"
-    assert weight_shared_batch_shader_file(
-        "parallel_linear_silu_multiply_bf16_1024x4096.comp"
-    ) == "parallel_linear_silu_multiply_batch16_bf16_1024x4096.comp"
-    assert weight_shared_batch_shader_file(
-        "split_bf16_2x16x256_head_interleaved.comp"
-    ) == "split_batch16_bf16_2x16x256_head_interleaved.comp"
+        "parallel_linear_silu_multiply_fp8_e4m3_b128x128_5120x17408.comp"
+    ) == ("parallel_linear_silu_multiply_batch16_fp8_e4m3_b128x128_5120x17408.comp")
+    assert (
+        weight_shared_batch_shader_file("linear_bf16_1024x1024.comp")
+        == "linear_batch16_bf16_1024x1024.comp"
+    )
+    assert (
+        weight_shared_batch_shader_file("linear_bf16_1024x1024.comp", tile_width=4)
+        == "linear_batch4_bf16_1024x1024.comp"
+    )
+    assert (
+        weight_shared_batch_shader_file("linear_residual_bf16_1024x1024.comp")
+        == "linear_residual_batch16_bf16_1024x1024.comp"
+    )
+    assert (
+        weight_shared_batch_shader_file(
+            "parallel_linear_silu_multiply_bf16_1024x4096.comp"
+        )
+        == "parallel_linear_silu_multiply_batch16_bf16_1024x4096.comp"
+    )
+    assert (
+        weight_shared_batch_shader_file("split_bf16_2x16x256_head_interleaved.comp")
+        == "split_batch16_bf16_2x16x256_head_interleaved.comp"
+    )
     assert (
         weight_shared_batch_shader_file("sigmoid_multiply_bf16.comp")
         == "sigmoid_multiply_batch16_bf16.comp"
     )
-    assert weight_shared_batch_shader_file(
-        "linear_fp8_e4m3_b127x128_5120x17408.comp"
-    ) is None
+    assert (
+        weight_shared_batch_shader_file("linear_fp8_e4m3_b127x128_5120x17408.comp")
+        is None
+    )
     assert weight_shared_batch_shader_file("linear_bf16_1023x1024.comp") is None
-    assert frame_parallel_batch_shader_file(
-        "rms_norm_batch16_bf16_h4096_eps1e-06_offset1.comp"
-    ) == "rms_norm_batch1_bf16_h4096_eps1e-06_offset1.comp"
-    assert frame_parallel_batch_shader_file(
-        "split_batch16_bf16_2x16x256_head_interleaved.comp"
-    ) == "split_batch1_bf16_2x16x256_head_interleaved.comp"
-    assert frame_parallel_batch_shader_file(
-        "linear_batch16_bf16_4096x4096.comp"
-    ) is None
+    assert (
+        frame_parallel_batch_shader_file(
+            "rms_norm_batch16_bf16_h4096_eps1e-06_offset1.comp"
+        )
+        == "rms_norm_batch1_bf16_h4096_eps1e-06_offset1.comp"
+    )
+    assert (
+        frame_parallel_batch_shader_file(
+            "split_batch16_bf16_2x16x256_head_interleaved.comp"
+        )
+        == "split_batch1_bf16_2x16x256_head_interleaved.comp"
+    )
+    assert (
+        frame_parallel_batch_shader_file("linear_batch16_bf16_4096x4096.comp") is None
+    )
 
 
 def test_compiler_orders_frame_parallel_before_portable_batch_implementation() -> None:
@@ -180,12 +196,16 @@ def test_compiler_orders_frame_parallel_before_portable_batch_implementation() -
 
 def test_compiler_selects_stateful_causal_scan_kernels() -> None:
     assert CAUSAL_SCAN_LANE_TILE_WIDTH == 64
-    assert causal_scan_batch_shader_file(
-        "causal_conv1d_silu_bf16_c8192_k4.comp"
-    ) == "causal_conv1d_silu_temporal_bf16_c8192_k4.comp"
-    assert causal_scan_batch_shader_file(
-        "gated_delta_step_k16x128_v32x128_af32_dtbf16_nf32_eps1e-06.comp"
-    ) == "gated_delta_scan_k16x128_v32x128_af32_dtbf16_nf32_eps1e-06.comp"
+    assert (
+        causal_scan_batch_shader_file("causal_conv1d_silu_bf16_c8192_k4.comp")
+        == "causal_conv1d_silu_temporal_bf16_c8192_k4.comp"
+    )
+    assert (
+        causal_scan_batch_shader_file(
+            "gated_delta_step_k16x128_v32x128_af32_dtbf16_nf32_eps1e-06.comp"
+        )
+        == "gated_delta_scan_k16x128_v32x128_af32_dtbf16_nf32_eps1e-06.comp"
+    )
     assert causal_scan_batch_shader_file(
         "parallel_head_norm_rope_2way_bf16_h16_4_d256_r64_eps1e-06_"
         "offset1_theta10000000_half__sc6.comp"
@@ -194,16 +214,20 @@ def test_compiler_selects_stateful_causal_scan_kernels() -> None:
         "eps1e-06_offset1_theta10000000_half.comp"
     )
     assert causal_scan_batch_shader_file("linear_bf16_4096x4096.comp") is None
-    assert causal_scan_workgroup_count_x(
-        "causal_conv1d_silu_bf16_c8192_k4.comp"
-    ) == 64
-    assert causal_scan_workgroup_count_x(
-        "gated_delta_step_k16x128_v32x128_af32_dtbf16_nf32_eps1e-06.comp"
-    ) == 32
-    assert causal_scan_workgroup_count_x(
-        "parallel_head_norm_rope_2way_bf16_h16_4_d256_r64_eps1e-06_"
-        "offset1_theta10000000_half__sc6.comp"
-    ) == 20
+    assert causal_scan_workgroup_count_x("causal_conv1d_silu_bf16_c8192_k4.comp") == 64
+    assert (
+        causal_scan_workgroup_count_x(
+            "gated_delta_step_k16x128_v32x128_af32_dtbf16_nf32_eps1e-06.comp"
+        )
+        == 32
+    )
+    assert (
+        causal_scan_workgroup_count_x(
+            "parallel_head_norm_rope_2way_bf16_h16_4_d256_r64_eps1e-06_"
+            "offset1_theta10000000_half__sc6.comp"
+        )
+        == 20
+    )
 
     attention_local_size = attention_workgroup_shape(256)[0]
     assert causal_scan_batch_stages(
@@ -236,7 +260,9 @@ def test_compiler_renders_temporal_attention_stages(tmp_path: Path) -> None:
 
     copy_shader_templates(shader_source_dir, tmp_path, shader_files)
 
-    read_source = next(tmp_path.glob("append_gqa_attention_temporal_read_*.comp")).read_text()
+    read_source = next(
+        tmp_path.glob("append_gqa_attention_temporal_read_*.comp")
+    ).read_text()
     assert "layout(set = 0, binding = 6) readonly buffer KvStateRead" in read_source
     assert "const uint ATTENTION_WINDOW = 32768u;" in read_source
     assert "absolute_tick >= batch_control.start_stream_tick_low" in read_source
@@ -246,46 +272,58 @@ def test_compiler_renders_temporal_attention_stages(tmp_path: Path) -> None:
     commit_source = next(tmp_path.glob("append_kv_temporal_commit_*.comp")).read_text()
     assert "layout(set = 0, binding = 7) buffer KvStateWrite" in commit_source
     assert "const uint ATTENTION_WINDOW = 32768u;" in commit_source
-    assert "min(batch_control.dynamic_state_capacity, ATTENTION_WINDOW)" in commit_source
+    assert (
+        "min(batch_control.dynamic_state_capacity, ATTENTION_WINDOW)" in commit_source
+    )
     assert "position * KV_WORD_COUNT + head_word" in commit_source
     assert "{{" not in read_source
     assert "{{" not in commit_source
 
 
 def test_compiler_selects_cooperative_bfloat16_projection_kernels() -> None:
-    assert cooperative_bfloat16_batch_shader_file(
-        "linear_bf16_1024x4096.comp"
-    ) == "linear_batch64_cooperative_bf16_1024x4096.comp"
-    assert cooperative_bfloat16_batch_shader_file(
-        "linear_residual_bf16_4096x1024.comp"
-    ) == "linear_residual_batch64_cooperative_bf16_4096x1024.comp"
-    assert cooperative_bfloat16_batch_shader_file(
-        "parallel_linear_3way_bf16_1024x1024_256_256.comp"
-    ) == (
-        "parallel_linear_batch64_cooperative_3way_bf16_"
-        "1024x1024_256_256.comp"
+    assert (
+        cooperative_bfloat16_batch_shader_file("linear_bf16_1024x4096.comp")
+        == "linear_batch64_cooperative_bf16_1024x4096.comp"
+    )
+    assert (
+        cooperative_bfloat16_batch_shader_file("linear_residual_bf16_4096x1024.comp")
+        == "linear_residual_batch64_cooperative_bf16_4096x1024.comp"
     )
     assert cooperative_bfloat16_batch_shader_file(
-        "parallel_linear_silu_multiply_bf16_1024x4096.comp"
-    ) == (
-        "parallel_linear_silu_multiply_batch64_cooperative_bf16_"
-        "1024x4096.comp"
-    )
-    assert cooperative_bfloat16_workgroup_count_x(
         "parallel_linear_3way_bf16_1024x1024_256_256.comp"
-    ) == 24
-    assert cooperative_bfloat16_workgroup_count_x(
-        "parallel_linear_2way_bf16_1024x1024_256.comp"
-    ) == 20
-    assert cooperative_bfloat16_workgroup_count_x(
-        "parallel_linear_silu_multiply_bf16_1024x4096.comp"
-    ) == 64
+    ) == ("parallel_linear_batch64_cooperative_3way_bf16_1024x1024_256_256.comp")
     assert cooperative_bfloat16_batch_shader_file(
-        "linear_fp8_e4m3_b128x128_1024x4096.comp"
-    ) is None
+        "parallel_linear_silu_multiply_bf16_1024x4096.comp"
+    ) == ("parallel_linear_silu_multiply_batch64_cooperative_bf16_1024x4096.comp")
+    assert (
+        cooperative_bfloat16_workgroup_count_x(
+            "parallel_linear_3way_bf16_1024x1024_256_256.comp"
+        )
+        == 24
+    )
+    assert (
+        cooperative_bfloat16_workgroup_count_x(
+            "parallel_linear_2way_bf16_1024x1024_256.comp"
+        )
+        == 20
+    )
+    assert (
+        cooperative_bfloat16_workgroup_count_x(
+            "parallel_linear_silu_multiply_bf16_1024x4096.comp"
+        )
+        == 64
+    )
+    assert (
+        cooperative_bfloat16_batch_shader_file(
+            "linear_fp8_e4m3_b128x128_1024x4096.comp"
+        )
+        is None
+    )
 
 
-def test_projection_pedal_compiles_ordered_target_native_and_scalar_implementations() -> None:
+def test_projection_pedal_compiles_ordered_target_native_and_scalar_implementations() -> (
+    None
+):
     spec = pedal_kernel_spec(
         execution_index=0,
         node={"id": "project", "op": "linear"},
@@ -401,10 +439,8 @@ def test_compiler_renders_cooperative_bfloat16_batch_shaders(tmp_path: Path) -> 
     shader_files = {
         "linear_batch64_cooperative_bf16_1024x4096.comp",
         "linear_residual_batch64_cooperative_bf16_4096x1024.comp",
-        "parallel_linear_batch64_cooperative_3way_bf16_"
-        "1024x1024_256_256.comp",
-        "parallel_linear_silu_multiply_batch64_cooperative_bf16_"
-        "1024x4096.comp",
+        "parallel_linear_batch64_cooperative_3way_bf16_1024x1024_256_256.comp",
+        "parallel_linear_silu_multiply_batch64_cooperative_bf16_1024x4096.comp",
     }
 
     copy_shader_templates(shader_source_dir, tmp_path, shader_files)
@@ -427,17 +463,14 @@ def test_compiler_renders_cooperative_bfloat16_batch_shaders(tmp_path: Path) -> 
         assert f"shared float result_tile[{expected_result_tile}];" in source
         assert "{{" not in source
     direct_linear = (
-        tmp_path
-        / "linear_residual_batch64_cooperative_bf16_4096x1024.comp"
+        tmp_path / "linear_residual_batch64_cooperative_bf16_4096x1024.comp"
     ).read_text()
     direct_parallel = (
-        tmp_path
-        / "parallel_linear_batch64_cooperative_3way_bf16_"
+        tmp_path / "parallel_linear_batch64_cooperative_3way_bf16_"
         "1024x1024_256_256.comp"
     ).read_text()
     direct_fused = (
-        tmp_path
-        / "parallel_linear_silu_multiply_batch64_cooperative_bf16_"
+        tmp_path / "parallel_linear_silu_multiply_batch64_cooperative_bf16_"
         "1024x4096.comp"
     ).read_text()
     assert "weight.values," in direct_linear
@@ -485,7 +518,9 @@ def test_attention_tile_stays_within_portable_shared_memory_budget(
     assert shared_floats * 4 <= 32 * 1024
 
 
-def test_write_compiled_tensor_preserves_canonical_row_major_order(tmp_path: Path) -> None:
+def test_write_compiled_tensor_preserves_canonical_row_major_order(
+    tmp_path: Path,
+) -> None:
     tensor_name = "matrix.weight"
     values = tuple(range(16))
     source_header = {
@@ -523,7 +558,9 @@ def test_write_compiled_tensor_preserves_canonical_row_major_order(tmp_path: Pat
     assert struct.unpack("<16H", payload) == values
 
 
-def test_compiler_renders_row_major_matrix_and_transducer_shaders(tmp_path: Path) -> None:
+def test_compiler_renders_row_major_matrix_and_transducer_shaders(
+    tmp_path: Path,
+) -> None:
     shader_source_dir = Path(__file__).parents[1] / "runtime-rs" / "shaders"
     shader_files = {
         "linear_bf16_768x2048.comp",
@@ -546,21 +583,15 @@ def test_compiler_renders_row_major_matrix_and_transducer_shaders(tmp_path: Path
     )
     assert (
         "const uint VOCAB_SIZE = 32000u;"
-        in (
-            tmp_path / "embedding_lookup_bf16_32000x768_scale12.comp"
-        ).read_text()
+        in (tmp_path / "embedding_lookup_bf16_32000x768_scale12.comp").read_text()
     )
     assert (
         "gl_WorkGroupID.y"
-        in (
-            tmp_path / "embedding_lookup_batch_bf16_32000x768_scale12.comp"
-        ).read_text()
+        in (tmp_path / "embedding_lookup_batch_bf16_32000x768_scale12.comp").read_text()
     )
     assert (
         "const float EMBEDDING_SCALE = 12;"
-        in (
-            tmp_path / "embedding_lookup_bf16_32000x768_scale12.comp"
-        ).read_text()
+        in (tmp_path / "embedding_lookup_bf16_32000x768_scale12.comp").read_text()
     )
     assert (
         "const float OUTPUT_SCALE = 0.166666667;"
@@ -641,9 +672,7 @@ def test_compiler_renders_fused_parallel_ffn_projection_shader(
     tmp_path: Path,
 ) -> None:
     shader_source_dir = Path(__file__).parents[1] / "runtime-rs" / "shaders"
-    shader_file = (
-        "parallel_linear_silu_multiply_bf16_1024x2560.comp"
-    )
+    shader_file = "parallel_linear_silu_multiply_bf16_1024x2560.comp"
 
     copy_shader_templates(shader_source_dir, tmp_path, {shader_file})
 
@@ -812,8 +841,7 @@ def test_compiler_renders_projected_recurrent_depthwise_shader(
 ) -> None:
     shader_source_dir = Path(__file__).parents[1] / "runtime-rs" / "shaders"
     shader_file = (
-        "linear_split_recurrent_depthwise_gate_bf16_"
-        "1024x1024_k3_ig0_2_og1.comp"
+        "linear_split_recurrent_depthwise_gate_bf16_1024x1024_k3_ig0_2_og1.comp"
     )
 
     copy_shader_templates(shader_source_dir, tmp_path, {shader_file})
@@ -911,9 +939,7 @@ def test_compiler_renders_native_auto_gptq_int4_linear_variants(
 
     linear = (tmp_path / "linear_int4_gptq_g128_512x768.comp").read_text()
     bias = (tmp_path / "linear_bias_int4_gptq_g128_512x768.comp").read_text()
-    residual = (
-        tmp_path / "linear_residual_int4_gptq_g128_512x768.comp"
-    ).read_text()
+    residual = (tmp_path / "linear_residual_int4_gptq_g128_512x768.comp").read_text()
     assert "const uint GROUP_SIZE = 128u;" in linear
     assert "const uint INPUT_SIZE = 512u;" in linear
     assert "const uint OUTPUT_SIZE = 768u;" in linear
@@ -938,9 +964,7 @@ def test_compiler_renders_native_compressed_tensors_int4_linear_variants(
 
     linear = (tmp_path / "linear_int4_ct_g32_512x768.comp").read_text()
     bias = (tmp_path / "linear_bias_int4_ct_g32_512x768.comp").read_text()
-    residual = (
-        tmp_path / "linear_residual_int4_ct_g32_512x768.comp"
-    ).read_text()
+    residual = (tmp_path / "linear_residual_int4_ct_g32_512x768.comp").read_text()
     assert "const uint GROUP_SIZE = 32u;" in linear
     assert "row * PACKED_COLUMNS" in linear
     assert "int(quantized) - 8" in linear
@@ -955,27 +979,52 @@ def test_compiler_renders_native_block_scaled_fp8_sparse_experts(
     shader_source_dir = Path(__file__).parents[1] / "runtime-rs" / "shaders"
     shader_files = {
         "moe_topk_bf16_e256_k8.comp",
-        "sparse_moe_experts_fp8_e4m3_b128x128_h2048_i512_e256_k8.comp",
-        "moe_reduce_bf16_h2048_e256.comp",
+        "sparse_moe_gate_up_fp8_e4m3_b128x128_h2048_i512_e256_k8.comp",
+        "sparse_moe_down_fp8_e4m3_b128x128_h2048_i512_e256_k8.comp",
+        "moe_reduce_bf16_h2048_k8.comp",
         "sigmoid_scalar_multiply_bf16_2048.comp",
     }
 
     copy_shader_templates(shader_source_dir, tmp_path, shader_files)
 
-    expert_shader = (
-        tmp_path
-        / "sparse_moe_experts_fp8_e4m3_b128x128_h2048_i512_e256_k8.comp"
+    gate_up_shader = (
+        tmp_path / "sparse_moe_gate_up_fp8_e4m3_b128x128_h2048_i512_e256_k8.comp"
     ).read_text()
-    assert "const uint NUM_EXPERTS = 256u;" in expert_shader
-    assert "const uint EXPERTS_PER_TOKEN = 8u;" in expert_shader
-    assert "#extension GL_EXT_float_e4m3 : require" in expert_shader
-    assert "uintBitsToFloate4m3EXT" in expert_shader
-    assert "ExpertInputScaleInv" in expert_shader
-    assert "ExpertOutputScaleInv" in expert_shader
-    assert "{{" not in expert_shader
+    down_shader = (
+        tmp_path / "sparse_moe_down_fp8_e4m3_b128x128_h2048_i512_e256_k8.comp"
+    ).read_text()
+    router_shader = (tmp_path / "moe_topk_bf16_e256_k8.comp").read_text()
+    reduce_shader = (tmp_path / "moe_reduce_bf16_h2048_k8.comp").read_text()
+    assert "const uint NUM_EXPERTS = 256u;" in gate_up_shader
+    assert "const uint EXPERTS_PER_TOKEN = 8u;" in gate_up_shader
+    assert "#extension GL_EXT_float_e4m3 : require" in gate_up_shader
+    assert "uintBitsToFloate4m3EXT" in gate_up_shader
+    assert "ExpertInputScaleInv" in gate_up_shader
+    assert "ExpertOutputScaleInv" in down_shader
+    assert "expert_routes.words[route] = (weight << 16u) | expert;" in router_shader
+    assert "route < EXPERTS_PER_TOKEN" in reduce_shader
+    assert all("{{" not in source for source in (gate_up_shader, down_shader))
     assert (
         "const uint HIDDEN_SIZE = 2048u;"
         in (tmp_path / "sigmoid_scalar_multiply_bf16_2048.comp").read_text()
+    )
+
+
+def test_compiler_parallelizes_only_selected_sparse_expert_routes() -> None:
+    attrs = {
+        "hidden_size": 2048,
+        "intermediate_size": 512,
+        "num_experts": 256,
+        "experts_per_token": 8,
+    }
+
+    assert (
+        workgroup_count_x_for_node({}, {"op": "sparse_moe_gate_up", "attrs": attrs}, {})
+        == 2048
+    )
+    assert (
+        workgroup_count_x_for_node({}, {"op": "sparse_moe_down", "attrs": attrs}, {})
+        == 8192
     )
 
 
@@ -1200,16 +1249,13 @@ def test_compiler_renders_hybrid_recurrent_and_gated_attention_pedals(
 
     convolution = (tmp_path / "causal_conv1d_silu_bf16_c6144_k4.comp").read_text()
     recurrence = (
-        tmp_path
-        / "gated_delta_step_k16x128_v16x128_af32_dtbf16_nf32_eps1e-06.comp"
+        tmp_path / "gated_delta_step_k16x128_v16x128_af32_dtbf16_nf32_eps1e-06.comp"
     ).read_text()
     bf16_recurrence = (
-        tmp_path
-        / "gated_delta_step_k16x128_v16x128_abf16_dtbf16_nbf16_eps1e-06.comp"
+        tmp_path / "gated_delta_step_k16x128_v16x128_abf16_dtbf16_nbf16_eps1e-06.comp"
     ).read_text()
     temporal_recurrence = (
-        tmp_path
-        / "gated_delta_scan_k16x128_v16x128_af32_dtbf16_nf32_eps1e-06.comp"
+        tmp_path / "gated_delta_scan_k16x128_v16x128_af32_dtbf16_nf32_eps1e-06.comp"
     ).read_text()
     split = (tmp_path / "split_bf16_2x8x256_head_interleaved.comp").read_text()
     assert "const uint CHANNELS = 6144u;" in convolution
@@ -1227,10 +1273,14 @@ def test_compiler_renders_hybrid_recurrent_and_gated_attention_pedals(
     assert "reduction[gl_SubgroupID] = q_sum;" in temporal_recurrence
     assert "head_output[gl_SubgroupID] = k_sum;" in temporal_recurrence
     assert "head_beta = 1.0 /" in temporal_recurrence
-    assert "float previous = recurrent_state[key_dim] * head_decay;" in temporal_recurrence
+    assert (
+        "float previous = recurrent_state[key_dim] * head_decay;" in temporal_recurrence
+    )
     assert "recurrent_state[key_dim] = previous;" in temporal_recurrence
     assert "float next = recurrent_state[key_dim] + key * delta;" in temporal_recurrence
-    assert "recurrent_state[key_dim] * head_decay + key * delta" not in temporal_recurrence
+    assert (
+        "recurrent_state[key_dim] * head_decay + key * delta" not in temporal_recurrence
+    )
     assert "const uint BLOCKS = 8u;" in split
     assert "const uint BLOCK_PART_WIDTH = 256u;" in split
     assert all(
@@ -1243,20 +1293,23 @@ def test_compiler_renders_sparse_moe_and_scaled_residual_pedals(tmp_path: Path) 
     shader_files = {
         "scaled_add_bf16_1024_scale0.22.comp",
         "moe_topk_bf16_e32_k8.comp",
-        "sparse_moe_experts_bf16_h1024_i512_e32_k8.comp",
-        "moe_reduce_bf16_h1024_e32.comp",
+        "sparse_moe_gate_up_bf16_h1024_i512_e32_k8.comp",
+        "sparse_moe_down_bf16_h1024_i512_e32_k8.comp",
+        "moe_reduce_bf16_h1024_k8.comp",
     }
 
     copy_shader_templates(shader_source_dir, tmp_path, shader_files)
 
     scaled_add = (tmp_path / "scaled_add_bf16_1024_scale0.22.comp").read_text()
     router = (tmp_path / "moe_topk_bf16_e32_k8.comp").read_text()
-    experts = (tmp_path / "sparse_moe_experts_bf16_h1024_i512_e32_k8.comp").read_text()
-    reduce = (tmp_path / "moe_reduce_bf16_h1024_e32.comp").read_text()
+    gate_up = (tmp_path / "sparse_moe_gate_up_bf16_h1024_i512_e32_k8.comp").read_text()
+    down = (tmp_path / "sparse_moe_down_bf16_h1024_i512_e32_k8.comp").read_text()
+    reduce = (tmp_path / "moe_reduce_bf16_h1024_k8.comp").read_text()
     assert "const float RESIDUAL_SCALE = 0.22;" in scaled_add
     assert "const uint NUM_EXPERTS = 32u;" in router
     assert "const uint EXPERTS_PER_TOKEN = 8u;" in router
-    assert "const uint INTERMEDIATE_SIZE = 512u;" in experts
+    assert "const uint INTERMEDIATE_SIZE = 512u;" in gate_up
+    assert "const uint INTERMEDIATE_SIZE = 512u;" in down
     assert "const uint HIDDEN_SIZE = 1024u;" in reduce
     assert all(
         "{{" not in (tmp_path / shader_file).read_text() for shader_file in shader_files
