@@ -470,14 +470,18 @@ def build_system_circuits(model: Json) -> list[Json]:
 
     sampling = model["sampling"]
     sampler_method = sampling["method"]
+    sampler_presence_penalty = sampling["presence_penalty"]
+    sampler_repetition_penalty = sampling["repetition_penalty"]
     if sampler_method == "greedy":
         sampler_temperature = 1.0
         sampler_top_k = 1
         sampler_top_p = 1.0
+        sampler_min_p = 0.0
     else:
         sampler_temperature = sampling["temperature"]
         sampler_top_k = sampling["top_k"]
         sampler_top_p = sampling["top_p"]
+        sampler_min_p = sampling["min_p"]
     sampler_circuit = _system_circuit(
         pedal_id="sampler",
         operator_type="sampler",
@@ -511,6 +515,9 @@ def build_system_circuits(model: Json) -> list[Json]:
                     "temperature": sampler_temperature,
                     "top_k": sampler_top_k,
                     "top_p": sampler_top_p,
+                    "min_p": sampler_min_p,
+                    "presence_penalty": sampler_presence_penalty,
+                    "repetition_penalty": sampler_repetition_penalty,
                     "randomness": "seed_and_stream_tick",
                 },
             }
@@ -1657,6 +1664,18 @@ def _ffn_tail(
     hidden_size = int(feed_forward["hidden_size"])
     if per_layer_width is not None:
         width = int(per_layer_width)
+        per_layer_embedding_chunks = sorted(
+            (
+                name
+                for name in parameters
+                if name.startswith("per_layer_embedding_chunk_")
+            ),
+            key=lambda name: int(name.rsplit("_", 1)[1]),
+        )
+        if not per_layer_embedding_chunks:
+            raise ValueError(
+                "per-layer input requires compiled per-layer embedding chunks"
+            )
         tail.extend(
             [
                 {
@@ -1666,7 +1685,7 @@ def _ffn_tail(
                     "outputs": ["per_layer_input"],
                     "params": [
                         "token_embedding",
-                        "per_layer_embedding",
+                        *per_layer_embedding_chunks,
                         "per_layer_model_projection",
                         "per_layer_projection_norm",
                     ],
@@ -1675,6 +1694,12 @@ def _ffn_tail(
                         "per_layer_width": width,
                         "layer_index": int(numerics["per_layer_input_layer_index"]),
                         "layer_count": int(numerics["per_layer_input_layer_count"]),
+                        "embedding_chunk_count": int(
+                            numerics["per_layer_embedding_chunk_count"]
+                        ),
+                        "embedding_chunk_rows": int(
+                            numerics["per_layer_embedding_chunk_rows"]
+                        ),
                         "norm_eps": float(numerics["rms_norm_eps"]),
                         "token_embedding_scale": float(
                             numerics["token_embedding_scale"]
@@ -1866,7 +1891,6 @@ def _param_role(name: str) -> str:
         "q_norm": "attention_query_head_normalization",
         "k_norm": "attention_key_head_normalization",
         "token_embedding": "token_embedding_for_per_layer_input",
-        "per_layer_embedding": "packed_per_layer_token_embedding",
         "per_layer_model_projection": "packed_per_layer_context_projection",
         "per_layer_projection_norm": "per_layer_context_projection_normalization",
         "per_layer_input_gate": "per_layer_residual_gate_projection",
@@ -1905,6 +1929,8 @@ def _param_role(name: str) -> str:
     if name.endswith("_scales"):
         weight_id = name.removesuffix("_scales")
         return f"{roles[weight_id]}_group_scales"
+    if name.startswith("per_layer_embedding_chunk_"):
+        return "packed_per_layer_token_embedding_chunk"
     return roles[name]
 
 

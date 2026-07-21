@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import shutil
 import signal
@@ -161,6 +162,16 @@ def main() -> None:
         type=int,
         help="explicit sampler randomness seed (default: 0)",
     )
+    parser.add_argument("--temperature", type=float, help="runtime sampler temperature override")
+    parser.add_argument("--top-k", type=int, help="runtime sampler top-k override")
+    parser.add_argument("--top-p", type=float, help="runtime sampler top-p override")
+    parser.add_argument("--min-p", type=float, help="runtime sampler min-p override")
+    parser.add_argument(
+        "--presence-penalty", type=float, help="runtime sampler presence-penalty override"
+    )
+    parser.add_argument(
+        "--repetition-penalty", type=float, help="runtime sampler repetition-penalty override"
+    )
     parser.add_argument(
         "--no-special-tokens",
         action="store_true",
@@ -294,6 +305,29 @@ def main() -> None:
             parser.error("--seed must be between 0 and 4294967295")
         if args.profile_runs < 1:
             parser.error("--profile-runs must be at least 1")
+        if args.temperature is not None and (
+            not math.isfinite(args.temperature) or args.temperature <= 0
+        ):
+            parser.error("--temperature must be greater than zero")
+        if args.top_k is not None and args.top_k < 1:
+            parser.error("--top-k must be at least 1")
+        if args.top_p is not None and (
+            not math.isfinite(args.top_p) or not 0 < args.top_p <= 1
+        ):
+            parser.error("--top-p must be in (0, 1]")
+        if args.min_p is not None and (
+            not math.isfinite(args.min_p) or not 0 <= args.min_p <= 1
+        ):
+            parser.error("--min-p must be in [0, 1]")
+        if args.presence_penalty is not None and not math.isfinite(
+            args.presence_penalty
+        ):
+            parser.error("--presence-penalty must be finite")
+        if args.repetition_penalty is not None and (
+            not math.isfinite(args.repetition_penalty)
+            or args.repetition_penalty <= 0
+        ):
+            parser.error("--repetition-penalty must be greater than zero")
         run_engine(args)
         return
     reporter = JsonLineCompileReporter() if args.compiler_events_jsonl else None
@@ -364,6 +398,12 @@ def validate_action_options(
         ("--max-new-tokens", args.max_new_tokens is not None),
         ("--speculative-draft-tokens", args.speculative_draft_tokens is not None),
         ("--seed", args.seed is not None),
+        ("--temperature", args.temperature is not None),
+        ("--top-k", args.top_k is not None),
+        ("--top-p", args.top_p is not None),
+        ("--min-p", args.min_p is not None),
+        ("--presence-penalty", args.presence_penalty is not None),
+        ("--repetition-penalty", args.repetition_penalty is not None),
         ("--no-special-tokens", args.no_special_tokens),
         ("--keep-special-tokens", args.keep_special_tokens),
         ("--generated-only", args.generated_only),
@@ -508,6 +548,16 @@ def build_runtime_command(args: argparse.Namespace, package_manifest: Path) -> l
     random_seed = getattr(args, "seed", 0)
     if random_seed != 0:
         runtime_args.extend(["--seed", str(random_seed)])
+    for option, value in (
+        ("--temperature", args.temperature),
+        ("--top-k", args.top_k),
+        ("--top-p", args.top_p),
+        ("--min-p", args.min_p),
+        ("--presence-penalty", args.presence_penalty),
+        ("--repetition-penalty", args.repetition_penalty),
+    ):
+        if value is not None:
+            runtime_args.extend([option, str(value)])
     if args.no_special_tokens:
         runtime_args.append("--no-special-tokens")
     if args.keep_special_tokens:

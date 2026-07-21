@@ -112,11 +112,11 @@ void main() {
         return;
     }
 
-    uint capacity = stream_control.words[4];
+    uint runtime_capacity = stream_control.words[4];
+    uint capacity = ATTENTION_WINDOW == 0u
+        ? runtime_capacity
+        : min(runtime_capacity, ATTENTION_WINDOW);
     uint tokens = capacity == 0u ? 0u : available_tokens(capacity);
-    if (ATTENTION_WINDOW != 0u) {
-        tokens = min(tokens, ATTENTION_WINDOW);
-    }
     uint kv_head = query_head / QUERY_GROUPS_PER_KV_HEAD;
 
     if (local_index < HEAD_WIDTH) {

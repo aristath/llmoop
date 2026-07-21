@@ -15,6 +15,11 @@ from llmoop.compilation import check_compile_cancelled, read_json, write_json
 
 Json = dict[str, Any]
 
+# Vulkan storage-buffer ranges are commonly capped below 4 GiB even when the
+# backing allocation is larger. Keep compiled shader-visible parameter chunks
+# comfortably below that boundary and align chunks to complete tensor rows.
+MAX_SHADER_PARAMETER_CHUNK_BYTES = 1 << 30
+
 
 class ModelTranspileError(RuntimeError):
     pass
@@ -278,6 +283,7 @@ def transpile_model(
         tensor_index["tensors"],
         generation_config=generation_config,
     )
+    segment_per_layer_embedding_parameters(structure, tensor_index)
     check_compile_cancelled(cancel_requested)
 
     if output_dir.exists():
@@ -1531,8 +1537,27 @@ def discover_outer_norm_weight_offset(
 
 
 def discover_sampling_policy(generation_config: Json) -> Json:
+    repetition_penalty = float(generation_config.get("repetition_penalty", 1.0))
+    if not math.isfinite(repetition_penalty) or repetition_penalty <= 0.0:
+        raise ModelTranspileError(
+            "sampling repetition_penalty must be finite and positive, "
+            f"got {repetition_penalty}"
+        )
+    presence_penalty = float(generation_config.get("presence_penalty", 0.0))
+    if not math.isfinite(presence_penalty):
+        raise ModelTranspileError(
+            "sampling presence_penalty must be finite, "
+            f"got {presence_penalty}"
+        )
+    min_p = float(generation_config.get("min_p", 0.0))
+    if not math.isfinite(min_p) or not 0.0 <= min_p <= 1.0:
+        raise ModelTranspileError(f"sampling min_p must be in [0, 1], got {min_p}")
     if not bool(generation_config.get("do_sample", False)):
-        return {"method": "greedy"}
+        return {
+            "method": "greedy",
+            "presence_penalty": presence_penalty,
+            "repetition_penalty": repetition_penalty,
+        }
 
     temperature = float(generation_config.get("temperature", 1.0))
     top_k = int(generation_config.get("top_k", 0))
@@ -1552,6 +1577,9 @@ def discover_sampling_policy(generation_config: Json) -> Json:
         "temperature": temperature,
         "top_k": top_k,
         "top_p": top_p,
+        "min_p": min_p,
+        "presence_penalty": presence_penalty,
+        "repetition_penalty": repetition_penalty,
     }
 
 
@@ -1695,6 +1723,20 @@ def make_layer(
             "per_layer_input_width": layer.per_layer_input_width,
             "per_layer_input_layer_index": layer.index,
             "per_layer_input_layer_count": structure.num_hidden_layers,
+            "per_layer_embedding_chunk_count": len(
+                [
+                    name
+                    for name in layer.tensors
+                    if name.startswith("per_layer_embedding_chunk_")
+                ]
+            )
+            or None,
+            "per_layer_embedding_chunk_rows": (
+                MAX_SHADER_PARAMETER_CHUNK_BYTES
+                // (structure.num_hidden_layers * layer.per_layer_input_width * 2)
+                if layer.per_layer_input_width is not None
+                else None
+            ),
             "token_embedding_scale": structure.embedding_scale,
             "per_layer_embedding_scale": (
                 round_float_to_bf16(math.sqrt(layer.per_layer_input_width))
@@ -2333,7 +2375,7 @@ def make_state_ports(
                 "value_shape_per_token": [layer.num_key_value_heads, head_width],
                 "dtype": "BF16",
                 "growth": "per_activation",
-                "window_size": layer.attention_window_size,
+                "max_dynamic_activations": layer.attention_window_size,
                 "sharing": sharing,
             }
         ]
@@ -2497,6 +2539,65 @@ def make_tensor_index(model_dir: Path) -> Json:
         },
         "tensors": tensor_entries,
     }
+
+
+def segment_per_layer_embedding_parameters(
+    structure: ModelStructure, tensor_index: Json
+) -> None:
+    """Expose oversized packed PLE tables as row-aligned compiled tensors.
+
+    Each alias points at a disjoint contiguous source range. Packaging then
+    emits ordinary standalone tensors, so the runtime remains unaware of the
+    source checkpoint's oversized allocation.
+    """
+
+    tensors = tensor_index["tensors"]
+    segmented: dict[str, list[str]] = {}
+    for layer in structure.layers:
+        tensor_name = layer.tensors.get("per_layer_embedding")
+        if tensor_name is None:
+            continue
+        if tensor_name not in segmented:
+            info = tensors[tensor_name]
+            shape = [int(value) for value in info["shape"]]
+            if info.get("dtype") != "BF16" or len(shape) != 2:
+                raise ModelTranspileError(
+                    f"per-layer embedding tensor {tensor_name!r} must be a BF16 matrix"
+                )
+            row_bytes = shape[1] * 2
+            rows_per_chunk = MAX_SHADER_PARAMETER_CHUNK_BYTES // row_bytes
+            if rows_per_chunk == 0:
+                raise ModelTranspileError(
+                    f"per-layer embedding tensor {tensor_name!r} has a row wider than "
+                    "the compiled shader parameter chunk limit"
+                )
+            source_offsets = [int(value) for value in info["data_offsets"]]
+            chunk_names: list[str] = []
+            for chunk_index, row_start in enumerate(
+                range(0, shape[0], rows_per_chunk)
+            ):
+                row_end = min(row_start + rows_per_chunk, shape[0])
+                byte_start = row_start * row_bytes
+                byte_end = row_end * row_bytes
+                chunk_name = f"{tensor_name}.__llmoop_chunk_{chunk_index:03d}"
+                tensors[chunk_name] = {
+                    "dtype": "BF16",
+                    "shape": [row_end - row_start, shape[1]],
+                    "data_offsets": [
+                        source_offsets[0] + byte_start,
+                        source_offsets[0] + byte_end,
+                    ],
+                    "parameter_count": (row_end - row_start) * shape[1],
+                    "byte_count": byte_end - byte_start,
+                    "source_file": info["source_file"],
+                    "source_header_bytes": int(info["source_header_bytes"]),
+                }
+                chunk_names.append(chunk_name)
+            segmented[tensor_name] = chunk_names
+
+        del layer.tensors["per_layer_embedding"]
+        for chunk_index, chunk_name in enumerate(segmented[tensor_name]):
+            layer.tensors[f"per_layer_embedding_chunk_{chunk_index}"] = chunk_name
 
 
 def discover_safetensor_files(model_dir: Path) -> tuple[Path, ...]:

@@ -219,7 +219,7 @@ def test_compiler_selects_stateful_causal_scan_kernels() -> None:
             "workgroup_count_x": 16 * 64,
         },
         {
-            "shader_path": "shaders/append_kv_temporal_commit_bf16_kv4_d256.comp",
+            "shader_path": "shaders/append_kv_temporal_commit_bf16_kv4_d256_w0.comp",
             "local_size_x": 64,
             "workgroup_count_x": 4,
         },
@@ -231,7 +231,7 @@ def test_compiler_renders_temporal_attention_stages(tmp_path: Path) -> None:
     shader_files = {
         "append_gqa_attention_temporal_read_bf16_"
         "q16_kv4_d256_scale0.0625_w32768_sinks.comp",
-        "append_kv_temporal_commit_bf16_kv4_d256_sinks.comp",
+        "append_kv_temporal_commit_bf16_kv4_d256_w32768_sinks.comp",
     }
 
     copy_shader_templates(shader_source_dir, tmp_path, shader_files)
@@ -245,6 +245,8 @@ def test_compiler_renders_temporal_attention_stages(tmp_path: Path) -> None:
     assert "if (position >= batch_control.batch_width) return;" in read_source
     commit_source = next(tmp_path.glob("append_kv_temporal_commit_*.comp")).read_text()
     assert "layout(set = 0, binding = 7) buffer KvStateWrite" in commit_source
+    assert "const uint ATTENTION_WINDOW = 32768u;" in commit_source
+    assert "min(batch_control.dynamic_state_capacity, ATTENTION_WINDOW)" in commit_source
     assert "position * KV_WORD_COUNT + head_word" in commit_source
     assert "{{" not in read_source
     assert "{{" not in commit_source
@@ -594,21 +596,24 @@ def test_compiler_renders_direct_three_way_linear_split_shaders(tmp_path: Path) 
 def test_compiler_renders_row_major_per_layer_embedding_shader(tmp_path: Path) -> None:
     shader_source_dir = Path(__file__).parents[1] / "runtime-rs" / "shaders"
     shader_file = (
-        "per_layer_embedding_bf16_v32000_h1024_p128_l2of8_eps1e-06_"
-        "tes1_pes1_mps1_cs1__sc5.comp"
+        "per_layer_embedding_bf16_v32000_h1024_p128_l2of8_c3r12000_"
+        "eps1e-06_tes1_pes1_mps1_cs1__sc7.comp"
     )
 
     copy_shader_templates(shader_source_dir, tmp_path, {shader_file})
 
     source = (tmp_path / shader_file).read_text()
     assert "readonly buffer TokenEmbedding { uint words[]; }" in source
-    assert "readonly buffer PerLayerEmbedding { uint words[]; }" in source
+    assert "binding = 2) readonly buffer PerLayerEmbeddingChunk0" in source
+    assert "binding = 4) readonly buffer PerLayerEmbeddingChunk2" in source
     assert "readonly buffer ModelProjection { uint words[]; }" in source
     assert "token_id * INPUT_WORDS + word" in source
-    assert "token_id * PACKED_WORDS + word" in source
+    assert "uint chunk = token_id / EMBEDDING_CHUNK_ROWS;" in source
+    assert "row * PACKED_WORDS + word" in source
     assert "row * INPUT_WORDS + word" in source
     assert "uvec2" not in source
-    assert "layout(set = 0, binding = 5) readonly buffer StreamControl" in source
+    assert "layout(set = 0, binding = 7) readonly buffer StreamControl" in source
+    assert "round_bf16(lo_projection + lo_identity)" in source
     assert "{{" not in source
 
 
@@ -737,6 +742,8 @@ def test_compiler_renders_parallel_head_norm_rope_shader(tmp_path: Path) -> None
     assert "const bool ROPE_INTERLEAVED = false;" in source
     assert "layout(set = 0, binding = 6) readonly buffer StreamControl" in source
     assert "shared uint normalized_words" in source
+    assert "float cosine = round_bf16(cos(angle));" in source
+    assert "return round_bf16(direct + rotated);" in source
     assert "{{" not in source
 
 
@@ -1000,6 +1007,8 @@ def test_compiler_renders_attention_pedals_from_discovered_dimensions(
     assert "const float ROPE_THETA = 100000;" in rope
     assert "const bool ROPE_INTERLEAVED = false;" in rope
     assert "binding = 2) readonly buffer StreamControl" in rope
+    assert "float sine = round_bf16(sin(angle));" in rope
+    assert "return round_bf16(direct + rotated);" in rope
     assert "const uint KV_HEADS = 5u;" in append
     assert "binding = 9) readonly buffer StreamControl" in append
     assert "const uint QUERY_HEADS = 15u;" in attention
@@ -1016,7 +1025,7 @@ def test_compiler_renders_model_owned_sampling_shader(tmp_path: Path) -> None:
     shader_source_dir = Path(__file__).parents[1] / "runtime-rs" / "shaders"
     candidate_shader_file = "temperature_top_k_candidates_f32_248320_k20_g128_l256.comp"
     sampler_shader_file = (
-        "temperature_top_k_top_p_sampler_f32_t0.6_k20_p0.95_g128_l256.comp"
+        "temperature_top_k_top_p_sampler_f32_t0.6_k20_p0.95_m0_g128_l256.comp"
     )
 
     copy_shader_templates(
@@ -1033,10 +1042,41 @@ def test_compiler_renders_model_owned_sampling_shader(tmp_path: Path) -> None:
     assert "subgroupMax(local_logit)" in candidates
     assert "const float TEMPERATURE = 0.6;" in sampler
     assert "const float TOP_P = 0.95;" in sampler
+    assert "const float MIN_P = 0;" in sampler
     assert "binding = 3) readonly buffer SamplerSeed" in sampler
     assert "partition_cursors" in sampler
     assert "{{" not in candidates
     assert "{{" not in sampler
+
+
+def test_compiler_renders_repetition_state_as_sampler_pedal_artifacts(
+    tmp_path: Path,
+) -> None:
+    shader_source_dir = Path(__file__).parents[1] / "runtime-rs" / "shaders"
+    tracker_file = "record_seen_token_65536.comp"
+    batch_tracker_file = "record_seen_tokens_batch64_65536.comp"
+    candidate_file = (
+        "temperature_top_k_candidates_repetition_f32_65536_"
+        "rp1.05_pp1.5_k50_g128_l256.comp"
+    )
+
+    copy_shader_templates(
+        shader_source_dir,
+        tmp_path,
+        {tracker_file, batch_tracker_file, candidate_file},
+    )
+
+    tracker = (tmp_path / tracker_file).read_text()
+    batch_tracker = (tmp_path / batch_tracker_file).read_text()
+    candidates = (tmp_path / candidate_file).read_text()
+    assert "const uint VOCAB_SIZE = 65536u;" in tracker
+    assert "atomicOr(seen_tokens.words" in tracker
+    assert "layout(push_constant) uniform PushConstants" in batch_tracker
+    assert "const float REPETITION_PENALTY = 1.05;" in candidates
+    assert "const float PRESENCE_PENALTY = 1.5;" in candidates
+    assert "value < 0.0 ? value * REPETITION_PENALTY" in candidates
+    assert "binding = 2) readonly buffer SeenTokens" in candidates
+    assert all("{{" not in source for source in (tracker, batch_tracker, candidates))
 
 
 def test_compiler_renders_biased_recurrent_and_windowed_attention_pedals(
@@ -1063,6 +1103,7 @@ def test_compiler_renders_biased_recurrent_and_windowed_attention_pedals(
     assert "const uint HEADS = 2u;" in recurrent
     assert "binding = 13) readonly buffer StreamControl" in recurrent
     assert "const uint ATTENTION_WINDOW = 8u;" in attention
+    assert "min(runtime_capacity, ATTENTION_WINDOW)" in attention
     assert all(
         "{{" not in (tmp_path / shader_file).read_text() for shader_file in shader_files
     )

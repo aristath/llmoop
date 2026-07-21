@@ -12,6 +12,7 @@ from llmoop.model_transpiler import (
     discover_sampling_policy,
     make_layer,
     make_model_graph,
+    segment_per_layer_embedding_parameters,
     synthesize_packed_expert_tensors,
 )
 
@@ -21,7 +22,11 @@ def _tensor(shape: list[int], dtype: str = "BF16") -> dict[str, object]:
 
 
 def test_discovers_model_owned_sampling_policy() -> None:
-    assert discover_sampling_policy({}) == {"method": "greedy"}
+    assert discover_sampling_policy({}) == {
+        "method": "greedy",
+        "presence_penalty": 0.0,
+        "repetition_penalty": 1.0,
+    }
     assert discover_sampling_policy(
         {
             "do_sample": True,
@@ -34,6 +39,27 @@ def test_discovers_model_owned_sampling_policy() -> None:
         "temperature": 0.6,
         "top_k": 20,
         "top_p": 0.95,
+        "min_p": 0.0,
+        "presence_penalty": 0.0,
+        "repetition_penalty": 1.0,
+    }
+    assert discover_sampling_policy(
+        {
+            "do_sample": True,
+            "temperature": 0.1,
+            "top_k": 50,
+            "min_p": 0.04,
+            "presence_penalty": 1.5,
+            "repetition_penalty": 1.05,
+        }
+    ) == {
+        "method": "temperature_top_k_top_p",
+        "temperature": 0.1,
+        "top_k": 50,
+        "top_p": 1.0,
+        "min_p": 0.04,
+        "presence_penalty": 1.5,
+        "repetition_penalty": 1.05,
     }
 
 
@@ -579,8 +605,8 @@ def test_discovers_mixed_window_attention_sinks_and_shared_sparse_experts() -> N
 
     full = make_layer(structure, structure.layers[0])
     sliding = make_layer(structure, structure.layers[1])
-    assert full["state_ports"][0]["window_size"] is None
-    assert sliding["state_ports"][0]["window_size"] == 128
+    assert full["state_ports"][0]["max_dynamic_activations"] is None
+    assert sliding["state_ports"][0]["max_dynamic_activations"] == 128
 
     circuit = build_pedal_circuit(sliding, Path("layer_01.json"))
     nodes = {node["id"]: node for node in circuit["nodes"]}
@@ -742,6 +768,40 @@ def test_discovers_multimodal_decoder_with_per_layer_inputs_and_shared_kv() -> N
     assert "ffn_post_norm" in structure.layers[0].tensors
     assert structure.layers[0].per_layer_input_width == 2
     assert "k_projection" not in structure.layers[2].tensors
+
+    packed_name = f"{language_root}.embed_tokens_per_layer.weight"
+    tensor_index = {
+        "tensors": {
+            packed_name: {
+                "dtype": "BF16",
+                "shape": [150_000_000, 8],
+                "data_offsets": [64, 2_400_000_064],
+                "parameter_count": 1_200_000_000,
+                "byte_count": 2_400_000_000,
+                "source_file": "/models/source.safetensors",
+                "source_header_bytes": 128,
+            }
+        }
+    }
+    segment_per_layer_embedding_parameters(structure, tensor_index)
+    chunk_names = [
+        structure.layers[0].tensors[f"per_layer_embedding_chunk_{index}"]
+        for index in range(3)
+    ]
+    assert all(
+        layer.tensors[f"per_layer_embedding_chunk_{index}"] == chunk_names[index]
+        for layer in structure.layers
+        for index in range(3)
+    )
+    assert all("per_layer_embedding" not in layer.tensors for layer in structure.layers)
+    chunks = [tensor_index["tensors"][name] for name in chunk_names]
+    assert [chunk["shape"][0] for chunk in chunks] == [
+        67_108_864,
+        67_108_864,
+        15_782_272,
+    ]
+    assert chunks[0]["data_offsets"][0] == 64
+    assert chunks[-1]["data_offsets"][1] == 2_400_000_064
 
 
 def test_discovers_recurrent_block_pattern_biases_and_numerics_by_structure() -> None:

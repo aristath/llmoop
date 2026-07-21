@@ -4,16 +4,18 @@ layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
 layout(set = 0, binding = 0) buffer OutputFrame { uint words[]; } output_frame;
 layout(set = 0, binding = 1) readonly buffer TokenEmbedding { uint words[]; } token_embedding;
-layout(set = 0, binding = 2) readonly buffer PerLayerEmbedding { uint words[]; } per_layer_embedding;
-layout(set = 0, binding = 3) readonly buffer ModelProjection { uint words[]; } model_projection;
-layout(set = 0, binding = 4) readonly buffer ProjectionNorm { uint words[]; } projection_norm;
-layout(set = 0, binding = 5) readonly buffer StreamControl { uint words[]; } stream_control;
+{{PER_LAYER_EMBEDDING_BINDINGS}}
+layout(set = 0, binding = {{MODEL_PROJECTION_BINDING}}) readonly buffer ModelProjection { uint words[]; } model_projection;
+layout(set = 0, binding = {{PROJECTION_NORM_BINDING}}) readonly buffer ProjectionNorm { uint words[]; } projection_norm;
+layout(set = 0, binding = {{STREAM_CONTROL_BINDING}}) readonly buffer StreamControl { uint words[]; } stream_control;
 
 const uint VOCAB_SIZE = {{VOCAB_SIZE}}u;
 const uint HIDDEN_SIZE = {{HIDDEN_SIZE}}u;
 const uint PER_LAYER_WIDTH = {{PER_LAYER_WIDTH}}u;
 const uint LAYER_INDEX = {{LAYER_INDEX}}u;
 const uint LAYER_COUNT = {{LAYER_COUNT}}u;
+const uint EMBEDDING_CHUNK_COUNT = {{EMBEDDING_CHUNK_COUNT}}u;
+const uint EMBEDDING_CHUNK_ROWS = {{EMBEDDING_CHUNK_ROWS}}u;
 const uint INPUT_WORDS = (HIDDEN_SIZE + 1u) / 2u;
 const uint PACKED_WIDTH = LAYER_COUNT * PER_LAYER_WIDTH;
 const uint PACKED_WORDS = (PACKED_WIDTH + 1u) / 2u;
@@ -38,7 +40,10 @@ uint token_embedding_word(uint token_id, uint word) {
     return token_embedding.words[token_id * INPUT_WORDS + word];
 }
 uint per_layer_embedding_word(uint token_id, uint word) {
-    return per_layer_embedding.words[token_id * PACKED_WORDS + word];
+    uint chunk = token_id / EMBEDDING_CHUNK_ROWS;
+    uint row = token_id % EMBEDDING_CHUNK_ROWS;
+{{PER_LAYER_EMBEDDING_READS}}
+    return 0u;
 }
 uint projection_word(uint row, uint word) {
     return model_projection.words[row * INPUT_WORDS + word];
@@ -88,13 +93,17 @@ void main() {
         uint absolute_lo = LAYER_INDEX * PER_LAYER_WIDTH + lo_dim;
         float lo_projection = round_bf16(projected[lo_dim] * inv_rms * norm_weight(lo_dim));
         float lo_identity = packed_embedding_value(token_id, absolute_lo);
-        uint lo = f32_to_bf16((lo_projection + lo_identity) * COMBINATION_SCALE);
+        uint lo = f32_to_bf16(
+            round_bf16(lo_projection + lo_identity) * COMBINATION_SCALE
+        );
         uint hi = 0u;
         if (hi_dim < PER_LAYER_WIDTH) {
             uint absolute_hi = LAYER_INDEX * PER_LAYER_WIDTH + hi_dim;
             float hi_projection = round_bf16(projected[hi_dim] * inv_rms * norm_weight(hi_dim));
             float hi_identity = packed_embedding_value(token_id, absolute_hi);
-            hi = f32_to_bf16((hi_projection + hi_identity) * COMBINATION_SCALE);
+            hi = f32_to_bf16(
+                round_bf16(hi_projection + hi_identity) * COMBINATION_SCALE
+            );
         }
         output_frame.words[word] = (hi << 16) | lo;
     }

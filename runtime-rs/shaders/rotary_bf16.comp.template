@@ -32,6 +32,10 @@ uint f32_to_bf16(float value) {
     return (bits + rounding_bias) >> 16;
 }
 
+float round_bf16(float value) {
+    return bf16_to_f32(f32_to_bf16(value));
+}
+
 float read_input(uint index) {
     uint packed = input_frame.words[index >> 1];
     uint value = ((index & 1u) == 0u) ? (packed & 0xffffu) : (packed >> 16);
@@ -83,8 +87,11 @@ float rotate(uint base, uint dim) {
         return read_input(base + dim);
     }
     float angle = rope_angle(dim);
-    return (read_input(base + dim) * cos(angle))
-        + (rotate_value(base, dim) * sin(angle));
+    float cosine = round_bf16(cos(angle));
+    float sine = round_bf16(sin(angle));
+    float direct = round_bf16(read_input(base + dim) * cosine);
+    float rotated = round_bf16(rotate_value(base, dim) * sine);
+    return round_bf16(direct + rotated);
 }
 
 void main() {

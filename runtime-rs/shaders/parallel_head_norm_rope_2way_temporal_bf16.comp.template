@@ -46,6 +46,10 @@ uint f32_to_bf16(float value) {
     return (bits + 0x7fffu + lsb) >> 16;
 }
 
+float round_bf16(float value) {
+    return bf16_to_f32(f32_to_bf16(value));
+}
+
 uint branch_frame_words(uint branch) {
     return branch == 0u ? BRANCH_A_WORDS : BRANCH_B_WORDS;
 }
@@ -114,8 +118,11 @@ float rope_angle(uint dim, uint position) {
 float rotate(uint dim, uint position) {
     if (!ROPE_PROPORTIONAL && dim >= ROTARY_WIDTH) return read_normalized(dim);
     float angle = rope_angle(dim, position);
-    return (read_normalized(dim) * cos(angle))
-        + (rotate_value(dim) * sin(angle));
+    float cosine = round_bf16(cos(angle));
+    float sine = round_bf16(sin(angle));
+    float direct = round_bf16(read_normalized(dim) * cosine);
+    float rotated = round_bf16(rotate_value(dim) * sine);
+    return round_bf16(direct + rotated);
 }
 
 void write_branch_output(

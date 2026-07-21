@@ -248,14 +248,55 @@ def build_vulkan_resident_package_manifest(
     logits_bytes = vocab_size * dtype_byte_count("F32")
     sampling = model_graph["sampling"]
     sampler_method = str(sampling["method"])
+    sampler_presence_penalty = float(sampling["presence_penalty"])
+    sampler_repetition_penalty = float(sampling["repetition_penalty"])
+    sampler_uses_token_state = (
+        sampler_presence_penalty != 0.0 or sampler_repetition_penalty != 1.0
+    )
+    sampler_partition_count = 128
+    sampler_candidate_local_size_x = 256
+    sampler_merge_local_size_x = 256
+    sampler_top_k_capacity = min(
+        vocab_size,
+        max(256, int(sampling.get("top_k", 1))),
+    )
+    sampler_scratch_byte_capacity = (
+        sampler_partition_count * sampler_top_k_capacity * 8
+    )
+    sampler_state_kernels = []
+    if sampler_uses_token_state:
+        sampler_state_kernels = [
+            {
+                "role": "record_current_token",
+                "shader_path": compiled_shader_path(
+                    f"shaders/record_seen_token_{vocab_size}.comp"
+                ),
+                "local_size_x": 1,
+                "workgroup_count_x": 1,
+            },
+            {
+                "role": "record_token_batch",
+                "shader_path": compiled_shader_path(
+                    f"shaders/record_seen_tokens_batch64_{vocab_size}.comp"
+                ),
+                "local_size_x": 64,
+                "workgroup_count_x": 1,
+            },
+        ]
     if sampler_method == "greedy":
         sampler_id = "greedy_sampler"
-        sampler_shader_file = f"greedy_sampler_f32_{vocab_size}.comp"
+        sampler_shader_file = (
+            f"greedy_sampler_repetition_f32_{vocab_size}"
+            f"_rp{shader_float_token(sampler_repetition_penalty)}"
+            f"_pp{shader_float_token(sampler_presence_penalty)}.comp"
+            if sampler_uses_token_state
+            else f"greedy_sampler_f32_{vocab_size}.comp"
+        )
         sampler_temperature = 1.0
         sampler_top_k = 1
         sampler_top_p = 1.0
-        sampler_scratch_byte_capacity = 0
-        sampler_kernels = [
+        sampler_min_p = 0.0
+        sampler_kernels = sampler_state_kernels + [
             {
                 "role": "sample_logits",
                 "shader_path": compiled_shader_path(f"shaders/{sampler_shader_file}"),
@@ -268,12 +309,15 @@ def build_vulkan_resident_package_manifest(
         sampler_temperature = float(sampling["temperature"])
         sampler_top_k = int(sampling["top_k"])
         sampler_top_p = float(sampling["top_p"])
-        sampler_partition_count = 128
-        sampler_candidate_local_size_x = 256
-        sampler_merge_local_size_x = 256
-        sampler_scratch_byte_capacity = sampler_partition_count * sampler_top_k * 8
+        sampler_min_p = float(sampling["min_p"])
         sampler_candidate_shader_file = (
-            f"temperature_top_k_candidates_f32_{vocab_size}"
+            f"temperature_top_k_candidates_repetition_f32_{vocab_size}"
+            f"_rp{shader_float_token(sampler_repetition_penalty)}"
+            f"_pp{shader_float_token(sampler_presence_penalty)}"
+            f"_k{sampler_top_k}_g{sampler_partition_count}"
+            f"_l{sampler_candidate_local_size_x}.comp"
+            if sampler_uses_token_state
+            else f"temperature_top_k_candidates_f32_{vocab_size}"
             f"_k{sampler_top_k}_g{sampler_partition_count}"
             f"_l{sampler_candidate_local_size_x}.comp"
         )
@@ -281,9 +325,10 @@ def build_vulkan_resident_package_manifest(
             f"temperature_top_k_top_p_sampler_f32"
             f"_t{shader_float_token(sampler_temperature)}"
             f"_k{sampler_top_k}_p{shader_float_token(sampler_top_p)}"
+            f"_m{shader_float_token(sampler_min_p)}"
             f"_g{sampler_partition_count}_l{sampler_merge_local_size_x}.comp"
         )
-        sampler_kernels = [
+        sampler_kernels = sampler_state_kernels + [
             {
                 "role": "partition_top_k",
                 "shader_path": compiled_shader_path(
@@ -301,6 +346,58 @@ def build_vulkan_resident_package_manifest(
         ]
     else:
         raise ModelCompileError(f"unsupported sampling method {sampler_method!r}")
+
+    runtime_sampler_kernels = [
+        {
+            "role": "runtime_record_current_token",
+            "shader_path": compiled_shader_path(
+                f"shaders/record_seen_token_{vocab_size}.comp"
+            ),
+            "local_size_x": 1,
+            "workgroup_count_x": 1,
+        },
+        {
+            "role": "runtime_record_token_batch",
+            "shader_path": compiled_shader_path(
+                f"shaders/record_seen_tokens_batch64_{vocab_size}.comp"
+            ),
+            "local_size_x": 64,
+            "workgroup_count_x": 1,
+        },
+    ]
+    runtime_sampler_kernels.extend(
+        [
+            {
+                "role": "runtime_sample_logits",
+                "shader_path": compiled_shader_path(
+                    f"shaders/greedy_sampler_runtime_f32_{vocab_size}.comp"
+                ),
+                "local_size_x": 1024,
+                "workgroup_count_x": 1,
+            },
+            {
+                "role": "runtime_partition_top_k",
+                "shader_path": compiled_shader_path(
+                    f"shaders/temperature_top_k_candidates_runtime_f32_{vocab_size}"
+                    f"_kc{sampler_top_k_capacity}_g{sampler_partition_count}"
+                    f"_l{sampler_candidate_local_size_x}.comp"
+                ),
+                "local_size_x": sampler_candidate_local_size_x,
+                "workgroup_count_x": sampler_partition_count,
+            },
+            {
+                "role": "runtime_sample_candidates",
+                "shader_path": compiled_shader_path(
+                    f"shaders/temperature_top_k_top_p_sampler_runtime_f32"
+                    f"_kc{sampler_top_k_capacity}_g{sampler_partition_count}"
+                    f"_l{sampler_merge_local_size_x}.comp"
+                ),
+                "local_size_x": sampler_merge_local_size_x,
+                "workgroup_count_x": 1,
+            },
+        ]
+    )
+    sampler_kernels += runtime_sampler_kernels
 
     embed_tensor = model_graph["graph"]["input_transducer"]["params"]["weight"][
         "tensor"
@@ -625,6 +722,11 @@ def build_vulkan_resident_package_manifest(
                 "temperature": sampler_temperature,
                 "top_k": sampler_top_k,
                 "top_p": sampler_top_p,
+                "min_p": sampler_min_p,
+                "presence_penalty": sampler_presence_penalty,
+                "repetition_penalty": sampler_repetition_penalty,
+                "top_k_capacity": sampler_top_k_capacity,
+                "runtime_parameterized": False,
                 "logits_byte_capacity": logits_bytes,
                 "output_byte_capacity": 16,
                 "scratch_byte_capacity": sampler_scratch_byte_capacity,
@@ -1011,6 +1113,7 @@ def causal_scan_batch_stages(shader_file: str, local_size_x: int) -> list[Json] 
         1,
     )
     sinks = "_sinks" if attention.group(6) else ""
+    attention_window = attention.group(5) or "0"
     return [
         {
             "shader_path": f"shaders/{stem}",
@@ -1020,7 +1123,7 @@ def causal_scan_batch_stages(shader_file: str, local_size_x: int) -> list[Json] 
         {
             "shader_path": (
                 "shaders/append_kv_temporal_commit_bf16_"
-                f"kv{kv_heads}_d{head_width}{sinks}.comp"
+                f"kv{kv_heads}_d{head_width}_w{attention_window}{sinks}.comp"
             ),
             "local_size_x": 64,
             "workgroup_count_x": kv_heads,
@@ -1788,6 +1891,7 @@ def shader_file_for_node(
         return (
             f"per_layer_embedding_bf16_v{vocab_size}_h{attrs['hidden_size']}"
             f"_p{attrs['per_layer_width']}_l{attrs['layer_index']}of{attrs['layer_count']}"
+            f"_c{attrs['embedding_chunk_count']}r{attrs['embedding_chunk_rows']}"
             f"_eps{shader_float_token(float(attrs['norm_eps']))}"
             f"_tes{shader_float_token(float(attrs['token_embedding_scale']))}"
             f"_pes{shader_float_token(float(attrs['per_layer_embedding_scale']))}"
@@ -2920,14 +3024,56 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
             ("VOCAB_SIZE",),
         ),
         (
+            r"greedy_sampler_repetition_f32_(\d+)_rp([0-9eE+.-]+)_pp([0-9eE+.-]+)\.comp",
+            "greedy_sampler_repetition_f32.comp.template",
+            ("VOCAB_SIZE", "REPETITION_PENALTY", "PRESENCE_PENALTY"),
+        ),
+        (
+            r"greedy_sampler_runtime_f32_(\d+)\.comp",
+            "greedy_sampler_runtime_f32.comp.template",
+            ("VOCAB_SIZE",),
+        ),
+        (
             r"temperature_top_k_candidates_f32_(\d+)_k(\d+)_g(\d+)_l(\d+)\.comp",
             "temperature_top_k_candidates_f32.comp.template",
             ("VOCAB_SIZE", "TOP_K", "PARTITION_COUNT", "LOCAL_SIZE_X"),
         ),
         (
-            r"temperature_top_k_top_p_sampler_f32_t([0-9eE+.-]+)_k(\d+)_p([0-9eE+.-]+)_g(\d+)_l(\d+)\.comp",
+            r"temperature_top_k_candidates_repetition_f32_(\d+)_rp([0-9eE+.-]+)_pp([0-9eE+.-]+)_k(\d+)_g(\d+)_l(\d+)\.comp",
+            "temperature_top_k_candidates_repetition_f32.comp.template",
+            (
+                "VOCAB_SIZE",
+                "REPETITION_PENALTY",
+                "PRESENCE_PENALTY",
+                "TOP_K",
+                "PARTITION_COUNT",
+                "LOCAL_SIZE_X",
+            ),
+        ),
+        (
+            r"temperature_top_k_candidates_runtime_f32_(\d+)_kc(\d+)_g(\d+)_l(\d+)\.comp",
+            "temperature_top_k_candidates_runtime_f32.comp.template",
+            ("VOCAB_SIZE", "TOP_K_CAPACITY", "PARTITION_COUNT", "LOCAL_SIZE_X"),
+        ),
+        (
+            r"record_seen_token_(\d+)\.comp",
+            "record_seen_token.comp.template",
+            ("VOCAB_SIZE",),
+        ),
+        (
+            r"record_seen_tokens_batch64_(\d+)\.comp",
+            "record_seen_tokens_batch64.comp.template",
+            ("VOCAB_SIZE",),
+        ),
+        (
+            r"temperature_top_k_top_p_sampler_f32_t([0-9eE+.-]+)_k(\d+)_p([0-9eE+.-]+)_m([0-9eE+.-]+)_g(\d+)_l(\d+)\.comp",
             "temperature_top_k_top_p_sampler_f32.comp.template",
-            ("TEMPERATURE", "TOP_K", "TOP_P", "PARTITION_COUNT", "LOCAL_SIZE_X"),
+            ("TEMPERATURE", "TOP_K", "TOP_P", "MIN_P", "PARTITION_COUNT", "LOCAL_SIZE_X"),
+        ),
+        (
+            r"temperature_top_k_top_p_sampler_runtime_f32_kc(\d+)_g(\d+)_l(\d+)\.comp",
+            "temperature_top_k_top_p_sampler_runtime_f32.comp.template",
+            ("TOP_K_CAPACITY", "PARTITION_COUNT", "LOCAL_SIZE_X"),
         ),
         (
             r"split_batch(\d+)_bf16_2x(\d+)x(\d+)_head_interleaved\.comp",
@@ -3032,6 +3178,7 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
 
     per_layer_embedding_shape = re.fullmatch(
         r"per_layer_embedding_bf16_v(\d+)_h(\d+)_p(\d+)_l(\d+)of(\d+)"
+        r"_c(\d+)r(\d+)"
         r"_eps([0-9eE+.-]+)_tes([0-9eE+.-]+)_pes([0-9eE+.-]+)"
         r"_mps([0-9eE+.-]+)_cs([0-9eE+.-]+)\.comp",
         shader_file,
@@ -3043,7 +3190,9 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
             per_layer_width,
             layer_index,
             layer_count,
-        ) = map(int, per_layer_embedding_shape.groups()[:5])
+            chunk_count,
+            chunk_rows,
+        ) = map(int, per_layer_embedding_shape.groups()[:7])
         if hidden_size % 2 or per_layer_width % 2:
             raise ModelCompileError(
                 "packed BF16 per-layer embeddings require even hidden and per-layer widths"
@@ -3052,6 +3201,21 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
             raise ModelCompileError(
                 f"per-layer embedding index {layer_index} is outside {layer_count} layers"
             )
+        if chunk_count <= 0 or chunk_rows <= 0:
+            raise ModelCompileError(
+                "per-layer embedding requires positive chunk count and row capacity"
+            )
+        chunk_bindings = "\n".join(
+            f"layout(set = 0, binding = {2 + index}) readonly buffer "
+            f"PerLayerEmbeddingChunk{index} {{ uint words[]; }} "
+            f"per_layer_embedding_chunk_{index};"
+            for index in range(chunk_count)
+        )
+        chunk_reads = "\n".join(
+            f"    if (chunk == {index}u) return "
+            f"per_layer_embedding_chunk_{index}.words[row * PACKED_WORDS + word];"
+            for index in range(chunk_count)
+        )
         return render_shader_template(
             source_dir,
             "per_layer_embedding_bf16.comp.template",
@@ -3061,11 +3225,18 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
                 "PER_LAYER_WIDTH": str(per_layer_width),
                 "LAYER_INDEX": str(layer_index),
                 "LAYER_COUNT": str(layer_count),
-                "NORM_EPS": per_layer_embedding_shape.group(6),
-                "TOKEN_EMBEDDING_SCALE": per_layer_embedding_shape.group(7),
-                "PER_LAYER_EMBEDDING_SCALE": per_layer_embedding_shape.group(8),
-                "MODEL_PROJECTION_SCALE": per_layer_embedding_shape.group(9),
-                "COMBINATION_SCALE": per_layer_embedding_shape.group(10),
+                "EMBEDDING_CHUNK_COUNT": str(chunk_count),
+                "EMBEDDING_CHUNK_ROWS": str(chunk_rows),
+                "PER_LAYER_EMBEDDING_BINDINGS": chunk_bindings,
+                "PER_LAYER_EMBEDDING_READS": chunk_reads,
+                "MODEL_PROJECTION_BINDING": str(2 + chunk_count),
+                "PROJECTION_NORM_BINDING": str(3 + chunk_count),
+                "STREAM_CONTROL_BINDING": str(4 + chunk_count),
+                "NORM_EPS": per_layer_embedding_shape.group(8),
+                "TOKEN_EMBEDDING_SCALE": per_layer_embedding_shape.group(9),
+                "PER_LAYER_EMBEDDING_SCALE": per_layer_embedding_shape.group(10),
+                "MODEL_PROJECTION_SCALE": per_layer_embedding_shape.group(11),
+                "COMBINATION_SCALE": per_layer_embedding_shape.group(12),
             },
         )
 
@@ -3138,7 +3309,7 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
         )
 
     temporal_kv_commit_shape = re.fullmatch(
-        r"append_kv_temporal_commit_bf16_kv(\d+)_d(\d+)(_sinks)?\.comp",
+        r"append_kv_temporal_commit_bf16_kv(\d+)_d(\d+)_w(\d+)(_sinks)?\.comp",
         shader_file,
     )
     if temporal_kv_commit_shape is not None:
@@ -3153,8 +3324,9 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
             {
                 "KV_HEADS": str(kv_heads),
                 "HEAD_WIDTH": str(head_width),
+                "ATTENTION_WINDOW": temporal_kv_commit_shape.group(3),
                 "STATE_WRITE_BINDING": (
-                    "7" if temporal_kv_commit_shape.group(3) else "6"
+                    "7" if temporal_kv_commit_shape.group(4) else "6"
                 ),
             },
         )
@@ -4687,7 +4859,15 @@ def validate_compiled_generation_contract(
         or sampler_attrs.get("randomness") != "seed_and_stream_tick"
         or any(
             sampler_spec.get(field) != sampler_attrs.get(field)
-            for field in ("method", "temperature", "top_k", "top_p")
+            for field in (
+                "method",
+                "temperature",
+                "top_k",
+                "top_p",
+                "min_p",
+                "presence_penalty",
+                "repetition_penalty",
+            )
         )
         or not isinstance(sampler_package.get("kernels"), list)
         or not sampler_package["kernels"]

@@ -34,6 +34,12 @@ def runtime_args(**overrides: object) -> Namespace:
         "context_size": None,
         "vulkan_device_index": None,
         "seed": 0,
+        "temperature": None,
+        "top_k": None,
+        "top_p": None,
+        "min_p": None,
+        "presence_penalty": None,
+        "repetition_penalty": None,
         "no_special_tokens": False,
         "keep_special_tokens": False,
         "generated_only": False,
@@ -79,6 +85,33 @@ class RuntimeCliCommandTest(unittest.TestCase):
                 for index in range(len(build_runtime_command(args, package)) - 1)
             ],
         )
+
+    def test_build_runtime_command_forwards_sampler_overrides(self) -> None:
+        package = Path("packages/model_x/vulkan_resident_package.json")
+        args = runtime_args(
+            prompt="Hello",
+            temperature=1.0,
+            top_k=20,
+            top_p=0.95,
+            min_p=0.02,
+            presence_penalty=1.5,
+            repetition_penalty=1.05,
+        )
+
+        command = build_runtime_command(args, package)
+
+        for expected in (
+            ["--temperature", "1.0"],
+            ["--top-k", "20"],
+            ["--top-p", "0.95"],
+            ["--min-p", "0.02"],
+            ["--presence-penalty", "1.5"],
+            ["--repetition-penalty", "1.05"],
+        ):
+            self.assertIn(
+                expected,
+                [command[index : index + 2] for index in range(len(command) - 1)],
+            )
 
     def test_model_compiler_renders_linear_shader_for_discovered_shape(self) -> None:
         shader_source_dir = Path(__file__).parents[1] / "runtime-rs" / "shaders"
@@ -586,6 +619,28 @@ class RuntimeCliCommandTest(unittest.TestCase):
 
 
 class CompiledPackageTest(unittest.TestCase):
+    def test_compiled_package_contains_both_runtime_sampler_families(self) -> None:
+        fixture = compiled_model_or_skip()
+        manifest = json.loads(fixture.package_manifest.read_text())
+        runtime_roles = {
+            kernel["role"]
+            for kernel in manifest["sampler"]["kernels"]
+            if kernel["role"].startswith("runtime_")
+        }
+
+        self.assertEqual(
+            {
+                "runtime_record_current_token",
+                "runtime_record_token_batch",
+                "runtime_sample_logits",
+                "runtime_partition_top_k",
+                "runtime_sample_candidates",
+            },
+            runtime_roles,
+        )
+        self.assertGreaterEqual(manifest["sampler"]["spec"]["top_k_capacity"], 1)
+        self.assertGreater(manifest["sampler"]["spec"]["scratch_byte_capacity"], 0)
+
     def test_compiled_package_contains_tokenizer_files(self) -> None:
         fixture = compiled_model_or_skip()
         manifest = json.loads(fixture.package_manifest.read_text())

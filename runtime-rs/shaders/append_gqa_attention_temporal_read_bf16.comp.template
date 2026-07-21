@@ -143,12 +143,13 @@ void main() {
     uint dim = subgroup_part * gl_SubgroupSize + gl_SubgroupInvocationID;
     if (position >= batch_control.batch_width) return;
 
-    uint capacity = batch_control.dynamic_state_capacity;
+    uint capacity = ATTENTION_WINDOW == 0u
+        ? batch_control.dynamic_state_capacity
+        : min(batch_control.dynamic_state_capacity, ATTENTION_WINDOW);
     uint kv_head = query_head / QUERY_GROUPS_PER_KV_HEAD;
     {
         uint stream_tick = batch_control.start_stream_tick_low + position;
         uint tokens = capacity == 0u ? 0u : min(stream_tick + 1u, capacity);
-        if (ATTENTION_WINDOW != 0u) tokens = min(tokens, ATTENTION_WINDOW);
         uint oldest_tick = stream_tick + 1u - tokens;
 
         if (local_index < HEAD_WIDTH) {

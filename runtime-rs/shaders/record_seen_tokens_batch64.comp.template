@@ -1,0 +1,28 @@
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer TokenIds {
+    uint values[];
+} token_ids;
+
+layout(set = 0, binding = 1) buffer SeenTokens {
+    uint words[];
+} seen_tokens;
+
+layout(push_constant) uniform PushConstants {
+    uint token_count;
+} push_constants;
+
+const uint VOCAB_SIZE = {{VOCAB_SIZE}}u;
+
+void main() {
+    uint index = gl_LocalInvocationID.x;
+    if (index >= push_constants.token_count) {
+        return;
+    }
+    uint token_id = token_ids.values[index];
+    if (token_id < VOCAB_SIZE) {
+        atomicOr(seen_tokens.words[token_id >> 5u], 1u << (token_id & 31u));
+    }
+}

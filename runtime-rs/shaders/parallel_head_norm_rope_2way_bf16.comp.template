@@ -57,6 +57,10 @@ uint f32_to_bf16(float value) {
     return (bits + rounding_bias) >> 16;
 }
 
+float round_bf16(float value) {
+    return bf16_to_f32(f32_to_bf16(value));
+}
+
 float read_branch_input(uint branch, uint index) {
     uint packed = branch == 0u
         ? input_a.words[index >> 1]
@@ -124,8 +128,11 @@ float rotate(uint dim) {
         return read_normalized(dim);
     }
     float angle = rope_angle(dim);
-    return (read_normalized(dim) * cos(angle))
-        + (rotate_value(dim) * sin(angle));
+    float cosine = round_bf16(cos(angle));
+    float sine = round_bf16(sin(angle));
+    float direct = round_bf16(read_normalized(dim) * cosine);
+    float rotated = round_bf16(rotate_value(dim) * sine);
+    return round_bf16(direct + rotated);
 }
 
 void write_branch_output(uint branch, uint word_index, uint packed) {

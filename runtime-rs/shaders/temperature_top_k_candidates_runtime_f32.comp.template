@@ -1,0 +1,94 @@
+#version 450
+
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x = {{LOCAL_SIZE_X}}, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer Logits { float values[]; } logits;
+layout(set = 0, binding = 1) buffer PartitionCandidates { uvec2 values[]; } partition_candidates;
+layout(set = 0, binding = 2) readonly buffer SeenTokens { uint words[]; } seen_tokens;
+layout(set = 0, binding = 3) readonly buffer SamplerParameters { uint words[]; } sampler_parameters;
+
+const uint VOCAB_SIZE = {{VOCAB_SIZE}}u;
+const uint TOP_K_CAPACITY = {{TOP_K_CAPACITY}}u;
+const uint PARTITION_COUNT = {{PARTITION_COUNT}}u;
+const uint PARTITION_SIZE = (VOCAB_SIZE + PARTITION_COUNT - 1u) / PARTITION_COUNT;
+const uint LOCAL_SIZE_X = {{LOCAL_SIZE_X}}u;
+const float LOWEST_FLOAT = -3.4028234663852886e38;
+
+shared float subgroup_top_logits[{{LOCAL_SIZE_X}}];
+shared uint subgroup_top_token_ids[{{LOCAL_SIZE_X}}];
+shared float selected_logit;
+shared uint selected_token_id;
+
+bool candidate_is_better(float candidate_logit, uint candidate_token_id, float current_logit, uint current_token_id) {
+    return candidate_logit > current_logit
+        || (candidate_logit == current_logit && candidate_token_id < current_token_id);
+}
+
+bool candidate_is_worse(float candidate_logit, uint candidate_token_id, float current_logit, uint current_token_id) {
+    return candidate_logit < current_logit
+        || (candidate_logit == current_logit && candidate_token_id > current_token_id);
+}
+
+float configured_logit(uint token_id) {
+    float value = logits.values[token_id];
+    bool was_seen = (seen_tokens.words[token_id >> 5u] & (1u << (token_id & 31u))) != 0u;
+    if (!was_seen) {
+        return value;
+    }
+    float repetition_penalty = uintBitsToFloat(sampler_parameters.words[5]);
+    value = value < 0.0 ? value * repetition_penalty : value / repetition_penalty;
+    return value - uintBitsToFloat(sampler_parameters.words[4]);
+}
+
+void main() {
+    uint lane = gl_LocalInvocationID.x;
+    uint partition_index = gl_WorkGroupID.x;
+    uint partition_start = partition_index * PARTITION_SIZE;
+    uint partition_end = min(partition_start + PARTITION_SIZE, VOCAB_SIZE);
+    uint top_k = min(sampler_parameters.words[1], TOP_K_CAPACITY);
+    float previous_logit = 0.0;
+    uint previous_token_id = 0u;
+
+    for (uint rank = 0u; rank < top_k; rank += 1u) {
+        float local_logit = LOWEST_FLOAT;
+        uint local_token_id = 0xffffffffu;
+        for (uint token_id = partition_start + lane; token_id < partition_end; token_id += LOCAL_SIZE_X) {
+            float candidate_logit = configured_logit(token_id);
+            if (isnan(candidate_logit)) { continue; }
+            if (rank != 0u && !candidate_is_worse(candidate_logit, token_id, previous_logit, previous_token_id)) { continue; }
+            if (candidate_is_better(candidate_logit, token_id, local_logit, local_token_id)) {
+                local_logit = candidate_logit;
+                local_token_id = token_id;
+            }
+        }
+
+        float subgroup_logit = subgroupMax(local_logit);
+        uint subgroup_token_id = subgroupMin(local_logit == subgroup_logit ? local_token_id : 0xffffffffu);
+        if (subgroupElect()) {
+            subgroup_top_logits[gl_SubgroupID] = subgroup_logit;
+            subgroup_top_token_ids[gl_SubgroupID] = subgroup_token_id;
+        }
+        barrier();
+        if (lane == 0u) {
+            float best_logit = subgroup_top_logits[0];
+            uint best_token_id = subgroup_top_token_ids[0];
+            for (uint subgroup = 1u; subgroup < gl_NumSubgroups; subgroup += 1u) {
+                float candidate_logit = subgroup_top_logits[subgroup];
+                uint candidate_token_id = subgroup_top_token_ids[subgroup];
+                if (candidate_is_better(candidate_logit, candidate_token_id, best_logit, best_token_id)) {
+                    best_logit = candidate_logit;
+                    best_token_id = candidate_token_id;
+                }
+            }
+            selected_logit = best_logit;
+            selected_token_id = best_token_id;
+            partition_candidates.values[partition_index * TOP_K_CAPACITY + rank] = uvec2(floatBitsToUint(best_logit), best_token_id);
+        }
+        barrier();
+        previous_logit = selected_logit;
+        previous_token_id = selected_token_id;
+    }
+}

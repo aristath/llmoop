@@ -1,0 +1,100 @@
+#version 450
+
+layout(local_size_x = 1024, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer Logits {
+    float values[];
+} logits;
+
+layout(set = 0, binding = 1) buffer SamplerOutput {
+    uint words[];
+} sampler_output;
+
+layout(set = 0, binding = 2) buffer StreamControl {
+    uint words[];
+} stream_control;
+
+layout(set = 0, binding = 3) readonly buffer SeenTokens {
+    uint words[];
+} seen_tokens;
+
+const uint VOCAB_SIZE = {{VOCAB_SIZE}}u;
+const float REPETITION_PENALTY = {{REPETITION_PENALTY}};
+const float PRESENCE_PENALTY = {{PRESENCE_PENALTY}};
+const float LOWEST_FLOAT = -3.4028234663852886e38;
+
+shared float best_logits[1024];
+shared uint best_token_ids[1024];
+
+bool candidate_is_better(float candidate_logit, uint candidate_token_id, float best_logit, uint best_token_id) {
+    return candidate_logit > best_logit
+        || (candidate_logit == best_logit && candidate_token_id < best_token_id);
+}
+
+float penalized_logit(uint token_id) {
+    float value = logits.values[token_id];
+    bool was_seen = (seen_tokens.words[token_id >> 5u] & (1u << (token_id & 31u))) != 0u;
+    if (!was_seen) {
+        return value;
+    }
+    value = value < 0.0 ? value * REPETITION_PENALTY : value / REPETITION_PENALTY;
+    return value - PRESENCE_PENALTY;
+}
+
+void main() {
+    uint lane = gl_LocalInvocationID.x;
+    uint best_token_id = lane;
+    float best_logit = lane < VOCAB_SIZE ? penalized_logit(lane) : LOWEST_FLOAT;
+    for (uint token_id = lane + 1024u; token_id < VOCAB_SIZE; token_id += 1024u) {
+        float candidate = penalized_logit(token_id);
+        if (candidate_is_better(candidate, token_id, best_logit, best_token_id)) {
+            best_token_id = token_id;
+            best_logit = candidate;
+        }
+    }
+
+    best_logits[lane] = best_logit;
+    best_token_ids[lane] = best_token_id;
+    barrier();
+
+    for (uint stride = 512u; stride > 0u; stride >>= 1u) {
+        if (lane < stride) {
+            float candidate_logit = best_logits[lane + stride];
+            uint candidate_token_id = best_token_ids[lane + stride];
+            if (candidate_is_better(
+                candidate_logit,
+                candidate_token_id,
+                best_logits[lane],
+                best_token_ids[lane]
+            )) {
+                best_logits[lane] = candidate_logit;
+                best_token_ids[lane] = candidate_token_id;
+            }
+        }
+        barrier();
+    }
+
+    if (lane == 0u) {
+        uint token_id = best_token_ids[0];
+        uint logit_bits = floatBitsToUint(best_logits[0]);
+        uint stream_tick_low = stream_control.words[1];
+        uint history_capacity = stream_control.words[4];
+        uint history_word = 4u + (stream_tick_low % history_capacity) * 4u;
+
+        sampler_output.words[0] = token_id;
+        sampler_output.words[1] = logit_bits;
+        sampler_output.words[2] = 0u;
+        sampler_output.words[3] = 0u;
+        sampler_output.words[history_word] = token_id;
+        sampler_output.words[history_word + 1u] = logit_bits;
+        sampler_output.words[history_word + 2u] = 0u;
+        sampler_output.words[history_word + 3u] = 0u;
+
+        stream_control.words[0] = token_id;
+        uint next_tick_low = stream_tick_low + 1u;
+        if (next_tick_low == 0u) {
+            stream_control.words[2] += 1u;
+        }
+        stream_control.words[1] = next_tick_low;
+    }
+}

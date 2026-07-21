@@ -23,6 +23,7 @@ layout(push_constant) uniform BatchControl {
 
 const uint KV_HEADS = {{KV_HEADS}}u;
 const uint HEAD_WIDTH = {{HEAD_WIDTH}}u;
+const uint ATTENTION_WINDOW = {{ATTENTION_WINDOW}}u;
 const uint HEAD_WORD_COUNT = HEAD_WIDTH / 2u;
 const uint KV_WORD_COUNT = KV_HEADS * HEAD_WORD_COUNT;
 const uint SLOT_WORD_COUNT = KV_WORD_COUNT * 2u;
@@ -30,7 +31,9 @@ const uint SLOT_WORD_COUNT = KV_WORD_COUNT * 2u;
 void main() {
     uint kv_head = gl_WorkGroupID.x;
     uint lane = gl_LocalInvocationID.x;
-    uint capacity = batch_control.dynamic_state_capacity;
+    uint capacity = ATTENTION_WINDOW == 0u
+        ? batch_control.dynamic_state_capacity
+        : min(batch_control.dynamic_state_capacity, ATTENTION_WINDOW);
     if (kv_head >= KV_HEADS || capacity == 0u) return;
 
     for (uint word = lane; word < HEAD_WORD_COUNT; word += 64u) {

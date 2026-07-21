@@ -5,42 +5,24 @@
 
 layout(local_size_x = {{LOCAL_SIZE_X}}, local_size_y = 1, local_size_z = 1) in;
 
-layout(set = 0, binding = 0) readonly buffer PartitionCandidates {
-    uvec2 values[];
-} partition_candidates;
+layout(set = 0, binding = 0) readonly buffer PartitionCandidates { uvec2 values[]; } partition_candidates;
+layout(set = 0, binding = 1) buffer SamplerOutput { uint words[]; } sampler_output;
+layout(set = 0, binding = 2) buffer StreamControl { uint words[]; } stream_control;
+layout(set = 0, binding = 3) readonly buffer SamplerSeed { uint words[]; } sampler_seed;
+layout(set = 0, binding = 4) readonly buffer SamplerParameters { uint words[]; } sampler_parameters;
 
-layout(set = 0, binding = 1) buffer SamplerOutput {
-    uint words[];
-} sampler_output;
-
-layout(set = 0, binding = 2) buffer StreamControl {
-    uint words[];
-} stream_control;
-
-layout(set = 0, binding = 3) readonly buffer SamplerSeed {
-    uint words[];
-} sampler_seed;
-
-const uint TOP_K = {{TOP_K}}u;
+const uint TOP_K_CAPACITY = {{TOP_K_CAPACITY}}u;
 const uint PARTITION_COUNT = {{PARTITION_COUNT}}u;
-const float TEMPERATURE = {{TEMPERATURE}};
-const float TOP_P = {{TOP_P}};
-const float MIN_P = {{MIN_P}};
 const float LOWEST_FLOAT = -3.4028234663852886e38;
 
 shared uint partition_cursors[{{PARTITION_COUNT}}];
 shared float subgroup_top_logits[{{LOCAL_SIZE_X}}];
 shared uint subgroup_top_token_ids[{{LOCAL_SIZE_X}}];
 shared uint subgroup_top_partitions[{{LOCAL_SIZE_X}}];
-shared float final_top_logits[{{TOP_K}}];
-shared uint final_top_token_ids[{{TOP_K}}];
+shared float final_top_logits[{{TOP_K_CAPACITY}}];
+shared uint final_top_token_ids[{{TOP_K_CAPACITY}}];
 
-bool candidate_is_better(
-    float candidate_logit,
-    uint candidate_token_id,
-    float current_logit,
-    uint current_token_id
-) {
+bool candidate_is_better(float candidate_logit, uint candidate_token_id, float current_logit, uint current_token_id) {
     return candidate_logit > current_logit
         || (candidate_logit == current_logit && candidate_token_id < current_token_id);
 }
@@ -55,44 +37,31 @@ uint hash_u32(uint value) {
 }
 
 float random_unit(uint stream_tick_low, uint stream_tick_high) {
-    uint bits = hash_u32(
-        sampler_seed.words[0]
-        ^ stream_tick_low
-        ^ (stream_tick_high * 0x9e3779b9u)
-    );
+    uint bits = hash_u32(sampler_seed.words[0] ^ stream_tick_low ^ (stream_tick_high * 0x9e3779b9u));
     return float(bits >> 8u) * (1.0 / 16777216.0);
 }
 
 void main() {
     uint lane = gl_LocalInvocationID.x;
-    if (lane < PARTITION_COUNT) {
-        partition_cursors[lane] = 0u;
-    }
+    uint top_k = min(sampler_parameters.words[1], TOP_K_CAPACITY);
+    if (lane < PARTITION_COUNT) { partition_cursors[lane] = 0u; }
     barrier();
 
-    // The first kernel has already sorted each disjoint vocabulary partition.
-    // Merge those lists on the GPU without rescanning logits or copying any
-    // candidates to the host.
-    for (uint rank = 0u; rank < TOP_K; rank += 1u) {
+    for (uint rank = 0u; rank < top_k; rank += 1u) {
         float local_logit = LOWEST_FLOAT;
         uint local_token_id = 0xffffffffu;
         uint local_partition = 0xffffffffu;
         if (lane < PARTITION_COUNT) {
             uint cursor = partition_cursors[lane];
-            uvec2 candidate = partition_candidates.values[lane * TOP_K + cursor];
+            uvec2 candidate = partition_candidates.values[lane * TOP_K_CAPACITY + cursor];
             local_logit = uintBitsToFloat(candidate.x);
             local_token_id = candidate.y;
             local_partition = lane;
         }
-
         float subgroup_logit = subgroupMax(local_logit);
-        uint subgroup_token_id = subgroupMin(
-            local_logit == subgroup_logit ? local_token_id : 0xffffffffu
-        );
+        uint subgroup_token_id = subgroupMin(local_logit == subgroup_logit ? local_token_id : 0xffffffffu);
         uint subgroup_partition = subgroupMin(
-            local_logit == subgroup_logit && local_token_id == subgroup_token_id
-                ? local_partition
-                : 0xffffffffu
+            local_logit == subgroup_logit && local_token_id == subgroup_token_id ? local_partition : 0xffffffffu
         );
         if (subgroupElect()) {
             subgroup_top_logits[gl_SubgroupID] = subgroup_logit;
@@ -100,7 +69,6 @@ void main() {
             subgroup_top_partitions[gl_SubgroupID] = subgroup_partition;
         }
         barrier();
-
         if (lane == 0u) {
             float best_logit = subgroup_top_logits[0];
             uint best_token_id = subgroup_top_token_ids[0];
@@ -108,12 +76,7 @@ void main() {
             for (uint subgroup = 1u; subgroup < gl_NumSubgroups; subgroup += 1u) {
                 float candidate_logit = subgroup_top_logits[subgroup];
                 uint candidate_token_id = subgroup_top_token_ids[subgroup];
-                if (candidate_is_better(
-                    candidate_logit,
-                    candidate_token_id,
-                    best_logit,
-                    best_token_id
-                )) {
+                if (candidate_is_better(candidate_logit, candidate_token_id, best_logit, best_token_id)) {
                     best_logit = candidate_logit;
                     best_token_id = candidate_token_id;
                     best_partition = subgroup_top_partitions[subgroup];
@@ -126,34 +89,27 @@ void main() {
         barrier();
     }
 
-    if (lane != 0u) {
-        return;
-    }
-
-    float maximum_scaled_logit = final_top_logits[0] / TEMPERATURE;
-    float minimum_logit = MIN_P > 0.0
-        ? final_top_logits[0] + TEMPERATURE * log(MIN_P)
+    if (lane != 0u) { return; }
+    float temperature = uintBitsToFloat(sampler_parameters.words[0]);
+    float top_p = uintBitsToFloat(sampler_parameters.words[2]);
+    float min_p = uintBitsToFloat(sampler_parameters.words[3]);
+    float maximum_scaled_logit = final_top_logits[0] / temperature;
+    float minimum_logit = min_p > 0.0
+        ? final_top_logits[0] + temperature * log(min_p)
         : LOWEST_FLOAT;
     float total_weight = 0.0;
-    for (uint index = 0u; index < TOP_K; index += 1u) {
-        if (final_top_logits[index] < minimum_logit) {
-            break;
-        }
-        total_weight += exp(final_top_logits[index] / TEMPERATURE - maximum_scaled_logit);
+    for (uint index = 0u; index < top_k; index += 1u) {
+        if (final_top_logits[index] < minimum_logit) { break; }
+        total_weight += exp(final_top_logits[index] / temperature - maximum_scaled_logit);
     }
-
-    float nucleus_threshold = TOP_P * total_weight;
+    float nucleus_threshold = top_p * total_weight;
     float nucleus_weight = 0.0;
     uint nucleus_count = 0u;
-    for (uint index = 0u; index < TOP_K; index += 1u) {
-        if (final_top_logits[index] < minimum_logit) {
-            break;
-        }
-        nucleus_weight += exp(final_top_logits[index] / TEMPERATURE - maximum_scaled_logit);
+    for (uint index = 0u; index < top_k; index += 1u) {
+        if (final_top_logits[index] < minimum_logit) { break; }
+        nucleus_weight += exp(final_top_logits[index] / temperature - maximum_scaled_logit);
         nucleus_count = index + 1u;
-        if (nucleus_weight >= nucleus_threshold) {
-            break;
-        }
+        if (nucleus_weight >= nucleus_threshold) { break; }
     }
 
     uint stream_tick_low = stream_control.words[1];
@@ -162,18 +118,14 @@ void main() {
     float cumulative_weight = 0.0;
     uint selected_index = nucleus_count - 1u;
     for (uint index = 0u; index < nucleus_count; index += 1u) {
-        cumulative_weight += exp(final_top_logits[index] / TEMPERATURE - maximum_scaled_logit);
-        if (target < cumulative_weight) {
-            selected_index = index;
-            break;
-        }
+        cumulative_weight += exp(final_top_logits[index] / temperature - maximum_scaled_logit);
+        if (target < cumulative_weight) { selected_index = index; break; }
     }
 
     uint token_id = final_top_token_ids[selected_index];
     uint logit_bits = floatBitsToUint(final_top_logits[selected_index]);
     uint history_capacity = stream_control.words[4];
     uint history_word = 4u + (stream_tick_low % history_capacity) * 4u;
-
     sampler_output.words[0] = token_id;
     sampler_output.words[1] = logit_bits;
     sampler_output.words[2] = 1u;
@@ -182,11 +134,8 @@ void main() {
     sampler_output.words[history_word + 1u] = logit_bits;
     sampler_output.words[history_word + 2u] = 1u;
     sampler_output.words[history_word + 3u] = 0u;
-
     stream_control.words[0] = token_id;
     uint next_tick_low = stream_tick_low + 1u;
-    if (next_tick_low == 0u) {
-        stream_control.words[2] += 1u;
-    }
+    if (next_tick_low == 0u) { stream_control.words[2] += 1u; }
     stream_control.words[1] = next_tick_low;
 }

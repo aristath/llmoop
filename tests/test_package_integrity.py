@@ -590,8 +590,8 @@ def test_shader_templates_compile_to_vulkan_1_4_spirv(tmp_path: Path) -> None:
         "parallel_linear_silu_multiply_batch16_fp8_e4m3_b128x128_5120x17408.comp",
         "parallel_linear_silu_multiply_batch16_bf16_768x2048.comp",
         "parallel_linear_silu_multiply_batch64_cooperative_bf16_768x2048.comp",
-        "per_layer_embedding_bf16_v32000_h768_p128_l2of6_eps1e-05_"
-        "tes1_pes1_mps1_cs1__sc5.comp",
+        "per_layer_embedding_bf16_v32000_h768_p128_l2of6_c1r12000_"
+        "eps1e-05_tes1_pes1_mps1_cs1__sc5.comp",
         "rms_norm_bf16_h768_eps1e-05_offset0.comp",
         "rotary_bf16_12x64_r64_theta10000_half__sc2.comp",
         "append_kv_state_bf16_4x64__sc9.comp",
@@ -603,7 +603,10 @@ def test_shader_templates_compile_to_vulkan_1_4_spirv(tmp_path: Path) -> None:
         "moe_topk_bf16_e64_k8.comp",
         "sparse_moe_experts_bf16_h768_i256_e64_k8.comp",
         "temperature_top_k_candidates_f32_32000_k40_g128_l256.comp",
-        "temperature_top_k_top_p_sampler_f32_t0.7_k40_p0.95_g128_l256.comp",
+        "temperature_top_k_top_p_sampler_f32_t0.7_k40_p0.95_m0_g128_l256.comp",
+        "greedy_sampler_runtime_f32_32000.comp",
+        "temperature_top_k_candidates_runtime_f32_32000_kc256_g128_l256.comp",
+        "temperature_top_k_top_p_sampler_runtime_f32_kc256_g128_l256.comp",
     }
     shader_dir = tmp_path / "shaders"
     copy_shader_templates(shader_source_dir, shader_dir, shader_files)
