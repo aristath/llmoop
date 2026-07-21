@@ -432,6 +432,13 @@ impl VulkanPermanentParameterBufferPlan {
     pub fn from_placed_resident_plan(
         placed_resident_plan: &VulkanPlacedStreamCircuitResidentPlan,
     ) -> Result<Self, VulkanPermanentParameterBufferPlanError> {
+        Self::from_placed_resident_plan_excluding_tensors(placed_resident_plan, &BTreeSet::new())
+    }
+
+    pub fn from_placed_resident_plan_excluding_tensors(
+        placed_resident_plan: &VulkanPlacedStreamCircuitResidentPlan,
+        excluded_tensors: &BTreeSet<String>,
+    ) -> Result<Self, VulkanPermanentParameterBufferPlanError> {
         let mut parameters = Vec::with_capacity(
             placed_resident_plan
                 .resident_plan
@@ -439,6 +446,7 @@ impl VulkanPermanentParameterBufferPlan {
                 .len(),
         );
         let mut tensor_ids = BTreeSet::new();
+        let mut found_excluded_tensors = BTreeSet::new();
         let mut total_byte_capacity = Some(0usize);
         let mut unresolved_tensors = Vec::new();
 
@@ -448,6 +456,10 @@ impl VulkanPermanentParameterBufferPlan {
                     "{} permanent parameter tensor {:?} appears more than once",
                     placed_resident_plan.device_id, parameter.tensor
                 )));
+            }
+            if excluded_tensors.contains(&parameter.tensor) {
+                found_excluded_tensors.insert(parameter.tensor.clone());
+                continue;
             }
 
             match (total_byte_capacity, parameter.byte_count) {
@@ -472,6 +484,13 @@ impl VulkanPermanentParameterBufferPlan {
                 byte_capacity: parameter.byte_count,
                 use_count: parameter.use_count,
             });
+        }
+
+        if let Some(tensor) = excluded_tensors.difference(&found_excluded_tensors).next() {
+            return Err(VulkanPermanentParameterBufferPlanError(format!(
+                "{} cannot exclude unavailable permanent parameter tensor {tensor:?}",
+                placed_resident_plan.device_id
+            )));
         }
 
         let parameter_count = parameters.len();
@@ -34569,6 +34588,81 @@ mod tests {
         assert_eq!(resident_plan.per_stream_activation_slot_elements, None);
         assert_eq!(resident_plan.per_stream_activation_slot_bytes, None);
         assert!(!resident_plan.unresolved_activation_slots.is_empty());
+    }
+
+    #[test]
+    fn permanent_parameter_plan_excludes_physically_lowered_tensors() {
+        let graph = fixture_model_execution_graph();
+        let tensor_index = TensorIndex::from_json_file(fixture_model_tensor_index_path()).unwrap();
+        let execution_plan =
+            StreamCircuitExecutionPlan::from_graph_with_tensor_index(&graph, &tensor_index)
+                .unwrap();
+        let resource_plan =
+            StreamCircuitResourcePlan::from_graph_and_plan(&graph, &execution_plan).unwrap();
+        let placement_plan = graph
+            .placement_plan(&StreamCircuitPlacementSpec::new("gpu0"))
+            .unwrap();
+        let placed_resident_plan =
+            VulkanPlacedStreamCircuitResidentPlan::from_resource_plan_for_device(
+                &resource_plan,
+                &placement_plan,
+                "gpu0",
+                Some(&tensor_index),
+                Some(2),
+            )
+            .unwrap();
+        let full =
+            VulkanPermanentParameterBufferPlan::from_placed_resident_plan(&placed_resident_plan)
+                .unwrap();
+        let removed = full.parameters.iter().take(2).cloned().collect::<Vec<_>>();
+        let excluded = removed
+            .iter()
+            .map(|parameter| parameter.tensor.clone())
+            .collect::<BTreeSet<_>>();
+
+        let pruned =
+            VulkanPermanentParameterBufferPlan::from_placed_resident_plan_excluding_tensors(
+                &placed_resident_plan,
+                &excluded,
+            )
+            .unwrap();
+
+        assert_eq!(pruned.parameter_count, full.parameter_count - 2);
+        assert_eq!(
+            pruned.total_byte_capacity,
+            Some(
+                full.total_byte_capacity.unwrap()
+                    - removed
+                        .iter()
+                        .map(|parameter| parameter.byte_capacity.unwrap())
+                        .sum::<usize>()
+            )
+        );
+        assert!(
+            pruned
+                .parameters
+                .iter()
+                .all(|parameter| !excluded.contains(&parameter.tensor))
+        );
+        assert!(
+            pruned
+                .parameters
+                .iter()
+                .enumerate()
+                .all(|(index, parameter)| parameter.buffer_index == index)
+        );
+
+        let error =
+            VulkanPermanentParameterBufferPlan::from_placed_resident_plan_excluding_tensors(
+                &placed_resident_plan,
+                &BTreeSet::from(["not-a-resident-tensor".to_string()]),
+            )
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("cannot exclude unavailable permanent parameter tensor")
+        );
     }
 
     #[test]
