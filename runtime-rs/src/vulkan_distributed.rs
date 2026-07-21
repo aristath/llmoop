@@ -9,8 +9,8 @@ use crate::tensor_storage::{TensorStorage, TensorStorageRange};
 use crate::vulkan_compute::{
     VulkanComputeDevice, VulkanError, VulkanResidentBuffer, VulkanResidentKernelBufferAccess,
     VulkanResidentKernelBufferBinding, VulkanResidentKernelDispatch, VulkanResidentKernelSequence,
-    VulkanResidentKernelSequenceStep, VulkanSharedHostAllocation, VulkanTimelineSemaphore,
-    VulkanTimelineSemaphorePoint,
+    VulkanResidentKernelSequenceStep, VulkanResidentQueueSubmissionBatch,
+    VulkanSharedHostAllocation, VulkanTimelineSemaphore, VulkanTimelineSemaphorePoint,
 };
 use crate::vulkan_stream_circuit::{
     VulkanActivationSlotBufferOverride, VulkanDescriptorResourceAddress,
@@ -1146,6 +1146,7 @@ impl VulkanDistributedDispatchRunners {
         owner_device_id: &str,
         dispatch_index: usize,
         submission: VulkanDistributedDispatchSubmission,
+        submission_batch: Option<&VulkanResidentQueueSubmissionBatch<'a>>,
         mut device_for: F,
     ) -> Result<VulkanDistributedDispatchRun, VulkanDistributedDispatchRunnerError>
     where
@@ -1202,7 +1203,15 @@ impl VulkanDistributedDispatchRunners {
                     )]
                 })
                 .unwrap_or_default();
-            let submission = if signal_completion {
+            let submission = if let Some(submission_batch) = submission_batch {
+                submission_batch.enqueue_recorded_sequence(
+                    device,
+                    &shard.sequence,
+                    &wait_points,
+                    &signal_points,
+                    signal_completion,
+                )
+            } else if signal_completion {
                 device.submit_recorded_resident_kernel_sequence_with_timeline_semaphores(
                     &shard.sequence,
                     &wait_points,

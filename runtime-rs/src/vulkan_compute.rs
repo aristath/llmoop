@@ -198,6 +198,112 @@ impl<'a> VulkanTimelineSemaphorePoint<'a> {
     }
 }
 
+/// Collects already-recorded resident command buffers by logical device.
+/// Timeline waits and signals remain attached to their original command, so a
+/// caller can enqueue a complete cross-device DAG before issuing one
+/// `vkQueueSubmit2` call per participating queue.
+pub struct VulkanResidentQueueSubmissionBatch<'a> {
+    groups: RefCell<Vec<VulkanResidentQueueSubmissionGroup<'a>>>,
+}
+
+struct VulkanResidentQueueSubmissionGroup<'a> {
+    device: &'a VulkanComputeDevice,
+    submissions: Vec<VulkanPreparedResidentQueueSubmission>,
+}
+
+struct VulkanPreparedResidentQueueSubmission {
+    command_buffer: vk::CommandBuffer,
+    wait_points: Vec<(vk::Semaphore, u64)>,
+    signal_points: Vec<(vk::Semaphore, u64)>,
+    completion_fence: Option<vk::Fence>,
+}
+
+impl Default for VulkanResidentQueueSubmissionBatch<'_> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<'a> VulkanResidentQueueSubmissionBatch<'a> {
+    pub fn new() -> Self {
+        Self {
+            groups: RefCell::new(Vec::new()),
+        }
+    }
+
+    pub fn enqueue_recorded_sequence(
+        &self,
+        device: &'a VulkanComputeDevice,
+        sequence: &VulkanResidentKernelSequence,
+        wait_points: &[VulkanTimelineSemaphorePoint<'_>],
+        signal_points: &[VulkanTimelineSemaphorePoint<'_>],
+        signal_completion: bool,
+    ) -> Result<(), VulkanError> {
+        if !sequence.has_recorded_commands() {
+            return Err(VulkanError(
+                "resident kernel sequence has no recorded commands".to_string(),
+            ));
+        }
+        if sequence.device.handle() != device.device.handle() {
+            return Err(VulkanError(
+                "resident queue submission sequence belongs to another logical device".to_string(),
+            ));
+        }
+        for point in wait_points.iter().chain(signal_points) {
+            device.validate_local_timeline_semaphore(point.semaphore)?;
+        }
+        let submission = VulkanPreparedResidentQueueSubmission {
+            command_buffer: sequence.command_buffer,
+            wait_points: wait_points
+                .iter()
+                .map(|point| (point.semaphore.semaphore, point.value))
+                .collect(),
+            signal_points: signal_points
+                .iter()
+                .map(|point| (point.semaphore.semaphore, point.value))
+                .collect(),
+            completion_fence: signal_completion.then_some(sequence.completion_fence),
+        };
+        let mut groups = self.groups.borrow_mut();
+        if let Some(group) = groups
+            .iter_mut()
+            .find(|group| group.device.shares_logical_device_with(device))
+        {
+            group.submissions.push(submission);
+        } else {
+            groups.push(VulkanResidentQueueSubmissionGroup {
+                device,
+                submissions: vec![submission],
+            });
+        }
+        Ok(())
+    }
+
+    pub fn pending_submission_count(&self) -> usize {
+        self.groups
+            .borrow()
+            .iter()
+            .map(|group| group.submissions.len())
+            .sum()
+    }
+
+    pub fn submit_all(&self) -> Result<usize, VulkanError> {
+        let groups = std::mem::take(&mut *self.groups.borrow_mut());
+        let mut submitted = 0usize;
+        for group in groups {
+            group
+                .device
+                .submit_prepared_resident_queue_batch(&group.submissions)?;
+            submitted = submitted
+                .checked_add(group.submissions.len())
+                .ok_or_else(|| {
+                    VulkanError("resident queue submission count overflowed".to_string())
+                })?;
+        }
+        Ok(submitted)
+    }
+}
+
 #[derive(Clone)]
 struct VulkanResidentMemoryAccess {
     queue: vk::Queue,
@@ -2301,6 +2407,107 @@ impl VulkanComputeDevice {
                     completion_fence.unwrap_or(vk::Fence::null()),
                 )
                 .map_err(|error| VulkanError(format!("failed to submit {label}: {error:?}")))?;
+        }
+        Ok(())
+    }
+
+    fn submit_prepared_resident_queue_batch(
+        &self,
+        submissions: &[VulkanPreparedResidentQueueSubmission],
+    ) -> Result<(), VulkanError> {
+        if submissions.is_empty() {
+            return Ok(());
+        }
+        let wait_infos = submissions
+            .iter()
+            .map(|submission| {
+                submission
+                    .wait_points
+                    .iter()
+                    .map(|(semaphore, value)| {
+                        vk::SemaphoreSubmitInfo::default()
+                            .semaphore(*semaphore)
+                            .value(*value)
+                            .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let command_infos =
+            submissions
+                .iter()
+                .map(|submission| {
+                    [vk::CommandBufferSubmitInfo::default()
+                        .command_buffer(submission.command_buffer)]
+                })
+                .collect::<Vec<_>>();
+        let signal_infos = submissions
+            .iter()
+            .map(|submission| {
+                submission
+                    .signal_points
+                    .iter()
+                    .map(|(semaphore, value)| {
+                        vk::SemaphoreSubmitInfo::default()
+                            .semaphore(*semaphore)
+                            .value(*value)
+                            .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let submit_infos = (0..submissions.len())
+            .map(|index| {
+                vk::SubmitInfo2::default()
+                    .wait_semaphore_infos(&wait_infos[index])
+                    .command_buffer_infos(&command_infos[index])
+                    .signal_semaphore_infos(&signal_infos[index])
+            })
+            .collect::<Vec<_>>();
+        let mut completion_fences = Vec::new();
+        for fence in submissions
+            .iter()
+            .filter_map(|submission| submission.completion_fence)
+        {
+            if !completion_fences.contains(&fence) {
+                completion_fences.push(fence);
+            }
+        }
+        unsafe {
+            if !completion_fences.is_empty() {
+                self.device
+                    .reset_fences(&completion_fences)
+                    .map_err(|error| {
+                        VulkanError(format!(
+                            "failed to reset resident queue batch completion fences: {error:?}"
+                        ))
+                    })?;
+            }
+            let batch_fence = if completion_fences.len() == 1 {
+                completion_fences[0]
+            } else {
+                vk::Fence::null()
+            };
+            self.device
+                .queue_submit2(self.queue, &submit_infos, batch_fence)
+                .map_err(|error| {
+                    VulkanError(format!(
+                        "failed to submit resident queue batch containing {} commands: {error:?}",
+                        submissions.len()
+                    ))
+                })?;
+            if completion_fences.len() > 1 {
+                let completion_submit = [vk::SubmitInfo2::default()];
+                for fence in completion_fences {
+                    self.device
+                        .queue_submit2(self.queue, &completion_submit, fence)
+                        .map_err(|error| {
+                            VulkanError(format!(
+                                "failed to submit resident queue batch completion fence: {error:?}"
+                            ))
+                        })?;
+                }
+            }
         }
         Ok(())
     }
