@@ -272,6 +272,7 @@ pub struct VulkanDistributedActivationBufferAllocation {
 
 pub struct VulkanDistributedActivationBuffers {
     pub plan: VulkanDistributedActivationBufferPlan,
+    pub lane_capacity: usize,
     pub allocations: Vec<VulkanDistributedActivationBuffer>,
     pub allocation_count: usize,
     pub import_count: usize,
@@ -281,16 +282,42 @@ pub struct VulkanDistributedActivationBuffers {
 impl VulkanDistributedActivationBuffers {
     pub fn allocate<'a, F, E>(
         plan: &VulkanDistributedActivationBufferPlan,
+        device_for: F,
+    ) -> Result<Self, VulkanDistributedActivationBufferError>
+    where
+        F: FnMut(&str) -> Result<&'a VulkanComputeDevice, E>,
+        E: Display,
+    {
+        Self::allocate_for_lanes(plan, 1, device_for)
+    }
+
+    pub fn allocate_for_lanes<'a, F, E>(
+        plan: &VulkanDistributedActivationBufferPlan,
+        lane_capacity: usize,
         mut device_for: F,
     ) -> Result<Self, VulkanDistributedActivationBufferError>
     where
         F: FnMut(&str) -> Result<&'a VulkanComputeDevice, E>,
         E: Display,
     {
+        if lane_capacity == 0 {
+            return Err(VulkanDistributedActivationBufferError(
+                "distributed activation lane capacity must not be zero".to_string(),
+            ));
+        }
         let mut allocations = Vec::with_capacity(plan.allocations.len());
         let mut import_count = 0usize;
         let mut total_shared_byte_capacity = 0usize;
         for planned in &plan.allocations {
+            let byte_capacity = planned
+                .byte_capacity
+                .checked_mul(lane_capacity)
+                .ok_or_else(|| {
+                    VulkanDistributedActivationBufferError(format!(
+                        "distributed activation {}.slot_{} lane capacity overflowed",
+                        planned.pedal_id, planned.slot
+                    ))
+                })?;
             let owner = device_for(&planned.owner_device_id).map_err(|error| {
                 VulkanDistributedActivationBufferError(format!(
                     "failed to resolve distributed activation owner {:?}: {error}",
@@ -310,11 +337,11 @@ impl VulkanDistributedActivationBuffers {
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             let shared_allocation = owner
-                .create_shared_host_allocation(&peers, planned.byte_capacity)
+                .create_shared_host_allocation(&peers, byte_capacity)
                 .map_err(|error| {
                     VulkanDistributedActivationBufferError(format!(
                         "failed to allocate {} shared activation bytes for {}.slot_{}: {error}",
-                        planned.byte_capacity, planned.pedal_id, planned.slot
+                        byte_capacity, planned.pedal_id, planned.slot
                     ))
                 })?;
             let mut device_buffers = BTreeMap::new();
@@ -349,7 +376,7 @@ impl VulkanDistributedActivationBuffers {
                     )
                 })?;
             total_shared_byte_capacity = total_shared_byte_capacity
-                .checked_add(planned.byte_capacity)
+                .checked_add(byte_capacity)
                 .ok_or_else(|| {
                     VulkanDistributedActivationBufferError(
                         "distributed activation byte capacity overflowed".to_string(),
@@ -364,6 +391,7 @@ impl VulkanDistributedActivationBuffers {
 
         Ok(Self {
             plan: plan.clone(),
+            lane_capacity,
             allocation_count: allocations.len(),
             allocations,
             import_count,
@@ -1985,6 +2013,25 @@ mod tests {
                 .unwrap()
                 .output_use_count,
             1
+        );
+    }
+
+    #[test]
+    fn rejects_zero_lane_shared_activation_allocations_before_device_access() {
+        let execution_plan = fixture_plan("row_major");
+        let activation_plan =
+            VulkanDistributedActivationBufferPlan::from_execution_plan(&execution_plan).unwrap();
+
+        let error =
+            VulkanDistributedActivationBuffers::allocate_for_lanes(&activation_plan, 0, |_| {
+                Err::<&VulkanComputeDevice, _>("device resolver must not run")
+            })
+            .err()
+            .unwrap();
+
+        assert_eq!(
+            error.to_string(),
+            "distributed activation lane capacity must not be zero"
         );
     }
 
