@@ -23145,6 +23145,43 @@ fn wait_for_compact_slice_submitted_work(
     Ok(())
 }
 
+fn wait_for_compact_slice_terminal_work(
+    slice: &VulkanMountedPlacedResidentInProcessStreamTickSlice<'_>,
+    device_by_id: &BTreeMap<String, &VulkanComputeDevice>,
+    distributed_runners: &VulkanDistributedDispatchRunners,
+) -> Result<(), VulkanMountedPlacedResidentInProcessStreamTickError> {
+    let terminal_segment = slice.execution_plan.dispatch_segments.last();
+    let terminal_distributed = slice
+        .execution_plan
+        .distributed_dispatch_stages
+        .iter()
+        .next_back();
+    if terminal_distributed.is_some_and(|(stage_index, _)| {
+        terminal_segment.is_none_or(|segment| *stage_index >= segment.end_stage_index)
+    }) {
+        let (_, dispatch) = terminal_distributed.expect("terminal distributed stage exists");
+        return distributed_runners
+            .wait_dispatch(slice.device_id(), dispatch.dispatch_index, |device_id| {
+                device_by_id.get(device_id).copied().ok_or_else(|| {
+                    VulkanError(format!(
+                        "distributed shard device {device_id:?} is not mounted"
+                    ))
+                })
+            })
+            .map_err(VulkanMountedPlacedResidentInProcessStreamTickError::Distributed);
+    }
+    if let Some(segment) = terminal_segment {
+        segment
+            .wait_submitted(slice.device, slice.dispatch_extensions.sequence_variant)
+            .map_err(|error| {
+                VulkanMountedPlacedResidentInProcessStreamTickError::StreamTick(
+                    VulkanMountedPlacedResidentStreamTickError::Dispatch(error),
+                )
+            })?;
+    }
+    Ok(())
+}
+
 fn advance_compact_slice_with_distributed_dependencies(
     slice: &mut VulkanMountedPlacedResidentInProcessStreamTickSlice<'_>,
     device_by_id: &BTreeMap<String, &VulkanComputeDevice>,
@@ -23546,13 +23583,6 @@ fn advance_compact_slice_with_distributed_dependencies(
             ))),
         );
     }
-    wait_for_compact_slice_submitted_work(
-        slice,
-        device_by_id,
-        distributed_runners,
-        last_submitted_segment,
-        completion_dependency,
-    )?;
     Ok(slice.cursor.completed_stage_count - completed_before)
 }
 
@@ -23759,6 +23789,14 @@ fn run_mounted_placed_resident_stream_tick_slices_in_process_with_schedule_and_d
                 "placed cable timeline dependencies were not consumed".to_string(),
             )),
         );
+    }
+    if let Some(distributed_runners) = distributed_runners {
+        for slice in slices
+            .iter()
+            .filter(|slice| !slice.cursor.capture_execution_trace)
+        {
+            wait_for_compact_slice_terminal_work(slice, &device_by_id, distributed_runners)?;
+        }
     }
 
     Ok(in_process_stream_tick_run_snapshot(
