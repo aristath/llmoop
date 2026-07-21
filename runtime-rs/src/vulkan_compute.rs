@@ -96,6 +96,7 @@ pub struct VulkanComputeDevice {
     subgroup_size: u32,
     max_compute_work_group_invocations: u32,
     max_compute_work_group_size_x: u32,
+    min_storage_buffer_offset_alignment: usize,
     timestamp_period_ns: f32,
     generic_storage_pipelines: RefCell<HashMap<VulkanGenericPipelineKey, VulkanStoragePipeline>>,
     immediate_kernel_sequence: RefCell<Option<VulkanResidentKernelSequence>>,
@@ -1105,6 +1106,10 @@ impl VulkanComputeDeviceCatalog {
             let physical_device_properties =
                 instance.get_physical_device_properties(physical_device);
             let limits = physical_device_properties.limits;
+            let min_storage_buffer_offset_alignment =
+                usize::try_from(limits.min_storage_buffer_offset_alignment).map_err(|_| {
+                    VulkanError("Vulkan storage-buffer offset alignment exceeds usize".to_string())
+                })?;
             let subgroup_size = physical_device_subgroup_size(instance, physical_device);
 
             Ok(VulkanComputeDevice {
@@ -1121,6 +1126,7 @@ impl VulkanComputeDeviceCatalog {
                 subgroup_size,
                 max_compute_work_group_invocations: limits.max_compute_work_group_invocations,
                 max_compute_work_group_size_x: limits.max_compute_work_group_size[0],
+                min_storage_buffer_offset_alignment,
                 timestamp_period_ns: limits.timestamp_period,
                 generic_storage_pipelines: RefCell::new(HashMap::new()),
                 immediate_kernel_sequence: RefCell::new(None),
@@ -1178,6 +1184,10 @@ impl VulkanComputeDevice {
         local_size_x > 0
             && local_size_x <= self.max_compute_work_group_invocations
             && local_size_x <= self.max_compute_work_group_size_x
+    }
+
+    pub fn min_storage_buffer_offset_alignment(&self) -> usize {
+        self.min_storage_buffer_offset_alignment
     }
 
     pub fn supports_shared_host_memory(&self) -> bool {

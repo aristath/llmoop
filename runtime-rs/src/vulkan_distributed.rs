@@ -15,6 +15,7 @@ const BF16_BYTE_COUNT: usize = 2;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VulkanDistributedExecutionPlan {
     pub device_ids: Vec<String>,
+    pub storage_buffer_offset_alignment: usize,
     pub dispatches: Vec<VulkanDistributedDispatchPlan>,
     pub shared_input_byte_capacity: usize,
     pub shared_output_byte_capacity: usize,
@@ -27,8 +28,17 @@ impl VulkanDistributedExecutionPlan {
         tensor_index: &TensorIndex,
         artifact_manifest: &VulkanReusableKernelArtifactManifest,
         device_ids: &[String],
+        storage_buffer_offset_alignment: usize,
     ) -> Result<Self, VulkanDistributedPlanError> {
         validate_device_pool(device_ids)?;
+        if storage_buffer_offset_alignment == 0
+            || !storage_buffer_offset_alignment.is_power_of_two()
+            || !storage_buffer_offset_alignment.is_multiple_of(BF16_BYTE_COUNT)
+        {
+            return Err(VulkanDistributedPlanError(format!(
+                "distributed storage-buffer offset alignment {storage_buffer_offset_alignment} is invalid"
+            )));
+        }
         let mut dispatches = Vec::new();
         let mut shared_input_byte_capacity = 0usize;
         let mut shared_output_byte_capacity = 0usize;
@@ -67,6 +77,7 @@ impl VulkanDistributedExecutionPlan {
                     tensor_index,
                     device_ids,
                     artifact.workgroup_count_x,
+                    storage_buffer_offset_alignment,
                 )?;
                 shared_input_byte_capacity =
                     shared_input_byte_capacity.max(planned.input_byte_capacity);
@@ -85,6 +96,7 @@ impl VulkanDistributedExecutionPlan {
 
         Ok(Self {
             device_ids: device_ids.to_vec(),
+            storage_buffer_offset_alignment,
             dispatches,
             shared_input_byte_capacity,
             shared_output_byte_capacity,
@@ -453,6 +465,7 @@ fn plan_dispatch(
     tensor_index: &TensorIndex,
     device_ids: &[String],
     artifact_workgroup_count_x: u32,
+    storage_buffer_offset_alignment: usize,
 ) -> Result<VulkanDistributedDispatchPlan, VulkanDistributedPlanError> {
     let parameter_descriptors = dispatch
         .descriptors
@@ -504,7 +517,12 @@ fn plan_dispatch(
             ),
         ));
     }
-    let mut row_alignment = output_rows / artifact_workgroup_count;
+    let workgroup_row_count = output_rows / artifact_workgroup_count;
+    let mut row_alignment = least_common_multiple(
+        workgroup_row_count,
+        storage_buffer_offset_alignment / BF16_BYTE_COUNT,
+    )
+    .ok_or_else(|| dispatch_error(dispatch, "row alignment overflowed".to_string()))?;
     if [first.layout.as_deref(), second.layout.as_deref()]
         .contains(&Some("vulkan_bf16_row_pair_u32"))
     {
@@ -520,8 +538,13 @@ fn plan_dispatch(
     let input_activation = activation_slot(dispatch, 0, input_byte_capacity, "input")?;
     let output_activation = activation_slot(dispatch, 1, output_byte_capacity, "output")?;
 
-    let raw_shards = distribute_rows(output_rows, device_ids.len(), row_alignment)
-        .map_err(|error| dispatch_error(dispatch, error))?;
+    let raw_shards = distribute_rows(
+        output_rows,
+        device_ids.len(),
+        workgroup_row_count,
+        row_alignment,
+    )
+    .map_err(|error| dispatch_error(dispatch, error))?;
     let first_row_bytes = tensor_row_bytes(dispatch, first_tensor, first, output_rows)?;
     let second_row_bytes = tensor_row_bytes(dispatch, second_tensor, second, output_rows)?;
     let mut distributed_parameter_byte_count = 0usize;
@@ -529,9 +552,10 @@ fn plan_dispatch(
         .iter()
         .zip(raw_shards)
         .map(|(device_id, (row_start, row_count))| {
-            let workgroup_count_x = u32::try_from(row_count / row_alignment).map_err(|_| {
-                dispatch_error(dispatch, "shard workgroup count exceeds u32".to_string())
-            })?;
+            let workgroup_count_x =
+                u32::try_from(row_count / workgroup_row_count).map_err(|_| {
+                    dispatch_error(dispatch, "shard workgroup count exceeds u32".to_string())
+                })?;
             let first_fragment = parameter_fragment(
                 *first_binding,
                 first_tensor,
@@ -698,27 +722,45 @@ fn activation_slot(
 fn distribute_rows(
     row_count: usize,
     requested_shards: usize,
-    row_alignment: usize,
+    workgroup_row_count: usize,
+    shard_boundary_row_alignment: usize,
 ) -> Result<Vec<(usize, usize)>, String> {
-    if row_count == 0 || requested_shards == 0 || row_alignment == 0 {
+    if row_count == 0
+        || requested_shards == 0
+        || workgroup_row_count == 0
+        || shard_boundary_row_alignment == 0
+    {
         return Err("row distribution dimensions must not be zero".to_string());
     }
-    if !row_count.is_multiple_of(row_alignment) {
+    if !row_count.is_multiple_of(workgroup_row_count)
+        || !shard_boundary_row_alignment.is_multiple_of(workgroup_row_count)
+    {
         return Err(format!(
-            "row count {row_count} is not aligned to {row_alignment}"
+            "row count {row_count} and shard boundary {shard_boundary_row_alignment} are incompatible with workgroup width {workgroup_row_count}"
         ));
     }
-    let row_groups = row_count / row_alignment;
-    let shard_count = requested_shards.min(row_groups);
-    let groups_per_shard = row_groups / shard_count;
-    let remainder = row_groups % shard_count;
+    let aligned_groups = row_count / shard_boundary_row_alignment;
+    let tail_rows = row_count % shard_boundary_row_alignment;
+    let shard_count = requested_shards.min(aligned_groups + usize::from(tail_rows != 0));
+    let groups_per_shard = aligned_groups / shard_count;
+    let remainder = aligned_groups % shard_count;
     let mut row_start = 0usize;
     let mut shards = Vec::with_capacity(shard_count);
     for shard_index in 0..shard_count {
         let group_count = groups_per_shard + usize::from(shard_index < remainder);
         let shard_rows = group_count
-            .checked_mul(row_alignment)
+            .checked_mul(shard_boundary_row_alignment)
+            .and_then(|rows| {
+                if shard_index + 1 == shard_count {
+                    rows.checked_add(tail_rows)
+                } else {
+                    Some(rows)
+                }
+            })
             .ok_or_else(|| "row shard size overflowed".to_string())?;
+        if shard_rows == 0 {
+            return Err("row distribution produced an empty shard".to_string());
+        }
         shards.push((row_start, shard_rows));
         row_start = row_start
             .checked_add(shard_rows)
@@ -793,6 +835,7 @@ mod tests {
         assert_eq!(plan.dispatches.len(), 1);
         assert_eq!(plan.shared_input_byte_capacity, 8);
         assert_eq!(plan.shared_output_byte_capacity, 24);
+        assert_eq!(plan.storage_buffer_offset_alignment, 4);
         assert_eq!(plan.distributed_parameter_byte_count, 192);
         let dispatch = &plan.dispatches[0];
         assert_eq!(dispatch.owner_device_id, "owner");
@@ -849,6 +892,33 @@ mod tests {
                 .iter()
                 .all(|shard| shard.row_start % 2 == 0 && shard.row_count % 2 == 0)
         );
+    }
+
+    #[test]
+    fn aligns_shared_output_offsets_and_keeps_a_workgroup_aligned_tail() {
+        let plan = fixture_plan_result_with_alignment("row_major", 16).unwrap();
+        let dispatch = &plan.dispatches[0];
+
+        assert_eq!(dispatch.row_alignment, 8);
+        assert_eq!(
+            dispatch
+                .shards
+                .iter()
+                .map(|shard| (
+                    shard.device_id.as_str(),
+                    shard.row_start,
+                    shard.row_count,
+                    shard.workgroup_count_x,
+                    shard.output_byte_offset,
+                ))
+                .collect::<Vec<_>>(),
+            vec![("owner", 0, 8, 4, 0), ("helper-a", 8, 4, 2, 16)]
+        );
+        assert!(dispatch.shards.iter().all(|shard| {
+            shard
+                .output_byte_offset
+                .is_multiple_of(plan.storage_buffer_offset_alignment)
+        }));
     }
 
     #[test]
@@ -930,6 +1000,13 @@ mod tests {
     fn fixture_plan_result(
         layout: &str,
     ) -> Result<VulkanDistributedExecutionPlan, VulkanDistributedPlanError> {
+        fixture_plan_result_with_alignment(layout, 4)
+    }
+
+    fn fixture_plan_result_with_alignment(
+        layout: &str,
+        storage_buffer_offset_alignment: usize,
+    ) -> Result<VulkanDistributedExecutionPlan, VulkanDistributedPlanError> {
         let tensor_index = fixture_tensor_index(layout);
         let activation =
             |binding, name: &str, signal: &str, bytes| VulkanResolvedDescriptorBinding {
@@ -1006,6 +1083,7 @@ mod tests {
                 "helper-b".to_string(),
                 "helper-c".to_string(),
             ],
+            storage_buffer_offset_alignment,
         )
     }
 
