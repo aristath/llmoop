@@ -125,6 +125,8 @@ pub struct TensorMetadata {
     pub source_file: Option<String>,
     #[serde(default)]
     pub data_sha256: Option<String>,
+    #[serde(default)]
+    pub layout: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1733,6 +1735,7 @@ mod tests {
                         data_offsets: None,
                         source_file: None,
                         data_sha256: None,
+                        layout: None,
                     },
                 ),
                 (
@@ -1746,6 +1749,7 @@ mod tests {
                         data_offsets: None,
                         source_file: None,
                         data_sha256: None,
+                        layout: None,
                     },
                 ),
             ]),
@@ -1915,7 +1919,8 @@ mod tests {
                 "projection.qweight": {
                   "dtype": "I32",
                   "shape": [64, 768],
-                  "logical_shape": [768, 512]
+                  "logical_shape": [768, 512],
+                  "layout": "packed_int32"
                 }
               }
             }"#,
@@ -1927,6 +1932,10 @@ mod tests {
             Some([768, 512].as_slice())
         );
         assert_eq!(index.tensors["projection.qweight"].shape, vec![64, 768]);
+        assert_eq!(
+            index.tensors["projection.qweight"].layout.as_deref(),
+            Some("packed_int32")
+        );
     }
 
     #[test]
