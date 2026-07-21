@@ -91,7 +91,7 @@ pub struct VulkanComputeDevice {
     device_name: String,
     enabled_device_extensions: BTreeSet<String>,
     shared_host_memory_alignment: Option<usize>,
-    opaque_fd_semaphore_supported: bool,
+    opaque_fd_timeline_semaphore_supported: bool,
     cooperative_bfloat16_shapes: BTreeSet<(u32, u32, u32)>,
     subgroup_size: u32,
     max_compute_work_group_invocations: u32,
@@ -177,12 +177,24 @@ pub struct VulkanSharedHostAllocation {
     byte_capacity: usize,
 }
 
-pub struct VulkanQueueSemaphore {
+pub struct VulkanTimelineSemaphore {
     device: ash::Device,
     device_handle: vk::Device,
     semaphore: vk::Semaphore,
     opaque_fd_exportable: bool,
     permanent_opaque_fd_imported: Cell<bool>,
+}
+
+#[derive(Clone, Copy)]
+pub struct VulkanTimelineSemaphorePoint<'a> {
+    semaphore: &'a VulkanTimelineSemaphore,
+    value: u64,
+}
+
+impl<'a> VulkanTimelineSemaphorePoint<'a> {
+    pub fn new(semaphore: &'a VulkanTimelineSemaphore, value: u64) -> Self {
+        Self { semaphore, value }
+    }
 }
 
 #[derive(Clone)]
@@ -493,7 +505,7 @@ impl Drop for VulkanSharedHostAllocation {
     }
 }
 
-impl Drop for VulkanQueueSemaphore {
+impl Drop for VulkanTimelineSemaphore {
     fn drop(&mut self) {
         unsafe {
             self.device.destroy_semaphore(self.semaphore, None);
@@ -1039,12 +1051,12 @@ impl VulkanComputeDeviceCatalog {
                 } else {
                     None
                 };
-            let opaque_fd_semaphore_supported =
-                physical_device_supports_extension(
-                    instance,
-                    physical_device,
-                    ash::khr::external_semaphore_fd::NAME,
-                )? && physical_device_supports_opaque_fd_semaphore(instance, physical_device);
+            let opaque_fd_timeline_semaphore_supported = physical_device_supports_extension(
+                instance,
+                physical_device,
+                ash::khr::external_semaphore_fd::NAME,
+            )?
+                && physical_device_supports_opaque_fd_timeline_semaphore(instance, physical_device);
             let (timeline_semaphore_supported, synchronization2_supported) =
                 physical_device_supports_modern_submission(instance, physical_device);
             if !timeline_semaphore_supported || !synchronization2_supported {
@@ -1096,7 +1108,7 @@ impl VulkanComputeDeviceCatalog {
                         .into_owned(),
                 );
             }
-            if opaque_fd_semaphore_supported {
+            if opaque_fd_timeline_semaphore_supported {
                 extension_names.push(ash::khr::external_semaphore_fd::NAME.as_ptr());
                 enabled_device_extensions.insert(
                     ash::khr::external_semaphore_fd::NAME
@@ -1105,6 +1117,7 @@ impl VulkanComputeDeviceCatalog {
                 );
             }
             if shader_float8_supported {
+                shader_float8_features.p_next = device_info.p_next.cast_mut();
                 device_info.p_next = std::ptr::from_ref(&shader_float8_features).cast();
             }
             if cooperative_bfloat16_supported {
@@ -1138,7 +1151,7 @@ impl VulkanComputeDeviceCatalog {
                 device_name,
                 enabled_device_extensions,
                 shared_host_memory_alignment,
-                opaque_fd_semaphore_supported,
+                opaque_fd_timeline_semaphore_supported,
                 cooperative_bfloat16_shapes,
                 subgroup_size,
                 max_compute_work_group_invocations: limits.max_compute_work_group_invocations,
@@ -1211,8 +1224,8 @@ impl VulkanComputeDevice {
         self.shared_host_memory_alignment.is_some()
     }
 
-    pub fn supports_opaque_fd_semaphores(&self) -> bool {
-        self.opaque_fd_semaphore_supported
+    pub fn supports_opaque_fd_timeline_semaphores(&self) -> bool {
+        self.opaque_fd_timeline_semaphore_supported
     }
 
     pub fn owns_resident_buffer(&self, buffer: &VulkanResidentBuffer) -> bool {
@@ -1411,39 +1424,47 @@ impl VulkanComputeDevice {
         }
     }
 
-    pub fn create_queue_semaphore(&self) -> Result<VulkanQueueSemaphore, VulkanError> {
-        self.create_queue_semaphore_with_opaque_fd_export(false)
+    pub fn create_timeline_semaphore(
+        &self,
+        initial_value: u64,
+    ) -> Result<VulkanTimelineSemaphore, VulkanError> {
+        self.create_timeline_semaphore_with_opaque_fd_export(initial_value, false)
     }
 
-    pub fn create_opaque_fd_exportable_queue_semaphore(
+    pub fn create_opaque_fd_exportable_timeline_semaphore(
         &self,
-    ) -> Result<VulkanQueueSemaphore, VulkanError> {
-        if !self.opaque_fd_semaphore_supported {
+        initial_value: u64,
+    ) -> Result<VulkanTimelineSemaphore, VulkanError> {
+        if !self.opaque_fd_timeline_semaphore_supported {
             return Err(VulkanError(format!(
-                "Vulkan device {:?} cannot export persistent opaque-file semaphores",
+                "Vulkan device {:?} cannot export persistent opaque-file timeline semaphores",
                 self.device_name
             )));
         }
-        self.create_queue_semaphore_with_opaque_fd_export(true)
+        self.create_timeline_semaphore_with_opaque_fd_export(initial_value, true)
     }
 
-    fn create_queue_semaphore_with_opaque_fd_export(
+    fn create_timeline_semaphore_with_opaque_fd_export(
         &self,
+        initial_value: u64,
         opaque_fd_exportable: bool,
-    ) -> Result<VulkanQueueSemaphore, VulkanError> {
+    ) -> Result<VulkanTimelineSemaphore, VulkanError> {
+        let mut timeline_info = vk::SemaphoreTypeCreateInfo::default()
+            .semaphore_type(vk::SemaphoreType::TIMELINE)
+            .initial_value(initial_value);
         let semaphore = if opaque_fd_exportable {
             let mut export_info = vk::ExportSemaphoreCreateInfo::default()
                 .handle_types(VULKAN_PERSISTENT_CROSS_DEVICE_SYNC_HANDLE_TYPE);
-            let create_info = vk::SemaphoreCreateInfo::default().push_next(&mut export_info);
+            let create_info = vk::SemaphoreCreateInfo::default()
+                .push_next(&mut timeline_info)
+                .push_next(&mut export_info);
             unsafe { self.device.create_semaphore(&create_info, None) }
         } else {
-            unsafe {
-                self.device
-                    .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
-            }
+            let create_info = vk::SemaphoreCreateInfo::default().push_next(&mut timeline_info);
+            unsafe { self.device.create_semaphore(&create_info, None) }
         }
-        .map_err(|error| VulkanError(format!("failed to create queue semaphore: {error:?}")))?;
-        Ok(VulkanQueueSemaphore {
+        .map_err(|error| VulkanError(format!("failed to create timeline semaphore: {error:?}")))?;
+        Ok(VulkanTimelineSemaphore {
             device: self.device.clone(),
             device_handle: self.device.handle(),
             semaphore,
@@ -1452,14 +1473,14 @@ impl VulkanComputeDevice {
         })
     }
 
-    pub fn export_queue_semaphore_opaque_fd(
+    pub fn export_timeline_semaphore_opaque_fd(
         &self,
-        semaphore: &VulkanQueueSemaphore,
+        semaphore: &VulkanTimelineSemaphore,
     ) -> Result<OwnedFd, VulkanError> {
-        self.validate_local_queue_semaphore(semaphore)?;
+        self.validate_local_timeline_semaphore(semaphore)?;
         if !semaphore.opaque_fd_exportable {
             return Err(VulkanError(
-                "queue semaphore was not created for persistent opaque-file export".to_string(),
+                "timeline semaphore was not created for persistent opaque-file export".to_string(),
             ));
         }
         let loader =
@@ -1469,27 +1490,27 @@ impl VulkanComputeDevice {
             .handle_type(VULKAN_PERSISTENT_CROSS_DEVICE_SYNC_HANDLE_TYPE);
         let fd = unsafe { loader.get_semaphore_fd(&get_info) }.map_err(|error| {
             VulkanError(format!(
-                "failed to export queue semaphore as persistent opaque file: {error:?}"
+                "failed to export timeline semaphore as persistent opaque file: {error:?}"
             ))
         })?;
         Ok(unsafe { OwnedFd::from_raw_fd(fd) })
     }
 
-    pub fn import_queue_semaphore_opaque_fd(
+    pub fn import_timeline_semaphore_opaque_fd(
         &self,
-        semaphore: &VulkanQueueSemaphore,
+        semaphore: &VulkanTimelineSemaphore,
         fd: OwnedFd,
     ) -> Result<(), VulkanError> {
-        self.validate_local_queue_semaphore(semaphore)?;
-        if !self.opaque_fd_semaphore_supported {
+        self.validate_local_timeline_semaphore(semaphore)?;
+        if !self.opaque_fd_timeline_semaphore_supported {
             return Err(VulkanError(format!(
-                "Vulkan device {:?} cannot import persistent opaque-file semaphores",
+                "Vulkan device {:?} cannot import persistent opaque-file timeline semaphores",
                 self.device_name
             )));
         }
         if semaphore.permanent_opaque_fd_imported.get() {
             return Err(VulkanError(
-                "queue semaphore already has a permanently imported opaque-file payload"
+                "timeline semaphore already has a permanently imported opaque-file payload"
                     .to_string(),
             ));
         }
@@ -1502,7 +1523,7 @@ impl VulkanComputeDevice {
             ash::khr::external_semaphore_fd::Device::new(&self.context.instance, &self.device);
         unsafe { loader.import_semaphore_fd(&import_info) }.map_err(|error| {
             VulkanError(format!(
-                "failed to import queue semaphore persistent opaque file: {error:?}"
+                "failed to import timeline semaphore persistent opaque file: {error:?}"
             ))
         })?;
         let _fd_owned_by_vulkan = fd.into_raw_fd();
@@ -1510,13 +1531,13 @@ impl VulkanComputeDevice {
         Ok(())
     }
 
-    fn validate_local_queue_semaphore(
+    fn validate_local_timeline_semaphore(
         &self,
-        semaphore: &VulkanQueueSemaphore,
+        semaphore: &VulkanTimelineSemaphore,
     ) -> Result<(), VulkanError> {
         if semaphore.device_handle != self.device.handle() {
             return Err(VulkanError(
-                "queue semaphore belongs to a different Vulkan logical device".to_string(),
+                "timeline semaphore belongs to a different Vulkan logical device".to_string(),
             ));
         }
         Ok(())
@@ -2148,25 +2169,25 @@ impl VulkanComputeDevice {
         &self,
         sequence: &VulkanResidentKernelSequence,
     ) -> Result<(), VulkanError> {
-        self.submit_recorded_resident_kernel_sequence_with_semaphores(sequence, &[], &[])
+        self.submit_recorded_resident_kernel_sequence_with_timeline_semaphores(sequence, &[], &[])
     }
 
-    pub fn submit_recorded_resident_kernel_sequence_with_semaphores(
+    pub fn submit_recorded_resident_kernel_sequence_with_timeline_semaphores(
         &self,
         sequence: &VulkanResidentKernelSequence,
-        wait_semaphores: &[&VulkanQueueSemaphore],
-        signal_semaphores: &[&VulkanQueueSemaphore],
+        wait_points: &[VulkanTimelineSemaphorePoint<'_>],
+        signal_points: &[VulkanTimelineSemaphorePoint<'_>],
     ) -> Result<(), VulkanError> {
         if !sequence.has_recorded_commands() {
             return Err(VulkanError(
                 "resident kernel sequence has no recorded commands".to_string(),
             ));
         }
-        self.submit_command_buffer_with_semaphores(
+        self.submit_command_buffer_with_timeline_semaphores(
             sequence.command_buffer,
             sequence.completion_fence,
-            wait_semaphores,
-            signal_semaphores,
+            wait_points,
+            signal_points,
             "resident kernel sequence",
         )
     }
@@ -2183,7 +2204,7 @@ impl VulkanComputeDevice {
         &self,
         sequence: &VulkanResidentKernelSequence,
     ) -> Result<(), VulkanError> {
-        self.submit_command_buffer_with_semaphores(
+        self.submit_command_buffer_with_timeline_semaphores(
             sequence.command_buffer,
             sequence.completion_fence,
             &[],
@@ -2192,30 +2213,32 @@ impl VulkanComputeDevice {
         )
     }
 
-    fn submit_command_buffer_with_semaphores(
+    fn submit_command_buffer_with_timeline_semaphores(
         &self,
         command_buffer: vk::CommandBuffer,
         completion_fence: vk::Fence,
-        wait_semaphores: &[&VulkanQueueSemaphore],
-        signal_semaphores: &[&VulkanQueueSemaphore],
+        wait_points: &[VulkanTimelineSemaphorePoint<'_>],
+        signal_points: &[VulkanTimelineSemaphorePoint<'_>],
         label: &str,
     ) -> Result<(), VulkanError> {
-        for semaphore in wait_semaphores.iter().chain(signal_semaphores) {
-            self.validate_local_queue_semaphore(semaphore)?;
+        for point in wait_points.iter().chain(signal_points) {
+            self.validate_local_timeline_semaphore(point.semaphore)?;
         }
-        let wait_infos = wait_semaphores
+        let wait_infos = wait_points
             .iter()
-            .map(|semaphore| {
+            .map(|point| {
                 vk::SemaphoreSubmitInfo::default()
-                    .semaphore(semaphore.semaphore)
+                    .semaphore(point.semaphore.semaphore)
+                    .value(point.value)
                     .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
             })
             .collect::<Vec<_>>();
-        let signal_infos = signal_semaphores
+        let signal_infos = signal_points
             .iter()
-            .map(|semaphore| {
+            .map(|point| {
                 vk::SemaphoreSubmitInfo::default()
-                    .semaphore(semaphore.semaphore)
+                    .semaphore(point.semaphore.semaphore)
+                    .value(point.value)
                     .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
             })
             .collect::<Vec<_>>();
@@ -2227,9 +2250,8 @@ impl VulkanComputeDevice {
                         "failed to reset {label} completion fence: {error:?}"
                     ))
                 })?;
-            let command_buffers = [
-                vk::CommandBufferSubmitInfo::default().command_buffer(command_buffer),
-            ];
+            let command_buffers =
+                [vk::CommandBufferSubmitInfo::default().command_buffer(command_buffer)];
             let submit_info = [vk::SubmitInfo2::default()
                 .wait_semaphore_infos(&wait_infos)
                 .command_buffer_infos(&command_buffers)
@@ -2962,12 +2984,16 @@ fn physical_device_shared_host_memory_alignment(
     Ok(alignment)
 }
 
-fn physical_device_supports_opaque_fd_semaphore(
+fn physical_device_supports_opaque_fd_timeline_semaphore(
     instance: &ash::Instance,
     physical_device: vk::PhysicalDevice,
 ) -> bool {
+    let mut timeline_info = vk::SemaphoreTypeCreateInfo::default()
+        .semaphore_type(vk::SemaphoreType::TIMELINE)
+        .initial_value(0);
     let info = vk::PhysicalDeviceExternalSemaphoreInfo::default()
-        .handle_type(VULKAN_PERSISTENT_CROSS_DEVICE_SYNC_HANDLE_TYPE);
+        .handle_type(VULKAN_PERSISTENT_CROSS_DEVICE_SYNC_HANDLE_TYPE)
+        .push_next(&mut timeline_info);
     let mut properties = vk::ExternalSemaphoreProperties::default();
     unsafe {
         instance.get_physical_device_external_semaphore_properties(
@@ -3797,8 +3823,8 @@ mod tests {
         let worker = VulkanComputeDevice::new_for_physical_device_index(worker_index).unwrap();
         assert!(owner.supports_shared_host_memory());
         assert!(worker.supports_shared_host_memory());
-        assert!(owner.supports_opaque_fd_semaphores());
-        assert!(worker.supports_opaque_fd_semaphores());
+        assert!(owner.supports_opaque_fd_timeline_semaphores());
+        assert!(worker.supports_opaque_fd_timeline_semaphores());
 
         let allocation = owner.create_shared_host_allocation(&[&worker], 12).unwrap();
         let owner_buffer = owner
@@ -3851,48 +3877,62 @@ mod tests {
             )
             .unwrap();
 
-        let ready_source = owner.create_opaque_fd_exportable_queue_semaphore().unwrap();
-        let ready_wait = worker.create_queue_semaphore().unwrap();
+        let ready_source = owner
+            .create_opaque_fd_exportable_timeline_semaphore(0)
+            .unwrap();
+        let ready_wait = worker.create_timeline_semaphore(0).unwrap();
         worker
-            .import_queue_semaphore_opaque_fd(
+            .import_timeline_semaphore_opaque_fd(
                 &ready_wait,
                 owner
-                    .export_queue_semaphore_opaque_fd(&ready_source)
+                    .export_timeline_semaphore_opaque_fd(&ready_source)
                     .unwrap(),
             )
             .unwrap();
         let done_source = worker
-            .create_opaque_fd_exportable_queue_semaphore()
+            .create_opaque_fd_exportable_timeline_semaphore(0)
             .unwrap();
-        let done_wait = owner.create_queue_semaphore().unwrap();
+        let done_wait = owner.create_timeline_semaphore(0).unwrap();
         owner
-            .import_queue_semaphore_opaque_fd(
+            .import_timeline_semaphore_opaque_fd(
                 &done_wait,
                 worker
-                    .export_queue_semaphore_opaque_fd(&done_source)
+                    .export_timeline_semaphore_opaque_fd(&done_source)
                     .unwrap(),
             )
             .unwrap();
 
-        for _ in 0..2 {
+        for dependency_value in 1..=2 {
             owner
-                .submit_recorded_resident_kernel_sequence_with_semaphores(
+                .submit_recorded_resident_kernel_sequence_with_timeline_semaphores(
                     &owner_first,
                     &[],
-                    &[&ready_source],
+                    &[VulkanTimelineSemaphorePoint::new(
+                        &ready_source,
+                        dependency_value,
+                    )],
                 )
                 .unwrap();
             worker
-                .submit_recorded_resident_kernel_sequence_with_semaphores(
+                .submit_recorded_resident_kernel_sequence_with_timeline_semaphores(
                     &worker_sequence,
-                    &[&ready_wait],
-                    &[&done_source],
+                    &[VulkanTimelineSemaphorePoint::new(
+                        &ready_wait,
+                        dependency_value,
+                    )],
+                    &[VulkanTimelineSemaphorePoint::new(
+                        &done_source,
+                        dependency_value,
+                    )],
                 )
                 .unwrap();
             owner
-                .submit_recorded_resident_kernel_sequence_with_semaphores(
+                .submit_recorded_resident_kernel_sequence_with_timeline_semaphores(
                     &owner_last,
-                    &[&done_wait],
+                    &[VulkanTimelineSemaphorePoint::new(
+                        &done_wait,
+                        dependency_value,
+                    )],
                     &[],
                 )
                 .unwrap();

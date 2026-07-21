@@ -29,12 +29,11 @@ use crate::stream_plan::{
 use crate::tensor_storage::TensorStorage;
 use crate::vulkan::{DEFAULT_COMPUTE_LOCAL_SIZE_X, DEFAULT_SPIRV_ENTRY_POINT, read_spirv_words};
 use crate::vulkan_compute::{
-    VulkanComputeDevice, VulkanError, VulkanQueueSemaphore, VulkanResidentBuffer,
-    VulkanResidentBufferCopy, VulkanResidentBufferCopyBatch, VulkanResidentBufferRangeCopy,
-    VulkanResidentKernelBufferAccess, VulkanResidentKernelBufferBinding,
-    VulkanResidentKernelDispatch, VulkanResidentKernelSequence,
+    VulkanComputeDevice, VulkanError, VulkanResidentBuffer, VulkanResidentBufferCopy,
+    VulkanResidentBufferCopyBatch, VulkanResidentBufferRangeCopy, VulkanResidentKernelBufferAccess,
+    VulkanResidentKernelBufferBinding, VulkanResidentKernelDispatch, VulkanResidentKernelSequence,
     VulkanResidentKernelSequenceSnapshotCopy, VulkanResidentKernelSequenceStep,
-    VulkanResidentMappedBufferCopy,
+    VulkanResidentMappedBufferCopy, VulkanTimelineSemaphorePoint,
 };
 use crate::vulkan_distributed::{
     VulkanDistributedActivationBufferPlan, VulkanDistributedActivationBuffers,
@@ -19124,15 +19123,15 @@ impl VulkanMountedPlacedResidentDispatchSegmentRunner {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn submit_with_stream_control_and_semaphores(
+    fn submit_with_stream_control_and_timeline_semaphores(
         &self,
         device: &VulkanComputeDevice,
         control: VulkanMountedPlacedStreamControl,
         prefix_dispatches: &[&VulkanResidentKernelDispatch],
         suffix_dispatches: &[&VulkanResidentKernelDispatch],
         sequence_variant: u8,
-        wait_semaphores: &[&VulkanQueueSemaphore],
-        signal_semaphores: &[&VulkanQueueSemaphore],
+        wait_points: &[VulkanTimelineSemaphorePoint<'_>],
+        signal_points: &[VulkanTimelineSemaphorePoint<'_>],
     ) -> Result<(), VulkanMountedPlacedResidentKernelDispatchError> {
         if !self.sequences.borrow().contains_key(&sequence_variant) {
             let sequence = device
@@ -19149,10 +19148,10 @@ impl VulkanMountedPlacedResidentDispatchSegmentRunner {
             .expect("resident sequence variant was initialized");
         if self.can_replay_recorded_commands(sequence, prefix_dispatches, suffix_dispatches) {
             return device
-                .submit_recorded_resident_kernel_sequence_with_semaphores(
+                .submit_recorded_resident_kernel_sequence_with_timeline_semaphores(
                     sequence,
-                    wait_semaphores,
-                    signal_semaphores,
+                    wait_points,
+                    signal_points,
                 )
                 .map_err(VulkanMountedPlacedResidentKernelDispatchError::Vulkan);
         }
@@ -19183,10 +19182,10 @@ impl VulkanMountedPlacedResidentDispatchSegmentRunner {
             .record_resident_kernel_sequence(sequence, &steps)
             .map_err(VulkanMountedPlacedResidentKernelDispatchError::Vulkan)?;
         device
-            .submit_recorded_resident_kernel_sequence_with_semaphores(
+            .submit_recorded_resident_kernel_sequence_with_timeline_semaphores(
                 sequence,
-                wait_semaphores,
-                signal_semaphores,
+                wait_points,
+                signal_points,
             )
             .map_err(VulkanMountedPlacedResidentKernelDispatchError::Vulkan)
     }
@@ -22740,9 +22739,9 @@ fn wait_for_compact_slice_submitted_work(
     device_by_id: &BTreeMap<String, &VulkanComputeDevice>,
     distributed_runners: &VulkanDistributedDispatchRunners,
     last_submitted_segment: Option<&VulkanMountedPlacedResidentDispatchSegmentRunner>,
-    completion_dispatch_index: Option<usize>,
+    completion_dependency: Option<(usize, u64)>,
 ) -> Result<(), VulkanMountedPlacedResidentInProcessStreamTickError> {
-    if let Some(dispatch_index) = completion_dispatch_index {
+    if let Some((dispatch_index, _)) = completion_dependency {
         return distributed_runners
             .wait_dispatch(slice.device_id(), dispatch_index, |device_id| {
                 device_by_id.get(device_id).copied().ok_or_else(|| {
@@ -22802,8 +22801,8 @@ fn advance_compact_slice_with_distributed_dependencies(
     let completed_before = slice.cursor.completed_stage_count;
     let mut last_submitted_segment: Option<&VulkanMountedPlacedResidentDispatchSegmentRunner> =
         None;
-    let mut ready_dispatch_index = None;
-    let mut completion_dispatch_index = None;
+    let mut ready_dependency = None;
+    let mut completion_dependency = None;
 
     while slice.cursor.next_stage_index < slice.cursor.tick_plan.stages.len() {
         let stage = &slice.cursor.tick_plan.stages[slice.cursor.next_stage_index];
@@ -22814,7 +22813,7 @@ fn advance_compact_slice_with_distributed_dependencies(
                     device_by_id,
                     distributed_runners,
                     last_submitted_segment.take(),
-                    completion_dispatch_index.take(),
+                    completion_dependency.take(),
                 )?;
                 match transport.receive_incoming_cable(slice.mounted, *cable_index) {
                     Ok(_) => slice.cursor.complete_current_stage(),
@@ -22838,7 +22837,9 @@ fn advance_compact_slice_with_distributed_dependencies(
                         .distributed_dispatch_dependencies_at_stage(slice.cursor.next_stage_index)
                         .expect("every distributed stage has a dependency topology");
                     debug_assert_eq!(dependencies.dispatch_index, distributed.dispatch_index);
-                    let consumes_ready = ready_dispatch_index == Some(distributed.dispatch_index);
+                    let consumes_ready = ready_dependency.is_some_and(|(dispatch_index, _)| {
+                        dispatch_index == distributed.dispatch_index
+                    });
                     if consumes_ready != dependencies.has_owner_producer {
                         return Err(
                             VulkanMountedPlacedResidentInProcessStreamTickError::Schedule(
@@ -22851,9 +22852,19 @@ fn advance_compact_slice_with_distributed_dependencies(
                             ),
                         );
                     }
+                    let dependency_value = if let Some((_, dependency_value)) = ready_dependency {
+                        dependency_value
+                    } else {
+                        distributed_runners
+                            .reserve_dependency_value(slice.device_id(), distributed.dispatch_index)
+                            .map_err(
+                                VulkanMountedPlacedResidentInProcessStreamTickError::Distributed,
+                            )?
+                    };
                     let submission = distributed_runners.submit_dispatch_with_device_dependencies(
                         slice.device_id(),
                         distributed.dispatch_index,
+                        dependency_value,
                         consumes_ready,
                         dependencies.has_owner_continuation,
                         |device_id| {
@@ -22892,9 +22903,10 @@ fn advance_compact_slice_with_distributed_dependencies(
                         );
                         return Err(error.into());
                     }
-                    ready_dispatch_index = None;
+                    ready_dependency = None;
                     if dependencies.has_owner_continuation {
-                        completion_dispatch_index = Some(distributed.dispatch_index);
+                        completion_dependency =
+                            Some((distributed.dispatch_index, dependency_value));
                     } else {
                         distributed_runners
                             .wait_dispatch(
@@ -22932,10 +22944,13 @@ fn advance_compact_slice_with_distributed_dependencies(
                     .execution_plan
                     .distributed_dispatch_at_stage(segment.end_stage_index)
                     .map(|dispatch| dispatch.dispatch_index);
-                let wait_semaphores = match completion_dispatch_index
-                    .map(|dispatch_index| {
-                        distributed_runners
-                            .owner_completion_wait_semaphores(slice.device_id(), dispatch_index)
+                let wait_points = match completion_dependency
+                    .map(|(dispatch_index, dependency_value)| {
+                        distributed_runners.owner_completion_wait_points(
+                            slice.device_id(),
+                            dispatch_index,
+                            dependency_value,
+                        )
                     })
                     .transpose()
                 {
@@ -22946,35 +22961,60 @@ fn advance_compact_slice_with_distributed_dependencies(
                             device_by_id,
                             distributed_runners,
                             last_submitted_segment,
-                            completion_dispatch_index,
+                            completion_dependency,
                         );
                         return Err(
                             VulkanMountedPlacedResidentInProcessStreamTickError::Distributed(error),
                         );
                     }
                 };
-                let signal_semaphores = match next_distributed
+                let next_dependency = match next_distributed
                     .map(|dispatch_index| {
                         distributed_runners
-                            .owner_ready_signal_semaphores(slice.device_id(), dispatch_index)
+                            .reserve_dependency_value(slice.device_id(), dispatch_index)
+                            .map(|dependency_value| (dispatch_index, dependency_value))
                     })
                     .transpose()
                 {
-                    Ok(semaphores) => semaphores.unwrap_or_default(),
+                    Ok(dependency) => dependency,
                     Err(error) => {
                         let _ = wait_for_compact_slice_submitted_work(
                             slice,
                             device_by_id,
                             distributed_runners,
                             last_submitted_segment,
-                            completion_dispatch_index,
+                            completion_dependency,
                         );
                         return Err(
                             VulkanMountedPlacedResidentInProcessStreamTickError::Distributed(error),
                         );
                     }
                 };
-                let submission = segment.submit_with_stream_control_and_semaphores(
+                let signal_points = match next_dependency
+                    .map(|(dispatch_index, dependency_value)| {
+                        distributed_runners.owner_ready_signal_points(
+                            slice.device_id(),
+                            dispatch_index,
+                            dependency_value,
+                        )
+                    })
+                    .transpose()
+                {
+                    Ok(points) => points.unwrap_or_default(),
+                    Err(error) => {
+                        let _ = wait_for_compact_slice_submitted_work(
+                            slice,
+                            device_by_id,
+                            distributed_runners,
+                            last_submitted_segment,
+                            completion_dependency,
+                        );
+                        return Err(
+                            VulkanMountedPlacedResidentInProcessStreamTickError::Distributed(error),
+                        );
+                    }
+                };
+                let submission = segment.submit_with_stream_control_and_timeline_semaphores(
                     slice.device,
                     control,
                     if slice.execution_plan.first_dispatch_segment_stage_index()
@@ -22992,8 +23032,8 @@ fn advance_compact_slice_with_distributed_dependencies(
                         &[]
                     },
                     slice.dispatch_extensions.sequence_variant,
-                    &wait_semaphores,
-                    &signal_semaphores,
+                    &wait_points,
+                    &signal_points,
                 );
                 if let Err(error) = submission {
                     let _ = wait_for_compact_slice_submitted_work(
@@ -23001,7 +23041,7 @@ fn advance_compact_slice_with_distributed_dependencies(
                         device_by_id,
                         distributed_runners,
                         last_submitted_segment,
-                        completion_dispatch_index,
+                        completion_dependency,
                     );
                     return Err(
                         VulkanMountedPlacedResidentInProcessStreamTickError::StreamTick(
@@ -23009,8 +23049,8 @@ fn advance_compact_slice_with_distributed_dependencies(
                         ),
                     );
                 }
-                completion_dispatch_index = None;
-                ready_dispatch_index = next_distributed;
+                completion_dependency = None;
+                ready_dependency = next_dependency;
                 last_submitted_segment = Some(segment);
                 while slice.cursor.next_stage_index < segment.end_stage_index {
                     slice.cursor.complete_current_stage();
@@ -23022,7 +23062,7 @@ fn advance_compact_slice_with_distributed_dependencies(
                     device_by_id,
                     distributed_runners,
                     last_submitted_segment.take(),
-                    completion_dispatch_index.take(),
+                    completion_dependency.take(),
                 )?;
                 transport
                     .publish_outgoing_cable(slice.mounted, *cable_index)
@@ -23040,7 +23080,7 @@ fn advance_compact_slice_with_distributed_dependencies(
         device_by_id,
         distributed_runners,
         last_submitted_segment,
-        completion_dispatch_index,
+        completion_dependency,
     )?;
     Ok(slice.cursor.completed_stage_count - completed_before)
 }
