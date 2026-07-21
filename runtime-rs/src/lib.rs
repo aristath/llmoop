@@ -10,6 +10,8 @@ pub mod vulkan;
 #[cfg(feature = "vulkan")]
 pub mod vulkan_compute;
 #[cfg(feature = "vulkan")]
+pub mod vulkan_distributed;
+#[cfg(feature = "vulkan")]
 pub mod vulkan_stream_circuit;
 
 #[cfg(feature = "vulkan")]
@@ -19,5 +21,7 @@ pub use stream_plan::*;
 pub use vulkan::*;
 #[cfg(feature = "vulkan")]
 pub use vulkan_compute::*;
+#[cfg(feature = "vulkan")]
+pub use vulkan_distributed::*;
 #[cfg(feature = "vulkan")]
 pub use vulkan_stream_circuit::*;
