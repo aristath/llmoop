@@ -1,8 +1,10 @@
-use std::cell::RefCell;
+use std::alloc::{Layout, alloc_zeroed, dealloc};
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeSet, HashMap};
 use std::error::Error;
 use std::ffi::{CStr, CString, c_void};
 use std::fmt::{Display, Formatter};
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 #[cfg(test)]
 use std::path::Path;
 use std::sync::Arc;
@@ -15,6 +17,10 @@ const VK_KHR_SHADER_BFLOAT16_NAME: &CStr = c"VK_KHR_shader_bfloat16";
 const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT8_FEATURES_EXT: i32 = 1_000_567_000;
 const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_BFLOAT16_FEATURES_KHR: i32 = 1_000_141_000;
 const VK_COMPONENT_TYPE_BFLOAT16_KHR: i32 = 1_000_141_000;
+const VULKAN_SHARED_HOST_MEMORY_HANDLE_TYPE: vk::ExternalMemoryHandleTypeFlags =
+    vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT;
+const VULKAN_CROSS_DEVICE_SYNC_HANDLE_TYPE: vk::ExternalSemaphoreHandleTypeFlags =
+    vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD;
 
 // ash 0.38 is generated from Vulkan 1.3.281 headers, while shader-float8 was
 // added later. Keep this ABI-compatible definition local until ash publishes
@@ -84,6 +90,8 @@ pub struct VulkanComputeDevice {
     queue: vk::Queue,
     device_name: String,
     enabled_device_extensions: BTreeSet<String>,
+    shared_host_memory_alignment: Option<usize>,
+    sync_fd_semaphore_supported: bool,
     cooperative_bfloat16_shapes: BTreeSet<(u32, u32, u32)>,
     subgroup_size: u32,
     max_compute_work_group_invocations: u32,
@@ -157,6 +165,24 @@ pub struct VulkanResidentBuffer {
     memory_access: VulkanResidentMemoryAccess,
     byte_capacity: vk::DeviceSize,
     persistent_mapping: Option<usize>,
+    _shared_host_allocation: Option<Arc<VulkanSharedHostAllocation>>,
+}
+
+/// Page-aligned host memory imported into multiple Vulkan devices. GPUs access
+/// the same bytes directly; the host does not relay activation data.
+pub struct VulkanSharedHostAllocation {
+    address: usize,
+    layout: Layout,
+    byte_capacity: usize,
+}
+
+pub struct VulkanQueueSemaphore {
+    device: ash::Device,
+    device_handle: vk::Device,
+    semaphore: vk::Semaphore,
+    sync_fd_exportable: bool,
+    pending_sync_fd_signal: Cell<bool>,
+    temporary_sync_fd_imported: Cell<bool>,
 }
 
 #[derive(Clone)]
@@ -446,6 +472,28 @@ impl VulkanResidentBuffer {
             offset: offset as vk::DeviceSize,
             range: len as vk::DeviceSize,
         })
+    }
+}
+
+impl VulkanSharedHostAllocation {
+    pub fn byte_capacity(&self) -> usize {
+        self.byte_capacity
+    }
+}
+
+impl Drop for VulkanSharedHostAllocation {
+    fn drop(&mut self) {
+        unsafe {
+            dealloc(self.address as *mut u8, self.layout);
+        }
+    }
+}
+
+impl Drop for VulkanQueueSemaphore {
+    fn drop(&mut self) {
+        unsafe {
+            self.device.destroy_semaphore(self.semaphore, None);
+        }
     }
 }
 
@@ -973,6 +1021,26 @@ impl VulkanComputeDeviceCatalog {
                 BTreeSet::new()
             };
             let cooperative_bfloat16_supported = !cooperative_bfloat16_shapes.is_empty();
+            let shared_host_memory_alignment =
+                if physical_device_supports_extension(
+                    instance,
+                    physical_device,
+                    ash::ext::external_memory_host::NAME,
+                )? && physical_device_supports_shared_host_buffer(instance, physical_device)
+                {
+                    Some(physical_device_shared_host_memory_alignment(
+                        instance,
+                        physical_device,
+                    )?)
+                } else {
+                    None
+                };
+            let sync_fd_semaphore_supported =
+                physical_device_supports_extension(
+                    instance,
+                    physical_device,
+                    ash::khr::external_semaphore_fd::NAME,
+                )? && physical_device_supports_sync_fd_semaphore(instance, physical_device);
             let mut shader_float8_features =
                 VulkanPhysicalDeviceShaderFloat8FeaturesExt::disabled();
             let mut shader_bfloat16_features =
@@ -1001,6 +1069,22 @@ impl VulkanComputeDeviceCatalog {
                 );
                 enabled_device_extensions
                     .insert(VK_KHR_SHADER_BFLOAT16_NAME.to_string_lossy().into_owned());
+            }
+            if shared_host_memory_alignment.is_some() {
+                extension_names.push(ash::ext::external_memory_host::NAME.as_ptr());
+                enabled_device_extensions.insert(
+                    ash::ext::external_memory_host::NAME
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+            }
+            if sync_fd_semaphore_supported {
+                extension_names.push(ash::khr::external_semaphore_fd::NAME.as_ptr());
+                enabled_device_extensions.insert(
+                    ash::khr::external_semaphore_fd::NAME
+                        .to_string_lossy()
+                        .into_owned(),
+                );
             }
             if shader_float8_supported {
                 device_info.p_next = std::ptr::from_ref(&shader_float8_features).cast();
@@ -1031,6 +1115,8 @@ impl VulkanComputeDeviceCatalog {
                 queue,
                 device_name,
                 enabled_device_extensions,
+                shared_host_memory_alignment,
+                sync_fd_semaphore_supported,
                 cooperative_bfloat16_shapes,
                 subgroup_size,
                 max_compute_work_group_invocations: limits.max_compute_work_group_invocations,
@@ -1094,6 +1180,367 @@ impl VulkanComputeDevice {
             && local_size_x <= self.max_compute_work_group_size_x
     }
 
+    pub fn supports_shared_host_memory(&self) -> bool {
+        self.shared_host_memory_alignment.is_some()
+    }
+
+    pub fn supports_sync_fd_semaphores(&self) -> bool {
+        self.sync_fd_semaphore_supported
+    }
+
+    pub fn create_shared_host_allocation(
+        &self,
+        peer_devices: &[&VulkanComputeDevice],
+        byte_capacity: usize,
+    ) -> Result<Arc<VulkanSharedHostAllocation>, VulkanError> {
+        if byte_capacity == 0 {
+            return Err(VulkanError(
+                "shared host allocation capacity must not be zero".to_string(),
+            ));
+        }
+        let mut alignment = 1usize;
+        let mut required_size = byte_capacity;
+        for device in std::iter::once(self).chain(peer_devices.iter().copied()) {
+            alignment = alignment.max(device.shared_host_memory_alignment.ok_or_else(|| {
+                VulkanError(format!(
+                    "Vulkan device {:?} cannot import shared host memory",
+                    device.device_name
+                ))
+            })?);
+            let requirements = device.shared_host_buffer_memory_requirements(byte_capacity)?;
+            alignment =
+                alignment.max(usize::try_from(requirements.alignment).map_err(|_| {
+                    VulkanError("shared buffer alignment exceeds usize".to_string())
+                })?);
+            required_size =
+                required_size.max(usize::try_from(requirements.size).map_err(|_| {
+                    VulkanError("shared buffer allocation size exceeds usize".to_string())
+                })?);
+        }
+        if !alignment.is_power_of_two() {
+            return Err(VulkanError(format!(
+                "shared buffer alignment {alignment} is not a power of two"
+            )));
+        }
+        let allocation_size = required_size
+            .checked_add(alignment - 1)
+            .map(|size| size & !(alignment - 1))
+            .ok_or_else(|| VulkanError("shared host allocation size overflowed".to_string()))?;
+        let layout = Layout::from_size_align(allocation_size, alignment).map_err(|error| {
+            VulkanError(format!("invalid shared host allocation layout: {error}"))
+        })?;
+        let pointer = unsafe { alloc_zeroed(layout) };
+        if pointer.is_null() {
+            return Err(VulkanError(format!(
+                "failed to allocate {allocation_size} bytes of aligned shared host memory"
+            )));
+        }
+        Ok(Arc::new(VulkanSharedHostAllocation {
+            address: pointer as usize,
+            layout,
+            byte_capacity,
+        }))
+    }
+
+    fn shared_host_buffer_memory_requirements(
+        &self,
+        byte_capacity: usize,
+    ) -> Result<vk::MemoryRequirements, VulkanError> {
+        unsafe {
+            let mut external_buffer_info = vk::ExternalMemoryBufferCreateInfo::default()
+                .handle_types(VULKAN_SHARED_HOST_MEMORY_HANDLE_TYPE);
+            let buffer_info = vk::BufferCreateInfo::default()
+                .size(byte_capacity as vk::DeviceSize)
+                .usage(resident_buffer_usage())
+                .sharing_mode(vk::SharingMode::EXCLUSIVE)
+                .push_next(&mut external_buffer_info);
+            let buffer = self
+                .device
+                .create_buffer(&buffer_info, None)
+                .map_err(|error| {
+                    VulkanError(format!(
+                        "failed to query shared host-backed buffer requirements: {error:?}"
+                    ))
+                })?;
+            let requirements = self.device.get_buffer_memory_requirements(buffer);
+            self.device.destroy_buffer(buffer, None);
+            Ok(requirements)
+        }
+    }
+
+    pub fn import_shared_host_buffer(
+        &self,
+        allocation: Arc<VulkanSharedHostAllocation>,
+    ) -> Result<VulkanResidentBuffer, VulkanError> {
+        if self.shared_host_memory_alignment.is_none() {
+            return Err(VulkanError(format!(
+                "Vulkan device {:?} cannot import shared host memory",
+                self.device_name
+            )));
+        }
+        let loader =
+            ash::ext::external_memory_host::Device::new(&self.context.instance, &self.device);
+        let mut host_properties = vk::MemoryHostPointerPropertiesEXT::default();
+        let result = unsafe {
+            (loader.fp().get_memory_host_pointer_properties_ext)(
+                loader.device(),
+                VULKAN_SHARED_HOST_MEMORY_HANDLE_TYPE,
+                allocation.address as *const c_void,
+                &mut host_properties,
+            )
+        };
+        if result != vk::Result::SUCCESS {
+            return Err(VulkanError(format!(
+                "failed to query shared host-pointer memory types: {result:?}"
+            )));
+        }
+
+        unsafe {
+            let mut external_buffer_info = vk::ExternalMemoryBufferCreateInfo::default()
+                .handle_types(VULKAN_SHARED_HOST_MEMORY_HANDLE_TYPE);
+            let buffer_info = vk::BufferCreateInfo::default()
+                .size(allocation.byte_capacity as vk::DeviceSize)
+                .usage(resident_buffer_usage())
+                .sharing_mode(vk::SharingMode::EXCLUSIVE)
+                .push_next(&mut external_buffer_info);
+            let buffer = self
+                .device
+                .create_buffer(&buffer_info, None)
+                .map_err(|error| {
+                    VulkanError(format!(
+                        "failed to create shared host-backed storage buffer: {error:?}"
+                    ))
+                })?;
+            let requirements = self.device.get_buffer_memory_requirements(buffer);
+            if requirements.size > allocation.layout.size() as vk::DeviceSize {
+                self.device.destroy_buffer(buffer, None);
+                return Err(VulkanError(format!(
+                    "shared host allocation has {} bytes but Vulkan requires {}",
+                    allocation.layout.size(),
+                    requirements.size
+                )));
+            }
+            let compatible_memory_types =
+                requirements.memory_type_bits & host_properties.memory_type_bits;
+            let memory_type_index = match find_memory_type(
+                &self.context.instance,
+                self.physical_device,
+                compatible_memory_types,
+                vk::MemoryPropertyFlags::HOST_VISIBLE,
+                vk::MemoryPropertyFlags::HOST_COHERENT | vk::MemoryPropertyFlags::HOST_CACHED,
+            ) {
+                Some(index) => index,
+                None => {
+                    self.device.destroy_buffer(buffer, None);
+                    return Err(VulkanError(format!(
+                        "no host-visible memory type can import the shared allocation (buffer types {:#010x}, host types {:#010x})",
+                        requirements.memory_type_bits, host_properties.memory_type_bits
+                    )));
+                }
+            };
+            let memory_access = match self.resident_memory_access(memory_type_index) {
+                Ok(access) => access,
+                Err(error) => {
+                    self.device.destroy_buffer(buffer, None);
+                    return Err(error);
+                }
+            };
+            let mut import_info = vk::ImportMemoryHostPointerInfoEXT::default()
+                .handle_type(VULKAN_SHARED_HOST_MEMORY_HANDLE_TYPE)
+                .host_pointer(allocation.address as *mut c_void);
+            let memory_info = vk::MemoryAllocateInfo::default()
+                .allocation_size(allocation.layout.size() as vk::DeviceSize)
+                .memory_type_index(memory_type_index)
+                .push_next(&mut import_info);
+            let memory = match self.device.allocate_memory(&memory_info, None) {
+                Ok(memory) => memory,
+                Err(error) => {
+                    self.device.destroy_buffer(buffer, None);
+                    return Err(VulkanError(format!(
+                        "failed to import shared host allocation: {error:?}"
+                    )));
+                }
+            };
+            if let Err(error) = self.device.bind_buffer_memory(buffer, memory, 0) {
+                self.device.free_memory(memory, None);
+                self.device.destroy_buffer(buffer, None);
+                return Err(VulkanError(format!(
+                    "failed to bind shared host allocation: {error:?}"
+                )));
+            }
+            Ok(VulkanResidentBuffer {
+                device: self.device.clone(),
+                buffer,
+                memory,
+                memory_access,
+                byte_capacity: allocation.byte_capacity as vk::DeviceSize,
+                persistent_mapping: None,
+                _shared_host_allocation: Some(allocation),
+            })
+        }
+    }
+
+    pub fn create_queue_semaphore(&self) -> Result<VulkanQueueSemaphore, VulkanError> {
+        self.create_queue_semaphore_with_sync_fd_export(false)
+    }
+
+    pub fn create_sync_fd_exportable_queue_semaphore(
+        &self,
+    ) -> Result<VulkanQueueSemaphore, VulkanError> {
+        self.create_queue_semaphore_with_sync_fd_export(true)
+    }
+
+    fn create_queue_semaphore_with_sync_fd_export(
+        &self,
+        exportable: bool,
+    ) -> Result<VulkanQueueSemaphore, VulkanError> {
+        if exportable && !self.sync_fd_semaphore_supported {
+            return Err(VulkanError(format!(
+                "Vulkan device {:?} cannot export sync-file semaphores",
+                self.device_name
+            )));
+        }
+        let semaphore = if exportable {
+            let mut export_info = vk::ExportSemaphoreCreateInfo::default()
+                .handle_types(VULKAN_CROSS_DEVICE_SYNC_HANDLE_TYPE);
+            let create_info = vk::SemaphoreCreateInfo::default().push_next(&mut export_info);
+            unsafe { self.device.create_semaphore(&create_info, None) }
+        } else {
+            unsafe {
+                self.device
+                    .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
+            }
+        }
+        .map_err(|error| VulkanError(format!("failed to create queue semaphore: {error:?}")))?;
+        Ok(VulkanQueueSemaphore {
+            device: self.device.clone(),
+            device_handle: self.device.handle(),
+            semaphore,
+            sync_fd_exportable: exportable,
+            pending_sync_fd_signal: Cell::new(false),
+            temporary_sync_fd_imported: Cell::new(false),
+        })
+    }
+
+    pub fn export_pending_queue_semaphore_sync_fd(
+        &self,
+        semaphore: &VulkanQueueSemaphore,
+    ) -> Result<OwnedFd, VulkanError> {
+        self.validate_local_queue_semaphore(semaphore)?;
+        if !semaphore.sync_fd_exportable {
+            return Err(VulkanError(
+                "queue semaphore was not created for sync-file export".to_string(),
+            ));
+        }
+        if !semaphore.pending_sync_fd_signal.get() {
+            return Err(VulkanError(
+                "sync-file export requires a pending queue signal operation".to_string(),
+            ));
+        }
+        let loader =
+            ash::khr::external_semaphore_fd::Device::new(&self.context.instance, &self.device);
+        let get_info = vk::SemaphoreGetFdInfoKHR::default()
+            .semaphore(semaphore.semaphore)
+            .handle_type(VULKAN_CROSS_DEVICE_SYNC_HANDLE_TYPE);
+        let fd = unsafe { loader.get_semaphore_fd(&get_info) }.map_err(|error| {
+            VulkanError(format!(
+                "failed to export pending queue semaphore as sync file: {error:?}"
+            ))
+        })?;
+        semaphore.pending_sync_fd_signal.set(false);
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+
+    pub fn import_queue_semaphore_sync_fd(
+        &self,
+        semaphore: &VulkanQueueSemaphore,
+        fd: OwnedFd,
+    ) -> Result<(), VulkanError> {
+        self.validate_local_queue_semaphore(semaphore)?;
+        if !self.sync_fd_semaphore_supported {
+            return Err(VulkanError(format!(
+                "Vulkan device {:?} cannot import sync-file semaphores",
+                self.device_name
+            )));
+        }
+        if semaphore.temporary_sync_fd_imported.get() {
+            return Err(VulkanError(
+                "queue semaphore already has an unconsumed temporary sync-file payload".to_string(),
+            ));
+        }
+        let import_info = vk::ImportSemaphoreFdInfoKHR::default()
+            .semaphore(semaphore.semaphore)
+            .flags(vk::SemaphoreImportFlags::TEMPORARY)
+            .handle_type(VULKAN_CROSS_DEVICE_SYNC_HANDLE_TYPE)
+            .fd(fd.as_raw_fd());
+        let loader =
+            ash::khr::external_semaphore_fd::Device::new(&self.context.instance, &self.device);
+        unsafe { loader.import_semaphore_fd(&import_info) }.map_err(|error| {
+            VulkanError(format!(
+                "failed to import queue semaphore sync file: {error:?}"
+            ))
+        })?;
+        let _fd_owned_by_vulkan = fd.into_raw_fd();
+        semaphore.temporary_sync_fd_imported.set(true);
+        Ok(())
+    }
+
+    fn validate_local_queue_semaphore(
+        &self,
+        semaphore: &VulkanQueueSemaphore,
+    ) -> Result<(), VulkanError> {
+        if semaphore.device_handle != self.device.handle() {
+            return Err(VulkanError(
+                "queue semaphore belongs to a different Vulkan logical device".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn resident_memory_access(
+        &self,
+        memory_type_index: u32,
+    ) -> Result<VulkanResidentMemoryAccess, VulkanError> {
+        let memory_properties = unsafe {
+            self.context
+                .instance
+                .get_physical_device_memory_properties(self.physical_device)
+        };
+        let property_flags =
+            memory_properties.memory_types[memory_type_index as usize].property_flags;
+        let directly_mappable = property_flags.contains(
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        );
+        let staging_memory_type_index = if directly_mappable {
+            None
+        } else {
+            Some(
+                unsafe {
+                    find_memory_type(
+                        &self.context.instance,
+                        self.physical_device,
+                        u32::MAX,
+                        vk::MemoryPropertyFlags::HOST_VISIBLE
+                            | vk::MemoryPropertyFlags::HOST_COHERENT,
+                        vk::MemoryPropertyFlags::empty(),
+                    )
+                }
+                .ok_or_else(|| {
+                    VulkanError(
+                        "no host-visible coherent memory type for resident staging transfers"
+                            .to_string(),
+                    )
+                })?,
+            )
+        };
+        Ok(VulkanResidentMemoryAccess {
+            queue: self.queue,
+            queue_family_index: self.queue_family_index,
+            property_flags,
+            staging_memory_type_index,
+        })
+    }
+
     pub fn create_resident_buffer(
         &self,
         byte_capacity: usize,
@@ -1115,6 +1562,7 @@ impl VulkanComputeDevice {
             memory_access,
             byte_capacity,
             persistent_mapping: None,
+            _shared_host_allocation: None,
         })
     }
 
@@ -1139,6 +1587,7 @@ impl VulkanComputeDevice {
             memory_access,
             byte_capacity,
             persistent_mapping: None,
+            _shared_host_allocation: None,
         })
     }
 
@@ -1160,11 +1609,7 @@ impl VulkanComputeDevice {
         unsafe {
             let buffer_info = vk::BufferCreateInfo::default()
                 .size(byte_capacity)
-                .usage(
-                    vk::BufferUsageFlags::STORAGE_BUFFER
-                        | vk::BufferUsageFlags::TRANSFER_SRC
-                        | vk::BufferUsageFlags::TRANSFER_DST,
-                )
+                .usage(resident_buffer_usage())
                 .sharing_mode(vk::SharingMode::EXCLUSIVE);
             let buffer = self
                 .device
@@ -1678,12 +2123,27 @@ impl VulkanComputeDevice {
         &self,
         sequence: &VulkanResidentKernelSequence,
     ) -> Result<(), VulkanError> {
+        self.submit_recorded_resident_kernel_sequence_with_semaphores(sequence, &[], &[])
+    }
+
+    pub fn submit_recorded_resident_kernel_sequence_with_semaphores(
+        &self,
+        sequence: &VulkanResidentKernelSequence,
+        wait_semaphores: &[&VulkanQueueSemaphore],
+        signal_semaphores: &[&VulkanQueueSemaphore],
+    ) -> Result<(), VulkanError> {
         if !sequence.has_recorded_commands() {
             return Err(VulkanError(
                 "resident kernel sequence has no recorded commands".to_string(),
             ));
         }
-        self.submit_resident_kernel_sequence(sequence)
+        self.submit_command_buffer_with_semaphores(
+            sequence.command_buffer,
+            sequence.completion_fence,
+            wait_semaphores,
+            signal_semaphores,
+            "resident kernel sequence",
+        )
     }
 
     fn submit_resident_kernel_sequence_and_wait(
@@ -1698,23 +2158,71 @@ impl VulkanComputeDevice {
         &self,
         sequence: &VulkanResidentKernelSequence,
     ) -> Result<(), VulkanError> {
+        self.submit_command_buffer_with_semaphores(
+            sequence.command_buffer,
+            sequence.completion_fence,
+            &[],
+            &[],
+            "resident kernel sequence",
+        )
+    }
+
+    fn submit_command_buffer_with_semaphores(
+        &self,
+        command_buffer: vk::CommandBuffer,
+        completion_fence: vk::Fence,
+        wait_semaphores: &[&VulkanQueueSemaphore],
+        signal_semaphores: &[&VulkanQueueSemaphore],
+        label: &str,
+    ) -> Result<(), VulkanError> {
+        for semaphore in wait_semaphores.iter().chain(signal_semaphores) {
+            self.validate_local_queue_semaphore(semaphore)?;
+        }
+        if signal_semaphores
+            .iter()
+            .any(|semaphore| semaphore.sync_fd_exportable && semaphore.pending_sync_fd_signal.get())
+        {
+            return Err(VulkanError(
+                "cannot signal a sync-file semaphore before exporting its pending payload"
+                    .to_string(),
+            ));
+        }
+        let wait_handles = wait_semaphores
+            .iter()
+            .map(|semaphore| semaphore.semaphore)
+            .collect::<Vec<_>>();
+        let signal_handles = signal_semaphores
+            .iter()
+            .map(|semaphore| semaphore.semaphore)
+            .collect::<Vec<_>>();
+        let wait_stage_masks = vec![vk::PipelineStageFlags::ALL_COMMANDS; wait_handles.len()];
         unsafe {
-            let command_buffers = [sequence.command_buffer];
-            let submit_info = [vk::SubmitInfo::default().command_buffers(&command_buffers)];
             self.device
-                .reset_fences(&[sequence.completion_fence])
+                .reset_fences(&[completion_fence])
                 .map_err(|error| {
                     VulkanError(format!(
-                        "failed to reset resident kernel sequence completion fence: {error:?}"
+                        "failed to reset {label} completion fence: {error:?}"
                     ))
                 })?;
+            let command_buffers = [command_buffer];
+            let submit_info = [vk::SubmitInfo::default()
+                .wait_semaphores(&wait_handles)
+                .wait_dst_stage_mask(&wait_stage_masks)
+                .command_buffers(&command_buffers)
+                .signal_semaphores(&signal_handles)];
             self.device
-                .queue_submit(self.queue, &submit_info, sequence.completion_fence)
-                .map_err(|error| {
-                    VulkanError(format!(
-                        "failed to submit resident kernel sequence: {error:?}"
-                    ))
-                })?;
+                .queue_submit(self.queue, &submit_info, completion_fence)
+                .map_err(|error| VulkanError(format!("failed to submit {label}: {error:?}")))?;
+        }
+        for semaphore in signal_semaphores {
+            if semaphore.sync_fd_exportable {
+                semaphore.pending_sync_fd_signal.set(true);
+            }
+        }
+        for semaphore in wait_semaphores {
+            if semaphore.temporary_sync_fd_imported.get() {
+                semaphore.temporary_sync_fd_imported.set(false);
+            }
         }
         Ok(())
     }
@@ -1740,6 +2248,24 @@ impl VulkanComputeDevice {
         sequence: &VulkanResidentKernelSequence,
         steps: &[VulkanResidentKernelSequenceStep<'_>],
         snapshot_copies: &[VulkanResidentKernelSequenceSnapshotCopy<'_>],
+    ) -> Result<(), VulkanError> {
+        self.prepare_resident_kernel_sequence(sequence, steps, snapshot_copies, true)
+    }
+
+    pub fn record_resident_kernel_sequence(
+        &self,
+        sequence: &VulkanResidentKernelSequence,
+        steps: &[VulkanResidentKernelSequenceStep<'_>],
+    ) -> Result<(), VulkanError> {
+        self.prepare_resident_kernel_sequence(sequence, steps, &[], false)
+    }
+
+    fn prepare_resident_kernel_sequence(
+        &self,
+        sequence: &VulkanResidentKernelSequence,
+        steps: &[VulkanResidentKernelSequenceStep<'_>],
+        snapshot_copies: &[VulkanResidentKernelSequenceSnapshotCopy<'_>],
+        execute: bool,
     ) -> Result<(), VulkanError> {
         if steps.is_empty() {
             return Err(VulkanError(
@@ -1769,7 +2295,7 @@ impl VulkanComputeDevice {
         }
 
         unsafe {
-            let profiling_enabled = std::env::var_os("LLMOOP_VK_PERF_LOGGER").is_some();
+            let profiling_enabled = execute && std::env::var_os("LLMOOP_VK_PERF_LOGGER").is_some();
             let command_buffer_matches = !profiling_enabled
                 && sequence
                     .recorded_steps
@@ -2049,6 +2575,10 @@ impl VulkanComputeDevice {
                             .collect(),
                     );
                 }
+            }
+
+            if !execute {
+                return Ok(());
             }
 
             self.submit_resident_kernel_sequence_and_wait(sequence)?;
@@ -2367,6 +2897,79 @@ fn physical_device_supports_extension(
     }))
 }
 
+fn resident_buffer_usage() -> vk::BufferUsageFlags {
+    vk::BufferUsageFlags::STORAGE_BUFFER
+        | vk::BufferUsageFlags::TRANSFER_SRC
+        | vk::BufferUsageFlags::TRANSFER_DST
+}
+
+fn physical_device_supports_shared_host_buffer(
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+) -> bool {
+    let info = vk::PhysicalDeviceExternalBufferInfo::default()
+        .flags(vk::BufferCreateFlags::empty())
+        .usage(resident_buffer_usage())
+        .handle_type(VULKAN_SHARED_HOST_MEMORY_HANDLE_TYPE);
+    let mut properties = vk::ExternalBufferProperties::default();
+    unsafe {
+        instance.get_physical_device_external_buffer_properties(
+            physical_device,
+            &info,
+            &mut properties,
+        );
+    }
+    properties
+        .external_memory_properties
+        .external_memory_features
+        .contains(vk::ExternalMemoryFeatureFlags::IMPORTABLE)
+        && properties
+            .external_memory_properties
+            .compatible_handle_types
+            .contains(VULKAN_SHARED_HOST_MEMORY_HANDLE_TYPE)
+}
+
+fn physical_device_shared_host_memory_alignment(
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+) -> Result<usize, VulkanError> {
+    let mut external_host = vk::PhysicalDeviceExternalMemoryHostPropertiesEXT::default();
+    let mut properties = vk::PhysicalDeviceProperties2::default().push_next(&mut external_host);
+    unsafe {
+        instance.get_physical_device_properties2(physical_device, &mut properties);
+    }
+    let alignment = usize::try_from(external_host.min_imported_host_pointer_alignment)
+        .map_err(|_| VulkanError("shared host-memory alignment exceeds usize".to_string()))?;
+    if alignment == 0 || !alignment.is_power_of_two() {
+        return Err(VulkanError(format!(
+            "Vulkan device reported invalid shared host-memory alignment {alignment}"
+        )));
+    }
+    Ok(alignment)
+}
+
+fn physical_device_supports_sync_fd_semaphore(
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+) -> bool {
+    let info = vk::PhysicalDeviceExternalSemaphoreInfo::default()
+        .handle_type(VULKAN_CROSS_DEVICE_SYNC_HANDLE_TYPE);
+    let mut properties = vk::ExternalSemaphoreProperties::default();
+    unsafe {
+        instance.get_physical_device_external_semaphore_properties(
+            physical_device,
+            &info,
+            &mut properties,
+        );
+    }
+    properties.external_semaphore_features.contains(
+        vk::ExternalSemaphoreFeatureFlags::EXPORTABLE
+            | vk::ExternalSemaphoreFeatureFlags::IMPORTABLE,
+    ) && properties
+        .compatible_handle_types
+        .contains(VULKAN_CROSS_DEVICE_SYNC_HANDLE_TYPE)
+}
+
 fn physical_device_supports_shader_float8(
     instance: &ash::Instance,
     physical_device: vk::PhysicalDevice,
@@ -2566,7 +3169,7 @@ unsafe fn find_memory_type(
             let preferred_property_count = (memory_type.property_flags & preferred_flags)
                 .as_raw()
                 .count_ones();
-            (heap_size, preferred_property_count)
+            (preferred_property_count, heap_size)
         })
 }
 
@@ -3136,6 +3739,133 @@ mod tests {
         assert_eq!(
             bytes_to_u32(&buffer.read_bytes(12).unwrap()),
             vec![5, 6, 45]
+        );
+    }
+
+    #[test]
+    fn cross_device_shared_host_memory_uses_sync_file_dependencies() {
+        let Some(spirv_words) = compile_test_shader_words() else {
+            eprintln!("skipping cross-device Vulkan test: no GLSL to SPIR-V compiler found");
+            return;
+        };
+        let (Some(owner_index), Some(worker_index)) = (
+            std::env::var("LLMOOP_TEST_VULKAN_DEVICE_INDEX")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok()),
+            std::env::var("LLMOOP_TEST_VULKAN_SECONDARY_DEVICE_INDEX")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok()),
+        ) else {
+            eprintln!("skipping cross-device Vulkan test: explicit device pair unset");
+            return;
+        };
+        assert_ne!(owner_index, worker_index);
+
+        let owner = VulkanComputeDevice::new_for_physical_device_index(owner_index).unwrap();
+        let worker = VulkanComputeDevice::new_for_physical_device_index(worker_index).unwrap();
+        assert!(owner.supports_shared_host_memory());
+        assert!(worker.supports_shared_host_memory());
+        assert!(owner.supports_sync_fd_semaphores());
+        assert!(worker.supports_sync_fd_semaphores());
+
+        let allocation = owner.create_shared_host_allocation(&[&worker], 12).unwrap();
+        let owner_buffer = owner
+            .import_shared_host_buffer(Arc::clone(&allocation))
+            .unwrap();
+        let worker_buffer = worker.import_shared_host_buffer(allocation).unwrap();
+        owner_buffer.write_bytes(&u32_bytes(&[1, 2, 41])).unwrap();
+
+        let owner_dispatch = owner
+            .create_resident_kernel_dispatch(
+                &spirv_words,
+                &[VulkanResidentKernelBufferBinding::new(0, &owner_buffer, 12)],
+                1,
+                64,
+                0,
+            )
+            .unwrap();
+        let worker_dispatch = worker
+            .create_resident_kernel_dispatch(
+                &spirv_words,
+                &[VulkanResidentKernelBufferBinding::new(
+                    0,
+                    &worker_buffer,
+                    12,
+                )],
+                1,
+                64,
+                0,
+            )
+            .unwrap();
+        let owner_first = owner.create_resident_kernel_sequence().unwrap();
+        owner
+            .record_resident_kernel_sequence(
+                &owner_first,
+                &[VulkanResidentKernelSequenceStep::new(&owner_dispatch, &[])],
+            )
+            .unwrap();
+        let worker_sequence = worker.create_resident_kernel_sequence().unwrap();
+        worker
+            .record_resident_kernel_sequence(
+                &worker_sequence,
+                &[VulkanResidentKernelSequenceStep::new(&worker_dispatch, &[])],
+            )
+            .unwrap();
+        let owner_last = owner.create_resident_kernel_sequence().unwrap();
+        owner
+            .record_resident_kernel_sequence(
+                &owner_last,
+                &[VulkanResidentKernelSequenceStep::new(&owner_dispatch, &[])],
+            )
+            .unwrap();
+
+        let ready_source = owner.create_sync_fd_exportable_queue_semaphore().unwrap();
+        let ready_wait = worker.create_queue_semaphore().unwrap();
+        let done_source = worker.create_sync_fd_exportable_queue_semaphore().unwrap();
+        let done_wait = owner.create_queue_semaphore().unwrap();
+
+        owner
+            .submit_recorded_resident_kernel_sequence_with_semaphores(
+                &owner_first,
+                &[],
+                &[&ready_source],
+            )
+            .unwrap();
+        worker
+            .import_queue_semaphore_sync_fd(
+                &ready_wait,
+                owner
+                    .export_pending_queue_semaphore_sync_fd(&ready_source)
+                    .unwrap(),
+            )
+            .unwrap();
+        worker
+            .submit_recorded_resident_kernel_sequence_with_semaphores(
+                &worker_sequence,
+                &[&ready_wait],
+                &[&done_source],
+            )
+            .unwrap();
+        owner
+            .import_queue_semaphore_sync_fd(
+                &done_wait,
+                worker
+                    .export_pending_queue_semaphore_sync_fd(&done_source)
+                    .unwrap(),
+            )
+            .unwrap();
+        owner
+            .submit_recorded_resident_kernel_sequence_with_semaphores(
+                &owner_last,
+                &[&done_wait],
+                &[],
+            )
+            .unwrap();
+        owner.wait_resident_kernel_sequence(&owner_last).unwrap();
+
+        assert_eq!(
+            bytes_to_u32(&owner_buffer.read_bytes(12).unwrap()),
+            vec![4, 5, 44]
         );
     }
 
