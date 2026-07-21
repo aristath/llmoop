@@ -968,6 +968,8 @@ def test_compiler_renders_native_block_scaled_fp8_sparse_experts(
     ).read_text()
     assert "const uint NUM_EXPERTS = 256u;" in expert_shader
     assert "const uint EXPERTS_PER_TOKEN = 8u;" in expert_shader
+    assert "#extension GL_EXT_float_e4m3 : require" in expert_shader
+    assert "uintBitsToFloate4m3EXT" in expert_shader
     assert "ExpertInputScaleInv" in expert_shader
     assert "ExpertOutputScaleInv" in expert_shader
     assert "{{" not in expert_shader
