@@ -6,9 +6,10 @@ use std::sync::Arc;
 use crate::stream_plan::{TensorIndex, TensorMetadata};
 use crate::tensor_storage::{TensorStorage, TensorStorageRange};
 use crate::vulkan_compute::{
-    VulkanComputeDevice, VulkanError, VulkanResidentBuffer, VulkanResidentKernelBufferAccess,
-    VulkanResidentKernelBufferBinding, VulkanResidentKernelDispatch, VulkanResidentKernelSequence,
-    VulkanResidentKernelSequenceStep, VulkanSharedHostAllocation,
+    VulkanComputeDevice, VulkanError, VulkanQueueSemaphore, VulkanResidentBuffer,
+    VulkanResidentKernelBufferAccess, VulkanResidentKernelBufferBinding,
+    VulkanResidentKernelDispatch, VulkanResidentKernelSequence, VulkanResidentKernelSequenceStep,
+    VulkanSharedHostAllocation,
 };
 use crate::vulkan_stream_circuit::{
     VulkanActivationSlotBufferOverride, VulkanDescriptorResourceAddress,
@@ -833,6 +834,12 @@ impl VulkanDistributedDispatchRunners {
         let mut dispatches = Vec::with_capacity(execution_plan.dispatches.len());
         let mut shard_count = 0usize;
         for planned_dispatch in &execution_plan.dispatches {
+            let owner_device = device_for(&planned_dispatch.owner_device_id).map_err(|error| {
+                VulkanDistributedDispatchRunnerError(format!(
+                    "failed to resolve distributed owner device {:?}: {error}",
+                    planned_dispatch.owner_device_id
+                ))
+            })?;
             let artifact = loaded_manifest
                 .artifact(&planned_dispatch.reusable_family_id)
                 .ok_or_else(|| {
@@ -984,9 +991,54 @@ impl VulkanDistributedDispatchRunners {
                     )
                 })?;
             }
+            let mut helper_synchronization = Vec::with_capacity(
+                planned_dispatch
+                    .shards
+                    .iter()
+                    .filter(|shard| shard.device_id != planned_dispatch.owner_device_id)
+                    .count(),
+            );
+            for planned_shard in &planned_dispatch.shards {
+                if planned_shard.device_id == planned_dispatch.owner_device_id {
+                    continue;
+                }
+                let helper_device = device_for(&planned_shard.device_id).map_err(|error| {
+                    VulkanDistributedDispatchRunnerError(format!(
+                        "failed to resolve distributed helper device {:?}: {error}",
+                        planned_shard.device_id
+                    ))
+                })?;
+                if !owner_device.supports_sync_fd_semaphores()
+                    || !helper_device.supports_sync_fd_semaphores()
+                {
+                    return Err(VulkanDistributedDispatchRunnerError(format!(
+                        "distributed dispatch {}.{} requires sync-file semaphores on owner {:?} and helper {:?}",
+                        planned_dispatch.pedal_id,
+                        planned_dispatch.node_id,
+                        planned_dispatch.owner_device_id,
+                        planned_shard.device_id
+                    )));
+                }
+                helper_synchronization.push(VulkanDistributedDispatchHelperSynchronization {
+                    device_id: planned_shard.device_id.clone(),
+                    ready_source: owner_device
+                        .create_sync_fd_exportable_queue_semaphore()
+                        .map_err(VulkanDistributedDispatchRunnerError::from)?,
+                    ready_wait: helper_device
+                        .create_queue_semaphore()
+                        .map_err(VulkanDistributedDispatchRunnerError::from)?,
+                    done_source: helper_device
+                        .create_sync_fd_exportable_queue_semaphore()
+                        .map_err(VulkanDistributedDispatchRunnerError::from)?,
+                    done_wait: owner_device
+                        .create_queue_semaphore()
+                        .map_err(VulkanDistributedDispatchRunnerError::from)?,
+                });
+            }
             dispatches.push(VulkanDistributedDispatchRunner {
                 planned: planned_dispatch.clone(),
                 shards,
+                helper_synchronization,
             });
         }
 
@@ -1006,6 +1058,210 @@ impl VulkanDistributedDispatchRunners {
             dispatch.planned.owner_device_id == owner_device_id
                 && dispatch.planned.dispatch_index == dispatch_index
         })
+    }
+
+    pub fn owner_ready_signal_semaphores(
+        &self,
+        owner_device_id: &str,
+        dispatch_index: usize,
+    ) -> Result<Vec<&VulkanQueueSemaphore>, VulkanDistributedDispatchRunnerError> {
+        let dispatch = self.dispatch(owner_device_id, dispatch_index).ok_or_else(|| {
+            VulkanDistributedDispatchRunnerError(format!(
+                "distributed runner has no dispatch {dispatch_index} owned by {owner_device_id:?}"
+            ))
+        })?;
+        Ok(dispatch
+            .helper_synchronization
+            .iter()
+            .map(|sync| &sync.ready_source)
+            .collect())
+    }
+
+    pub fn owner_completion_wait_semaphores(
+        &self,
+        owner_device_id: &str,
+        dispatch_index: usize,
+    ) -> Result<Vec<&VulkanQueueSemaphore>, VulkanDistributedDispatchRunnerError> {
+        let dispatch = self.dispatch(owner_device_id, dispatch_index).ok_or_else(|| {
+            VulkanDistributedDispatchRunnerError(format!(
+                "distributed runner has no dispatch {dispatch_index} owned by {owner_device_id:?}"
+            ))
+        })?;
+        Ok(dispatch
+            .helper_synchronization
+            .iter()
+            .map(|sync| &sync.done_wait)
+            .collect())
+    }
+
+    pub fn submit_dispatch_with_device_dependencies<'a, F, E>(
+        &self,
+        owner_device_id: &str,
+        dispatch_index: usize,
+        consume_owner_ready_signal: bool,
+        prepare_owner_continuation: bool,
+        mut device_for: F,
+    ) -> Result<VulkanDistributedDispatchRun, VulkanDistributedDispatchRunnerError>
+    where
+        F: FnMut(&str) -> Result<&'a VulkanComputeDevice, E>,
+        E: Display,
+    {
+        let dispatch = self.dispatch(owner_device_id, dispatch_index).ok_or_else(|| {
+            VulkanDistributedDispatchRunnerError(format!(
+                "distributed runner has no dispatch {dispatch_index} owned by {owner_device_id:?}"
+            ))
+        })?;
+        let owner_device = device_for(owner_device_id).map_err(|error| {
+            VulkanDistributedDispatchRunnerError(format!(
+                "failed to resolve distributed owner device {owner_device_id:?}: {error}"
+            ))
+        })?;
+        let resolved_shards = dispatch
+            .shards
+            .iter()
+            .map(|shard| {
+                device_for(&shard.planned.device_id)
+                    .map(|device| (shard, device))
+                    .map_err(|error| {
+                        VulkanDistributedDispatchRunnerError(format!(
+                            "failed to resolve distributed shard device {:?}: {error}",
+                            shard.planned.device_id
+                        ))
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if consume_owner_ready_signal {
+            for synchronization in &dispatch.helper_synchronization {
+                let helper_device = resolved_shards
+                    .iter()
+                    .find(|(shard, _)| shard.planned.device_id == synchronization.device_id)
+                    .map(|(_, device)| *device)
+                    .expect("every helper synchronization belongs to a resolved shard");
+                let ready_fd = owner_device
+                    .export_pending_queue_semaphore_sync_fd(&synchronization.ready_source)
+                    .map_err(VulkanDistributedDispatchRunnerError::from)?;
+                helper_device
+                    .import_queue_semaphore_sync_fd(&synchronization.ready_wait, ready_fd)
+                    .map_err(VulkanDistributedDispatchRunnerError::from)?;
+            }
+        }
+
+        let mut submitted: Vec<(&VulkanComputeDevice, &VulkanDistributedDispatchShardRunner)> =
+            Vec::with_capacity(dispatch.shards.len());
+        for (shard, device) in resolved_shards {
+            let synchronization = dispatch
+                .helper_synchronization
+                .iter()
+                .find(|sync| sync.device_id == shard.planned.device_id);
+            let wait_semaphores = synchronization
+                .filter(|_| consume_owner_ready_signal)
+                .map(|sync| vec![&sync.ready_wait])
+                .unwrap_or_default();
+            let signal_semaphores = synchronization
+                .filter(|_| prepare_owner_continuation)
+                .map(|sync| vec![&sync.done_source])
+                .unwrap_or_default();
+            if let Err(error) = device.submit_recorded_resident_kernel_sequence_with_semaphores(
+                &shard.sequence,
+                &wait_semaphores,
+                &signal_semaphores,
+            ) {
+                for (submitted_device, submitted_shard) in &submitted {
+                    let _ =
+                        submitted_device.wait_resident_kernel_sequence(&submitted_shard.sequence);
+                }
+                return Err(VulkanDistributedDispatchRunnerError(format!(
+                    "failed to submit distributed dispatch {}.{} shard on {:?}: {error}",
+                    dispatch.planned.pedal_id, dispatch.planned.node_id, shard.planned.device_id
+                )));
+            }
+            submitted.push((device, shard));
+        }
+
+        if prepare_owner_continuation {
+            for synchronization in &dispatch.helper_synchronization {
+                let helper_device = submitted
+                    .iter()
+                    .find(|(_, shard)| shard.planned.device_id == synchronization.device_id)
+                    .map(|(device, _)| *device)
+                    .expect("every helper synchronization belongs to a submitted shard");
+                let done_fd = match helper_device
+                    .export_pending_queue_semaphore_sync_fd(&synchronization.done_source)
+                {
+                    Ok(fd) => fd,
+                    Err(error) => {
+                        for (submitted_device, submitted_shard) in &submitted {
+                            let _ = submitted_device
+                                .wait_resident_kernel_sequence(&submitted_shard.sequence);
+                        }
+                        return Err(VulkanDistributedDispatchRunnerError::from(error));
+                    }
+                };
+                if let Err(error) =
+                    owner_device.import_queue_semaphore_sync_fd(&synchronization.done_wait, done_fd)
+                {
+                    for (submitted_device, submitted_shard) in &submitted {
+                        let _ = submitted_device
+                            .wait_resident_kernel_sequence(&submitted_shard.sequence);
+                    }
+                    return Err(VulkanDistributedDispatchRunnerError::from(error));
+                }
+            }
+        }
+
+        Ok(VulkanDistributedDispatchRun {
+            owner_device_id: owner_device_id.to_string(),
+            dispatch_index,
+            pedal_id: dispatch.planned.pedal_id.clone(),
+            node_id: dispatch.planned.node_id.clone(),
+            shard_count: dispatch.shards.len(),
+        })
+    }
+
+    pub fn wait_dispatch<'a, F, E>(
+        &self,
+        owner_device_id: &str,
+        dispatch_index: usize,
+        mut device_for: F,
+    ) -> Result<(), VulkanDistributedDispatchRunnerError>
+    where
+        F: FnMut(&str) -> Result<&'a VulkanComputeDevice, E>,
+        E: Display,
+    {
+        let dispatch = self.dispatch(owner_device_id, dispatch_index).ok_or_else(|| {
+            VulkanDistributedDispatchRunnerError(format!(
+                "distributed runner has no dispatch {dispatch_index} owned by {owner_device_id:?}"
+            ))
+        })?;
+        let resolved_shards = dispatch
+            .shards
+            .iter()
+            .map(|shard| {
+                device_for(&shard.planned.device_id)
+                    .map(|device| (shard, device))
+                    .map_err(|error| {
+                        VulkanDistributedDispatchRunnerError(format!(
+                            "failed to resolve distributed shard device {:?}: {error}",
+                            shard.planned.device_id
+                        ))
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut first_error = None;
+        for (shard, device) in resolved_shards {
+            if let Err(error) = device.wait_resident_kernel_sequence(&shard.sequence)
+                && first_error.is_none()
+            {
+                first_error = Some(format!(
+                    "failed waiting for distributed dispatch {}.{} shard on {:?}: {error}",
+                    dispatch.planned.pedal_id, dispatch.planned.node_id, shard.planned.device_id
+                ));
+            }
+        }
+        if let Some(error) = first_error {
+            return Err(VulkanDistributedDispatchRunnerError(error));
+        }
+        Ok(())
     }
 
     pub fn run_dispatch<'a, F, E>(
@@ -1083,12 +1339,21 @@ pub struct VulkanDistributedDispatchRun {
 pub struct VulkanDistributedDispatchRunner {
     pub planned: VulkanDistributedDispatchPlan,
     pub shards: Vec<VulkanDistributedDispatchShardRunner>,
+    helper_synchronization: Vec<VulkanDistributedDispatchHelperSynchronization>,
 }
 
 pub struct VulkanDistributedDispatchShardRunner {
     pub planned: VulkanDistributedDispatchShard,
     pub resident_dispatch: VulkanResidentKernelDispatch,
     pub sequence: VulkanResidentKernelSequence,
+}
+
+struct VulkanDistributedDispatchHelperSynchronization {
+    device_id: String,
+    ready_source: VulkanQueueSemaphore,
+    ready_wait: VulkanQueueSemaphore,
+    done_source: VulkanQueueSemaphore,
+    done_wait: VulkanQueueSemaphore,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1101,6 +1366,12 @@ impl Display for VulkanDistributedDispatchRunnerError {
 }
 
 impl Error for VulkanDistributedDispatchRunnerError {}
+
+impl From<VulkanError> for VulkanDistributedDispatchRunnerError {
+    fn from(error: VulkanError) -> Self {
+        Self(error.to_string())
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VulkanDistributedParameterExclusionPlan {
