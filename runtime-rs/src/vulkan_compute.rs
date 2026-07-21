@@ -1564,6 +1564,24 @@ impl VulkanComputeDevice {
         self.create_timeline_semaphore_with_opaque_fd_export(initial_value, true)
     }
 
+    pub fn wait_timeline_semaphore_value(
+        &self,
+        semaphore: &VulkanTimelineSemaphore,
+        value: u64,
+    ) -> Result<(), VulkanError> {
+        self.validate_local_timeline_semaphore(semaphore)?;
+        let semaphores = [semaphore.semaphore];
+        let values = [value];
+        let wait_info = vk::SemaphoreWaitInfo::default()
+            .semaphores(&semaphores)
+            .values(&values);
+        unsafe { self.device.wait_semaphores(&wait_info, u64::MAX) }.map_err(|error| {
+            VulkanError(format!(
+                "failed to wait for timeline semaphore value {value}: {error:?}"
+            ))
+        })
+    }
+
     fn create_timeline_semaphore_with_opaque_fd_export(
         &self,
         initial_value: u64,
