@@ -38,9 +38,9 @@ use crate::vulkan_compute::{
 use crate::vulkan_distributed::{
     VulkanDistributedActivationBufferPlan, VulkanDistributedActivationBuffers,
     VulkanDistributedDispatchPlan, VulkanDistributedDispatchRunnerError,
-    VulkanDistributedDispatchRunners, VulkanDistributedExecutionPlan,
-    VulkanDistributedParameterAllocationPlan, VulkanDistributedParameterBuffers,
-    VulkanDistributedParameterExclusionPlan,
+    VulkanDistributedDispatchRunners, VulkanDistributedDispatchSubmission,
+    VulkanDistributedExecutionPlan, VulkanDistributedParameterAllocationPlan,
+    VulkanDistributedParameterBuffers, VulkanDistributedParameterExclusionPlan,
 };
 
 pub const VULKAN_STREAM_CIRCUIT_BACKEND_ID: &str = "vulkan_stream_circuit_ir";
@@ -5860,6 +5860,35 @@ impl VulkanResidentStateTransactionBank {
             }
         }
         Ok(copies)
+    }
+
+    fn copies_for_tick<'a>(
+        &'a self,
+        buffers: &'a VulkanStreamCircuitStreamBuffers,
+        after_step_index: usize,
+        tick_index: usize,
+    ) -> Result<Vec<VulkanResidentKernelSequenceSnapshotCopy<'a>>, VulkanError> {
+        if tick_index >= self.cycle_width {
+            return Err(VulkanError(format!(
+                "resident state transaction tick {tick_index} exceeds capacity {}",
+                self.cycle_width
+            )));
+        }
+        let snapshot_index = tick_index + usize::from(self.has_baseline);
+        self.entries
+            .iter()
+            .map(|entry| {
+                let state = &buffers.state_buffers[entry.state_buffer_index];
+                VulkanResidentKernelSequenceSnapshotCopy::new(
+                    after_step_index,
+                    &state.buffer,
+                    &entry.snapshots,
+                    0,
+                    snapshot_index * entry.byte_capacity,
+                    entry.byte_capacity,
+                )
+            })
+            .collect()
     }
 
     fn copies_for_state_buffers<'a>(
@@ -14722,6 +14751,8 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
             &self.activation_schedule,
             Some(&self.distributed_dispatch_runners),
             Some(&self.cable_synchronizations),
+            VulkanPlacedSubmissionPolicy::SYNCHRONOUS,
+            None,
         )
         .map_err(VulkanResidentInProcessPlacedRuntimeError::Tick)
     }
@@ -14778,6 +14809,8 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
             &self.activation_schedule,
             Some(&self.distributed_dispatch_runners),
             Some(&self.cable_synchronizations),
+            VulkanPlacedSubmissionPolicy::SYNCHRONOUS,
+            None,
         )
         .map_err(VulkanResidentInProcessPlacedRuntimeError::Tick)
     }
@@ -14838,6 +14871,8 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
             &self.activation_schedule,
             Some(&self.distributed_dispatch_runners),
             Some(&self.cable_synchronizations),
+            VulkanPlacedSubmissionPolicy::SYNCHRONOUS,
+            None,
         )
         .map_err(VulkanResidentInProcessPlacedRuntimeError::Tick)?;
         if placed_run.status != VulkanMountedPlacedResidentInProcessStreamTickRunStatus::Completed {
@@ -14960,6 +14995,8 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
             &self.activation_schedule,
             Some(&self.distributed_dispatch_runners),
             Some(&self.cable_synchronizations),
+            VulkanPlacedSubmissionPolicy::SYNCHRONOUS,
+            None,
         )
         .map_err(VulkanResidentInProcessPlacedRuntimeError::Tick)?;
         if placed_run.status != VulkanMountedPlacedResidentInProcessStreamTickRunStatus::Completed {
@@ -19482,6 +19519,7 @@ pub struct VulkanMountedPlacedResidentDispatchSegmentRunner {
     dispatches: Vec<VulkanMountedPlacedResidentPedalDispatch>,
     stream_control_buffer: Arc<VulkanResidentBuffer>,
     sequences: RefCell<BTreeMap<u8, VulkanResidentKernelSequence>>,
+    feedback_sequences: RefCell<Vec<VulkanResidentKernelSequence>>,
 }
 
 impl VulkanMountedPlacedResidentDispatchSegmentRunner {
@@ -19564,6 +19602,7 @@ impl VulkanMountedPlacedResidentDispatchSegmentRunner {
                     .create_resident_kernel_sequence()
                     .map_err(VulkanMountedPlacedResidentKernelDispatchError::Vulkan)?,
             )])),
+            feedback_sequences: RefCell::new(Vec::new()),
         })
     }
 
@@ -19575,9 +19614,36 @@ impl VulkanMountedPlacedResidentDispatchSegmentRunner {
         prefix_dispatches: &[&VulkanResidentKernelDispatch],
         suffix_dispatches: &[&VulkanResidentKernelDispatch],
         sequence_variant: u8,
+        feedback_lane: Option<usize>,
+        snapshot_copies: &[VulkanResidentKernelSequenceSnapshotCopy<'_>],
         wait_points: &[VulkanTimelineSemaphorePoint<'_>],
         signal_points: &[VulkanTimelineSemaphorePoint<'_>],
+        signal_completion: bool,
     ) -> Result<(), VulkanMountedPlacedResidentKernelDispatchError> {
+        if let Some(feedback_lane) = feedback_lane {
+            while self.feedback_sequences.borrow().len() <= feedback_lane {
+                let sequence = device
+                    .create_resident_kernel_sequence()
+                    .map_err(VulkanMountedPlacedResidentKernelDispatchError::Vulkan)?;
+                self.feedback_sequences.borrow_mut().push(sequence);
+            }
+            let feedback_sequences = self.feedback_sequences.borrow();
+            let sequence = feedback_sequences
+                .get(feedback_lane)
+                .expect("resident feedback sequence lane was initialized");
+            return self.record_and_submit_sequence(
+                device,
+                sequence,
+                control,
+                prefix_dispatches,
+                suffix_dispatches,
+                snapshot_copies,
+                wait_points,
+                signal_points,
+                signal_completion,
+            );
+        }
+        debug_assert!(snapshot_copies.is_empty());
         if !self.sequences.borrow().contains_key(&sequence_variant) {
             let sequence = device
                 .create_resident_kernel_sequence()
@@ -19591,14 +19657,40 @@ impl VulkanMountedPlacedResidentDispatchSegmentRunner {
         let sequence = sequences
             .get(&sequence_variant)
             .expect("resident sequence variant was initialized");
+        self.record_and_submit_sequence(
+            device,
+            sequence,
+            control,
+            prefix_dispatches,
+            suffix_dispatches,
+            snapshot_copies,
+            wait_points,
+            signal_points,
+            signal_completion,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_and_submit_sequence(
+        &self,
+        device: &VulkanComputeDevice,
+        sequence: &VulkanResidentKernelSequence,
+        control: VulkanMountedPlacedStreamControl,
+        prefix_dispatches: &[&VulkanResidentKernelDispatch],
+        suffix_dispatches: &[&VulkanResidentKernelDispatch],
+        snapshot_copies: &[VulkanResidentKernelSequenceSnapshotCopy<'_>],
+        wait_points: &[VulkanTimelineSemaphorePoint<'_>],
+        signal_points: &[VulkanTimelineSemaphorePoint<'_>],
+        signal_completion: bool,
+    ) -> Result<(), VulkanMountedPlacedResidentKernelDispatchError> {
         if self.can_replay_recorded_commands(sequence, prefix_dispatches, suffix_dispatches) {
-            return device
-                .submit_recorded_resident_kernel_sequence_with_timeline_semaphores(
-                    sequence,
-                    wait_points,
-                    signal_points,
-                )
-                .map_err(VulkanMountedPlacedResidentKernelDispatchError::Vulkan);
+            return self.submit_recorded_sequence(
+                device,
+                sequence,
+                wait_points,
+                signal_points,
+                signal_completion,
+            );
         }
         let push_constants = self
             .dispatches
@@ -19623,16 +19715,47 @@ impl VulkanMountedPlacedResidentDispatchSegmentRunner {
                 .iter()
                 .map(|dispatch| VulkanResidentKernelSequenceStep::new(dispatch, &[])),
         );
-        device
-            .record_resident_kernel_sequence(sequence, &steps)
-            .map_err(VulkanMountedPlacedResidentKernelDispatchError::Vulkan)?;
-        device
-            .submit_recorded_resident_kernel_sequence_with_timeline_semaphores(
+        if snapshot_copies.is_empty() {
+            device.record_resident_kernel_sequence(sequence, &steps)
+        } else {
+            device.record_resident_kernel_sequence_with_snapshot_copies(
+                sequence,
+                &steps,
+                snapshot_copies,
+            )
+        }
+        .map_err(VulkanMountedPlacedResidentKernelDispatchError::Vulkan)?;
+        self.submit_recorded_sequence(
+            device,
+            sequence,
+            wait_points,
+            signal_points,
+            signal_completion,
+        )
+    }
+
+    fn submit_recorded_sequence(
+        &self,
+        device: &VulkanComputeDevice,
+        sequence: &VulkanResidentKernelSequence,
+        wait_points: &[VulkanTimelineSemaphorePoint<'_>],
+        signal_points: &[VulkanTimelineSemaphorePoint<'_>],
+        signal_completion: bool,
+    ) -> Result<(), VulkanMountedPlacedResidentKernelDispatchError> {
+        if signal_completion {
+            device.submit_recorded_resident_kernel_sequence_with_timeline_semaphores(
                 sequence,
                 wait_points,
                 signal_points,
             )
-            .map_err(VulkanMountedPlacedResidentKernelDispatchError::Vulkan)
+        } else {
+            device.submit_recorded_resident_kernel_sequence_unfenced_with_timeline_semaphores(
+                sequence,
+                wait_points,
+                signal_points,
+            )
+        }
+        .map_err(VulkanMountedPlacedResidentKernelDispatchError::Vulkan)
     }
 
     fn can_replay_recorded_commands(
@@ -19659,7 +19782,17 @@ impl VulkanMountedPlacedResidentDispatchSegmentRunner {
         &self,
         device: &VulkanComputeDevice,
         sequence_variant: u8,
+        feedback_lane: Option<usize>,
     ) -> Result<(), VulkanMountedPlacedResidentKernelDispatchError> {
+        if let Some(feedback_lane) = feedback_lane {
+            let feedback_sequences = self.feedback_sequences.borrow();
+            let sequence = feedback_sequences
+                .get(feedback_lane)
+                .expect("submitted resident feedback sequence lane must remain mounted");
+            return device
+                .wait_resident_kernel_sequence(sequence)
+                .map_err(VulkanMountedPlacedResidentKernelDispatchError::Vulkan);
+        }
         let sequences = self.sequences.borrow();
         let sequence = sequences
             .get(&sequence_variant)
@@ -23185,7 +23318,12 @@ fn wait_for_compact_slice_submitted_work(
     distributed_runners: &VulkanDistributedDispatchRunners,
     last_submitted_segment: Option<&VulkanMountedPlacedResidentDispatchSegmentRunner>,
     completion_dependency: Option<(usize, u64)>,
+    feedback_lane: Option<usize>,
+    signal_completion: bool,
 ) -> Result<(), VulkanMountedPlacedResidentInProcessStreamTickError> {
+    if !signal_completion {
+        return Ok(());
+    }
     if let Some((dispatch_index, _)) = completion_dependency {
         return distributed_runners
             .wait_dispatch(slice.device_id(), dispatch_index, |device_id| {
@@ -23199,7 +23337,11 @@ fn wait_for_compact_slice_submitted_work(
     }
     if let Some(segment) = last_submitted_segment {
         segment
-            .wait_submitted(slice.device, slice.dispatch_extensions.sequence_variant)
+            .wait_submitted(
+                slice.device,
+                slice.dispatch_extensions.sequence_variant,
+                feedback_lane,
+            )
             .map_err(|error| {
                 VulkanMountedPlacedResidentInProcessStreamTickError::StreamTick(
                     VulkanMountedPlacedResidentStreamTickError::Dispatch(error),
@@ -23213,6 +23355,7 @@ fn wait_for_compact_slice_terminal_work(
     slice: &VulkanMountedPlacedResidentInProcessStreamTickSlice<'_>,
     device_by_id: &BTreeMap<String, &VulkanComputeDevice>,
     distributed_runners: &VulkanDistributedDispatchRunners,
+    feedback_lane: Option<usize>,
 ) -> Result<(), VulkanMountedPlacedResidentInProcessStreamTickError> {
     let terminal_segment = slice.execution_plan.dispatch_segments.last();
     let terminal_distributed = slice
@@ -23236,7 +23379,11 @@ fn wait_for_compact_slice_terminal_work(
     }
     if let Some(segment) = terminal_segment {
         segment
-            .wait_submitted(slice.device, slice.dispatch_extensions.sequence_variant)
+            .wait_submitted(
+                slice.device,
+                slice.dispatch_extensions.sequence_variant,
+                feedback_lane,
+            )
             .map_err(|error| {
                 VulkanMountedPlacedResidentInProcessStreamTickError::StreamTick(
                     VulkanMountedPlacedResidentStreamTickError::Dispatch(error),
@@ -23303,12 +23450,31 @@ fn prepare_compact_shared_stream_control(
         })
 }
 
+#[derive(Clone, Copy)]
+struct VulkanPlacedSubmissionPolicy {
+    write_stream_control: bool,
+    signal_completion: bool,
+    wait_for_completion: bool,
+    feedback_lane: Option<usize>,
+}
+
+impl VulkanPlacedSubmissionPolicy {
+    const SYNCHRONOUS: Self = Self {
+        write_stream_control: true,
+        signal_completion: true,
+        wait_for_completion: true,
+        feedback_lane: None,
+    };
+}
+
 fn advance_compact_slice_with_distributed_dependencies(
     slice: &mut VulkanMountedPlacedResidentInProcessStreamTickSlice<'_>,
     device_by_id: &BTreeMap<String, &VulkanComputeDevice>,
     transport: &mut VulkanInProcessPlacedCableTransport,
     distributed_runners: &VulkanDistributedDispatchRunners,
     cable_synchronizations: &VulkanPlacedCableTimelineSynchronizations,
+    submission_policy: VulkanPlacedSubmissionPolicy,
+    state_transaction: Option<&VulkanResidentStateTransactionBank>,
 ) -> Result<usize, VulkanMountedPlacedResidentInProcessStreamTickError> {
     debug_assert!(!slice.cursor.capture_execution_trace);
     let dynamic_state_capacity_activations =
@@ -23359,6 +23525,8 @@ fn advance_compact_slice_with_distributed_dependencies(
                         distributed_runners,
                         last_submitted_segment.take(),
                         completion_dependency.take(),
+                        submission_policy.feedback_lane,
+                        submission_policy.signal_completion,
                     )?;
                 }
                 match transport.receive_incoming_cable(slice.mounted, *cable_index) {
@@ -23409,6 +23577,18 @@ fn advance_compact_slice_with_distributed_dependencies(
                             ),
                         );
                     }
+                    if !dependencies.has_owner_continuation && !submission_policy.signal_completion
+                    {
+                        return Err(
+                            VulkanMountedPlacedResidentInProcessStreamTickError::Schedule(
+                                VulkanError(format!(
+                                    "unfenced placed window cannot end at distributed dispatch {} on {:?}",
+                                    distributed.dispatch_index,
+                                    slice.device_id()
+                                )),
+                            ),
+                        );
+                    }
                     let dependency_value = if let Some((_, dependency_value)) = ready_dependency {
                         dependency_value
                     } else {
@@ -23421,9 +23601,12 @@ fn advance_compact_slice_with_distributed_dependencies(
                     let submission = distributed_runners.submit_dispatch_with_device_dependencies(
                         slice.device_id(),
                         distributed.dispatch_index,
-                        dependency_value,
-                        consumes_ready,
-                        dependencies.has_owner_continuation,
+                        VulkanDistributedDispatchSubmission {
+                            dependency_value,
+                            consume_owner_ready_signal: consumes_ready,
+                            prepare_owner_continuation: dependencies.has_owner_continuation,
+                            signal_completion: submission_policy.signal_completion,
+                        },
                         |device_id| {
                             device_by_id.get(device_id).copied().ok_or_else(|| {
                                 VulkanError(format!(
@@ -23433,10 +23616,13 @@ fn advance_compact_slice_with_distributed_dependencies(
                         },
                     );
                     if let Err(error) = submission {
-                        if let Some(segment) = last_submitted_segment {
+                        if submission_policy.signal_completion
+                            && let Some(segment) = last_submitted_segment
+                        {
                             let _ = segment.wait_submitted(
                                 slice.device,
                                 slice.dispatch_extensions.sequence_variant,
+                                submission_policy.feedback_lane,
                             );
                         }
                         return Err(
@@ -23447,17 +23633,19 @@ fn advance_compact_slice_with_distributed_dependencies(
                         slice.execution_plan,
                         distributed.dispatch_index,
                     ) {
-                        let _ = distributed_runners.wait_dispatch(
-                            slice.device_id(),
-                            distributed.dispatch_index,
-                            |device_id| {
-                                device_by_id.get(device_id).copied().ok_or_else(|| {
-                                    VulkanError(format!(
-                                        "distributed shard device {device_id:?} is not mounted"
-                                    ))
-                                })
-                            },
-                        );
+                        if submission_policy.signal_completion {
+                            let _ = distributed_runners.wait_dispatch(
+                                slice.device_id(),
+                                distributed.dispatch_index,
+                                |device_id| {
+                                    device_by_id.get(device_id).copied().ok_or_else(|| {
+                                        VulkanError(format!(
+                                            "distributed shard device {device_id:?} is not mounted"
+                                        ))
+                                    })
+                                },
+                            );
+                        }
                         return Err(error.into());
                     }
                     ready_dependency = None;
@@ -23519,6 +23707,8 @@ fn advance_compact_slice_with_distributed_dependencies(
                             distributed_runners,
                             last_submitted_segment,
                             completion_dependency,
+                            submission_policy.feedback_lane,
+                            submission_policy.signal_completion,
                         );
                         return Err(
                             VulkanMountedPlacedResidentInProcessStreamTickError::Distributed(error),
@@ -23542,6 +23732,8 @@ fn advance_compact_slice_with_distributed_dependencies(
                             distributed_runners,
                             last_submitted_segment,
                             completion_dependency,
+                            submission_policy.feedback_lane,
+                            submission_policy.signal_completion,
                         );
                         return Err(
                             VulkanMountedPlacedResidentInProcessStreamTickError::Distributed(error),
@@ -23566,6 +23758,8 @@ fn advance_compact_slice_with_distributed_dependencies(
                             distributed_runners,
                             last_submitted_segment,
                             completion_dependency,
+                            submission_policy.feedback_lane,
+                            submission_policy.signal_completion,
                         );
                         return Err(
                             VulkanMountedPlacedResidentInProcessStreamTickError::Distributed(error),
@@ -23602,26 +23796,69 @@ fn advance_compact_slice_with_distributed_dependencies(
                         signal_points.push(signal_point);
                     }
                 }
+                let is_terminal_segment = slice.execution_plan.last_dispatch_segment_stage_index()
+                    == Some(segment.start_stage_index);
+                let prefix_dispatches = if slice.execution_plan.first_dispatch_segment_stage_index()
+                    == Some(segment.start_stage_index)
+                {
+                    slice.dispatch_extensions.prefix_dispatches.as_slice()
+                } else {
+                    &[]
+                };
+                let suffix_dispatches = if is_terminal_segment {
+                    slice.dispatch_extensions.suffix_dispatches.as_slice()
+                } else {
+                    &[]
+                };
+                let snapshot_copies = if is_terminal_segment {
+                    state_transaction
+                        .map(|transaction| {
+                            let after_step_index = prefix_dispatches
+                                .len()
+                                .checked_add(segment.dispatch_count)
+                                .and_then(|count| count.checked_add(suffix_dispatches.len()))
+                                .and_then(|count| count.checked_sub(1))
+                                .ok_or_else(|| {
+                                    VulkanMountedPlacedResidentInProcessStreamTickError::Schedule(
+                                        VulkanError(
+                                            "resident feedback snapshot step index overflowed"
+                                                .to_string(),
+                                        ),
+                                    )
+                                })?;
+                            transaction
+                                .copies_for_tick(
+                                    &slice.mounted.buffers,
+                                    after_step_index,
+                                    submission_policy.feedback_lane.ok_or_else(|| {
+                                        VulkanMountedPlacedResidentInProcessStreamTickError::Schedule(
+                                            VulkanError(
+                                                "resident feedback snapshot requires a sequence lane"
+                                                    .to_string(),
+                                            ),
+                                        )
+                                    })?,
+                                )
+                                .map_err(
+                                    VulkanMountedPlacedResidentInProcessStreamTickError::Schedule,
+                                )
+                        })
+                        .transpose()?
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
                 let submission = segment.submit_with_stream_control_and_timeline_semaphores(
                     slice.device,
                     control,
-                    if slice.execution_plan.first_dispatch_segment_stage_index()
-                        == Some(segment.start_stage_index)
-                    {
-                        &slice.dispatch_extensions.prefix_dispatches
-                    } else {
-                        &[]
-                    },
-                    if slice.execution_plan.last_dispatch_segment_stage_index()
-                        == Some(segment.start_stage_index)
-                    {
-                        &slice.dispatch_extensions.suffix_dispatches
-                    } else {
-                        &[]
-                    },
+                    prefix_dispatches,
+                    suffix_dispatches,
                     slice.dispatch_extensions.sequence_variant,
+                    submission_policy.feedback_lane,
+                    &snapshot_copies,
                     &wait_points,
                     &signal_points,
+                    submission_policy.signal_completion,
                 );
                 if let Err(error) = submission {
                     let _ = wait_for_compact_slice_submitted_work(
@@ -23630,6 +23867,8 @@ fn advance_compact_slice_with_distributed_dependencies(
                         distributed_runners,
                         last_submitted_segment,
                         completion_dependency,
+                        submission_policy.feedback_lane,
+                        submission_policy.signal_completion,
                     );
                     return Err(
                         VulkanMountedPlacedResidentInProcessStreamTickError::StreamTick(
@@ -23668,6 +23907,8 @@ fn advance_compact_slice_with_distributed_dependencies(
                         distributed_runners,
                         last_submitted_segment.take(),
                         completion_dependency.take(),
+                        submission_policy.feedback_lane,
+                        submission_policy.signal_completion,
                     )?;
                 }
                 transport
@@ -23720,7 +23961,13 @@ fn run_mounted_placed_resident_stream_tick_slices_in_process_with_schedule(
     VulkanMountedPlacedResidentInProcessStreamTickError,
 > {
     run_mounted_placed_resident_stream_tick_slices_in_process_with_schedule_and_distributed(
-        slices, transport, schedule, None, None,
+        slices,
+        transport,
+        schedule,
+        None,
+        None,
+        VulkanPlacedSubmissionPolicy::SYNCHRONOUS,
+        None,
     )
 }
 
@@ -23730,6 +23977,8 @@ fn run_mounted_placed_resident_stream_tick_slices_in_process_with_schedule_and_d
     schedule: &VulkanMountedPlacedResidentInProcessSchedule,
     distributed_runners: Option<&VulkanDistributedDispatchRunners>,
     cable_synchronizations: Option<&VulkanPlacedCableTimelineSynchronizations>,
+    submission_policy: VulkanPlacedSubmissionPolicy,
+    state_transactions: Option<&[VulkanResidentStateTransactionBank]>,
 ) -> Result<
     VulkanMountedPlacedResidentInProcessStreamTickRun,
     VulkanMountedPlacedResidentInProcessStreamTickError,
@@ -23737,6 +23986,17 @@ fn run_mounted_placed_resident_stream_tick_slices_in_process_with_schedule_and_d
     schedule
         .validate_slices(slices)
         .map_err(VulkanMountedPlacedResidentInProcessStreamTickError::Schedule)?;
+    if let Some(state_transactions) = state_transactions
+        && state_transactions.len() != slices.len()
+    {
+        return Err(
+            VulkanMountedPlacedResidentInProcessStreamTickError::Schedule(VulkanError(format!(
+                "placed feedback state transaction count {} does not match slice count {}",
+                state_transactions.len(),
+                slices.len()
+            ))),
+        );
+    }
     transport.reset_tick_state();
     register_in_process_direct_cable_copies(slices, transport)?;
     if cable_synchronizations
@@ -23748,7 +24008,7 @@ fn run_mounted_placed_resident_stream_tick_slices_in_process_with_schedule_and_d
             )),
         );
     }
-    if distributed_runners.is_some() {
+    if distributed_runners.is_some() && submission_policy.write_stream_control {
         prepare_compact_shared_stream_control(slices)?;
     }
 
@@ -23776,6 +24036,8 @@ fn run_mounted_placed_resident_stream_tick_slices_in_process_with_schedule_and_d
                         transport,
                         runners,
                         cable_synchronizations,
+                        submission_policy,
+                        state_transactions.map(|transactions| &transactions[*device_index]),
                     )?;
                 if device_completed_stage_delta == 0 {
                     return Err(
@@ -23900,12 +24162,19 @@ fn run_mounted_placed_resident_stream_tick_slices_in_process_with_schedule_and_d
             )),
         );
     }
-    if let Some(distributed_runners) = distributed_runners {
+    if submission_policy.wait_for_completion
+        && let Some(distributed_runners) = distributed_runners
+    {
         for slice in slices
             .iter()
             .filter(|slice| !slice.cursor.capture_execution_trace)
         {
-            wait_for_compact_slice_terminal_work(slice, &device_by_id, distributed_runners)?;
+            wait_for_compact_slice_terminal_work(
+                slice,
+                &device_by_id,
+                distributed_runners,
+                submission_policy.feedback_lane,
+            )?;
         }
     }
 

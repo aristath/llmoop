@@ -2338,6 +2338,15 @@ impl VulkanComputeDevice {
         self.prepare_resident_kernel_sequence(sequence, steps, &[], false)
     }
 
+    pub fn record_resident_kernel_sequence_with_snapshot_copies(
+        &self,
+        sequence: &VulkanResidentKernelSequence,
+        steps: &[VulkanResidentKernelSequenceStep<'_>],
+        snapshot_copies: &[VulkanResidentKernelSequenceSnapshotCopy<'_>],
+    ) -> Result<(), VulkanError> {
+        self.prepare_resident_kernel_sequence(sequence, steps, snapshot_copies, false)
+    }
+
     fn prepare_resident_kernel_sequence(
         &self,
         sequence: &VulkanResidentKernelSequence,

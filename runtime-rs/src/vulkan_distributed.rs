@@ -31,6 +31,14 @@ pub struct VulkanDistributedExecutionPlan {
     pub distributed_parameter_byte_count: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VulkanDistributedDispatchSubmission {
+    pub dependency_value: u64,
+    pub consume_owner_ready_signal: bool,
+    pub prepare_owner_continuation: bool,
+    pub signal_completion: bool,
+}
+
 impl VulkanDistributedExecutionPlan {
     pub fn from_prepared_plans(
         prepared_plans: &[(&str, &VulkanPreparedDispatchPlan)],
@@ -1137,15 +1145,19 @@ impl VulkanDistributedDispatchRunners {
         &self,
         owner_device_id: &str,
         dispatch_index: usize,
-        dependency_value: u64,
-        consume_owner_ready_signal: bool,
-        prepare_owner_continuation: bool,
+        submission: VulkanDistributedDispatchSubmission,
         mut device_for: F,
     ) -> Result<VulkanDistributedDispatchRun, VulkanDistributedDispatchRunnerError>
     where
         F: FnMut(&str) -> Result<&'a VulkanComputeDevice, E>,
         E: Display,
     {
+        let VulkanDistributedDispatchSubmission {
+            dependency_value,
+            consume_owner_ready_signal,
+            prepare_owner_continuation,
+            signal_completion,
+        } = submission;
         let dispatch = self.dispatch(owner_device_id, dispatch_index).ok_or_else(|| {
             VulkanDistributedDispatchRunnerError(format!(
                 "distributed runner has no dispatch {dispatch_index} owned by {owner_device_id:?}"
@@ -1190,13 +1202,20 @@ impl VulkanDistributedDispatchRunners {
                     )]
                 })
                 .unwrap_or_default();
-            if let Err(error) = device
-                .submit_recorded_resident_kernel_sequence_with_timeline_semaphores(
+            let submission = if signal_completion {
+                device.submit_recorded_resident_kernel_sequence_with_timeline_semaphores(
                     &shard.sequence,
                     &wait_points,
                     &signal_points,
                 )
-            {
+            } else {
+                device.submit_recorded_resident_kernel_sequence_unfenced_with_timeline_semaphores(
+                    &shard.sequence,
+                    &wait_points,
+                    &signal_points,
+                )
+            };
+            if let Err(error) = submission {
                 for (submitted_device, submitted_shard) in &submitted {
                     let _ =
                         submitted_device.wait_resident_kernel_sequence(&submitted_shard.sequence);
