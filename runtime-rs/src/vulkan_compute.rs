@@ -713,6 +713,8 @@ pub struct VulkanResidentKernelSequence {
 struct VulkanResidentKernelRecordedInputCopy {
     source: vk::Buffer,
     destination: vk::Buffer,
+    source_offset: vk::DeviceSize,
+    destination_offset: vk::DeviceSize,
     byte_len: vk::DeviceSize,
 }
 
@@ -752,19 +754,70 @@ impl<'a> VulkanResidentKernelSequenceStep<'a> {
 
 #[derive(Clone, Copy)]
 pub struct VulkanResidentKernelSequenceInputCopy<'a> {
-    copy: &'a VulkanResidentBufferCopy,
+    copy: VulkanResidentKernelSequenceInputCopySource<'a>,
+}
+
+#[derive(Clone, Copy)]
+enum VulkanResidentKernelSequenceInputCopySource<'a> {
+    Binding(&'a VulkanResidentBufferCopy),
+    Range(VulkanResidentBufferRangeCopy<'a>),
 }
 
 impl<'a> VulkanResidentKernelSequenceInputCopy<'a> {
     pub fn new(copy: &'a VulkanResidentBufferCopy) -> Self {
-        Self { copy }
+        Self {
+            copy: VulkanResidentKernelSequenceInputCopySource::Binding(copy),
+        }
+    }
+
+    pub fn from_range(copy: VulkanResidentBufferRangeCopy<'a>) -> Self {
+        Self {
+            copy: VulkanResidentKernelSequenceInputCopySource::Range(copy),
+        }
+    }
+
+    fn source(self) -> vk::Buffer {
+        match self.copy {
+            VulkanResidentKernelSequenceInputCopySource::Binding(copy) => copy.source,
+            VulkanResidentKernelSequenceInputCopySource::Range(copy) => copy.source.buffer,
+        }
+    }
+
+    fn destination(self) -> vk::Buffer {
+        match self.copy {
+            VulkanResidentKernelSequenceInputCopySource::Binding(copy) => copy.destination,
+            VulkanResidentKernelSequenceInputCopySource::Range(copy) => copy.destination.buffer,
+        }
+    }
+
+    fn source_offset(self) -> vk::DeviceSize {
+        match self.copy {
+            VulkanResidentKernelSequenceInputCopySource::Binding(_) => 0,
+            VulkanResidentKernelSequenceInputCopySource::Range(copy) => copy.source_offset,
+        }
+    }
+
+    fn destination_offset(self) -> vk::DeviceSize {
+        match self.copy {
+            VulkanResidentKernelSequenceInputCopySource::Binding(_) => 0,
+            VulkanResidentKernelSequenceInputCopySource::Range(copy) => copy.destination_offset,
+        }
+    }
+
+    fn byte_len(self) -> vk::DeviceSize {
+        match self.copy {
+            VulkanResidentKernelSequenceInputCopySource::Binding(copy) => copy.byte_len,
+            VulkanResidentKernelSequenceInputCopySource::Range(copy) => copy.byte_len,
+        }
     }
 
     fn recorded(self) -> VulkanResidentKernelRecordedInputCopy {
         VulkanResidentKernelRecordedInputCopy {
-            source: self.copy.source,
-            destination: self.copy.destination,
-            byte_len: self.copy.byte_len,
+            source: self.source(),
+            destination: self.destination(),
+            source_offset: self.source_offset(),
+            destination_offset: self.destination_offset(),
+            byte_len: self.byte_len(),
         }
     }
 }
@@ -2829,16 +2882,36 @@ impl VulkanComputeDevice {
                         &[],
                         &[],
                     );
-                    for input_copy in input_copies {
+                    for (copy_index, input_copy) in input_copies.iter().enumerate() {
+                        if copy_index != 0 {
+                            let transfer_order = [vk::MemoryBarrier::default()
+                                .src_access_mask(
+                                    vk::AccessFlags::TRANSFER_READ
+                                        | vk::AccessFlags::TRANSFER_WRITE,
+                                )
+                                .dst_access_mask(
+                                    vk::AccessFlags::TRANSFER_READ
+                                        | vk::AccessFlags::TRANSFER_WRITE,
+                                )];
+                            self.device.cmd_pipeline_barrier(
+                                sequence.command_buffer,
+                                vk::PipelineStageFlags::TRANSFER,
+                                vk::PipelineStageFlags::TRANSFER,
+                                vk::DependencyFlags::empty(),
+                                &transfer_order,
+                                &[],
+                                &[],
+                            );
+                        }
                         let regions = [vk::BufferCopy {
-                            src_offset: 0,
-                            dst_offset: 0,
-                            size: input_copy.copy.byte_len,
+                            src_offset: input_copy.source_offset(),
+                            dst_offset: input_copy.destination_offset(),
+                            size: input_copy.byte_len(),
                         }];
                         self.device.cmd_copy_buffer(
                             sequence.command_buffer,
-                            input_copy.copy.source,
-                            input_copy.copy.destination,
+                            input_copy.source(),
+                            input_copy.destination(),
                             &regions,
                         );
                     }
