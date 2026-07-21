@@ -285,9 +285,75 @@ impl VulkanStreamCircuitResidentPlan {
         device: &VulkanComputeDevice,
         dynamic_state_capacity_activations: usize,
     ) -> Result<VulkanStreamCircuitStreamBuffers, VulkanError> {
+        self.allocate_stream_buffers_with_activation_overrides(
+            device,
+            dynamic_state_capacity_activations,
+            &[],
+        )
+    }
+
+    pub fn allocate_stream_buffers_with_activation_overrides(
+        &self,
+        device: &VulkanComputeDevice,
+        dynamic_state_capacity_activations: usize,
+        activation_overrides: &[VulkanActivationSlotBufferOverride],
+    ) -> Result<VulkanStreamCircuitStreamBuffers, VulkanError> {
         let mut state_buffers = Vec::with_capacity(self.stream_state_buffers.len());
         let mut activation_slot_buffers = Vec::new();
         let mut total_byte_capacity = 0usize;
+        let mut override_index = BTreeMap::new();
+
+        for activation_override in activation_overrides {
+            let key = (
+                activation_override.pedal_id.clone(),
+                activation_override.slot,
+            );
+            if override_index.insert(key, activation_override).is_some() {
+                return Err(VulkanError(format!(
+                    "activation buffer override repeats {}.slot_{}",
+                    activation_override.pedal_id, activation_override.slot
+                )));
+            }
+            if !device.owns_resident_buffer(&activation_override.buffer) {
+                return Err(VulkanError(format!(
+                    "activation buffer override {}.slot_{} belongs to a different Vulkan logical device",
+                    activation_override.pedal_id, activation_override.slot
+                )));
+            }
+            if !activation_override.buffer.is_shared_host_backed() {
+                return Err(VulkanError(format!(
+                    "activation buffer override {}.slot_{} is not backed by shared host memory",
+                    activation_override.pedal_id, activation_override.slot
+                )));
+            }
+            let slot = self
+                .activation_bank(&activation_override.pedal_id)
+                .and_then(|bank| {
+                    bank.slots
+                        .iter()
+                        .find(|slot| slot.slot == activation_override.slot)
+                })
+                .ok_or_else(|| {
+                    VulkanError(format!(
+                        "activation buffer override {}.slot_{} does not address a resident activation slot",
+                        activation_override.pedal_id, activation_override.slot
+                    ))
+                })?;
+            let required_byte_capacity = slot.bytes.ok_or_else(|| {
+                VulkanError(format!(
+                    "{} activation slot {} has unknown byte size",
+                    activation_override.pedal_id, activation_override.slot
+                ))
+            })?;
+            if activation_override.buffer.byte_capacity() < required_byte_capacity {
+                return Err(VulkanError(format!(
+                    "activation buffer override {}.slot_{} has {} bytes but requires {required_byte_capacity}",
+                    activation_override.pedal_id,
+                    activation_override.slot,
+                    activation_override.buffer.byte_capacity()
+                )));
+            }
+        }
 
         for state in &self.stream_state_buffers {
             let byte_capacity =
@@ -322,13 +388,23 @@ impl VulkanStreamCircuitResidentPlan {
                     byte_capacity,
                     "activation slot buffer allocation",
                 )?;
+                let activation_override =
+                    override_index.remove(&(bank.pedal_id.clone(), slot.slot));
+                let (buffer, shared_across_devices) = match activation_override {
+                    Some(activation_override) => (Arc::clone(&activation_override.buffer), true),
+                    None => (
+                        Arc::new(device.create_resident_buffer(byte_capacity)?),
+                        false,
+                    ),
+                };
                 activation_slot_buffers.push(VulkanActivationSlotBufferAllocation {
                     pedal_id: bank.pedal_id.clone(),
                     circuit_id: bank.circuit_id.clone(),
                     slot: slot.slot,
                     signal_ids: slot.signal_ids.clone(),
                     byte_capacity,
-                    buffer: device.create_resident_buffer(byte_capacity)?,
+                    shared_across_devices,
+                    buffer,
                 });
             }
         }
@@ -1114,7 +1190,14 @@ pub struct VulkanActivationSlotBufferAllocation {
     pub slot: usize,
     pub signal_ids: Vec<String>,
     pub byte_capacity: usize,
-    pub buffer: VulkanResidentBuffer,
+    pub shared_across_devices: bool,
+    pub buffer: Arc<VulkanResidentBuffer>,
+}
+
+pub struct VulkanActivationSlotBufferOverride {
+    pub pedal_id: String,
+    pub slot: usize,
+    pub buffer: Arc<VulkanResidentBuffer>,
 }
 
 impl VulkanStreamCircuitStreamBuffers {

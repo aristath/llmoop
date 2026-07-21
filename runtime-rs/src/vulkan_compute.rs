@@ -297,6 +297,10 @@ impl VulkanResidentBuffer {
         self.byte_capacity as usize
     }
 
+    pub fn is_shared_host_backed(&self) -> bool {
+        self._shared_host_allocation.is_some()
+    }
+
     pub fn is_persistently_mapped(&self) -> bool {
         self.persistent_mapping.is_some()
     }
@@ -1196,6 +1200,10 @@ impl VulkanComputeDevice {
 
     pub fn supports_sync_fd_semaphores(&self) -> bool {
         self.sync_fd_semaphore_supported
+    }
+
+    pub fn owns_resident_buffer(&self, buffer: &VulkanResidentBuffer) -> bool {
+        self.device.handle() == buffer.device.handle()
     }
 
     pub fn create_shared_host_allocation(
