@@ -704,8 +704,16 @@ pub struct VulkanResidentKernelSequence {
     command_buffer: vk::CommandBuffer,
     completion_fence: vk::Fence,
     timestamp_period_ns: f32,
+    recorded_input_copies: RefCell<Option<Vec<VulkanResidentKernelRecordedInputCopy>>>,
     recorded_steps: RefCell<Option<Vec<VulkanResidentKernelRecordedStep>>>,
     recorded_snapshot_copies: RefCell<Option<Vec<VulkanResidentKernelRecordedSnapshotCopy>>>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct VulkanResidentKernelRecordedInputCopy {
+    source: vk::Buffer,
+    destination: vk::Buffer,
+    byte_len: vk::DeviceSize,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -738,6 +746,25 @@ impl<'a> VulkanResidentKernelSequenceStep<'a> {
         Self {
             dispatch,
             push_constants,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct VulkanResidentKernelSequenceInputCopy<'a> {
+    copy: &'a VulkanResidentBufferCopy,
+}
+
+impl<'a> VulkanResidentKernelSequenceInputCopy<'a> {
+    pub fn new(copy: &'a VulkanResidentBufferCopy) -> Self {
+        Self { copy }
+    }
+
+    fn recorded(self) -> VulkanResidentKernelRecordedInputCopy {
+        VulkanResidentKernelRecordedInputCopy {
+            source: self.copy.source,
+            destination: self.copy.destination,
+            byte_len: self.copy.byte_len,
         }
     }
 }
@@ -895,6 +922,8 @@ pub struct VulkanResidentBufferCopy {
     queue: vk::Queue,
     command_pool: vk::CommandPool,
     command_buffer: vk::CommandBuffer,
+    source: vk::Buffer,
+    destination: vk::Buffer,
     byte_len: vk::DeviceSize,
 }
 
@@ -1100,7 +1129,9 @@ impl Drop for VulkanResidentKernelSequence {
 
 impl VulkanResidentKernelSequence {
     pub fn has_recorded_commands(&self) -> bool {
-        self.recorded_steps.borrow().is_some() && self.recorded_snapshot_copies.borrow().is_some()
+        self.recorded_input_copies.borrow().is_some()
+            && self.recorded_steps.borrow().is_some()
+            && self.recorded_snapshot_copies.borrow().is_some()
     }
 }
 
@@ -2005,6 +2036,8 @@ impl VulkanComputeDevice {
                 queue: self.queue,
                 command_pool,
                 command_buffer,
+                source: source.buffer,
+                destination: destination.buffer,
                 byte_len,
             })
         }
@@ -2324,6 +2357,7 @@ impl VulkanComputeDevice {
                 command_buffer,
                 completion_fence,
                 timestamp_period_ns: self.timestamp_period_ns,
+                recorded_input_copies: RefCell::new(None),
                 recorded_steps: RefCell::new(None),
                 recorded_snapshot_copies: RefCell::new(None),
             })
@@ -2600,7 +2634,16 @@ impl VulkanComputeDevice {
         steps: &[VulkanResidentKernelSequenceStep<'_>],
         snapshot_copies: &[VulkanResidentKernelSequenceSnapshotCopy<'_>],
     ) -> Result<(), VulkanError> {
-        self.prepare_resident_kernel_sequence(sequence, steps, snapshot_copies, true)
+        self.prepare_resident_kernel_sequence(sequence, &[], steps, snapshot_copies, true)
+    }
+
+    pub fn run_resident_kernel_sequence_with_input_copies(
+        &self,
+        sequence: &VulkanResidentKernelSequence,
+        input_copies: &[VulkanResidentKernelSequenceInputCopy<'_>],
+        steps: &[VulkanResidentKernelSequenceStep<'_>],
+    ) -> Result<(), VulkanError> {
+        self.prepare_resident_kernel_sequence(sequence, input_copies, steps, &[], true)
     }
 
     pub fn record_resident_kernel_sequence(
@@ -2608,7 +2651,7 @@ impl VulkanComputeDevice {
         sequence: &VulkanResidentKernelSequence,
         steps: &[VulkanResidentKernelSequenceStep<'_>],
     ) -> Result<(), VulkanError> {
-        self.prepare_resident_kernel_sequence(sequence, steps, &[], false)
+        self.prepare_resident_kernel_sequence(sequence, &[], steps, &[], false)
     }
 
     pub fn record_resident_kernel_sequence_with_snapshot_copies(
@@ -2617,12 +2660,13 @@ impl VulkanComputeDevice {
         steps: &[VulkanResidentKernelSequenceStep<'_>],
         snapshot_copies: &[VulkanResidentKernelSequenceSnapshotCopy<'_>],
     ) -> Result<(), VulkanError> {
-        self.prepare_resident_kernel_sequence(sequence, steps, snapshot_copies, false)
+        self.prepare_resident_kernel_sequence(sequence, &[], steps, snapshot_copies, false)
     }
 
     fn prepare_resident_kernel_sequence(
         &self,
         sequence: &VulkanResidentKernelSequence,
+        input_copies: &[VulkanResidentKernelSequenceInputCopy<'_>],
         steps: &[VulkanResidentKernelSequenceStep<'_>],
         snapshot_copies: &[VulkanResidentKernelSequenceSnapshotCopy<'_>],
         execute: bool,
@@ -2657,6 +2701,17 @@ impl VulkanComputeDevice {
         unsafe {
             let profiling_enabled = execute && std::env::var_os("LLMOOP_VK_PERF_LOGGER").is_some();
             let command_buffer_matches = !profiling_enabled
+                && sequence
+                    .recorded_input_copies
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|recorded| {
+                        recorded.len() == input_copies.len()
+                            && recorded
+                                .iter()
+                                .zip(input_copies)
+                                .all(|(recorded, copy)| *recorded == copy.recorded())
+                    })
                 && sequence
                     .recorded_steps
                     .borrow()
@@ -2742,18 +2797,66 @@ impl VulkanComputeDevice {
             }
 
             if !command_buffer_matches {
-                let host_write_barrier = [vk::MemoryBarrier::default()
-                    .src_access_mask(vk::AccessFlags::HOST_WRITE)
-                    .dst_access_mask(vk::AccessFlags::SHADER_READ)];
-                self.device.cmd_pipeline_barrier(
-                    sequence.command_buffer,
-                    vk::PipelineStageFlags::HOST,
-                    vk::PipelineStageFlags::COMPUTE_SHADER,
-                    vk::DependencyFlags::empty(),
-                    &host_write_barrier,
-                    &[],
-                    &[],
-                );
+                if input_copies.is_empty() {
+                    let host_write_barrier = [vk::MemoryBarrier::default()
+                        .src_access_mask(vk::AccessFlags::HOST_WRITE)
+                        .dst_access_mask(vk::AccessFlags::SHADER_READ)];
+                    self.device.cmd_pipeline_barrier(
+                        sequence.command_buffer,
+                        vk::PipelineStageFlags::HOST,
+                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        vk::DependencyFlags::empty(),
+                        &host_write_barrier,
+                        &[],
+                        &[],
+                    );
+                } else {
+                    let input_to_transfer = [vk::MemoryBarrier::default()
+                        .src_access_mask(
+                            vk::AccessFlags::HOST_WRITE
+                                | vk::AccessFlags::SHADER_WRITE
+                                | vk::AccessFlags::TRANSFER_WRITE,
+                        )
+                        .dst_access_mask(vk::AccessFlags::TRANSFER_READ)];
+                    self.device.cmd_pipeline_barrier(
+                        sequence.command_buffer,
+                        vk::PipelineStageFlags::HOST
+                            | vk::PipelineStageFlags::COMPUTE_SHADER
+                            | vk::PipelineStageFlags::TRANSFER,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::DependencyFlags::empty(),
+                        &input_to_transfer,
+                        &[],
+                        &[],
+                    );
+                    for input_copy in input_copies {
+                        let regions = [vk::BufferCopy {
+                            src_offset: 0,
+                            dst_offset: 0,
+                            size: input_copy.copy.byte_len,
+                        }];
+                        self.device.cmd_copy_buffer(
+                            sequence.command_buffer,
+                            input_copy.copy.source,
+                            input_copy.copy.destination,
+                            &regions,
+                        );
+                    }
+                    let transfer_to_compute = [vk::MemoryBarrier::default()
+                        .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                        .dst_access_mask(
+                            vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+                        )];
+                    self.device.cmd_pipeline_barrier(
+                        sequence.command_buffer,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        vk::DependencyFlags::empty(),
+                        &transfer_to_compute,
+                        &[],
+                        &[],
+                    );
+                }
             }
 
             let mut pending_buffer_accesses =
@@ -2913,9 +3016,17 @@ impl VulkanComputeDevice {
                     })?;
 
                 if profiling_enabled {
+                    *sequence.recorded_input_copies.borrow_mut() = None;
                     *sequence.recorded_steps.borrow_mut() = None;
                     *sequence.recorded_snapshot_copies.borrow_mut() = None;
                 } else {
+                    *sequence.recorded_input_copies.borrow_mut() = Some(
+                        input_copies
+                            .iter()
+                            .copied()
+                            .map(VulkanResidentKernelSequenceInputCopy::recorded)
+                            .collect(),
+                    );
                     *sequence.recorded_steps.borrow_mut() = Some(
                         steps
                             .iter()
