@@ -3425,6 +3425,22 @@ impl VulkanResidentInputEmbeddingTransducerRunner {
                     tensor: spec.parameter_tensor.clone(),
                 }
             })?;
+        Self::from_mounted_token_embedding_with_parameter_allocation(
+            device,
+            mounted,
+            embedding_weight,
+            spirv_words,
+            spec,
+        )
+    }
+
+    fn from_mounted_token_embedding_with_parameter_allocation(
+        device: &VulkanComputeDevice,
+        mounted: &VulkanMountedPlacedStreamCircuit,
+        embedding_weight: &VulkanPermanentParameterBufferAllocation,
+        spirv_words: &[u32],
+        spec: &VulkanResidentInputEmbeddingTransducerSpec,
+    ) -> Result<Self, VulkanResidentInputEmbeddingTransducerRunnerError> {
         validate_input_embedding_weight(embedding_weight, spec)?;
 
         let output_frame = mounted
@@ -11843,7 +11859,9 @@ pub struct VulkanResidentSpeculativeDecoderModelPackage {
     pub hosted_pedal_count: usize,
     package: VulkanResidentSpeculativeDecoderPackageSpec,
     device_slice: Arc<VulkanResidentModelPackageDeviceSlice>,
-    additional_output_parameter_buffers: Option<Arc<VulkanPermanentParameterBuffers>>,
+    additional_parameter_buffers: Option<Arc<VulkanPermanentParameterBuffers>>,
+    input_embedding_spec: VulkanResidentInputEmbeddingTransducerSpec,
+    input_embedding_spirv_words: Vec<u32>,
     output_norm_spirv_words: Vec<u32>,
     output_projection_spirv_words: Vec<u32>,
 }
@@ -11854,6 +11872,8 @@ struct VulkanResidentSpeculativeDecoderLoadContext<'a> {
     capacity: usize,
     tensor_index: &'a TensorIndex,
     target_output_parameters: &'a VulkanPermanentParameterBuffers,
+    input_embedding_spec: &'a VulkanResidentInputEmbeddingTransducerSpec,
+    input_embedding_spirv_words: &'a [u32],
 }
 
 impl VulkanResidentSpeculativeDecoderModelPackage {
@@ -11897,6 +11917,7 @@ impl VulkanResidentSpeculativeDecoderModelPackage {
         );
 
         let additional_tensors = [
+            context.input_embedding_spec.parameter_tensor.as_str(),
             decoder.output_transducer.norm_parameter_tensor.as_str(),
             decoder
                 .output_transducer
@@ -11910,8 +11931,10 @@ impl VulkanResidentSpeculativeDecoderModelPackage {
                 .parameter_buffer(tensor)
                 .is_none()
         })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
         .collect::<Vec<_>>();
-        let additional_output_parameter_buffers = if additional_tensors.is_empty() {
+        let additional_parameter_buffers = if additional_tensors.is_empty() {
             None
         } else {
             Some(Arc::new(
@@ -11934,6 +11957,10 @@ impl VulkanResidentSpeculativeDecoderModelPackage {
             &decoder.output_transducer.projection_shader_path,
         )
         .map_err(VulkanResidentInProcessPlacedRuntimeError::Package)?;
+        let mut input_embedding_spec = context.input_embedding_spec.clone();
+        input_embedding_spec.transducer_id = decoder.input_adapter.pedal_id.clone();
+        input_embedding_spec.output_signal_id =
+            decoder.input_adapter.token_embedding_signal_id.clone();
 
         Ok(Self {
             id: decoder.id.clone(),
@@ -11941,18 +11968,20 @@ impl VulkanResidentSpeculativeDecoderModelPackage {
             hosted_pedal_count: device_slice.hosted_pedal_count,
             package: decoder.clone(),
             device_slice,
-            additional_output_parameter_buffers,
+            additional_parameter_buffers,
+            input_embedding_spec,
+            input_embedding_spirv_words: context.input_embedding_spirv_words.to_vec(),
             output_norm_spirv_words,
             output_projection_spirv_words,
         })
     }
 
-    fn output_parameter<'a>(
+    fn parameter<'a>(
         &'a self,
         target_output_parameters: &'a VulkanPermanentParameterBuffers,
         tensor: &str,
     ) -> Option<&'a VulkanPermanentParameterBufferAllocation> {
-        self.additional_output_parameter_buffers
+        self.additional_parameter_buffers
             .as_deref()
             .and_then(|buffers| buffers.parameter_buffer(tensor))
             .or_else(|| target_output_parameters.parameter_buffer(tensor))
@@ -12054,10 +12083,9 @@ struct VulkanResidentSpeculativeDecoderProcessor {
     device_id: String,
     mounted: VulkanMountedPlacedStreamCircuit,
     execution_plan: VulkanMountedPlacedResidentStreamTickExecutionPlan,
+    input_transducer: VulkanResidentInputEmbeddingTransducerRunner,
     output_transducer: VulkanResidentOutputTransducerRunner,
     sampler: VulkanResidentSamplerRunner,
-    target_embedding_copy: Option<VulkanResidentBufferCopy>,
-    token_embedding_signal_id: String,
     target_hidden_copy: VulkanResidentBufferCopy,
     recursive_hidden_copy: VulkanResidentBufferCopy,
     pending_hidden_input_copy: VulkanResidentBufferCopy,
@@ -12079,8 +12107,6 @@ impl VulkanResidentSpeculativeDecoderProcessor {
     fn from_model(
         device: &VulkanComputeDevice,
         model: &VulkanResidentSpeculativeDecoderModelPackage,
-        target_embedding: &VulkanResidentBuffer,
-        target_embedding_device_id: &str,
         target_hidden: &VulkanResidentBuffer,
         target_output_parameters: &VulkanPermanentParameterBuffers,
         sampler_kernels: &[VulkanResidentSamplerKernelArtifact],
@@ -12125,17 +12151,6 @@ impl VulkanResidentSpeculativeDecoderProcessor {
         .map_err(VulkanResidentInProcessPlacedRuntimeError::ResidentDispatch)?;
 
         let adapter = &model.package.input_adapter;
-        let token_embedding = mounted
-            .boundary_io
-            .input_buffer(&adapter.token_embedding_signal_id)
-            .ok_or_else(|| {
-                VulkanResidentInProcessPlacedRuntimeError::Package(
-                    VulkanResidentTokenModelPackageError::new(format!(
-                        "speculative decoder {:?} has no token embedding input {:?}",
-                        model.id, adapter.token_embedding_signal_id
-                    )),
-                )
-            })?;
         let hidden_input = mounted
             .boundary_io
             .input_buffer(&adapter.target_hidden_signal_id)
@@ -12147,11 +12162,32 @@ impl VulkanResidentSpeculativeDecoderProcessor {
                     )),
                 )
             })?;
+        let input_embedding_weight = model
+            .parameter(
+                target_output_parameters,
+                &model.input_embedding_spec.parameter_tensor,
+            )
+            .ok_or_else(|| {
+                VulkanResidentInProcessPlacedRuntimeError::InputTransducer(
+                    VulkanResidentInputEmbeddingTransducerRunnerError::MissingTransducerParameterBuffer {
+                        tensor: model.input_embedding_spec.parameter_tensor.clone(),
+                    },
+                )
+            })?;
+        let input_transducer =
+            VulkanResidentInputEmbeddingTransducerRunner::from_mounted_token_embedding_with_parameter_allocation(
+                device,
+                &mounted,
+                input_embedding_weight,
+                &model.input_embedding_spirv_words,
+                &model.input_embedding_spec,
+            )
+            .map_err(VulkanResidentInProcessPlacedRuntimeError::InputTransducer)?;
         let output_spec = model
             .output_transducer_spec(model.package.output_transducer.input_signal_id.clone())
             .map_err(VulkanResidentInProcessPlacedRuntimeError::Package)?;
         let norm_weight = model
-            .output_parameter(target_output_parameters, &output_spec.norm_parameter_tensor)
+            .parameter(target_output_parameters, &output_spec.norm_parameter_tensor)
             .ok_or_else(|| {
                 VulkanResidentInProcessPlacedRuntimeError::OutputTransducer(
                     VulkanResidentOutputTransducerRunnerError::MissingTransducerParameterBuffer {
@@ -12160,7 +12196,7 @@ impl VulkanResidentSpeculativeDecoderProcessor {
                 )
             })?;
         let projection_weight = model
-            .output_parameter(
+            .parameter(
                 target_output_parameters,
                 &output_spec.projection_parameter_tensor,
             )
@@ -12191,16 +12227,6 @@ impl VulkanResidentSpeculativeDecoderProcessor {
             random_seed,
         )
         .map_err(VulkanResidentInProcessPlacedRuntimeError::Sampler)?;
-        let target_embedding_copy = (target_embedding_device_id == model.device_id)
-            .then(|| {
-                device.create_resident_buffer_copy(
-                    target_embedding,
-                    &token_embedding.buffer,
-                    adapter.input_frame_byte_capacity,
-                )
-            })
-            .transpose()
-            .map_err(VulkanResidentInProcessPlacedRuntimeError::FeedbackCable)?;
         let target_hidden_copy = device
             .create_resident_buffer_copy(
                 target_hidden,
@@ -12251,10 +12277,9 @@ impl VulkanResidentSpeculativeDecoderProcessor {
             device_id: model.device_id.clone(),
             mounted,
             execution_plan,
+            input_transducer,
             output_transducer,
             sampler,
-            target_embedding_copy,
-            token_embedding_signal_id: adapter.token_embedding_signal_id.clone(),
             target_hidden_copy,
             recursive_hidden_copy,
             pending_hidden_input_copy,
@@ -12263,28 +12288,6 @@ impl VulkanResidentSpeculativeDecoderProcessor {
             _pending_target_hidden: pending_target_hidden,
             state_transaction,
         })
-    }
-
-    fn copy_target_embedding(
-        &self,
-        target_embedding: &VulkanResidentBuffer,
-        byte_capacity: usize,
-    ) -> Result<(), VulkanResidentInProcessPlacedRuntimeError> {
-        if let Some(copy) = &self.target_embedding_copy {
-            return copy
-                .run(byte_capacity)
-                .map_err(VulkanResidentInProcessPlacedRuntimeError::FeedbackCable);
-        }
-        let bytes = target_embedding
-            .read_bytes(byte_capacity)
-            .map_err(VulkanResidentInProcessPlacedRuntimeError::FeedbackCable)?;
-        self.mounted
-            .boundary_io
-            .input_buffer(&self.token_embedding_signal_id)
-            .expect("validated speculative token embedding boundary must remain mounted")
-            .buffer
-            .write_bytes(&bytes)
-            .map_err(VulkanResidentInProcessPlacedRuntimeError::FeedbackCable)
     }
 
     fn capture_baseline(&self) -> Result<(), VulkanResidentInProcessPlacedRuntimeError> {
@@ -12305,6 +12308,7 @@ impl VulkanResidentSpeculativeDecoderProcessor {
     fn run_draft_step(
         &self,
         device: &VulkanComputeDevice,
+        input_token_id: u32,
         stream_tick: u64,
         draft_index: usize,
     ) -> Result<u32, VulkanResidentInProcessPlacedRuntimeError> {
@@ -12313,7 +12317,7 @@ impl VulkanResidentSpeculativeDecoderProcessor {
         } else {
             VulkanDraftHiddenSource::Recursive
         };
-        self.run_state_step(device, stream_tick, hidden_source)?;
+        self.run_state_step(device, input_token_id, stream_tick, hidden_source)?;
         self.output_transducer
             .run(device)
             .map_err(VulkanResidentInProcessPlacedRuntimeError::OutputTransducer)?;
@@ -12327,9 +12331,13 @@ impl VulkanResidentSpeculativeDecoderProcessor {
     fn run_state_step(
         &self,
         device: &VulkanComputeDevice,
+        input_token_id: u32,
         stream_tick: u64,
         hidden_source: VulkanDraftHiddenSource,
     ) -> Result<(), VulkanResidentInProcessPlacedRuntimeError> {
+        self.input_transducer
+            .run_token_id(device, input_token_id)
+            .map_err(VulkanResidentInProcessPlacedRuntimeError::InputTransducer)?;
         let hidden_copy = match hidden_source {
             VulkanDraftHiddenSource::Target => &self.target_hidden_copy,
             VulkanDraftHiddenSource::Recursive => &self.recursive_hidden_copy,
@@ -13582,6 +13590,8 @@ impl VulkanResidentInProcessPlacedModelPackage {
             capacity,
             tensor_index: &tensor_index,
             target_output_parameters: &output_transducer_parameter_buffers,
+            input_embedding_spec: &runtime_model.package.input_transducer.spec,
+            input_embedding_spirv_words: &input_transducer_spirv_words,
         };
         for decoder in runtime_model
             .package
@@ -13925,26 +13935,12 @@ impl VulkanResidentInProcessPlacedModelPackage {
             &device_for,
         )
         .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
-        let target_embedding = input_slice
-            .mounted
-            .boundary_io
-            .input_buffer(&self.input_transducer_spec.output_signal_id)
-            .ok_or_else(|| {
-                VulkanResidentInProcessPlacedRuntimeError::Package(
-                    VulkanResidentTokenModelPackageError::new(format!(
-                        "placed package {:?} has no target embedding buffer {:?}",
-                        self.package_id, self.input_transducer_spec.output_signal_id
-                    )),
-                )
-            })?;
         let mut speculative_decoders = Vec::with_capacity(self.speculative_decoders.len());
         for decoder in &self.speculative_decoders {
             let draft_device = device_for(&decoder.device_id)?;
             speculative_decoders.push(VulkanResidentSpeculativeDecoderProcessor::from_model(
                 draft_device,
                 decoder,
-                &target_embedding.buffer,
-                &self.input_device_id,
                 output_transducer.normalized_frame_buffer(),
                 &self.output_transducer_parameter_buffers,
                 &self.sampler_kernels,
@@ -13984,39 +13980,21 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
     fn synchronize_speculative_decoders_after_target_tick(
         &self,
         devices: &BTreeMap<String, Rc<VulkanComputeDevice>>,
+        input_token_id: u32,
         stream_tick: u64,
     ) -> Result<(), VulkanResidentInProcessPlacedRuntimeError> {
         if self.speculative_decoders.is_empty() {
             return Ok(());
         }
-        let target_embedding = self
-            .device(&self.model.input_device_id)
-            .and_then(|slice| {
-                slice
-                    .mounted
-                    .boundary_io
-                    .input_buffer(&self.model.input_transducer_spec.output_signal_id)
-            })
-            .ok_or_else(|| {
-                VulkanResidentInProcessPlacedRuntimeError::Package(
-                    VulkanResidentTokenModelPackageError::new(format!(
-                        "placed package {:?} has no target embedding boundary {:?}",
-                        self.model.package_id, self.model.input_transducer_spec.output_signal_id
-                    )),
-                )
-            })?;
         for decoder in &self.speculative_decoders {
             let draft_device = devices.get(&decoder.device_id).ok_or_else(|| {
                 VulkanResidentInProcessPlacedRuntimeError::MissingBoundDevice {
                     device_id: decoder.device_id.clone(),
                 }
             })?;
-            decoder.copy_target_embedding(
-                &target_embedding.buffer,
-                self.model.input_transducer_spec.output_frame_byte_capacity,
-            )?;
             decoder.run_state_step(
                 draft_device.as_ref(),
+                input_token_id,
                 stream_tick,
                 VulkanDraftHiddenSource::PendingTarget,
             )?;
@@ -14531,7 +14509,7 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
                     device_id: output_slice.device_id.clone(),
                 }
             })?;
-            for frame_index in 0..input_token_ids.len() {
+            for (frame_index, input_token_id) in input_token_ids.iter().copied().enumerate() {
                 runner.input_frame_copies[frame_index]
                     .run()
                     .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
@@ -14549,7 +14527,11 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
                         &[],
                     )
                     .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
-                self.synchronize_speculative_decoders_after_target_tick(devices, stream_tick)?;
+                self.synchronize_speculative_decoders_after_target_tick(
+                    devices,
+                    input_token_id,
+                    stream_tick,
+                )?;
             }
         }
 
@@ -15838,32 +15820,11 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
             .checked_add(1)
             .ok_or(VulkanResidentInProcessPlacedRuntimeError::StreamTickOverflow)?;
         self.ensure_verification_state_transactions(devices, target_tick_count)?;
-        let input_device = devices.get(&self.model.input_device_id).ok_or_else(|| {
-            VulkanResidentInProcessPlacedRuntimeError::MissingBoundDevice {
-                device_id: self.model.input_device_id.clone(),
-            }
-        })?;
         let draft_device = devices.get(&decoder.device_id).ok_or_else(|| {
             VulkanResidentInProcessPlacedRuntimeError::MissingBoundDevice {
                 device_id: decoder.device_id.clone(),
             }
         })?;
-        let target_embedding = self
-            .device(&self.model.input_device_id)
-            .and_then(|slice| {
-                slice
-                    .mounted
-                    .boundary_io
-                    .input_buffer(&self.model.input_transducer_spec.output_signal_id)
-            })
-            .ok_or_else(|| {
-                VulkanResidentInProcessPlacedRuntimeError::Package(
-                    VulkanResidentTokenModelPackageError::new(format!(
-                        "placed package {:?} has no target embedding boundary {:?}",
-                        self.model.package_id, self.model.input_transducer_spec.output_signal_id
-                    )),
-                )
-            })?;
 
         decoder.capture_baseline()?;
         self.capture_verification_baseline()?;
@@ -15872,27 +15833,17 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
             let mut draft_token_ids = Vec::with_capacity(draft_token_count);
             let mut draft_input_token_id = initial_token_id;
             for draft_index in 0..draft_token_count {
-                self.input_transducer
-                    .prepare_token_id_only(draft_input_token_id)
-                    .map_err(VulkanResidentInProcessPlacedRuntimeError::InputTransducer)?;
-                input_device
-                    .run_resident_kernel_dispatch(&self.input_transducer.resident_dispatch, &[])
-                    .map_err(|error| {
-                        VulkanResidentInProcessPlacedRuntimeError::InputTransducer(
-                            VulkanResidentInputEmbeddingTransducerRunnerError::Vulkan(error),
-                        )
-                    })?;
-                decoder.copy_target_embedding(
-                    &target_embedding.buffer,
-                    self.model.input_transducer_spec.output_frame_byte_capacity,
-                )?;
                 let stream_tick = start_stream_tick
                     .checked_add(u64::try_from(draft_index).map_err(|_| {
                         VulkanResidentInProcessPlacedRuntimeError::StreamTickOverflow
                     })?)
                     .ok_or(VulkanResidentInProcessPlacedRuntimeError::StreamTickOverflow)?;
-                let token_id =
-                    decoder.run_draft_step(draft_device.as_ref(), stream_tick, draft_index)?;
+                let token_id = decoder.run_draft_step(
+                    draft_device.as_ref(),
+                    draft_input_token_id,
+                    stream_tick,
+                    draft_index,
+                )?;
                 draft_token_ids.push(token_id);
                 draft_input_token_id = token_id;
             }
@@ -15918,20 +15869,6 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
                 .take(verification.committed_target_tick_count)
                 .enumerate()
             {
-                self.input_transducer
-                    .prepare_token_id_only(input_token_id)
-                    .map_err(VulkanResidentInProcessPlacedRuntimeError::InputTransducer)?;
-                input_device
-                    .run_resident_kernel_dispatch(&self.input_transducer.resident_dispatch, &[])
-                    .map_err(|error| {
-                        VulkanResidentInProcessPlacedRuntimeError::InputTransducer(
-                            VulkanResidentInputEmbeddingTransducerRunnerError::Vulkan(error),
-                        )
-                    })?;
-                decoder.copy_target_embedding(
-                    &target_embedding.buffer,
-                    self.model.input_transducer_spec.output_frame_byte_capacity,
-                )?;
                 let hidden_source = if catch_up_index == 0 {
                     VulkanDraftHiddenSource::PendingTarget
                 } else {
@@ -15946,7 +15883,12 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
                         VulkanResidentInProcessPlacedRuntimeError::StreamTickOverflow
                     })?)
                     .ok_or(VulkanResidentInProcessPlacedRuntimeError::StreamTickOverflow)?;
-                decoder.run_state_step(draft_device.as_ref(), stream_tick, hidden_source)?;
+                decoder.run_state_step(
+                    draft_device.as_ref(),
+                    input_token_id,
+                    stream_tick,
+                    hidden_source,
+                )?;
             }
             let committed_hidden =
                 &target_hidden_frames[verification.committed_target_tick_count - 1];
@@ -16666,7 +16608,11 @@ impl VulkanResidentInProcessPlacedPromptStream {
             None
         };
         self.processor
-            .synchronize_speculative_decoders_after_target_tick(&self.devices, stream_tick)?;
+            .synchronize_speculative_decoders_after_target_tick(
+                &self.devices,
+                activation.input_token_id,
+                stream_tick,
+            )?;
         let output_event = self
             .active_input_event
             .as_mut()
