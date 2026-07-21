@@ -40,7 +40,7 @@ use crate::vulkan_compute::{
 };
 use crate::vulkan_distributed::{
     VulkanDistributedActivationBufferPlan, VulkanDistributedActivationBuffers,
-    VulkanDistributedDispatchDistribution, VulkanDistributedDispatchPlan,
+    VulkanDistributedDispatchDistribution, VulkanDistributedDispatchGroup,
     VulkanDistributedDispatchRunnerError, VulkanDistributedDispatchRunners,
     VulkanDistributedDispatchSubmission, VulkanDistributedExecutionPlan,
     VulkanDistributedParameterAllocationPlan, VulkanDistributedParameterBuffers,
@@ -7090,6 +7090,20 @@ fn pedal_batch_execution_units(
     Ok(execution_units)
 }
 
+fn pedal_batch_execution_units_for_distributed_groups(
+    dispatch_spans: &[VulkanPedalBatchDispatchSpan],
+    distributed_group_leaders: &BTreeSet<usize>,
+) -> Result<Vec<VulkanPedalBatchExecutionUnit>, VulkanError> {
+    let mut execution_units = pedal_batch_execution_units(dispatch_spans)?;
+    execution_units.retain(|unit| match unit {
+        VulkanPedalBatchExecutionUnit::DistributedDispatch { dispatch_index } => {
+            distributed_group_leaders.contains(dispatch_index)
+        }
+        VulkanPedalBatchExecutionUnit::LocalPedal { .. } => true,
+    });
+    Ok(execution_units)
+}
+
 impl VulkanResidentPedalBatchSliceRunner {
     fn new(
         devices: &BTreeMap<String, Rc<VulkanComputeDevice>>,
@@ -7425,8 +7439,17 @@ impl VulkanResidentPedalBatchSliceRunner {
                 distributed: false,
             });
         }
-        let execution_units = pedal_batch_execution_units(&dispatch_spans)
-            .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
+        let distributed_group_leaders = distributed_execution_plan
+            .dispatch_groups
+            .iter()
+            .filter(|group| group.owner_device_id == slice.device_id)
+            .map(|group| group.leader().dispatch_index)
+            .collect::<BTreeSet<_>>();
+        let execution_units = pedal_batch_execution_units_for_distributed_groups(
+            &dispatch_spans,
+            &distributed_group_leaders,
+        )
+        .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
 
         let sequences = (0..execution_units
             .iter()
@@ -7705,7 +7728,7 @@ struct VulkanDistributedPedalBatchRunners {
 }
 
 struct VulkanDistributedPedalBatchDispatchRunner {
-    planned: VulkanDistributedDispatchPlan,
+    planned: VulkanDistributedDispatchGroup,
     shards: Vec<VulkanDistributedPedalBatchShardRunner>,
 }
 
@@ -8025,11 +8048,82 @@ impl VulkanDistributedPedalBatchRunners {
                 });
             }
             dispatches.push(VulkanDistributedPedalBatchDispatchRunner {
-                planned: planned.clone(),
+                planned: VulkanDistributedDispatchGroup {
+                    owner_device_id: planned.owner_device_id.clone(),
+                    dispatches: vec![planned.clone()],
+                },
                 shards,
             });
         }
-        Ok(Self { dispatches })
+        let mut dispatches_by_key = dispatches
+            .into_iter()
+            .map(|runner| {
+                let leader = runner.planned.leader();
+                (
+                    (leader.owner_device_id.clone(), leader.dispatch_index),
+                    runner,
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut grouped_dispatches = Vec::with_capacity(execution_plan.dispatch_groups.len());
+        for planned_group in &execution_plan.dispatch_groups {
+            let mut members = planned_group
+                .dispatches
+                .iter()
+                .map(|planned| {
+                    dispatches_by_key
+                        .remove(&(planned.owner_device_id.clone(), planned.dispatch_index))
+                        .ok_or_else(|| {
+                            VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(
+                                format!(
+                                    "distributed pedal batch has no physical dispatch {}.{}",
+                                    planned.pedal_id, planned.node_id
+                                ),
+                            ))
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut leader_runner = members.remove(0);
+            for member in members {
+                if member.shards.len() != leader_runner.shards.len() {
+                    return Err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop(
+                        VulkanError(format!(
+                            "distributed pedal batch group {}..{} changes shard count",
+                            planned_group.leader().dispatch_index,
+                            planned_group.tail().dispatch_index
+                        )),
+                    ));
+                }
+                for (leader_shard, member_shard) in
+                    leader_runner.shards.iter_mut().zip(member.shards)
+                {
+                    if leader_shard.device_id != member_shard.device_id {
+                        return Err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop(
+                            VulkanError(format!(
+                                "distributed pedal batch group {}..{} changes shard device from {:?} to {:?}",
+                                planned_group.leader().dispatch_index,
+                                planned_group.tail().dispatch_index,
+                                leader_shard.device_id,
+                                member_shard.device_id
+                            )),
+                        ));
+                    }
+                    leader_shard.dispatches.extend(member_shard.dispatches);
+                }
+            }
+            leader_runner.planned = planned_group.clone();
+            grouped_dispatches.push(leader_runner);
+        }
+        if !dispatches_by_key.is_empty() {
+            return Err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop(
+                VulkanError(
+                    "distributed pedal batch left ungrouped physical dispatches".to_string(),
+                ),
+            ));
+        }
+        Ok(Self {
+            dispatches: grouped_dispatches,
+        })
     }
 
     fn run_dispatch(
@@ -8044,7 +8138,7 @@ impl VulkanDistributedPedalBatchRunners {
             .iter()
             .find(|dispatch| {
                 dispatch.planned.owner_device_id == owner_device_id
-                    && dispatch.planned.dispatch_index == dispatch_index
+                    && dispatch.planned.leader().dispatch_index == dispatch_index
             })
             .ok_or_else(|| {
                 VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(format!(
@@ -15093,21 +15187,21 @@ impl VulkanResidentInProcessPlacedModelPackage {
                 .map_err(VulkanResidentInProcessPlacedRuntimeError::BoundDispatchPlan)?;
             let tick_plan =
                 VulkanMountedPlacedStreamTickPlan::from_mounted_bound_plan(&mounted_bound);
-            let distributed_dispatch_indices = self
+            let distributed_dispatch_groups = self
                 .distributed_execution_plan
-                .dispatches
+                .dispatch_groups
                 .iter()
-                .filter(|dispatch| dispatch.owner_device_id == package_slice.device_id)
-                .map(|dispatch| dispatch.dispatch_index)
-                .collect::<BTreeSet<_>>();
+                .filter(|group| group.owner_device_id == package_slice.device_id)
+                .map(|group| group.dispatch_indices())
+                .collect::<Vec<_>>();
             let resident_execution_plan =
-                VulkanMountedPlacedResidentStreamTickExecutionPlan::from_tick_plan_with_distributed_dispatches(
+                VulkanMountedPlacedResidentStreamTickExecutionPlan::from_tick_plan_with_distributed_dispatch_groups(
                     device,
                     &mounted,
                     &mounted_bound,
                     package_slice.loaded_manifest(),
                     tick_plan,
-                    &distributed_dispatch_indices,
+                    &distributed_dispatch_groups,
                 )
                 .map_err(VulkanResidentInProcessPlacedRuntimeError::ResidentDispatch)?;
             devices.push(VulkanResidentInProcessPlacedStreamProcessorDevice {
@@ -21782,8 +21876,23 @@ pub struct VulkanMountedPlacedResidentStreamTickExecutionPlan {
     pub distributed_dispatch_count: usize,
     dispatch_segments: Vec<VulkanMountedPlacedResidentDispatchSegmentRunner>,
     distributed_dispatch_stages: BTreeMap<usize, VulkanMountedPlacedStreamTickDispatch>,
+    distributed_dispatch_groups: BTreeMap<usize, VulkanMountedPlacedDistributedDispatchStageGroup>,
     distributed_dispatch_dependencies:
         BTreeMap<usize, VulkanMountedPlacedDistributedDispatchDependencies>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct VulkanMountedPlacedDistributedDispatchStageGroup {
+    dispatches: Vec<VulkanMountedPlacedStreamTickDispatch>,
+    end_stage_index: usize,
+}
+
+impl VulkanMountedPlacedDistributedDispatchStageGroup {
+    fn leader(&self) -> &VulkanMountedPlacedStreamTickDispatch {
+        self.dispatches
+            .first()
+            .expect("distributed stage groups are never empty")
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -21819,6 +21928,28 @@ impl VulkanMountedPlacedResidentStreamTickExecutionPlan {
         tick_plan: VulkanMountedPlacedStreamTickPlan,
         distributed_dispatch_indices: &BTreeSet<usize>,
     ) -> Result<Self, VulkanMountedPlacedResidentKernelDispatchError> {
+        let distributed_dispatch_groups = distributed_dispatch_indices
+            .iter()
+            .map(|dispatch_index| vec![*dispatch_index])
+            .collect::<Vec<_>>();
+        Self::from_tick_plan_with_distributed_dispatch_groups(
+            device,
+            mounted,
+            mounted_bound_plan,
+            loaded_manifest,
+            tick_plan,
+            &distributed_dispatch_groups,
+        )
+    }
+
+    pub fn from_tick_plan_with_distributed_dispatch_groups(
+        device: &VulkanComputeDevice,
+        mounted: &VulkanMountedPlacedStreamCircuit,
+        mounted_bound_plan: &VulkanMountedPlacedBoundDispatchPlan,
+        loaded_manifest: &VulkanLoadedReusableKernelArtifactManifest,
+        tick_plan: VulkanMountedPlacedStreamTickPlan,
+        distributed_dispatch_groups: &[Vec<usize>],
+    ) -> Result<Self, VulkanMountedPlacedResidentKernelDispatchError> {
         if tick_plan.device_id != mounted.device_id() {
             return Err(
                 VulkanMountedPlacedResidentKernelDispatchError::ExecutionPlanDeviceMismatch {
@@ -21836,16 +21967,25 @@ impl VulkanMountedPlacedResidentStreamTickExecutionPlan {
             );
         }
 
+        let distributed_dispatch_indices = distributed_dispatch_groups
+            .iter()
+            .flatten()
+            .copied()
+            .collect::<BTreeSet<_>>();
         let distributed_dispatch_stages =
-            distributed_dispatch_stages(&tick_plan, distributed_dispatch_indices)?;
+            distributed_dispatch_stages(&tick_plan, &distributed_dispatch_indices)?;
+        let distributed_dispatch_groups = distributed_dispatch_stage_groups(
+            &distributed_dispatch_stages,
+            distributed_dispatch_groups,
+        )?;
 
         let dispatch_segment_stage_ranges =
             resident_dispatch_segment_stage_ranges_excluding_dispatches(
                 &tick_plan.stages,
-                distributed_dispatch_indices,
+                &distributed_dispatch_indices,
             );
         let distributed_dispatch_dependencies = distributed_dispatch_dependency_topologies(
-            &distributed_dispatch_stages,
+            &distributed_dispatch_groups,
             &dispatch_segment_stage_ranges,
         );
         let mut dispatch_segments = Vec::new();
@@ -21880,6 +22020,7 @@ impl VulkanMountedPlacedResidentStreamTickExecutionPlan {
             distributed_dispatch_count,
             dispatch_segments,
             distributed_dispatch_stages,
+            distributed_dispatch_groups,
             distributed_dispatch_dependencies,
         })
     }
@@ -21909,7 +22050,16 @@ impl VulkanMountedPlacedResidentStreamTickExecutionPlan {
         &self,
         stage_index: usize,
     ) -> Option<&VulkanMountedPlacedStreamTickDispatch> {
-        self.distributed_dispatch_stages.get(&stage_index)
+        self.distributed_dispatch_groups
+            .get(&stage_index)
+            .map(VulkanMountedPlacedDistributedDispatchStageGroup::leader)
+    }
+
+    fn distributed_dispatch_group_at_stage(
+        &self,
+        stage_index: usize,
+    ) -> Option<&VulkanMountedPlacedDistributedDispatchStageGroup> {
+        self.distributed_dispatch_groups.get(&stage_index)
     }
 
     fn distributed_dispatch_dependencies_at_stage(
@@ -21945,30 +22095,97 @@ impl VulkanMountedPlacedResidentStreamTickExecutionPlan {
 }
 
 fn distributed_dispatch_dependency_topologies(
-    distributed_dispatch_stages: &BTreeMap<usize, VulkanMountedPlacedStreamTickDispatch>,
+    distributed_dispatch_groups: &BTreeMap<usize, VulkanMountedPlacedDistributedDispatchStageGroup>,
     dispatch_segment_stage_ranges: &[(usize, usize)],
 ) -> BTreeMap<usize, VulkanMountedPlacedDistributedDispatchDependencies> {
-    distributed_dispatch_stages
+    distributed_dispatch_groups
         .iter()
-        .map(|(stage_index, dispatch)| {
+        .map(|(stage_index, group)| {
             (
                 *stage_index,
                 VulkanMountedPlacedDistributedDispatchDependencies {
-                    dispatch_index: dispatch.dispatch_index,
+                    dispatch_index: group.leader().dispatch_index,
                     has_owner_producer: dispatch_segment_stage_ranges
                         .iter()
                         .any(|(_, end)| end == stage_index),
-                    has_owner_continuation: stage_index.checked_add(1).is_some_and(
-                        |next_stage_index| {
-                            dispatch_segment_stage_ranges
-                                .iter()
-                                .any(|(start, _)| *start == next_stage_index)
-                        },
-                    ),
+                    has_owner_continuation: dispatch_segment_stage_ranges
+                        .iter()
+                        .any(|(start, _)| *start == group.end_stage_index),
                 },
             )
         })
         .collect()
+}
+
+fn distributed_dispatch_stage_groups(
+    distributed_dispatch_stages: &BTreeMap<usize, VulkanMountedPlacedStreamTickDispatch>,
+    dispatch_groups: &[Vec<usize>],
+) -> Result<
+    BTreeMap<usize, VulkanMountedPlacedDistributedDispatchStageGroup>,
+    VulkanMountedPlacedResidentKernelDispatchError,
+> {
+    let stages_by_dispatch = distributed_dispatch_stages
+        .iter()
+        .map(|(stage_index, dispatch)| (dispatch.dispatch_index, (*stage_index, dispatch)))
+        .collect::<BTreeMap<_, _>>();
+    let mut groups = BTreeMap::new();
+    let mut claimed_dispatches = BTreeSet::new();
+    for dispatch_indices in dispatch_groups {
+        let Some(leader_dispatch_index) = dispatch_indices.first().copied() else {
+            continue;
+        };
+        let (leader_stage_index, _) = stages_by_dispatch
+            .get(&leader_dispatch_index)
+            .copied()
+            .ok_or_else(|| {
+                VulkanMountedPlacedResidentKernelDispatchError::MissingDistributedDispatchStage {
+                    device_id: "distributed execution plan".to_string(),
+                    dispatch_index: leader_dispatch_index,
+                }
+            })?;
+        let mut dispatches = Vec::with_capacity(dispatch_indices.len());
+        for (offset, dispatch_index) in dispatch_indices.iter().copied().enumerate() {
+            if !claimed_dispatches.insert(dispatch_index) {
+                return Err(
+                    VulkanMountedPlacedResidentKernelDispatchError::DistributedDispatchMismatch {
+                        device_id: "distributed execution plan".to_string(),
+                        stage_index: leader_stage_index + offset,
+                        expected_dispatch_index: dispatch_index,
+                        completed_dispatch_index: dispatch_index,
+                    },
+                );
+            }
+            let expected_stage_index = leader_stage_index + offset;
+            let (stage_index, dispatch) = stages_by_dispatch
+                .get(&dispatch_index)
+                .copied()
+                .ok_or_else(|| {
+                    VulkanMountedPlacedResidentKernelDispatchError::MissingDistributedDispatchStage {
+                        device_id: "distributed execution plan".to_string(),
+                        dispatch_index,
+                    }
+                })?;
+            if stage_index != expected_stage_index {
+                return Err(
+                    VulkanMountedPlacedResidentKernelDispatchError::DistributedDispatchMismatch {
+                        device_id: "distributed execution plan".to_string(),
+                        stage_index: expected_stage_index,
+                        expected_dispatch_index: dispatch_index,
+                        completed_dispatch_index: dispatch.dispatch_index,
+                    },
+                );
+            }
+            dispatches.push(dispatch.clone());
+        }
+        groups.insert(
+            leader_stage_index,
+            VulkanMountedPlacedDistributedDispatchStageGroup {
+                dispatches,
+                end_stage_index: leader_stage_index + dispatch_indices.len(),
+            },
+        );
+    }
+    Ok(groups)
 }
 
 #[cfg(test)]
@@ -24826,9 +25043,9 @@ impl VulkanMountedPlacedResidentStreamTickCursor {
         &mut self,
         execution_plan: &VulkanMountedPlacedResidentStreamTickExecutionPlan,
         dispatch_index: usize,
-    ) -> Result<(), VulkanMountedPlacedResidentStreamTickError> {
-        let dispatch = self
-            .pending_distributed_dispatch(execution_plan)
+    ) -> Result<usize, VulkanMountedPlacedResidentStreamTickError> {
+        let group = execution_plan
+            .distributed_dispatch_group_at_stage(self.next_stage_index)
             .ok_or_else(|| {
                 VulkanMountedPlacedResidentStreamTickError::Dispatch(
                     VulkanMountedPlacedResidentKernelDispatchError::MissingDispatchSegment {
@@ -24837,19 +25054,47 @@ impl VulkanMountedPlacedResidentStreamTickCursor {
                     },
                 )
             })?;
-        if dispatch.dispatch_index != dispatch_index {
+        if group.leader().dispatch_index != dispatch_index {
             return Err(VulkanMountedPlacedResidentStreamTickError::Dispatch(
                 VulkanMountedPlacedResidentKernelDispatchError::DistributedDispatchMismatch {
                     device_id: execution_plan.tick_plan.device_id.clone(),
                     stage_index: self.next_stage_index,
-                    expected_dispatch_index: dispatch.dispatch_index,
+                    expected_dispatch_index: group.leader().dispatch_index,
                     completed_dispatch_index: dispatch_index,
                 },
             ));
         }
         self.last_blocked = None;
-        self.complete_current_stage();
-        Ok(())
+        for dispatch in &group.dispatches {
+            let current = self
+                .tick_plan
+                .stages
+                .get(self.next_stage_index)
+                .and_then(|stage| match stage {
+                    VulkanMountedPlacedStreamTickStage::Dispatch { dispatch, .. } => Some(dispatch),
+                    _ => None,
+                })
+                .ok_or_else(|| {
+                    VulkanMountedPlacedResidentStreamTickError::Dispatch(
+                        VulkanMountedPlacedResidentKernelDispatchError::MissingDispatchSegment {
+                            device_id: execution_plan.tick_plan.device_id.clone(),
+                            stage_index: self.next_stage_index,
+                        },
+                    )
+                })?;
+            if current.dispatch_index != dispatch.dispatch_index {
+                return Err(VulkanMountedPlacedResidentStreamTickError::Dispatch(
+                    VulkanMountedPlacedResidentKernelDispatchError::DistributedDispatchMismatch {
+                        device_id: execution_plan.tick_plan.device_id.clone(),
+                        stage_index: self.next_stage_index,
+                        expected_dispatch_index: dispatch.dispatch_index,
+                        completed_dispatch_index: current.dispatch_index,
+                    },
+                ));
+            }
+            self.complete_current_stage();
+        }
+        Ok(group.dispatches.len())
     }
 
     fn complete_current_stage(&mut self) {
@@ -25267,8 +25512,11 @@ fn wait_for_compact_execution_plan_terminal_work(
         terminal_segment.is_none_or(|segment| *stage_index >= segment.end_stage_index)
     }) {
         let (_, dispatch) = terminal_distributed.expect("terminal distributed stage exists");
+        let dispatch_index = distributed_runners
+            .leader_dispatch_index(device_id, dispatch.dispatch_index)
+            .unwrap_or(dispatch.dispatch_index);
         return distributed_runners
-            .wait_dispatch(device_id, dispatch.dispatch_index, |shard_device_id| {
+            .wait_dispatch(device_id, dispatch_index, |shard_device_id| {
                 device_by_id.get(shard_device_id).copied().ok_or_else(|| {
                     VulkanError(format!(
                         "distributed shard device {shard_device_id:?} is not mounted"
@@ -26150,15 +26398,16 @@ fn run_mounted_placed_resident_stream_tick_slices_in_process_with_schedule_and_d
                             })
                     })
                     .map_err(VulkanMountedPlacedResidentInProcessStreamTickError::Distributed)?;
-                {
+                let completed_dispatch_stages = {
                     let slice = &mut slices[*device_index];
                     slice.cursor.complete_pending_distributed_dispatch(
                         slice.execution_plan,
                         dispatch_index,
-                    )?;
-                }
-                device_completed_stage_delta =
-                    device_completed_stage_delta.checked_add(1).ok_or_else(|| {
+                    )?
+                };
+                device_completed_stage_delta = device_completed_stage_delta
+                    .checked_add(completed_dispatch_stages)
+                    .ok_or_else(|| {
                         VulkanMountedPlacedResidentInProcessStreamTickError::Schedule(VulkanError(
                             "placed distributed stage progress overflowed".to_string(),
                         ))
@@ -28369,6 +28618,28 @@ mod tests {
     }
 
     #[test]
+    fn pedal_batch_execution_submits_only_distributed_group_leaders() {
+        let spans = (0..3)
+            .map(|dispatch_index| VulkanPedalBatchDispatchSpan {
+                pedal_id: "layer_00".to_string(),
+                dispatch_index,
+                step_start: 0,
+                step_end: 0,
+                distributed: true,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            pedal_batch_execution_units_for_distributed_groups(&spans, &BTreeSet::from([0, 2]),)
+                .unwrap(),
+            vec![
+                VulkanPedalBatchExecutionUnit::DistributedDispatch { dispatch_index: 0 },
+                VulkanPedalBatchExecutionUnit::DistributedDispatch { dispatch_index: 2 },
+            ]
+        );
+    }
+
+    #[test]
     fn pedal_batch_execution_rejects_noncontiguous_dispatch_steps() {
         let spans = vec![
             VulkanPedalBatchDispatchSpan {
@@ -28795,10 +29066,15 @@ mod tests {
             &stages,
             &distributed_indices,
         );
+        let distributed_groups = distributed_dispatch_stage_groups(
+            &distributed_stages,
+            &[vec![0], vec![2], vec![3], vec![5]],
+        )
+        .unwrap();
 
         assert_eq!(ranges, vec![(1, 2), (4, 5)]);
         assert_eq!(
-            distributed_dispatch_dependency_topologies(&distributed_stages, &ranges),
+            distributed_dispatch_dependency_topologies(&distributed_groups, &ranges),
             BTreeMap::from([
                 (
                     0,
@@ -28837,19 +29113,75 @@ mod tests {
     }
 
     #[test]
-    fn cursor_completes_only_the_matching_distributed_barrier() {
-        let stage = fixture_tick_dispatch_stage(0);
-        let VulkanMountedPlacedStreamTickStage::Dispatch { dispatch, .. } = &stage else {
-            unreachable!();
-        };
-        let distributed_dispatch = dispatch.clone();
+    fn distributed_dependency_topology_uses_composed_group_boundaries() {
+        let stages = (0..6).map(fixture_tick_dispatch_stage).collect::<Vec<_>>();
+        let distributed_indices = BTreeSet::from([2, 3]);
         let tick_plan = VulkanMountedPlacedStreamTickPlan {
             backend_id: VULKAN_STREAM_CIRCUIT_BACKEND_ID.to_string(),
             device_id: "gpu0".to_string(),
-            stages: vec![stage],
-            stage_count: 1,
+            stages: stages.clone(),
+            stage_count: stages.len(),
             receive_stage_count: 0,
-            dispatch_stage_count: 1,
+            dispatch_stage_count: stages.len(),
+            publish_stage_count: 0,
+            local_cable_read_count: 0,
+            local_cable_write_count: 0,
+            incoming_cable_read_count: 0,
+            outgoing_cable_write_count: 0,
+            model_input_read_count: 0,
+            model_output_write_count: 0,
+            can_execute: false,
+        };
+        let distributed_stages =
+            distributed_dispatch_stages(&tick_plan, &distributed_indices).unwrap();
+        let distributed_groups =
+            distributed_dispatch_stage_groups(&distributed_stages, &[vec![2, 3]]).unwrap();
+        let ranges = resident_dispatch_segment_stage_ranges_excluding_dispatches(
+            &stages,
+            &distributed_indices,
+        );
+
+        assert_eq!(ranges, vec![(0, 2), (4, 6)]);
+        assert_eq!(
+            distributed_dispatch_dependency_topologies(&distributed_groups, &ranges),
+            BTreeMap::from([(
+                2,
+                VulkanMountedPlacedDistributedDispatchDependencies {
+                    dispatch_index: 2,
+                    has_owner_producer: true,
+                    has_owner_continuation: true,
+                },
+            )])
+        );
+    }
+
+    #[test]
+    fn cursor_completes_an_entire_matching_distributed_group() {
+        let stages = vec![
+            fixture_tick_dispatch_stage(0),
+            fixture_tick_dispatch_stage(1),
+        ];
+        let VulkanMountedPlacedStreamTickStage::Dispatch { dispatch, .. } = &stages[0] else {
+            unreachable!();
+        };
+        let distributed_dispatch = dispatch.clone();
+        let grouped_dispatch = dispatch.clone();
+        let VulkanMountedPlacedStreamTickStage::Dispatch {
+            dispatch: second_dispatch,
+            ..
+        } = &stages[1]
+        else {
+            unreachable!();
+        };
+        let second_distributed_dispatch = second_dispatch.clone();
+        let second_grouped_dispatch = second_dispatch.clone();
+        let tick_plan = VulkanMountedPlacedStreamTickPlan {
+            backend_id: VULKAN_STREAM_CIRCUIT_BACKEND_ID.to_string(),
+            device_id: "gpu0".to_string(),
+            stages,
+            stage_count: 2,
+            receive_stage_count: 0,
+            dispatch_stage_count: 2,
             publish_stage_count: 0,
             local_cable_read_count: 0,
             local_cable_write_count: 0,
@@ -28863,9 +29195,19 @@ mod tests {
             tick_plan: Arc::new(tick_plan),
             dispatch_segment_count: 0,
             dispatch_count: 0,
-            distributed_dispatch_count: 1,
+            distributed_dispatch_count: 2,
             dispatch_segments: Vec::new(),
-            distributed_dispatch_stages: BTreeMap::from([(0, distributed_dispatch)]),
+            distributed_dispatch_stages: BTreeMap::from([
+                (0, distributed_dispatch),
+                (1, second_distributed_dispatch),
+            ]),
+            distributed_dispatch_groups: BTreeMap::from([(
+                0,
+                VulkanMountedPlacedDistributedDispatchStageGroup {
+                    dispatches: vec![grouped_dispatch, second_grouped_dispatch],
+                    end_stage_index: 2,
+                },
+            )]),
             distributed_dispatch_dependencies: BTreeMap::from([(
                 0,
                 VulkanMountedPlacedDistributedDispatchDependencies {
@@ -28897,7 +29239,7 @@ mod tests {
             .complete_pending_distributed_dispatch(&execution_plan, 0)
             .unwrap();
         assert!(cursor.is_completed());
-        assert_eq!(cursor.completed_stage_count, 1);
+        assert_eq!(cursor.completed_stage_count, 2);
     }
 
     fn assert_bf16_bytes_close(actual: &[u8], expected: &[u8], max_absolute_error: f32) {
