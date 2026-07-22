@@ -39,6 +39,7 @@ pub enum VulkanShaderFeature {
     ShaderInt8,
     ShaderInt16,
     ShaderInt64,
+    ShaderIntegerDotProduct,
     StorageBuffer16BitAccess,
     UniformAndStorageBuffer16BitAccess,
     StoragePushConstant16,
@@ -106,6 +107,7 @@ impl VulkanShaderFeature {
             Self::ShaderInt8 => "shader_int8",
             Self::ShaderInt16 => "shader_int16",
             Self::ShaderInt64 => "shader_int64",
+            Self::ShaderIntegerDotProduct => "shader_integer_dot_product",
             Self::StorageBuffer16BitAccess => "storage_buffer16_bit_access",
             Self::UniformAndStorageBuffer16BitAccess => "uniform_and_storage_buffer16_bit_access",
             Self::StoragePushConstant16 => "storage_push_constant16",
@@ -1641,6 +1643,12 @@ impl VulkanComputeDeviceCatalog {
                 .storage_push_constant8(
                     enabled_shader_features.contains(&VulkanShaderFeature::StoragePushConstant8),
                 );
+            let mut integer_dot_product_features =
+                vk::PhysicalDeviceShaderIntegerDotProductFeatures::default()
+                    .shader_integer_dot_product(
+                        enabled_shader_features
+                            .contains(&VulkanShaderFeature::ShaderIntegerDotProduct),
+                    );
             let mut vulkan_memory_model_features =
                 vk::PhysicalDeviceVulkanMemoryModelFeatures::default()
                     .vulkan_memory_model(
@@ -1672,6 +1680,7 @@ impl VulkanComputeDeviceCatalog {
                 .push_next(&mut shader_float16_int8_features)
                 .push_next(&mut storage16_features)
                 .push_next(&mut storage8_features)
+                .push_next(&mut integer_dot_product_features)
                 .push_next(&mut vulkan_memory_model_features);
             if shader_float8_support.shader_float8
                 || shader_float8_support.shader_float8_cooperative_matrix
@@ -4002,6 +4011,7 @@ fn vulkan_shader_feature_for_spirv_capability(capability: u32) -> Option<VulkanS
         5116 => VulkanShaderFeature::ShaderBfloat16Type,
         5117 => VulkanShaderFeature::ShaderBfloat16DotProduct,
         5118 => VulkanShaderFeature::ShaderBfloat16CooperativeMatrix,
+        6019 => VulkanShaderFeature::ShaderIntegerDotProduct,
         6915 => VulkanShaderFeature::ShaderMixedFloatDotProductFloat8AccFloat32,
         5345 => VulkanShaderFeature::VulkanMemoryModel,
         5346 => VulkanShaderFeature::VulkanMemoryModelDeviceScope,
@@ -4177,11 +4187,13 @@ fn physical_device_standard_shader_features(
     let mut float16_int8 = vk::PhysicalDeviceShaderFloat16Int8Features::default();
     let mut storage16 = vk::PhysicalDevice16BitStorageFeatures::default();
     let mut storage8 = vk::PhysicalDevice8BitStorageFeatures::default();
+    let mut integer_dot_product = vk::PhysicalDeviceShaderIntegerDotProductFeatures::default();
     let mut memory_model = vk::PhysicalDeviceVulkanMemoryModelFeatures::default();
     let mut features = vk::PhysicalDeviceFeatures2::default()
         .push_next(&mut float16_int8)
         .push_next(&mut storage16)
         .push_next(&mut storage8)
+        .push_next(&mut integer_dot_product)
         .push_next(&mut memory_model);
     unsafe {
         instance.get_physical_device_features2(physical_device, &mut features);
@@ -4198,6 +4210,10 @@ fn physical_device_standard_shader_features(
         VulkanShaderFeature::ShaderFloat16,
     );
     insert(float16_int8.shader_int8, VulkanShaderFeature::ShaderInt8);
+    insert(
+        integer_dot_product.shader_integer_dot_product,
+        VulkanShaderFeature::ShaderIntegerDotProduct,
+    );
     insert(core.shader_float64, VulkanShaderFeature::ShaderFloat64);
     insert(core.shader_int16, VulkanShaderFeature::ShaderInt16);
     insert(core.shader_int64, VulkanShaderFeature::ShaderInt64);
@@ -4940,6 +4956,21 @@ mod tests {
             BTreeSet::from([
                 VulkanShaderFeature::ShaderFloat8,
                 VulkanShaderFeature::ShaderMixedFloatDotProductFloat8AccFloat32,
+            ])
+        );
+    }
+
+    #[test]
+    fn spirv_contract_extracts_native_integer_dot_product_feature() {
+        let words = spirv_test_module(&[1, 39, 6019], 1);
+
+        let requirements = vulkan_spirv_requirements(&words).unwrap();
+
+        assert_eq!(
+            requirements.shader_features,
+            BTreeSet::from([
+                VulkanShaderFeature::ShaderInt8,
+                VulkanShaderFeature::ShaderIntegerDotProduct,
             ])
         );
     }
