@@ -137,6 +137,16 @@ def test_compiler_selects_only_compatible_weight_shared_batch_kernels() -> None:
         == "linear_residual_batch16_fp8_e4m3_b128x128_17408x5120.comp"
     )
     assert (
+        weight_shared_batch_shader_file("linear_int4_gptq_sf16_g128_5120x17408.comp")
+        == "linear_batch16_int4_gptq_sf16_g128_5120x17408.comp"
+    )
+    assert (
+        weight_shared_batch_shader_file(
+            "linear_residual_int4_ct_sbf16_g32_16384x5376.comp"
+        )
+        == "linear_residual_batch16_int4_ct_sbf16_g32_16384x5376.comp"
+    )
+    assert (
         weight_shared_batch_shader_file("parallel_linear_2way_bf16_1024x2560_2560.comp")
         == "parallel_linear_batch16_2way_bf16_1024x2560_2560.comp"
     )
@@ -992,24 +1002,36 @@ def test_compiler_renders_native_auto_gptq_int4_linear_variants(
 ) -> None:
     shader_source_dir = Path(__file__).parents[1] / "runtime-rs" / "shaders"
     shader_files = {
-        "linear_int4_gptq_g128_512x768.comp",
-        "linear_bias_int4_gptq_g128_512x768.comp",
-        "linear_residual_int4_gptq_g128_512x768.comp",
+        "linear_int4_gptq_sf16_g128_512x768.comp",
+        "linear_bias_int4_gptq_sf16_g128_512x768.comp",
+        "linear_residual_int4_gptq_sf16_g128_512x768.comp",
+        "linear_batch16_int4_gptq_sf16_g128_512x768.comp",
+        "linear_bias_batch16_int4_gptq_sf16_g128_512x768.comp",
+        "linear_residual_batch16_int4_gptq_sf16_g128_512x768.comp",
     }
 
     copy_shader_templates(shader_source_dir, tmp_path, shader_files)
 
-    linear = (tmp_path / "linear_int4_gptq_g128_512x768.comp").read_text()
-    bias = (tmp_path / "linear_bias_int4_gptq_g128_512x768.comp").read_text()
-    residual = (tmp_path / "linear_residual_int4_gptq_g128_512x768.comp").read_text()
+    linear = (tmp_path / "linear_int4_gptq_sf16_g128_512x768.comp").read_text()
+    bias = (tmp_path / "linear_bias_int4_gptq_sf16_g128_512x768.comp").read_text()
+    residual = (
+        tmp_path / "linear_residual_int4_gptq_sf16_g128_512x768.comp"
+    ).read_text()
+    batch = (tmp_path / "linear_batch16_int4_gptq_sf16_g128_512x768.comp").read_text()
     assert "const uint GROUP_SIZE = 128u;" in linear
     assert "const uint INPUT_SIZE = 512u;" in linear
     assert "const uint OUTPUT_SIZE = 768u;" in linear
-    assert "& 15u) + 1u" in linear
+    assert "const uint OUTPUT_TILE_ROWS = 64u;" in linear
+    assert "SPV_KHR_integer_dot_product" in linear
+    assert "int8_dot4" in linear
+    assert "shared i8vec4 quantized_input" in linear
+    assert "packed_column * OUTPUT_SIZE + row" in linear
     assert "unpackHalf2x16" in linear
     assert "readonly buffer Bias" in bias
-    assert "readonly buffer ResidualFrame" in residual
-    assert all("{{" not in source for source in (linear, bias, residual))
+    assert "readonly buffer ResidualFrames" in residual
+    assert "const uint BATCH_TILE_WIDTH = 16u;" in batch
+    assert "batch_control.batch_width" in batch
+    assert all("{{" not in source for source in (linear, bias, residual, batch))
 
 
 def test_compiler_renders_native_compressed_tensors_int4_linear_variants(
@@ -1017,22 +1039,32 @@ def test_compiler_renders_native_compressed_tensors_int4_linear_variants(
 ) -> None:
     shader_source_dir = Path(__file__).parents[1] / "runtime-rs" / "shaders"
     shader_files = {
-        "linear_int4_ct_g32_512x768.comp",
-        "linear_bias_int4_ct_g32_512x768.comp",
-        "linear_residual_int4_ct_g32_512x768.comp",
+        "linear_int4_ct_sbf16_g32_512x768.comp",
+        "linear_bias_int4_ct_sbf16_g32_512x768.comp",
+        "linear_residual_int4_ct_sbf16_g32_512x768.comp",
+        "linear_batch16_int4_ct_sbf16_g32_512x768.comp",
+        "linear_bias_batch16_int4_ct_sbf16_g32_512x768.comp",
+        "linear_residual_batch16_int4_ct_sbf16_g32_512x768.comp",
     }
 
     copy_shader_templates(shader_source_dir, tmp_path, shader_files)
 
-    linear = (tmp_path / "linear_int4_ct_g32_512x768.comp").read_text()
-    bias = (tmp_path / "linear_bias_int4_ct_g32_512x768.comp").read_text()
-    residual = (tmp_path / "linear_residual_int4_ct_g32_512x768.comp").read_text()
+    linear = (tmp_path / "linear_int4_ct_sbf16_g32_512x768.comp").read_text()
+    bias = (tmp_path / "linear_bias_int4_ct_sbf16_g32_512x768.comp").read_text()
+    residual = (tmp_path / "linear_residual_int4_ct_sbf16_g32_512x768.comp").read_text()
+    batch = (tmp_path / "linear_batch16_int4_ct_sbf16_g32_512x768.comp").read_text()
     assert "const uint GROUP_SIZE = 32u;" in linear
+    assert "const uint OUTPUT_TILE_ROWS = 16u;" in linear
     assert "row * PACKED_COLUMNS" in linear
-    assert "int(quantized) - 8" in linear
-    assert "read_scale(row * SCALE_COLUMNS" in bias
-    assert "readonly buffer ResidualFrame" in residual
-    assert all("{{" not in source for source in (linear, bias, residual))
+    assert "int(packed & 15u) - 8" in linear
+    assert "SPV_KHR_integer_dot_product" in linear
+    assert "int8_dot4" in linear
+    assert "subgroupAdd" in linear
+    assert "read_bf16_word(scales.words[index >> 1u], index)" in bias
+    assert "readonly buffer ResidualFrames" in residual
+    assert "const uint BATCH_TILE_WIDTH = 16u;" in batch
+    assert "batch_control.batch_width" in batch
+    assert all("{{" not in source for source in (linear, bias, residual, batch))
 
 
 def test_compiler_renders_native_block_scaled_fp8_sparse_experts(
@@ -1173,6 +1205,36 @@ def test_compiler_tiles_dense_fp8_dispatch_without_changing_bf16_dispatch() -> N
     assert workgroup_count_x_for_node(circuit, fused_ffn, fp8_tensor_index) == 544
     assert workgroup_count_x_for_node(circuit, linear, bf16_tensor_index) == 8704
     assert workgroup_count_x_for_node(circuit, fused_ffn, bf16_tensor_index) == 8704
+
+
+def test_compiler_tiles_int4_dispatch_by_physical_packing_format() -> None:
+    circuit = {"parameters": {"refs": {"weight": {"tensor": "weight"}}}}
+    node = {"id": "project", "op": "linear", "params": ["weight"]}
+    auto_gptq = {
+        "tensors": {
+            "weight": {
+                "dtype": "I32",
+                "shape": [640, 17408],
+                "logical_shape": [17408, 5120],
+                "quantization": {"format": "auto_gptq"},
+            }
+        }
+    }
+    compressed_tensors = {
+        "tensors": {
+            "weight": {
+                "dtype": "I32",
+                "shape": [16384, 672],
+                "logical_shape": [16384, 5376],
+                "quantization": {"format": "compressed_tensors_pack_quantized"},
+            }
+        }
+    }
+    bf16 = {"tensors": {"weight": {"dtype": "BF16", "shape": [17408, 5120]}}}
+
+    assert workgroup_count_x_for_node(circuit, node, auto_gptq) == 272
+    assert workgroup_count_x_for_node(circuit, node, compressed_tensors) == 1024
+    assert workgroup_count_x_for_node(circuit, node, bf16) == 8704
 
 
 def test_compiler_rejects_fp8_sparse_expert_geometry_unsafe_for_native_dot() -> None:

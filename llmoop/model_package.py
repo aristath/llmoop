@@ -48,6 +48,9 @@ FP8_SPARSE_DOWN_TILE_ROWS = 64
 FP8_LINEAR_TILE_ROWS = (2, 4, 8, 16, 32, 64)
 FP8_LINEAR_MIN_WORKGROUPS = 128
 FP8_FUSED_FFN_TILE_ROWS = 32
+INT8_ACTIVATION_BLOCK_WIDTH = 32
+INT4_GPTQ_OUTPUT_TILE_ROWS = 64
+INT4_CT_OUTPUT_TILE_ROWS = 16
 GLSL_VULKAN_DEVICE_EXTENSION_REQUIREMENTS = {
     "GL_EXT_float_e4m3": "VK_EXT_shader_float8",
     "GL_EXT_bfloat16": "VK_KHR_shader_bfloat16",
@@ -1318,6 +1321,23 @@ def weight_shared_batch_shader_file(
                 f"{operation}_batch{tile}_fp8_e4m3_",
                 1,
             )
+    int4 = re.fullmatch(
+        r"(linear|linear_bias|linear_residual)_int4_(gptq|ct)_s(?:f16|bf16)_"
+        r"g(\d+)_(\d+)x(\d+)\.comp",
+        shader_file,
+    )
+    if int4 is not None:
+        operation, _, group_size, input_size, output_size = int4.groups()
+        if (
+            int(group_size) % INT8_ACTIVATION_BLOCK_WIDTH == 0
+            and int(input_size) % int(group_size) == 0
+            and int(output_size) % 2 == 0
+        ):
+            return shader_file.replace(
+                f"{operation}_int4_",
+                f"{operation}_batch{tile}_int4_",
+                1,
+            )
     bf16 = re.fullmatch(
         r"(linear|linear_residual)_bf16_(\d+)x(\d+)\.comp",
         shader_file,
@@ -1431,9 +1451,12 @@ def shader_file_for_node(
                     f"linear node {node['id']!r} has unsupported packed format "
                     f"{quantization_format!r}"
                 )
+            scale_dtype = packed_int4_scale_dtype_for_node(
+                circuit, node, tensor_index
+            ).lower()
             prefix = "linear_bias" if has_bias else "linear"
             return (
-                f"{prefix}_int4_{format_token}_g{group_size}_"
+                f"{prefix}_int4_{format_token}_s{scale_dtype}_g{group_size}_"
                 f"{in_features}x{out_features}.comp"
             )
         if parameter_dtype == "F8_E4M3":
@@ -1654,8 +1677,11 @@ def shader_file_for_node(
                     f"linear-residual node {node['id']!r} has unsupported packed "
                     f"format {quantization_format!r}"
                 )
+            scale_dtype = packed_int4_scale_dtype_for_node(
+                circuit, node, tensor_index
+            ).lower()
             return (
-                f"linear_residual_int4_{format_token}_g{group_size}_"
+                f"linear_residual_int4_{format_token}_s{scale_dtype}_g{group_size}_"
                 f"{in_features}x{out_features}.comp"
             )
         if parameter_dtype == "F8_E4M3":
@@ -2073,7 +2099,25 @@ def workgroup_count_x_for_node(circuit: Json, node: Json, tensor_index: Json) ->
         return (int(out_features) + 1) // 2
     if node["op"] in {"linear", "linear_residual", "linear_split_3way"}:
         out_features, _ = parameter_shape_for_node(circuit, node, tensor_index)
-        if parameter_dtype_for_node(circuit, node, tensor_index) == "F8_E4M3":
+        parameter_dtype = parameter_dtype_for_node(circuit, node, tensor_index)
+        if parameter_dtype == "I32":
+            quantization_format = packed_linear_quantization_format_for_node(
+                circuit, node, tensor_index
+            )
+            tile_rows = (
+                INT4_GPTQ_OUTPUT_TILE_ROWS
+                if quantization_format == "auto_gptq"
+                else INT4_CT_OUTPUT_TILE_ROWS
+                if quantization_format == "compressed_tensors_pack_quantized"
+                else 0
+            )
+            if tile_rows == 0:
+                raise ModelCompileError(
+                    f"packed linear node {node['id']!r} has unsupported format "
+                    f"{quantization_format!r}"
+                )
+            return (int(out_features) + tile_rows - 1) // tile_rows
+        if parameter_dtype == "F8_E4M3":
             tile_rows = fp8_linear_tile_rows(int(out_features))
             return (int(out_features) + tile_rows - 1) // tile_rows
         # One workgroup collaboratively computes and packs two BF16 output rows.
@@ -2152,6 +2196,112 @@ def fp8_linear_tile_rows(output_size: int) -> int:
         if (output_size + tile_rows - 1) // tile_rows >= FP8_LINEAR_MIN_WORKGROUPS:
             return tile_rows
     return FP8_LINEAR_TILE_ROWS[0]
+
+
+def validate_native_int4_shader_shape(
+    shader_file: str, group_size: int, input_size: int, output_size: int
+) -> None:
+    if (
+        group_size <= 0
+        or group_size % INT8_ACTIVATION_BLOCK_WIDTH != 0
+        or input_size <= 0
+        or input_size % group_size != 0
+        or output_size <= 0
+        or output_size % 2 != 0
+    ):
+        raise ModelCompileError(f"invalid native INT4 shader shape {shader_file!r}")
+
+
+def int4_shader_replacements(
+    *,
+    operation: str,
+    quantization_format: str,
+    scale_dtype: str,
+    batch_tile_width: int | None,
+) -> dict[str, str]:
+    if operation not in {"linear", "linear_bias", "linear_residual"}:
+        raise ModelCompileError(f"unsupported native INT4 operation {operation!r}")
+    if quantization_format not in {"gptq", "ct"}:
+        raise ModelCompileError(
+            f"unsupported native INT4 quantization format {quantization_format!r}"
+        )
+    if scale_dtype == "f16":
+        read_scale_body = (
+            "    vec2 values = unpackHalf2x16(scales.words[index >> 1u]);\n"
+            "    return (index & 1u) == 0u ? values.x : values.y;"
+        )
+    elif scale_dtype == "bf16":
+        read_scale_body = "    return read_bf16_word(scales.words[index >> 1u], index);"
+    else:
+        raise ModelCompileError(f"unsupported native INT4 scale dtype {scale_dtype!r}")
+
+    has_residual = operation == "linear_residual"
+    has_bias = operation == "linear_bias"
+    output_binding = 2 if has_residual else 1
+    qweight_binding = output_binding + 1
+    qzeros_binding = qweight_binding + 1 if quantization_format == "gptq" else None
+    scales_binding = (
+        (qzeros_binding + 1) if qzeros_binding is not None else qweight_binding + 1
+    )
+    auxiliary_binding = scales_binding + 1 if has_bias else None
+
+    if has_residual:
+        auxiliary_buffer = (
+            "layout(set = 0, binding = 1) readonly buffer ResidualFrames { "
+            "uint words[]; } residual_frames;"
+        )
+        finalize_output = (
+            "float finalize_output(uint batch_index, uint row, float value) {\n"
+            "    uint index = batch_index * OUTPUT_WORDS + (row >> 1u);\n"
+            "    return read_bf16_word(residual_frames.words[index], row) + value;\n"
+            "}"
+        )
+    elif has_bias:
+        auxiliary_buffer = (
+            f"layout(set = 0, binding = {auxiliary_binding}) readonly buffer Bias {{ "
+            "uint words[]; } bias;"
+        )
+        finalize_output = (
+            "float finalize_output(uint batch_index, uint row, float value) {\n"
+            "    return read_bf16_word(bias.words[row >> 1u], row) + value;\n"
+            "}"
+        )
+    else:
+        auxiliary_buffer = ""
+        finalize_output = (
+            "float finalize_output(uint batch_index, uint row, float value) {\n"
+            "    return value;\n"
+            "}"
+        )
+
+    if batch_tile_width is None:
+        batch_control = ""
+        batch_tile_width = 1
+        batch_start = "0u"
+        batch_width = "1u"
+    else:
+        batch_control = (
+            "layout(push_constant) uniform BatchControl { uint batch_width; } "
+            "batch_control;"
+        )
+        batch_start = "gl_WorkGroupID.y * BATCH_TILE_WIDTH"
+        batch_width = "batch_control.batch_width"
+
+    replacements = {
+        "OUTPUT_BINDING": str(output_binding),
+        "QWEIGHT_BINDING": str(qweight_binding),
+        "SCALES_BINDING": str(scales_binding),
+        "AUXILIARY_BUFFER": auxiliary_buffer,
+        "FINALIZE_OUTPUT_FUNCTION": finalize_output,
+        "BATCH_CONTROL": batch_control,
+        "BATCH_TILE_WIDTH": str(batch_tile_width),
+        "BATCH_START": batch_start,
+        "BATCH_WIDTH": batch_width,
+        "READ_SCALE_BODY": read_scale_body,
+    }
+    if qzeros_binding is not None:
+        replacements["QZEROS_BINDING"] = str(qzeros_binding)
+    return replacements
 
 
 def attention_workgroup_shape(head_width: int) -> tuple[int, int]:
@@ -2967,6 +3117,84 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
             },
         )
 
+    native_int4_linear = re.fullmatch(
+        r"(linear|linear_bias|linear_residual)_int4_(gptq|ct)_s(f16|bf16)_"
+        r"g(\d+)_(\d+)x(\d+)\.comp",
+        shader_file,
+    )
+    if native_int4_linear is not None:
+        operation, quantization_format, scale_dtype = native_int4_linear.groups()[:3]
+        group_size, input_size, output_size = map(int, native_int4_linear.groups()[3:])
+        output_tile_rows = (
+            INT4_GPTQ_OUTPUT_TILE_ROWS
+            if quantization_format == "gptq"
+            else INT4_CT_OUTPUT_TILE_ROWS
+        )
+        validate_native_int4_shader_shape(
+            shader_file, group_size, input_size, output_size
+        )
+        return render_shader_template(
+            source_dir,
+            f"linear_int4_{quantization_format}.comp.template",
+            int4_shader_replacements(
+                operation=operation,
+                quantization_format=quantization_format,
+                scale_dtype=scale_dtype,
+                batch_tile_width=None,
+            )
+            | {
+                "GROUP_SIZE": str(group_size),
+                "INPUT_SIZE": str(input_size),
+                "OUTPUT_SIZE": str(output_size),
+                "ACTIVATION_BLOCK_WIDTH": str(INT8_ACTIVATION_BLOCK_WIDTH),
+                "OUTPUT_TILE_ROWS": str(output_tile_rows),
+            },
+        )
+
+    native_int4_batch_linear = re.fullmatch(
+        r"(linear|linear_bias|linear_residual)_batch(\d+)_int4_(gptq|ct)_"
+        r"s(f16|bf16)_"
+        r"g(\d+)_(\d+)x(\d+)\.comp",
+        shader_file,
+    )
+    if native_int4_batch_linear is not None:
+        operation = native_int4_batch_linear.group(1)
+        batch_tile_width = int(native_int4_batch_linear.group(2))
+        quantization_format = native_int4_batch_linear.group(3)
+        scale_dtype = native_int4_batch_linear.group(4)
+        group_size, input_size, output_size = map(
+            int, native_int4_batch_linear.groups()[4:]
+        )
+        if batch_tile_width <= 0:
+            raise ModelCompileError(
+                f"invalid native batched INT4 shader shape {shader_file!r}"
+            )
+        output_tile_rows = (
+            INT4_GPTQ_OUTPUT_TILE_ROWS
+            if quantization_format == "gptq"
+            else INT4_CT_OUTPUT_TILE_ROWS
+        )
+        validate_native_int4_shader_shape(
+            shader_file, group_size, input_size, output_size
+        )
+        return render_shader_template(
+            source_dir,
+            f"linear_int4_{quantization_format}.comp.template",
+            int4_shader_replacements(
+                operation=operation,
+                quantization_format=quantization_format,
+                scale_dtype=scale_dtype,
+                batch_tile_width=batch_tile_width,
+            )
+            | {
+                "GROUP_SIZE": str(group_size),
+                "INPUT_SIZE": str(input_size),
+                "OUTPUT_SIZE": str(output_size),
+                "ACTIVATION_BLOCK_WIDTH": str(INT8_ACTIVATION_BLOCK_WIDTH),
+                "OUTPUT_TILE_ROWS": str(output_tile_rows),
+            },
+        )
+
     shaped_templates = (
         (
             r"sigmoid_multiply_batch(\d+)_bf16\.comp",
@@ -2982,36 +3210,6 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
             r"silu_multiply_bf16_(\d+)\.comp",
             "silu_multiply_bf16.comp.template",
             ("ELEMENT_COUNT",),
-        ),
-        (
-            r"linear_int4_ct_g(\d+)_(\d+)x(\d+)\.comp",
-            "linear_int4_ct.comp.template",
-            ("GROUP_SIZE", "INPUT_SIZE", "OUTPUT_SIZE"),
-        ),
-        (
-            r"linear_bias_int4_ct_g(\d+)_(\d+)x(\d+)\.comp",
-            "linear_bias_int4_ct.comp.template",
-            ("GROUP_SIZE", "INPUT_SIZE", "OUTPUT_SIZE"),
-        ),
-        (
-            r"linear_residual_int4_ct_g(\d+)_(\d+)x(\d+)\.comp",
-            "linear_residual_int4_ct.comp.template",
-            ("GROUP_SIZE", "INPUT_SIZE", "OUTPUT_SIZE"),
-        ),
-        (
-            r"linear_int4_gptq_g(\d+)_(\d+)x(\d+)\.comp",
-            "linear_int4_gptq.comp.template",
-            ("GROUP_SIZE", "INPUT_SIZE", "OUTPUT_SIZE"),
-        ),
-        (
-            r"linear_bias_int4_gptq_g(\d+)_(\d+)x(\d+)\.comp",
-            "linear_bias_int4_gptq.comp.template",
-            ("GROUP_SIZE", "INPUT_SIZE", "OUTPUT_SIZE"),
-        ),
-        (
-            r"linear_residual_int4_gptq_g(\d+)_(\d+)x(\d+)\.comp",
-            "linear_residual_int4_gptq.comp.template",
-            ("GROUP_SIZE", "INPUT_SIZE", "OUTPUT_SIZE"),
         ),
         (
             r"sigmoid_scalar_multiply_bf16_(\d+)\.comp",
@@ -5665,6 +5863,23 @@ def packed_linear_quantization_format_for_node(
             f"packed linear node {node['id']!r} has no quantization format"
         )
     return str(quantization["format"])
+
+
+def packed_int4_scale_dtype_for_node(
+    circuit: Json, node: Json, tensor_index: Json
+) -> str:
+    scale_parameter_id = f"{node['params'][0]}_scales"
+    if scale_parameter_id not in node.get("params", []):
+        raise ModelCompileError(
+            f"packed INT4 linear node {node['id']!r} has no scale parameter"
+        )
+    scale_dtype = parameter_dtype_for_id(circuit, scale_parameter_id, tensor_index)
+    if scale_dtype not in {"F16", "BF16"}:
+        raise ModelCompileError(
+            f"packed INT4 linear node {node['id']!r} has unsupported scale dtype "
+            f"{scale_dtype!r}"
+        )
+    return scale_dtype
 
 
 def compressed_tensors_int4_group_size_for_node(
