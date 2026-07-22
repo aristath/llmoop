@@ -1047,9 +1047,10 @@ def test_compiler_renders_native_auto_gptq_int4_linear_variants(
     assert "const uint INPUT_SIZE = 512u;" in linear
     assert "const uint OUTPUT_SIZE = 768u;" in linear
     assert "const uint OUTPUT_TILE_ROWS = 64u;" in linear
-    assert "SPV_KHR_integer_dot_product" in linear
-    assert "int8_dot4" in linear
-    assert "shared i8vec4 quantized_input" in linear
+    assert "SPV_KHR_integer_dot_product" not in linear
+    assert "int8_dot4" not in linear
+    assert "quantized_input" not in linear
+    assert "read_inputx4(batch_index, packed_column * 8u)" in linear
     assert "packed_column * OUTPUT_SIZE + row" in linear
     assert "unpackHalf2x16" in linear
     assert "readonly buffer Bias" in bias
@@ -1082,8 +1083,10 @@ def test_compiler_renders_native_compressed_tensors_int4_linear_variants(
     assert "const uint OUTPUT_TILE_ROWS = 16u;" in linear
     assert "row * PACKED_COLUMNS" in linear
     assert "int(packed & 15u) - 8" in linear
-    assert "SPV_KHR_integer_dot_product" in linear
-    assert "int8_dot4" in linear
+    assert "SPV_KHR_integer_dot_product" not in linear
+    assert "int8_dot4" not in linear
+    assert "quantized_input" not in linear
+    assert "read_inputx4(batch_index, packed_column * 8u)" in linear
     assert "subgroupAdd" in linear
     assert "read_bf16_word(scales.words[index >> 1u], index)" in bias
     assert "readonly buffer ResidualFrames" in residual
@@ -1779,9 +1782,12 @@ def test_compiler_renders_native_compressed_tensors_int4_sparse_experts(
     gate_source = (tmp_path / gate_file).read_text()
     down_source = (tmp_path / down_file).read_text()
     batch_source = (tmp_path / batch_gate).read_text()
-    assert "SPV_KHR_integer_dot_product" in gate_source
-    assert "int8_dot4" in gate_source
-    assert "shared i8vec4 quantized_hidden[HIDDEN_SIZE / 4u]" in gate_source
+    assert "SPV_KHR_integer_dot_product" not in gate_source
+    assert "int8_dot4" not in gate_source
+    assert "quantized_hidden" not in gate_source
+    assert "read_hiddenx4(batch_index, packed_column * 8u)" in gate_source
+    assert "quantized_intermediate" not in down_source
+    assert "read_intermediatex4(route_index, packed_column * 8u)" in down_source
     assert "const uint GROUP_SIZE = 32u;" in gate_source
     assert "expert_input_scales.words[index >> 1u]" in gate_source
     assert "route_weight" in down_source

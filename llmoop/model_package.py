@@ -49,7 +49,7 @@ FP8_SPARSE_DOWN_TILE_ROWS = 64
 FP8_LINEAR_TILE_ROWS = (2, 4, 8, 16, 32, 64)
 FP8_LINEAR_MIN_WORKGROUPS = 128
 FP8_FUSED_FFN_TILE_ROWS = 32
-INT8_ACTIVATION_BLOCK_WIDTH = 32
+INT4_VALUES_PER_PACKED_WORD = 8
 INT4_GPTQ_OUTPUT_TILE_ROWS = 64
 INT4_CT_OUTPUT_TILE_ROWS = 16
 GLSL_VULKAN_DEVICE_EXTENSION_REQUIREMENTS = {
@@ -1351,7 +1351,7 @@ def weight_shared_batch_shader_file(
     if int4 is not None:
         operation, _, group_size, input_size, output_size = int4.groups()
         if (
-            int(group_size) % INT8_ACTIVATION_BLOCK_WIDTH == 0
+            int(group_size) % INT4_VALUES_PER_PACKED_WORD == 0
             and int(input_size) % int(group_size) == 0
             and int(output_size) % 2 == 0
         ):
@@ -2305,7 +2305,7 @@ def validate_native_int4_shader_shape(
 ) -> None:
     if (
         group_size <= 0
-        or group_size % INT8_ACTIVATION_BLOCK_WIDTH != 0
+        or group_size % INT4_VALUES_PER_PACKED_WORD != 0
         or input_size <= 0
         or input_size % group_size != 0
         or output_size <= 0
@@ -3276,7 +3276,6 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
                 "GROUP_SIZE": str(group_size),
                 "INPUT_SIZE": str(input_size),
                 "OUTPUT_SIZE": str(output_size),
-                "ACTIVATION_BLOCK_WIDTH": str(INT8_ACTIVATION_BLOCK_WIDTH),
                 "OUTPUT_TILE_ROWS": str(output_tile_rows),
             },
         )
@@ -3320,7 +3319,6 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
                 "GROUP_SIZE": str(group_size),
                 "INPUT_SIZE": str(input_size),
                 "OUTPUT_SIZE": str(output_size),
-                "ACTIVATION_BLOCK_WIDTH": str(INT8_ACTIVATION_BLOCK_WIDTH),
                 "OUTPUT_TILE_ROWS": str(output_tile_rows),
             },
         )
@@ -4105,7 +4103,7 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
         output_width = intermediate_size if stage == "gate_up" else hidden_size
         if (
             group_size <= 0
-            or group_size % INT8_ACTIVATION_BLOCK_WIDTH != 0
+            or group_size % INT4_VALUES_PER_PACKED_WORD != 0
             or input_width % group_size != 0
             or input_width % 8 != 0
             or output_width % 2 != 0
@@ -6498,7 +6496,7 @@ def compressed_tensors_int4_moe_shape_for_stage(
         or [int(value) for value in weight_info.get("shape", [])]
         != [experts, output_rows, input_width // 8]
         or group_size <= 0
-        or group_size % INT8_ACTIVATION_BLOCK_WIDTH != 0
+        or group_size % INT4_VALUES_PER_PACKED_WORD != 0
         or input_width % group_size != 0
         or output_rows % 2 != 0
     ):

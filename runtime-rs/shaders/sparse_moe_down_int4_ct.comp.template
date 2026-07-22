@@ -2,16 +2,6 @@
 
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
-#extension GL_KHR_shader_subgroup_clustered : require
-#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
-#extension GL_EXT_spirv_intrinsics : require
-
-spirv_instruction(
-    extensions = ["SPV_KHR_integer_dot_product"],
-    capabilities = [6019],
-    id = 4450
-)
-int int8_dot4(i8vec4 a, i8vec4 b);
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
@@ -29,19 +19,13 @@ const uint INTERMEDIATE_SIZE = {{INTERMEDIATE_SIZE}}u;
 const uint NUM_EXPERTS = {{NUM_EXPERTS}}u;
 const uint EXPERTS_PER_TOKEN = {{EXPERTS_PER_TOKEN}}u;
 const uint TILE_ROWS = {{TILE_ROWS}}u;
-const uint ACTIVATION_BLOCK_WIDTH = 32u;
 const uint TILES_PER_ROUTE = (HIDDEN_SIZE + TILE_ROWS - 1u) / TILE_ROWS;
 const uint HIDDEN_WORDS = HIDDEN_SIZE / 2u;
 const uint INTERMEDIATE_WORDS = INTERMEDIATE_SIZE / 2u;
 const uint PACKED_COLUMNS = INTERMEDIATE_SIZE / 8u;
 const uint SCALE_COLUMNS = INTERMEDIATE_SIZE / GROUP_SIZE;
-const uint ACTIVATION_BLOCKS = INTERMEDIATE_SIZE / ACTIVATION_BLOCK_WIDTH;
-const uint ACTIVATION_WORDS_PER_BLOCK = ACTIVATION_BLOCK_WIDTH / 4u;
-const uint PACKED_COLUMNS_PER_BLOCK = ACTIVATION_BLOCK_WIDTH / 8u;
 const uint EXPERT_OUTPUT_WORDS = HIDDEN_SIZE * PACKED_COLUMNS;
 
-shared i8vec4 quantized_intermediate[INTERMEDIATE_SIZE / 4u];
-shared float intermediate_scales[ACTIVATION_BLOCKS];
 shared float subgroup_sum[TILE_ROWS][64];
 shared float output_rows[TILE_ROWS];
 
@@ -80,44 +64,22 @@ float read_scale(uint expert, uint row, uint group) {
 {{READ_SCALE_BODY}}
 }
 
-i8vec4 unpack_weight_lo(uint packed) {
-    return i8vec4(
-        int(packed & 15u) - 8,
-        int((packed >> 4u) & 15u) - 8,
-        int((packed >> 8u) & 15u) - 8,
-        int((packed >> 12u) & 15u) - 8
+vec4 unpack_weight_lo(uint packed) {
+    return vec4(
+        float(int(packed & 15u) - 8),
+        float(int((packed >> 4u) & 15u) - 8),
+        float(int((packed >> 8u) & 15u) - 8),
+        float(int((packed >> 12u) & 15u) - 8)
     );
 }
 
-i8vec4 unpack_weight_hi(uint packed) {
-    return i8vec4(
-        int((packed >> 16u) & 15u) - 8,
-        int((packed >> 20u) & 15u) - 8,
-        int((packed >> 24u) & 15u) - 8,
-        int((packed >> 28u) & 15u) - 8
+vec4 unpack_weight_hi(uint packed) {
+    return vec4(
+        float(int((packed >> 16u) & 15u) - 8),
+        float(int((packed >> 20u) & 15u) - 8),
+        float(int((packed >> 24u) & 15u) - 8),
+        float(int((packed >> 28u) & 15u) - 8)
     );
-}
-
-void quantize_intermediate(uint route_index, uint lane) {
-    uint cluster = lane >> 5u;
-    uint cluster_lane = lane & 31u;
-    for (uint block = cluster; block < ACTIVATION_BLOCKS; block += 2u) {
-        vec4 value = vec4(0.0);
-        if (cluster_lane < ACTIVATION_WORDS_PER_BLOCK) {
-            uint column = block * ACTIVATION_BLOCK_WIDTH + cluster_lane * 4u;
-            value = read_intermediatex4(route_index, column);
-        }
-        float lane_max = max(max(abs(value.x), abs(value.y)), max(abs(value.z), abs(value.w)));
-        float block_max = subgroupClusteredMax(lane_max, 32u);
-        float scale = block_max > 0.0 ? block_max / 127.0 : 1.0;
-        if (cluster_lane == 0u) intermediate_scales[block] = scale;
-        if (cluster_lane < ACTIVATION_WORDS_PER_BLOCK) {
-            vec4 rounded = clamp(round(value / scale), vec4(-127.0), vec4(127.0));
-            quantized_intermediate[
-                block * ACTIVATION_WORDS_PER_BLOCK + cluster_lane
-            ] = i8vec4(rounded);
-        }
-    }
 }
 
 void main() {
@@ -138,9 +100,6 @@ void main() {
     float route_weight = bf16_to_f32(packed_route >> 16u);
 
     uint lane = gl_LocalInvocationID.x;
-    quantize_intermediate(route_index, lane);
-    barrier();
-
     uint first_row = tile * TILE_ROWS;
     for (uint local_row = 0u; local_row < TILE_ROWS; local_row++) {
         uint row = first_row + local_row;
@@ -150,18 +109,16 @@ void main() {
                 uint packed = expert_output_weight.words[
                     (expert * HIDDEN_SIZE + row) * PACKED_COLUMNS + packed_column
                 ];
-                uint input_word = packed_column * 2u;
-                int packed_sum = int8_dot4(
-                    quantized_intermediate[input_word], unpack_weight_lo(packed)
-                ) + int8_dot4(
-                    quantized_intermediate[input_word + 1u], unpack_weight_hi(packed)
-                );
-                uint block = packed_column / PACKED_COLUMNS_PER_BLOCK;
                 uint scale_group = packed_column * 8u / GROUP_SIZE;
                 sum = fma(
-                    float(packed_sum),
-                    intermediate_scales[block]
-                        * read_scale(expert, row, scale_group),
+                    dot(
+                        read_intermediatex4(route_index, packed_column * 8u),
+                        unpack_weight_lo(packed)
+                    ) + dot(
+                        read_intermediatex4(route_index, packed_column * 8u + 4u),
+                        unpack_weight_hi(packed)
+                    ),
+                    read_scale(expert, row, scale_group),
                     sum
                 );
             }
