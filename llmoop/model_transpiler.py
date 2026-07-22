@@ -86,6 +86,7 @@ class ModelStructure:
     num_experts: int | None
     experts_per_token: int | None
     recurrent_mixer: Json | None
+    quantization: Json | None
     sampling: Json
     token_ids: Json
     tensors: dict[str, str]
@@ -524,6 +525,7 @@ def discover_model_structure(
         num_experts=num_experts,
         experts_per_token=experts_per_token,
         recurrent_mixer=recurrent_mixer,
+        quantization=discover_quantization_policy(config),
         sampling=discover_sampling_policy(generation_config or {}),
         token_ids={
             "bos": decoder_config.get("bos_token_id"),
@@ -1536,6 +1538,85 @@ def discover_outer_norm_weight_offset(
     )
 
 
+def discover_quantization_policy(config: Json) -> Json | None:
+    """Normalize execution-relevant quantization facts from source metadata.
+
+    Checkpoint families place ``quantization_config`` at different nesting
+    levels.  The compiler records the numerical contract itself instead of
+    coupling execution to a model name or configuration path.
+    """
+
+    candidates: list[Json] = []
+
+    def visit(value: Any) -> None:
+        if not isinstance(value, dict):
+            return
+        quantization = value.get("quantization_config")
+        if isinstance(quantization, dict):
+            candidates.append(quantization)
+        for nested in value.values():
+            if isinstance(nested, dict):
+                visit(nested)
+
+    visit(config)
+    fp8_candidates = [
+        candidate
+        for candidate in candidates
+        if str(candidate.get("quant_method", "")).lower() == "fp8"
+    ]
+    if not fp8_candidates:
+        return None
+
+    policies: list[Json] = []
+    for candidate in fp8_candidates:
+        block_shape = candidate.get("weight_block_size")
+        if block_shape is None:
+            continue
+        if (
+            not isinstance(block_shape, list)
+            or len(block_shape) != 2
+            or any(
+                not isinstance(value, int)
+                or isinstance(value, bool)
+                or value <= 0
+                for value in block_shape
+            )
+        ):
+            raise ModelTranspileError(
+                f"FP8 weight_block_size must contain two positive integers; got {block_shape!r}"
+            )
+        activation_scheme = str(candidate.get("activation_scheme", "")).lower()
+        if activation_scheme != "dynamic":
+            continue
+        weight_per_tensor = bool(candidate.get("weight_per_tensor", False))
+        activation_per_tensor = bool(candidate.get("act_per_tensor", False))
+        if weight_per_tensor or activation_per_tensor:
+            continue
+        policies.append(
+            {
+                "weight": {
+                    "format": "block_scaled_fp8_e4m3",
+                    "block_shape": [int(value) for value in block_shape],
+                    "per_tensor": False,
+                },
+                "activation": {
+                    "format": "dynamic_block_fp8_e4m3",
+                    "group_size": int(block_shape[1]),
+                    "per_tensor": False,
+                },
+            }
+        )
+
+    if not policies:
+        return None
+    first = policies[0]
+    if any(policy != first for policy in policies[1:]):
+        raise ModelTranspileError(
+            "source contains conflicting dynamic block-FP8 quantization contracts"
+        )
+    return first
+
+
 def discover_sampling_policy(generation_config: Json) -> Json:
     repetition_penalty = float(generation_config.get("repetition_penalty", 1.0))
     if not math.isfinite(repetition_penalty) or repetition_penalty <= 0.0:
@@ -1848,6 +1929,7 @@ def make_model_graph(
             "logits_scale": structure.logits_scale,
             "logits_soft_cap": structure.logits_soft_cap,
         },
+        "quantization": structure.quantization,
         "sampling": structure.sampling,
         "token_ids": structure.token_ids,
         "files": {

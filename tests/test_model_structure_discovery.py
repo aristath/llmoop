@@ -9,6 +9,7 @@ from llmoop.model_transpiler import (
     attach_packed_linear_quantization,
     annotate_packed_linear_tensors,
     discover_model_structure,
+    discover_quantization_policy,
     discover_sampling_policy,
     make_layer,
     make_model_graph,
@@ -61,6 +62,48 @@ def test_discovers_model_owned_sampling_policy() -> None:
         "presence_penalty": 1.5,
         "repetition_penalty": 1.05,
     }
+
+
+def test_discovers_dynamic_block_fp8_by_numerical_structure() -> None:
+    config = {
+        "model_type": "outer_container",
+        "quantization_config": {
+            "quant_method": "fp8",
+            "activation_scheme": "dynamic",
+            "weight_per_tensor": False,
+            "act_per_tensor": False,
+            "weight_block_size": [128, 128],
+        },
+        "text_config": {"model_type": "unrelated_family_name"},
+    }
+
+    assert discover_quantization_policy(config) == {
+        "weight": {
+            "format": "block_scaled_fp8_e4m3",
+            "block_shape": [128, 128],
+            "per_tensor": False,
+        },
+        "activation": {
+            "format": "dynamic_block_fp8_e4m3",
+            "group_size": 128,
+            "per_tensor": False,
+        },
+    }
+
+
+def test_does_not_invent_dynamic_activation_quantization() -> None:
+    assert (
+        discover_quantization_policy(
+            {
+                "quantization_config": {
+                    "quant_method": "fp8",
+                    "activation_scheme": "static",
+                    "weight_block_size": [128, 128],
+                }
+            }
+        )
+        is None
+    )
 
 
 def test_attaches_block_scale_to_fp8_parameter_by_tensor_structure() -> None:
