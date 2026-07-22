@@ -1007,7 +1007,8 @@ fn infer_node_output_shapes(
         | "silu"
         | "gelu_tanh"
         | "rotary_position_embedding"
-        | "scalar_multiply" => Ok(repeat_shape(first_input_shape(node, signals), outputs)),
+        | "scalar_multiply"
+        | "softplus_multiply" => Ok(repeat_shape(first_input_shape(node, signals), outputs)),
         "per_layer_embedding" => {
             let output_shape = attr_usize(node, "per_layer_width").map(|width| vec![width]);
             Ok(repeat_shape(output_shape, outputs))
@@ -1704,6 +1705,52 @@ mod tests {
             infer_node_output_shapes("attention", &node, &signals, &BTreeMap::new(), None,)
                 .unwrap(),
             vec![Some(vec![1024])]
+        );
+    }
+
+    #[test]
+    fn infers_per_head_softplus_gate_output_shape_from_attention_frame() {
+        let node = crate::stream_circuit::CircuitNode {
+            id: "attention_output_gate".to_string(),
+            op: "softplus_multiply".to_string(),
+            inputs: vec!["attention_out".to_string(), "attention_gate".to_string()],
+            outputs: vec!["attention_gated".to_string()],
+            params: Vec::new(),
+            state_reads: Vec::new(),
+            state_writes: Vec::new(),
+            attrs: serde_json::json!({
+                "head_count": 48,
+                "head_width": 128
+            }),
+        };
+        let signals = BTreeMap::from([
+            (
+                "attention_out".to_string(),
+                PlannedSignal {
+                    id: "attention_out".to_string(),
+                    producer: SignalProducer::BoundaryInput,
+                    consumers: vec!["attention_output_gate".to_string()],
+                    shape: Some(vec![6144]),
+                    storage: SignalStorage::Boundary,
+                    is_boundary_output: false,
+                },
+            ),
+            (
+                "attention_gate".to_string(),
+                PlannedSignal {
+                    id: "attention_gate".to_string(),
+                    producer: SignalProducer::BoundaryInput,
+                    consumers: vec!["attention_output_gate".to_string()],
+                    shape: Some(vec![48]),
+                    storage: SignalStorage::Boundary,
+                    is_boundary_output: false,
+                },
+            ),
+        ]);
+
+        assert_eq!(
+            infer_node_output_shapes("layer_00", &node, &signals, &BTreeMap::new(), None,).unwrap(),
+            vec![Some(vec![6144])]
         );
     }
 
