@@ -2289,8 +2289,12 @@ fn choose_chat_runtime_context_size(
 }
 
 fn parse_args() -> Result<Args, String> {
+    parse_args_from(std::env::args().skip(1))
+}
+
+fn parse_args_from(raw: impl IntoIterator<Item = String>) -> Result<Args, String> {
     let mut parsed = Args::default();
-    let mut raw = std::env::args().skip(1);
+    let mut raw = raw.into_iter();
 
     while let Some(arg) = raw.next() {
         match arg.as_str() {
@@ -2319,7 +2323,10 @@ fn parse_args() -> Result<Args, String> {
                 parsed.inspect_device_slice = Some(next_value(&mut raw, "--inspect-device-slice")?);
             }
             "--device" => {
-                parsed.default_device_id = Some(next_value(&mut raw, &arg)?);
+                let device_id = next_value(&mut raw, &arg)?;
+                if parsed.default_device_id.replace(device_id).is_some() {
+                    return Err("--device may only be supplied once".to_string());
+                }
             }
             "--place-pedal" => {
                 let assignment = next_value(&mut raw, &arg)?;
@@ -2855,7 +2862,7 @@ Options:
   --chat                     Start an interactive resident text session.
   --chat-template-var <NAME=JSON>
                              Set a model-owned chat template variable; may be repeated.
-  --device <DEVICE_ID>       Default logical device for this runtime patch.
+  --device <DEVICE_ID>       Default logical device for unplaced pedals. May be supplied once.
   --place-pedal <PEDAL=DEV>  Assign one runtime pedal instance to a logical device.
   --bind-device <DEV=TARGET> Bind a logical device to a discovered Vulkan device ID.
   --chain <ITEM[,ITEM...]>    Runtime source chain. ITEM is SOURCE or INSTANCE=SOURCE.
@@ -2914,8 +2921,8 @@ mod tests {
         Args, RuntimeChatFormatter, RuntimeChatMessage, RuntimeChatSession,
         assistant_content_token_ids, chat_transcript_codec, incremental_chat_token_delta,
         model_owned_assistant_turn_stop_token_id, normalize_chat_template_for_runtime,
-        parse_chat_template_variable, parse_device_binding_assignment, parse_source_chain,
-        parse_vulkan_device_uuid_ref, resolve_runtime_context_size,
+        parse_args_from, parse_chat_template_variable, parse_device_binding_assignment,
+        parse_source_chain, parse_vulkan_device_uuid_ref, resolve_runtime_context_size,
         resolve_runtime_vulkan_physical_device_ref, runtime_device_bindings_report,
         runtime_physical_device_bindings_in,
     };
@@ -2933,6 +2940,18 @@ mod tests {
 
     #[derive(Clone, Copy)]
     struct CharacterCodec;
+
+    #[test]
+    fn duplicate_default_device_is_rejected() {
+        let error = parse_args_from(
+            ["--device", "gpu0", "--device", "gpu1"]
+                .into_iter()
+                .map(str::to_string),
+        )
+        .unwrap_err();
+
+        assert_eq!(error, "--device may only be supplied once");
+    }
 
     impl VulkanResidentTokenTextCodec for CharacterCodec {
         fn encode_text(&self, text: &str) -> Result<Vec<u32>, VulkanResidentTokenTextCodecError> {
