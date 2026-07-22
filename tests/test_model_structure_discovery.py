@@ -739,7 +739,6 @@ def test_discovers_sparse_moe_and_model_specific_numerics_by_structure(
         "experts_per_token": 8,
         "activation": "sigmoid",
         "normalize_selected": True,
-        "routed_scaling_factor": 2.5,
         "logit_softcap": 0.0,
         "selection_bias": True,
     }
@@ -747,6 +746,7 @@ def test_discovers_sparse_moe_and_model_specific_numerics_by_structure(
     assert nodes["sparse_moe_gate_up"]["params"] == ["moe_input"]
     assert nodes["sparse_moe_down"]["params"] == ["moe_output"]
     assert nodes["moe_reduce"]["outputs"] == ["ffn_out"]
+    assert nodes["moe_reduce"]["attrs"]["routed_scaling_factor"] == 2.5
 
 
 def test_discovers_mixed_window_attention_sinks_and_shared_sparse_experts() -> None:

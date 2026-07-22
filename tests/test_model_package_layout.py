@@ -214,8 +214,8 @@ def test_compiler_selects_only_compatible_weight_shared_batch_kernels() -> None:
         == "sparse_moe_gate_up_batch1_fp8_e4m3_b128x128_h2048_i512_e256_k8.comp"
     )
     assert (
-        frame_parallel_batch_shader_file("moe_reduce_bf16_h2048_k8.comp")
-        == "moe_reduce_batch1_bf16_h2048_k8.comp"
+        frame_parallel_batch_shader_file("moe_reduce_bf16_h2048_k8_scale1.comp")
+        == "moe_reduce_batch1_bf16_h2048_k8_scale1.comp"
     )
 
 
@@ -1106,8 +1106,8 @@ def test_compiler_renders_native_block_scaled_fp8_sparse_experts(
         "sparse_moe_gate_up_batch1_fp8_e4m3_b128x128_h2048_i512_e256_k8.comp",
         "sparse_moe_down_fp8_e4m3_b128x128_h2048_i512_e256_k8.comp",
         "sparse_moe_down_batch1_fp8_e4m3_b128x128_h2048_i512_e256_k8.comp",
-        "moe_reduce_bf16_h2048_k8.comp",
-        "moe_reduce_batch1_bf16_h2048_k8.comp",
+        "moe_reduce_bf16_h2048_k8_scale1.comp",
+        "moe_reduce_batch1_bf16_h2048_k8_scale1.comp",
         "sigmoid_scalar_multiply_bf16_2048.comp",
     }
 
@@ -1120,7 +1120,7 @@ def test_compiler_renders_native_block_scaled_fp8_sparse_experts(
         tmp_path / "sparse_moe_down_fp8_e4m3_b128x128_h2048_i512_e256_k8.comp"
     ).read_text()
     router_shader = (tmp_path / "moe_topk_bf16_e256_k8.comp").read_text()
-    reduce_shader = (tmp_path / "moe_reduce_bf16_h2048_k8.comp").read_text()
+    reduce_shader = (tmp_path / "moe_reduce_bf16_h2048_k8_scale1.comp").read_text()
     assert "const uint NUM_EXPERTS = 256u;" in gate_up_shader
     assert "const uint EXPERTS_PER_TOKEN = 8u;" in gate_up_shader
     assert "#extension GL_EXT_float_e4m3 : require" in gate_up_shader
@@ -1608,7 +1608,7 @@ def test_compiler_renders_sparse_moe_and_scaled_residual_pedals(tmp_path: Path) 
         "sparse_moe_gate_up_batch1_bf16_h1024_i512_e32_k8.comp",
         "sparse_moe_down_bf16_h1024_i512_e32_k8.comp",
         "sparse_moe_down_batch1_bf16_h1024_i512_e32_k8.comp",
-        "moe_reduce_bf16_h1024_k8.comp",
+        "moe_reduce_bf16_h1024_k8_scale1.comp",
     }
 
     copy_shader_templates(shader_source_dir, tmp_path, shader_files)
@@ -1617,7 +1617,7 @@ def test_compiler_renders_sparse_moe_and_scaled_residual_pedals(tmp_path: Path) 
     router = (tmp_path / "moe_topk_bf16_e32_k8.comp").read_text()
     gate_up = (tmp_path / "sparse_moe_gate_up_bf16_h1024_i512_e32_k8.comp").read_text()
     down = (tmp_path / "sparse_moe_down_bf16_h1024_i512_e32_k8.comp").read_text()
-    reduce = (tmp_path / "moe_reduce_bf16_h1024_k8.comp").read_text()
+    reduce = (tmp_path / "moe_reduce_bf16_h1024_k8_scale1.comp").read_text()
     assert "const float RESIDUAL_SCALE = 0.22;" in scaled_add
     assert "const uint NUM_EXPERTS = 32u;" in router
     assert "const uint EXPERTS_PER_TOKEN = 8u;" in router
@@ -1647,7 +1647,6 @@ def test_compiler_renders_sigmoid_router_with_selection_bias(tmp_path: Path) -> 
             "experts_per_token": 10,
             "activation": "sigmoid",
             "normalize_selected": True,
-            "routed_scaling_factor": 2.5,
             "logit_softcap": 0.0,
             "selection_bias": True,
         },
@@ -1661,8 +1660,18 @@ def test_compiler_renders_sigmoid_router_with_selection_bias(tmp_path: Path) -> 
             }
         }
     }
-    primary = "moe_topk_sigmoid_bf16_e256_k10_norm1_scale2.5_cap0_biasf32.comp"
-    batch = "moe_topk_batch1_sigmoid_bf16_e256_k10_norm1_scale2.5_cap0_biasf32.comp"
+    primary = "moe_topk_sigmoid_bf16_e256_k10_norm1_cap0_biasf32.comp"
+    batch = "moe_topk_batch1_sigmoid_bf16_e256_k10_norm1_cap0_biasf32.comp"
+    reduce_node = {
+        "id": "moe_reduce",
+        "op": "moe_reduce",
+        "attrs": {
+            "hidden_size": 3072,
+            "experts_per_token": 10,
+            "routed_scaling_factor": 2.5,
+        },
+    }
+    reduce_file = "moe_reduce_bf16_h3072_k10_scale2.5.comp"
 
     assert (
         shader_file_for_node(
@@ -1674,17 +1683,28 @@ def test_compiler_renders_sigmoid_router_with_selection_bias(tmp_path: Path) -> 
         == primary
     )
     assert frame_parallel_batch_shader_file(primary) == batch
-    copy_shader_templates(shader_source_dir, tmp_path, {primary, batch})
+    assert (
+        shader_file_for_node(
+            {}, reduce_node, {}, {"hidden_size": 3072, "intermediate_size": 1024}
+        )
+        == reduce_file
+    )
+    copy_shader_templates(shader_source_dir, tmp_path, {primary, batch, reduce_file})
 
     primary_source = (tmp_path / primary).read_text()
     batch_source = (tmp_path / batch).read_text()
     assert "const bool ROUTER_SIGMOID = 1 != 0;" in primary_source
     assert "const bool NORMALIZE_SELECTED = 1 != 0;" in primary_source
-    assert "const float ROUTED_SCALE = 2.5;" in primary_source
+    assert "ROUTED_SCALE" not in primary_source
     assert "RouterSelectionBias" in primary_source
     assert "uintBitsToFloat(router_selection_bias.words[expert])" in primary_source
-    assert "binding = 2) buffer ExpertRoutes" in primary_source
+    assert "binding = 1) buffer ExpertRoutes" in primary_source
+    assert "binding = 2) readonly buffer RouterSelectionBias" in primary_source
+    assert "binding = 2) buffer ExpertRoutes" not in primary_source
     assert "gl_WorkGroupID.y" in batch_source
+    reduce_source = (tmp_path / reduce_file).read_text()
+    assert "const float ROUTED_SCALE = 2.5;" in reduce_source
+    assert "f32_to_bf16(lo * ROUTED_SCALE)" in reduce_source
     assert "{{" not in primary_source
     assert "{{" not in batch_source
 

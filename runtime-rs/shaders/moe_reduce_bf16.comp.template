@@ -13,6 +13,7 @@ layout(set = 0, binding = 1) buffer OutputFrame {
 const uint HIDDEN_SIZE = {{HIDDEN_SIZE}}u;
 const uint EXPERTS_PER_TOKEN = {{EXPERTS_PER_TOKEN}}u;
 const uint HIDDEN_WORDS = HIDDEN_SIZE / 2u;
+const float ROUTED_SCALE = {{ROUTED_SCALE}};
 
 float bf16_to_f32(uint value) {
     return uintBitsToFloat((value & 0xffffu) << 16);
@@ -37,6 +38,8 @@ void main() {
             lo = add_bf16(lo, bf16_to_f32(contribution));
             hi = add_bf16(hi, bf16_to_f32(contribution >> 16));
         }
-        output_frame.words[word] = (f32_to_bf16(hi) << 16) | f32_to_bf16(lo);
+        output_frame.words[word] =
+            (f32_to_bf16(hi * ROUTED_SCALE) << 16)
+            | f32_to_bf16(lo * ROUTED_SCALE);
     }
 }

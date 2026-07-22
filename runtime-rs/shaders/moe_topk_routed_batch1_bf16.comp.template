@@ -18,7 +18,6 @@ const uint NUM_EXPERTS = {{NUM_EXPERTS}}u;
 const uint EXPERTS_PER_TOKEN = {{EXPERTS_PER_TOKEN}}u;
 const bool ROUTER_SIGMOID = {{ROUTER_SIGMOID}} != 0;
 const bool NORMALIZE_SELECTED = {{NORMALIZE_SELECTED}} != 0;
-const float ROUTED_SCALE = {{ROUTED_SCALE}};
 const float LOGIT_SOFTCAP = {{LOGIT_SOFTCAP}};
 const uint ROUTER_WORDS = (NUM_EXPERTS + 1u) / 2u;
 
@@ -115,7 +114,6 @@ void main() {
         float logit = router_logit(batch_index, expert);
         float weight = ROUTER_SIGMOID ? sigmoid(logit) : exp(logit - maximum);
         if (NORMALIZE_SELECTED || !ROUTER_SIGMOID) weight /= denominator;
-        weight *= ROUTED_SCALE;
         expert_routes.words[route_base + route] =
             (f32_to_bf16(weight) << 16u) | expert;
     }

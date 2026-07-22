@@ -1106,7 +1106,7 @@ def frame_parallel_batch_shader_file(shader_file: str) -> str | None:
         return shader_file.replace("moe_topk_", "moe_topk_batch1_", 1)
     if re.fullmatch(
         r"moe_topk_(?:sigmoid|softmax)_bf16_e\d+_k\d+_norm[01]_"
-        r"scale[0-9eE+.-]+_cap[0-9eE+.-]+_(?:biasf32|biasbf16|nobias)\.comp",
+        r"cap[0-9eE+.-]+_(?:biasf32|biasbf16|nobias)\.comp",
         shader_file,
     ):
         return shader_file.replace("moe_topk_", "moe_topk_batch1_", 1)
@@ -1121,7 +1121,9 @@ def frame_parallel_batch_shader_file(shader_file: str) -> str | None:
             .replace("_fp8_e4m3_", "_batch1_fp8_e4m3_", 1)
             .replace("_int4_ct_", "_batch1_int4_ct_", 1)
         )
-    if re.fullmatch(r"moe_reduce_bf16_h\d+_k\d+\.comp", shader_file):
+    if re.fullmatch(
+        r"moe_reduce_bf16_h\d+_k\d+_scale[0-9eE+.-]+\.comp", shader_file
+    ):
         return shader_file.replace("moe_reduce_", "moe_reduce_batch1_", 1)
     if re.fullmatch(
         r"rms_norm_batch\d+_bf16_h\d+_eps[0-9eE+.-]+_offset[0-9eE+.-]+\.comp",
@@ -2071,17 +2073,12 @@ def shader_file_for_node(
         attrs = node["attrs"]
         activation = str(attrs.get("activation"))
         normalize_selected = bool(attrs.get("normalize_selected"))
-        routed_scale = float(attrs.get("routed_scaling_factor"))
         logit_softcap = float(attrs.get("logit_softcap"))
         has_bias = bool(attrs.get("selection_bias"))
         bias_dtype = None
         if activation not in {"sigmoid", "softmax"}:
             raise ModelCompileError(
                 f"MoE router node {node['id']!r} has unsupported activation {activation!r}"
-            )
-        if not math.isfinite(routed_scale) or routed_scale <= 0.0:
-            raise ModelCompileError(
-                f"MoE router node {node['id']!r} has invalid routed scale {routed_scale}"
             )
         if not math.isfinite(logit_softcap) or logit_softcap < 0.0:
             raise ModelCompileError(
@@ -2112,7 +2109,6 @@ def shader_file_for_node(
         if (
             activation == "softmax"
             and normalize_selected
-            and routed_scale == 1.0
             and logit_softcap == 0.0
             and not has_bias
         ):
@@ -2120,7 +2116,6 @@ def shader_file_for_node(
         return (
             f"moe_topk_{activation}_bf16_e{attrs['num_experts']}_"
             f"k{attrs['experts_per_token']}_norm{int(normalize_selected)}_"
-            f"scale{shader_float_token(routed_scale)}_"
             f"cap{shader_float_token(logit_softcap)}_"
             f"{'bias' + bias_dtype.lower() if bias_dtype else 'nobias'}.comp"
         )
@@ -2157,9 +2152,15 @@ def shader_file_for_node(
         )
     if op == "moe_reduce":
         attrs = node["attrs"]
+        routed_scale = float(attrs["routed_scaling_factor"])
+        if not math.isfinite(routed_scale) or routed_scale <= 0.0:
+            raise ModelCompileError(
+                f"MoE reduction node {node['id']!r} has invalid routed scale {routed_scale}"
+            )
         return (
             f"moe_reduce_bf16_h{attrs['hidden_size']}"
-            f"_k{attrs['experts_per_token']}.comp"
+            f"_k{attrs['experts_per_token']}"
+            f"_scale{shader_float_token(routed_scale)}.comp"
         )
 
     raise ModelCompileError(
@@ -3980,7 +3981,7 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
 
     custom_moe_topk_shape = re.fullmatch(
         r"moe_topk(?:_batch(\d+))?_(sigmoid|softmax)_bf16_e(\d+)_k(\d+)_"
-        r"norm([01])_scale([0-9eE+.-]+)_cap([0-9eE+.-]+)_"
+        r"norm([01])_cap([0-9eE+.-]+)_"
         r"(biasf32|biasbf16|nobias)\.comp",
         shader_file,
     )
@@ -3991,7 +3992,6 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
             num_experts,
             experts_per_token,
             normalize_selected,
-            routed_scale,
             logit_softcap,
             bias_mode,
         ) = custom_moe_topk_shape.groups()
@@ -4017,10 +4017,9 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
                 "EXPERTS_PER_TOKEN": str(experts_per_token),
                 "ROUTER_SIGMOID": "1" if activation == "sigmoid" else "0",
                 "NORMALIZE_SELECTED": normalize_selected,
-                "ROUTED_SCALE": routed_scale,
                 "LOGIT_SOFTCAP": logit_softcap,
                 "BIAS_DECLARATION": (
-                    "layout(set = 0, binding = 1) readonly buffer RouterSelectionBias "
+                    "layout(set = 0, binding = 2) readonly buffer RouterSelectionBias "
                     "{ uint words[]; } router_selection_bias;"
                     if has_bias
                     else ""
@@ -4032,7 +4031,10 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
                     if bias_mode == "biasbf16"
                     else "0.0"
                 ),
-                "ROUTES_BINDING": "2" if has_bias else "1",
+                # Runtime descriptors are ordered as inputs, outputs, then
+                # parameters. A biased router therefore keeps its route output
+                # at binding 1 and places the selection-bias parameter at 2.
+                "ROUTES_BINDING": "1",
             },
         )
 
@@ -4255,10 +4257,14 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
         )
 
     moe_reduce_shape = re.fullmatch(
-        r"moe_reduce(?:_batch(\d+))?_bf16_h(\d+)_k(\d+)\.comp", shader_file
+        r"moe_reduce(?:_batch(\d+))?_bf16_h(\d+)_k(\d+)_"
+        r"scale([0-9eE+.-]+)\.comp",
+        shader_file,
     )
     if moe_reduce_shape is not None:
-        batch_tile, hidden_size, experts_per_token = moe_reduce_shape.groups()
+        batch_tile, hidden_size, experts_per_token, routed_scale = (
+            moe_reduce_shape.groups()
+        )
         if batch_tile not in {None, "1"}:
             raise ModelCompileError(
                 "sparse reduction supports only frame-parallel batch tiles"
@@ -4274,6 +4280,7 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
             {
                 "HIDDEN_SIZE": str(hidden_size),
                 "EXPERTS_PER_TOKEN": str(experts_per_token),
+                "ROUTED_SCALE": routed_scale,
             },
         )
 

@@ -10,6 +10,7 @@ layout(push_constant) uniform BatchControl { uint batch_width; } batch_control;
 const uint HIDDEN_SIZE = {{HIDDEN_SIZE}}u;
 const uint EXPERTS_PER_TOKEN = {{EXPERTS_PER_TOKEN}}u;
 const uint HIDDEN_WORDS = HIDDEN_SIZE / 2u;
+const float ROUTED_SCALE = {{ROUTED_SCALE}};
 
 float bf16_to_f32(uint value) {
     return uintBitsToFloat((value & 0xffffu) << 16);
@@ -43,6 +44,7 @@ void main() {
             hi = add_bf16(hi, bf16_to_f32(contribution >> 16u));
         }
         output_frames.words[output_offset + word] =
-            (f32_to_bf16(hi) << 16u) | f32_to_bf16(lo);
+            (f32_to_bf16(hi * ROUTED_SCALE) << 16u)
+            | f32_to_bf16(lo * ROUTED_SCALE);
     }
 }

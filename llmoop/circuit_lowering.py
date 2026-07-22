@@ -1495,7 +1495,6 @@ def _ffn_tail(
                     "experts_per_token": int(feed_forward["experts_per_token"]),
                     "activation": str(routing["activation"]),
                     "normalize_selected": bool(routing["normalize_selected"]),
-                    "routed_scaling_factor": float(routing["routed_scaling_factor"]),
                     "logit_softcap": float(routing["logit_softcap"]),
                     "selection_bias": "moe_router_correction_bias" in parameters,
                 },
@@ -1554,6 +1553,7 @@ def _ffn_tail(
                 "attrs": {
                     "hidden_size": int(feed_forward["hidden_size"]),
                     "experts_per_token": int(feed_forward["experts_per_token"]),
+                    "routed_scaling_factor": float(routing["routed_scaling_factor"]),
                 },
             },
         ]
