@@ -19,6 +19,7 @@ from llmoop.model_package import (
     cooperative_bfloat16_workgroup_count_x,
     copy_shader_templates,
     frame_parallel_batch_shader_file,
+    fp8_moe_block_shape_for_stage,
     pedal_kernel_spec,
     required_vulkan_device_extensions,
     required_vulkan_features,
@@ -1044,6 +1045,13 @@ def test_compiler_renders_native_block_scaled_fp8_sparse_experts(
     assert "uintBitsToFloate4m3EXT" in gate_up_shader
     assert "ExpertInputScaleInv" in gate_up_shader
     assert "ExpertOutputScaleInv" in down_shader
+    assert "const uint TILE_ROWS = 32u;" in gate_up_shader
+    assert "const uint TILE_ROWS = 64u;" in down_shader
+    assert "shared fe4m3vec4 quantized_hidden" in gate_up_shader
+    assert "shared fe4m3vec4 quantized_intermediate" in down_shader
+    assert "SPV_VALVE_mixed_float_dot_product" in gate_up_shader
+    assert "fp8_dot4_acc32" in gate_up_shader
+    assert "subgroupClusteredMax" in gate_up_shader
     assert "expert_routes.words[route] = (weight << 16u) | expert;" in router_shader
     assert "route < EXPERTS_PER_TOKEN" in reduce_shader
     assert all("{{" not in source for source in (gate_up_shader, down_shader))
@@ -1067,22 +1075,31 @@ def test_compiler_parallelizes_only_selected_sparse_expert_routes() -> None:
         "num_experts": 256,
         "experts_per_token": 8,
     }
+    circuit = {"parameters": {"refs": {"expert_weight": {"tensor": "expert_weight"}}}}
+    fp8_tensor_index = {"tensors": {"expert_weight": {"dtype": "F8_E4M3"}}}
+    bf16_tensor_index = {"tensors": {"expert_weight": {"dtype": "BF16"}}}
+    gate_up = {
+        "op": "sparse_moe_gate_up",
+        "attrs": attrs,
+        "params": ["expert_weight"],
+    }
+    down = {
+        "op": "sparse_moe_down",
+        "attrs": attrs,
+        "params": ["expert_weight"],
+    }
 
-    assert (
-        workgroup_count_x_for_node({}, {"op": "sparse_moe_gate_up", "attrs": attrs}, {})
-        == 2048
-    )
-    assert (
-        workgroup_count_x_for_node({}, {"op": "sparse_moe_down", "attrs": attrs}, {})
-        == 8192
-    )
+    assert workgroup_count_x_for_node(circuit, gate_up, fp8_tensor_index) == 128
+    assert workgroup_count_x_for_node(circuit, down, fp8_tensor_index) == 256
+    assert workgroup_count_x_for_node(circuit, gate_up, bf16_tensor_index) == 2048
+    assert workgroup_count_x_for_node(circuit, down, bf16_tensor_index) == 8192
 
     spec = pedal_kernel_spec(
         execution_index=0,
         node={"id": "sparse_moe_gate_up", "op": "sparse_moe_gate_up"},
         shader_file=("sparse_moe_gate_up_fp8_e4m3_b128x128_h2048_i512_e256_k8.comp"),
         local_size_x=64,
-        workgroup_count_x=2048,
+        workgroup_count_x=128,
     )
     assert spec["batch_mode"] == "weight_shared"
     assert [
@@ -1096,9 +1113,53 @@ def test_compiler_parallelizes_only_selected_sparse_expert_routes() -> None:
                 "h2048_i512_e256_k8.comp"
             ),
             "local_size_x": 64,
-            "workgroup_count_x": 2048,
+            "workgroup_count_x": 128,
         }
     ]
+
+
+def test_compiler_rejects_fp8_sparse_expert_geometry_unsafe_for_native_dot() -> None:
+    circuit = {
+        "parameters": {
+            "refs": {
+                "moe_input": {"tensor": "experts.gate_up"},
+                "moe_input_scale_inv": {"tensor": "experts.gate_up_scale"},
+            }
+        }
+    }
+    node = {
+        "id": "sparse_moe_gate_up",
+        "op": "sparse_moe_gate_up",
+        "params": ["moe_input", "moe_input_scale_inv"],
+        "attrs": {
+            "hidden_size": 2048,
+            "intermediate_size": 512,
+            "num_experts": 256,
+            "experts_per_token": 8,
+        },
+    }
+    tensor_index = {
+        "tensors": {
+            "experts.gate_up": {
+                "dtype": "F8_E4M3",
+                "shape": [256, 1024, 2048],
+                "layout": "row_major",
+            },
+            "experts.gate_up_scale": {
+                "dtype": "BF16",
+                "shape": [256, 8, 32],
+                "layout": "row_major",
+            },
+        }
+    }
+
+    with pytest.raises(ModelCompileError, match="requires 128-column blocks"):
+        fp8_moe_block_shape_for_stage(
+            circuit,
+            node,
+            tensor_index,
+            stage="gate_up",
+        )
 
 
 def test_compiler_renders_attention_pedals_from_discovered_dimensions(

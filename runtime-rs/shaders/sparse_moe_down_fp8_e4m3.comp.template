@@ -2,8 +2,17 @@
 
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_clustered : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
 #extension GL_EXT_float_e4m3 : require
+#extension GL_EXT_spirv_intrinsics : require
+
+spirv_instruction(
+    extensions = ["SPV_VALVE_mixed_float_dot_product"],
+    capabilities = [6915],
+    id = 6918
+)
+float fp8_dot4_acc32(fe4m3vec4 a, fe4m3vec4 b, float accumulator);
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
@@ -19,14 +28,21 @@ const uint HIDDEN_SIZE = {{HIDDEN_SIZE}}u;
 const uint INTERMEDIATE_SIZE = {{INTERMEDIATE_SIZE}}u;
 const uint NUM_EXPERTS = {{NUM_EXPERTS}}u;
 const uint EXPERTS_PER_TOKEN = {{EXPERTS_PER_TOKEN}}u;
+const uint TILE_ROWS = {{TILE_ROWS}}u;
+const uint TILES_PER_ROUTE = (HIDDEN_SIZE + TILE_ROWS - 1u) / TILE_ROWS;
 const uint HIDDEN_WORDS = HIDDEN_SIZE / 2u;
 const uint INTERMEDIATE_WORDS = INTERMEDIATE_SIZE / 2u;
+const uint INTERMEDIATE_FP8_WORDS = INTERMEDIATE_SIZE / 4u;
+const uint INTERMEDIATE_BLOCKS = INTERMEDIATE_SIZE / BLOCK_COLUMNS;
+const uint BLOCK_FP8_WORDS = BLOCK_COLUMNS / 4u;
 const uint EXPERT_OUTPUT_WORDS = HIDDEN_SIZE * INTERMEDIATE_SIZE / 4u;
 const uint SCALE_ROWS = (HIDDEN_SIZE + BLOCK_ROWS - 1u) / BLOCK_ROWS;
-const uint SCALE_COLUMNS = (INTERMEDIATE_SIZE + BLOCK_COLUMNS - 1u) / BLOCK_COLUMNS;
+const uint SCALE_COLUMNS = INTERMEDIATE_BLOCKS;
 
-shared float subgroup_lo[64];
-shared float subgroup_hi[64];
+shared fe4m3vec4 quantized_intermediate[INTERMEDIATE_FP8_WORDS];
+shared float intermediate_scales[INTERMEDIATE_BLOCKS];
+shared float subgroup_sum[TILE_ROWS][64];
+shared float output_rows[TILE_ROWS];
 
 float bf16_to_f32(uint value) { return uintBitsToFloat((value & 0xffffu) << 16); }
 
@@ -38,27 +54,7 @@ uint f32_to_bf16(float value) {
 
 float round_bf16(float value) { return bf16_to_f32(f32_to_bf16(value)); }
 
-float fp8_e4m3_to_f32(uint value) {
-    return float(uintBitsToFloate4m3EXT(uint8_t(value & 0xffu)));
-}
-
-vec4 fp8_e4m3x4_to_f32(uint packed) {
-    return vec4(
-        fp8_e4m3_to_f32(packed),
-        fp8_e4m3_to_f32(packed >> 8u),
-        fp8_e4m3_to_f32(packed >> 16u),
-        fp8_e4m3_to_f32(packed >> 24u)
-    );
-}
-
 float read_bf16_word(uint packed, uint index) {
-    return bf16_to_f32(packed >> ((index & 1u) * 16u));
-}
-
-float read_intermediate(uint route, uint index) {
-    uint packed = expert_intermediates.words[
-        route * INTERMEDIATE_WORDS + (index >> 1u)
-    ];
     return bf16_to_f32(packed >> ((index & 1u) * 16u));
 }
 
@@ -74,27 +70,26 @@ vec4 read_intermediatex4(uint route, uint column) {
     );
 }
 
-float read_scale(uint expert, uint row, uint column) {
-    uint index = (expert * SCALE_ROWS + row / BLOCK_ROWS)
-        * SCALE_COLUMNS + column / BLOCK_COLUMNS;
+float read_scale(uint expert, uint row, uint block) {
+    uint index = (expert * SCALE_ROWS + row / BLOCK_ROWS) * SCALE_COLUMNS + block;
     return read_bf16_word(expert_output_scale_inv.words[index >> 1u], index);
 }
 
-float read_weight(uint expert, uint row, uint column) {
+fe4m3vec4 read_weightx4(uint expert, uint row, uint column) {
     uint index = (expert * HIDDEN_SIZE + row) * INTERMEDIATE_SIZE + column;
     uint packed = expert_output_weight.words[index >> 2u];
-    return fp8_e4m3_to_f32(packed >> ((index & 3u) * 8u));
-}
-
-vec4 read_weightx4(uint expert, uint row, uint column) {
-    uint index = (expert * HIDDEN_SIZE + row) * INTERMEDIATE_SIZE + column;
-    return fp8_e4m3x4_to_f32(expert_output_weight.words[index >> 2u]);
+    return uintBitsToFloate4m3EXT(u8vec4(
+        uint8_t(packed),
+        uint8_t(packed >> 8u),
+        uint8_t(packed >> 16u),
+        uint8_t(packed >> 24u)
+    ));
 }
 
 void main() {
     uint group = gl_WorkGroupID.x;
-    uint route = group / HIDDEN_WORDS;
-    uint word = group % HIDDEN_WORDS;
+    uint route = group / TILES_PER_ROUTE;
+    uint tile = group % TILES_PER_ROUTE;
     if (route >= EXPERTS_PER_TOKEN) {
         return;
     }
@@ -112,63 +107,69 @@ void main() {
     float route_weight = bf16_to_f32(packed_route >> 16u);
 
     uint lane = gl_LocalInvocationID.x;
-    uint lo_row = word * 2u;
-    uint hi_row = lo_row + 1u;
-    float lo = 0.0;
-    float hi = 0.0;
-
-    if ((INTERMEDIATE_SIZE % 4u) == 0u && (BLOCK_COLUMNS % 4u) == 0u) {
-        for (uint column = lane * 4u; column < INTERMEDIATE_SIZE; column += 256u) {
-            vec4 intermediate = read_intermediatex4(route, column);
-            lo = fma(
-                dot(intermediate, read_weightx4(expert, lo_row, column)),
-                read_scale(expert, lo_row, column),
-                lo
-            );
-            hi = fma(
-                dot(intermediate, read_weightx4(expert, hi_row, column)),
-                read_scale(expert, hi_row, column),
-                hi
-            );
+    uint cluster = lane >> 5u;
+    uint cluster_lane = lane & 31u;
+    for (uint block = cluster; block < INTERMEDIATE_BLOCKS; block += 2u) {
+        uint word = block * BLOCK_FP8_WORDS + cluster_lane;
+        vec4 intermediate = read_intermediatex4(route, word * 4u);
+        float lane_max = max(
+            max(abs(intermediate.x), abs(intermediate.y)),
+            max(abs(intermediate.z), abs(intermediate.w))
+        );
+        float block_max = subgroupClusteredMax(lane_max, 32u);
+        float scale = block_max > 0.0 ? block_max / 448.0 : 1.0;
+        if (cluster_lane == 0u) {
+            intermediate_scales[block] = scale;
         }
-    } else {
-        for (uint column = lane; column < INTERMEDIATE_SIZE; column += 64u) {
-            float intermediate = read_intermediate(route, column);
-            lo = fma(
-                intermediate,
-                read_weight(expert, lo_row, column)
-                    * read_scale(expert, lo_row, column),
-                lo
-            );
-            hi = fma(
-                intermediate,
-                read_weight(expert, hi_row, column)
-                    * read_scale(expert, hi_row, column),
-                hi
-            );
-        }
-    }
-
-    lo = subgroupAdd(lo);
-    hi = subgroupAdd(hi);
-    if (gl_NumSubgroups > 1u && gl_SubgroupInvocationID == 0u) {
-        subgroup_lo[gl_SubgroupID] = lo;
-        subgroup_hi[gl_SubgroupID] = hi;
+        quantized_intermediate[word] = fe4m3vec4(intermediate / scale);
     }
     barrier();
 
-    if (lane == 0u) {
-        if (gl_NumSubgroups > 1u) {
-            lo = 0.0;
-            hi = 0.0;
-            for (uint subgroup = 0u; subgroup < gl_NumSubgroups; subgroup++) {
-                lo += subgroup_lo[subgroup];
-                hi += subgroup_hi[subgroup];
+    uint first_row = tile * TILE_ROWS;
+    for (uint local_row = 0u; local_row < TILE_ROWS; local_row++) {
+        uint row = first_row + local_row;
+        float sum = 0.0;
+        if (row < HIDDEN_SIZE) {
+            for (uint word = lane; word < INTERMEDIATE_FP8_WORDS; word += 64u) {
+                uint block = word / BLOCK_FP8_WORDS;
+                sum = fma(
+                    fp8_dot4_acc32(
+                        quantized_intermediate[word],
+                        read_weightx4(expert, row, word * 4u),
+                        0.0
+                    ),
+                    intermediate_scales[block] * read_scale(expert, row, block),
+                    sum
+                );
             }
         }
-        lo = round_bf16(round_bf16(lo) * route_weight);
-        hi = round_bf16(round_bf16(hi) * route_weight);
-        expert_outputs.words[route * HIDDEN_WORDS + word] =
-            (f32_to_bf16(hi) << 16u) | f32_to_bf16(lo);
+        sum = subgroupAdd(sum);
+        if (gl_SubgroupInvocationID == 0u) {
+            subgroup_sum[local_row][gl_SubgroupID] = sum;
+        }
+    }
+    barrier();
+
+    if (lane < TILE_ROWS) {
+        uint row = first_row + lane;
+        float sum = 0.0;
+        for (uint subgroup = 0u; subgroup < gl_NumSubgroups; subgroup++) {
+            sum += subgroup_sum[lane][subgroup];
+        }
+        output_rows[lane] = row < HIDDEN_SIZE
+            ? round_bf16(round_bf16(sum) * route_weight)
+            : 0.0;
+    }
+    barrier();
+
+    if (lane < TILE_ROWS / 2u) {
+        uint row = first_row + lane * 2u;
+        if (row < HIDDEN_SIZE) {
+            uint hi = row + 1u < HIDDEN_SIZE
+                ? f32_to_bf16(output_rows[lane * 2u + 1u])
+                : 0u;
+            expert_outputs.words[route * HIDDEN_WORDS + row / 2u] =
+                (hi << 16u) | f32_to_bf16(output_rows[lane * 2u]);
+        }
     }
 }

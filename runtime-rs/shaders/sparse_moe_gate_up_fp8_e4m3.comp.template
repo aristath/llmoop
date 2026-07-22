@@ -2,12 +2,21 @@
 
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_clustered : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
 #extension GL_EXT_float_e4m3 : require
+#extension GL_EXT_spirv_intrinsics : require
+
+spirv_instruction(
+    extensions = ["SPV_VALVE_mixed_float_dot_product"],
+    capabilities = [6915],
+    id = 6918
+)
+float fp8_dot4_acc32(fe4m3vec4 a, fe4m3vec4 b, float accumulator);
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
-layout(set = 0, binding = 0) readonly buffer HiddenInput { uint words[]; } hidden_input;
+layout(set = 0, binding = 0) readonly buffer HiddenFrame { uint words[]; } hidden_frame;
 layout(set = 0, binding = 1) readonly buffer ExpertRoutes { uint words[]; } expert_routes;
 layout(set = 0, binding = 2) buffer ExpertIntermediates { uint words[]; } expert_intermediates;
 layout(set = 0, binding = 3) readonly buffer ExpertInputWeight { uint words[]; } expert_input_weight;
@@ -19,16 +28,25 @@ const uint HIDDEN_SIZE = {{HIDDEN_SIZE}}u;
 const uint INTERMEDIATE_SIZE = {{INTERMEDIATE_SIZE}}u;
 const uint NUM_EXPERTS = {{NUM_EXPERTS}}u;
 const uint EXPERTS_PER_TOKEN = {{EXPERTS_PER_TOKEN}}u;
+const uint TILE_ROWS = {{TILE_ROWS}}u;
+const uint TILES_PER_ROUTE = (INTERMEDIATE_SIZE + TILE_ROWS - 1u) / TILE_ROWS;
+const uint HIDDEN_FP8_WORDS = HIDDEN_SIZE / 4u;
+const uint HIDDEN_BLOCKS = HIDDEN_SIZE / BLOCK_COLUMNS;
+const uint BLOCK_FP8_WORDS = BLOCK_COLUMNS / 4u;
 const uint INTERMEDIATE_WORDS = INTERMEDIATE_SIZE / 2u;
 const uint EXPERT_INPUT_ROWS = INTERMEDIATE_SIZE * 2u;
 const uint EXPERT_INPUT_WORDS = EXPERT_INPUT_ROWS * HIDDEN_SIZE / 4u;
 const uint SCALE_ROWS = (EXPERT_INPUT_ROWS + BLOCK_ROWS - 1u) / BLOCK_ROWS;
-const uint SCALE_COLUMNS = (HIDDEN_SIZE + BLOCK_COLUMNS - 1u) / BLOCK_COLUMNS;
+const uint SCALE_COLUMNS = HIDDEN_BLOCKS;
 
-shared float subgroup_gate_lo[64];
-shared float subgroup_gate_hi[64];
-shared float subgroup_up_lo[64];
-shared float subgroup_up_hi[64];
+// Pedal-private transient layer: one dynamic FP8 representation is shared by
+// every output row in this matrix tile while lane-contiguous weight reads stay
+// coalesced.
+shared fe4m3vec4 quantized_hidden[HIDDEN_FP8_WORDS];
+shared float hidden_scales[HIDDEN_BLOCKS];
+shared float subgroup_gate[TILE_ROWS][64];
+shared float subgroup_up[TILE_ROWS][64];
+shared float activated_rows[TILE_ROWS];
 
 float bf16_to_f32(uint value) { return uintBitsToFloat((value & 0xffffu) << 16); }
 
@@ -40,30 +58,14 @@ uint f32_to_bf16(float value) {
 
 float round_bf16(float value) { return bf16_to_f32(f32_to_bf16(value)); }
 
-float fp8_e4m3_to_f32(uint value) {
-    return float(uintBitsToFloate4m3EXT(uint8_t(value & 0xffu)));
-}
-
-vec4 fp8_e4m3x4_to_f32(uint packed) {
-    return vec4(
-        fp8_e4m3_to_f32(packed),
-        fp8_e4m3_to_f32(packed >> 8u),
-        fp8_e4m3_to_f32(packed >> 16u),
-        fp8_e4m3_to_f32(packed >> 24u)
-    );
-}
-
 float read_bf16_word(uint packed, uint index) {
     return bf16_to_f32(packed >> ((index & 1u) * 16u));
 }
 
-float read_hidden(uint index) {
-    return read_bf16_word(hidden_input.words[index >> 1u], index);
-}
-
 vec4 read_hiddenx4(uint column) {
-    uint lo = hidden_input.words[column >> 1u];
-    uint hi = hidden_input.words[(column >> 1u) + 1u];
+    uint offset = column >> 1u;
+    uint lo = hidden_frame.words[offset];
+    uint hi = hidden_frame.words[offset + 1u];
     return vec4(
         bf16_to_f32(lo),
         bf16_to_f32(lo >> 16u),
@@ -72,27 +74,26 @@ vec4 read_hiddenx4(uint column) {
     );
 }
 
-float read_scale(uint expert, uint row, uint column) {
-    uint index = (expert * SCALE_ROWS + row / BLOCK_ROWS)
-        * SCALE_COLUMNS + column / BLOCK_COLUMNS;
+float read_scale(uint expert, uint row, uint block) {
+    uint index = (expert * SCALE_ROWS + row / BLOCK_ROWS) * SCALE_COLUMNS + block;
     return read_bf16_word(expert_input_scale_inv.words[index >> 1u], index);
 }
 
-float read_weight(uint expert, uint row, uint column) {
+fe4m3vec4 read_weightx4(uint expert, uint row, uint column) {
     uint index = (expert * EXPERT_INPUT_ROWS + row) * HIDDEN_SIZE + column;
     uint packed = expert_input_weight.words[index >> 2u];
-    return fp8_e4m3_to_f32(packed >> ((index & 3u) * 8u));
-}
-
-vec4 read_weightx4(uint expert, uint row, uint column) {
-    uint index = (expert * EXPERT_INPUT_ROWS + row) * HIDDEN_SIZE + column;
-    return fp8_e4m3x4_to_f32(expert_input_weight.words[index >> 2u]);
+    return uintBitsToFloate4m3EXT(u8vec4(
+        uint8_t(packed),
+        uint8_t(packed >> 8u),
+        uint8_t(packed >> 16u),
+        uint8_t(packed >> 24u)
+    ));
 }
 
 void main() {
     uint group = gl_WorkGroupID.x;
-    uint route = group / INTERMEDIATE_WORDS;
-    uint word = group % INTERMEDIATE_WORDS;
+    uint route = group / TILES_PER_ROUTE;
+    uint tile = group % TILES_PER_ROUTE;
     if (route >= EXPERTS_PER_TOKEN) {
         return;
     }
@@ -108,106 +109,89 @@ void main() {
     expert -= expert_start;
 
     uint lane = gl_LocalInvocationID.x;
-    uint first = word * 2u;
-    uint gate_lo_row = first;
-    uint gate_hi_row = first + 1u;
-    uint up_lo_row = INTERMEDIATE_SIZE + first;
-    uint up_hi_row = up_lo_row + 1u;
-    float gate_lo = 0.0;
-    float gate_hi = 0.0;
-    float up_lo = 0.0;
-    float up_hi = 0.0;
-
-    if ((HIDDEN_SIZE % 4u) == 0u && (BLOCK_COLUMNS % 4u) == 0u) {
-        for (uint column = lane * 4u; column < HIDDEN_SIZE; column += 256u) {
-            vec4 hidden = read_hiddenx4(column);
-            gate_lo = fma(
-                dot(hidden, read_weightx4(expert, gate_lo_row, column)),
-                read_scale(expert, gate_lo_row, column),
-                gate_lo
-            );
-            gate_hi = fma(
-                dot(hidden, read_weightx4(expert, gate_hi_row, column)),
-                read_scale(expert, gate_hi_row, column),
-                gate_hi
-            );
-            up_lo = fma(
-                dot(hidden, read_weightx4(expert, up_lo_row, column)),
-                read_scale(expert, up_lo_row, column),
-                up_lo
-            );
-            up_hi = fma(
-                dot(hidden, read_weightx4(expert, up_hi_row, column)),
-                read_scale(expert, up_hi_row, column),
-                up_hi
-            );
+    uint cluster = lane >> 5u;
+    uint cluster_lane = lane & 31u;
+    for (uint block = cluster; block < HIDDEN_BLOCKS; block += 2u) {
+        uint word = block * BLOCK_FP8_WORDS + cluster_lane;
+        vec4 hidden = read_hiddenx4(word * 4u);
+        float lane_max = max(
+            max(abs(hidden.x), abs(hidden.y)),
+            max(abs(hidden.z), abs(hidden.w))
+        );
+        float block_max = subgroupClusteredMax(lane_max, 32u);
+        float scale = block_max > 0.0 ? block_max / 448.0 : 1.0;
+        if (cluster_lane == 0u) {
+            hidden_scales[block] = scale;
         }
-    } else {
-        for (uint column = lane; column < HIDDEN_SIZE; column += 64u) {
-            float hidden = read_hidden(column);
-            gate_lo = fma(
-                hidden,
-                read_weight(expert, gate_lo_row, column)
-                    * read_scale(expert, gate_lo_row, column),
-                gate_lo
-            );
-            gate_hi = fma(
-                hidden,
-                read_weight(expert, gate_hi_row, column)
-                    * read_scale(expert, gate_hi_row, column),
-                gate_hi
-            );
-            up_lo = fma(
-                hidden,
-                read_weight(expert, up_lo_row, column)
-                    * read_scale(expert, up_lo_row, column),
-                up_lo
-            );
-            up_hi = fma(
-                hidden,
-                read_weight(expert, up_hi_row, column)
-                    * read_scale(expert, up_hi_row, column),
-                up_hi
-            );
-        }
-    }
-
-    gate_lo = subgroupAdd(gate_lo);
-    gate_hi = subgroupAdd(gate_hi);
-    up_lo = subgroupAdd(up_lo);
-    up_hi = subgroupAdd(up_hi);
-    if (gl_NumSubgroups > 1u && gl_SubgroupInvocationID == 0u) {
-        subgroup_gate_lo[gl_SubgroupID] = gate_lo;
-        subgroup_gate_hi[gl_SubgroupID] = gate_hi;
-        subgroup_up_lo[gl_SubgroupID] = up_lo;
-        subgroup_up_hi[gl_SubgroupID] = up_hi;
+        quantized_hidden[word] = fe4m3vec4(hidden / scale);
     }
     barrier();
 
-    if (lane == 0u) {
-        if (gl_NumSubgroups > 1u) {
-            gate_lo = 0.0;
-            gate_hi = 0.0;
-            up_lo = 0.0;
-            up_hi = 0.0;
-            for (uint subgroup = 0u; subgroup < gl_NumSubgroups; subgroup++) {
-                gate_lo += subgroup_gate_lo[subgroup];
-                gate_hi += subgroup_gate_hi[subgroup];
-                up_lo += subgroup_up_lo[subgroup];
-                up_hi += subgroup_up_hi[subgroup];
+    uint first_row = tile * TILE_ROWS;
+    for (uint local_row = 0u; local_row < TILE_ROWS; local_row++) {
+        uint row = first_row + local_row;
+        float gate = 0.0;
+        float up = 0.0;
+        if (row < INTERMEDIATE_SIZE) {
+            for (uint word = lane; word < HIDDEN_FP8_WORDS; word += 64u) {
+                uint block = word / BLOCK_FP8_WORDS;
+                uint column = word * 4u;
+                float activation_scale = hidden_scales[block];
+                fe4m3vec4 hidden = quantized_hidden[word];
+                gate = fma(
+                    fp8_dot4_acc32(hidden, read_weightx4(expert, row, column), 0.0),
+                    activation_scale * read_scale(expert, row, block),
+                    gate
+                );
+                up = fma(
+                    fp8_dot4_acc32(
+                        hidden,
+                        read_weightx4(expert, INTERMEDIATE_SIZE + row, column),
+                        0.0
+                    ),
+                    activation_scale
+                        * read_scale(expert, INTERMEDIATE_SIZE + row, block),
+                    up
+                );
             }
         }
-        gate_lo = round_bf16(gate_lo);
-        gate_hi = round_bf16(gate_hi);
-        up_lo = round_bf16(up_lo);
-        up_hi = round_bf16(up_hi);
-        float hidden_lo = round_bf16(
-            round_bf16(gate_lo / (1.0 + exp(-gate_lo))) * up_lo
-        );
-        float hidden_hi = round_bf16(
-            round_bf16(gate_hi / (1.0 + exp(-gate_hi))) * up_hi
-        );
-        expert_intermediates.words[route * INTERMEDIATE_WORDS + word] =
-            (f32_to_bf16(hidden_hi) << 16u) | f32_to_bf16(hidden_lo);
+        gate = subgroupAdd(gate);
+        up = subgroupAdd(up);
+        if (gl_SubgroupInvocationID == 0u) {
+            subgroup_gate[local_row][gl_SubgroupID] = gate;
+            subgroup_up[local_row][gl_SubgroupID] = up;
+        }
+    }
+    barrier();
+
+    if (lane < TILE_ROWS) {
+        uint row = first_row + lane;
+        float gate = 0.0;
+        float up = 0.0;
+        for (uint subgroup = 0u; subgroup < gl_NumSubgroups; subgroup++) {
+            gate += subgroup_gate[lane][subgroup];
+            up += subgroup_up[lane][subgroup];
+        }
+        if (row < INTERMEDIATE_SIZE) {
+            gate = round_bf16(gate);
+            up = round_bf16(up);
+            activated_rows[lane] = round_bf16(
+                round_bf16(gate / (1.0 + exp(-gate))) * up
+            );
+        } else {
+            activated_rows[lane] = 0.0;
+        }
+    }
+    barrier();
+
+    if (lane < TILE_ROWS / 2u) {
+        uint row = first_row + lane * 2u;
+        if (row < INTERMEDIATE_SIZE) {
+            uint hi = row + 1u < INTERMEDIATE_SIZE
+                ? f32_to_bf16(activated_rows[lane * 2u + 1u])
+                : 0u;
+            expert_intermediates.words[route * INTERMEDIATE_WORDS + row / 2u] =
+                (hi << 16u) | f32_to_bf16(activated_rows[lane * 2u]);
+        }
     }
 }

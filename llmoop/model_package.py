@@ -43,6 +43,8 @@ CONFIG_PACKAGE_FILE = "config.json"
 SCALAR_BATCH_LANE_TILE_WIDTH = 16
 EXACT_BATCH_LANE_TILE_WIDTHS = (2, 4, 8, SCALAR_BATCH_LANE_TILE_WIDTH)
 CAUSAL_SCAN_LANE_TILE_WIDTH = 64
+FP8_SPARSE_GATE_UP_TILE_ROWS = 32
+FP8_SPARSE_DOWN_TILE_ROWS = 64
 GLSL_VULKAN_DEVICE_EXTENSION_REQUIREMENTS = {
     "GL_EXT_float_e4m3": "VK_EXT_shader_float8",
     "GL_EXT_bfloat16": "VK_KHR_shader_bfloat16",
@@ -2078,12 +2080,28 @@ def workgroup_count_x_for_node(circuit: Json, node: Json, tensor_index: Json) ->
         return int(node["attrs"]["heads"])
     if node["op"] == "sparse_moe_gate_up":
         attrs = node["attrs"]
+        if parameter_dtype_for_node(circuit, node, tensor_index) == "F8_E4M3":
+            return int(attrs["experts_per_token"]) * (
+                (
+                    int(attrs["intermediate_size"])
+                    + FP8_SPARSE_GATE_UP_TILE_ROWS
+                    - 1
+                )
+                // FP8_SPARSE_GATE_UP_TILE_ROWS
+            )
         return int(attrs["experts_per_token"]) * (
             (int(attrs["intermediate_size"]) + 1) // 2
         )
     if node["op"] == "sparse_moe_down":
         attrs = node["attrs"]
-        return int(attrs["experts_per_token"]) * ((int(attrs["hidden_size"]) + 1) // 2)
+        if parameter_dtype_for_node(circuit, node, tensor_index) == "F8_E4M3":
+            return int(attrs["experts_per_token"]) * (
+                (int(attrs["hidden_size"]) + FP8_SPARSE_DOWN_TILE_ROWS - 1)
+                // FP8_SPARSE_DOWN_TILE_ROWS
+            )
+        return int(attrs["experts_per_token"]) * (
+            (int(attrs["hidden_size"]) + 1) // 2
+        )
     if node["op"] in {
         "rms_norm_per_head",
         "rms_norm_per_head_unscaled",
@@ -3573,6 +3591,11 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
                 "INTERMEDIATE_SIZE": str(intermediate_size),
                 "NUM_EXPERTS": str(num_experts),
                 "EXPERTS_PER_TOKEN": str(experts_per_token),
+                "TILE_ROWS": str(
+                    FP8_SPARSE_GATE_UP_TILE_ROWS
+                    if stage == "gate_up"
+                    else FP8_SPARSE_DOWN_TILE_ROWS
+                ),
             },
         )
 
@@ -5740,7 +5763,24 @@ def fp8_moe_block_shape_for_stage(
         raise ModelCompileError(
             f"FP8 sparse MoE {stage} scale shape is invalid: {scale_shape}"
         )
-    return regular_block_shape(expected_weight_shape[1:], scale_shape[1:])
+    block_rows, block_columns = regular_block_shape(
+        expected_weight_shape[1:], scale_shape[1:]
+    )
+    input_width = hidden if stage == "gate_up" else intermediate
+    output_width = intermediate if stage == "gate_up" else hidden
+    if (
+        block_columns != 128
+        or input_width % block_columns != 0
+        or input_width % 4 != 0
+        or output_width % 2 != 0
+    ):
+        raise ModelCompileError(
+            f"native FP8 sparse MoE {stage} requires 128-column blocks, "
+            f"a four-aligned input width, and an even output width; got "
+            f"block {[block_rows, block_columns]} with input {input_width} and "
+            f"output {output_width}"
+        )
+    return block_rows, block_columns
 
 
 def regular_block_shape(
