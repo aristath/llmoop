@@ -42,6 +42,30 @@ pub struct VulkanDistributedDispatchSubmission {
 }
 
 impl VulkanDistributedExecutionPlan {
+    pub fn for_placed_pedals(
+        device_ids: &[String],
+        storage_buffer_offset_alignment: usize,
+    ) -> Result<Self, VulkanDistributedPlanError> {
+        validate_device_pool(device_ids)?;
+        if storage_buffer_offset_alignment == 0
+            || !storage_buffer_offset_alignment.is_power_of_two()
+            || !storage_buffer_offset_alignment.is_multiple_of(BF16_BYTE_COUNT)
+        {
+            return Err(VulkanDistributedPlanError(format!(
+                "distributed storage-buffer offset alignment {storage_buffer_offset_alignment} is invalid"
+            )));
+        }
+        Ok(Self {
+            device_ids: device_ids.to_vec(),
+            storage_buffer_offset_alignment,
+            dispatches: Vec::new(),
+            dispatch_groups: Vec::new(),
+            shared_input_byte_capacity: 0,
+            shared_output_byte_capacity: 0,
+            distributed_parameter_byte_count: 0,
+        })
+    }
+
     pub fn from_prepared_plans(
         prepared_plans: &[(&str, &VulkanPreparedDispatchPlan)],
         tensor_index: &TensorIndex,
@@ -2690,6 +2714,19 @@ mod tests {
         VulkanKernelDescriptorUsage, VulkanKernelScalarBinding, VulkanKernelScalarSource,
         VulkanResolvedDescriptorBinding, VulkanReusableKernelArtifact,
     };
+
+    #[test]
+    fn placed_pedals_do_not_implicitly_shard_their_internal_dispatches() {
+        let device_ids = vec!["gpu0".to_string(), "gpu1".to_string()];
+        let plan = VulkanDistributedExecutionPlan::for_placed_pedals(&device_ids, 256).unwrap();
+
+        assert_eq!(plan.device_ids, device_ids);
+        assert!(plan.dispatches.is_empty());
+        assert!(plan.dispatch_groups.is_empty());
+        assert_eq!(plan.shared_input_byte_capacity, 0);
+        assert_eq!(plan.shared_output_byte_capacity, 0);
+        assert_eq!(plan.distributed_parameter_byte_count, 0);
+    }
 
     #[test]
     fn timeline_dependency_clock_is_monotonic_and_refuses_wraparound() {

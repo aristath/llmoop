@@ -6956,8 +6956,7 @@ fn select_pedal_batch_kernel_artifact_where<'a>(
                 && artifact.node_id == node_id
                 && (artifact.batch_mode == VulkanResidentPedalKernelBatchMode::WeightShared
                     || execution_mode == VulkanPedalBatchExecutionMode::CausalSequence)
-                && (execution_mode == VulkanPedalBatchExecutionMode::CausalSequence
-                    || artifact.exact_primary_equivalence)
+                && artifact.exact_primary_equivalence
                 && compatible(artifact)
         })
         .min_by_key(|artifact| {
@@ -14853,7 +14852,6 @@ impl VulkanResidentInProcessPlacedModelPackage {
         let distributed_loaded_manifest =
             resident_package_loaded_kernel_manifest_for_slice_plans(&device_slice_plans)
                 .map_err(VulkanResidentInProcessPlacedRuntimeError::Package)?;
-        let distributed_artifact_manifest = distributed_loaded_manifest.artifact_manifest();
         let storage_buffer_offset_alignment = device_ids
             .iter()
             .map(|device_id| {
@@ -14863,10 +14861,7 @@ impl VulkanResidentInProcessPlacedModelPackage {
             .into_iter()
             .max()
             .unwrap_or(1);
-        let distributed_execution_plan = VulkanDistributedExecutionPlan::from_prepared_plans(
-            &prepared_plans,
-            &tensor_index,
-            &distributed_artifact_manifest,
+        let distributed_execution_plan = VulkanDistributedExecutionPlan::for_placed_pedals(
             &device_ids,
             storage_buffer_offset_alignment,
         )
@@ -28708,7 +28703,7 @@ mod tests {
     }
 
     #[test]
-    fn speculative_batches_select_the_smallest_exact_covering_tile() {
+    fn pedal_batches_never_select_a_numerically_unproven_kernel() {
         let artifact =
             |lane_tile_width, exact_primary_equivalence| VulkanResidentPedalBatchKernelArtifact {
                 pedal_id: "processor".to_string(),
@@ -28746,7 +28741,8 @@ mod tests {
             6,
         )
         .unwrap();
-        assert_eq!(causal.lane_tile_width, 64);
+        assert_eq!(causal.lane_tile_width, 16);
+        assert!(causal.exact_primary_equivalence);
 
         let heterogeneous = select_pedal_batch_kernel_artifact_where(
             &artifacts,
