@@ -1631,7 +1631,6 @@ def shader_file_for_node(
                     f"fused FFN projection node {node['id']!r} has incompatible "
                     f"parameters {shapes}"
                 )
-            shader_format = "fp8_e4m3"
             block_shape = block_shapes.pop()
         else:
             raise ModelCompileError(
