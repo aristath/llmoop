@@ -1171,6 +1171,7 @@ def _attention_nodes(
         "position_source": "stream_tick",
         "theta": float(numerics["rope_theta"]),
         "rope_type": str(numerics.get("rope_type", "default")),
+        "scaling": numerics.get("rope_scaling"),
         "interleaved": bool(numerics["rope_interleaved"]),
         "rotary_width": int(numerics["rotary_width"]),
         **heads,
