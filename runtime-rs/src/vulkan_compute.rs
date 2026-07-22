@@ -15,8 +15,12 @@ use serde::{Deserialize, Serialize};
 
 const VK_EXT_SHADER_FLOAT8_NAME: &CStr = c"VK_EXT_shader_float8";
 const VK_KHR_SHADER_BFLOAT16_NAME: &CStr = c"VK_KHR_shader_bfloat16";
+const VK_VALVE_SHADER_MIXED_FLOAT_DOT_PRODUCT_NAME: &CStr =
+    c"VK_VALVE_shader_mixed_float_dot_product";
 const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT8_FEATURES_EXT: i32 = 1_000_567_000;
 const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_BFLOAT16_FEATURES_KHR: i32 = 1_000_141_000;
+const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_MIXED_FLOAT_DOT_PRODUCT_FEATURES_VALVE: i32 =
+    1_000_673_000;
 const VK_COMPONENT_TYPE_BFLOAT16_KHR: i32 = 1_000_141_000;
 const VULKAN_SHARED_HOST_MEMORY_HANDLE_TYPE: vk::ExternalMemoryHandleTypeFlags =
     vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT;
@@ -47,6 +51,7 @@ pub enum VulkanShaderFeature {
     ShaderBfloat16Type,
     ShaderBfloat16DotProduct,
     ShaderBfloat16CooperativeMatrix,
+    ShaderMixedFloatDotProductFloat8AccFloat32,
     VulkanMemoryModel,
     VulkanMemoryModelDeviceScope,
     CooperativeMatrix,
@@ -113,6 +118,9 @@ impl VulkanShaderFeature {
             Self::ShaderBfloat16Type => "shader_bfloat16_type",
             Self::ShaderBfloat16DotProduct => "shader_bfloat16_dot_product",
             Self::ShaderBfloat16CooperativeMatrix => "shader_bfloat16_cooperative_matrix",
+            Self::ShaderMixedFloatDotProductFloat8AccFloat32 => {
+                "shader_mixed_float_dot_product_float8_acc_float32"
+            }
             Self::VulkanMemoryModel => "vulkan_memory_model",
             Self::VulkanMemoryModelDeviceScope => "vulkan_memory_model_device_scope",
             Self::CooperativeMatrix => "cooperative_matrix",
@@ -147,6 +155,11 @@ struct VulkanShaderBfloat16Support {
     shader_bfloat16_type: bool,
     shader_bfloat16_dot_product: bool,
     shader_bfloat16_cooperative_matrix: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct VulkanShaderMixedFloatDotProductSupport {
+    shader_float8_acc_float32: bool,
 }
 
 // ash 0.38 is generated from Vulkan 1.3.281 headers, while shader-float8 was
@@ -194,6 +207,34 @@ impl VulkanPhysicalDeviceShaderBfloat16FeaturesKhr {
             shader_bfloat16_type: vk::FALSE,
             shader_bfloat16_dot_product: vk::FALSE,
             shader_bfloat16_cooperative_matrix: vk::FALSE,
+        }
+    }
+}
+
+// VK_VALVE_shader_mixed_float_dot_product is newer than the Vulkan headers
+// used by the latest ash release. Keep the current extension ABI local until
+// upstream bindings include it.
+#[repr(C)]
+struct VulkanPhysicalDeviceShaderMixedFloatDotProductFeaturesValve {
+    s_type: vk::StructureType,
+    p_next: *mut c_void,
+    shader_float16_acc_float32: vk::Bool32,
+    shader_float16_acc_float16: vk::Bool32,
+    shader_bfloat16_acc: vk::Bool32,
+    shader_float8_acc_float32: vk::Bool32,
+}
+
+impl VulkanPhysicalDeviceShaderMixedFloatDotProductFeaturesValve {
+    fn disabled() -> Self {
+        Self {
+            s_type: vk::StructureType::from_raw(
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_MIXED_FLOAT_DOT_PRODUCT_FEATURES_VALVE,
+            ),
+            p_next: std::ptr::null_mut(),
+            shader_float16_acc_float32: vk::FALSE,
+            shader_float16_acc_float16: vk::FALSE,
+            shader_bfloat16_acc: vk::FALSE,
+            shader_float8_acc_float32: vk::FALSE,
         }
     }
 }
@@ -1418,6 +1459,16 @@ impl VulkanComputeDeviceCatalog {
             } else {
                 VulkanShaderBfloat16Support::default()
             };
+            let mixed_float_dot_product_extension_supported = physical_device_supports_extension(
+                instance,
+                physical_device,
+                VK_VALVE_SHADER_MIXED_FLOAT_DOT_PRODUCT_NAME,
+            )?;
+            let mixed_float_dot_product_support = if mixed_float_dot_product_extension_supported {
+                physical_device_shader_mixed_float_dot_product_support(instance, physical_device)
+            } else {
+                VulkanShaderMixedFloatDotProductSupport::default()
+            };
             let cooperative_bfloat16_features_supported = cooperative_matrix_supported
                 && shader_bfloat16_support.shader_bfloat16_type
                 && shader_bfloat16_support.shader_bfloat16_cooperative_matrix;
@@ -1485,6 +1536,10 @@ impl VulkanComputeDeviceCatalog {
                 enabled_shader_features
                     .insert(VulkanShaderFeature::ShaderBfloat16CooperativeMatrix);
             }
+            if mixed_float_dot_product_support.shader_float8_acc_float32 {
+                enabled_shader_features
+                    .insert(VulkanShaderFeature::ShaderMixedFloatDotProductFloat8AccFloat32);
+            }
             let enabled_core_features = vk::PhysicalDeviceFeatures {
                 shader_float64: bool32(
                     enabled_shader_features.contains(&VulkanShaderFeature::ShaderFloat64),
@@ -1544,6 +1599,8 @@ impl VulkanComputeDeviceCatalog {
                 VulkanPhysicalDeviceShaderFloat8FeaturesExt::disabled();
             let mut shader_bfloat16_features =
                 VulkanPhysicalDeviceShaderBfloat16FeaturesKhr::disabled();
+            let mut mixed_float_dot_product_features =
+                VulkanPhysicalDeviceShaderMixedFloatDotProductFeaturesValve::disabled();
             let mut cooperative_matrix_features =
                 vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default();
             let mut timeline_semaphore_features =
@@ -1598,6 +1655,15 @@ impl VulkanComputeDeviceCatalog {
                 enabled_device_extensions
                     .insert(VK_KHR_SHADER_BFLOAT16_NAME.to_string_lossy().into_owned());
             }
+            if mixed_float_dot_product_support.shader_float8_acc_float32 {
+                mixed_float_dot_product_features.shader_float8_acc_float32 = vk::TRUE;
+                extension_names.push(VK_VALVE_SHADER_MIXED_FLOAT_DOT_PRODUCT_NAME.as_ptr());
+                enabled_device_extensions.insert(
+                    VK_VALVE_SHADER_MIXED_FLOAT_DOT_PRODUCT_NAME
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+            }
             if shared_host_memory_alignment.is_some() {
                 extension_names.push(ash::ext::external_memory_host::NAME.as_ptr());
                 enabled_device_extensions.insert(
@@ -1626,6 +1692,10 @@ impl VulkanComputeDeviceCatalog {
             {
                 shader_bfloat16_features.p_next = device_info.p_next.cast_mut();
                 device_info.p_next = std::ptr::from_ref(&shader_bfloat16_features).cast();
+            }
+            if mixed_float_dot_product_support.shader_float8_acc_float32 {
+                mixed_float_dot_product_features.p_next = device_info.p_next.cast_mut();
+                device_info.p_next = std::ptr::from_ref(&mixed_float_dot_product_features).cast();
             }
             if cooperative_matrix_supported {
                 cooperative_matrix_features.p_next = device_info.p_next.cast_mut();
@@ -3876,6 +3946,7 @@ fn vulkan_shader_feature_for_spirv_capability(capability: u32) -> Option<VulkanS
         5116 => VulkanShaderFeature::ShaderBfloat16Type,
         5117 => VulkanShaderFeature::ShaderBfloat16DotProduct,
         5118 => VulkanShaderFeature::ShaderBfloat16CooperativeMatrix,
+        6915 => VulkanShaderFeature::ShaderMixedFloatDotProductFloat8AccFloat32,
         5345 => VulkanShaderFeature::VulkanMemoryModel,
         5346 => VulkanShaderFeature::VulkanMemoryModelDeviceScope,
         6022 => VulkanShaderFeature::CooperativeMatrix,
@@ -4131,6 +4202,24 @@ fn physical_device_shader_float8_support(
         shader_float8: shader_float8.shader_float8 == vk::TRUE,
         shader_float8_cooperative_matrix: shader_float8.shader_float8_cooperative_matrix
             == vk::TRUE,
+    }
+}
+
+fn physical_device_shader_mixed_float_dot_product_support(
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+) -> VulkanShaderMixedFloatDotProductSupport {
+    let mut mixed_float_dot_product =
+        VulkanPhysicalDeviceShaderMixedFloatDotProductFeaturesValve::disabled();
+    let mut features = vk::PhysicalDeviceFeatures2 {
+        p_next: std::ptr::from_mut(&mut mixed_float_dot_product).cast(),
+        ..Default::default()
+    };
+    unsafe {
+        instance.get_physical_device_features2(physical_device, &mut features);
+    }
+    VulkanShaderMixedFloatDotProductSupport {
+        shader_float8_acc_float32: mixed_float_dot_product.shader_float8_acc_float32 == vk::TRUE,
     }
 }
 
@@ -4710,6 +4799,21 @@ mod tests {
                 VulkanShaderFeature::ShaderBfloat16CooperativeMatrix,
                 VulkanShaderFeature::VulkanMemoryModel,
                 VulkanShaderFeature::CooperativeMatrix,
+            ])
+        );
+    }
+
+    #[test]
+    fn spirv_contract_extracts_native_fp8_dot_product_feature() {
+        let words = spirv_test_module(&[1, 4212, 6915], 1);
+
+        let requirements = vulkan_spirv_requirements(&words).unwrap();
+
+        assert_eq!(
+            requirements.shader_features,
+            BTreeSet::from([
+                VulkanShaderFeature::ShaderFloat8,
+                VulkanShaderFeature::ShaderMixedFloatDotProductFloat8AccFloat32,
             ])
         );
     }

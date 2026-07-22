@@ -41,7 +41,9 @@ def write_spirv_module(path: Path, capabilities: list[int]) -> None:
 
 def test_compiler_derives_vulkan_features_from_compiled_spirv(tmp_path: Path) -> None:
     shader = tmp_path / "cooperative.spv"
-    write_spirv_module(shader, [1, 9, 22, 61, 63, 4433, 5116, 5118, 5345, 6022])
+    write_spirv_module(
+        shader, [1, 9, 22, 61, 63, 4433, 5116, 5118, 5345, 6022, 6915]
+    )
 
     assert spirv_capabilities(shader) == {
         1,
@@ -54,6 +56,7 @@ def test_compiler_derives_vulkan_features_from_compiled_spirv(tmp_path: Path) ->
         5118,
         5345,
         6022,
+        6915,
     }
     assert required_vulkan_features(tmp_path, {shader.name}) == [
         "cooperative_matrix",
@@ -61,12 +64,34 @@ def test_compiler_derives_vulkan_features_from_compiled_spirv(tmp_path: Path) ->
         "shader_bfloat16_type",
         "shader_float16",
         "shader_int16",
+        "shader_mixed_float_dot_product_float8_acc_float32",
         "storage_buffer16_bit_access",
         "vulkan_memory_model",
     ]
     assert required_vulkan_subgroup_operations(tmp_path, {shader.name}) == [
         "arithmetic",
         "basic",
+    ]
+
+
+def test_compiler_derives_vendor_device_extension_from_spirv_intrinsic(
+    tmp_path: Path,
+) -> None:
+    shader = tmp_path / "mixed_fp8.comp"
+    shader.write_text(
+        '''#version 460
+#extension GL_EXT_spirv_intrinsics : require
+spirv_instruction(
+    extensions = ["SPV_VALVE_mixed_float_dot_product"],
+    capabilities = [6915],
+    id = 6918
+)
+float fp8_dot();
+'''
+    )
+
+    assert required_vulkan_device_extensions(tmp_path, {shader.name}) == [
+        "VK_VALVE_shader_mixed_float_dot_product"
     ]
 
 

@@ -44,6 +44,9 @@ GLSL_VULKAN_DEVICE_EXTENSION_REQUIREMENTS = {
     "GL_EXT_bfloat16": "VK_KHR_shader_bfloat16",
     "GL_KHR_cooperative_matrix": "VK_KHR_cooperative_matrix",
 }
+SPIRV_VULKAN_DEVICE_EXTENSION_REQUIREMENTS = {
+    "SPV_VALVE_mixed_float_dot_product": "VK_VALVE_shader_mixed_float_dot_product",
+}
 SPIRV_MAGIC = 0x07230203
 SPIRV_OP_CAPABILITY = 17
 SPIRV_CAPABILITY_VULKAN_FEATURE_REQUIREMENTS = {
@@ -64,6 +67,7 @@ SPIRV_CAPABILITY_VULKAN_FEATURE_REQUIREMENTS = {
     5116: "shader_bfloat16_type",
     5117: "shader_bfloat16_dot_product",
     5118: "shader_bfloat16_cooperative_matrix",
+    6915: "shader_mixed_float_dot_product_float8_acc_float32",
     5345: "vulkan_memory_model",
     5346: "vulkan_memory_model_device_scope",
     6022: "cooperative_matrix",
@@ -2162,11 +2166,18 @@ def required_vulkan_device_extensions(
     shader_dir: Path, shader_files: set[str]
 ) -> list[str]:
     required_glsl_extensions = set()
+    required_spirv_extensions = set()
     for shader_file in shader_files:
         source = (shader_dir / shader_file).read_text()
         required_glsl_extensions.update(
             re.findall(
                 r"^\s*#extension\s+(\S+)\s*:\s*require\s*$", source, re.MULTILINE
+            )
+        )
+        required_spirv_extensions.update(
+            re.findall(
+                r'"(SPV_[A-Za-z0-9_]+)"',
+                source,
             )
         )
     return sorted(
@@ -2176,6 +2187,13 @@ def required_vulkan_device_extensions(
                 GLSL_VULKAN_DEVICE_EXTENSION_REQUIREMENTS.items()
             )
             if glsl_extension in required_glsl_extensions
+        }
+        | {
+            vulkan_extension
+            for spirv_extension, vulkan_extension in (
+                SPIRV_VULKAN_DEVICE_EXTENSION_REQUIREMENTS.items()
+            )
+            if spirv_extension in required_spirv_extensions
         }
     )
 
