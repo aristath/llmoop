@@ -45,6 +45,9 @@ EXACT_BATCH_LANE_TILE_WIDTHS = (2, 4, 8, SCALAR_BATCH_LANE_TILE_WIDTH)
 CAUSAL_SCAN_LANE_TILE_WIDTH = 64
 FP8_SPARSE_GATE_UP_TILE_ROWS = 32
 FP8_SPARSE_DOWN_TILE_ROWS = 64
+FP8_LINEAR_TILE_ROWS = (2, 4, 8, 16, 32, 64)
+FP8_LINEAR_MIN_WORKGROUPS = 128
+FP8_FUSED_FFN_TILE_ROWS = 32
 GLSL_VULKAN_DEVICE_EXTENSION_REQUIREMENTS = {
     "GL_EXT_float_e4m3": "VK_EXT_shader_float8",
     "GL_EXT_bfloat16": "VK_KHR_shader_bfloat16",
@@ -2059,9 +2062,19 @@ def workgroup_count_x_for_node(circuit: Json, node: Json, tensor_index: Json) ->
         out_features, _ = parameter_shape_for_id(
             circuit, node["params"][0], tensor_index
         )
+        if (
+            parameter_dtype_for_id(circuit, node["params"][0], tensor_index)
+            == "F8_E4M3"
+        ):
+            return (
+                int(out_features) + FP8_FUSED_FFN_TILE_ROWS - 1
+            ) // FP8_FUSED_FFN_TILE_ROWS
         return (int(out_features) + 1) // 2
     if node["op"] in {"linear", "linear_residual", "linear_split_3way"}:
         out_features, _ = parameter_shape_for_node(circuit, node, tensor_index)
+        if parameter_dtype_for_node(circuit, node, tensor_index) == "F8_E4M3":
+            tile_rows = fp8_linear_tile_rows(int(out_features))
+            return (int(out_features) + tile_rows - 1) // tile_rows
         # One workgroup collaboratively computes and packs two BF16 output rows.
         return (int(out_features) + 1) // 2
     if node["op"] in {
@@ -2129,6 +2142,15 @@ def local_size_x_for_node(node: Json) -> int:
     if node["op"] == "rg_lru_step":
         return int(node["attrs"]["block_width"])
     return 64
+
+
+def fp8_linear_tile_rows(output_size: int) -> int:
+    if output_size <= 0:
+        raise ModelCompileError("FP8 linear output width must be positive")
+    for tile_rows in reversed(FP8_LINEAR_TILE_ROWS):
+        if (output_size + tile_rows - 1) // tile_rows >= FP8_LINEAR_MIN_WORKGROUPS:
+            return tile_rows
+    return FP8_LINEAR_TILE_ROWS[0]
 
 
 def attention_workgroup_shape(head_width: int) -> tuple[int, int]:
@@ -2825,6 +2847,40 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
                 "BLOCK_COLUMNS": str(block_columns),
                 "INPUT_SIZE": str(input_size),
                 "OUTPUT_SIZE": str(output_size),
+                "OUTPUT_TILE_ROWS": str(FP8_FUSED_FFN_TILE_ROWS),
+            },
+        )
+
+    native_fp8_linear = re.fullmatch(
+        r"(linear|linear_bias|linear_residual)_fp8_e4m3_"
+        r"b(\d+)x(\d+)_(\d+)x(\d+)\.comp",
+        shader_file,
+    )
+    if native_fp8_linear is not None:
+        operation = native_fp8_linear.group(1)
+        block_rows, block_columns, input_size, output_size = map(
+            int, native_fp8_linear.groups()[1:]
+        )
+        if (
+            block_rows <= 0
+            or block_columns != 128
+            or input_size <= 0
+            or input_size % block_columns != 0
+            or output_size <= 0
+            or output_size % 2 != 0
+        ):
+            raise ModelCompileError(
+                f"invalid native FP8 linear shader shape {shader_file!r}"
+            )
+        return render_shader_template(
+            source_dir,
+            f"{operation}_fp8_e4m3.comp.template",
+            {
+                "BLOCK_ROWS": str(block_rows),
+                "BLOCK_COLUMNS": str(block_columns),
+                "INPUT_SIZE": str(input_size),
+                "OUTPUT_SIZE": str(output_size),
+                "OUTPUT_TILE_ROWS": str(fp8_linear_tile_rows(output_size)),
             },
         )
 
@@ -2875,6 +2931,41 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
             },
         )
 
+    native_fp8_batch_linear = re.fullmatch(
+        r"(linear|linear_residual)_batch(\d+)_fp8_e4m3_"
+        r"b(\d+)x(\d+)_(\d+)x(\d+)\.comp",
+        shader_file,
+    )
+    if native_fp8_batch_linear is not None:
+        operation = native_fp8_batch_linear.group(1)
+        batch_tile_width, block_rows, block_columns, input_size, output_size = map(
+            int, native_fp8_batch_linear.groups()[1:]
+        )
+        if (
+            batch_tile_width <= 0
+            or block_rows <= 0
+            or block_columns != 128
+            or input_size <= 0
+            or input_size % block_columns != 0
+            or output_size <= 0
+            or output_size % 2 != 0
+        ):
+            raise ModelCompileError(
+                f"invalid native batched FP8 linear shader shape {shader_file!r}"
+            )
+        return render_shader_template(
+            source_dir,
+            f"{operation}_batch_fp8_e4m3.comp.template",
+            {
+                "BATCH_TILE_WIDTH": str(batch_tile_width),
+                "BLOCK_ROWS": str(block_rows),
+                "BLOCK_COLUMNS": str(block_columns),
+                "INPUT_SIZE": str(input_size),
+                "OUTPUT_SIZE": str(output_size),
+                "OUTPUT_TILE_ROWS": str(fp8_linear_tile_rows(output_size)),
+            },
+        )
+
     shaped_templates = (
         (
             r"sigmoid_multiply_batch(\d+)_bf16\.comp",
@@ -2885,28 +2976,6 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
             r"rms_norm_batch(\d+)_bf16_h(\d+)_eps([0-9eE+.-]+)_offset([0-9eE+.-]+)\.comp",
             "rms_norm_batch_bf16.comp.template",
             ("BATCH_TILE_WIDTH", "HIDDEN_SIZE", "NORM_EPS", "WEIGHT_OFFSET"),
-        ),
-        (
-            r"linear_batch(\d+)_fp8_e4m3_b(\d+)x(\d+)_(\d+)x(\d+)\.comp",
-            "linear_batch_fp8_e4m3.comp.template",
-            (
-                "BATCH_TILE_WIDTH",
-                "BLOCK_ROWS",
-                "BLOCK_COLUMNS",
-                "INPUT_SIZE",
-                "OUTPUT_SIZE",
-            ),
-        ),
-        (
-            r"linear_residual_batch(\d+)_fp8_e4m3_b(\d+)x(\d+)_(\d+)x(\d+)\.comp",
-            "linear_residual_batch_fp8_e4m3.comp.template",
-            (
-                "BATCH_TILE_WIDTH",
-                "BLOCK_ROWS",
-                "BLOCK_COLUMNS",
-                "INPUT_SIZE",
-                "OUTPUT_SIZE",
-            ),
         ),
         (
             r"silu_multiply_bf16_(\d+)\.comp",
@@ -2942,21 +3011,6 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
             r"linear_residual_int4_gptq_g(\d+)_(\d+)x(\d+)\.comp",
             "linear_residual_int4_gptq.comp.template",
             ("GROUP_SIZE", "INPUT_SIZE", "OUTPUT_SIZE"),
-        ),
-        (
-            r"linear_fp8_e4m3_b(\d+)x(\d+)_(\d+)x(\d+)\.comp",
-            "linear_fp8_e4m3.comp.template",
-            ("BLOCK_ROWS", "BLOCK_COLUMNS", "INPUT_SIZE", "OUTPUT_SIZE"),
-        ),
-        (
-            r"linear_bias_fp8_e4m3_b(\d+)x(\d+)_(\d+)x(\d+)\.comp",
-            "linear_bias_fp8_e4m3.comp.template",
-            ("BLOCK_ROWS", "BLOCK_COLUMNS", "INPUT_SIZE", "OUTPUT_SIZE"),
-        ),
-        (
-            r"linear_residual_fp8_e4m3_b(\d+)x(\d+)_(\d+)x(\d+)\.comp",
-            "linear_residual_fp8_e4m3.comp.template",
-            ("BLOCK_ROWS", "BLOCK_COLUMNS", "INPUT_SIZE", "OUTPUT_SIZE"),
         ),
         (
             r"sigmoid_scalar_multiply_bf16_(\d+)\.comp",
@@ -5710,6 +5764,18 @@ def fp8_block_shape_for_node(
         raise ModelCompileError(
             f"FP8 linear node {node['id']!r} scale shape {scale_shape} is not "
             f"a regular block grid for weight shape {[out_features, in_features]}"
+        )
+    if (
+        block_columns != 128
+        or in_features % block_columns != 0
+        or in_features % 4 != 0
+        or out_features % 2 != 0
+    ):
+        raise ModelCompileError(
+            f"native FP8 linear node {node['id']!r} requires 128-column blocks, "
+            f"a four-aligned input width, and an even output width; got "
+            f"block {[block_rows, block_columns]} for "
+            f"{[out_features, in_features]}"
         )
     return block_rows, block_columns
 

@@ -449,9 +449,13 @@ def test_compiler_renders_weight_shared_pedal_batch_shaders(tmp_path: Path) -> N
         if "fp8_e4m3" in shader_file:
             assert "#extension GL_EXT_float_e4m3 : require" in source
             assert "uintBitsToFloate4m3EXT" in source
+            assert "SPV_VALVE_mixed_float_dot_product" in source
+            assert "fp8_dot4_acc32" in source
+            assert "shared fe4m3vec4 quantized_input" in source
         assert "{{" not in source
     assert required_vulkan_device_extensions(tmp_path, shader_files) == [
-        "VK_EXT_shader_float8"
+        "VK_EXT_shader_float8",
+        "VK_VALVE_shader_mixed_float_dot_product",
     ]
 
 
@@ -789,7 +793,10 @@ def test_compiler_selects_and_renders_fused_block_scaled_fp8_ffn_shader(
     assert "binding = 3) readonly buffer GateScaleInv" in source
     assert "binding = 5) readonly buffer UpScaleInv" in source
     assert "const uint BLOCK_ROWS = 128u;" in source
-    assert "for (uint column = lane * 4u;" in source
+    assert "const uint OUTPUT_TILE_ROWS = 32u;" in source
+    assert "shared fe4m3vec4 quantized_input" in source
+    assert "fp8_dot4_acc32" in source
+    assert "for (uint word = lane;" in source
     assert "rounded_silu" in source
     assert "{{" not in source
 
@@ -949,14 +956,25 @@ def test_compiler_renders_native_block_scaled_fp8_linear_shaders(
 
     copy_shader_templates(shader_source_dir, tmp_path, shader_files)
 
+    expected_tile_rows = {
+        "linear_fp8_e4m3_b128x128_5120x17408.comp": 64,
+        "linear_bias_fp8_e4m3_b128x128_5120x17408.comp": 64,
+        "linear_residual_fp8_e4m3_b128x128_17408x5120.comp": 32,
+    }
     for shader_file in shader_files:
         shader = (tmp_path / shader_file).read_text()
         assert "const uint BLOCK_ROWS = 128u;" in shader
         assert "const uint BLOCK_COLUMNS = 128u;" in shader
-        assert "fp8_e4m3_to_f32" in shader
-        assert "fp8_e4m3x4_to_f32" in shader
-        assert "for (uint column = lane * 4u;" in shader
-        assert "gl_NumSubgroups == 1u" in shader
+        assert (
+            f"const uint OUTPUT_TILE_ROWS = {expected_tile_rows[shader_file]}u;"
+            in shader
+        )
+        assert "#extension GL_EXT_spirv_intrinsics : require" in shader
+        assert "SPV_VALVE_mixed_float_dot_product" in shader
+        assert "fp8_dot4_acc32" in shader
+        assert "shared fe4m3vec4 quantized_input" in shader
+        assert "subgroupClusteredMax" in shader
+        assert "for (uint word = lane;" in shader
         assert "WeightScaleInv" in shader
         assert "{{" not in shader
     assert (
@@ -1116,6 +1134,41 @@ def test_compiler_parallelizes_only_selected_sparse_expert_routes() -> None:
             "workgroup_count_x": 128,
         }
     ]
+
+
+def test_compiler_tiles_dense_fp8_dispatch_without_changing_bf16_dispatch() -> None:
+    circuit = {
+        "parameters": {
+            "refs": {
+                "weight": {"tensor": "weight"},
+                "gate_weight": {"tensor": "gate_weight"},
+                "up_weight": {"tensor": "up_weight"},
+            }
+        }
+    }
+    fp8_tensor_index = {
+        "tensors": {
+            "weight": {"dtype": "F8_E4M3", "shape": [17408, 5120]},
+            "gate_weight": {"dtype": "F8_E4M3", "shape": [17408, 5120]},
+            "up_weight": {"dtype": "F8_E4M3", "shape": [17408, 5120]},
+        }
+    }
+    bf16_tensor_index = {
+        "tensors": {
+            tensor_name: {"dtype": "BF16", "shape": [17408, 5120]}
+            for tensor_name in ("weight", "gate_weight", "up_weight")
+        }
+    }
+    linear = {"op": "linear", "params": ["weight"]}
+    fused_ffn = {
+        "op": "parallel_linear_silu_multiply",
+        "params": ["gate_weight", "up_weight"],
+    }
+
+    assert workgroup_count_x_for_node(circuit, linear, fp8_tensor_index) == 272
+    assert workgroup_count_x_for_node(circuit, fused_ffn, fp8_tensor_index) == 544
+    assert workgroup_count_x_for_node(circuit, linear, bf16_tensor_index) == 8704
+    assert workgroup_count_x_for_node(circuit, fused_ffn, bf16_tensor_index) == 8704
 
 
 def test_compiler_rejects_fp8_sparse_expert_geometry_unsafe_for_native_dot() -> None:

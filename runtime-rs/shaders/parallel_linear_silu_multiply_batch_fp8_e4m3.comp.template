@@ -2,8 +2,17 @@
 
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_clustered : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
 #extension GL_EXT_float_e4m3 : require
+#extension GL_EXT_spirv_intrinsics : require
+
+spirv_instruction(
+    extensions = ["SPV_VALVE_mixed_float_dot_product"],
+    capabilities = [6915],
+    id = 6918
+)
+float fp8_dot4_acc32(fe4m3vec4 a, fe4m3vec4 b, float accumulator);
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
@@ -21,37 +30,21 @@ const uint BLOCK_ROWS = {{BLOCK_ROWS}}u;
 const uint BLOCK_COLUMNS = {{BLOCK_COLUMNS}}u;
 const uint INPUT_SIZE = {{INPUT_SIZE}}u;
 const uint OUTPUT_SIZE = {{OUTPUT_SIZE}}u;
-const uint INPUT_WORDS = (INPUT_SIZE + 1u) / 2u;
-const uint OUTPUT_WORDS = (OUTPUT_SIZE + 1u) / 2u;
-const uint SCALE_COLUMNS = (INPUT_SIZE + BLOCK_COLUMNS - 1u) / BLOCK_COLUMNS;
+const uint OUTPUT_TILE_ROWS = {{OUTPUT_TILE_ROWS}}u;
+const uint INPUT_WORDS = INPUT_SIZE / 2u;
+const uint OUTPUT_WORDS = OUTPUT_SIZE / 2u;
+const uint INPUT_FP8_WORDS = INPUT_SIZE / 4u;
+const uint INPUT_BLOCKS = INPUT_SIZE / BLOCK_COLUMNS;
+const uint BLOCK_FP8_WORDS = BLOCK_COLUMNS / 4u;
+const uint SCALE_COLUMNS = INPUT_BLOCKS;
 
-shared float subgroup_gate_lo[BATCH_TILE_WIDTH][64];
-shared float subgroup_gate_hi[BATCH_TILE_WIDTH][64];
-shared float subgroup_up_lo[BATCH_TILE_WIDTH][64];
-shared float subgroup_up_hi[BATCH_TILE_WIDTH][64];
+shared fe4m3vec4 quantized_input[INPUT_FP8_WORDS];
+shared float input_scales[INPUT_BLOCKS];
+shared float subgroup_gate[OUTPUT_TILE_ROWS][64];
+shared float subgroup_up[OUTPUT_TILE_ROWS][64];
+shared float activated_rows[OUTPUT_TILE_ROWS];
 
 float bf16_to_f32(uint value) { return uintBitsToFloat((value & 0xffffu) << 16); }
-
-vec4 read_input_bf16x4(uint batch_index, uint column) {
-    uint offset = batch_index * INPUT_WORDS + (column >> 1u);
-    uint lo = input_frames.words[offset];
-    uint hi = input_frames.words[offset + 1u];
-    return vec4(bf16_to_f32(lo), bf16_to_f32(lo >> 16u), bf16_to_f32(hi), bf16_to_f32(hi >> 16u));
-}
-
-float read_scale_bf16(uint packed_index, bool gate) {
-    uint pair = gate ? gate_scale_inv.words[packed_index >> 1u] : up_scale_inv.words[packed_index >> 1u];
-    return bf16_to_f32(pair >> ((packed_index & 1u) * 16u));
-}
-
-float fp8_e4m3_to_f32(uint value) {
-    return float(uintBitsToFloate4m3EXT(uint8_t(value & 0xffu)));
-}
-
-vec4 fp8_e4m3x4_to_f32(uint packed) {
-    return vec4(fp8_e4m3_to_f32(packed), fp8_e4m3_to_f32(packed >> 8u),
-        fp8_e4m3_to_f32(packed >> 16u), fp8_e4m3_to_f32(packed >> 24u));
-}
 
 uint f32_to_bf16(float value) {
     uint bits = floatBitsToUint(value);
@@ -60,96 +53,149 @@ uint f32_to_bf16(float value) {
 }
 
 float round_bf16(float value) { return bf16_to_f32(f32_to_bf16(value)); }
-float rounded_silu(float value) { return round_bf16(value / (1.0 + exp(-value))); }
 
-void write_result(uint batch_index, uint word_index, uint hi_row,
-        float gate_lo, float gate_hi, float up_lo, float up_hi) {
-    uint lo = f32_to_bf16(rounded_silu(round_bf16(gate_lo)) * round_bf16(up_lo));
-    uint hi = hi_row < OUTPUT_SIZE
-        ? f32_to_bf16(rounded_silu(round_bf16(gate_hi)) * round_bf16(up_hi)) : 0u;
-    output_frames.words[batch_index * OUTPUT_WORDS + word_index] = (hi << 16u) | lo;
+float rounded_silu(float value) {
+    return round_bf16(value / (1.0 + exp(-value)));
+}
+
+float read_bf16_word(uint packed, uint index) {
+    return bf16_to_f32(packed >> ((index & 1u) * 16u));
+}
+
+vec4 read_inputx4(uint batch_index, uint column) {
+    uint offset = batch_index * INPUT_WORDS + (column >> 1u);
+    uint lo = input_frames.words[offset];
+    uint hi = input_frames.words[offset + 1u];
+    return vec4(
+        bf16_to_f32(lo),
+        bf16_to_f32(lo >> 16u),
+        bf16_to_f32(hi),
+        bf16_to_f32(hi >> 16u)
+    );
+}
+
+float read_gate_scale(uint row, uint block) {
+    uint index = (row / BLOCK_ROWS) * SCALE_COLUMNS + block;
+    return read_bf16_word(gate_scale_inv.words[index >> 1u], index);
+}
+
+float read_up_scale(uint row, uint block) {
+    uint index = (row / BLOCK_ROWS) * SCALE_COLUMNS + block;
+    return read_bf16_word(up_scale_inv.words[index >> 1u], index);
+}
+
+fe4m3vec4 read_gate_weightx4(uint row, uint column) {
+    uint index = row * INPUT_SIZE + column;
+    uint packed = gate_weight.words[index >> 2u];
+    return uintBitsToFloate4m3EXT(u8vec4(
+        uint8_t(packed),
+        uint8_t(packed >> 8u),
+        uint8_t(packed >> 16u),
+        uint8_t(packed >> 24u)
+    ));
+}
+
+fe4m3vec4 read_up_weightx4(uint row, uint column) {
+    uint index = row * INPUT_SIZE + column;
+    uint packed = up_weight.words[index >> 2u];
+    return uintBitsToFloate4m3EXT(u8vec4(
+        uint8_t(packed),
+        uint8_t(packed >> 8u),
+        uint8_t(packed >> 16u),
+        uint8_t(packed >> 24u)
+    ));
 }
 
 void main() {
-    uint word_index = gl_WorkGroupID.x;
-    uint batch_start = gl_WorkGroupID.y * BATCH_TILE_WIDTH;
     uint lane = gl_LocalInvocationID.x;
-    uint lo_row = word_index * 2u;
-    uint hi_row = lo_row + 1u;
-    float gate_lo[BATCH_TILE_WIDTH];
-    float gate_hi[BATCH_TILE_WIDTH];
-    float up_lo[BATCH_TILE_WIDTH];
-    float up_hi[BATCH_TILE_WIDTH];
-    for (uint batch_lane = 0u; batch_lane < BATCH_TILE_WIDTH; batch_lane++) {
-        gate_lo[batch_lane] = 0.0; gate_hi[batch_lane] = 0.0;
-        up_lo[batch_lane] = 0.0; up_hi[batch_lane] = 0.0;
-    }
+    uint cluster = lane >> 5u;
+    uint cluster_lane = lane & 31u;
+    uint first_row = gl_WorkGroupID.x * OUTPUT_TILE_ROWS;
+    uint batch_start = gl_WorkGroupID.y * BATCH_TILE_WIDTH;
 
-    if (word_index < OUTPUT_WORDS) {
-        for (uint column = lane * 4u; column < INPUT_SIZE; column += 256u) {
-            uint lo_weight_index = lo_row * INPUT_SIZE + column;
-            uint scale_index = (lo_row / BLOCK_ROWS) * SCALE_COLUMNS + column / BLOCK_COLUMNS;
-            float gate_scale = read_scale_bf16(scale_index, true);
-            float up_scale = read_scale_bf16(scale_index, false);
-            vec4 gate_lo_weight = fp8_e4m3x4_to_f32(gate_weight.words[lo_weight_index >> 2u]);
-            vec4 up_lo_weight = fp8_e4m3x4_to_f32(up_weight.words[lo_weight_index >> 2u]);
-            vec4 gate_hi_weight = vec4(0.0);
-            vec4 up_hi_weight = vec4(0.0);
-            if (hi_row < OUTPUT_SIZE) {
-                uint hi_weight_index = hi_row * INPUT_SIZE + column;
-                gate_hi_weight = fp8_e4m3x4_to_f32(gate_weight.words[hi_weight_index >> 2u]);
-                up_hi_weight = fp8_e4m3x4_to_f32(up_weight.words[hi_weight_index >> 2u]);
-            }
-            for (uint batch_lane = 0u; batch_lane < BATCH_TILE_WIDTH; batch_lane++) {
-                uint batch_index = batch_start + batch_lane;
-                if (batch_index >= batch_control.batch_width) continue;
-                vec4 input_value = read_input_bf16x4(batch_index, column);
-                gate_lo[batch_lane] = fma(dot(input_value, gate_lo_weight), gate_scale, gate_lo[batch_lane]);
-                gate_hi[batch_lane] = fma(dot(input_value, gate_hi_weight), gate_scale, gate_hi[batch_lane]);
-                up_lo[batch_lane] = fma(dot(input_value, up_lo_weight), up_scale, up_lo[batch_lane]);
-                up_hi[batch_lane] = fma(dot(input_value, up_hi_weight), up_scale, up_hi[batch_lane]);
-            }
+    for (uint batch_lane = 0u; batch_lane < BATCH_TILE_WIDTH; batch_lane++) {
+        uint batch_index = batch_start + batch_lane;
+        if (batch_index >= batch_control.batch_width) {
+            break;
         }
-    }
+        for (uint block = cluster; block < INPUT_BLOCKS; block += 2u) {
+            uint word = block * BLOCK_FP8_WORDS + cluster_lane;
+            vec4 input_value = read_inputx4(batch_index, word * 4u);
+            float lane_max = max(
+                max(abs(input_value.x), abs(input_value.y)),
+                max(abs(input_value.z), abs(input_value.w))
+            );
+            float block_max = subgroupClusteredMax(lane_max, 32u);
+            float scale = block_max > 0.0 ? block_max / 448.0 : 1.0;
+            if (cluster_lane == 0u) {
+                input_scales[block] = scale;
+            }
+            quantized_input[word] = fe4m3vec4(input_value / scale);
+        }
+        barrier();
 
-    for (uint batch_lane = 0u; batch_lane < BATCH_TILE_WIDTH; batch_lane++) {
-        gate_lo[batch_lane] = subgroupAdd(gate_lo[batch_lane]);
-        gate_hi[batch_lane] = subgroupAdd(gate_hi[batch_lane]);
-        up_lo[batch_lane] = subgroupAdd(up_lo[batch_lane]);
-        up_hi[batch_lane] = subgroupAdd(up_hi[batch_lane]);
-    }
-    if (gl_NumSubgroups == 1u) {
-        if (gl_SubgroupInvocationID == 0u && word_index < OUTPUT_WORDS) {
-            for (uint batch_lane = 0u; batch_lane < BATCH_TILE_WIDTH; batch_lane++) {
-                uint batch_index = batch_start + batch_lane;
-                if (batch_index < batch_control.batch_width) {
-                    write_result(batch_index, word_index, hi_row, gate_lo[batch_lane], gate_hi[batch_lane], up_lo[batch_lane], up_hi[batch_lane]);
+        for (uint local_row = 0u; local_row < OUTPUT_TILE_ROWS; local_row++) {
+            uint row = first_row + local_row;
+            float gate = 0.0;
+            float up = 0.0;
+            if (row < OUTPUT_SIZE) {
+                for (uint word = lane; word < INPUT_FP8_WORDS; word += 64u) {
+                    uint block = word / BLOCK_FP8_WORDS;
+                    uint column = word * 4u;
+                    float activation_scale = input_scales[block];
+                    gate = fma(
+                        fp8_dot4_acc32(
+                            quantized_input[word],
+                            read_gate_weightx4(row, column),
+                            0.0
+                        ),
+                        activation_scale * read_gate_scale(row, block),
+                        gate
+                    );
+                    up = fma(
+                        fp8_dot4_acc32(
+                            quantized_input[word],
+                            read_up_weightx4(row, column),
+                            0.0
+                        ),
+                        activation_scale * read_up_scale(row, block),
+                        up
+                    );
                 }
             }
-        }
-        return;
-    }
-    if (gl_SubgroupInvocationID == 0u) {
-        for (uint batch_lane = 0u; batch_lane < BATCH_TILE_WIDTH; batch_lane++) {
-            subgroup_gate_lo[batch_lane][gl_SubgroupID] = gate_lo[batch_lane];
-            subgroup_gate_hi[batch_lane][gl_SubgroupID] = gate_hi[batch_lane];
-            subgroup_up_lo[batch_lane][gl_SubgroupID] = up_lo[batch_lane];
-            subgroup_up_hi[batch_lane][gl_SubgroupID] = up_hi[batch_lane];
-        }
-    }
-    barrier();
-    if (lane == 0u && word_index < OUTPUT_WORDS) {
-        for (uint batch_lane = 0u; batch_lane < BATCH_TILE_WIDTH; batch_lane++) {
-            uint batch_index = batch_start + batch_lane;
-            if (batch_index >= batch_control.batch_width) continue;
-            float g_lo = 0.0, g_hi = 0.0, u_lo = 0.0, u_hi = 0.0;
-            for (uint subgroup = 0u; subgroup < gl_NumSubgroups; subgroup++) {
-                g_lo += subgroup_gate_lo[batch_lane][subgroup];
-                g_hi += subgroup_gate_hi[batch_lane][subgroup];
-                u_lo += subgroup_up_lo[batch_lane][subgroup];
-                u_hi += subgroup_up_hi[batch_lane][subgroup];
+            gate = subgroupAdd(gate);
+            up = subgroupAdd(up);
+            if (gl_SubgroupInvocationID == 0u) {
+                subgroup_gate[local_row][gl_SubgroupID] = gate;
+                subgroup_up[local_row][gl_SubgroupID] = up;
             }
-            write_result(batch_index, word_index, hi_row, g_lo, g_hi, u_lo, u_hi);
         }
+        barrier();
+
+        if (lane < OUTPUT_TILE_ROWS) {
+            uint row = first_row + lane;
+            float gate = 0.0;
+            float up = 0.0;
+            for (uint subgroup = 0u; subgroup < gl_NumSubgroups; subgroup++) {
+                gate += subgroup_gate[lane][subgroup];
+                up += subgroup_up[lane][subgroup];
+            }
+            activated_rows[lane] = row < OUTPUT_SIZE
+                ? rounded_silu(round_bf16(gate)) * round_bf16(up)
+                : 0.0;
+        }
+        barrier();
+
+        if (lane < OUTPUT_TILE_ROWS / 2u) {
+            uint row = first_row + lane * 2u;
+            if (row < OUTPUT_SIZE) {
+                uint hi = row + 1u < OUTPUT_SIZE
+                    ? f32_to_bf16(activated_rows[lane * 2u + 1u])
+                    : 0u;
+                output_frames.words[batch_index * OUTPUT_WORDS + row / 2u] =
+                    (hi << 16u) | f32_to_bf16(activated_rows[lane * 2u]);
+            }
+        }
+        barrier();
     }
 }
