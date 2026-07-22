@@ -1113,9 +1113,7 @@ def _attention_nodes(
         attention_gate = "attention_gate"
         activation = str(numerics.get("attention_gate_activation"))
         if activation not in {"sigmoid", "softplus"}:
-            raise ValueError(
-                f"unsupported attention gate activation {activation!r}"
-            )
+            raise ValueError(f"unsupported attention gate activation {activation!r}")
         attention_gate_op = f"{activation}_multiply"
     q_rope_input = "q_projected"
     if has_q_norm:
@@ -1472,6 +1470,7 @@ def _ffn_tail(
     if feed_forward["type"] == "sparse_moe":
         shared_intermediate_size = feed_forward.get("shared_intermediate_size")
         has_shared_expert = shared_intermediate_size is not None
+        routing = feed_forward["routing"]
         body = [
             {
                 "id": "moe_router_projection",
@@ -1485,9 +1484,19 @@ def _ffn_tail(
                 "op": "moe_topk",
                 "inputs": ["moe_router_logits"],
                 "outputs": ["moe_routes"],
+                "params": (
+                    ["moe_router_correction_bias"]
+                    if "moe_router_correction_bias" in parameters
+                    else []
+                ),
                 "attrs": {
                     "num_experts": int(feed_forward["num_experts"]),
                     "experts_per_token": int(feed_forward["experts_per_token"]),
+                    "activation": str(routing["activation"]),
+                    "normalize_selected": bool(routing["normalize_selected"]),
+                    "routed_scaling_factor": float(routing["routed_scaling_factor"]),
+                    "logit_softcap": float(routing["logit_softcap"]),
+                    "selection_bias": "moe_router_correction_bias" in parameters,
                 },
             },
             {
@@ -1502,6 +1511,7 @@ def _ffn_tail(
                         if "moe_input_scale_inv" in parameters
                         else []
                     ),
+                    *(["moe_input_scales"] if "moe_input_scales" in parameters else []),
                 ],
                 "attrs": {
                     "hidden_size": int(feed_forward.get("hidden_size", 0)),
@@ -1520,6 +1530,11 @@ def _ffn_tail(
                     *(
                         ["moe_output_scale_inv"]
                         if "moe_output_scale_inv" in parameters
+                        else []
+                    ),
+                    *(
+                        ["moe_output_scales"]
+                        if "moe_output_scales" in parameters
                         else []
                     ),
                 ],
@@ -1911,6 +1926,7 @@ def _param_role(name: str) -> str:
         "ffn_up": "feed_forward_up_projection",
         "ffn_up_bias": "feed_forward_up_projection_bias",
         "moe_router": "mixture_of_experts_router_projection",
+        "moe_router_correction_bias": "mixture_of_experts_router_selection_bias",
         "moe_input": "mixture_of_experts_gate_up_weights",
         "moe_output": "mixture_of_experts_down_weights",
         "shared_mlp_input": "shared_expert_gate_up_projection",

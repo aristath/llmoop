@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 import shutil
 import struct
@@ -1104,12 +1105,21 @@ def frame_parallel_batch_shader_file(shader_file: str) -> str | None:
     if re.fullmatch(r"moe_topk_bf16_e\d+_k\d+\.comp", shader_file):
         return shader_file.replace("moe_topk_", "moe_topk_batch1_", 1)
     if re.fullmatch(
-        r"sparse_moe_(?:gate_up|down)_(?:bf16|fp8_e4m3_b\d+x\d+)_"
+        r"moe_topk_(?:sigmoid|softmax)_bf16_e\d+_k\d+_norm[01]_"
+        r"scale[0-9eE+.-]+_cap[0-9eE+.-]+_(?:biasf32|biasbf16|nobias)\.comp",
+        shader_file,
+    ):
+        return shader_file.replace("moe_topk_", "moe_topk_batch1_", 1)
+    if re.fullmatch(
+        r"sparse_moe_(?:gate_up|down)_(?:bf16|fp8_e4m3_b\d+x\d+|"
+        r"int4_ct_s(?:f16|bf16)_g\d+)_"
         r"h\d+_i\d+_e\d+_k\d+\.comp",
         shader_file,
     ):
-        return shader_file.replace("_bf16_", "_batch1_bf16_", 1).replace(
-            "_fp8_e4m3_", "_batch1_fp8_e4m3_", 1
+        return (
+            shader_file.replace("_bf16_", "_batch1_bf16_", 1)
+            .replace("_fp8_e4m3_", "_batch1_fp8_e4m3_", 1)
+            .replace("_int4_ct_", "_batch1_int4_ct_", 1)
         )
     if re.fullmatch(r"moe_reduce_bf16_h\d+_k\d+\.comp", shader_file):
         return shader_file.replace("moe_reduce_", "moe_reduce_batch1_", 1)
@@ -1420,6 +1430,17 @@ def package_auxiliary_circuit_graph(
     }
 
 
+def feed_forward_intermediate_size(circuit: Json) -> int:
+    for node in circuit.get("nodes", []):
+        if node.get("id") == "ffn_gate_activation":
+            width = int(node.get("attrs", {}).get("element_count", 0))
+            if width > 0:
+                return width
+    raise ModelCompileError(
+        f"circuit {circuit.get('id')!r} does not describe its feed-forward width"
+    )
+
+
 def shader_file_for_node(
     circuit: Json,
     node: Json,
@@ -1427,7 +1448,6 @@ def shader_file_for_node(
     dimensions: Json,
 ) -> str:
     hidden_size = int(dimensions["hidden_size"])
-    intermediate_size = int(dimensions["intermediate_size"])
     op = node["op"]
 
     if op == "rms_norm":
@@ -1744,7 +1764,11 @@ def shader_file_for_node(
         element_count = int(
             node.get("attrs", {}).get(
                 "element_count",
-                intermediate_size if node["id"] == "ffn_gate_multiply" else hidden_size,
+                (
+                    feed_forward_intermediate_size(circuit)
+                    if node["id"] == "ffn_gate_multiply"
+                    else hidden_size
+                ),
             )
         )
         return f"multiply_bf16_{element_count}.comp"
@@ -1860,7 +1884,7 @@ def shader_file_for_node(
             f"_scale{shader_float_token(float(node['attrs']['scale']))}.comp"
         )
     if op == "silu":
-        return f"silu_bf16_{intermediate_size}.comp"
+        return f"silu_bf16_{int(node['attrs']['element_count'])}.comp"
     if op == "gelu_tanh":
         return f"gelu_tanh_bf16_{int(node['attrs']['element_count'])}.comp"
     if op == "silu_multiply":
@@ -1876,9 +1900,7 @@ def shader_file_for_node(
                 f"softplus gate node {node['id']!r} has invalid attention geometry"
             )
         mode = "per_head" if attrs.get("per_head") else "per_element"
-        return (
-            f"softplus_multiply_bf16_q{query_heads}_d{head_width}_{mode}.comp"
-        )
+        return f"softplus_multiply_bf16_q{query_heads}_d{head_width}_{mode}.comp"
     if op == "sigmoid_scalar_multiply":
         return f"sigmoid_scalar_multiply_bf16_{hidden_size}.comp"
     if op == "rms_norm_per_head":
@@ -2056,8 +2078,60 @@ def shader_file_for_node(
         )
     if op == "moe_topk":
         attrs = node["attrs"]
+        activation = str(attrs.get("activation"))
+        normalize_selected = bool(attrs.get("normalize_selected"))
+        routed_scale = float(attrs.get("routed_scaling_factor"))
+        logit_softcap = float(attrs.get("logit_softcap"))
+        has_bias = bool(attrs.get("selection_bias"))
+        bias_dtype = None
+        if activation not in {"sigmoid", "softmax"}:
+            raise ModelCompileError(
+                f"MoE router node {node['id']!r} has unsupported activation {activation!r}"
+            )
+        if not math.isfinite(routed_scale) or routed_scale <= 0.0:
+            raise ModelCompileError(
+                f"MoE router node {node['id']!r} has invalid routed scale {routed_scale}"
+            )
+        if not math.isfinite(logit_softcap) or logit_softcap < 0.0:
+            raise ModelCompileError(
+                f"MoE router node {node['id']!r} has invalid logit softcap {logit_softcap}"
+            )
+        if has_bias:
+            if len(node.get("params", [])) != 1:
+                raise ModelCompileError(
+                    f"MoE router node {node['id']!r} is missing its selection bias"
+                )
+            bias_id = node["params"][0]
+            if (
+                parameter_shape_for_id(circuit, bias_id, tensor_index)
+                != [int(attrs["num_experts"])]
+                or parameter_dtype_for_id(circuit, bias_id, tensor_index)
+                not in {"F32", "BF16"}
+                or parameter_layout_for_id(circuit, bias_id, tensor_index)
+                != ROW_MAJOR_LAYOUT
+            ):
+                raise ModelCompileError(
+                    f"MoE router node {node['id']!r} has incompatible selection bias"
+                )
+            bias_dtype = parameter_dtype_for_id(circuit, bias_id, tensor_index)
+        elif node.get("params"):
+            raise ModelCompileError(
+                f"MoE router node {node['id']!r} has an undeclared selection bias"
+            )
+        if (
+            activation == "softmax"
+            and normalize_selected
+            and routed_scale == 1.0
+            and logit_softcap == 0.0
+            and not has_bias
+        ):
+            return f"moe_topk_bf16_e{attrs['num_experts']}_k{attrs['experts_per_token']}.comp"
         return (
-            f"moe_topk_bf16_e{attrs['num_experts']}_k{attrs['experts_per_token']}.comp"
+            f"moe_topk_{activation}_bf16_e{attrs['num_experts']}_"
+            f"k{attrs['experts_per_token']}_norm{int(normalize_selected)}_"
+            f"scale{shader_float_token(routed_scale)}_"
+            f"cap{shader_float_token(logit_softcap)}_"
+            f"{'bias' + bias_dtype.lower() if bias_dtype else 'nobias'}.comp"
         )
     if op in {"sparse_moe_gate_up", "sparse_moe_down"}:
         attrs = node["attrs"]
@@ -2069,6 +2143,15 @@ def shader_file_for_node(
             )
             return (
                 f"sparse_moe_{stage}_fp8_e4m3_b{block_rows}x{block_columns}_"
+                f"h{attrs['hidden_size']}_i{attrs['intermediate_size']}_"
+                f"e{attrs['num_experts']}_k{attrs['experts_per_token']}.comp"
+            )
+        if parameter_dtype == "I32":
+            group_size, scale_dtype = compressed_tensors_int4_moe_shape_for_stage(
+                circuit, node, tensor_index, stage=stage
+            )
+            return (
+                f"sparse_moe_{stage}_int4_ct_s{scale_dtype.lower()}_g{group_size}_"
                 f"h{attrs['hidden_size']}_i{attrs['intermediate_size']}_"
                 f"e{attrs['num_experts']}_k{attrs['experts_per_token']}.comp"
             )
@@ -2160,28 +2243,34 @@ def workgroup_count_x_for_node(circuit: Json, node: Json, tensor_index: Json) ->
         return int(node["attrs"]["heads"])
     if node["op"] == "sparse_moe_gate_up":
         attrs = node["attrs"]
-        if parameter_dtype_for_node(circuit, node, tensor_index) == "F8_E4M3":
+        parameter_dtype = parameter_dtype_for_node(circuit, node, tensor_index)
+        if parameter_dtype == "F8_E4M3":
             return int(attrs["experts_per_token"]) * (
-                (
-                    int(attrs["intermediate_size"])
-                    + FP8_SPARSE_GATE_UP_TILE_ROWS
-                    - 1
-                )
+                (int(attrs["intermediate_size"]) + FP8_SPARSE_GATE_UP_TILE_ROWS - 1)
                 // FP8_SPARSE_GATE_UP_TILE_ROWS
+            )
+        if parameter_dtype == "I32":
+            return int(attrs["experts_per_token"]) * (
+                (int(attrs["intermediate_size"]) + INT4_CT_OUTPUT_TILE_ROWS - 1)
+                // INT4_CT_OUTPUT_TILE_ROWS
             )
         return int(attrs["experts_per_token"]) * (
             (int(attrs["intermediate_size"]) + 1) // 2
         )
     if node["op"] == "sparse_moe_down":
         attrs = node["attrs"]
-        if parameter_dtype_for_node(circuit, node, tensor_index) == "F8_E4M3":
+        parameter_dtype = parameter_dtype_for_node(circuit, node, tensor_index)
+        if parameter_dtype == "F8_E4M3":
             return int(attrs["experts_per_token"]) * (
                 (int(attrs["hidden_size"]) + FP8_SPARSE_DOWN_TILE_ROWS - 1)
                 // FP8_SPARSE_DOWN_TILE_ROWS
             )
-        return int(attrs["experts_per_token"]) * (
-            (int(attrs["hidden_size"]) + 1) // 2
-        )
+        if parameter_dtype == "I32":
+            return int(attrs["experts_per_token"]) * (
+                (int(attrs["hidden_size"]) + INT4_CT_OUTPUT_TILE_ROWS - 1)
+                // INT4_CT_OUTPUT_TILE_ROWS
+            )
+        return int(attrs["experts_per_token"]) * ((int(attrs["hidden_size"]) + 1) // 2)
     if node["op"] in {
         "rms_norm_per_head",
         "rms_norm_per_head_unscaled",
@@ -3806,6 +3895,64 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
             },
         )
 
+    custom_moe_topk_shape = re.fullmatch(
+        r"moe_topk(?:_batch(\d+))?_(sigmoid|softmax)_bf16_e(\d+)_k(\d+)_"
+        r"norm([01])_scale([0-9eE+.-]+)_cap([0-9eE+.-]+)_"
+        r"(biasf32|biasbf16|nobias)\.comp",
+        shader_file,
+    )
+    if custom_moe_topk_shape is not None:
+        (
+            batch_tile,
+            activation,
+            num_experts,
+            experts_per_token,
+            normalize_selected,
+            routed_scale,
+            logit_softcap,
+            bias_mode,
+        ) = custom_moe_topk_shape.groups()
+        if batch_tile not in {None, "1"}:
+            raise ModelCompileError(
+                "sparse routing supports only frame-parallel batch tiles"
+            )
+        num_experts, experts_per_token = map(int, (num_experts, experts_per_token))
+        if not 0 < experts_per_token <= num_experts <= 4096:
+            raise ModelCompileError(
+                f"invalid sparse expert routing e{num_experts} k{experts_per_token}"
+            )
+        has_bias = bias_mode != "nobias"
+        return render_shader_template(
+            source_dir,
+            (
+                "moe_topk_routed_bf16.comp.template"
+                if batch_tile is None
+                else "moe_topk_routed_batch1_bf16.comp.template"
+            ),
+            {
+                "NUM_EXPERTS": str(num_experts),
+                "EXPERTS_PER_TOKEN": str(experts_per_token),
+                "ROUTER_SIGMOID": "1" if activation == "sigmoid" else "0",
+                "NORMALIZE_SELECTED": normalize_selected,
+                "ROUTED_SCALE": routed_scale,
+                "LOGIT_SOFTCAP": logit_softcap,
+                "BIAS_DECLARATION": (
+                    "layout(set = 0, binding = 1) readonly buffer RouterSelectionBias "
+                    "{ uint words[]; } router_selection_bias;"
+                    if has_bias
+                    else ""
+                ),
+                "READ_SELECTION_BIAS": (
+                    "uintBitsToFloat(router_selection_bias.words[expert])"
+                    if bias_mode == "biasf32"
+                    else "unpack_bf16(router_selection_bias.words[expert >> 1u], expert)"
+                    if bias_mode == "biasbf16"
+                    else "0.0"
+                ),
+                "ROUTES_BINDING": "2" if has_bias else "1",
+            },
+        )
+
     moe_topk_shape = re.fullmatch(
         r"moe_topk(?:_batch(\d+))?_bf16_e(\d+)_k(\d+)\.comp", shader_file
     )
@@ -3830,6 +3977,91 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
             {
                 "NUM_EXPERTS": str(num_experts),
                 "EXPERTS_PER_TOKEN": str(experts_per_token),
+            },
+        )
+
+    sparse_moe_int4_shape = re.fullmatch(
+        r"sparse_moe_(gate_up|down)(?:_batch(\d+))?_int4_ct_"
+        r"s(f16|bf16)_g(\d+)_h(\d+)_i(\d+)_e(\d+)_k(\d+)\.comp",
+        shader_file,
+    )
+    if sparse_moe_int4_shape is not None:
+        (
+            stage,
+            batch_tile,
+            scale_dtype,
+            group_size,
+            hidden_size,
+            intermediate_size,
+            num_experts,
+            experts_per_token,
+        ) = sparse_moe_int4_shape.groups()
+        if batch_tile not in {None, "1"}:
+            raise ModelCompileError(
+                "INT4 sparse experts support only frame-parallel batch tiles"
+            )
+        (
+            group_size,
+            hidden_size,
+            intermediate_size,
+            num_experts,
+            experts_per_token,
+        ) = map(
+            int,
+            (
+                group_size,
+                hidden_size,
+                intermediate_size,
+                num_experts,
+                experts_per_token,
+            ),
+        )
+        input_width = hidden_size if stage == "gate_up" else intermediate_size
+        output_width = intermediate_size if stage == "gate_up" else hidden_size
+        if (
+            group_size <= 0
+            or group_size % INT8_ACTIVATION_BLOCK_WIDTH != 0
+            or input_width % group_size != 0
+            or input_width % 8 != 0
+            or output_width % 2 != 0
+            or not 0 < experts_per_token <= num_experts <= 4096
+        ):
+            raise ModelCompileError(
+                f"invalid INT4 sparse expert geometry {shader_file!r}"
+            )
+        read_scale_body = (
+            "    vec2 values = unpackHalf2x16(expert_"
+            f"{'input' if stage == 'gate_up' else 'output'}"
+            "_scales.words[index >> 1u]);\n"
+            "    return (index & 1u) == 0u ? values.x : values.y;"
+            if scale_dtype == "f16"
+            else (
+                "    return read_bf16_word(expert_"
+                f"{'input' if stage == 'gate_up' else 'output'}"
+                "_scales.words[index >> 1u], index);"
+            )
+        )
+        return render_shader_template(
+            source_dir,
+            f"sparse_moe_{stage}_int4_ct.comp.template",
+            {
+                "GROUP_SIZE": str(group_size),
+                "HIDDEN_SIZE": str(hidden_size),
+                "INTERMEDIATE_SIZE": str(intermediate_size),
+                "NUM_EXPERTS": str(num_experts),
+                "EXPERTS_PER_TOKEN": str(experts_per_token),
+                "TILE_ROWS": str(INT4_CT_OUTPUT_TILE_ROWS),
+                "BATCH_CONTROL": (
+                    ""
+                    if batch_tile is None
+                    else "layout(push_constant) uniform BatchControl { uint "
+                    "batch_width; } batch_control;"
+                ),
+                "BATCH_INDEX": ("0u" if batch_tile is None else "gl_WorkGroupID.y"),
+                "BATCH_WIDTH": (
+                    "1u" if batch_tile is None else "batch_control.batch_width"
+                ),
+                "READ_SCALE_BODY": read_scale_body,
             },
         )
 
@@ -4240,10 +4472,14 @@ def validate_compiled_package(package_dir: Path, manifest: Json) -> None:
     if not isinstance(manifest.get("package_id"), str) or not manifest["package_id"]:
         raise ModelCompileError("compiled package has no package id")
     compiler_fingerprint = manifest.get("compiler_fingerprint")
-    if not isinstance(compiler_fingerprint, str) or re.fullmatch(
-        rf"{re.escape(COMPILER_FINGERPRINT_SCHEMA)}:[0-9a-f]{{64}}",
-        compiler_fingerprint,
-    ) is None:
+    if (
+        not isinstance(compiler_fingerprint, str)
+        or re.fullmatch(
+            rf"{re.escape(COMPILER_FINGERPRINT_SCHEMA)}:[0-9a-f]{{64}}",
+            compiler_fingerprint,
+        )
+        is None
+    ):
         raise ModelCompileError(
             "compiled package has no valid compiler fingerprint; recompile the model"
         )
@@ -6112,6 +6348,82 @@ def fp8_moe_block_shape_for_stage(
             f"output {output_width}"
         )
     return block_rows, block_columns
+
+
+def compressed_tensors_int4_moe_shape_for_stage(
+    circuit: Json,
+    node: Json,
+    tensor_index: Json,
+    *,
+    stage: str,
+) -> tuple[int, str]:
+    if stage == "gate_up":
+        weight_id = "moe_input"
+        scale_id = "moe_input_scales"
+    elif stage == "down":
+        weight_id = "moe_output"
+        scale_id = "moe_output_scales"
+    else:
+        raise ModelCompileError(f"unknown sparse MoE stage {stage!r}")
+    expected_params = [weight_id, scale_id]
+    if node.get("params") != expected_params:
+        raise ModelCompileError(
+            f"INT4 sparse MoE {stage} node {node['id']!r} must bind "
+            f"{expected_params}; got {node.get('params')}"
+        )
+
+    attrs = node["attrs"]
+    experts = int(attrs["num_experts"])
+    hidden = int(attrs["hidden_size"])
+    intermediate = int(attrs["intermediate_size"])
+    expected_logical_shape = (
+        [experts, intermediate * 2, hidden]
+        if stage == "gate_up"
+        else [experts, hidden, intermediate]
+    )
+    weight_ref = circuit["parameters"]["refs"][weight_id]
+    weight_info = tensor_index["tensors"][weight_ref["tensor"]]
+    quantization = weight_info.get("quantization")
+    if (
+        parameter_dtype_for_id(circuit, weight_id, tensor_index) != "I32"
+        or parameter_layout_for_id(circuit, weight_id, tensor_index) != ROW_MAJOR_LAYOUT
+        or not isinstance(quantization, dict)
+        or quantization.get("format") != "compressed_tensors_pack_quantized"
+        or int(quantization.get("bits", 0)) != 4
+        or not bool(quantization.get("symmetric"))
+        or int(quantization.get("signed_offset", -1)) != 8
+    ):
+        raise ModelCompileError(
+            f"INT4 sparse MoE {stage} weight has an incompatible quantization contract"
+        )
+    group_size = int(quantization.get("group_size", 0))
+    input_width = expected_logical_shape[2]
+    output_rows = expected_logical_shape[1]
+    if (
+        parameter_shape_for_id(circuit, weight_id, tensor_index)
+        != expected_logical_shape
+        or [int(value) for value in weight_info.get("shape", [])]
+        != [experts, output_rows, input_width // 8]
+        or group_size <= 0
+        or group_size % INT8_ACTIVATION_BLOCK_WIDTH != 0
+        or input_width % group_size != 0
+        or output_rows % 2 != 0
+    ):
+        raise ModelCompileError(
+            f"INT4 sparse MoE {stage} has incompatible weight shape or group geometry"
+        )
+
+    scale_shape = parameter_shape_for_id(circuit, scale_id, tensor_index)
+    scale_dtype = parameter_dtype_for_id(circuit, scale_id, tensor_index)
+    if (
+        scale_shape != [experts, output_rows, input_width // group_size]
+        or scale_dtype not in {"F16", "BF16"}
+        or parameter_layout_for_id(circuit, scale_id, tensor_index) != ROW_MAJOR_LAYOUT
+    ):
+        raise ModelCompileError(
+            f"INT4 sparse MoE {stage} scale shape or dtype is incompatible"
+        )
+    return group_size, scale_dtype
 
 
 def regular_block_shape(

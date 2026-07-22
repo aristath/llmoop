@@ -1,0 +1,122 @@
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer RouterLogits {
+    uint words[];
+} router_logits;
+
+{{BIAS_DECLARATION}}
+
+layout(set = 0, binding = {{ROUTES_BINDING}}) buffer ExpertRoutes {
+    uint words[];
+} expert_routes;
+
+layout(push_constant) uniform BatchControl { uint batch_width; } batch_control;
+
+const uint NUM_EXPERTS = {{NUM_EXPERTS}}u;
+const uint EXPERTS_PER_TOKEN = {{EXPERTS_PER_TOKEN}}u;
+const bool ROUTER_SIGMOID = {{ROUTER_SIGMOID}} != 0;
+const bool NORMALIZE_SELECTED = {{NORMALIZE_SELECTED}} != 0;
+const float ROUTED_SCALE = {{ROUTED_SCALE}};
+const float LOGIT_SOFTCAP = {{LOGIT_SOFTCAP}};
+const uint ROUTER_WORDS = (NUM_EXPERTS + 1u) / 2u;
+
+shared uint top_indices[EXPERTS_PER_TOKEN];
+
+float bf16_to_f32(uint value) {
+    return uintBitsToFloat((value & 0xffffu) << 16);
+}
+
+uint f32_to_bf16(float value) {
+    uint bits = floatBitsToUint(value);
+    uint lsb = (bits >> 16) & 1u;
+    return (bits + 0x7fffu + lsb) >> 16;
+}
+
+float unpack_bf16(uint packed, uint index) {
+    return bf16_to_f32((index & 1u) == 0u ? packed : packed >> 16);
+}
+
+float router_logit(uint batch_index, uint expert) {
+    float value = unpack_bf16(
+        router_logits.words[batch_index * ROUTER_WORDS + (expert >> 1u)],
+        expert
+    );
+    return LOGIT_SOFTCAP > 0.0
+        ? tanh(value / LOGIT_SOFTCAP) * LOGIT_SOFTCAP
+        : value;
+}
+
+float sigmoid(float value) {
+    return 1.0 / (1.0 + exp(-value));
+}
+
+float selection_score(uint batch_index, uint expert) {
+    float logit = router_logit(batch_index, expert);
+    float routed = ROUTER_SIGMOID ? sigmoid(logit) : logit;
+    return routed + {{READ_SELECTION_BIAS}};
+}
+
+bool already_selected(uint expert, uint count) {
+    for (uint index = 0u; index < count; index++) {
+        if (top_indices[index] == expert) return true;
+    }
+    return false;
+}
+
+void main() {
+    if (gl_LocalInvocationID.x != 0u) return;
+    uint batch_index = gl_WorkGroupID.y;
+    if (batch_index >= batch_control.batch_width) return;
+
+    for (uint route = 0u; route < EXPERTS_PER_TOKEN; route++) {
+        float best_score = -uintBitsToFloat(0x7f800000u);
+        uint best_expert = 0u;
+        for (uint expert = 0u; expert < NUM_EXPERTS; expert++) {
+            float score = selection_score(batch_index, expert);
+            if (!already_selected(expert, route) && score > best_score) {
+                best_score = score;
+                best_expert = expert;
+            }
+        }
+        top_indices[route] = best_expert;
+    }
+
+    float maximum = router_logit(batch_index, top_indices[0]);
+    float denominator = 0.0;
+    if (NORMALIZE_SELECTED) {
+        for (uint route = 0u; route < EXPERTS_PER_TOKEN; route++) {
+            float logit = router_logit(batch_index, top_indices[route]);
+            denominator += ROUTER_SIGMOID ? sigmoid(logit) : exp(logit - maximum);
+        }
+    } else if (!ROUTER_SIGMOID) {
+        maximum = -uintBitsToFloat(0x7f800000u);
+        for (uint expert = 0u; expert < NUM_EXPERTS; expert++) {
+            maximum = max(maximum, router_logit(batch_index, expert));
+        }
+        for (uint expert = 0u; expert < NUM_EXPERTS; expert++) {
+            denominator += exp(router_logit(batch_index, expert) - maximum);
+        }
+    }
+
+    for (uint route = 1u; route < EXPERTS_PER_TOKEN; route++) {
+        uint expert = top_indices[route];
+        uint insertion = route;
+        while (insertion > 0u && top_indices[insertion - 1u] > expert) {
+            top_indices[insertion] = top_indices[insertion - 1u];
+            insertion--;
+        }
+        top_indices[insertion] = expert;
+    }
+    uint route_base = batch_index * EXPERTS_PER_TOKEN;
+    for (uint route = 0u; route < EXPERTS_PER_TOKEN; route++) {
+        uint expert = top_indices[route];
+        float logit = router_logit(batch_index, expert);
+        float weight = ROUTER_SIGMOID ? sigmoid(logit) : exp(logit - maximum);
+        if (NORMALIZE_SELECTED || !ROUTER_SIGMOID) weight /= denominator;
+        weight *= ROUTED_SCALE;
+        expert_routes.words[route_base + route] =
+            (f32_to_bf16(weight) << 16u) | expert;
+    }
+}

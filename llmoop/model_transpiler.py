@@ -88,6 +88,7 @@ class ModelStructure:
     activation: str
     num_experts: int | None
     experts_per_token: int | None
+    moe_routing: Json | None
     recurrent_mixer: Json | None
     quantization: Json | None
     sampling: Json
@@ -179,6 +180,10 @@ MOE_ROUTER_SUFFIXES = (
     "block_sparse_moe.router.weight",
     "block_sparse_moe.gate.weight",
     "mlp.gate.weight",
+)
+MOE_ROUTER_CORRECTION_BIAS_SUFFIXES = (
+    "mlp.experts.e_score_correction_bias",
+    "mlp.gate.e_score_correction_bias",
 )
 
 SHARED_MLP_INPUT_SUFFIXES = (
@@ -479,6 +484,9 @@ def discover_model_structure(
     else:
         num_experts = None
         experts_per_token = None
+    moe_routing = (
+        discover_moe_routing(model_dir, decoder_config) if has_sparse_experts else None
+    )
 
     return ModelStructure(
         model_dir=model_dir,
@@ -535,6 +543,7 @@ def discover_model_structure(
         activation=discover_activation(decoder_config),
         num_experts=num_experts,
         experts_per_token=experts_per_token,
+        moe_routing=moe_routing,
         recurrent_mixer=recurrent_mixer,
         quantization=discover_quantization_policy(config),
         sampling=discover_sampling_policy(generation_config or {}),
@@ -707,6 +716,11 @@ def discover_layer_structure(
                 ),
             }
         )
+        router_correction_bias = find_optional_layer_tensor(
+            tensors, prefix, MOE_ROUTER_CORRECTION_BIAS_SUFFIXES
+        )
+        if router_correction_bias is not None:
+            layer_tensors["moe_router_correction_bias"] = router_correction_bias
         shared_input = find_optional_layer_tensor(
             tensors, prefix, SHARED_MLP_INPUT_SUFFIXES
         )
@@ -1091,9 +1105,7 @@ def discover_layer_structure(
         shared_kv_source_layer=shared_kv_source_layer,
         per_layer_input_width=per_layer_input_width,
         feed_forward_type=feed_forward_type,
-        intermediate_size=discover_layer_intermediate_size(
-            tensors, layer_tensors
-        ),
+        intermediate_size=discover_layer_intermediate_size(tensors, layer_tensors),
         shared_intermediate_size=(
             tensor_matrix_shape(tensors, layer_tensors["shared_mlp_input"])[0] // 2
             if "shared_mlp_input" in layer_tensors
@@ -1465,9 +1477,7 @@ def discover_per_layer_attention_heads(
     return result
 
 
-def discover_attention_gate_activation(
-    model_dir: Path, config: Json
-) -> str | None:
+def discover_attention_gate_activation(model_dir: Path, config: Json) -> str | None:
     configured = config.get("attention_gate_activation") or config.get(
         "attn_gate_activation"
     )
@@ -1500,6 +1510,56 @@ def discover_attention_gate_activation(
             f"model source contains ambiguous attention gate activations {sorted(discovered)}"
         )
     return next(iter(discovered), None)
+
+
+def discover_moe_routing(model_dir: Path, config: Json) -> Json:
+    configured = config.get("moe_router_activation") or config.get("scoring_func")
+    activation = str(configured).lower() if configured is not None else None
+    if activation is None:
+        discovered: set[str] = set()
+        patterns = {
+            "sigmoid": re.compile(
+                r"(?:F|torch|nn\.functional)\.sigmoid\s*\(\s*router_logits"
+            ),
+            "softmax": re.compile(
+                r"(?:F|torch|nn\.functional)\.softmax\s*\(\s*router_logits"
+            ),
+        }
+        for source_file in sorted(model_dir.glob("*.py")):
+            source = source_file.read_text(errors="replace")
+            discovered.update(
+                candidate
+                for candidate, pattern in patterns.items()
+                if pattern.search(source) is not None
+            )
+        if len(discovered) > 1:
+            raise ModelTranspileError(
+                f"model source contains ambiguous MoE router activations {sorted(discovered)}"
+            )
+        activation = next(iter(discovered), "softmax")
+    if activation not in {"sigmoid", "softmax"}:
+        raise ModelTranspileError(f"unsupported MoE router activation {activation!r}")
+
+    logit_softcap = float(config.get("moe_router_logit_softcapping") or 0.0)
+    routed_scale = float(
+        config.get("moe_routed_scaling_factor")
+        or config.get("routed_scaling_factor")
+        or 1.0
+    )
+    if logit_softcap < 0.0 or not math.isfinite(logit_softcap):
+        raise ModelTranspileError(
+            f"MoE router logit softcap must be finite and non-negative, got {logit_softcap}"
+        )
+    if routed_scale <= 0.0 or not math.isfinite(routed_scale):
+        raise ModelTranspileError(
+            f"MoE routed scaling factor must be finite and positive, got {routed_scale}"
+        )
+    return {
+        "activation": activation,
+        "normalize_selected": bool(config.get("norm_topk_prob", True)),
+        "routed_scaling_factor": routed_scale,
+        "logit_softcap": logit_softcap,
+    }
 
 
 def discover_layer_rope_parameters(
@@ -1682,9 +1742,7 @@ def discover_quantization_policy(config: Json) -> Json | None:
             not isinstance(block_shape, list)
             or len(block_shape) != 2
             or any(
-                not isinstance(value, int)
-                or isinstance(value, bool)
-                or value <= 0
+                not isinstance(value, int) or isinstance(value, bool) or value <= 0
                 for value in block_shape
             )
         ):
@@ -1733,8 +1791,7 @@ def discover_sampling_policy(generation_config: Json) -> Json:
     presence_penalty = float(generation_config.get("presence_penalty", 0.0))
     if not math.isfinite(presence_penalty):
         raise ModelTranspileError(
-            "sampling presence_penalty must be finite, "
-            f"got {presence_penalty}"
+            f"sampling presence_penalty must be finite, got {presence_penalty}"
         )
     min_p = float(generation_config.get("min_p", 0.0))
     if not math.isfinite(min_p) or not 0.0 <= min_p <= 1.0:
@@ -2174,6 +2231,7 @@ def make_feed_forward_descriptor(
             {
                 "num_experts": structure.num_experts,
                 "experts_per_token": structure.experts_per_token,
+                "routing": structure.moe_routing,
                 "shared_intermediate_size": layer.shared_intermediate_size,
             }
         )
@@ -2232,6 +2290,10 @@ def make_ffn_component(structure: ModelStructure, layer: LayerStructure) -> Json
             "input": tensor_ref(layer.tensors["moe_input"]),
             "output": tensor_ref(layer.tensors["moe_output"]),
         }
+        if "moe_router_correction_bias" in layer.tensors:
+            params["router_correction_bias"] = tensor_ref(
+                layer.tensors["moe_router_correction_bias"]
+            )
         if layer.shared_intermediate_size is not None:
             params.update(
                 {
@@ -2371,9 +2433,7 @@ def make_attention_operator(structure: ModelStructure, layer: LayerStructure) ->
         params["attention_gate_projection"] = tensor_ref(
             layer.tensors["attention_gate_projection"]
         )
-        internal_pedals.append(
-            {"id": "attention_gate_projection", "type": "linear"}
-        )
+        internal_pedals.append({"id": "attention_gate_projection", "type": "linear"})
     if "q_norm" in layer.tensors:
         params["q_norm"] = tensor_ref(layer.tensors["q_norm"])
         internal_pedals.append({"id": "q_norm", "type": "rms_norm_per_head"})
@@ -2785,9 +2845,7 @@ def segment_per_layer_embedding_parameters(
                 )
             source_offsets = [int(value) for value in info["data_offsets"]]
             chunk_names: list[str] = []
-            for chunk_index, row_start in enumerate(
-                range(0, shape[0], rows_per_chunk)
-            ):
+            for chunk_index, row_start in enumerate(range(0, shape[0], rows_per_chunk)):
                 row_end = min(row_start + rows_per_chunk, shape[0])
                 byte_start = row_start * row_bytes
                 byte_end = row_end * row_bytes
@@ -2969,15 +3027,16 @@ def synthesize_packed_expert_tensors(
             quantizations = [tensors[name].get("quantization") for name in required]
             if any(
                 not isinstance(quantization, dict)
-                or quantization.get("format")
-                != "compressed_tensors_pack_quantized"
+                or quantization.get("format") != "compressed_tensors_pack_quantized"
                 for quantization in quantizations
             ):
                 raise ModelTranspileError(
                     f"layer prefix {layer_prefix!r} expert {expert} has unsupported "
                     "packed quantization"
                 )
-            scales = tuple(str(quantization["scales"]) for quantization in quantizations)
+            scales = tuple(
+                str(quantization["scales"]) for quantization in quantizations
+            )
             missing_scales = [name for name in scales if name not in tensors]
             if missing_scales:
                 raise ModelTranspileError(
@@ -2996,9 +3055,7 @@ def synthesize_packed_expert_tensors(
             f"layer prefix {layer_prefix!r} has incompatible expert projection "
             f"shapes gate={gate_shape}, up={up_shape}, down={down_shape}"
         )
-    for gate, up, down in zip(
-        gate_weights, up_weights, down_weights, strict=True
-    ):
+    for gate, up, down in zip(gate_weights, up_weights, down_weights, strict=True):
         if (
             tensor_matrix_shape(tensors, gate) != gate_shape
             or tensor_matrix_shape(tensors, up) != up_shape

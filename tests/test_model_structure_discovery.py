@@ -538,9 +538,7 @@ def test_discovers_source_defined_per_head_attention_gate(tmp_path: Path) -> Non
     pedal = make_layer(structure, layer)
     circuit = build_pedal_circuit(pedal, Path("layer_00.json"))
     nodes = {node["id"]: node for node in circuit["nodes"]}
-    assert nodes["attention_gate_projection"]["params"] == [
-        "attention_gate_projection"
-    ]
+    assert nodes["attention_gate_projection"]["params"] == ["attention_gate_projection"]
     assert nodes["attention_output_gate"] == {
         "id": "attention_output_gate",
         "op": "softplus_multiply",
@@ -648,7 +646,12 @@ def test_discovers_nested_hybrid_decoder_by_tensor_structure() -> None:
     assert split["attrs"]["block_part_width"] == 256
 
 
-def test_discovers_sparse_moe_and_model_specific_numerics_by_structure() -> None:
+def test_discovers_sparse_moe_and_model_specific_numerics_by_structure(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "modeling_sparse.py").write_text(
+        "routing_scores = torch.sigmoid(router_logits)\n"
+    )
     prefix = "model.layers.0"
     tensors = {
         "model.embed_tokens.weight": _tensor([49155, 1024]),
@@ -662,6 +665,7 @@ def test_discovers_sparse_moe_and_model_specific_numerics_by_structure() -> None
         f"{prefix}.block_sparse_moe.input_linear.weight": _tensor([32, 1024, 1024]),
         f"{prefix}.block_sparse_moe.output_linear.weight": _tensor([32, 1024, 512]),
         f"{prefix}.block_sparse_moe.router.layer.weight": _tensor([32, 1024]),
+        f"{prefix}.mlp.experts.e_score_correction_bias": _tensor([32]),
     }
     config = {
         "model_type": "synthetic_sparse_decoder",
@@ -672,6 +676,8 @@ def test_discovers_sparse_moe_and_model_specific_numerics_by_structure() -> None
         "num_key_value_heads": 8,
         "num_local_experts": 32,
         "num_experts_per_tok": 8,
+        "norm_topk_prob": True,
+        "moe_routed_scaling_factor": 2.5,
         "embedding_multiplier": 12.0,
         "residual_multiplier": 0.22,
         "attention_multiplier": 0.015625,
@@ -683,7 +689,7 @@ def test_discovers_sparse_moe_and_model_specific_numerics_by_structure() -> None
         "tie_word_embeddings": True,
     }
 
-    structure = discover_model_structure(Path("synthetic"), config, tensors)
+    structure = discover_model_structure(tmp_path, config, tensors)
     layer = structure.layers[0]
     assert layer.operator_type == "full_attention"
     assert layer.feed_forward_type == "sparse_moe"
@@ -703,7 +709,13 @@ def test_discovers_sparse_moe_and_model_specific_numerics_by_structure() -> None
     assert nodes["moe_topk"]["attrs"] == {
         "num_experts": 32,
         "experts_per_token": 8,
+        "activation": "sigmoid",
+        "normalize_selected": True,
+        "routed_scaling_factor": 2.5,
+        "logit_softcap": 0.0,
+        "selection_bias": True,
     }
+    assert nodes["moe_topk"]["params"] == ["moe_router_correction_bias"]
     assert nodes["sparse_moe_gate_up"]["params"] == ["moe_input"]
     assert nodes["sparse_moe_down"]["params"] == ["moe_output"]
     assert nodes["moe_reduce"]["outputs"] == ["ffn_out"]
@@ -721,14 +733,10 @@ def test_discovers_mixed_window_attention_sinks_and_shared_sparse_experts() -> N
             {
                 f"{prefix}.input_layernorm.weight": _tensor([16]),
                 f"{prefix}.post_attention_layernorm.weight": _tensor([16]),
-                f"{prefix}.self_attn.q_proj.weight": _tensor(
-                    [query_heads * 8, 16]
-                ),
+                f"{prefix}.self_attn.q_proj.weight": _tensor([query_heads * 8, 16]),
                 f"{prefix}.self_attn.k_proj.weight": _tensor([8, 16]),
                 f"{prefix}.self_attn.v_proj.weight": _tensor([8, 16]),
-                f"{prefix}.self_attn.o_proj.weight": _tensor(
-                    [16, query_heads * 8]
-                ),
+                f"{prefix}.self_attn.o_proj.weight": _tensor([16, query_heads * 8]),
                 f"{prefix}.self_attn.sinks": _tensor([query_heads]),
                 f"{prefix}.block_sparse_moe.experts.gate_up_proj": _tensor([4, 12, 16]),
                 f"{prefix}.block_sparse_moe.experts.down_proj": _tensor([4, 16, 6]),
@@ -777,6 +785,7 @@ def test_discovers_mixed_window_attention_sinks_and_shared_sparse_experts() -> N
     assert nodes["shared_mlp_activation"]["attrs"] == {"element_count": 10}
     assert nodes["shared_mlp_output_projection"]["params"] == ["shared_mlp_output"]
     assert nodes["shared_and_sparse_expert_add"]["outputs"] == ["ffn_out"]
+    assert nodes["moe_topk"]["attrs"]["activation"] == "softmax"
 
 
 def test_discovers_fused_qkv_and_gate_up_projections_by_shape() -> None:
