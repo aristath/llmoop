@@ -44,6 +44,7 @@ class LayerStructure:
     shared_kv_source_layer: int | None
     per_layer_input_width: int | None
     feed_forward_type: str
+    intermediate_size: int
     shared_intermediate_size: int | None
     tensors: dict[str, str]
 
@@ -63,7 +64,6 @@ class ModelStructure:
     architectures: tuple[str, ...]
     dtype: str | None
     hidden_size: int
-    intermediate_size: int
     num_hidden_layers: int
     num_attention_heads: int
     num_key_value_heads: int
@@ -380,6 +380,11 @@ def discover_model_structure(
     configured_head_width = int(
         decoder_config.get("head_dim") or hidden_size // num_attention_heads
     )
+    per_layer_attention_heads = discover_per_layer_attention_heads(
+        decoder_config,
+        layer_count=layer_count,
+        default=num_attention_heads,
+    )
     configured_layer_types = discover_configured_layer_types(
         decoder_config, layer_count
     )
@@ -396,7 +401,7 @@ def discover_model_structure(
             decoder_config=decoder_config,
             configured_layer_types=configured_layer_types,
             configured_attention_window_size=attention_window_size,
-            num_attention_heads=num_attention_heads,
+            num_attention_heads=per_layer_attention_heads[index],
             configured_num_key_value_heads=configured_num_key_value_heads,
             configured_head_width=configured_head_width,
             shared_kv_source_layer=shared_kv_sources.get(index),
@@ -420,7 +425,6 @@ def discover_model_structure(
         configured_attention_window_size=attention_window_size,
     )
 
-    intermediate_size = discover_intermediate_size(decoder_config, tensors, layers)
     first_attention = next(
         (layer for layer in layers if layer.operator_type == "full_attention"), None
     )
@@ -480,7 +484,6 @@ def discover_model_structure(
             or config.get("torch_dtype")
         ),
         hidden_size=hidden_size,
-        intermediate_size=intermediate_size,
         num_hidden_layers=layer_count,
         num_attention_heads=num_attention_heads,
         num_key_value_heads=num_key_value_heads,
@@ -1045,6 +1048,9 @@ def discover_layer_structure(
         shared_kv_source_layer=shared_kv_source_layer,
         per_layer_input_width=per_layer_input_width,
         feed_forward_type=feed_forward_type,
+        intermediate_size=discover_layer_intermediate_size(
+            tensors, layer_tensors
+        ),
         shared_intermediate_size=(
             tensor_matrix_shape(tensors, layer_tensors["shared_mlp_input"])[0] // 2
             if "shared_mlp_input" in layer_tensors
@@ -1397,6 +1403,24 @@ def discover_layer_head_width(
     return configured_head_width
 
 
+def discover_per_layer_attention_heads(
+    config: Json, *, layer_count: int, default: int
+) -> tuple[int, ...]:
+    configured = config.get("num_attention_heads_per_layer")
+    if configured is None:
+        return (default,) * layer_count
+    if not isinstance(configured, list) or len(configured) != layer_count:
+        raise ModelTranspileError(
+            "num_attention_heads_per_layer must contain one entry per layer"
+        )
+    result = tuple(int(value) for value in configured)
+    if any(value <= 0 for value in result):
+        raise ModelTranspileError(
+            "num_attention_heads_per_layer entries must be positive"
+        )
+    return result
+
+
 def discover_layer_rope_parameters(
     config: Json, configured_layer_type: str | None
 ) -> Json:
@@ -1665,35 +1689,27 @@ def discover_sampling_policy(generation_config: Json) -> Json:
     }
 
 
-def discover_intermediate_size(
-    config: Json, tensors: dict[str, Json], layers: tuple[LayerStructure, ...]
-) -> int:
-    discovered: set[int] = set()
-    for layer in layers:
-        if layer.feed_forward_type == "dense_swiglu":
-            if "ffn_gate_up" in layer.tensors:
-                discovered.add(
-                    tensor_matrix_shape(tensors, layer.tensors["ffn_gate_up"])[0] // 2
-                )
-            else:
-                discovered.add(
-                    tensor_matrix_shape(tensors, layer.tensors["ffn_gate"])[0]
-                )
-        elif layer.feed_forward_type == "sparse_moe":
-            shape = tensors[layer.tensors["moe_input"]]["shape"]
-            discovered.add(int(shape[-2]) // 2)
-    if len(discovered) != 1:
-        raise ModelTranspileError(
-            f"feed-forward tensor shapes disagree on intermediate width: {sorted(discovered)}"
-        )
-    return discovered.pop()
-
-
 def discover_attention_window_size(config: Json) -> int | None:
     for key in ("sliding_window", "attention_window_size"):
         if config.get(key) is not None:
             return int(config[key])
     return None
+
+
+def discover_layer_intermediate_size(
+    tensors: dict[str, Json], layer_tensors: dict[str, str]
+) -> int:
+    if "ffn_gate_up" in layer_tensors:
+        return tensor_matrix_shape(tensors, layer_tensors["ffn_gate_up"])[0] // 2
+    if "ffn_gate" in layer_tensors:
+        return tensor_matrix_shape(tensors, layer_tensors["ffn_gate"])[0]
+    info = tensors[layer_tensors["moe_input"]]
+    shape = [int(value) for value in info.get("logical_shape", info["shape"])]
+    if len(shape) != 3:
+        raise ModelTranspileError(
+            f"sparse expert input {layer_tensors['moe_input']!r} must be rank 3"
+        )
+    return shape[1] // 2
 
 
 def discover_embedding_scale(
@@ -1892,7 +1908,9 @@ def make_model_graph(
         },
         "dimensions": {
             "hidden_size": structure.hidden_size,
-            "intermediate_size": structure.intermediate_size,
+            "intermediate_sizes": [
+                layer.intermediate_size for layer in structure.layers
+            ],
             "num_hidden_layers": structure.num_hidden_layers,
             "num_attention_heads": structure.num_attention_heads,
             "num_key_value_heads": structure.num_key_value_heads,
@@ -2065,7 +2083,7 @@ def make_feed_forward_descriptor(
     descriptor: Json = {
         "type": layer.feed_forward_type,
         "hidden_size": structure.hidden_size,
-        "intermediate_size": structure.intermediate_size,
+        "intermediate_size": layer.intermediate_size,
         "activation": structure.activation,
     }
     if layer.feed_forward_type == "sparse_moe":
@@ -2171,7 +2189,9 @@ def make_ffn_component(structure: ModelStructure, layer: LayerStructure) -> Json
     return {
         "id": "feed_forward",
         "type": "swiglu_feed_forward",
-        "circuit_template": f"swiglu_ffn_{structure.hidden_size}_{structure.intermediate_size}_v1",
+        "circuit_template": (
+            f"swiglu_ffn_{structure.hidden_size}_{layer.intermediate_size}_v1"
+        ),
         "input": "ffn_norm.output",
         "output": "ffn.output",
         "activation": structure.activation,
@@ -2527,9 +2547,9 @@ def make_state_ports(
 def make_pedal_class(structure: ModelStructure, layer: LayerStructure) -> str:
     operator_type = layer.operator_type
     feed_forward = (
-        f"moe{structure.num_experts}x{structure.experts_per_token}i{structure.intermediate_size}"
+        f"moe{structure.num_experts}x{structure.experts_per_token}i{layer.intermediate_size}"
         if layer.feed_forward_type == "sparse_moe"
-        else f"ffn{structure.intermediate_size}"
+        else f"ffn{layer.intermediate_size}"
     )
     if operator_type == "conv":
         return (

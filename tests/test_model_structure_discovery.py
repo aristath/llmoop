@@ -665,15 +665,20 @@ def test_discovers_mixed_window_attention_sinks_and_shared_sparse_experts() -> N
     }
     for index in range(2):
         prefix = f"model.layers.{index}"
+        query_heads = 2 if index == 0 else 4
         tensors.update(
             {
                 f"{prefix}.input_layernorm.weight": _tensor([16]),
                 f"{prefix}.post_attention_layernorm.weight": _tensor([16]),
-                f"{prefix}.self_attn.q_proj.weight": _tensor([16, 16]),
+                f"{prefix}.self_attn.q_proj.weight": _tensor(
+                    [query_heads * 8, 16]
+                ),
                 f"{prefix}.self_attn.k_proj.weight": _tensor([8, 16]),
                 f"{prefix}.self_attn.v_proj.weight": _tensor([8, 16]),
-                f"{prefix}.self_attn.o_proj.weight": _tensor([16, 16]),
-                f"{prefix}.self_attn.sinks": _tensor([2]),
+                f"{prefix}.self_attn.o_proj.weight": _tensor(
+                    [16, query_heads * 8]
+                ),
+                f"{prefix}.self_attn.sinks": _tensor([query_heads]),
                 f"{prefix}.block_sparse_moe.experts.gate_up_proj": _tensor([4, 12, 16]),
                 f"{prefix}.block_sparse_moe.experts.down_proj": _tensor([4, 16, 6]),
                 f"{prefix}.block_sparse_moe.router.weight": _tensor([4, 16]),
@@ -688,6 +693,7 @@ def test_discovers_mixed_window_attention_sinks_and_shared_sparse_experts() -> N
         "shared_intermediate_size": 10,
         "num_hidden_layers": 2,
         "num_attention_heads": 2,
+        "num_attention_heads_per_layer": [2, 4],
         "num_key_value_heads": 1,
         "num_local_experts": 4,
         "num_experts_per_tok": 2,
@@ -700,6 +706,7 @@ def test_discovers_mixed_window_attention_sinks_and_shared_sparse_experts() -> N
     }
 
     structure = discover_model_structure(Path("synthetic"), config, tensors)
+    assert [layer.num_attention_heads for layer in structure.layers] == [2, 4]
     assert [layer.attention_window_size for layer in structure.layers] == [None, 128]
     assert [layer.shared_intermediate_size for layer in structure.layers] == [10, 10]
 
@@ -750,7 +757,7 @@ def test_discovers_fused_qkv_and_gate_up_projections_by_shape() -> None:
 
     structure = discover_model_structure(Path("synthetic"), config, tensors)
     layer = structure.layers[0]
-    assert structure.intermediate_size == 12
+    assert layer.intermediate_size == 12
     assert layer.tensors["qkv_projection"].endswith("qkv_proj.weight")
     assert layer.tensors["ffn_gate_up"].endswith("gate_up_proj.weight")
 
@@ -984,7 +991,7 @@ def test_discovers_recurrent_block_pattern_biases_and_numerics_by_structure() ->
         "rg_lru",
         "full_attention",
     ]
-    assert structure.intermediate_size == 24
+    assert [layer.intermediate_size for layer in structure.layers] == [24, 24, 24]
     assert structure.rotary_width == 4
     assert structure.attention_window_size == 8
     assert structure.embedding_scale == 4.0
