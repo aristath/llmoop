@@ -571,6 +571,132 @@ impl VulkanResidentKernelBufferAccess {
             (false, false) => unreachable!("a resident buffer access must read or write"),
         }
     }
+
+    fn shader_access_mask(self) -> vk::AccessFlags {
+        match self {
+            Self::Read => vk::AccessFlags::SHADER_READ,
+            Self::Write => vk::AccessFlags::SHADER_WRITE,
+            Self::ReadWrite => vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct VulkanResidentKernelBufferRangeAccess {
+    buffer: vk::Buffer,
+    byte_offset: vk::DeviceSize,
+    byte_len: vk::DeviceSize,
+    access: VulkanResidentKernelBufferAccess,
+}
+
+impl VulkanResidentKernelBufferRangeAccess {
+    fn byte_end(self) -> vk::DeviceSize {
+        self.byte_offset + self.byte_len
+    }
+
+    fn overlaps(self, other: Self) -> bool {
+        self.buffer == other.buffer
+            && self.byte_offset < other.byte_end()
+            && other.byte_offset < self.byte_end()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct VulkanResidentKernelBufferDependency {
+    buffer: vk::Buffer,
+    byte_offset: vk::DeviceSize,
+    byte_len: vk::DeviceSize,
+    source_access: VulkanResidentKernelBufferAccess,
+    destination_access: VulkanResidentKernelBufferAccess,
+}
+
+fn take_resident_kernel_buffer_dependencies(
+    pending: &mut Vec<VulkanResidentKernelBufferRangeAccess>,
+    current: &[VulkanResidentKernelBufferRangeAccess],
+) -> Vec<VulkanResidentKernelBufferDependency> {
+    let mut dependencies = Vec::new();
+    for current_access in current {
+        let mut dependency_start = vk::DeviceSize::MAX;
+        let mut dependency_end = 0;
+        let mut source_access = None;
+        for pending_access in pending.iter().copied().filter(|pending_access| {
+            pending_access.overlaps(*current_access)
+                && pending_access.access.conflicts_with(current_access.access)
+        }) {
+            dependency_start =
+                dependency_start.min(pending_access.byte_offset.max(current_access.byte_offset));
+            dependency_end =
+                dependency_end.max(pending_access.byte_end().min(current_access.byte_end()));
+            source_access = Some(
+                source_access
+                    .map(|access: VulkanResidentKernelBufferAccess| {
+                        access.merge(pending_access.access)
+                    })
+                    .unwrap_or(pending_access.access),
+            );
+        }
+        if let Some(source_access) = source_access {
+            dependencies.push(VulkanResidentKernelBufferDependency {
+                buffer: current_access.buffer,
+                byte_offset: dependency_start,
+                byte_len: dependency_end - dependency_start,
+                source_access,
+                destination_access: current_access.access,
+            });
+        }
+    }
+    let mut unresolved = Vec::new();
+    for pending_access in pending.drain(..) {
+        let mut pieces = vec![pending_access];
+        for current_access in current.iter().copied().filter(|current_access| {
+            current_access.buffer == pending_access.buffer
+                && pending_access.access.conflicts_with(current_access.access)
+        }) {
+            let mut next_pieces = Vec::new();
+            for piece in pieces {
+                if !piece.overlaps(current_access) {
+                    next_pieces.push(piece);
+                    continue;
+                }
+                let overlap_start = piece.byte_offset.max(current_access.byte_offset);
+                let overlap_end = piece.byte_end().min(current_access.byte_end());
+                if piece.byte_offset < overlap_start {
+                    next_pieces.push(VulkanResidentKernelBufferRangeAccess {
+                        byte_len: overlap_start - piece.byte_offset,
+                        ..piece
+                    });
+                }
+                if overlap_end < piece.byte_end() {
+                    next_pieces.push(VulkanResidentKernelBufferRangeAccess {
+                        byte_offset: overlap_end,
+                        byte_len: piece.byte_end() - overlap_end,
+                        ..piece
+                    });
+                }
+            }
+            pieces = next_pieces;
+        }
+        unresolved.extend(pieces);
+    }
+    *pending = unresolved;
+    dependencies
+}
+
+fn merge_resident_kernel_buffer_accesses(
+    pending: &mut Vec<VulkanResidentKernelBufferRangeAccess>,
+    current: &[VulkanResidentKernelBufferRangeAccess],
+) {
+    for current_access in current {
+        if let Some(pending_access) = pending.iter_mut().find(|pending_access| {
+            pending_access.buffer == current_access.buffer
+                && pending_access.byte_offset == current_access.byte_offset
+                && pending_access.byte_len == current_access.byte_len
+        }) {
+            pending_access.access = pending_access.access.merge(current_access.access);
+        } else {
+            pending.push(*current_access);
+        }
+    }
 }
 
 impl<'a> VulkanResidentKernelBufferBinding<'a> {
@@ -864,7 +990,7 @@ pub struct VulkanResidentKernelDispatch {
     workgroup_count_y: u32,
     base_workgroup_z: u32,
     push_constant_byte_count: u32,
-    buffer_accesses: Vec<(vk::Buffer, VulkanResidentKernelBufferAccess)>,
+    buffer_accesses: Vec<VulkanResidentKernelBufferRangeAccess>,
 }
 
 /// Owns the Vulkan recording/submission resources for a composed sequence of
@@ -2612,7 +2738,7 @@ impl VulkanComputeDevice {
 
         let mut descriptor_bindings = Vec::with_capacity(buffers.len());
         let mut buffer_accesses =
-            Vec::<(vk::Buffer, VulkanResidentKernelBufferAccess)>::with_capacity(buffers.len());
+            Vec::<VulkanResidentKernelBufferRangeAccess>::with_capacity(buffers.len());
         for buffer in buffers {
             buffer
                 .buffer
@@ -2624,13 +2750,25 @@ impl VulkanComputeDevice {
                 )));
             }
             descriptor_bindings.push(buffer.binding);
-            if let Some((_, access)) = buffer_accesses
-                .iter_mut()
-                .find(|(resident_buffer, _)| *resident_buffer == buffer.buffer.buffer)
-            {
-                *access = access.merge(buffer.access);
+            let byte_offset = vk::DeviceSize::try_from(buffer.byte_offset).map_err(|_| {
+                VulkanError("resident kernel buffer offset overflowed Vulkan size".to_string())
+            })?;
+            let byte_len = vk::DeviceSize::try_from(buffer.byte_len).map_err(|_| {
+                VulkanError("resident kernel buffer length overflowed Vulkan size".to_string())
+            })?;
+            if let Some(existing) = buffer_accesses.iter_mut().find(|existing| {
+                existing.buffer == buffer.buffer.buffer
+                    && existing.byte_offset == byte_offset
+                    && existing.byte_len == byte_len
+            }) {
+                existing.access = existing.access.merge(buffer.access);
             } else {
-                buffer_accesses.push((buffer.buffer.buffer, buffer.access));
+                buffer_accesses.push(VulkanResidentKernelBufferRangeAccess {
+                    buffer: buffer.buffer.buffer,
+                    byte_offset,
+                    byte_len,
+                    access: buffer.access,
+                });
             }
         }
         descriptor_bindings.sort_unstable();
@@ -3321,38 +3459,38 @@ impl VulkanComputeDevice {
                 }
             }
 
-            let mut pending_buffer_accesses =
-                Vec::<(vk::Buffer, VulkanResidentKernelBufferAccess)>::new();
+            let mut pending_buffer_accesses = Vec::<VulkanResidentKernelBufferRangeAccess>::new();
             if !command_buffer_matches {
                 for (step_index, step) in steps.iter().enumerate() {
-                    let has_buffer_hazard = step.dispatch.buffer_accesses.iter().any(
-                        |(current_buffer, current_access)| {
-                            pending_buffer_accesses.iter().any(
-                                |(pending_buffer, pending_access)| {
-                                    pending_buffer == current_buffer
-                                        && pending_access.conflicts_with(*current_access)
-                                },
-                            )
-                        },
+                    let dependencies = take_resident_kernel_buffer_dependencies(
+                        &mut pending_buffer_accesses,
+                        &step.dispatch.buffer_accesses,
                     );
-                    if has_buffer_hazard {
-                        let memory_barrier = [vk::MemoryBarrier::default()
-                            .src_access_mask(
-                                vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
-                            )
-                            .dst_access_mask(
-                                vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
-                            )];
+                    if !dependencies.is_empty() {
+                        let buffer_barriers = dependencies
+                            .iter()
+                            .map(|dependency| {
+                                vk::BufferMemoryBarrier::default()
+                                    .src_access_mask(dependency.source_access.shader_access_mask())
+                                    .dst_access_mask(
+                                        dependency.destination_access.shader_access_mask(),
+                                    )
+                                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                                    .buffer(dependency.buffer)
+                                    .offset(dependency.byte_offset)
+                                    .size(dependency.byte_len)
+                            })
+                            .collect::<Vec<_>>();
                         self.device.cmd_pipeline_barrier(
                             sequence.command_buffer,
                             vk::PipelineStageFlags::COMPUTE_SHADER,
                             vk::PipelineStageFlags::COMPUTE_SHADER,
                             vk::DependencyFlags::empty(),
-                            &memory_barrier,
                             &[],
+                            &buffer_barriers,
                             &[],
                         );
-                        pending_buffer_accesses.clear();
                     }
 
                     self.device.cmd_bind_pipeline(
@@ -3395,16 +3533,10 @@ impl VulkanComputeDevice {
                             1,
                         );
                     }
-                    for (current_buffer, current_access) in &step.dispatch.buffer_accesses {
-                        if let Some((_, pending_access)) = pending_buffer_accesses
-                            .iter_mut()
-                            .find(|(pending_buffer, _)| pending_buffer == current_buffer)
-                        {
-                            *pending_access = pending_access.merge(*current_access);
-                        } else {
-                            pending_buffer_accesses.push((*current_buffer, *current_access));
-                        }
-                    }
+                    merge_resident_kernel_buffer_accesses(
+                        &mut pending_buffer_accesses,
+                        &step.dispatch.buffer_accesses,
+                    );
                     if let Some(query_pool) = query_pool {
                         self.device.cmd_write_timestamp(
                             sequence.command_buffer,
@@ -4769,6 +4901,84 @@ fn test_command_exists(command: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn range_access(
+        byte_offset: vk::DeviceSize,
+        byte_len: vk::DeviceSize,
+        access: VulkanResidentKernelBufferAccess,
+    ) -> VulkanResidentKernelBufferRangeAccess {
+        VulkanResidentKernelBufferRangeAccess {
+            buffer: vk::Buffer::null(),
+            byte_offset,
+            byte_len,
+            access,
+        }
+    }
+
+    #[test]
+    fn resident_kernel_dependencies_only_synchronize_conflicting_buffer_ranges() {
+        let mut pending = vec![
+            range_access(0, 128, VulkanResidentKernelBufferAccess::Write),
+            range_access(256, 128, VulkanResidentKernelBufferAccess::Read),
+        ];
+        let current = [
+            range_access(64, 128, VulkanResidentKernelBufferAccess::Read),
+            range_access(512, 128, VulkanResidentKernelBufferAccess::Write),
+        ];
+
+        let dependencies = take_resident_kernel_buffer_dependencies(&mut pending, &current);
+
+        assert_eq!(
+            dependencies,
+            vec![VulkanResidentKernelBufferDependency {
+                buffer: vk::Buffer::null(),
+                byte_offset: 64,
+                byte_len: 64,
+                source_access: VulkanResidentKernelBufferAccess::Write,
+                destination_access: VulkanResidentKernelBufferAccess::Read,
+            }]
+        );
+        assert_eq!(
+            pending,
+            vec![
+                range_access(0, 64, VulkanResidentKernelBufferAccess::Write),
+                range_access(256, 128, VulkanResidentKernelBufferAccess::Read),
+            ]
+        );
+    }
+
+    #[test]
+    fn resident_kernel_dependencies_preserve_read_after_read_without_a_barrier() {
+        let access = range_access(0, 128, VulkanResidentKernelBufferAccess::Read);
+        let mut pending = vec![access];
+
+        let dependencies = take_resident_kernel_buffer_dependencies(&mut pending, &[access]);
+
+        assert!(dependencies.is_empty());
+        assert_eq!(pending, vec![access]);
+    }
+
+    #[test]
+    fn resident_kernel_access_merge_keeps_disjoint_arena_ranges_independent() {
+        let mut pending = vec![range_access(0, 128, VulkanResidentKernelBufferAccess::Read)];
+        merge_resident_kernel_buffer_accesses(
+            &mut pending,
+            &[
+                range_access(0, 128, VulkanResidentKernelBufferAccess::Write),
+                range_access(256, 128, VulkanResidentKernelBufferAccess::Write),
+            ],
+        );
+
+        assert_eq!(pending.len(), 2);
+        assert_eq!(
+            pending[0],
+            range_access(0, 128, VulkanResidentKernelBufferAccess::ReadWrite)
+        );
+        assert_eq!(
+            pending[1],
+            range_access(256, 128, VulkanResidentKernelBufferAccess::Write)
+        );
+    }
 
     fn spirv_test_module(capabilities: &[u32], memory_model: u32) -> Vec<u32> {
         let mut words = vec![SPIRV_MAGIC, 0x0001_0600, 0, 1, 0];
