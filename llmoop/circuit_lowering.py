@@ -1079,6 +1079,7 @@ def _attention_nodes(
             ]
         )
     attention_gate = None
+    attention_gate_op = None
     if numerics.get("attention_output_gate"):
         attention_width = int(heads["query_heads"]) * int(heads["head_width"])
         nodes.append(
@@ -1098,6 +1099,24 @@ def _attention_nodes(
             }
         )
         attention_gate = "attention_gate"
+        attention_gate_op = "sigmoid_multiply"
+    elif "attention_gate_projection" in parameters:
+        nodes.append(
+            {
+                "id": "attention_gate_projection",
+                "op": "linear",
+                "inputs": ["operator_norm_out"],
+                "outputs": ["attention_gate"],
+                "params": _linear_params("attention_gate_projection", parameters),
+            }
+        )
+        attention_gate = "attention_gate"
+        activation = str(numerics.get("attention_gate_activation"))
+        if activation not in {"sigmoid", "softplus"}:
+            raise ValueError(
+                f"unsupported attention gate activation {activation!r}"
+            )
+        attention_gate_op = f"{activation}_multiply"
     q_rope_input = "q_projected"
     if has_q_norm:
         nodes.append(
@@ -1213,6 +1232,25 @@ def _attention_nodes(
                 **heads,
             },
         },
+        *(
+            [
+                {
+                    "id": "attention_output_gate",
+                    "op": attention_gate_op,
+                    "inputs": ["attention_out", attention_gate],
+                    "outputs": ["attention_gated"],
+                    "attrs": {
+                        "query_heads": int(heads["query_heads"]),
+                        "head_width": int(heads["head_width"]),
+                        "per_head": bool(
+                            numerics.get("attention_gate_per_head", False)
+                        ),
+                    },
+                }
+            ]
+            if attention_gate is not None
+            else []
+        ),
         {
             "id": "attention_out_projection",
             "op": "linear",
@@ -1227,16 +1265,6 @@ def _attention_nodes(
             parameters=parameters,
         ),
     ]
-    if attention_gate:
-        attention_tail.insert(
-            4,
-            {
-                "id": "attention_output_gate",
-                "op": "sigmoid_multiply",
-                "inputs": ["attention_out", attention_gate],
-                "outputs": ["attention_gated"],
-            },
-        )
     nodes.extend(attention_tail)
     return nodes
 
@@ -1901,6 +1929,8 @@ def _param_role(name: str) -> str:
         "v_projection_bias": "attention_value_projection_bias",
         "attention_out_projection": "attention_output_projection",
         "attention_out_projection_bias": "attention_output_projection_bias",
+        "attention_gate_projection": "attention_gate_projection",
+        "attention_gate_projection_bias": "attention_gate_projection_bias",
         "attention_sinks": "attention_sink_logits",
         "q_norm": "attention_query_head_normalization",
         "k_norm": "attention_key_head_normalization",

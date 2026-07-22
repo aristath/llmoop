@@ -39,6 +39,8 @@ class LayerStructure:
     rope_theta: float
     rope_type: str
     attention_scale: float
+    attention_gate_activation: str | None
+    attention_gate_per_head: bool
     attention_key_equals_value: bool
     value_head_norm: bool
     shared_kv_source_layer: int | None
@@ -218,6 +220,7 @@ ATTENTION_OUT_PROJECTION_SUFFIXES = (
 ATTENTION_Q_NORM_SUFFIXES = ("self_attn.q_layernorm.weight", "self_attn.q_norm.weight")
 ATTENTION_K_NORM_SUFFIXES = ("self_attn.k_layernorm.weight", "self_attn.k_norm.weight")
 ATTENTION_SINK_SUFFIXES = ("self_attn.sinks",)
+ATTENTION_GATE_PROJECTION_SUFFIXES = ("self_attn.g_proj.weight",)
 
 GATED_DELTA_QKV_SUFFIXES = ("linear_attn.in_proj_qkv.weight",)
 GATED_DELTA_Z_SUFFIXES = ("linear_attn.in_proj_z.weight",)
@@ -385,6 +388,9 @@ def discover_model_structure(
         layer_count=layer_count,
         default=num_attention_heads,
     )
+    attention_gate_activation = discover_attention_gate_activation(
+        model_dir, decoder_config
+    )
     configured_layer_types = discover_configured_layer_types(
         decoder_config, layer_count
     )
@@ -404,6 +410,7 @@ def discover_model_structure(
             num_attention_heads=per_layer_attention_heads[index],
             configured_num_key_value_heads=configured_num_key_value_heads,
             configured_head_width=configured_head_width,
+            configured_attention_gate_activation=attention_gate_activation,
             shared_kv_source_layer=shared_kv_sources.get(index),
             per_layer_input=per_layer_input,
             token_embedding=token_embedding,
@@ -557,6 +564,7 @@ def discover_layer_structure(
     num_attention_heads: int,
     configured_num_key_value_heads: int,
     configured_head_width: int,
+    configured_attention_gate_activation: str | None,
     shared_kv_source_layer: int | None,
     per_layer_input: Json | None,
     token_embedding: str,
@@ -825,6 +833,11 @@ def discover_layer_structure(
         )
         if optional_sinks is not None:
             layer_tensors["attention_sinks"] = optional_sinks
+        optional_gate_projection = find_optional_layer_tensor(
+            tensors, prefix, ATTENTION_GATE_PROJECTION_SUFFIXES
+        )
+        if optional_gate_projection is not None:
+            layer_tensors["attention_gate_projection"] = optional_gate_projection
         attention_linear_ids: tuple[str, ...] = (
             ("qkv_projection", "attention_out_projection")
             if fused_qkv is not None
@@ -837,10 +850,19 @@ def discover_layer_structure(
                     "k_projection",
                     "v_projection",
                     "attention_out_projection",
+                    "attention_gate_projection",
                 )
                 if parameter_id in layer_tensors
             )
         )
+        if (
+            "attention_gate_projection" in layer_tensors
+            and "attention_gate_projection" not in attention_linear_ids
+        ):
+            attention_linear_ids = (
+                *attention_linear_ids,
+                "attention_gate_projection",
+            )
         add_optional_linear_biases(tensors, layer_tensors, attention_linear_ids)
     elif operator_type == "gated_delta":
         layer_tensors.update(
@@ -1017,6 +1039,23 @@ def discover_layer_structure(
             and "q_norm" in layer_tensors
             and "k_norm" in layer_tensors
         )
+        attention_gate_activation = None
+        attention_gate_per_head = False
+        if "attention_gate_projection" in layer_tensors:
+            if configured_attention_gate_activation is None:
+                raise ModelTranspileError(
+                    f"could not discover activation for attention gate in layer {layer_index}"
+                )
+            gate_width = tensor_matrix_shape(
+                tensors, layer_tensors["attention_gate_projection"]
+            )[0]
+            attention_gate_per_head = gate_width == num_attention_heads
+            if not attention_gate_per_head and gate_width != expected_q_width:
+                raise ModelTranspileError(
+                    f"attention gate width {gate_width} is incompatible with "
+                    f"{num_attention_heads} heads of width {head_width}"
+                )
+            attention_gate_activation = configured_attention_gate_activation
     else:
         head_width = configured_head_width
         num_key_value_heads = configured_num_key_value_heads
@@ -1027,6 +1066,8 @@ def discover_layer_structure(
             decoder_config.get("attention_multiplier", configured_head_width**-0.5)
         )
         value_head_norm = False
+        attention_gate_activation = None
+        attention_gate_per_head = False
 
     attach_block_quantization_scales(tensors, layer_tensors)
     attach_packed_linear_quantization(tensors, layer_tensors)
@@ -1043,6 +1084,8 @@ def discover_layer_structure(
         rope_theta=rope_theta,
         rope_type=rope_type,
         attention_scale=attention_scale,
+        attention_gate_activation=attention_gate_activation,
+        attention_gate_per_head=attention_gate_per_head,
         attention_key_equals_value=attention_key_equals_value,
         value_head_norm=value_head_norm,
         shared_kv_source_layer=shared_kv_source_layer,
@@ -1221,6 +1264,7 @@ def discover_draft_pedalboards(
                 num_attention_heads=num_attention_heads,
                 configured_num_key_value_heads=configured_num_key_value_heads,
                 configured_head_width=configured_head_width,
+                configured_attention_gate_activation=None,
                 shared_kv_source_layer=None,
                 per_layer_input=None,
                 token_embedding=token_embedding,
@@ -1419,6 +1463,43 @@ def discover_per_layer_attention_heads(
             "num_attention_heads_per_layer entries must be positive"
         )
     return result
+
+
+def discover_attention_gate_activation(
+    model_dir: Path, config: Json
+) -> str | None:
+    configured = config.get("attention_gate_activation") or config.get(
+        "attn_gate_activation"
+    )
+    if configured is not None:
+        activation = str(configured).lower()
+        if activation not in {"sigmoid", "softplus"}:
+            raise ModelTranspileError(
+                f"unsupported attention gate activation {configured!r}"
+            )
+        return activation
+
+    discovered: set[str] = set()
+    patterns = {
+        "softplus": re.compile(
+            r"(?:F|torch|nn\.functional)\.softplus\s*\(\s*self\.g_proj\s*\("
+        ),
+        "sigmoid": re.compile(
+            r"(?:F|torch|nn\.functional)\.sigmoid\s*\(\s*self\.g_proj\s*\("
+        ),
+    }
+    for source_file in sorted(model_dir.glob("*.py")):
+        source = source_file.read_text(errors="replace")
+        discovered.update(
+            activation
+            for activation, pattern in patterns.items()
+            if pattern.search(source) is not None
+        )
+    if len(discovered) > 1:
+        raise ModelTranspileError(
+            f"model source contains ambiguous attention gate activations {sorted(discovered)}"
+        )
+    return next(iter(discovered), None)
 
 
 def discover_layer_rope_parameters(
@@ -1813,6 +1894,8 @@ def make_layer(
             "rotary_width": layer.rotary_width,
             "rms_norm_weight_offset": structure.rms_norm_weight_offset,
             "attention_output_gate": structure.attention_output_gate,
+            "attention_gate_activation": layer.attention_gate_activation,
+            "attention_gate_per_head": layer.attention_gate_per_head,
             "attention_key_equals_value": layer.attention_key_equals_value,
             "residual_scale": structure.residual_scale,
             "attention_scale": layer.attention_scale,
@@ -2256,6 +2339,7 @@ def make_attention_operator(structure: ModelStructure, layer: LayerStructure) ->
         ("k_projection_bias", "k_projection_bias"),
         ("v_projection_bias", "v_projection_bias"),
         ("attention_out_projection_bias", "out_projection_bias"),
+        ("attention_gate_projection_bias", "attention_gate_projection_bias"),
     ):
         if source_id in layer.tensors:
             params[target_id] = tensor_ref(layer.tensors[source_id])
@@ -2283,6 +2367,13 @@ def make_attention_operator(structure: ModelStructure, layer: LayerStructure) ->
     )
     if structure.attention_output_gate:
         internal_pedals.append({"id": "q_gate_split", "type": "split"})
+    if "attention_gate_projection" in layer.tensors:
+        params["attention_gate_projection"] = tensor_ref(
+            layer.tensors["attention_gate_projection"]
+        )
+        internal_pedals.append(
+            {"id": "attention_gate_projection", "type": "linear"}
+        )
     if "q_norm" in layer.tensors:
         params["q_norm"] = tensor_ref(layer.tensors["q_norm"])
         internal_pedals.append({"id": "q_norm", "type": "rms_norm_per_head"})
@@ -2304,8 +2395,18 @@ def make_attention_operator(structure: ModelStructure, layer: LayerStructure) ->
             },
             {"id": "attention_read", "type": "scaled_dot_product_attention"},
             *(
-                [{"id": "attention_output_gate", "type": "sigmoid_multiply"}]
+                [
+                    {
+                        "id": "attention_output_gate",
+                        "type": (
+                            "sigmoid_multiply"
+                            if structure.attention_output_gate
+                            else f"{layer.attention_gate_activation}_multiply"
+                        ),
+                    }
+                ]
                 if structure.attention_output_gate
+                or layer.attention_gate_activation is not None
                 else []
             ),
             {"id": "out_projection", "type": "linear"},
@@ -2325,6 +2426,14 @@ def make_attention_operator(structure: ModelStructure, layer: LayerStructure) ->
         "rotary_width": layer.rotary_width,
         "rope_type": layer.rope_type,
         "output_gate": structure.attention_output_gate,
+        "attention_gate": (
+            {
+                "activation": layer.attention_gate_activation,
+                "per_head": layer.attention_gate_per_head,
+            }
+            if layer.attention_gate_activation is not None
+            else None
+        ),
         "window_size": layer.attention_window_size,
         "shared_kv_source_layer": layer.shared_kv_source_layer,
         "state_ports": make_state_ports(structure, layer),

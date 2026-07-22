@@ -500,6 +500,57 @@ def test_discovers_attention_without_optional_query_key_norms() -> None:
     assert nodes["operator_norm"]["attrs"]["eps"] == 1e-5
 
 
+def test_discovers_source_defined_per_head_attention_gate(tmp_path: Path) -> None:
+    (tmp_path / "modeling_custom.py").write_text(
+        "gate = F.softplus(self.g_proj(hidden_states).float())\n"
+    )
+    prefix = "model.layers.0"
+    tensors = {
+        "model.embed_tokens.weight": _tensor([256, 16]),
+        "model.norm.weight": _tensor([16]),
+        f"{prefix}.input_layernorm.weight": _tensor([16]),
+        f"{prefix}.post_attention_layernorm.weight": _tensor([16]),
+        f"{prefix}.self_attn.q_proj.weight": _tensor([16, 16]),
+        f"{prefix}.self_attn.k_proj.weight": _tensor([8, 16]),
+        f"{prefix}.self_attn.v_proj.weight": _tensor([8, 16]),
+        f"{prefix}.self_attn.o_proj.weight": _tensor([16, 16]),
+        f"{prefix}.self_attn.g_proj.weight": _tensor([2, 16]),
+        f"{prefix}.mlp.gate_proj.weight": _tensor([12, 16]),
+        f"{prefix}.mlp.up_proj.weight": _tensor([12, 16]),
+        f"{prefix}.mlp.down_proj.weight": _tensor([16, 12]),
+    }
+    config = {
+        "hidden_size": 16,
+        "num_hidden_layers": 1,
+        "num_attention_heads": 2,
+        "num_key_value_heads": 1,
+        "head_dim": 8,
+        "vocab_size": 256,
+        "rms_norm_eps": 1e-5,
+        "rope_theta": 10_000.0,
+    }
+
+    structure = discover_model_structure(tmp_path, config, tensors)
+    layer = structure.layers[0]
+    assert layer.attention_gate_activation == "softplus"
+    assert layer.attention_gate_per_head is True
+
+    pedal = make_layer(structure, layer)
+    circuit = build_pedal_circuit(pedal, Path("layer_00.json"))
+    nodes = {node["id"]: node for node in circuit["nodes"]}
+    assert nodes["attention_gate_projection"]["params"] == [
+        "attention_gate_projection"
+    ]
+    assert nodes["attention_output_gate"] == {
+        "id": "attention_output_gate",
+        "op": "softplus_multiply",
+        "inputs": ["attention_out", "attention_gate"],
+        "outputs": ["attention_gated"],
+        "attrs": {"query_heads": 2, "head_width": 8, "per_head": True},
+    }
+    assert nodes["attention_out_projection"]["inputs"] == ["attention_gated"]
+
+
 def test_discovers_nested_hybrid_decoder_by_tensor_structure() -> None:
     root = "model.language_model"
     tensors = {

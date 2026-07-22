@@ -1299,6 +1299,16 @@ def weight_shared_batch_shader_file(
         return shader_file.replace("split_bf16_", f"split_batch{tile}_bf16_", 1)
     if shader_file == "sigmoid_multiply_bf16.comp":
         return f"sigmoid_multiply_batch{tile}_bf16.comp"
+    attention_gate = re.fullmatch(
+        r"softplus_multiply_bf16_q(\d+)_d(\d+)_(per_head|per_element)\.comp",
+        shader_file,
+    )
+    if attention_gate is not None:
+        return shader_file.replace(
+            "softplus_multiply_bf16_",
+            f"softplus_multiply_batch{tile}_bf16_",
+            1,
+        )
     rms_norm = re.fullmatch(
         r"rms_norm_bf16_h(\d+)_eps([0-9eE+.-]+)_offset([0-9eE+.-]+)\.comp",
         shader_file,
@@ -1857,6 +1867,18 @@ def shader_file_for_node(
         return f"silu_multiply_bf16_{int(node['attrs']['element_count'])}.comp"
     if op == "sigmoid_multiply":
         return "sigmoid_multiply_bf16.comp"
+    if op == "softplus_multiply":
+        attrs = node.get("attrs", {})
+        query_heads = int(attrs.get("query_heads", 0))
+        head_width = int(attrs.get("head_width", 0))
+        if query_heads <= 0 or head_width <= 0 or head_width % 2:
+            raise ModelCompileError(
+                f"softplus gate node {node['id']!r} has invalid attention geometry"
+            )
+        mode = "per_head" if attrs.get("per_head") else "per_element"
+        return (
+            f"softplus_multiply_bf16_q{query_heads}_d{head_width}_{mode}.comp"
+        )
     if op == "sigmoid_scalar_multiply":
         return f"sigmoid_scalar_multiply_bf16_{hidden_size}.comp"
     if op == "rms_norm_per_head":
@@ -3192,6 +3214,33 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
                 "OUTPUT_SIZE": str(output_size),
                 "ACTIVATION_BLOCK_WIDTH": str(INT8_ACTIVATION_BLOCK_WIDTH),
                 "OUTPUT_TILE_ROWS": str(output_tile_rows),
+            },
+        )
+
+    attention_gate = re.fullmatch(
+        r"softplus_multiply(?:_batch(\d+))?_bf16_q(\d+)_d(\d+)_"
+        r"(per_head|per_element)\.comp",
+        shader_file,
+    )
+    if attention_gate is not None:
+        batch_tile, query_heads, head_width, mode = attention_gate.groups()
+        query_heads, head_width = map(int, (query_heads, head_width))
+        if query_heads <= 0 or head_width <= 0 or head_width % 2:
+            raise ModelCompileError(
+                f"invalid softplus attention gate shape {shader_file!r}"
+            )
+        return render_shader_template(
+            source_dir,
+            (
+                "softplus_multiply_bf16.comp.template"
+                if batch_tile is None
+                else "softplus_multiply_batch_bf16.comp.template"
+            ),
+            {
+                "BATCH_TILE_WIDTH": batch_tile or "1",
+                "QUERY_HEADS": str(query_heads),
+                "HEAD_WIDTH": str(head_width),
+                "PER_HEAD": "1" if mode == "per_head" else "0",
             },
         )
 

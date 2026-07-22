@@ -179,6 +179,9 @@ def test_compiler_selects_only_compatible_weight_shared_batch_kernels() -> None:
         weight_shared_batch_shader_file("sigmoid_multiply_bf16.comp")
         == "sigmoid_multiply_batch16_bf16.comp"
     )
+    assert weight_shared_batch_shader_file(
+        "softplus_multiply_bf16_q72_d128_per_head.comp"
+    ) == "softplus_multiply_batch16_bf16_q72_d128_per_head.comp"
     assert (
         weight_shared_batch_shader_file("linear_fp8_e4m3_b127x128_5120x17408.comp")
         is None
@@ -1527,18 +1530,47 @@ def test_compiler_renders_hybrid_recurrent_and_gated_attention_pedals(
     assert "head_output[gl_SubgroupID] = k_sum;" in temporal_recurrence
     assert "head_beta = 1.0 /" in temporal_recurrence
     assert (
-        "float previous = recurrent_state[key_dim] * head_decay;" in temporal_recurrence
+        "float previous = recurrent_state[key_dim] * head_decay;"
+        in temporal_recurrence
     )
     assert "recurrent_state[key_dim] = previous;" in temporal_recurrence
     assert "float next = recurrent_state[key_dim] + key * delta;" in temporal_recurrence
     assert (
-        "recurrent_state[key_dim] * head_decay + key * delta" not in temporal_recurrence
+        "recurrent_state[key_dim] * head_decay + key * delta"
+        not in temporal_recurrence
     )
     assert "const uint BLOCKS = 8u;" in split
     assert "const uint BLOCK_PART_WIDTH = 256u;" in split
     assert all(
         "{{" not in (tmp_path / shader_file).read_text() for shader_file in shader_files
     )
+
+
+def test_compiler_renders_per_head_softplus_attention_gate(tmp_path: Path) -> None:
+    shader_source_dir = Path(__file__).parents[1] / "runtime-rs" / "shaders"
+    primary = "softplus_multiply_bf16_q72_d128_per_head.comp"
+    batch = "softplus_multiply_batch16_bf16_q72_d128_per_head.comp"
+    node = {
+        "id": "attention_output_gate",
+        "op": "softplus_multiply",
+        "attrs": {"query_heads": 72, "head_width": 128, "per_head": True},
+    }
+
+    assert shader_file_for_node(
+        {}, node, {}, {"hidden_size": 3072, "intermediate_size": 1024}
+    ) == primary
+    copy_shader_templates(shader_source_dir, tmp_path, {primary, batch})
+
+    primary_source = (tmp_path / primary).read_text()
+    batch_source = (tmp_path / batch).read_text()
+    assert "const uint QUERY_HEADS = 72u;" in primary_source
+    assert "const uint HEAD_WIDTH = 128u;" in primary_source
+    assert "const bool PER_HEAD = 1 != 0;" in primary_source
+    assert "element / HEAD_WIDTH" in primary_source
+    assert "const uint BATCH_TILE_WIDTH = 16u;" in batch_source
+    assert "batch_index * GATE_WORDS" in batch_source
+    assert "{{" not in primary_source
+    assert "{{" not in batch_source
 
 
 def test_compiler_renders_sparse_moe_and_scaled_residual_pedals(tmp_path: Path) -> None:
