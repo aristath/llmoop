@@ -836,8 +836,29 @@ def test_compiler_renders_parallel_head_norm_rope_shader(tmp_path: Path) -> None
     assert "const bool ROPE_INTERLEAVED = false;" in source
     assert "layout(set = 0, binding = 6) readonly buffer StreamControl" in source
     assert "shared uint normalized_words" in source
-    assert "float cosine = round_bf16(cos(angle));" in source
+    assert "float cosine = round_bf16(cos(angle) * ROPE_ATTENTION_FACTOR);" in source
     assert "return round_bf16(direct + rotated);" in source
+    assert "{{" not in source
+
+
+def test_compiler_renders_yarn_rope_profile_into_fused_shader(
+    tmp_path: Path,
+) -> None:
+    shader_source_dir = Path(__file__).parents[1] / "runtime-rs" / "shaders"
+    shader_file = (
+        "parallel_head_norm_rope_2way_bf16_h48_8_d128_r64_"
+        "eps1e-06_offset0_theta500000_yarn_f32_lo9_hi18_a1.34657359_half__sc6.comp"
+    )
+
+    copy_shader_templates(shader_source_dir, tmp_path, {shader_file})
+
+    source = (tmp_path / shader_file).read_text()
+    assert "const bool ROPE_YARN = true;" in source
+    assert "const float ROPE_FACTOR = 32;" in source
+    assert "const float ROPE_CORRECTION_LOW = 9;" in source
+    assert "const float ROPE_CORRECTION_HIGH = 18;" in source
+    assert "const float ROPE_ATTENTION_FACTOR = 1.34657359;" in source
+    assert "return mix(inverse_frequency, inverse_frequency / ROPE_FACTOR, ramp);" in source
     assert "{{" not in source
 
 
@@ -1315,7 +1336,7 @@ def test_compiler_renders_attention_pedals_from_discovered_dimensions(
     assert "const float ROPE_THETA = 100000;" in rope
     assert "const bool ROPE_INTERLEAVED = false;" in rope
     assert "binding = 2) readonly buffer StreamControl" in rope
-    assert "float sine = round_bf16(sin(angle));" in rope
+    assert "float sine = round_bf16(sin(angle) * ROPE_ATTENTION_FACTOR);" in rope
     assert "return round_bf16(direct + rotated);" in rope
     assert "const uint KV_HEADS = 5u;" in append
     assert "binding = 9) readonly buffer StreamControl" in append

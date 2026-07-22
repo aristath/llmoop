@@ -38,6 +38,7 @@ class LayerStructure:
     rotary_width: int
     rope_theta: float
     rope_type: str
+    rope_scaling: Json | None
     attention_scale: float
     attention_gate_activation: str | None
     attention_gate_per_head: bool
@@ -1039,6 +1040,7 @@ def discover_layer_structure(
         rotary_width = int(
             head_width * float(rope_parameters.get("partial_rotary_factor", 1.0))
         )
+        rope_scaling = compile_rope_scaling(rope_parameters, rotary_width)
         attention_scale = float(
             decoder_config.get(
                 "attention_multiplier",
@@ -1076,6 +1078,7 @@ def discover_layer_structure(
         rotary_width = configured_head_width
         rope_theta = discover_rope_theta(decoder_config)
         rope_type = "default"
+        rope_scaling = None
         attention_scale = float(
             decoder_config.get("attention_multiplier", configured_head_width**-0.5)
         )
@@ -1097,6 +1100,7 @@ def discover_layer_structure(
         rotary_width=rotary_width,
         rope_theta=rope_theta,
         rope_type=rope_type,
+        rope_scaling=rope_scaling,
         attention_scale=attention_scale,
         attention_gate_activation=attention_gate_activation,
         attention_gate_per_head=attention_gate_per_head,
@@ -1585,6 +1589,80 @@ def discover_layer_rope_parameters(
     )
 
 
+def compile_rope_scaling(parameters: Json, rotary_width: int) -> Json | None:
+    rope_type = str(parameters.get("rope_type", "default"))
+    if rope_type in {"default", "proportional"}:
+        return None
+    if rope_type != "yarn":
+        raise ModelTranspileError(f"unsupported RoPE type {rope_type!r}")
+    if rotary_width <= 0 or rotary_width % 2:
+        raise ModelTranspileError(
+            f"YaRN rotary width must be positive and even, got {rotary_width}"
+        )
+
+    theta = float(parameters.get("rope_theta") or 0.0)
+    factor = float(parameters.get("factor") or 0.0)
+    original_context = int(parameters.get("original_max_position_embeddings") or 0)
+    beta_fast = float(parameters.get("beta_fast") or 32.0)
+    beta_slow = float(parameters.get("beta_slow") or 1.0)
+    truncate = bool(parameters.get("truncate", True))
+    if (
+        not math.isfinite(theta)
+        or theta <= 0.0
+        or not math.isfinite(factor)
+        or factor <= 0.0
+        or original_context <= 0
+        or not math.isfinite(beta_fast)
+        or not math.isfinite(beta_slow)
+        or beta_fast < beta_slow
+    ):
+        raise ModelTranspileError(
+            "YaRN requires positive finite theta/factor/context and beta_fast >= beta_slow"
+        )
+
+    attention_factor_value = parameters.get("attention_factor")
+    attention_factor = (
+        float(attention_factor_value)
+        if attention_factor_value is not None
+        else 1.0 if factor <= 1.0 else 0.1 * math.log(factor) + 1.0
+    )
+    if not math.isfinite(attention_factor) or attention_factor <= 0.0:
+        raise ModelTranspileError(
+            f"YaRN attention factor must be finite and positive, got {attention_factor}"
+        )
+
+    def correction_dimension(rotations: float) -> float:
+        return (
+            rotary_width
+            * math.log(original_context / (rotations * 2.0 * math.pi))
+            / (2.0 * math.log(theta))
+        )
+
+    correction_low = correction_dimension(beta_fast)
+    correction_high = correction_dimension(beta_slow)
+    if truncate:
+        correction_low = math.floor(correction_low)
+        correction_high = math.ceil(correction_high)
+    correction_low = max(float(correction_low), 0.0)
+    correction_high = min(float(correction_high), float(rotary_width - 1))
+    if correction_high <= correction_low:
+        raise ModelTranspileError(
+            "YaRN correction range must have positive width, got "
+            f"{correction_low}..{correction_high}"
+        )
+    return {
+        "type": "yarn",
+        "factor": factor,
+        "original_max_position_embeddings": original_context,
+        "beta_fast": beta_fast,
+        "beta_slow": beta_slow,
+        "truncate": truncate,
+        "attention_factor": attention_factor,
+        "correction_low": correction_low,
+        "correction_high": correction_high,
+    }
+
+
 def discover_attention_output_gate(
     config: Json,
     tensors: dict[str, Json],
@@ -1947,6 +2025,7 @@ def make_layer(
             "rms_norm_eps": structure.norm_eps,
             "rope_theta": layer.rope_theta,
             "rope_type": layer.rope_type,
+            "rope_scaling": deepcopy(layer.rope_scaling),
             "rope_interleaved": structure.rope_interleaved,
             "rotary_width": layer.rotary_width,
             "rms_norm_weight_offset": structure.rms_norm_weight_offset,

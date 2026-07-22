@@ -20,6 +20,11 @@ const uint ROTARY_WIDTH = {{ROTARY_WIDTH}}u;
 const float ROPE_THETA = {{ROPE_THETA}};
 const bool ROPE_INTERLEAVED = {{ROPE_INTERLEAVED}};
 const bool ROPE_PROPORTIONAL = {{ROPE_PROPORTIONAL}};
+const bool ROPE_YARN = {{ROPE_YARN}};
+const float ROPE_FACTOR = {{ROPE_FACTOR}};
+const float ROPE_CORRECTION_LOW = {{ROPE_CORRECTION_LOW}};
+const float ROPE_CORRECTION_HIGH = {{ROPE_CORRECTION_HIGH}};
+const float ROPE_ATTENTION_FACTOR = {{ROPE_ATTENTION_FACTOR}};
 
 float bf16_to_f32(uint value) {
     return uintBitsToFloat((value & 0xffffu) << 16);
@@ -59,6 +64,21 @@ float rotate_value(uint base, uint dim) {
         : read_input(base + dim - (ROTARY_WIDTH / 2u));
 }
 
+float rope_inverse_frequency(uint frequency_index, uint frequency_width) {
+    float inverse_frequency = pow(
+        ROPE_THETA,
+        -2.0 * float(frequency_index) / float(frequency_width)
+    );
+    if (!ROPE_YARN) return inverse_frequency;
+    float ramp = clamp(
+        (float(frequency_index) - ROPE_CORRECTION_LOW)
+            / (ROPE_CORRECTION_HIGH - ROPE_CORRECTION_LOW),
+        0.0,
+        1.0
+    );
+    return mix(inverse_frequency, inverse_frequency / ROPE_FACTOR, ramp);
+}
+
 float rope_angle(uint dim) {
     if (ROPE_PROPORTIONAL) {
         uint half_width = HEAD_WIDTH / 2u;
@@ -66,19 +86,13 @@ float rope_angle(uint dim) {
         if (frequency_index >= (ROTARY_WIDTH / 2u)) {
             return 0.0;
         }
-        float inv_freq = pow(
-            ROPE_THETA,
-            -2.0 * float(frequency_index) / float(HEAD_WIDTH)
-        );
+        float inv_freq = rope_inverse_frequency(frequency_index, HEAD_WIDTH);
         return float(stream_control.words[1]) * inv_freq;
     }
     uint frequency_index = ROPE_INTERLEAVED
         ? dim / 2u
         : dim % (ROTARY_WIDTH / 2u);
-    float inv_freq = pow(
-        ROPE_THETA,
-        -2.0 * float(frequency_index) / float(ROTARY_WIDTH)
-    );
+    float inv_freq = rope_inverse_frequency(frequency_index, ROTARY_WIDTH);
     return float(stream_control.words[1]) * inv_freq;
 }
 
@@ -87,8 +101,8 @@ float rotate(uint base, uint dim) {
         return read_input(base + dim);
     }
     float angle = rope_angle(dim);
-    float cosine = round_bf16(cos(angle));
-    float sine = round_bf16(sin(angle));
+    float cosine = round_bf16(cos(angle) * ROPE_ATTENTION_FACTOR);
+    float sine = round_bf16(sin(angle) * ROPE_ATTENTION_FACTOR);
     float direct = round_bf16(read_input(base + dim) * cosine);
     float rotated = round_bf16(rotate_value(base, dim) * sine);
     return round_bf16(direct + rotated);

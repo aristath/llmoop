@@ -1259,6 +1259,7 @@ def causal_scan_batch_shader_file(shader_file: str) -> str | None:
     if re.fullmatch(
         r"parallel_head_norm_rope_2way_bf16_h\d+_\d+_d\d+_r\d+"
         r"_eps[0-9eE+.-]+_offset[0-9eE+.-]+_theta[0-9eE+.-]+"
+        r"(?:_yarn_f[0-9eE+.-]+_lo[0-9eE+.-]+_hi[0-9eE+.-]+_a[0-9eE+.-]+)?"
         r"_(?:half|interleaved|proportional)__sc\d+\.comp",
         shader_file,
     ):
@@ -1291,6 +1292,7 @@ def causal_scan_workgroup_count_x(shader_file: str) -> int:
     head_norm_rope = re.fullmatch(
         r"parallel_head_norm_rope_2way_bf16_h(\d+)_(\d+)_d\d+_r\d+"
         r"_eps[0-9eE+.-]+_offset[0-9eE+.-]+_theta[0-9eE+.-]+"
+        r"(?:_yarn_f[0-9eE+.-]+_lo[0-9eE+.-]+_hi[0-9eE+.-]+_a[0-9eE+.-]+)?"
         r"_(?:half|interleaved|proportional)__sc\d+\.comp",
         shader_file,
     )
@@ -1942,7 +1944,7 @@ def shader_file_for_node(
         if any(len(values) != 1 for values in common_fields.values()) or any(
             int(norm["head_count"]) != int(rope["head_count"])
             for norm, rope in zip(norms, ropes, strict=True)
-        ):
+        ) or ropes[0].get("scaling") != ropes[1].get("scaling"):
             raise ModelCompileError(
                 f"parallel head-norm/rope node {node['id']!r} mixes incompatible branch geometry"
             )
@@ -1962,22 +1964,19 @@ def shader_file_for_node(
                 f"parallel head-norm/rope node {node['id']!r} has incompatible "
                 f"normalization parameters {parameter_shapes}"
             )
-        rope_type = common_fields["rope_type"].pop()
-        interleaved = common_fields["interleaved"].pop()
-        rope_layout = (
-            "proportional"
-            if rope_type == "proportional"
-            else "interleaved"
-            if interleaved
-            else "half"
-        )
+        rope_attrs = {
+            "theta": common_fields["theta"].pop(),
+            "rope_type": common_fields["rope_type"].pop(),
+            "interleaved": common_fields["interleaved"].pop(),
+            "scaling": ropes[0].get("scaling"),
+        }
         binding = stream_control_binding_for_node(circuit, node)
         return (
             f"parallel_head_norm_rope_2way_bf16_h{head_counts[0]}_{head_counts[1]}"
             f"_d{head_width}_r{common_fields['rotary_width'].pop()}"
             f"_eps{shader_float_token(common_fields['eps'].pop())}"
             f"_offset{shader_float_token(common_fields['weight_offset'].pop())}"
-            f"_theta{shader_float_token(common_fields['theta'].pop())}_{rope_layout}"
+            f"_{rope_shader_suffix(rope_attrs)}"
             f"__sc{binding}.comp"
         )
     if op == "per_layer_embedding":
@@ -1997,18 +1996,11 @@ def shader_file_for_node(
         )
     if op == "rotary_position_embedding":
         binding = stream_control_binding_for_node(circuit, node)
-        rope_layout = (
-            "proportional"
-            if node["attrs"].get("rope_type") == "proportional"
-            else "interleaved"
-            if node["attrs"]["interleaved"]
-            else "half"
-        )
         return (
             f"rotary_bf16_{node['attrs']['head_count']}x"
             f"{node['attrs']['head_width']}"
             f"_r{node['attrs']['rotary_width']}"
-            f"_theta{shader_float_token(float(node['attrs']['theta']))}_{rope_layout}"
+            f"_{rope_shader_suffix(node['attrs'])}"
             f"__sc{binding}.comp"
         )
     if op == "append_state_update":
@@ -2601,6 +2593,34 @@ def rms_norm_shader_file(hidden_size: int, eps: float, weight_offset: float) -> 
 
 def shader_float_token(value: float) -> str:
     return format(value, ".9g")
+
+
+def rope_shader_suffix(attrs: Json) -> str:
+    rope_type = str(attrs.get("rope_type", "default"))
+    layout = (
+        "proportional"
+        if rope_type == "proportional"
+        else "interleaved"
+        if attrs.get("interleaved")
+        else "half"
+    )
+    theta = float(attrs["theta"])
+    scaling = attrs.get("scaling")
+    if rope_type == "yarn":
+        if not isinstance(scaling, dict) or scaling.get("type") != "yarn":
+            raise ModelCompileError("YaRN RoPE node has no compiled scaling profile")
+        return (
+            f"theta{shader_float_token(theta)}_yarn"
+            f"_f{shader_float_token(float(scaling['factor']))}"
+            f"_lo{shader_float_token(float(scaling['correction_low']))}"
+            f"_hi{shader_float_token(float(scaling['correction_high']))}"
+            f"_a{shader_float_token(float(scaling['attention_factor']))}_{layout}"
+        )
+    if scaling is not None:
+        raise ModelCompileError(
+            f"RoPE type {rope_type!r} unexpectedly declares a scaling profile"
+        )
+    return f"theta{shader_float_token(theta)}_{layout}"
 
 
 def copy_shader_templates(
@@ -3429,6 +3449,27 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
         (
             r"parallel_head_norm_rope_2way_temporal_bf16_h(\d+)_(\d+)_d(\d+)_r(\d+)"
             r"_eps([0-9eE+.-]+)_offset([0-9eE+.-]+)_theta([0-9eE+.-]+)"
+            r"_yarn_f([0-9eE+.-]+)_lo([0-9eE+.-]+)_hi([0-9eE+.-]+)"
+            r"_a([0-9eE+.-]+)_(half|interleaved|proportional)\.comp",
+            "parallel_head_norm_rope_2way_temporal_bf16.comp.template",
+            (
+                "BRANCH_A_HEADS",
+                "BRANCH_B_HEADS",
+                "HEAD_WIDTH",
+                "ROTARY_WIDTH",
+                "NORM_EPS",
+                "WEIGHT_OFFSET",
+                "ROPE_THETA",
+                "ROPE_FACTOR",
+                "ROPE_CORRECTION_LOW",
+                "ROPE_CORRECTION_HIGH",
+                "ROPE_ATTENTION_FACTOR",
+                "ROPE_LAYOUT",
+            ),
+        ),
+        (
+            r"parallel_head_norm_rope_2way_temporal_bf16_h(\d+)_(\d+)_d(\d+)_r(\d+)"
+            r"_eps([0-9eE+.-]+)_offset([0-9eE+.-]+)_theta([0-9eE+.-]+)"
             r"_(half|interleaved|proportional)\.comp",
             "parallel_head_norm_rope_2way_temporal_bf16.comp.template",
             (
@@ -3445,6 +3486,27 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
         (
             r"parallel_head_norm_rope_2way_bf16_h(\d+)_(\d+)_d(\d+)_r(\d+)"
             r"_eps([0-9eE+.-]+)_offset([0-9eE+.-]+)_theta([0-9eE+.-]+)"
+            r"_yarn_f([0-9eE+.-]+)_lo([0-9eE+.-]+)_hi([0-9eE+.-]+)"
+            r"_a([0-9eE+.-]+)_(half|interleaved|proportional)\.comp",
+            "parallel_head_norm_rope_2way_bf16.comp.template",
+            (
+                "BRANCH_A_HEADS",
+                "BRANCH_B_HEADS",
+                "HEAD_WIDTH",
+                "ROTARY_WIDTH",
+                "NORM_EPS",
+                "WEIGHT_OFFSET",
+                "ROPE_THETA",
+                "ROPE_FACTOR",
+                "ROPE_CORRECTION_LOW",
+                "ROPE_CORRECTION_HIGH",
+                "ROPE_ATTENTION_FACTOR",
+                "ROPE_LAYOUT",
+            ),
+        ),
+        (
+            r"parallel_head_norm_rope_2way_bf16_h(\d+)_(\d+)_d(\d+)_r(\d+)"
+            r"_eps([0-9eE+.-]+)_offset([0-9eE+.-]+)_theta([0-9eE+.-]+)"
             r"_(half|interleaved|proportional)\.comp",
             "parallel_head_norm_rope_2way_bf16.comp.template",
             (
@@ -3455,6 +3517,23 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
                 "NORM_EPS",
                 "WEIGHT_OFFSET",
                 "ROPE_THETA",
+                "ROPE_LAYOUT",
+            ),
+        ),
+        (
+            r"rotary_bf16_(\d+)x(\d+)_r(\d+)_theta([0-9eE+.-]+)"
+            r"_yarn_f([0-9eE+.-]+)_lo([0-9eE+.-]+)_hi([0-9eE+.-]+)"
+            r"_a([0-9eE+.-]+)_(half|interleaved|proportional)\.comp",
+            "rotary_bf16.comp.template",
+            (
+                "HEAD_COUNT",
+                "HEAD_WIDTH",
+                "ROTARY_WIDTH",
+                "ROPE_THETA",
+                "ROPE_FACTOR",
+                "ROPE_CORRECTION_LOW",
+                "ROPE_CORRECTION_HIGH",
+                "ROPE_ATTENTION_FACTOR",
                 "ROPE_LAYOUT",
             ),
         ),
@@ -3631,6 +3710,13 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
                 replacements["ROPE_PROPORTIONAL"] = (
                     "true" if rope_layout == "proportional" else "false"
                 )
+                replacements["ROPE_YARN"] = (
+                    "true" if "ROPE_FACTOR" in replacements else "false"
+                )
+                replacements.setdefault("ROPE_FACTOR", "1.0")
+                replacements.setdefault("ROPE_CORRECTION_LOW", "0.0")
+                replacements.setdefault("ROPE_CORRECTION_HIGH", "1.0")
+                replacements.setdefault("ROPE_ATTENTION_FACTOR", "1.0")
             return render_shader_template(source_dir, template, replacements)
 
     per_layer_embedding_shape = re.fullmatch(
@@ -5802,6 +5888,14 @@ def can_fuse_bf16_parallel_head_norm_rope(
             {float(norm["attrs"]["weight_offset"]) for norm in norms},
             {float(rope["attrs"]["theta"]) for rope in ropes},
             {str(rope["attrs"].get("rope_type", "default")) for rope in ropes},
+            {
+                json.dumps(
+                    rope["attrs"].get("scaling"),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                for rope in ropes
+            },
             {bool(rope["attrs"]["interleaved"]) for rope in ropes},
             {str(rope["attrs"]["position_source"]) for rope in ropes},
         )

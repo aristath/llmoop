@@ -8,6 +8,7 @@ from llmoop.model_transpiler import (
     attach_block_quantization_scales,
     attach_packed_linear_quantization,
     annotate_packed_linear_tensors,
+    compile_rope_scaling,
     discover_model_structure,
     discover_quantization_policy,
     discover_sampling_policy,
@@ -20,6 +21,33 @@ from llmoop.model_transpiler import (
 
 def _tensor(shape: list[int], dtype: str = "BF16") -> dict[str, object]:
     return {"dtype": dtype, "shape": shape}
+
+
+def test_compiles_exact_yarn_frequency_and_attention_scaling() -> None:
+    scaling = compile_rope_scaling(
+        {
+            "rope_type": "yarn",
+            "rope_theta": 500_000.0,
+            "factor": 32.0,
+            "original_max_position_embeddings": 8192,
+            "beta_fast": 32.0,
+            "beta_slow": 1.0,
+            "attention_factor": 1.3465735902799727,
+        },
+        64,
+    )
+
+    assert scaling == {
+        "type": "yarn",
+        "factor": 32.0,
+        "original_max_position_embeddings": 8192,
+        "beta_fast": 32.0,
+        "beta_slow": 1.0,
+        "truncate": True,
+        "attention_factor": 1.3465735902799727,
+        "correction_low": 9.0,
+        "correction_high": 18.0,
+    }
 
 
 def test_discovers_model_owned_sampling_policy() -> None:
