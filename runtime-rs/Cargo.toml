@@ -37,3 +37,6 @@ sha2 = "0.10"
 smallvec = "1.15.2"
 tokenizers = { version = "0.23.1", optional = true }
 unicode-width = { version = "0.2.2", optional = true }
+
+[build-dependencies]
+sha2 = "0.10"

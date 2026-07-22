@@ -28,6 +28,10 @@ from llmoop.compilation import (
     relative_json_path,
     write_json,
 )
+from llmoop.compiler_fingerprint import (
+    COMPILER_FINGERPRINT_SCHEMA,
+    package_compiler_fingerprint,
+)
 from llmoop.model_transpiler import read_safetensors_header, transpile_model
 
 
@@ -637,6 +641,7 @@ def build_vulkan_resident_package_manifest(
     return {
         "schema": PACKAGE_SCHEMA,
         "package_id": package_id,
+        "compiler_fingerprint": package_compiler_fingerprint(shader_source_dir),
         "circuit_graph": package_circuit_graph(
             lowered_index, lowered_dir, compiled_circuits
         ),
@@ -3909,6 +3914,14 @@ def validate_compiled_package(package_dir: Path, manifest: Json) -> None:
         )
     if not isinstance(manifest.get("package_id"), str) or not manifest["package_id"]:
         raise ModelCompileError("compiled package has no package id")
+    compiler_fingerprint = manifest.get("compiler_fingerprint")
+    if not isinstance(compiler_fingerprint, str) or re.fullmatch(
+        rf"{re.escape(COMPILER_FINGERPRINT_SCHEMA)}:[0-9a-f]{{64}}",
+        compiler_fingerprint,
+    ) is None:
+        raise ModelCompileError(
+            "compiled package has no valid compiler fingerprint; recompile the model"
+        )
     if (
         not isinstance(manifest.get("max_context_activations"), int)
         or isinstance(manifest.get("max_context_activations"), bool)

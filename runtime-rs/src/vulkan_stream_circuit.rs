@@ -51,7 +51,8 @@ pub const VULKAN_STREAM_CIRCUIT_BACKEND_ID: &str = "vulkan_stream_circuit_ir";
 pub const VULKAN_REUSABLE_KERNEL_ARTIFACT_MANIFEST_SCHEMA: &str =
     "llmoop.vulkan_reusable_kernel_artifacts.v1";
 pub const VULKAN_RESIDENT_MODEL_PACKAGE_MANIFEST_SCHEMA: &str =
-    "llmoop.vulkan_resident_model_package.v2";
+    "llmoop.vulkan_resident_model_package.v3";
+pub const VULKAN_PACKAGE_COMPILER_FINGERPRINT: &str = env!("LLMOOP_PACKAGE_COMPILER_FINGERPRINT");
 const CONTRACT_DIGEST_ALGORITHM: &str = "llmoop.json_tree_sha256.v1";
 const VULKAN_STREAM_CONTROL_BYTE_CAPACITY: usize = 5 * std::mem::size_of::<u32>();
 const VULKAN_STREAM_CONTROL_TOKEN_BYTE_CAPACITY: usize = std::mem::size_of::<u32>();
@@ -10990,6 +10991,7 @@ impl Error for VulkanResidentTokenModelPackageError {}
 pub struct VulkanResidentModelPackageManifest {
     pub schema: String,
     pub package_id: String,
+    pub compiler_fingerprint: String,
     pub circuit_graph: VulkanResidentPackageCircuitGraph,
     pub tensor_index_path: String,
     pub behavioral_validation_path: String,
@@ -11830,6 +11832,30 @@ impl VulkanResidentModelPackageManifest {
         let bytes = fs::read(path)?;
         let raw_manifest: Value = serde_json::from_slice(&bytes)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let schema = raw_manifest
+            .get("schema")
+            .and_then(Value::as_str)
+            .unwrap_or("<missing>");
+        if schema != VULKAN_RESIDENT_MODEL_PACKAGE_MANIFEST_SCHEMA {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "unsupported resident model package manifest schema {schema:?}; recompile the model"
+                ),
+            ));
+        }
+        let compiler_fingerprint = raw_manifest
+            .get("compiler_fingerprint")
+            .and_then(Value::as_str)
+            .unwrap_or("<missing>");
+        if compiler_fingerprint != VULKAN_PACKAGE_COMPILER_FINGERPRINT {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "compiled package fingerprint {compiler_fingerprint:?} does not match runtime fingerprint {VULKAN_PACKAGE_COMPILER_FINGERPRINT:?}; recompile the model"
+                ),
+            ));
+        }
         let compiler_owned_placement = ["device_id", "placement"]
             .into_iter()
             .filter(|field| raw_manifest.get(field).is_some())
@@ -11844,15 +11870,6 @@ impl VulkanResidentModelPackageManifest {
         }
         let manifest: Self = serde_json::from_value(raw_manifest.clone())
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        if manifest.schema != VULKAN_RESIDENT_MODEL_PACKAGE_MANIFEST_SCHEMA {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "unsupported resident model package manifest schema {:?}",
-                    manifest.schema
-                ),
-            ));
-        }
         validate_resident_package_paths(&manifest)?;
         validate_behavioral_validation_artifact(path, &manifest, &raw_manifest)?;
         validate_resident_package_artifact_integrity(path, &manifest)?;
@@ -28447,6 +28464,48 @@ mod tests {
     const FIXTURE_MODEL_INPUT_FRAME_SIGNAL: &str = "input_frame";
     const FIXTURE_MODEL_OUTPUT_FRAME_SIGNAL: &str = "output_frame";
     const FIXTURE_MODEL_HIDDEN_SIZE: usize = 1_024;
+
+    #[test]
+    fn package_loader_rejects_stale_compiler_contracts_before_package_setup() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let manifest_path = std::env::temp_dir().join(format!(
+            "llmoop-stale-compiler-contract-{}-{unique}.json",
+            std::process::id()
+        ));
+
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec(&serde_json::json!({
+                "schema": "llmoop.vulkan_resident_model_package.v2"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let schema_error = VulkanResidentModelPackageManifest::from_json_file(&manifest_path)
+            .unwrap_err()
+            .to_string();
+        assert!(schema_error.contains("recompile the model"));
+
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec(&serde_json::json!({
+                "schema": VULKAN_RESIDENT_MODEL_PACKAGE_MANIFEST_SCHEMA,
+                "compiler_fingerprint": "stale"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let fingerprint_error = VulkanResidentModelPackageManifest::from_json_file(&manifest_path)
+            .unwrap_err()
+            .to_string();
+        assert!(fingerprint_error.contains("does not match runtime fingerprint"));
+        assert!(fingerprint_error.contains("recompile the model"));
+
+        std::fs::remove_file(manifest_path).unwrap();
+    }
 
     #[test]
     fn loaded_artifact_manifest_preserves_compiled_launch_geometry() {

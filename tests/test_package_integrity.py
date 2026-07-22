@@ -8,11 +8,12 @@ from pathlib import Path
 
 import pytest
 
-from llmoop.compilation import PACKAGE_SCHEMA, ModelCompileError
 from llmoop.behavioral_compiler import (
     CONTRACT_DIGEST_ALGORITHM,
     json_contract_digest,
 )
+from llmoop.compilation import PACKAGE_SCHEMA, ModelCompileError
+from llmoop.compiler_fingerprint import package_compiler_fingerprint
 from llmoop.model_package import (
     build_package_artifact_integrity,
     compile_shader_artifacts,
@@ -279,6 +280,9 @@ def minimal_package(root: Path) -> dict[str, object]:
     manifest = {
         "schema": PACKAGE_SCHEMA,
         "package_id": "fixture_package",
+        "compiler_fingerprint": package_compiler_fingerprint(
+            Path(__file__).parents[1] / "runtime-rs" / "shaders"
+        ),
         "max_context_activations": 1024,
         "required_vulkan_device_extensions": [],
         "required_vulkan_features": [],
@@ -438,6 +442,7 @@ def test_package_integrity_accepts_a_complete_compiler_boundary(tmp_path: Path) 
     ("corruption", "message"),
     [
         ("schema", "unsupported schema"),
+        ("compiler_fingerprint", "valid compiler fingerprint"),
         ("config", "missing required artifact"),
         ("behavioral", "missing behavioral validation artifact"),
         ("tokenizer", "missing tokenizer artifact"),
@@ -467,6 +472,8 @@ def test_package_integrity_rejects_corrupt_or_incomplete_artifacts(
     manifest = minimal_package(tmp_path)
     if corruption == "schema":
         manifest["schema"] = "broken"
+    elif corruption == "compiler_fingerprint":
+        manifest["compiler_fingerprint"] = "broken"
     elif corruption == "config":
         (tmp_path / "config.json").unlink()
     elif corruption == "behavioral":
