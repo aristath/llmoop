@@ -6,6 +6,7 @@ import re
 import shutil
 import struct
 from collections import Counter
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -2782,19 +2783,27 @@ def synthesize_packed_expert_tensors(
         return
 
     expert_pattern = re.compile(
-        rf"^{re.escape(layer_prefix)}\.mlp\.experts\.(\d+)\.gate_proj\.weight$"
+        rf"^{re.escape(layer_prefix)}\.mlp\.experts\.(\d+)\.gate_proj\."
+        r"(weight|weight_packed)$"
     )
-    expert_indices = sorted(
-        int(match.group(1))
+    expert_storage = {
+        int(match.group(1)): match.group(2)
         for tensor_name in tensors
         if (match := expert_pattern.fullmatch(tensor_name)) is not None
-    )
+    }
+    expert_indices = sorted(expert_storage)
     if not expert_indices:
         return
     if expert_indices != list(range(len(expert_indices))):
         raise ModelTranspileError(
             f"layer prefix {layer_prefix!r} has non-contiguous expert indices"
         )
+    storage_suffixes = set(expert_storage.values())
+    if len(storage_suffixes) != 1:
+        raise ModelTranspileError(
+            f"layer prefix {layer_prefix!r} mixes expert storage formats"
+        )
+    storage_suffix = storage_suffixes.pop()
 
     gate_weights: list[str] = []
     up_weights: list[str] = []
@@ -2804,9 +2813,9 @@ def synthesize_packed_expert_tensors(
     down_scales: list[str] = []
     for expert in expert_indices:
         base = f"{layer_prefix}.mlp.experts.{expert}"
-        gate = f"{base}.gate_proj.weight"
-        up = f"{base}.up_proj.weight"
-        down = f"{base}.down_proj.weight"
+        gate = f"{base}.gate_proj.{storage_suffix}"
+        up = f"{base}.up_proj.{storage_suffix}"
+        down = f"{base}.down_proj.{storage_suffix}"
         required = (gate, up, down)
         missing = [name for name in required if name not in tensors]
         if missing:
@@ -2827,6 +2836,28 @@ def synthesize_packed_expert_tensors(
             gate_scales.append(scales[0])
             up_scales.append(scales[1])
             down_scales.append(scales[2])
+        elif storage_suffix == "weight_packed":
+            quantizations = [tensors[name].get("quantization") for name in required]
+            if any(
+                not isinstance(quantization, dict)
+                or quantization.get("format")
+                != "compressed_tensors_pack_quantized"
+                for quantization in quantizations
+            ):
+                raise ModelTranspileError(
+                    f"layer prefix {layer_prefix!r} expert {expert} has unsupported "
+                    "packed quantization"
+                )
+            scales = tuple(str(quantization["scales"]) for quantization in quantizations)
+            missing_scales = [name for name in scales if name not in tensors]
+            if missing_scales:
+                raise ModelTranspileError(
+                    f"layer prefix {layer_prefix!r} expert {expert} is missing "
+                    f"INT4 scales {missing_scales}"
+                )
+            gate_scales.append(scales[0])
+            up_scales.append(scales[1])
+            down_scales.append(scales[2])
 
     gate_shape = tensor_matrix_shape(tensors, gate_weights[0])
     up_shape = tensor_matrix_shape(tensors, up_weights[0])
@@ -2836,21 +2867,69 @@ def synthesize_packed_expert_tensors(
             f"layer prefix {layer_prefix!r} has incompatible expert projection "
             f"shapes gate={gate_shape}, up={up_shape}, down={down_shape}"
         )
+    for gate, up, down in zip(
+        gate_weights, up_weights, down_weights, strict=True
+    ):
+        if (
+            tensor_matrix_shape(tensors, gate) != gate_shape
+            or tensor_matrix_shape(tensors, up) != up_shape
+            or tensor_matrix_shape(tensors, down) != down_shape
+        ):
+            raise ModelTranspileError(
+                f"layer prefix {layer_prefix!r} has inconsistent expert projection shapes"
+            )
     input_parts = [
         tensor_name
         for gate, up in zip(gate_weights, up_weights, strict=True)
         for tensor_name in (gate, up)
     ]
-    tensors[packed_input] = composite_tensor(
-        tensors,
-        input_parts,
-        [len(expert_indices), gate_shape[0] * 2, gate_shape[1]],
-    )
-    tensors[packed_output] = composite_tensor(
-        tensors,
-        down_weights,
-        [len(expert_indices), down_shape[0], down_shape[1]],
-    )
+    if storage_suffix == "weight_packed":
+        gate_storage_shape = [int(value) for value in tensors[gate_weights[0]]["shape"]]
+        up_storage_shape = [int(value) for value in tensors[up_weights[0]]["shape"]]
+        down_storage_shape = [int(value) for value in tensors[down_weights[0]]["shape"]]
+        if (
+            gate_storage_shape != up_storage_shape
+            or len(gate_storage_shape) != 2
+            or len(down_storage_shape) != 2
+        ):
+            raise ModelTranspileError(
+                f"layer prefix {layer_prefix!r} has incompatible packed expert storage"
+            )
+        tensors[packed_input] = composite_tensor(
+            tensors,
+            input_parts,
+            [
+                len(expert_indices),
+                gate_storage_shape[0] * 2,
+                gate_storage_shape[1],
+            ],
+        )
+        tensors[packed_input]["logical_shape"] = [
+            len(expert_indices),
+            gate_shape[0] * 2,
+            gate_shape[1],
+        ]
+        tensors[packed_output] = composite_tensor(
+            tensors,
+            down_weights,
+            [len(expert_indices), *down_storage_shape],
+        )
+        tensors[packed_output]["logical_shape"] = [
+            len(expert_indices),
+            down_shape[0],
+            down_shape[1],
+        ]
+    else:
+        tensors[packed_input] = composite_tensor(
+            tensors,
+            input_parts,
+            [len(expert_indices), gate_shape[0] * 2, gate_shape[1]],
+        )
+        tensors[packed_output] = composite_tensor(
+            tensors,
+            down_weights,
+            [len(expert_indices), down_shape[0], down_shape[1]],
+        )
 
     if gate_scales:
         gate_scale_shape = tensor_matrix_shape(tensors, gate_scales[0])
@@ -2865,7 +2944,17 @@ def synthesize_packed_expert_tensors(
             for gate, up in zip(gate_scales, up_scales, strict=True)
             for tensor_name in (gate, up)
         ]
-        tensors[f"{packed_input}_scale_inv"] = composite_tensor(
+        input_scale_name = (
+            f"{packed_input}_scales"
+            if storage_suffix == "weight_packed"
+            else f"{packed_input}_scale_inv"
+        )
+        output_scale_name = (
+            f"{packed_output}_scales"
+            if storage_suffix == "weight_packed"
+            else f"{packed_output}_scale_inv"
+        )
+        tensors[input_scale_name] = composite_tensor(
             tensors,
             input_scale_parts,
             [
@@ -2874,11 +2963,18 @@ def synthesize_packed_expert_tensors(
                 gate_scale_shape[1],
             ],
         )
-        tensors[f"{packed_output}_scale_inv"] = composite_tensor(
+        tensors[output_scale_name] = composite_tensor(
             tensors,
             down_scales,
             [len(expert_indices), *down_scale_shape],
         )
+        if storage_suffix == "weight_packed":
+            input_quantization = deepcopy(tensors[gate_weights[0]]["quantization"])
+            input_quantization["scales"] = input_scale_name
+            output_quantization = deepcopy(tensors[down_weights[0]]["quantization"])
+            output_quantization["scales"] = output_scale_name
+            tensors[packed_input]["quantization"] = input_quantization
+            tensors[packed_output]["quantization"] = output_quantization
 
     synthesize_shared_expert_input(tensors, layer_prefix)
 
