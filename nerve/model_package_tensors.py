@@ -914,6 +914,45 @@ def parameter_dtype_for_id(circuit: Json, parameter_id: str, tensor_index: Json)
     return str(tensor_index["tensors"][parameter["tensor"]]["dtype"])
 
 
+def q8_0_linear_shape_for_node(
+    circuit: Json, node: Json, tensor_index: Json
+) -> tuple[int, int]:
+    weight_id = str(node["params"][0])
+    weight_ref = circuit["parameters"]["refs"][weight_id]
+    weight_info = tensor_index["tensors"][weight_ref["tensor"]]
+    logical_shape = tensor_shape(tensor_index, weight_ref["tensor"])
+    if len(logical_shape) != 2:
+        raise ModelCompileError(
+            f"Q8_0 linear node {node['id']!r} requires a rank-2 logical shape"
+        )
+    out_features, in_features = map(int, logical_shape)
+    physical_shape = [int(value) for value in weight_info.get("shape", [])]
+    expected_physical_shape = [
+        out_features,
+        in_features // Q8_0_GROUP_SIZE,
+        Q8_0_BLOCK_WORDS,
+    ]
+    expected_bytes = (
+        out_features
+        * (in_features // Q8_0_GROUP_SIZE)
+        * Q8_0_BLOCK_BYTE_COUNT
+    )
+    if (
+        out_features <= 0
+        or out_features % 2
+        or in_features <= 0
+        or in_features % Q8_0_GROUP_SIZE
+        or physical_shape != expected_physical_shape
+        or int(weight_info.get("byte_count", 0)) != expected_bytes
+        or tensor_layout(tensor_index, weight_ref["tensor"]) != ROW_MAJOR_LAYOUT
+    ):
+        raise ModelCompileError(
+            f"Q8_0 linear node {node['id']!r} has incompatible shape, byte count, "
+            f"or layout for logical shape {logical_shape}"
+        )
+    return out_features, in_features
+
+
 def scalar_parameter_read_expression(buffer: str, dtype_token: str) -> str:
     if dtype_token == "f32":
         return f"uintBitsToFloat({buffer}.words[index])"

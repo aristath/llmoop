@@ -780,6 +780,68 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
             },
         )
 
+    native_q8_linear = re.fullmatch(
+        r"(linear|linear_bias|linear_residual)_q8_0_(\d+)x(\d+)\.comp",
+        shader_file,
+    )
+    if native_q8_linear is not None:
+        operation = native_q8_linear.group(1)
+        input_size, output_size = map(int, native_q8_linear.groups()[1:])
+        if (
+            input_size <= 0
+            or input_size % Q8_0_GROUP_SIZE
+            or output_size <= 0
+            or output_size % 2
+        ):
+            raise ModelCompileError(
+                f"invalid native Q8_0 linear shader shape {shader_file!r}"
+            )
+        has_residual = operation == "linear_residual"
+        has_bias = operation == "linear_bias"
+        output_binding = 2 if has_residual else 1
+        weight_binding = 3 if has_residual else 2
+        auxiliary_buffer = (
+            "layout(set = 0, binding = 3) readonly buffer Bias { "
+            "uint words[]; } bias;"
+            if has_bias
+            else (
+                "layout(set = 0, binding = 1) readonly buffer ResidualFrames { "
+                "uint words[]; } residual_frames;"
+                if has_residual
+                else ""
+            )
+        )
+        finalize_output = (
+            "float finalize_output(uint row, float value) {\n"
+            "    return read_bf16_word(residual_frames.words[row >> 1u], row) + value;\n"
+            "}"
+            if has_residual
+            else (
+                "float finalize_output(uint row, float value) {\n"
+                "    return read_bf16_word(bias.words[row >> 1u], row) + value;\n"
+                "}"
+                if has_bias
+                else (
+                    "float finalize_output(uint row, float value) {\n"
+                    "    return value;\n"
+                    "}"
+                )
+            )
+        )
+        return render_shader_template(
+            source_dir,
+            "linear_q8_0.comp.template",
+            {
+                "OUTPUT_BINDING": str(output_binding),
+                "WEIGHT_BINDING": str(weight_binding),
+                "AUXILIARY_BUFFER": auxiliary_buffer,
+                "FINALIZE_OUTPUT_FUNCTION": finalize_output,
+                "INPUT_SIZE": str(input_size),
+                "OUTPUT_SIZE": str(output_size),
+                "OUTPUT_TILE_ROWS": str(Q8_0_OUTPUT_TILE_ROWS),
+            },
+        )
+
     native_int4_linear = re.fullmatch(
         r"(linear|linear_bias|linear_residual)_int4_(gptq|ct)_s(f16|bf16)_"
         r"g(\d+)_(\d+)x(\d+)\.comp",

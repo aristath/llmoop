@@ -60,6 +60,23 @@ float fp8_dot();
     ]
 
 
+def test_compiler_derives_integer_dot_device_extension_from_glsl(
+    tmp_path: Path,
+) -> None:
+    shader = tmp_path / "q8_dot.comp"
+    shader.write_text(
+        """#version 460
+#extension GL_EXT_integer_dot_product : require
+
+void main() {}
+"""
+    )
+
+    assert required_vulkan_device_extensions(tmp_path, {shader.name}) == [
+        "VK_KHR_shader_integer_dot_product"
+    ]
+
+
 def test_compiler_rejects_malformed_spirv_during_requirement_derivation(
     tmp_path: Path,
 ) -> None:
@@ -78,4 +95,3 @@ def test_compiler_fails_closed_for_unmodeled_spirv_capabilities(
 
     with pytest.raises(ModelCompileError, match="without a runtime device contract"):
         spirv_capabilities(shader)
-

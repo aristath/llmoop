@@ -53,10 +53,13 @@ FP8_LINEAR_MIN_WORKGROUPS = 1
 FP8_FUSED_FFN_TILE_ROWS = 16
 Q8_0_GROUP_SIZE = 32
 Q8_0_BLOCK_BYTE_COUNT = 36
+Q8_0_BLOCK_WORDS = Q8_0_BLOCK_BYTE_COUNT // 4
+Q8_0_OUTPUT_TILE_ROWS = 32
 INT4_VALUES_PER_PACKED_WORD = 8
 INT4_GPTQ_OUTPUT_TILE_ROWS = 64
 INT4_CT_OUTPUT_TILE_ROWS = 16
 GLSL_VULKAN_DEVICE_EXTENSION_REQUIREMENTS = {
+    "GL_EXT_integer_dot_product": "VK_KHR_shader_integer_dot_product",
     "GL_EXT_float_e4m3": "VK_EXT_shader_float8",
     "GL_EXT_bfloat16": "VK_KHR_shader_bfloat16",
     "GL_KHR_cooperative_matrix": "VK_KHR_cooperative_matrix",

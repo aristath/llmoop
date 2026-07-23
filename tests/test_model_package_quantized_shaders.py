@@ -93,6 +93,66 @@ def test_parallel_linear_shader_selector_supports_fp8_weight_scale_pairs() -> No
     assert workgroup_count_x_for_node(circuit, node, tensor_index) == 160
 
 
+def test_linear_shader_selector_supports_internal_q8_0_weights() -> None:
+    node = {
+        "id": "project",
+        "op": "linear",
+        "inputs": ["hidden"],
+        "outputs": ["projected"],
+        "params": ["weight"],
+    }
+    circuit = {"parameters": {"refs": {"weight": {"tensor": "weight"}}}}
+    tensor_index = {
+        "tensors": {
+            "weight": {
+                "dtype": "Q8_0",
+                "shape": [768, 16, 9],
+                "logical_shape": [768, 512],
+                "byte_count": 768 * 16 * 36,
+                "layout": ROW_MAJOR_LAYOUT,
+            }
+        }
+    }
+    dimensions = {"hidden_size": 512, "intermediate_size": 2048}
+
+    assert shader_file_for_node(circuit, node, tensor_index, dimensions) == (
+        "linear_q8_0_512x768.comp"
+    )
+    assert workgroup_count_x_for_node(circuit, node, tensor_index) == 24
+
+    node["op"] = "linear_residual"
+    assert shader_file_for_node(circuit, node, tensor_index, dimensions) == (
+        "linear_residual_q8_0_512x768.comp"
+    )
+
+
+def test_compiler_renders_internal_q8_0_linear_shaders(tmp_path: Path) -> None:
+    shader_source_dir = Path(__file__).parents[1] / "runtime-rs" / "shaders"
+    shader_files = {
+        "linear_q8_0_512x768.comp",
+        "linear_bias_q8_0_512x768.comp",
+        "linear_residual_q8_0_512x768.comp",
+    }
+
+    copy_shader_templates(shader_source_dir, tmp_path, shader_files)
+
+    linear = (tmp_path / "linear_q8_0_512x768.comp").read_text()
+    bias = (tmp_path / "linear_bias_q8_0_512x768.comp").read_text()
+    residual = (tmp_path / "linear_residual_q8_0_512x768.comp").read_text()
+    assert "const uint INPUT_SIZE = 512u;" in linear
+    assert "const uint OUTPUT_SIZE = 768u;" in linear
+    assert "const uint OUTPUT_TILE_ROWS = 32u;" in linear
+    assert "const uint Q8_BLOCK_WORDS = 9u;" in linear
+    assert "#extension GL_EXT_integer_dot_product : require" in linear
+    assert "dotPacked4x8EXT" in linear
+    assert "subgroupClusteredMax" in linear
+    assert "shared uint quantized_input" in linear
+    assert "subgroupShuffle(quantized" in linear
+    assert "binding = 3) readonly buffer Bias" in bias
+    assert "binding = 1) readonly buffer ResidualFrames" in residual
+    assert all("{{" not in source for source in (linear, bias, residual))
+
+
 def test_compiler_renders_native_block_scaled_fp8_linear_shaders(
     tmp_path: Path,
 ) -> None:
@@ -419,4 +479,3 @@ def test_compiler_rejects_fp8_sparse_expert_geometry_unsafe_for_native_dot() -> 
             tensor_index,
             stage="gate_up",
         )
-

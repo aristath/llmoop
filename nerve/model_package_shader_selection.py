@@ -71,6 +71,13 @@ def shader_file_for_node(
                 f"{prefix}_fp8_e4m3_b{block_rows}x{block_columns}_"
                 f"{in_features}x{out_features}.comp"
             )
+        if parameter_dtype == "Q8_0":
+            out_features, in_features = q8_0_linear_shape_for_node(
+                circuit, node, tensor_index
+            )
+            has_bias = len(node.get("params", [])) == 2
+            prefix = "linear_bias" if has_bias else "linear"
+            return f"{prefix}_q8_0_{in_features}x{out_features}.comp"
         if parameter_dtype != "BF16":
             raise ModelCompileError(
                 f"linear node {node['id']!r} has unsupported weight dtype "
@@ -333,6 +340,11 @@ def shader_file_for_node(
                 f"linear_residual_fp8_e4m3_b{block_rows}x{block_columns}_"
                 f"{in_features}x{out_features}.comp"
             )
+        if parameter_dtype == "Q8_0":
+            out_features, in_features = q8_0_linear_shape_for_node(
+                circuit, node, tensor_index
+            )
+            return f"linear_residual_q8_0_{in_features}x{out_features}.comp"
         if parameter_dtype != "BF16":
             raise ModelCompileError(
                 f"linear-residual node {node['id']!r} has unsupported weight dtype "
@@ -850,6 +862,10 @@ def workgroup_count_x_for_node(circuit: Json, node: Json, tensor_index: Json) ->
         if parameter_dtype == "F8_E4M3":
             tile_rows = fp8_linear_tile_rows(int(out_features))
             return (int(out_features) + tile_rows - 1) // tile_rows
+        if parameter_dtype == "Q8_0":
+            return (
+                int(out_features) + Q8_0_OUTPUT_TILE_ROWS - 1
+            ) // Q8_0_OUTPUT_TILE_ROWS
         # One workgroup collaboratively computes and packs two BF16 output rows.
         return (int(out_features) + 1) // 2
     if node["op"] in {

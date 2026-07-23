@@ -1,0 +1,136 @@
+#version 460
+
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_clustered : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_EXT_integer_dot_product : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer InputFrame { uint words[]; } input_frame;
+layout(set = 0, binding = {{OUTPUT_BINDING}}) buffer OutputFrame { uint words[]; } output_frame;
+layout(set = 0, binding = {{WEIGHT_BINDING}}) readonly buffer Weight { uint words[]; } weight;
+{{AUXILIARY_BUFFER}}
+
+const uint INPUT_SIZE = {{INPUT_SIZE}}u;
+const uint OUTPUT_SIZE = {{OUTPUT_SIZE}}u;
+const uint OUTPUT_TILE_ROWS = {{OUTPUT_TILE_ROWS}}u;
+const uint INPUT_BLOCKS = INPUT_SIZE / 32u;
+const uint INPUT_Q8_WORDS = INPUT_SIZE / 4u;
+const uint Q8_BLOCK_WORDS = 9u;
+
+shared uint quantized_input[INPUT_Q8_WORDS];
+shared float input_scales[INPUT_BLOCKS];
+shared float subgroup_sum[OUTPUT_TILE_ROWS];
+shared float output_rows[OUTPUT_TILE_ROWS];
+
+float bf16_to_f32(uint value) { return uintBitsToFloat((value & 0xffffu) << 16u); }
+
+uint f32_to_bf16(float value) {
+    uint bits = floatBitsToUint(value);
+    uint lsb = (bits >> 16u) & 1u;
+    return (bits + 0x7fffu + lsb) >> 16u;
+}
+
+float read_bf16_word(uint packed, uint index) {
+    return bf16_to_f32(packed >> ((index & 1u) * 16u));
+}
+
+float read_input(uint column) {
+    return read_bf16_word(input_frame.words[column >> 1u], column);
+}
+
+int clamp_i8(float value) {
+    return clamp(int(round(value)), -127, 127);
+}
+
+uint pack_i8x4(int a, int b, int c, int d) {
+    return (uint(a) & 255u)
+        | ((uint(b) & 255u) << 8u)
+        | ((uint(c) & 255u) << 16u)
+        | ((uint(d) & 255u) << 24u);
+}
+
+float read_weight_scale(uint row, uint block) {
+    uint scale_word = weight.words[(row * INPUT_BLOCKS + block) * Q8_BLOCK_WORDS];
+    return bf16_to_f32(scale_word);
+}
+
+uint read_weight_q8_word(uint row, uint q8_word) {
+    uint block = q8_word >> 3u;
+    uint word = q8_word & 7u;
+    return weight.words[(row * INPUT_BLOCKS + block) * Q8_BLOCK_WORDS + 1u + word];
+}
+
+{{FINALIZE_OUTPUT_FUNCTION}}
+
+void quantize_input(uint lane) {
+    uint cluster = lane >> 5u;
+    uint cluster_lane = lane & 31u;
+    for (uint block = cluster; block < INPUT_BLOCKS; block += 2u) {
+        float value = read_input(block * 32u + cluster_lane);
+        float block_max = subgroupClusteredMax(abs(value), 32u);
+        float scale = block_max > 0.0 ? block_max / 127.0 : 1.0;
+        if (cluster_lane == 0u) {
+            input_scales[block] = scale;
+        }
+        int quantized = clamp_i8(value / scale);
+        if ((cluster_lane & 3u) == 0u) {
+            quantized_input[block * 8u + (cluster_lane >> 2u)] = pack_i8x4(
+                quantized,
+                subgroupShuffle(quantized, gl_SubgroupInvocationID + 1u),
+                subgroupShuffle(quantized, gl_SubgroupInvocationID + 2u),
+                subgroupShuffle(quantized, gl_SubgroupInvocationID + 3u)
+            );
+        }
+    }
+}
+
+void main() {
+    uint lane = gl_LocalInvocationID.x;
+    uint first_row = gl_WorkGroupID.x * OUTPUT_TILE_ROWS;
+    quantize_input(lane);
+    barrier();
+
+    for (uint local_row = 0u; local_row < OUTPUT_TILE_ROWS; local_row++) {
+        uint row = first_row + local_row;
+        float sum = 0.0;
+        if (row < OUTPUT_SIZE) {
+            for (uint q8_word = lane; q8_word < INPUT_Q8_WORDS; q8_word += 64u) {
+                uint block = q8_word >> 3u;
+                uint activation = quantized_input[q8_word];
+                uint qweight = read_weight_q8_word(row, q8_word);
+                int dot = dotPacked4x8EXT(int32_t(activation), int32_t(qweight));
+                sum = fma(
+                    float(dot),
+                    input_scales[block] * read_weight_scale(row, block),
+                    sum
+                );
+            }
+        }
+        sum = subgroupAdd(sum);
+        if (gl_SubgroupInvocationID == 0u) {
+            subgroup_sum[local_row] = sum;
+        }
+    }
+    barrier();
+
+    if (lane < OUTPUT_TILE_ROWS) {
+        uint row = first_row + lane;
+        output_rows[lane] = row < OUTPUT_SIZE ? subgroup_sum[lane] : 0.0;
+    }
+    barrier();
+
+    if (lane < OUTPUT_TILE_ROWS / 2u) {
+        uint row = first_row + lane * 2u;
+        if (row < OUTPUT_SIZE) {
+            uint lo = f32_to_bf16(finalize_output(row, output_rows[lane * 2u]));
+            uint hi = row + 1u < OUTPUT_SIZE
+                ? f32_to_bf16(finalize_output(row + 1u, output_rows[lane * 2u + 1u]))
+                : 0u;
+            output_frame.words[row >> 1u] = (hi << 16u) | lo;
+        }
+    }
+}
