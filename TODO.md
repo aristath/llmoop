@@ -230,6 +230,17 @@ Required pieces:
 
 For MoE models with a small active parameter count, performance should reflect active experts, not the full declared model size.
 
+Current status:
+
+- The compiler represents sparse MoE layers as explicit route-native components:
+  router/top-k, sparse expert gate/up, sparse expert down, and reducer.
+- BF16, FP8, and INT4 sparse expert shader families are generated from the
+  selected-route contract, and compiler tests now guard that expert workgroup
+  counts scale with `experts_per_token`, not the total expert pool.
+- This is not finished: route grouping/batching across streams, expert-shard
+  placement, runtime route counters, and benchmarks proving active-expert
+  scaling on real MoE packages are still required.
+
 ### 9. Make MTP/speculative decoding first-class
 
 Speculative decoding should not be treated as benchmark garnish.
