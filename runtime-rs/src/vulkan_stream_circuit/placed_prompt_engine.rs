@@ -234,6 +234,9 @@ impl VulkanResidentInProcessPlacedPromptEngine {
         let mut decode_activation_count = 0usize;
         let mut prefill_time_ns = 0u64;
         let mut decode_time_ns = 0u64;
+        let mut scheduler_step_count = 0usize;
+        let mut activation_batch_count = 0usize;
+        let mut max_activation_batch_width = 0usize;
         let scheduler_activation_capacity = self.streams.len().max(1);
         let scheduler_budget = RuntimeStreamSchedulerBudget::new(
             scheduler_activation_capacity,
@@ -249,8 +252,12 @@ impl VulkanResidentInProcessPlacedPromptEngine {
             if scheduler_step.batches.is_empty() {
                 break;
             }
+            scheduler_step_count = scheduler_step_count.saturating_add(1);
+            activation_batch_count =
+                activation_batch_count.saturating_add(scheduler_step.batches.len());
 
             for batch in scheduler_step.batches {
+                max_activation_batch_width = max_activation_batch_width.max(batch.activations.len());
                 for activation in batch.activations {
                     let activation_is_prefill =
                         matches!(activation.kind, RuntimeStreamActivationKind::PrefillChunk { .. });
@@ -317,6 +324,9 @@ impl VulkanResidentInProcessPlacedPromptEngine {
             input_runs,
             output_events,
             generated_token_ids,
+            scheduler_step_count,
+            activation_batch_count,
+            max_activation_batch_width,
             prefill_activation_count,
             decode_activation_count,
             prefill_time_ns,
@@ -416,6 +426,9 @@ pub struct VulkanResidentInProcessPlacedPromptEngineRun {
     pub input_runs: Vec<VulkanResidentInProcessPlacedPromptEngineInputRun>,
     pub output_events: Vec<VulkanResidentTokenRuntimeSchedulerOutputEvent>,
     pub generated_token_ids: Vec<u32>,
+    pub scheduler_step_count: usize,
+    pub activation_batch_count: usize,
+    pub max_activation_batch_width: usize,
     pub prefill_activation_count: usize,
     pub decode_activation_count: usize,
     pub prefill_time_ns: u64,

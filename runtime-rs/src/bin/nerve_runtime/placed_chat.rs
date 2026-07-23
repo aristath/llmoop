@@ -100,6 +100,9 @@ fn run_placed_chat(
                 run_time_ns,
                 token_ids.len(),
                 run.generated_token_ids.len(),
+                run.engine_run.scheduler_step_count,
+                run.engine_run.activation_batch_count,
+                run.engine_run.max_activation_batch_width,
                 run.engine_run.prefill_activation_count,
                 run.engine_run.decode_activation_count,
                 run.engine_run.prefill_time_ns,
@@ -176,6 +179,9 @@ fn execute_placed_prompt_run(
     let decode_activation_count = engine_run.decode_activation_count;
     let prefill_time_ns = engine_run.prefill_time_ns;
     let decode_time_ns = engine_run.decode_time_ns;
+    let scheduler_step_count = engine_run.scheduler_step_count;
+    let activation_batch_count = engine_run.activation_batch_count;
+    let max_activation_batch_width = engine_run.max_activation_batch_width;
     let run = engine_run
         .input_runs
         .into_iter()
@@ -200,6 +206,9 @@ fn execute_placed_prompt_run(
         run_time_ns,
         prompt_ids.len(),
         generated_token_count,
+        scheduler_step_count,
+        activation_batch_count,
+        max_activation_batch_width,
         prefill_activation_count,
         decode_activation_count,
         prefill_time_ns,

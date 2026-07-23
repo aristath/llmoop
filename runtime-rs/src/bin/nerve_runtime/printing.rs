@@ -30,6 +30,12 @@ fn print_runtime_timing_stats(label: &str, timing: &RuntimePromptTimingReport) {
     }
     println!("  prefill_activations={}", timing.prefill_activation_count);
     println!("  decode_activations={}", timing.decode_activation_count);
+    println!("  scheduler_steps={}", timing.scheduler_step_count);
+    println!("  activation_batches={}", timing.activation_batch_count);
+    println!(
+        "  max_activation_batch_width={}",
+        timing.max_activation_batch_width
+    );
     println!(
         "  prefill_ms={:.3}",
         nanos_to_millis(timing.prefill_time_ns)
