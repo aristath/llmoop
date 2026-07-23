@@ -204,21 +204,79 @@ def build_vulkan_resident_package_manifest(
         for component in output_components
         if component["type"] == "linear_projection"
     )
+    projection_scale_tensor = next(
+        (
+            component["params"].get("weight_scale_inv", {}).get("tensor")
+            for component in output_components
+            if component["type"] == "linear_projection"
+        ),
+        None,
+    )
     for role, tensor in (
         ("input embedding", embed_tensor),
         ("output normalization", norm_tensor),
-        ("output projection", projection_tensor),
     ):
         actual_dtype = tensor_dtype(tensor_index, tensor)
         if actual_dtype != dtype:
             raise ModelCompileError(
                 f"{role} tensor {tensor!r} has dtype {actual_dtype}; expected {dtype}"
             )
+    projection_dtype = tensor_dtype(tensor_index, projection_tensor)
     embedding_layout = tensor_layout(tensor_index, embed_tensor)
     projection_layout = tensor_layout(tensor_index, projection_tensor)
     if embedding_layout != ROW_MAJOR_LAYOUT or projection_layout != ROW_MAJOR_LAYOUT:
         raise ModelCompileError(
             "compiled input and output transducers require row-major tensors"
+        )
+    projection_scale_shape = None
+    projection_scale_byte_capacity = None
+    projection_scale_dtype = None
+    projection_block_rows = None
+    projection_block_columns = None
+    if projection_dtype == "BF16":
+        if projection_scale_tensor is not None:
+            raise ModelCompileError(
+                "BF16 output projection must not bind an FP8 scale tensor"
+            )
+    elif projection_dtype == "F8_E4M3":
+        if not isinstance(projection_scale_tensor, str):
+            raise ModelCompileError(
+                f"FP8 output projection tensor {projection_tensor!r} has no scale tensor"
+            )
+        projection_scale_dtype = tensor_dtype(tensor_index, projection_scale_tensor)
+        if projection_scale_dtype != "BF16":
+            raise ModelCompileError(
+                f"FP8 output projection scale tensor {projection_scale_tensor!r} "
+                f"has dtype {projection_scale_dtype}; expected BF16"
+            )
+        if tensor_layout(tensor_index, projection_scale_tensor) != ROW_MAJOR_LAYOUT:
+            raise ModelCompileError("FP8 output projection scales must be row-major")
+        projection_shape = tensor_shape(tensor_index, projection_tensor)
+        projection_scale_shape = tensor_shape(tensor_index, projection_scale_tensor)
+        projection_block_rows = FP8_LINEAR_TILE_ROWS[-1]
+        projection_block_columns = 128
+        expected_scale_shape = [
+            (projection_shape[0] + projection_block_rows - 1) // projection_block_rows,
+            (projection_shape[1] + projection_block_columns - 1)
+            // projection_block_columns,
+        ]
+        if (
+            projection_shape != [vocab_size, hidden_size]
+            or projection_shape[1] % projection_block_columns != 0
+            or projection_scale_shape != expected_scale_shape
+        ):
+            raise ModelCompileError(
+                f"FP8 output projection tensor {projection_tensor!r} shape "
+                f"{projection_shape} and scale shape {projection_scale_shape} "
+                f"do not match expected {[vocab_size, hidden_size]} / "
+                f"{expected_scale_shape}"
+            )
+        projection_scale_byte_capacity = tensor_byte_count(
+            tensor_index, projection_scale_tensor
+        )
+    else:
+        raise ModelCompileError(
+            f"unsupported output projection dtype {projection_dtype!r}"
         )
     embedding_shader_file = (
         f"embedding_lookup_bf16_{vocab_size}x{hidden_size}"
@@ -228,15 +286,38 @@ def build_vulkan_resident_package_manifest(
         "embedding_lookup_", "embedding_lookup_batch_", 1
     )
     output_scale = 1.0 / logits_scale
-    projection_shader_file = (
-        f"tied_output_projection_bf16_{vocab_size}x{hidden_size}"
-        f"_scale{shader_float_token(output_scale)}_to_f32.comp"
-    )
-    projection_batch_lane_tile_width = 4
-    projection_batch_shader_file = (
-        f"tied_output_projection_batch{projection_batch_lane_tile_width}_bf16_"
-        f"{vocab_size}x{hidden_size}_scale{shader_float_token(output_scale)}_to_f32.comp"
-    )
+    if projection_dtype == "F8_E4M3":
+        projection_tile_rows = fp8_linear_tile_rows(vocab_size)
+        projection_shader_file = (
+            f"tied_output_projection_fp8_e4m3_b{projection_block_rows}x"
+            f"{projection_block_columns}_{vocab_size}x{hidden_size}"
+            f"_scale{shader_float_token(output_scale)}_to_f32.comp"
+        )
+        projection_batch_lane_tile_width = 1
+        projection_batch_shader_file = (
+            f"tied_output_projection_batch{projection_batch_lane_tile_width}_"
+            f"fp8_e4m3_b{projection_block_rows}x{projection_block_columns}_"
+            f"{vocab_size}x{hidden_size}_scale{shader_float_token(output_scale)}"
+            "_to_f32.comp"
+        )
+        projection_workgroup_count_x = (
+            vocab_size + projection_tile_rows - 1
+        ) // projection_tile_rows
+        projection_local_size_x = 1024
+    else:
+        projection_shader_file = (
+            f"tied_output_projection_bf16_{vocab_size}x{hidden_size}"
+            f"_scale{shader_float_token(output_scale)}_to_f32.comp"
+        )
+        projection_batch_lane_tile_width = 4
+        projection_batch_shader_file = (
+            f"tied_output_projection_batch{projection_batch_lane_tile_width}_bf16_"
+            f"{vocab_size}x{hidden_size}_scale{shader_float_token(output_scale)}_to_f32.comp"
+        )
+        # The BF16 projection shader collaboratively computes two vocabulary
+        # rows per workgroup.
+        projection_workgroup_count_x = (vocab_size + 1) // 2
+        projection_local_size_x = 64
     norm_shader_file = rms_norm_shader_file(hidden_size, norm_eps, norm_weight_offset)
     norm_batch_lane_tile_width = projection_batch_lane_tile_width
     norm_batch_shader_file = weight_shared_batch_shader_file(
@@ -475,22 +556,23 @@ def build_vulkan_resident_package_manifest(
                     tensor_index, norm_tensor
                 ),
                 "projection_parameter_tensor": projection_tensor,
-                "projection_parameter_dtype": dtype,
+                "projection_parameter_dtype": projection_dtype,
                 "projection_parameter_shape": tensor_shape(
                     tensor_index, projection_tensor
                 ),
                 "projection_parameter_byte_capacity": tensor_byte_count(
                     tensor_index, projection_tensor
                 ),
+                "projection_scale_parameter_tensor": projection_scale_tensor,
+                "projection_scale_parameter_dtype": projection_scale_dtype,
+                "projection_scale_parameter_shape": projection_scale_shape,
+                "projection_scale_parameter_byte_capacity": projection_scale_byte_capacity,
                 "input_frame_byte_capacity": frame_bytes,
                 "normalized_frame_byte_capacity": frame_bytes,
                 "logits_byte_capacity": logits_bytes,
-                # The projection shader collaboratively computes two vocabulary
-                # rows per workgroup. Dispatch geometry is part of the compiled
-                # component, not something the runtime should infer from a model.
-                "projection_workgroup_count_x": (vocab_size + 1) // 2,
+                "projection_workgroup_count_x": projection_workgroup_count_x,
                 "norm_local_size_x": 64,
-                "projection_local_size_x": 64,
+                "projection_local_size_x": projection_local_size_x,
             },
             "embedding_norm_shader_path": compiled_shader_path(
                 f"shaders/{norm_shader_file}"
@@ -688,6 +770,10 @@ def speculative_decoder_specs(
                     "projection_parameter_byte_capacity": tensor_byte_count(
                         tensor_index, projection_tensor
                     ),
+                    "projection_scale_parameter_tensor": None,
+                    "projection_scale_parameter_dtype": None,
+                    "projection_scale_parameter_shape": None,
+                    "projection_scale_parameter_byte_capacity": None,
                     "input_frame_byte_capacity": frame_bytes,
                     "output_hidden_byte_capacity": frame_bytes,
                     "logits_byte_capacity": logits_bytes,

@@ -613,6 +613,11 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
                         },
                     )
                 })?;
+            let projection_scale = projection_scale_parameter_buffer(
+                &self.model.output_transducer_parameter_buffers,
+                &self.model.output_transducer_spec,
+            )
+            .map_err(VulkanResidentInProcessPlacedRuntimeError::OutputTransducer)?;
             let batch_execution = self.component_batch_execution.borrow();
             let raw_output = batch_execution
                 .as_ref()
@@ -629,6 +634,7 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
                 &raw_output.buffer,
                 norm_weight,
                 projection_weight,
+                projection_scale,
                 &self.model.embedding_norm_batch_spirv_words,
                 &self.model.tied_projection_batch_spirv_words,
                 &self.model.output_transducer_spec,

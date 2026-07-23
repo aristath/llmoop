@@ -502,6 +502,52 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
             },
         )
 
+    tied_output_projection_fp8 = re.fullmatch(
+        r"tied_output_projection(?:_batch(\d+))?_fp8_e4m3_b(\d+)x(\d+)_"
+        r"(\d+)x(\d+)_scale([A-Za-z0-9_]+)_to_f32\.comp",
+        shader_file,
+    )
+    if tied_output_projection_fp8 is not None:
+        batch_tile_width = (
+            int(tied_output_projection_fp8.group(1))
+            if tied_output_projection_fp8.group(1) is not None
+            else None
+        )
+        block_rows = int(tied_output_projection_fp8.group(2))
+        block_columns = int(tied_output_projection_fp8.group(3))
+        vocab_size = int(tied_output_projection_fp8.group(4))
+        input_size = int(tied_output_projection_fp8.group(5))
+        output_scale = tied_output_projection_fp8.group(6)
+        if (
+            (batch_tile_width is not None and batch_tile_width <= 0)
+            or
+            block_rows <= 0
+            or block_columns != 128
+            or input_size <= 0
+            or input_size % block_columns != 0
+            or vocab_size <= 0
+        ):
+            raise ModelCompileError(
+                f"invalid FP8 output projection shader shape {shader_file!r}"
+            )
+        return render_shader_template(
+            source_dir,
+            (
+                "tied_output_projection_batch_fp8_e4m3.comp.template"
+                if batch_tile_width is not None
+                else "tied_output_projection_fp8_e4m3.comp.template"
+            ),
+            {
+                "BATCH_TILE_WIDTH": str(batch_tile_width or 1),
+                "BLOCK_ROWS": str(block_rows),
+                "BLOCK_COLUMNS": str(block_columns),
+                "INPUT_SIZE": str(input_size),
+                "VOCAB_SIZE": str(vocab_size),
+                "OUTPUT_TILE_ROWS": str(fp8_linear_tile_rows(vocab_size)),
+                "OUTPUT_SCALE": output_scale,
+            },
+        )
+
     batched_bf16_linear = re.fullmatch(
         r"(linear|linear_residual)_batch(\d+)_bf16_"
         r"(\d+)x(\d+)\.comp",
@@ -1788,5 +1834,3 @@ def render_shader_template(
             f"shader template {template_path} has unresolved values: {', '.join(unresolved)}"
         )
     return rendered
-
-

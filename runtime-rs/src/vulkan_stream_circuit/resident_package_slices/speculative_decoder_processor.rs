@@ -114,12 +114,25 @@ impl VulkanResidentSpeculativeDecoderProcessor {
                     },
                 )
             })?;
+        let projection_scale = match output_spec.projection_scale_parameter_tensor.as_ref() {
+            Some(tensor) => Some(model.parameter(target_output_parameters, tensor).ok_or_else(
+                || {
+                    VulkanResidentInProcessPlacedRuntimeError::OutputTransducer(
+                        VulkanResidentOutputTransducerRunnerError::MissingProjectionScaleParameterBuffer {
+                            tensor: tensor.clone(),
+                        },
+                    )
+                },
+            )?),
+            None => None,
+        };
         let output_transducer =
             VulkanResidentOutputTransducerRunner::from_mounted_output_transducer_with_parameter_allocations(
                 device,
                 &mounted,
                 norm_weight,
                 projection_weight,
+                projection_scale,
                 &model.output_norm_spirv_words,
                 &model.output_projection_spirv_words,
                 &output_spec,
@@ -494,4 +507,3 @@ impl VulkanResidentSpeculativeDecoderProcessor {
             .map_err(VulkanResidentInProcessPlacedRuntimeError::FeedbackEdge)
     }
 }
-

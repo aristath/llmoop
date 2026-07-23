@@ -18,6 +18,7 @@ impl VulkanResidentBatchedOutputProjectionRunner {
         raw_frames_buffer: &VulkanResidentBuffer,
         norm_weight: &VulkanPermanentParameterBufferAllocation,
         projection_weight: &VulkanPermanentParameterBufferAllocation,
+        projection_scale: Option<&VulkanPermanentParameterBufferAllocation>,
         norm_spirv_words: &[u32],
         projection_spirv_words: &[u32],
         output_spec: &VulkanResidentOutputTransducerSpec,
@@ -49,6 +50,8 @@ impl VulkanResidentBatchedOutputProjectionRunner {
             ));
         }
         validate_output_projection_weight(projection_weight, output_spec)
+            .map_err(VulkanResidentInProcessPlacedRuntimeError::OutputTransducer)?;
+        validate_output_projection_scale(projection_scale, output_spec)
             .map_err(VulkanResidentInProcessPlacedRuntimeError::OutputTransducer)?;
         validate_output_embedding_norm_weight(norm_weight, output_spec)
             .map_err(VulkanResidentInProcessPlacedRuntimeError::OutputTransducer)?;
@@ -130,7 +133,7 @@ impl VulkanResidentBatchedOutputProjectionRunner {
                     "batched output projection workgroup count overflowed".to_string(),
                 ))
             })?;
-        let bindings = [
+        let mut bindings = vec![
             VulkanResidentKernelBufferBinding::new(
                 0,
                 &normalized_frames_buffer,
@@ -150,6 +153,12 @@ impl VulkanResidentBatchedOutputProjectionRunner {
             )
             .with_access(VulkanResidentKernelBufferAccess::Write),
         ];
+        if let Some(scale) = projection_scale {
+            bindings.push(
+                VulkanResidentKernelBufferBinding::new(3, &scale.buffer, scale.byte_capacity)
+                    .with_access(VulkanResidentKernelBufferAccess::Read),
+            );
+        }
         let projection_dispatch = device
             .create_resident_kernel_dispatch_2d(
                 projection_spirv_words,
@@ -279,4 +288,3 @@ impl VulkanResidentBatchedOutputProjectionRunner {
             .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)
     }
 }
-

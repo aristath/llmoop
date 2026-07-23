@@ -174,6 +174,11 @@ impl VulkanResidentSpeculativeDecoderModelPackage {
             projection_parameter_dtype: output.projection_parameter_dtype.clone(),
             projection_parameter_shape: output.projection_parameter_shape.clone(),
             projection_parameter_byte_capacity: output.projection_parameter_byte_capacity,
+            projection_scale_parameter_tensor: output.projection_scale_parameter_tensor.clone(),
+            projection_scale_parameter_dtype: output.projection_scale_parameter_dtype.clone(),
+            projection_scale_parameter_shape: output.projection_scale_parameter_shape.clone(),
+            projection_scale_parameter_byte_capacity: output
+                .projection_scale_parameter_byte_capacity,
             input_frame_byte_capacity: output.input_frame_byte_capacity,
             normalized_frame_byte_capacity: output.output_hidden_byte_capacity,
             logits_byte_capacity: output.logits_byte_capacity,

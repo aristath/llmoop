@@ -26,6 +26,10 @@ pub struct VulkanResidentOutputTransducerSpec {
     pub projection_parameter_dtype: String,
     pub projection_parameter_shape: Vec<usize>,
     pub projection_parameter_byte_capacity: usize,
+    pub projection_scale_parameter_tensor: Option<String>,
+    pub projection_scale_parameter_dtype: Option<String>,
+    pub projection_scale_parameter_shape: Option<Vec<usize>>,
+    pub projection_scale_parameter_byte_capacity: Option<usize>,
     pub input_frame_byte_capacity: usize,
     pub normalized_frame_byte_capacity: usize,
     pub logits_byte_capacity: usize,
@@ -57,11 +61,13 @@ impl VulkanResidentOutputTransducerRunner {
                     tensor: spec.projection_parameter_tensor.clone(),
                 }
             })?;
+        let embedding_scale = projection_scale_parameter_buffer(transducer_parameter_buffers, spec)?;
         Self::from_mounted_output_transducer_with_parameter_allocations(
             device,
             mounted,
             embedding_norm_weight,
             embedding_weight,
+            embedding_scale,
             embedding_norm_spirv_words,
             tied_projection_spirv_words,
             spec,
@@ -73,6 +79,7 @@ impl VulkanResidentOutputTransducerRunner {
         mounted: &VulkanMountedPlacedStreamCircuit,
         embedding_norm_weight: &VulkanPermanentParameterBufferAllocation,
         embedding_weight: &VulkanPermanentParameterBufferAllocation,
+        embedding_scale: Option<&VulkanPermanentParameterBufferAllocation>,
         embedding_norm_spirv_words: &[u32],
         tied_projection_spirv_words: &[u32],
         spec: &VulkanResidentOutputTransducerSpec,
@@ -96,6 +103,7 @@ impl VulkanResidentOutputTransducerRunner {
         }
 
         validate_output_projection_weight(embedding_weight, spec)?;
+        validate_output_projection_scale(embedding_scale, spec)?;
         validate_output_embedding_norm_weight(embedding_norm_weight, spec)?;
 
         let normalized_frame_buffer =
@@ -134,7 +142,7 @@ impl VulkanResidentOutputTransducerRunner {
         if projection_workgroup_count_x == 0 {
             return Err(VulkanResidentOutputTransducerRunnerError::InvalidProjectionWorkgroupCount);
         }
-        let tied_projection_bindings = [
+        let mut tied_projection_bindings = vec![
             VulkanResidentKernelBufferBinding::new(
                 0,
                 &normalized_frame_buffer,
@@ -150,6 +158,12 @@ impl VulkanResidentOutputTransducerRunner {
             VulkanResidentKernelBufferBinding::new(2, &logits_buffer, spec.logits_byte_capacity)
                 .with_access(VulkanResidentKernelBufferAccess::Write),
         ];
+        if let Some(scale) = embedding_scale {
+            tied_projection_bindings.push(
+                VulkanResidentKernelBufferBinding::new(3, &scale.buffer, scale.byte_capacity)
+                    .with_access(VulkanResidentKernelBufferAccess::Read),
+            );
+        }
         let tied_projection_dispatch = device.create_resident_kernel_dispatch(
             tied_projection_spirv_words,
             &tied_projection_bindings,
@@ -265,6 +279,15 @@ pub enum VulkanResidentOutputTransducerRunnerError {
         shape: Option<Vec<usize>>,
         byte_capacity: usize,
     },
+    MissingProjectionScaleParameterBuffer {
+        tensor: String,
+    },
+    InvalidProjectionScaleWeight {
+        tensor: String,
+        dtype: Option<String>,
+        shape: Option<Vec<usize>>,
+        byte_capacity: usize,
+    },
     MissingModelOutputBuffer {
         signal_id: String,
     },
@@ -305,6 +328,21 @@ impl Display for VulkanResidentOutputTransducerRunnerError {
             } => write!(
                 f,
                 "output embedding norm tensor {tensor:?} has dtype {dtype:?}, shape {shape:?}, and {byte_capacity} bytes"
+            ),
+            Self::MissingProjectionScaleParameterBuffer { tensor } => {
+                write!(
+                    f,
+                    "missing output projection scale parameter buffer for tensor {tensor:?}"
+                )
+            }
+            Self::InvalidProjectionScaleWeight {
+                tensor,
+                dtype,
+                shape,
+                byte_capacity,
+            } => write!(
+                f,
+                "output projection scale tensor {tensor:?} has dtype {dtype:?}, shape {shape:?}, and {byte_capacity} bytes"
             ),
             Self::MissingModelOutputBuffer { signal_id } => {
                 write!(f, "missing model output boundary buffer {signal_id:?}")
@@ -359,6 +397,67 @@ fn validate_output_projection_weight(
     Ok(())
 }
 
+fn projection_scale_parameter_buffer<'a>(
+    buffers: &'a VulkanPermanentParameterBuffers,
+    spec: &VulkanResidentOutputTransducerSpec,
+) -> Result<
+    Option<&'a VulkanPermanentParameterBufferAllocation>,
+    VulkanResidentOutputTransducerRunnerError,
+> {
+    let Some(tensor) = spec.projection_scale_parameter_tensor.as_ref() else {
+        return Ok(None);
+    };
+    buffers.parameter_buffer(tensor).map(Some).ok_or_else(|| {
+        VulkanResidentOutputTransducerRunnerError::MissingProjectionScaleParameterBuffer {
+            tensor: tensor.clone(),
+        }
+    })
+}
+
+fn validate_output_projection_scale(
+    allocation: Option<&VulkanPermanentParameterBufferAllocation>,
+    spec: &VulkanResidentOutputTransducerSpec,
+) -> Result<(), VulkanResidentOutputTransducerRunnerError> {
+    match spec.projection_parameter_dtype.as_str() {
+        "F8_E4M3" => {
+            let allocation = allocation.ok_or_else(|| {
+                VulkanResidentOutputTransducerRunnerError::MissingProjectionScaleParameterBuffer {
+                    tensor: spec
+                        .projection_scale_parameter_tensor
+                        .clone()
+                        .unwrap_or_else(|| "<missing>".to_string()),
+                }
+            })?;
+            if allocation.parameter.dtype != spec.projection_scale_parameter_dtype
+                || allocation.parameter.shape != spec.projection_scale_parameter_shape
+                || Some(allocation.byte_capacity) != spec.projection_scale_parameter_byte_capacity
+            {
+                return Err(
+                    VulkanResidentOutputTransducerRunnerError::InvalidProjectionScaleWeight {
+                        tensor: allocation.parameter.tensor.clone(),
+                        dtype: allocation.parameter.dtype.clone(),
+                        shape: allocation.parameter.shape.clone(),
+                        byte_capacity: allocation.byte_capacity,
+                    },
+                );
+            }
+        }
+        _ => {
+            if let Some(allocation) = allocation {
+                return Err(
+                    VulkanResidentOutputTransducerRunnerError::InvalidProjectionScaleWeight {
+                        tensor: allocation.parameter.tensor.clone(),
+                        dtype: allocation.parameter.dtype.clone(),
+                        shape: allocation.parameter.shape.clone(),
+                        byte_capacity: allocation.byte_capacity,
+                    },
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_output_embedding_norm_weight(
     allocation: &VulkanPermanentParameterBufferAllocation,
     spec: &VulkanResidentOutputTransducerSpec,
@@ -378,4 +477,3 @@ fn validate_output_embedding_norm_weight(
     }
     Ok(())
 }
-

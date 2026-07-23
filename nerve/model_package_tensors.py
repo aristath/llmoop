@@ -1,5 +1,7 @@
 from nerve.model_package_common import *
 
+import numpy as np
+
 
 def attention_tile_token_width(head_width: int) -> int:
     padded_head_width = ((head_width + 63) // 64) * 64
@@ -108,6 +110,200 @@ def write_compiled_composite_tensor(
             f"composite tensor {tensor_name!r} wrote {written} bytes; expected {byte_count}"
         )
     return len(header_payload), data_digest.hexdigest()
+
+
+def write_compiled_derived_fp8_e4m3_output_projection(
+    *,
+    weight_tensor_name: str,
+    weight_info: Json,
+    weight_destination: Path,
+    scale_tensor_name: str,
+    scale_info: Json,
+    scale_destination: Path,
+    layout: str,
+) -> dict[str, tuple[int, str]]:
+    if layout != ROW_MAJOR_LAYOUT:
+        raise ModelCompileError(
+            "derived FP8 output projection tensors require row-major layout"
+        )
+    derivation = weight_info.get("derived")
+    scale_derivation = scale_info.get("derived")
+    if (
+        not isinstance(derivation, dict)
+        or derivation.get("kind") != "bf16_to_fp8_e4m3"
+        or not isinstance(scale_derivation, dict)
+        or scale_derivation.get("kind") != "bf16_to_fp8_e4m3_scale"
+        or scale_derivation.get("group") != derivation.get("group")
+    ):
+        raise ModelCompileError(
+            "derived FP8 output projection weight and scale tensors have "
+            "incompatible derivation metadata"
+        )
+
+    source = Path(derivation["source_file"])
+    if not source.is_file():
+        raise ModelCompileError(f"derived FP8 source tensor file does not exist: {source}")
+    source_shape = [int(value) for value in derivation["source_shape"]]
+    if len(source_shape) != 2:
+        raise ModelCompileError(
+            f"derived FP8 source tensor must be a matrix, got shape {source_shape}"
+        )
+    output_rows, input_columns = source_shape
+    if weight_info["shape"] != source_shape:
+        raise ModelCompileError(
+            f"derived FP8 weight shape {weight_info['shape']} does not match "
+            f"source shape {source_shape}"
+        )
+    block_rows = int(derivation["block_rows"])
+    block_columns = int(derivation["block_columns"])
+    scale_shape = [
+        (output_rows + block_rows - 1) // block_rows,
+        (input_columns + block_columns - 1) // block_columns,
+    ]
+    if scale_info["shape"] != scale_shape:
+        raise ModelCompileError(
+            f"derived FP8 scale shape {scale_info['shape']} does not match "
+            f"expected shape {scale_shape}"
+        )
+    if block_rows <= 0 or block_columns != 128 or input_columns % block_columns != 0:
+        raise ModelCompileError(
+            "derived FP8 output projection requires positive row blocks and "
+            f"128-column aligned input; got block {block_rows}x{block_columns} "
+            f"for source shape {source_shape}"
+        )
+
+    weight_header = compiled_safetensors_header(
+        weight_tensor_name,
+        dtype="F8_E4M3",
+        shape=source_shape,
+        byte_count=output_rows * input_columns,
+        layout=layout,
+    )
+    scale_header = compiled_safetensors_header(
+        scale_tensor_name,
+        dtype="BF16",
+        shape=scale_shape,
+        byte_count=scale_shape[0] * scale_shape[1] * 2,
+        layout=layout,
+    )
+    source_header_bytes = int(derivation["source_header_bytes"])
+    source_offsets = [int(value) for value in derivation["data_offsets"]]
+    source_start = 8 + source_header_bytes + source_offsets[0]
+    row_bytes = input_columns * 2
+
+    weight_digest = sha256()
+    scale_digest = sha256()
+    with (
+        source.open("rb") as source_handle,
+        weight_destination.open("wb") as weight_handle,
+        scale_destination.open("wb") as scale_handle,
+    ):
+        weight_handle.write(struct.pack("<Q", len(weight_header)))
+        weight_handle.write(weight_header)
+        scale_handle.write(struct.pack("<Q", len(scale_header)))
+        scale_handle.write(scale_header)
+        source_handle.seek(source_start)
+        for row_start in range(0, output_rows, block_rows):
+            row_count = min(block_rows, output_rows - row_start)
+            source_bytes = source_handle.read(row_count * row_bytes)
+            if len(source_bytes) != row_count * row_bytes:
+                raise ModelCompileError(
+                    "unexpected end of output projection tensor while deriving FP8 artifact"
+                )
+            block = bf16_bytes_to_f32_matrix(source_bytes, row_count, input_columns)
+            quantized = np.empty((row_count, input_columns), dtype=np.uint8)
+            scales = np.empty(scale_shape[1], dtype=np.float32)
+            for block_column in range(scale_shape[1]):
+                column_start = block_column * block_columns
+                column_end = min(column_start + block_columns, input_columns)
+                source_block = block[:, column_start:column_end]
+                block_max = float(np.max(np.abs(source_block))) if source_block.size else 0.0
+                scale = block_max / 448.0 if block_max > 0.0 else 1.0
+                scales[block_column] = scale
+                quantized[:, column_start:column_end] = f32_to_e4m3fn(
+                    source_block / scale
+                )
+            weight_bytes = quantized.tobytes(order="C")
+            scale_bytes = f32_to_bf16_bytes(scales)
+            weight_handle.write(weight_bytes)
+            scale_handle.write(scale_bytes)
+            weight_digest.update(weight_bytes)
+            scale_digest.update(scale_bytes)
+
+    return {
+        weight_tensor_name: (len(weight_header), weight_digest.hexdigest()),
+        scale_tensor_name: (len(scale_header), scale_digest.hexdigest()),
+    }
+
+
+def compiled_safetensors_header(
+    tensor_name: str,
+    *,
+    dtype: str,
+    shape: list[int],
+    byte_count: int,
+    layout: str,
+) -> bytes:
+    header = {
+        "__metadata__": {"format": "nerve", "layout": layout},
+        tensor_name: {
+            "dtype": dtype,
+            "shape": shape,
+            "data_offsets": [0, byte_count],
+        },
+    }
+    header_payload = json.dumps(header, separators=(",", ":")).encode("utf-8")
+    header_payload += b" " * (-len(header_payload) % 8)
+    return header_payload
+
+
+def bf16_bytes_to_f32_matrix(data: bytes, rows: int, columns: int) -> np.ndarray:
+    bf16 = np.frombuffer(data, dtype="<u2").reshape(rows, columns)
+    bits = bf16.astype(np.uint32) << 16
+    return bits.view(np.float32)
+
+
+def f32_to_bf16_bytes(values: np.ndarray) -> bytes:
+    bits = np.asarray(values, dtype=np.float32).view(np.uint32)
+    rounded = bits + np.uint32(0x7FFF) + ((bits >> np.uint32(16)) & np.uint32(1))
+    bf16 = (rounded >> np.uint32(16)).astype("<u2", copy=False)
+    return bf16.tobytes(order="C")
+
+
+def f32_to_e4m3fn(values: np.ndarray) -> np.ndarray:
+    x = np.asarray(values, dtype=np.float32)
+    sign = np.where(np.signbit(x), 0x80, 0).astype(np.uint8)
+    ax = np.nan_to_num(np.abs(x), nan=0.0, posinf=448.0, neginf=448.0)
+    ax = np.minimum(ax, np.float32(448.0))
+    encoded = np.zeros(ax.shape, dtype=np.uint8)
+
+    nonzero = ax > 0.0
+    subnormal = nonzero & (ax < np.float32(2.0**-6))
+    if np.any(subnormal):
+        mantissa = np.rint(ax[subnormal] * np.float32(512.0)).astype(np.int32)
+        mantissa = np.clip(mantissa, 0, 7)
+        encoded[subnormal] = mantissa.astype(np.uint8)
+
+    normal = nonzero & ~subnormal
+    if np.any(normal):
+        normal_values = ax[normal]
+        exponent = np.floor(np.log2(normal_values)).astype(np.int32)
+        scaled = normal_values / np.exp2(exponent.astype(np.float32))
+        mantissa = np.rint((scaled - np.float32(1.0)) * np.float32(8.0)).astype(
+            np.int32
+        )
+        overflow = mantissa == 8
+        exponent[overflow] += 1
+        mantissa[overflow] = 0
+        exponent_field = exponent + 7
+        saturated = (exponent_field > 15) | (
+            (exponent_field == 15) & (mantissa > 6)
+        )
+        exponent_field = np.where(saturated, 15, exponent_field)
+        mantissa = np.where(saturated, 6, mantissa)
+        encoded[normal] = ((exponent_field << 3) | mantissa).astype(np.uint8)
+
+    return encoded | sign
 
 
 def copy_exact_bytes(
@@ -981,6 +1177,7 @@ def dtype_byte_count(dtype: str) -> int:
         "BF16": 2,
         "F16": 2,
         "F32": 4,
+        "F8_E4M3": 1,
     }
     try:
         return byte_counts[dtype]

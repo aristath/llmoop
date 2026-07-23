@@ -10,6 +10,7 @@ from nerve.model_package_assets import *
 from nerve.model_package_integrity import *
 from nerve.model_package_validation import *
 from nerve.model_package_tensors import *
+from nerve.model_package_derived_tensors import *
 
 def compile_model_package(
     model_dir: Path,
@@ -43,6 +44,12 @@ def compile_model_package(
         cancel_requested=cancel_requested,
     )
     check_compile_cancelled(cancel_requested)
+    tensor_index = read_json(transpiled_dir / "tensors.json")
+    model_graph = read_json(transpiled_dir / "model.json")
+    derive_output_projection_tensors(model_graph, tensor_index)
+    write_json(transpiled_dir / "tensors.json", tensor_index)
+    write_json(transpiled_dir / "model.json", model_graph)
+    check_compile_cancelled(cancel_requested)
     if lowered_dir.exists():
         shutil.rmtree(lowered_dir)
     lowered = lower_execution_graph(
@@ -58,8 +65,6 @@ def compile_model_package(
         cancel_requested=cancel_requested,
     )
     check_compile_cancelled(cancel_requested)
-    tensor_index = read_json(transpiled_dir / "tensors.json")
-    model_graph = read_json(transpiled_dir / "model.json")
     tensor_index = referenced_tensor_index(
         tensor_index,
         model_graph=model_graph,

@@ -1,4 +1,8 @@
 from model_package_layout_common import *
+from nerve.model_package_derived_tensors import derive_output_projection_tensors
+from nerve.model_package_tensors import (
+    write_compiled_derived_fp8_e4m3_output_projection,
+)
 
 def test_write_compiled_tensor_preserves_canonical_row_major_order(
     tmp_path: Path,
@@ -38,6 +42,81 @@ def test_write_compiled_tensor_preserves_canonical_row_major_order(
     header_bytes = struct.unpack("<Q", compiled[:8])[0]
     payload = compiled[8 + header_bytes :]
     assert struct.unpack("<16H", payload) == values
+
+
+def test_compiler_derives_fp8_output_projection_tensor_pair(tmp_path: Path) -> None:
+    source_tensor = "lm_head.weight"
+    source = tmp_path / "source.safetensors"
+    values = tuple([0x3F80] * (16 * 128))
+    source_header = {
+        source_tensor: {
+            "dtype": "BF16",
+            "shape": [16, 128],
+            "data_offsets": [0, len(values) * 2],
+        }
+    }
+    source_header_payload = json.dumps(source_header).encode("utf-8")
+    source.write_bytes(
+        struct.pack("<Q", len(source_header_payload))
+        + source_header_payload
+        + struct.pack(f"<{len(values)}H", *values)
+    )
+    tensor_index = {
+        "tensors": {
+            source_tensor: {
+                "dtype": "BF16",
+                "shape": [16, 128],
+                "source_file": str(source),
+                "source_header_bytes": len(source_header_payload),
+                "data_offsets": [0, len(values) * 2],
+                "parameter_count": len(values),
+                "byte_count": len(values) * 2,
+            }
+        }
+    }
+    model_graph = {
+        "graph": {
+            "output_transducer": {
+                "components": [
+                    {"id": "output_norm", "type": "rms_norm", "params": {}},
+                    {
+                        "id": "output_projection",
+                        "type": "linear_projection",
+                        "params": {"weight": {"tensor": source_tensor}},
+                    },
+                ]
+            }
+        }
+    }
+
+    derive_output_projection_tensors(model_graph, tensor_index)
+
+    projection = model_graph["graph"]["output_transducer"]["components"][1]
+    weight = projection["params"]["weight"]["tensor"]
+    scale = projection["params"]["weight_scale_inv"]["tensor"]
+    assert weight == "lm_head.weight.__nerve_output_fp8_e4m3"
+    assert scale == "lm_head.weight.__nerve_output_fp8_e4m3_scale_inv"
+    assert tensor_index["tensors"][weight]["dtype"] == "F8_E4M3"
+    assert tensor_index["tensors"][weight]["byte_count"] == 16 * 128
+    assert tensor_index["tensors"][scale]["dtype"] == "BF16"
+    assert tensor_index["tensors"][scale]["shape"] == [1, 1]
+
+    destinations = {
+        weight: tmp_path / "weight.safetensors",
+        scale: tmp_path / "scale.safetensors",
+    }
+    digests = write_compiled_derived_fp8_e4m3_output_projection(
+        weight_tensor_name=weight,
+        weight_info=tensor_index["tensors"][weight],
+        weight_destination=destinations[weight],
+        scale_tensor_name=scale,
+        scale_info=tensor_index["tensors"][scale],
+        scale_destination=destinations[scale],
+        layout=ROW_MAJOR_LAYOUT,
+    )
+    assert set(digests) == {weight, scale}
+    assert destinations[weight].stat().st_size > 16 * 128
+    assert destinations[scale].stat().st_size > 2
 
 
 def test_compiler_renders_row_major_matrix_and_transducer_shaders(
@@ -128,4 +207,3 @@ def test_compiler_renders_row_major_per_layer_embedding_shader(tmp_path: Path) -
     assert "layout(set = 0, binding = 7) readonly buffer StreamControl" in source
     assert "round_bf16(lo_projection + lo_identity)" in source
     assert "{{" not in source
-

@@ -30,6 +30,36 @@ def test_compiler_renders_parallel_linear_shaders(tmp_path: Path) -> None:
     assert "{{" not in fp8_pair_source
 
 
+def test_compiler_renders_fp8_output_projection_shaders(tmp_path: Path) -> None:
+    shader_source_dir = Path(__file__).parents[1] / "runtime-rs" / "shaders"
+    shader_files = {
+        "tied_output_projection_fp8_e4m3_b16x128_248320x5120_scale1_to_f32.comp",
+        "tied_output_projection_batch1_fp8_e4m3_b16x128_248320x5120_scale1_to_f32.comp",
+    }
+
+    copy_shader_templates(shader_source_dir, tmp_path, shader_files)
+
+    decode = (
+        tmp_path
+        / "tied_output_projection_fp8_e4m3_b16x128_248320x5120_scale1_to_f32.comp"
+    ).read_text()
+    batch = (
+        tmp_path
+        / "tied_output_projection_batch1_fp8_e4m3_b16x128_248320x5120_scale1_to_f32.comp"
+    ).read_text()
+    for source in (decode, batch):
+        assert "binding = 1) readonly buffer ProjectionWeight" in source
+        assert "binding = 3) readonly buffer ProjectionWeightScaleInv" in source
+        assert "const uint BLOCK_ROWS = 16u;" in source
+        assert "const uint BLOCK_COLUMNS = 128u;" in source
+        assert "const uint OUTPUT_TILE_ROWS = 16u;" in source
+        assert "fp8_dot4_acc32" in source
+        assert "{{" not in source
+    assert "layout(push_constant) uniform BatchControl" not in decode
+    assert "layout(push_constant) uniform BatchControl" in batch
+    assert "batch_index * VOCAB_SIZE + row" in batch
+
+
 def test_compiler_renders_fused_parallel_ffn_projection_shader(
     tmp_path: Path,
 ) -> None:
@@ -243,5 +273,4 @@ def test_compiler_renders_projected_recurrent_depthwise_shader(
     assert "const uint OUTPUT_GATE_INDEX = 1u;" in source
     assert "PAIRED_WEIGHT_LAYOUT" not in source
     assert "{{" not in source
-
 

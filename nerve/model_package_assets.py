@@ -138,13 +138,79 @@ def copy_tensor_package(
     compiled_sources = []
     tensors = sorted(packaged["tensors"].items())
     total = len(tensors)
+    derived_fp8_groups_written: set[str] = set()
+    derived_fp8_tensors_written: set[str] = set()
     for index, (tensor_name, info) in enumerate(tensors, start=1):
         check_compile_cancelled(cancel_requested)
+        if tensor_name in derived_fp8_tensors_written:
+            continue
         if progress is not None:
             progress(index, total, tensor_name)
         layout = ROW_MAJOR_LAYOUT
         digest = blake2s(tensor_name.encode("utf-8"), digest_size=8).hexdigest()
         destination = weights_dir / f"tensor_{digest}.safetensors"
+        derivation = info.get("derived")
+        if (
+            isinstance(derivation, dict)
+            and derivation.get("kind") == "bf16_to_fp8_e4m3_scale"
+        ):
+            if str(derivation["group"]) not in derived_fp8_groups_written:
+                raise ModelCompileError(
+                    f"derived FP8 scale tensor {tensor_name!r} was visited before "
+                    "its weight tensor"
+                )
+            continue
+        if (
+            isinstance(derivation, dict)
+            and derivation.get("kind") == "bf16_to_fp8_e4m3"
+        ):
+            scale_tensor_name = str(derivation["scale_tensor"])
+            scale_info = packaged["tensors"].get(scale_tensor_name)
+            if not isinstance(scale_info, dict):
+                raise ModelCompileError(
+                    f"derived FP8 weight tensor {tensor_name!r} references missing "
+                    f"scale tensor {scale_tensor_name!r}"
+                )
+            scale_digest = blake2s(
+                scale_tensor_name.encode("utf-8"), digest_size=8
+            ).hexdigest()
+            scale_destination = weights_dir / f"tensor_{scale_digest}.safetensors"
+            group_headers_and_digests = (
+                write_compiled_derived_fp8_e4m3_output_projection(
+                    weight_tensor_name=tensor_name,
+                    weight_info=info,
+                    weight_destination=destination,
+                    scale_tensor_name=scale_tensor_name,
+                    scale_info=scale_info,
+                    scale_destination=scale_destination,
+                    layout=layout,
+                )
+            )
+            for emitted_name, emitted_destination in (
+                (tensor_name, destination),
+                (scale_tensor_name, scale_destination),
+            ):
+                emitted_info = packaged["tensors"][emitted_name]
+                header_bytes, data_sha256 = group_headers_and_digests[emitted_name]
+                relative_destination = relative_json_path(package_dir, emitted_destination)
+                emitted_info["source_file"] = relative_destination
+                emitted_info["data_offsets"] = [0, int(emitted_info["byte_count"])]
+                emitted_info["data_sha256"] = data_sha256
+                emitted_info["layout"] = layout
+                emitted_info.pop("derived", None)
+                compiled_sources.append(
+                    {
+                        "path": relative_destination,
+                        "safetensors_header_bytes": header_bytes,
+                        "metadata": {
+                            "format": "nerve",
+                            "layout": layout,
+                        },
+                    }
+                )
+            derived_fp8_groups_written.add(str(derivation["group"]))
+            derived_fp8_tensors_written.update({tensor_name, scale_tensor_name})
+            continue
         if info.get("source_parts"):
             header_bytes, data_sha256 = write_compiled_composite_tensor(
                 tensor_name=tensor_name,
@@ -192,5 +258,3 @@ def copy_tensor_package(
 
     write_json(package_dir / "tensors.json", packaged)
     return packaged
-
-
