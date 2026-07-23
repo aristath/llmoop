@@ -600,13 +600,24 @@ impl VulkanResidentComponentBatchSliceRunner {
             dynamic_state_capacity_activations,
         );
         let mut sequence_index = 0usize;
-        for unit in &self.execution_units {
+        let mut local_submission_batch = VulkanResidentQueueSubmissionBatch::new();
+        let mut pending_completion_sequence_index = None;
+        for (unit_index, unit) in self.execution_units.iter().enumerate() {
             match unit {
                 VulkanComponentBatchExecutionUnit::LocalComponent {
                     step_start,
                     step_end,
                     ..
                 } => {
+                    let flush_after_segment = self
+                        .execution_units
+                        .get(unit_index + 1)
+                        .is_none_or(|next| {
+                            !matches!(
+                                next,
+                                VulkanComponentBatchExecutionUnit::LocalComponent { .. }
+                            )
+                        });
                     self.run_segment(
                         device,
                         mounted,
@@ -618,22 +629,38 @@ impl VulkanResidentComponentBatchSliceRunner {
                         sequence_index,
                         *step_start,
                         *step_end,
+                        Some(&local_submission_batch),
+                        flush_after_segment,
                     )?;
+                    pending_completion_sequence_index =
+                        flush_after_segment.then_some(sequence_index);
                     sequence_index += 1;
+                    if flush_after_segment {
+                        self.submit_and_wait_local_batch(
+                            device,
+                            std::mem::take(&mut local_submission_batch),
+                            pending_completion_sequence_index.take(),
+                        )?;
+                    }
                 }
                 VulkanComponentBatchExecutionUnit::DistributedDispatch { dispatch_index } => {
                     run_distributed(*dispatch_index, &batch_control)?;
                 }
             }
         }
+        self.submit_and_wait_local_batch(
+            device,
+            local_submission_batch,
+            pending_completion_sequence_index,
+        )?;
         debug_assert_eq!(sequence_index, self.sequences.len());
         Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn run_segment(
+    fn run_segment<'a>(
         &self,
-        device: &VulkanComputeDevice,
+        device: &'a VulkanComputeDevice,
         mounted: &VulkanMountedPlacedStreamCircuit,
         state_semantics: VulkanComponentBatchStateSemantics<'_>,
         batch_width: usize,
@@ -643,6 +670,8 @@ impl VulkanResidentComponentBatchSliceRunner {
         segment_index: usize,
         step_start: usize,
         step_end: usize,
+        submission_batch: Option<&VulkanResidentQueueSubmissionBatch<'a>>,
+        signal_completion: bool,
     ) -> Result<(), VulkanResidentInProcessPlacedRuntimeError> {
         let mut push_constant_storage = Vec::<Vec<u8>>::new();
         let mut active_steps = Vec::<&VulkanComponentBatchDispatchStep>::new();
@@ -686,7 +715,8 @@ impl VulkanResidentComponentBatchSliceRunner {
             })
             .collect::<Vec<_>>();
         let mut snapshot_copies = Vec::new();
-        if let VulkanComponentBatchStateSemantics::IndependentCandidates(transaction) = state_semantics
+        if let VulkanComponentBatchStateSemantics::IndependentCandidates(transaction) =
+            state_semantics
         {
             for (step_index, step) in active_steps.iter().enumerate() {
                 let Some(lane_index) = step.lane_index else {
@@ -707,12 +737,52 @@ impl VulkanResidentComponentBatchSliceRunner {
                 );
             }
         }
-        device
-            .run_resident_kernel_sequence_with_snapshot_copies(
-                &self.sequences[segment_index],
-                &sequence_steps,
-                &snapshot_copies,
-            )
+        if let Some(submission_batch) = submission_batch {
+            device
+                .record_resident_kernel_sequence_with_snapshot_copies(
+                    &self.sequences[segment_index],
+                    &sequence_steps,
+                    &snapshot_copies,
+                )
+                .and_then(|_| {
+                    submission_batch.enqueue_recorded_sequence(
+                        device,
+                        &self.sequences[segment_index],
+                        &[],
+                        &[],
+                        signal_completion,
+                    )
+                })
+                .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)
+        } else {
+            device
+                .run_resident_kernel_sequence_with_snapshot_copies(
+                    &self.sequences[segment_index],
+                    &sequence_steps,
+                    &snapshot_copies,
+                )
+                .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)
+        }
+    }
+
+    fn submit_and_wait_local_batch<'a>(
+        &'a self,
+        device: &'a VulkanComputeDevice,
+        submission_batch: VulkanResidentQueueSubmissionBatch<'a>,
+        completion_sequence_index: Option<usize>,
+    ) -> Result<(), VulkanResidentInProcessPlacedRuntimeError> {
+        if submission_batch.pending_submission_count() == 0 {
+            return Ok(());
+        }
+        let completion_sequence_index = completion_sequence_index.ok_or_else(|| {
+            VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(
+                "component batch local submission has no completion sequence".to_string(),
+            ))
+        })?;
+        submission_batch
+            .mount()
+            .and_then(|template| template.submit_with_timeline_value_offset(0))
+            .and_then(|_| device.wait_resident_kernel_sequence(&self.sequences[completion_sequence_index]))
             .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)
     }
 
@@ -747,4 +817,3 @@ impl VulkanResidentComponentBatchSliceRunner {
         })
     }
 }
-

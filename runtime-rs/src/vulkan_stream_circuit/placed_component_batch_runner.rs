@@ -415,4 +415,3 @@ fn component_batch_signal_target_with_mounted(
         _ => component_batch_signal_target(descriptor),
     }
 }
-
