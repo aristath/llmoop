@@ -151,7 +151,86 @@ def rewrite_circuit_fp8_linears_to_q8(circuit: Json, tensor_index: Json) -> bool
     used_params_after_rewrite: set[str] = set()
     for node in circuit.get("nodes", []):
         params = list(node.get("params", []))
-        if node.get("op") not in {"linear", "linear_residual"} or not params:
+        op = node.get("op")
+        if op in {"parallel_linear_2way", "parallel_linear_3way"}:
+            branch_count = int(node.get("attrs", {}).get("branch_count", 0))
+            branch_parameter_counts = [
+                int(count)
+                for count in node.get("attrs", {}).get(
+                    "branch_parameter_counts", [1] * branch_count
+                )
+            ]
+            if (
+                branch_count in {2, 3}
+                and len(branch_parameter_counts) == branch_count
+                and all(count == 2 for count in branch_parameter_counts)
+                and sum(branch_parameter_counts) == len(params)
+            ):
+                replacement_params: list[str] = []
+                replacement_pairs: list[tuple[str, str, str]] = []
+                offset = 0
+                for count in branch_parameter_counts:
+                    weight_id, scale_id = params[offset : offset + count]
+                    pair = fp8_pair_tensors(
+                        refs, tensor_index, weight_id=weight_id, scale_id=scale_id
+                    )
+                    if pair is None:
+                        break
+                    replacement_pairs.append((weight_id, pair[0], pair[1]))
+                    replacement_params.append(weight_id)
+                    offset += count
+                if len(replacement_pairs) == branch_count:
+                    for weight_id, weight_tensor, scale_tensor in replacement_pairs:
+                        refs[weight_id]["tensor"] = ensure_q8_tensor_for_fp8_pair(
+                            tensor_index,
+                            weight_tensor=weight_tensor,
+                            scale_tensor=scale_tensor,
+                        )
+                    node["params"] = replacement_params
+                    node["attrs"]["branch_parameter_counts"] = [1] * branch_count
+                    used_params_after_rewrite.update(replacement_params)
+                    rewritten = True
+                    continue
+            used_params_after_rewrite.update(params)
+            continue
+
+        if op == "parallel_linear_silu_multiply":
+            if len(params) == 4:
+                replacement_pairs = [
+                    fp8_pair_tensors(
+                        refs,
+                        tensor_index,
+                        weight_id=params[0],
+                        scale_id=params[1],
+                    ),
+                    fp8_pair_tensors(
+                        refs,
+                        tensor_index,
+                        weight_id=params[2],
+                        scale_id=params[3],
+                    ),
+                ]
+                if all(pair is not None for pair in replacement_pairs):
+                    for weight_id, pair in zip(
+                        (params[0], params[2]), replacement_pairs, strict=True
+                    ):
+                        if pair is None:
+                            raise ModelCompileError(
+                                "internal Q8 rewrite lost a validated FP8 pair"
+                            )
+                        refs[weight_id]["tensor"] = ensure_q8_tensor_for_fp8_pair(
+                            tensor_index,
+                            weight_tensor=pair[0],
+                            scale_tensor=pair[1],
+                        )
+                    node["params"] = [params[0], params[2]]
+                    used_params_after_rewrite.update(node["params"])
+                    rewritten = True
+                    continue
+            used_params_after_rewrite.update(params)
+            continue
+
+        if op not in {"linear", "linear_residual"} or not params:
             used_params_after_rewrite.update(params)
             continue
         weight_id = str(params[0])
@@ -159,31 +238,12 @@ def rewrite_circuit_fp8_linears_to_q8(circuit: Json, tensor_index: Json) -> bool
         if len(params) < 2 or params[1] != scale_id:
             used_params_after_rewrite.update(params)
             continue
-        weight_ref = refs.get(weight_id)
-        scale_ref = refs.get(scale_id)
-        if not isinstance(weight_ref, dict) or not isinstance(scale_ref, dict):
-            used_params_after_rewrite.update(params)
-            continue
-        weight_tensor = weight_ref.get("tensor")
-        scale_tensor = scale_ref.get("tensor")
-        if (
-            not isinstance(weight_tensor, str)
-            or not isinstance(scale_tensor, str)
-            or tensor_dtype(tensor_index, weight_tensor) != "F8_E4M3"
-            or tensor_dtype(tensor_index, scale_tensor) != "BF16"
-        ):
-            used_params_after_rewrite.update(params)
-            continue
-        shape = tensor_shape(tensor_index, weight_tensor)
-        if len(shape) != 2 or shape[1] % Q8_0_GROUP_SIZE:
-            used_params_after_rewrite.update(params)
-            continue
-        q8_tensor = ensure_q8_tensor_for_fp8_pair(
-            tensor_index,
-            weight_tensor=weight_tensor,
-            scale_tensor=scale_tensor,
+        replacement = q8_replacement_for_fp8_pair(
+            refs, tensor_index, weight_id=weight_id, scale_id=scale_id
         )
-        weight_ref["tensor"] = q8_tensor
+        if replacement is None:
+            used_params_after_rewrite.update(params)
+            continue
         node["params"] = [weight_id, *params[2:]]
         used_params_after_rewrite.update(node["params"])
         rewritten = True
@@ -193,6 +253,54 @@ def rewrite_circuit_fp8_linears_to_q8(circuit: Json, tensor_index: Json) -> bool
             if parameter_id not in used_params_after_rewrite:
                 refs.pop(parameter_id)
     return rewritten
+
+
+def q8_replacement_for_fp8_pair(
+    refs: Json,
+    tensor_index: Json,
+    *,
+    weight_id: str,
+    scale_id: str,
+) -> str | None:
+    pair = fp8_pair_tensors(
+        refs, tensor_index, weight_id=weight_id, scale_id=scale_id
+    )
+    if pair is None:
+        return None
+    weight_tensor, scale_tensor = pair
+    q8_tensor = ensure_q8_tensor_for_fp8_pair(
+        tensor_index,
+        weight_tensor=weight_tensor,
+        scale_tensor=scale_tensor,
+    )
+    refs[weight_id]["tensor"] = q8_tensor
+    return q8_tensor
+
+
+def fp8_pair_tensors(
+    refs: Json,
+    tensor_index: Json,
+    *,
+    weight_id: str,
+    scale_id: str,
+) -> tuple[str, str] | None:
+    weight_ref = refs.get(weight_id)
+    scale_ref = refs.get(scale_id)
+    if not isinstance(weight_ref, dict) or not isinstance(scale_ref, dict):
+        return None
+    weight_tensor = weight_ref.get("tensor")
+    scale_tensor = scale_ref.get("tensor")
+    if (
+        not isinstance(weight_tensor, str)
+        or not isinstance(scale_tensor, str)
+        or tensor_dtype(tensor_index, weight_tensor) != "F8_E4M3"
+        or tensor_dtype(tensor_index, scale_tensor) != "BF16"
+    ):
+        return None
+    shape = tensor_shape(tensor_index, weight_tensor)
+    if len(shape) != 2 or shape[1] % Q8_0_GROUP_SIZE:
+        return None
+    return weight_tensor, scale_tensor
 
 
 def ensure_q8_tensor_for_fp8_pair(

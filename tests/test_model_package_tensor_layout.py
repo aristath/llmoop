@@ -307,6 +307,101 @@ def test_compiler_rewrites_eligible_fp8_linears_to_internal_q8(
     )
 
 
+def test_compiler_rewrites_parallel_and_fused_fp8_linears_to_internal_q8(
+    tmp_path: Path,
+) -> None:
+    lowered_dir = tmp_path / "lowered"
+    circuit_dir = lowered_dir / "layer_00"
+    circuit_dir.mkdir(parents=True)
+    circuit = {
+        "parameters": {
+            "refs": {
+                parameter: {
+                    "tensor": f"layer.{parameter}.weight"
+                    if not parameter.endswith("_scale_inv")
+                    else f"layer.{parameter.removesuffix('_scale_inv')}.weight_scale_inv"
+                }
+                for parameter in (
+                    "q",
+                    "q_scale_inv",
+                    "k",
+                    "k_scale_inv",
+                    "gate",
+                    "gate_scale_inv",
+                    "up",
+                    "up_scale_inv",
+                )
+            }
+        },
+        "nodes": [
+            {
+                "id": "qk",
+                "op": "parallel_linear_2way",
+                "inputs": ["hidden"],
+                "outputs": ["q", "k"],
+                "params": ["q", "q_scale_inv", "k", "k_scale_inv"],
+                "attrs": {"branch_count": 2, "branch_parameter_counts": [2, 2]},
+            },
+            {
+                "id": "ffn_gate_up",
+                "op": "parallel_linear_silu_multiply",
+                "inputs": ["hidden"],
+                "outputs": ["ffn"],
+                "params": ["gate", "gate_scale_inv", "up", "up_scale_inv"],
+                "attrs": {
+                    "branch_count": 2,
+                    "element_count": 64,
+                    "intermediate_rounding": "BF16",
+                },
+            },
+        ],
+    }
+    (circuit_dir / "circuit.json").write_text(json.dumps(circuit))
+    lowered_index = {
+        "graph": {
+            "circuits": [
+                {
+                    "id": "layer_00",
+                    "circuit": "layer_00/circuit.json",
+                }
+            ]
+        }
+    }
+    tensor_index = {"tensors": {}}
+    for tensor in ("q", "k", "gate", "up"):
+        tensor_index["tensors"][f"layer.{tensor}.weight"] = {
+            "dtype": "F8_E4M3",
+            "shape": [64, 128],
+            "parameter_count": 64 * 128,
+            "byte_count": 64 * 128,
+            "source_file": "/models/source.safetensors",
+            "source_header_bytes": 128,
+            "data_offsets": [0, 64 * 128],
+        }
+        tensor_index["tensors"][f"layer.{tensor}.weight_scale_inv"] = {
+            "dtype": "BF16",
+            "shape": [1, 1],
+            "parameter_count": 1,
+            "byte_count": 2,
+            "source_file": "/models/source.safetensors",
+            "source_header_bytes": 128,
+            "data_offsets": [64 * 128, 64 * 128 + 2],
+        }
+
+    derive_internal_q8_linear_tensors(lowered_index, lowered_dir, tensor_index)
+
+    rewritten = json.loads((circuit_dir / "circuit.json").read_text())
+    assert rewritten["nodes"][0]["params"] == ["q", "k"]
+    assert rewritten["nodes"][0]["attrs"]["branch_parameter_counts"] == [1, 1]
+    assert rewritten["nodes"][1]["params"] == ["gate", "up"]
+    assert set(rewritten["parameters"]["refs"]) == {"q", "k", "gate", "up"}
+    for parameter in ("q", "k", "gate", "up"):
+        q8_tensor = f"layer.{parameter}.weight.__nerve_q8_0"
+        assert rewritten["parameters"]["refs"][parameter]["tensor"] == q8_tensor
+        assert tensor_index["tensors"][q8_tensor]["dtype"] == "Q8_0"
+        assert tensor_index["tensors"][q8_tensor]["shape"] == [64, 4, 9]
+
+
 def test_compiler_renders_row_major_matrix_and_transducer_shaders(
     tmp_path: Path,
 ) -> None:
