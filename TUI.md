@@ -1,8 +1,8 @@
-# llmoop TUI
+# NERVE TUI
 
 ## Purpose
 
-The model editor is the main feature and primary workspace of the llmoop TUI. It is not an auxiliary configuration page attached to a chat client. The TUI is the visible patch bay for the inference engine: it loads an existing compiled pedal kit or transpiles a source model into one, constructs a runtime pedalboard, places pedal instances on available devices, and lets the user inspect and edit that board.
+The model editor is the main feature and primary workspace of the NERVE TUI. It is not an auxiliary configuration page attached to a chat client. The TUI is the visible patch bay for the inference engine: it loads an existing compiled pedal kit or transpiles a source model into one, constructs a runtime pedalboard, places pedal instances on available devices, and lets the user inspect and edit that board.
 
 Chat, runtime statistics, logs, and device information support this workspace. They must not displace the pedalboard editor as the application's central surface.
 
@@ -22,18 +22,18 @@ This combination fits the editor because:
 
 Ratatui has an [official interactive custom-widget example](https://ratatui.rs/examples/widgets/custom_widget/) that includes mouse handling, as well as documentation for its [custom widget model](https://ratatui.rs/recipes/widgets/custom/).
 
-Ratatui is an immediate-mode rendering library rather than a complete retained GUI toolkit. llmoop will therefore own application state, focus, semantic actions, modal behavior, scrolling, and hit testing. This is appropriate for a specialized pedalboard editor because those behaviors are part of the product rather than generic form behavior.
+Ratatui is an immediate-mode rendering library rather than a complete retained GUI toolkit. NERVE will therefore own application state, focus, semantic actions, modal behavior, scrolling, and hit testing. This is appropriate for a specialized pedalboard editor because those behaviors are part of the product rather than generic form behavior.
 
 ## Launching the editor
 
-Running `python -m llmoop` without an action opens the TUI. During source development the editor can also be started directly with:
+Running `python -m nerve` without an action opens the TUI. During source development the editor can also be started directly with:
 
 ```text
 cargo run --manifest-path runtime-rs/Cargo.toml \
-  --features vulkan,tokenizers,tui --bin llmoop-tui
+  --features vulkan,tokenizers,tui --bin nerve-tui
 ```
 
-`LLMOOP_TUI_BIN` may point the Python launcher at an installed TUI executable. `LLMOOP_WORKSPACE`, `LLMOOP_PYTHON`, and `LLMOOP_COMPILER_BIN` can override the compiler-client launch boundary without putting model-family knowledge in the TUI.
+`NERVE_TUI_BIN` may point the Python launcher at an installed TUI executable. `NERVE_WORKSPACE`, `NERVE_PYTHON`, and `NERVE_COMPILER_BIN` can override the compiler-client launch boundary without putting model-family knowledge in the TUI.
 
 ## Core terminology
 
@@ -52,8 +52,8 @@ The compiled package provides the source pedal kit and canonical wiring. The TUI
 
 The TUI must support both entry paths into the editor:
 
-1. Load an existing llmoop compiled model package.
-2. Select a Safetensors source model, transpile it for llmoop, and load the resulting package.
+1. Load an existing NERVE compiled model package.
+2. Select a Safetensors source model, transpile it for NERVE, and load the resulting package.
 
 Model loading is part of the primary application workflow. It must be available from the empty application state and remain available from the model editor so the user can replace the current model.
 
@@ -71,7 +71,7 @@ Model loading is part of the primary application workflow. It must be available 
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
-The source selector must be usable as a path field and as a keyboard-and-mouse navigable filesystem browser. Pasting a path must work. The TUI should identify whether the selected path is an llmoop package or a source model and present the appropriate action explicitly: `Load model` or `Transpile and load`.
+The source selector must be usable as a path field and as a keyboard-and-mouse navigable filesystem browser. Pasting a path must work. The TUI should identify whether the selected path is a NERVE package or a source model and present the appropriate action explicitly: `Load model` or `Transpile and load`.
 
 A Safetensors model is normally more than a weights file. The compiler may also require configuration, tokenizer assets, a chat template, weight-index metadata, or other source artifacts. The TUI passes the selected source to the compiler's discovery API and displays what the compiler found. It must not infer model architecture or required artifacts itself.
 

@@ -1,4 +1,6 @@
-# Continuous Stream Inference Engine
+# NERVE: Neural Execution & Rewiring Virtual Engine
+
+## Continuous Stream Inference Engine
 
 ## Summary
 

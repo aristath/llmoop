@@ -1,0 +1,327 @@
+# TODO
+
+## Direction
+
+The goal is not to rebuild llama.cpp or vLLM under a different name.
+
+NERVE remains a continuous stream inference engine:
+
+```text
+running stream =
+    runtime patch
+  + compiled permanent pedal circuits
+  + mutable transient circuit
+```
+
+llama.cpp and vLLM should be used as engineering references for the hard practical parts that mature inference engines already solve: scheduling, memory/state management, batching, graph reuse, kernel selection, quantization, MoE routing, and speculative decoding.
+
+The product shape remains the pedalboard model described in `CONCEPT.md`.
+
+## Core architectural work
+
+### 1. Build a real stream scheduler
+
+Requests are not the primary runtime object. A request is an event injected into a persistent stream.
+
+Implement a scheduler that operates on streams and stream activations:
+
+- Track active, idle, interrupted, and closing streams.
+- Admit external input events into existing streams without destroying stream state.
+- Schedule running stream activations before newly waiting work.
+- Maintain a token/work budget per scheduler step.
+- Distinguish prompt/prefill work from decode/feedback work.
+- Support chunked prefill for long inputs.
+- Keep the model mounted between turns.
+- Report timings from normal chat runs without special profiling modes.
+
+The scheduler should schedule stream events, not convert NERVE into a stateless request/response server.
+
+### 2. Replace flat transient context with block-managed transient circuit state
+
+KV is not conceptually a disposable cache in NERVE. It is stream-owned transient circuit state.
+
+Use vLLM-style block management as a practical implementation clue, but expose it in NERVE terms:
+
+```text
+pedal instance state
+  -> allocated in blocks/pages
+  -> owned by a stream
+  -> referenced through state tables
+  -> reusable, freeable, forkable, and snapshot-able
+```
+
+Required pieces:
+
+- A block/page allocator for transient state.
+- Per-stream state tables.
+- Per-pedal or per-state block tables.
+- Slot mappings for writing new state.
+- Ref counts for shared or reused state blocks.
+- Free lists and safe reclamation.
+- State reset, snapshot, fork, and eventual merge semantics.
+- Support for attention KV, recurrent state, Mamba state, conv state, and other pedal-owned transient state.
+
+This should remove the architectural need for arbitrary tiny capacity limits while preserving bounded, explicit resource management.
+
+### 3. Preserve layer pedals as runtime/editing/placement boundaries
+
+For the first practical architecture, each source model layer remains a standalone source pedal in the compiled package.
+
+The backend may fuse, split, tile, or lower internals however it wants, but the logical layer-pedal boundary remains available to the runtime patch bay.
+
+The layer pedal is the unit that can be:
+
+- placed on a device;
+- bypassed;
+- duplicated;
+- inspected;
+- migrated;
+- replaced;
+- connected over a short in-device cable or a longer cross-device cable.
+
+Optimization must not erase the user-facing pedalboard contract.
+
+### 4. Put the scheduler below the runtime patch bay
+
+The runtime patch decides what exists and how it is wired.
+
+The scheduler decides when activations happen.
+
+Target shape:
+
+```text
+UI/API event
+   |
+   v
+stream scheduler
+   |
+   v
+runtime patch
+   |
+   v
+pedal instances + transient state pages
+   |
+   v
+backend execution plan
+```
+
+Placement remains a runtime concern. The compiler should produce a neutral pedal kit and canonical wiring, not a hardcoded execution placement.
+
+### 5. Make batch execution mean multi-stream signal processing
+
+Batching should not contradict the stream model.
+
+Instead:
+
+```text
+many active streams
+        |
+        v
+same mounted pedalboard execution window
+        |
+        v
+many stream outputs and state updates
+```
+
+Implement batch execution over active streams:
+
+- Batch decode ticks across multiple streams.
+- Batch compatible prefill chunks.
+- Keep per-stream state tables separate.
+- Keep public output and private feedback signals separate.
+- Avoid rebuilding or remounting the model for each prompt.
+
+This is the stream/pedalboard equivalent of vLLM continuous batching.
+
+### 6. Keep the device-owned feedback loop as the long-term target
+
+vLLM schedules each step host-side. That is useful as a starting point, but NERVE's concept wants active generation to live as close to the device as possible.
+
+Short-term acceptable path:
+
+- Host scheduler admits events.
+- Host builds bounded execution windows.
+- Device executes those windows.
+- Host receives output/control events.
+
+Long-term target:
+
+- Host injects events and receives public outputs.
+- Device owns bounded steady-state feedback windows.
+- Feedback token/state production stays on device where possible.
+- Host intervention is for control, interruption, stream admission, UI, and cross-device orchestration.
+
+### 7. Make kernel dispatch shape-aware
+
+Do not treat every compiled linear/pedal operation as the same kind of shader problem.
+
+Use llama.cpp as inspiration:
+
+- Decode often wants matvec-style kernels.
+- Prefill often wants matmul-style kernels.
+- Quantized formats need native paths, not wide-scalar expansion unless proven faster.
+- Backend dispatch should pick kernels based on runtime shape, dtype, device features, and pedal contract.
+- Graph/kernel reuse should avoid hot-path allocation and recompilation.
+
+Initial required dispatch families:
+
+- BF16 dense decode and prefill.
+- FP8 dense decode and prefill.
+- INT4 dense decode and prefill.
+- Attention/state-update paths.
+- Mamba/recurrent/conv state paths.
+- MoE route-native paths.
+- Sampler and speculative decode paths.
+
+### 8. Make MoE route-native
+
+MoE pedals must not behave like dense FFNs with a mask.
+
+Routing is a first-class signal:
+
+```text
+hidden signal -> router -> selected expert routes -> active expert pedals -> reducer
+```
+
+Required pieces:
+
+- Router/top-k pedal output as explicit route signal.
+- Expert execution that only processes selected experts/routes.
+- Route grouping or route batching to reduce wasted work.
+- Expert-shard placement across devices.
+- Correct reduction using route weights.
+- Tests that prove work and output shapes scale with selected routes, not total experts.
+
+For MoE models with a small active parameter count, performance should reflect active experts, not the full declared model size.
+
+### 9. Make MTP/speculative decoding first-class
+
+Speculative decoding should not be treated as benchmark garnish.
+
+For models that ship MTP/draft components, the compiled package should expose them as pedals or pedalboards with explicit wiring:
+
+```text
+main stream state -> draft pedal(s) -> proposed feedback tokens
+                                |
+                                v
+main pedalboard verifies/accepts/rejects
+```
+
+Required pieces:
+
+- Compile MTP/draft components as reusable source pedals.
+- Runtime patch support for draft pedals.
+- Scheduler support for lookahead slots.
+- Transient state rollback on rejected draft tokens.
+- Acceptance-rate and accepted-token stats in normal runtime output.
+- Correct behavior with thinking/reasoning models enabled normally.
+
+### 10. Treat prefill as a first-class workload
+
+Long context is a normal use case, not an edge case.
+
+Implement:
+
+- Chunked prefill.
+- Prefill/decode interleaving.
+- Batch prefill where compatible.
+- Block allocation before prefill chunks.
+- No arbitrary small token limits in tests or benchmarks.
+- Normal 64k+ output capacity and large context operation.
+
+Prefill speed and decode speed should be measured separately by default.
+
+### 11. Add prefix/state reuse after block-managed state exists
+
+Do not start with clever prefix caching before the state allocator is solid.
+
+Once block-managed transient state exists:
+
+- Hash full state blocks by token prefix and relevant runtime modifiers.
+- Reuse block-aligned prefix state across streams.
+- Keep ref counts for shared blocks.
+- Evict with LRU or better policy.
+- Keep model/pedal identity and patch identity in cache keys.
+- Support future external or remote state connectors.
+
+This maps to vLLM prefix caching while preserving NERVE's transient-circuit semantics.
+
+### 12. Make graph/kernel reuse explicit
+
+Avoid rebuilding execution shape on every prompt or token.
+
+Required pieces:
+
+- Separate prefill and decode execution plans.
+- Reusable mounted pedalboard plans.
+- Reusable batch-size/token-count execution templates.
+- Persistent descriptor/buffer layouts.
+- Hot-path metadata updates without allocation.
+- Stable graph identity based on patch, placement, shape class, and state layout.
+
+This is the Vulkan/SPIR-V analogue of graph reservation/reuse in llama.cpp and CUDA graph capture/replay in vLLM.
+
+## Validation expectations
+
+Every meaningful architectural change must preserve model usability.
+
+Validation should include:
+
+- Teacher-forced source/compiled comparison where available.
+- Free-running chat validation.
+- Multi-turn memory checks.
+- Thinking/reasoning mode enabled for thinking models.
+- Warmup run discarded when reporting benchmark averages.
+- Five normal chat requests for benchmark sanity:
+  - `hi`
+  - `Who are you?`
+  - `what is the capital of Greece?`
+  - `How many cities named "Corinth" are there?`
+  - `What is your knowledge cutoff date?`
+  - `I asked you earlier to tell me the capital of a country. Which country was that?`
+- Per-model validation after changes that touch compiler/runtime behavior.
+- No broad Vulkan test runs.
+- No parallel tests.
+- No NVIDIA NERVE workloads.
+
+## Near-term implementation order
+
+1. Define runtime stream/request/state scheduler data structures in Rust.
+2. Introduce block-managed transient state tables independent of any one model architecture.
+3. Route current single-chat execution through the scheduler with one stream.
+4. Add decode batching across streams without changing the compiled package format more than necessary.
+5. Add chunked prefill.
+6. Make attention/recurrent/Mamba state use the block/state table abstraction.
+7. Move current fixed-capacity feedback state onto the block-managed transient circuit.
+8. Add shape-aware dispatch selection for decode versus prefill kernels.
+9. Make MoE route execution truly active-route based.
+10. Wire MTP/speculative decoding as real runtime flow.
+11. Add prefix/state reuse.
+12. Re-benchmark all available models and compare against llama.cpp using warmed runs.
+
+## Non-goals
+
+- Do not turn NERVE into a clone of llama.cpp.
+- Do not turn NERVE into a clone of vLLM.
+- Do not make compiler output depend on runtime placement.
+- Do not hardcode model-specific behavior into core runtime files.
+- Do not solve performance by adding arbitrary low limits.
+- Do not optimize only benchmark prompts at the expense of real chat usability.
+- Do not erase pedal boundaries to gain short-term speed.
+- Do not add compatibility layers for old package formats unless there is a concrete current need.
+
+## Success criteria
+
+The engine is moving in the right direction when:
+
+- A compiled package remains a reusable pedal kit.
+- Runtime patching controls placement, wiring, duplication, and bypass.
+- A stream survives across multiple input events without remounting the model.
+- Transient state is explicit, stream-owned, and block-managed.
+- Multiple active streams can share mounted permanent circuits.
+- Decode and prefill use different optimized execution paths.
+- MoE models execute proportional to active routes.
+- MTP/speculative decoding works as part of normal generation.
+- Normal chat output includes useful performance stats.
+- Benchmarks discard warmup and report realistic multi-request averages.
+- The implementation still feels like the continuous stream/pedalboard architecture in `CONCEPT.md`.
