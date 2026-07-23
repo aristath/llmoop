@@ -65,6 +65,10 @@ impl VulkanComputeDevice {
         self.min_storage_buffer_offset_alignment
     }
 
+    pub fn device_local_memory_bytes(&self) -> u64 {
+        self.device_local_memory_bytes
+    }
+
     pub fn supports_shared_host_memory(&self) -> bool {
         self.shared_host_memory_alignment.is_some()
     }

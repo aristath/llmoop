@@ -16,6 +16,7 @@ pub struct VulkanComputeDevice {
     max_compute_work_group_invocations: u32,
     max_compute_work_group_size_x: u32,
     min_storage_buffer_offset_alignment: usize,
+    device_local_memory_bytes: u64,
     timestamp_period_ns: f32,
     generic_storage_pipelines: RefCell<HashMap<VulkanGenericPipelineKey, VulkanStoragePipeline>>,
     immediate_kernel_sequence: RefCell<Option<VulkanResidentKernelSequence>>,
@@ -448,4 +449,3 @@ impl<'a> VulkanResidentKernelBufferBinding<'a> {
         self
     }
 }
-

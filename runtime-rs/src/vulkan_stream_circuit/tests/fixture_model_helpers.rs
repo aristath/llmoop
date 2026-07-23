@@ -17,16 +17,30 @@ fn selected_test_vulkan_device() -> Result<VulkanComputeDevice, VulkanError> {
 
 #[test]
 fn backend_loop_window_is_device_owned_and_snapshot_memory_bounded() {
-    assert_eq!(backend_loop_window_for_static_state_bytes(0, 4_096), 64);
     assert_eq!(
-        backend_loop_window_for_static_state_bytes(2 * 1024 * 1024, 4_096),
+        backend_loop_window_for_static_state_bytes(0, 4_096, 64 * 1024 * 1024),
+        64
+    );
+    assert_eq!(
+        backend_loop_window_for_static_state_bytes(
+            2 * 1024 * 1024,
+            4_096,
+            64 * 1024 * 1024
+        ),
         32
     );
     assert_eq!(
-        backend_loop_window_for_static_state_bytes(128 * 1024 * 1024, 4_096),
+        backend_loop_window_for_static_state_bytes(
+            128 * 1024 * 1024,
+            4_096,
+            64 * 1024 * 1024
+        ),
         1
     );
-    assert_eq!(backend_loop_window_for_static_state_bytes(0, 8), 8);
+    assert_eq!(
+        backend_loop_window_for_static_state_bytes(0, 8, 64 * 1024 * 1024),
+        8
+    );
 }
 
 #[test]
@@ -36,13 +50,13 @@ fn placed_feedback_window_accepts_bridged_multi_device_execution_graphs() {
         every_slice_has_terminal_segment: true,
         distributed_dispatches_are_bridged: true,
         has_push_constants: false,
-        static_state_bytes: 0,
+        window_width: 64,
         sampler_history_capacity: 4_096,
     };
     assert_eq!(eligible.window_width(), Some(64));
     assert_eq!(
         VulkanResidentInProcessPlacedFeedbackLoopEligibility {
-            static_state_bytes: 2 * 1024 * 1024,
+            window_width: 32,
             ..eligible
         }
         .window_width(),
@@ -86,11 +100,12 @@ fn placed_feedback_window_accepts_bridged_multi_device_execution_graphs() {
             ..eligible
         }
         .window_width(),
-        None
+        Some(64)
     );
     assert_eq!(
         VulkanResidentInProcessPlacedFeedbackLoopEligibility {
             sampler_history_capacity: 1,
+            window_width: 1,
             ..eligible
         }
         .window_width(),

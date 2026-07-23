@@ -84,6 +84,14 @@ impl VulkanComputeDeviceCatalog {
             let queue_info = [vk::DeviceQueueCreateInfo::default()
                 .queue_family_index(queue_family_index)
                 .queue_priorities(&queue_priorities)];
+            let memory_properties =
+                instance.get_physical_device_memory_properties(physical_device);
+            let device_local_memory_bytes = (0..memory_properties.memory_heap_count)
+                .map(|heap_index| memory_properties.memory_heaps[heap_index as usize])
+                .filter(|heap| heap.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL))
+                .map(|heap| heap.size)
+                .max()
+                .unwrap_or(0);
             let shader_float8_extension_supported = physical_device_supports_extension(
                 instance,
                 physical_device,
@@ -395,6 +403,7 @@ impl VulkanComputeDeviceCatalog {
                 max_compute_work_group_invocations: limits.max_compute_work_group_invocations,
                 max_compute_work_group_size_x: limits.max_compute_work_group_size[0],
                 min_storage_buffer_offset_alignment,
+                device_local_memory_bytes,
                 timestamp_period_ns: limits.timestamp_period,
                 generic_storage_pipelines: RefCell::new(HashMap::new()),
                 immediate_kernel_sequence: RefCell::new(None),

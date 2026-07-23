@@ -72,7 +72,8 @@ const VULKAN_STREAM_CONTROL_METADATA_OFFSET: usize = VULKAN_STREAM_CONTROL_TOKEN
 const VULKAN_COMPONENT_BATCH_CONTROL_BYTE_CAPACITY: u32 = 4 * std::mem::size_of::<u32>() as u32;
 const VULKAN_SAMPLER_HISTORY_RECORD_BYTE_CAPACITY: usize = 4 * std::mem::size_of::<u32>();
 pub const VULKAN_BACKEND_LOOP_MAX_WINDOW: usize = 64;
-const VULKAN_BACKEND_LOOP_SNAPSHOT_BUDGET_BYTES: usize = 64 * 1024 * 1024;
+const VULKAN_BACKEND_LOOP_MIN_TRANSACTION_BUDGET_BYTES: usize = 64 * 1024 * 1024;
+const VULKAN_BACKEND_LOOP_TRANSACTION_HEAP_FRACTION_DIVISOR: usize = 8;
 
 include!("vulkan_stream_circuit/resident_plan_buffers.rs");
 include!("vulkan_stream_circuit/transient_state_pages.rs");

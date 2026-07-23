@@ -16,23 +16,28 @@ struct VulkanResidentInProcessPlacedFeedbackLoopEligibility {
     every_slice_has_terminal_segment: bool,
     distributed_dispatches_are_bridged: bool,
     has_push_constants: bool,
-    static_state_bytes: usize,
+    window_width: usize,
     sampler_history_capacity: usize,
 }
 
 impl VulkanResidentInProcessPlacedFeedbackLoopEligibility {
+    fn disabled_reason(self) -> Option<&'static str> {
+        if self.device_slice_count == 0 {
+            Some("no_device_slices")
+        } else if !self.every_slice_has_terminal_segment {
+            Some("missing_terminal_segment")
+        } else if !self.distributed_dispatches_are_bridged {
+            Some("unbridged_distributed_dispatch")
+        } else {
+            None
+        }
+    }
+
     fn window_width(self) -> Option<usize> {
-        if self.device_slice_count == 0
-            || !self.every_slice_has_terminal_segment
-            || !self.distributed_dispatches_are_bridged
-            || self.has_push_constants
-        {
+        if self.disabled_reason().is_some() {
             return None;
         }
-        let width = backend_loop_window_for_static_state_bytes(
-            self.static_state_bytes,
-            self.sampler_history_capacity,
-        );
+        let width = self.window_width.min(self.sampler_history_capacity.max(1));
         (width >= 2).then_some(width)
     }
 }
@@ -42,6 +47,7 @@ struct VulkanResidentInProcessPlacedFeedbackLoop {
     feedback_synchronization: Option<Box<VulkanResidentPlacedFeedbackTimelineSynchronization>>,
     output_synchronization: Box<VulkanResidentPlacedOutputTimelineSynchronization>,
     window_width: usize,
+    replayable: bool,
     scheduler_turn_count_per_tick: usize,
     completed_stage_count_per_tick: usize,
 }
@@ -358,11 +364,23 @@ impl VulkanResidentInProcessPlacedFeedbackLoop {
                 .flat_map(|slice| &slice.resident_execution_plan.dispatch_segments)
                 .flat_map(|segment| &segment.dispatches)
                 .any(|dispatch| dispatch.resident_dispatch.push_constant_byte_count() != 0);
-        let static_state_bytes = device_slices.iter().try_fold(0usize, |total, slice| {
-            total
-                .checked_add(total_static_state_bytes(&slice.mounted.buffers)?)
-                .ok_or_else(|| VulkanError("placed feedback state bytes overflowed".to_string()))
-        })?;
+        let mut window_width = VULKAN_BACKEND_LOOP_MAX_WINDOW.min(
+            sampler
+                .history_capacity_activations
+                .max(1),
+        );
+        for slice in device_slices {
+            let device = device_for(&slice.device_id).map_err(|error| {
+                VulkanError(format!("feedback device resolution failed: {error}"))
+            })?;
+            let slice_static_state_bytes = total_static_state_bytes(&slice.mounted.buffers)?;
+            let slice_window_width = backend_loop_window_for_static_state_bytes(
+                slice_static_state_bytes,
+                sampler.history_capacity_activations,
+                backend_loop_transaction_budget_bytes(device),
+            );
+            window_width = window_width.min(slice_window_width);
+        }
         let eligibility = VulkanResidentInProcessPlacedFeedbackLoopEligibility {
             device_slice_count: device_slices.len(),
             every_slice_has_terminal_segment: device_slices
@@ -378,7 +396,7 @@ impl VulkanResidentInProcessPlacedFeedbackLoop {
                     })
             }),
             has_push_constants,
-            static_state_bytes,
+            window_width,
             sampler_history_capacity: sampler.history_capacity_activations,
         };
         let Some(window_width) = eligibility.window_width() else {
@@ -422,6 +440,7 @@ impl VulkanResidentInProcessPlacedFeedbackLoop {
             feedback_synchronization,
             output_synchronization,
             window_width,
+            replayable: !has_push_constants,
             scheduler_turn_count_per_tick: activation_schedule.turns.len(),
             completed_stage_count_per_tick,
         }))
@@ -826,4 +845,3 @@ where
         stream_control_buffers,
     })
 }
-

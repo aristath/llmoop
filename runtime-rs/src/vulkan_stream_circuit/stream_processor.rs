@@ -22,6 +22,7 @@ impl VulkanResidentStreamProcessor {
         let backend_loop_window = backend_loop_window_for_static_state_bytes(
             total_static_state_bytes(&mounted.buffers)?,
             loop_runner.sampler.history_capacity_activations,
+            backend_loop_transaction_budget_bytes(device),
         );
         let static_state_snapshots =
             VulkanResidentStateTransactionBank::new(device, &mounted.buffers, backend_loop_window)?;
@@ -108,14 +109,24 @@ fn total_static_state_bytes(
 fn backend_loop_window_for_static_state_bytes(
     static_state_bytes: usize,
     sampler_history_capacity: usize,
+    transaction_budget_bytes: usize,
 ) -> usize {
-    let snapshot_limited = VULKAN_BACKEND_LOOP_SNAPSHOT_BUDGET_BYTES
+    let snapshot_limited = transaction_budget_bytes
         .checked_div(static_state_bytes)
         .unwrap_or(VULKAN_BACKEND_LOOP_MAX_WINDOW)
         .max(1);
     VULKAN_BACKEND_LOOP_MAX_WINDOW
         .min(snapshot_limited)
         .min(sampler_history_capacity.max(1))
+}
+
+fn backend_loop_transaction_budget_bytes(device: &VulkanComputeDevice) -> usize {
+    let device_local_memory_bytes =
+        usize::try_from(device.device_local_memory_bytes()).unwrap_or(usize::MAX);
+    device_local_memory_bytes
+        .checked_div(VULKAN_BACKEND_LOOP_TRANSACTION_HEAP_FRACTION_DIVISOR)
+        .unwrap_or(usize::MAX)
+        .max(VULKAN_BACKEND_LOOP_MIN_TRANSACTION_BUDGET_BYTES)
 }
 
 pub struct VulkanResidentRunningStream {

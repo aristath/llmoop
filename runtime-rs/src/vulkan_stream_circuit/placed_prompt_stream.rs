@@ -691,7 +691,12 @@ impl VulkanResidentInProcessPlacedPromptStream {
                 .ok_or(VulkanResidentInProcessPlacedRuntimeError::FeedbackDepthOverflow)?;
             let start_stream_tick = session.next_stream_tick;
             let mut restore_after_tick = None;
-            let replay_slot = (tick_count == window_width).then_some(&mut submission_replay);
+            let replay_slot = (tick_count == window_width
+                && processor
+                    .resident_feedback_loop
+                    .as_ref()
+                    .is_some_and(|feedback_loop| feedback_loop.replayable))
+            .then_some(&mut submission_replay);
             processor.run_resident_feedback_window(
                 devices,
                 start_stream_tick,
