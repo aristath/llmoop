@@ -297,8 +297,7 @@ Validation should include:
 9. Make MoE route execution truly active-route based.
 10. Wire MTP/speculative decoding as real runtime flow.
 11. Add prefix/state reuse.
-12. Finish the internal terminology/schema migration before package-format stabilization.
-13. Re-benchmark all available models and compare against llama.cpp using warmed runs.
+12. Re-benchmark all available models and compare against llama.cpp using warmed runs.
 
 ## Non-goals
 
