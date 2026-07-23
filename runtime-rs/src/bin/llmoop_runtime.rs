@@ -16,16 +16,16 @@ use llmoop_runtime::{
     RuntimePatchDuplicateAfterControl, RuntimePatchInspectionReport, RuntimePatchPlacementReport,
     RuntimePatchSourceChainEntry, RuntimePedalPortSummary, RuntimePlacedPedalTimingSummaryReport,
     RuntimePlacedPromptRunReport, RuntimePlacedTransportReport, RuntimePlacementReport,
-    RuntimePromptBenchmarkReport, RuntimePromptBenchmarkRunReport,
-    RuntimePromptBenchmarkTransportTotalsReport, RuntimePromptBenchmarkU64MetricReport,
-    RuntimePromptBenchmarkUsizeMetricReport, RuntimePromptTimingReport,
+    RuntimePromptTimingReport,
     RuntimeRemoteCableBufferReport, RuntimeSourcePedal, RuntimeTokenizerOptionsReport,
     RuntimeTopologyReport, VulkanComputeDevice, VulkanComputeDeviceCatalog,
     VulkanComputeDeviceInfo, VulkanResidentHfTokenizerTextCodec,
     VulkanResidentInProcessPlacedPromptEngine, VulkanResidentInProcessPlacedPromptStream,
     VulkanResidentModelPackageDeviceSlice, VulkanResidentModelPackageManifest,
     VulkanResidentRuntimeModel, VulkanResidentSamplerRuntimeConfig, VulkanResidentTokenInputEvent,
-    VulkanResidentTokenTextCodec, VulkanReusableKernelArtifactManifest, discover_runtime_devices,
+    VulkanResidentExecutionCounters, VulkanResidentTokenTextCodec,
+    VulkanReusableKernelArtifactManifest, discover_runtime_devices,
+    reset_vulkan_resident_execution_counters, vulkan_resident_execution_counters,
 };
 use minijinja::{Environment, Error as TemplateError, ErrorKind as TemplateErrorKind};
 use serde::Serialize;
@@ -60,8 +60,6 @@ struct Args {
     add_special_tokens: bool,
     skip_special_tokens: bool,
     generated_only: bool,
-    profile: bool,
-    profile_runs: usize,
     json: bool,
 }
 
@@ -108,8 +106,6 @@ impl Default for Args {
             add_special_tokens: true,
             skip_special_tokens: true,
             generated_only: false,
-            profile: false,
-            profile_runs: 1,
             json: false,
         }
     }
@@ -222,9 +218,6 @@ fn run() -> Result<(), Box<dyn Error>> {
         codec: &codec,
     };
 
-    if args.profile_runs > 1 {
-        return run_placed_prompt_benchmark(&context, runtime_model);
-    }
     run_placed_prompt(&context, runtime_model)
 }
 
@@ -487,6 +480,8 @@ fn normalize_chat_template_for_runtime(source: &str) -> String {
 struct RuntimeChatTurn {
     generated_token_ids: Vec<u32>,
     streamed: bool,
+    timing: RuntimePromptTimingReport,
+    execution_counters: VulkanResidentExecutionCounters,
 }
 
 fn run_chat_repl<C, T, F>(
@@ -590,6 +585,8 @@ where
             } else {
                 print_chat_response(&generated_text);
             }
+            print_runtime_timing_stats("stats", &turn.timing);
+            print_runtime_execution_counters(&turn.execution_counters);
             chat_session.commit_assistant_turn(input_text, &assistant_content);
             Ok(true)
         }
@@ -839,9 +836,12 @@ fn run_placed_chat(
                 args.max_new_tokens,
             )
             .with_origin("cli_chat");
+            let input_event_id = event.id.clone();
             if !stop_token_ids.is_empty() {
                 event = event.with_stop_tokens(stop_token_ids.clone());
             }
+            reset_vulkan_resident_execution_counters();
+            let run_start = Instant::now();
             let run = engine.submit_input_event_until_idle_with_output(
                 "main",
                 event,
@@ -861,12 +861,41 @@ fn run_placed_chat(
                     }
                 },
             )?;
+            let run_time_ns = elapsed_nanos_u64(run_start);
+            let execution_counters = vulkan_resident_execution_counters();
+            let submitted_run = run
+                .engine_run
+                .input_runs
+                .iter()
+                .find(|input_run| {
+                    input_run.stream_id == "main"
+                        && input_run.submitted_run.input_event.id == input_event_id
+                })
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "placed chat engine run loop did not return the submitted chat event run",
+                    )
+                })?;
+            let timing = runtime_prompt_timing_report(
+                0,
+                run_time_ns,
+                run.generated_token_ids.len(),
+                submitted_run.submitted_run.session_run.tick_count,
+                submitted_run
+                    .submitted_run
+                    .session_run
+                    .run
+                    .scheduler_turn_count,
+            );
             if let Some(error) = output_error {
                 return Err(Box::new(io::Error::new(io::ErrorKind::InvalidData, error)));
             }
             Ok(RuntimeChatTurn {
                 generated_token_ids: run.generated_token_ids,
                 streamed: true,
+                timing,
+                execution_counters,
             })
         },
     )
@@ -916,6 +945,7 @@ fn execute_placed_prompt_run(
     let input_event =
         VulkanResidentTokenInputEvent::new("prompt", prompt_ids.to_vec(), args.max_new_tokens);
     let input_event_id = input_event.id.clone();
+    reset_vulkan_resident_execution_counters();
     let submitted_run = engine.submit_input_event_until_idle("main", input_event)?;
     let run_time_ns = elapsed_nanos_u64(run_start);
     let run = submitted_run
@@ -1017,11 +1047,10 @@ fn print_placed_prompt_report(
         print_text(&report.generated_text);
     } else {
         print_text(&report.output_text);
-        if args.profile {
-            print_prompt_timing_profile(&report.timing);
-            print_speculative_profile(report);
-            print_placed_pedal_timing_profile(&report.pedal_timing_summaries, 5);
-        }
+        print_runtime_timing_stats("stats", &report.timing);
+        print_runtime_execution_counters(&vulkan_resident_execution_counters());
+        print_speculative_profile(report);
+        print_placed_pedal_timing_profile(&report.pedal_timing_summaries, 5);
     }
     Ok(())
 }
@@ -1059,306 +1088,12 @@ fn print_speculative_profile(report: &RuntimePlacedPromptRunReport) {
     );
 }
 
-fn run_placed_prompt_benchmark(
-    context: &PromptRunContext<'_>,
-    runtime_model: VulkanResidentRuntimeModel,
-) -> Result<(), Box<dyn Error>> {
-    let mut runs = Vec::with_capacity(context.args.profile_runs);
-    for _ in 0..context.args.profile_runs {
-        runs.push(execute_placed_prompt_run(context, runtime_model.clone())?);
-    }
-    let first = runs
-        .first()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "--profile-runs is empty"))?;
-    let benchmark_runs = runs
-        .iter()
-        .enumerate()
-        .map(|(run_index, run)| placed_benchmark_run_report(run_index, run))
-        .collect::<Vec<_>>();
-    let benchmark = runtime_prompt_benchmark_report(
-        context,
-        &first.execution_mode,
-        first.device_ids.clone(),
-        first.device_bindings.clone(),
-        benchmark_runs,
-    );
-    print_prompt_benchmark_report(context.args, &benchmark)
-}
-
-fn placed_benchmark_run_report(
-    run_index: usize,
-    run: &RuntimePlacedPromptRunReport,
-) -> RuntimePromptBenchmarkRunReport {
-    RuntimePromptBenchmarkRunReport {
-        run_index,
-        execution_mode: run.execution_mode.clone(),
-        stop_reason: run.stop_reason.clone(),
-        generated_token_count: run.timing.generated_token_count,
-        tick_count: run.timing.tick_count,
-        scheduler_turn_count: run.timing.scheduler_turn_count,
-        setup_time_ns: run.timing.setup_time_ns,
-        run_time_ns: run.timing.run_time_ns,
-        total_time_ns: run.timing.total_time_ns,
-        generated_tokens_per_second: generated_tokens_per_second(
-            run.timing.generated_token_count,
-            run.timing.run_time_ns,
-        ),
-        transport: Some(benchmark_transport_totals_from_report(&run.transport)),
-        pedal_timing_summaries: run.pedal_timing_summaries.clone(),
-    }
-}
-
-fn runtime_prompt_benchmark_report(
-    context: &PromptRunContext<'_>,
-    execution_mode: &str,
-    device_ids: Vec<String>,
-    device_bindings: RuntimeDeviceBindings,
-    runs: Vec<RuntimePromptBenchmarkRunReport>,
-) -> RuntimePromptBenchmarkReport {
-    let PromptRunContext {
-        args,
-        package_manifest,
-        tokenizer_dir,
-        prompt,
-        prompt_ids,
-        ..
-    } = context;
-    let setup_values = runs.iter().map(|run| run.setup_time_ns).collect::<Vec<_>>();
-    let run_values = runs.iter().map(|run| run.run_time_ns).collect::<Vec<_>>();
-    let total_values = runs.iter().map(|run| run.total_time_ns).collect::<Vec<_>>();
-    let generated_token_values = runs
-        .iter()
-        .map(|run| run.generated_token_count)
-        .collect::<Vec<_>>();
-    let tick_values = runs.iter().map(|run| run.tick_count).collect::<Vec<_>>();
-    let scheduler_turn_values = runs
-        .iter()
-        .map(|run| run.scheduler_turn_count)
-        .collect::<Vec<_>>();
-    let mut stop_reasons = BTreeMap::new();
-    for run in &runs {
-        *stop_reasons.entry(run.stop_reason.clone()).or_insert(0) += 1;
-    }
-    let total_generated_tokens = generated_token_values.iter().sum::<usize>();
-    let total_run_time_ns = run_values.iter().sum::<u64>();
-
-    RuntimePromptBenchmarkReport {
-        ok: true,
-        execution_mode: execution_mode.to_string(),
-        package_manifest: package_manifest.to_path_buf(),
-        tokenizer_dir: tokenizer_dir.to_path_buf(),
-        runtime_patch: runtime_patch_report(args),
-        device_bindings,
-        device_count: device_ids.len(),
-        device_ids,
-        profile_runs: runs.len(),
-        prompt_text: prompt.to_string(),
-        prompt_ids: prompt_ids.to_vec(),
-        max_new_tokens: args.max_new_tokens,
-        setup_time_ns: benchmark_u64_metric(&setup_values),
-        run_time_ns: benchmark_u64_metric(&run_values),
-        total_time_ns: benchmark_u64_metric(&total_values),
-        generated_token_count: benchmark_usize_metric(&generated_token_values),
-        tick_count: benchmark_usize_metric(&tick_values),
-        scheduler_turn_count: benchmark_usize_metric(&scheduler_turn_values),
-        generated_tokens_per_second: generated_tokens_per_second(
-            total_generated_tokens,
-            total_run_time_ns,
-        ),
-        stop_reasons,
-        transport_totals: aggregate_benchmark_transport_totals(&runs),
-        pedal_timing_summaries: aggregate_benchmark_pedal_timing_summaries(&runs),
-        runs,
-    }
-}
-
-fn benchmark_u64_metric(values: &[u64]) -> RuntimePromptBenchmarkU64MetricReport {
-    let total = values.iter().sum::<u64>();
-    RuntimePromptBenchmarkU64MetricReport {
-        total,
-        min: values.iter().copied().min().unwrap_or(0),
-        max: values.iter().copied().max().unwrap_or(0),
-        average: if values.is_empty() {
-            0.0
-        } else {
-            total as f64 / values.len() as f64
-        },
-    }
-}
-
-fn benchmark_usize_metric(values: &[usize]) -> RuntimePromptBenchmarkUsizeMetricReport {
-    let total = values.iter().sum::<usize>();
-    RuntimePromptBenchmarkUsizeMetricReport {
-        total,
-        min: values.iter().copied().min().unwrap_or(0),
-        max: values.iter().copied().max().unwrap_or(0),
-        average: if values.is_empty() {
-            0.0
-        } else {
-            total as f64 / values.len() as f64
-        },
-    }
-}
-
 fn generated_tokens_per_second(generated_token_count: usize, run_time_ns: u64) -> Option<f64> {
     if run_time_ns == 0 {
         None
     } else {
         Some(generated_token_count as f64 / (run_time_ns as f64 / 1_000_000_000.0))
     }
-}
-
-fn benchmark_transport_totals_from_report(
-    transport: &RuntimePlacedTransportReport,
-) -> RuntimePromptBenchmarkTransportTotalsReport {
-    RuntimePromptBenchmarkTransportTotalsReport {
-        published_packet_count: transport.published_packet_count,
-        published_byte_count: transport.published_byte_count,
-        received_packet_count: transport.received_packet_count,
-        received_byte_count: transport.received_byte_count,
-        direct_copy_count: transport.direct_copy_count,
-        direct_copy_byte_count: transport.direct_copy_byte_count,
-        direct_receive_count: transport.direct_receive_count,
-        direct_receive_byte_count: transport.direct_receive_byte_count,
-    }
-}
-
-fn aggregate_benchmark_transport_totals(
-    runs: &[RuntimePromptBenchmarkRunReport],
-) -> Option<RuntimePromptBenchmarkTransportTotalsReport> {
-    let mut total = RuntimePromptBenchmarkTransportTotalsReport {
-        published_packet_count: 0,
-        published_byte_count: 0,
-        received_packet_count: 0,
-        received_byte_count: 0,
-        direct_copy_count: 0,
-        direct_copy_byte_count: 0,
-        direct_receive_count: 0,
-        direct_receive_byte_count: 0,
-    };
-    let mut seen = false;
-    for transport in runs.iter().filter_map(|run| run.transport.as_ref()) {
-        seen = true;
-        total.published_packet_count = total
-            .published_packet_count
-            .saturating_add(transport.published_packet_count);
-        total.published_byte_count = total
-            .published_byte_count
-            .saturating_add(transport.published_byte_count);
-        total.received_packet_count = total
-            .received_packet_count
-            .saturating_add(transport.received_packet_count);
-        total.received_byte_count = total
-            .received_byte_count
-            .saturating_add(transport.received_byte_count);
-        total.direct_copy_count = total
-            .direct_copy_count
-            .saturating_add(transport.direct_copy_count);
-        total.direct_copy_byte_count = total
-            .direct_copy_byte_count
-            .saturating_add(transport.direct_copy_byte_count);
-        total.direct_receive_count = total
-            .direct_receive_count
-            .saturating_add(transport.direct_receive_count);
-        total.direct_receive_byte_count = total
-            .direct_receive_byte_count
-            .saturating_add(transport.direct_receive_byte_count);
-    }
-    seen.then_some(total)
-}
-
-fn aggregate_benchmark_pedal_timing_summaries(
-    runs: &[RuntimePromptBenchmarkRunReport],
-) -> Vec<RuntimePlacedPedalTimingSummaryReport> {
-    let mut summaries = BTreeMap::<(String, String), RuntimePlacedPedalTimingSummaryReport>::new();
-    for run in runs {
-        for timing in &run.pedal_timing_summaries {
-            let entry = summaries
-                .entry((timing.device_id.clone(), timing.pedal_id.clone()))
-                .or_insert_with(|| RuntimePlacedPedalTimingSummaryReport {
-                    device_id: timing.device_id.clone(),
-                    pedal_id: timing.pedal_id.clone(),
-                    tick_count: 0,
-                    dispatch_count: 0,
-                    total_run_time_ns: 0,
-                    average_tick_time_ns: None,
-                    average_dispatch_time_ns: None,
-                });
-            entry.tick_count += timing.tick_count;
-            entry.dispatch_count += timing.dispatch_count;
-            entry.total_run_time_ns = entry
-                .total_run_time_ns
-                .saturating_add(timing.total_run_time_ns);
-        }
-    }
-    let mut summaries = summaries.into_values().collect::<Vec<_>>();
-    for summary in &mut summaries {
-        summary.average_tick_time_ns = average_nanos(summary.total_run_time_ns, summary.tick_count);
-        summary.average_dispatch_time_ns =
-            average_nanos(summary.total_run_time_ns, summary.dispatch_count);
-    }
-    summaries.sort_by(|left, right| {
-        right
-            .total_run_time_ns
-            .cmp(&left.total_run_time_ns)
-            .then_with(|| left.device_id.cmp(&right.device_id))
-            .then_with(|| left.pedal_id.cmp(&right.pedal_id))
-    });
-    summaries
-}
-
-fn print_prompt_benchmark_report(
-    args: &Args,
-    report: &RuntimePromptBenchmarkReport,
-) -> Result<(), Box<dyn Error>> {
-    if args.json {
-        println!("{}", serde_json::to_string_pretty(report)?);
-        return Ok(());
-    }
-
-    println!("benchmark:");
-    println!("  execution_mode={}", report.execution_mode);
-    println!("  runs={}", report.profile_runs);
-    println!("  devices={}", report.device_ids.join(","));
-    println!(
-        "  setup_ms avg={:.3} min={:.3} max={:.3}",
-        nanos_to_millis_f64(report.setup_time_ns.average),
-        nanos_to_millis(report.setup_time_ns.min),
-        nanos_to_millis(report.setup_time_ns.max)
-    );
-    println!(
-        "  run_ms avg={:.3} min={:.3} max={:.3}",
-        nanos_to_millis_f64(report.run_time_ns.average),
-        nanos_to_millis(report.run_time_ns.min),
-        nanos_to_millis(report.run_time_ns.max)
-    );
-    println!(
-        "  total_ms avg={:.3} min={:.3} max={:.3}",
-        nanos_to_millis_f64(report.total_time_ns.average),
-        nanos_to_millis(report.total_time_ns.min),
-        nanos_to_millis(report.total_time_ns.max)
-    );
-    println!(
-        "  generated_tokens total={} avg={:.3}",
-        report.generated_token_count.total, report.generated_token_count.average
-    );
-    if let Some(tokens_per_second) = report.generated_tokens_per_second {
-        println!("  generated_tokens_per_second={tokens_per_second:.3}");
-    }
-    if !report.stop_reasons.is_empty() {
-        println!("stop_reasons:");
-        for (reason, count) in &report.stop_reasons {
-            println!("  {reason}={count}");
-        }
-    }
-    if let Some(transport) = &report.transport_totals {
-        println!("transport_totals:");
-        println!("  published_packets={}", transport.published_packet_count);
-        println!("  received_packets={}", transport.received_packet_count);
-        println!("  direct_copies={}", transport.direct_copy_count);
-    }
-    print_placed_pedal_timing_profile(&report.pedal_timing_summaries, 5);
-    Ok(())
 }
 
 fn inspect_runtime_topology(
@@ -2420,12 +2155,6 @@ fn parse_args_from(raw: impl IntoIterator<Item = String>) -> Result<Args, String
             "--generated-only" => {
                 parsed.generated_only = true;
             }
-            "--profile" => {
-                parsed.profile = true;
-            }
-            "--profile-runs" => {
-                parsed.profile_runs = parse_next(&mut raw, "--profile-runs")?;
-            }
             "--json" => {
                 parsed.json = true;
             }
@@ -2452,12 +2181,6 @@ fn parse_args_from(raw: impl IntoIterator<Item = String>) -> Result<Args, String
     if parsed.chat && inspect_mode_count > 0 {
         return Err("--chat cannot be combined with inspect modes".to_string());
     }
-    if parsed.chat && parsed.profile {
-        return Err("--profile is not supported with --chat".to_string());
-    }
-    if parsed.chat && parsed.profile_runs != 1 {
-        return Err("--profile-runs is not supported with --chat".to_string());
-    }
     if parsed.chat && parsed.json {
         return Err("--json is not supported with --chat yet".to_string());
     }
@@ -2475,9 +2198,6 @@ fn parse_args_from(raw: impl IntoIterator<Item = String>) -> Result<Args, String
     }
     if matches!(parsed.context_size, Some(0)) {
         return Err("--context-size must be at least 1".to_string());
-    }
-    if parsed.profile_runs == 0 {
-        return Err("--profile-runs must be at least 1".to_string());
     }
     if parsed
         .temperature
@@ -2793,12 +2513,17 @@ fn print_text(text: &str) {
     }
 }
 
-fn print_prompt_timing_profile(timing: &RuntimePromptTimingReport) {
-    println!("profile:");
+fn print_runtime_timing_stats(label: &str, timing: &RuntimePromptTimingReport) {
+    println!("{label}:");
     println!("  setup_ms={:.3}", nanos_to_millis(timing.setup_time_ns));
     println!("  run_ms={:.3}", nanos_to_millis(timing.run_time_ns));
     println!("  total_ms={:.3}", nanos_to_millis(timing.total_time_ns));
     println!("  generated_tokens={}", timing.generated_token_count);
+    if let Some(tokens_per_second) =
+        generated_tokens_per_second(timing.generated_token_count, timing.run_time_ns)
+    {
+        println!("  generated_tokens_per_second={tokens_per_second:.3}");
+    }
     println!("  ticks={}", timing.tick_count);
     println!("  scheduler_turns={}", timing.scheduler_turn_count);
     if let Some(average) = timing.average_generated_token_time_ns {
@@ -2810,6 +2535,43 @@ fn print_prompt_timing_profile(timing: &RuntimePromptTimingReport) {
     if let Some(average) = timing.average_scheduler_turn_time_ns {
         println!("  avg_scheduler_turn_ms={:.3}", nanos_to_millis(average));
     }
+}
+
+fn print_runtime_execution_counters(counters: &VulkanResidentExecutionCounters) {
+    println!("execution:");
+    println!(
+        "  resident_sequence_prepare_calls={}",
+        counters.resident_sequence_prepare_calls
+    );
+    println!(
+        "  resident_sequence_recorded_command_buffers={}",
+        counters.resident_sequence_recorded_command_buffers
+    );
+    println!(
+        "  resident_sequence_reused_command_buffers={}",
+        counters.resident_sequence_reused_command_buffers
+    );
+    println!(
+        "  resident_sequence_queue_submits={}",
+        counters.resident_sequence_queue_submits
+    );
+    println!(
+        "  resident_sequence_fence_waits={}",
+        counters.resident_sequence_fence_waits
+    );
+    println!(
+        "  resident_queue_batch_submits={}",
+        counters.resident_queue_batch_submits
+    );
+    println!(
+        "  resident_queue_batch_commands={}",
+        counters.resident_queue_batch_commands
+    );
+    println!(
+        "  resident_copy_queue_submits={}",
+        counters.resident_copy_queue_submits
+    );
+    println!("  resident_copy_waits={}", counters.resident_copy_waits);
 }
 
 fn print_placed_pedal_timing_profile(
@@ -2842,10 +2604,6 @@ fn optional_nanos_to_millis(value: Option<u64>) -> String {
 
 fn nanos_to_millis(nanos: u64) -> f64 {
     nanos as f64 / 1_000_000.0
-}
-
-fn nanos_to_millis_f64(nanos: f64) -> f64 {
-    nanos / 1_000_000.0
 }
 
 fn print_usage() {
@@ -2890,8 +2648,6 @@ Options:
                              Chat templates always own their complete special-token framing.
   --keep-special-tokens      Keep tokenizer special tokens in decoded output text.
   --generated-only           Print only newly generated text instead of prompt + generated text.
-  --profile                  Print human-readable timing and top-pedal summaries.
-  --profile-runs <N>         Run N fresh prompt trials and report aggregate benchmark stats.
   --json                     Print a machine-readable run report.
   -h, --help                 Show this help.
 

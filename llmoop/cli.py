@@ -188,17 +188,6 @@ def main() -> None:
         help="print only newly generated text for --run",
     )
     parser.add_argument(
-        "--profile",
-        action="store_true",
-        help="print human-readable runtime timing and top-pedal summaries for --run",
-    )
-    parser.add_argument(
-        "--profile-runs",
-        type=int,
-        metavar="N",
-        help="run N fresh prompt trials and report aggregate benchmark stats for --run (default: 1)",
-    )
-    parser.add_argument(
         "--json",
         action="store_true",
         help="print a machine-readable report",
@@ -231,8 +220,6 @@ def main() -> None:
         args.speculative_draft_tokens = 0
     if args.seed is None:
         args.seed = 0
-    if args.profile_runs is None:
-        args.profile_runs = 1
     if args.context_size is not None and args.context_size < 1:
         parser.error("--context-size must be at least 1")
     if args.speculative_draft_tokens < 0:
@@ -289,12 +276,6 @@ def main() -> None:
             parser.error("--chat cannot be combined with inspect modes")
         if inspect_mode_count == 0 and args.prompt is None and not args.chat:
             parser.error("--prompt is required with --run")
-        if inspect_mode_count > 0 and args.profile_runs != 1:
-            parser.error("--profile-runs is only supported for --run prompt execution")
-        if args.chat and args.profile:
-            parser.error("--profile is not supported with --chat")
-        if args.chat and args.profile_runs != 1:
-            parser.error("--profile-runs is not supported with --chat")
         if args.chat and args.json:
             parser.error("--json is not supported with --chat yet")
         if args.chat_template_var and not args.chat:
@@ -303,8 +284,6 @@ def main() -> None:
             parser.error("--vulkan-device-index must be non-negative")
         if args.seed < 0 or args.seed > 0xFFFF_FFFF:
             parser.error("--seed must be between 0 and 4294967295")
-        if args.profile_runs < 1:
-            parser.error("--profile-runs must be at least 1")
         if args.temperature is not None and (
             not math.isfinite(args.temperature) or args.temperature <= 0
         ):
@@ -407,8 +386,6 @@ def validate_action_options(
         ("--no-special-tokens", args.no_special_tokens),
         ("--keep-special-tokens", args.keep_special_tokens),
         ("--generated-only", args.generated_only),
-        ("--profile", args.profile),
-        ("--profile-runs", args.profile_runs is not None),
     )
     if args.run is None:
         for option, provided in runtime_options:
@@ -564,10 +541,6 @@ def build_runtime_command(args: argparse.Namespace, package_manifest: Path) -> l
         runtime_args.append("--keep-special-tokens")
     if args.generated_only:
         runtime_args.append("--generated-only")
-    if args.profile:
-        runtime_args.append("--profile")
-    if args.profile_runs != 1:
-        runtime_args.extend(["--profile-runs", str(args.profile_runs)])
     if args.json:
         runtime_args.append("--json")
 

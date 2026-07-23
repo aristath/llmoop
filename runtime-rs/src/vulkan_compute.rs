@@ -7,7 +7,10 @@ use std::fmt::{Display, Formatter};
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 #[cfg(test)]
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 use std::time::Instant;
 
 use ash::{Entry, vk};
@@ -273,6 +276,57 @@ pub struct VulkanComputeDevice {
     timestamp_period_ns: f32,
     generic_storage_pipelines: RefCell<HashMap<VulkanGenericPipelineKey, VulkanStoragePipeline>>,
     immediate_kernel_sequence: RefCell<Option<VulkanResidentKernelSequence>>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct VulkanResidentExecutionCounters {
+    pub resident_sequence_prepare_calls: u64,
+    pub resident_sequence_recorded_command_buffers: u64,
+    pub resident_sequence_reused_command_buffers: u64,
+    pub resident_sequence_queue_submits: u64,
+    pub resident_sequence_fence_waits: u64,
+    pub resident_queue_batch_submits: u64,
+    pub resident_queue_batch_commands: u64,
+    pub resident_copy_queue_submits: u64,
+    pub resident_copy_waits: u64,
+}
+
+static RESIDENT_SEQUENCE_PREPARE_CALLS: AtomicU64 = AtomicU64::new(0);
+static RESIDENT_SEQUENCE_RECORDED_COMMAND_BUFFERS: AtomicU64 = AtomicU64::new(0);
+static RESIDENT_SEQUENCE_REUSED_COMMAND_BUFFERS: AtomicU64 = AtomicU64::new(0);
+static RESIDENT_SEQUENCE_QUEUE_SUBMITS: AtomicU64 = AtomicU64::new(0);
+static RESIDENT_SEQUENCE_FENCE_WAITS: AtomicU64 = AtomicU64::new(0);
+static RESIDENT_QUEUE_BATCH_SUBMITS: AtomicU64 = AtomicU64::new(0);
+static RESIDENT_QUEUE_BATCH_COMMANDS: AtomicU64 = AtomicU64::new(0);
+static RESIDENT_COPY_QUEUE_SUBMITS: AtomicU64 = AtomicU64::new(0);
+static RESIDENT_COPY_WAITS: AtomicU64 = AtomicU64::new(0);
+
+pub fn reset_vulkan_resident_execution_counters() {
+    RESIDENT_SEQUENCE_PREPARE_CALLS.store(0, Ordering::Relaxed);
+    RESIDENT_SEQUENCE_RECORDED_COMMAND_BUFFERS.store(0, Ordering::Relaxed);
+    RESIDENT_SEQUENCE_REUSED_COMMAND_BUFFERS.store(0, Ordering::Relaxed);
+    RESIDENT_SEQUENCE_QUEUE_SUBMITS.store(0, Ordering::Relaxed);
+    RESIDENT_SEQUENCE_FENCE_WAITS.store(0, Ordering::Relaxed);
+    RESIDENT_QUEUE_BATCH_SUBMITS.store(0, Ordering::Relaxed);
+    RESIDENT_QUEUE_BATCH_COMMANDS.store(0, Ordering::Relaxed);
+    RESIDENT_COPY_QUEUE_SUBMITS.store(0, Ordering::Relaxed);
+    RESIDENT_COPY_WAITS.store(0, Ordering::Relaxed);
+}
+
+pub fn vulkan_resident_execution_counters() -> VulkanResidentExecutionCounters {
+    VulkanResidentExecutionCounters {
+        resident_sequence_prepare_calls: RESIDENT_SEQUENCE_PREPARE_CALLS.load(Ordering::Relaxed),
+        resident_sequence_recorded_command_buffers: RESIDENT_SEQUENCE_RECORDED_COMMAND_BUFFERS
+            .load(Ordering::Relaxed),
+        resident_sequence_reused_command_buffers: RESIDENT_SEQUENCE_REUSED_COMMAND_BUFFERS
+            .load(Ordering::Relaxed),
+        resident_sequence_queue_submits: RESIDENT_SEQUENCE_QUEUE_SUBMITS.load(Ordering::Relaxed),
+        resident_sequence_fence_waits: RESIDENT_SEQUENCE_FENCE_WAITS.load(Ordering::Relaxed),
+        resident_queue_batch_submits: RESIDENT_QUEUE_BATCH_SUBMITS.load(Ordering::Relaxed),
+        resident_queue_batch_commands: RESIDENT_QUEUE_BATCH_COMMANDS.load(Ordering::Relaxed),
+        resident_copy_queue_submits: RESIDENT_COPY_QUEUE_SUBMITS.load(Ordering::Relaxed),
+        resident_copy_waits: RESIDENT_COPY_WAITS.load(Ordering::Relaxed),
+    }
 }
 
 struct VulkanInstanceContext {
@@ -1404,9 +1458,11 @@ impl VulkanResidentBufferCopy {
                 .map_err(|error| {
                     VulkanError(format!("failed to submit resident byte copy: {error:?}"))
                 })?;
+            RESIDENT_COPY_QUEUE_SUBMITS.fetch_add(1, Ordering::Relaxed);
             self.device.queue_wait_idle(self.queue).map_err(|error| {
                 VulkanError(format!("failed waiting for resident byte copy: {error:?}"))
             })?;
+            RESIDENT_COPY_WAITS.fetch_add(1, Ordering::Relaxed);
             Ok(())
         }
     }
@@ -1435,6 +1491,7 @@ impl VulkanResidentBufferCopyBatch {
                         "failed to submit resident buffer copy batch: {error:?}"
                     ))
                 })?;
+            RESIDENT_COPY_QUEUE_SUBMITS.fetch_add(1, Ordering::Relaxed);
             self.device
                 .wait_for_fences(&[self.completion_fence], true, u64::MAX)
                 .map_err(|error| {
@@ -1442,6 +1499,7 @@ impl VulkanResidentBufferCopyBatch {
                         "failed waiting for resident buffer copy batch: {error:?}"
                     ))
                 })?;
+            RESIDENT_COPY_WAITS.fetch_add(1, Ordering::Relaxed);
         }
         Ok(())
     }
@@ -3132,6 +3190,7 @@ impl VulkanComputeDevice {
                     completion_fence.unwrap_or(vk::Fence::null()),
                 )
                 .map_err(|error| VulkanError(format!("failed to submit {label}: {error:?}")))?;
+            RESIDENT_SEQUENCE_QUEUE_SUBMITS.fetch_add(1, Ordering::Relaxed);
         }
         Ok(())
     }
@@ -3228,6 +3287,11 @@ impl VulkanComputeDevice {
                         submissions.len()
                     ))
                 })?;
+            RESIDENT_QUEUE_BATCH_SUBMITS.fetch_add(1, Ordering::Relaxed);
+            RESIDENT_QUEUE_BATCH_COMMANDS.fetch_add(
+                u64::try_from(submissions.len()).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
             if completion_fences.len() > 1 {
                 let completion_submit = [vk::SubmitInfo2::default()];
                 for fence in completion_fences {
@@ -3238,6 +3302,7 @@ impl VulkanComputeDevice {
                                 "failed to submit resident queue batch completion fence: {error:?}"
                             ))
                         })?;
+                    RESIDENT_QUEUE_BATCH_SUBMITS.fetch_add(1, Ordering::Relaxed);
                 }
             }
         }
@@ -3256,6 +3321,7 @@ impl VulkanComputeDevice {
                         "failed waiting for resident kernel sequence: {error:?}"
                     ))
                 })?;
+            RESIDENT_SEQUENCE_FENCE_WAITS.fetch_add(1, Ordering::Relaxed);
         }
         Ok(())
     }
@@ -3331,6 +3397,7 @@ impl VulkanComputeDevice {
         }
 
         unsafe {
+            RESIDENT_SEQUENCE_PREPARE_CALLS.fetch_add(1, Ordering::Relaxed);
             let profiling_enabled = execute && std::env::var_os("LLMOOP_VK_PERF_LOGGER").is_some();
             let command_buffer_matches = !profiling_enabled
                 && sequence
@@ -3368,8 +3435,13 @@ impl VulkanComputeDevice {
                             && recorded
                                 .iter()
                                 .zip(snapshot_copies)
-                                .all(|(recorded, copy)| *recorded == copy.recorded())
+                            .all(|(recorded, copy)| *recorded == copy.recorded())
                     });
+            if command_buffer_matches {
+                RESIDENT_SEQUENCE_REUSED_COMMAND_BUFFERS.fetch_add(1, Ordering::Relaxed);
+            } else {
+                RESIDENT_SEQUENCE_RECORDED_COMMAND_BUFFERS.fetch_add(1, Ordering::Relaxed);
+            }
             let host_start = profiling_enabled.then(Instant::now);
             let query_count = u32::try_from(steps.len() + 1).map_err(|_| {
                 VulkanError("resident kernel timestamp count overflowed".to_string())

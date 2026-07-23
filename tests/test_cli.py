@@ -43,8 +43,6 @@ def runtime_args(**overrides: object) -> Namespace:
         "no_special_tokens": False,
         "keep_special_tokens": False,
         "generated_only": False,
-        "profile": False,
-        "profile_runs": 1,
         "json": False,
         "runtime_bin": Path("/tmp/llmoop-runtime"),
     }
@@ -204,8 +202,6 @@ class RuntimeCliCommandTest(unittest.TestCase):
             no_special_tokens=False,
             keep_special_tokens=False,
             generated_only=False,
-            profile=False,
-            profile_runs=1,
             json=False,
             runtime_bin=Path("/tmp/llmoop-runtime"),
         )
@@ -218,45 +214,6 @@ class RuntimeCliCommandTest(unittest.TestCase):
                 "--chat",
                 "--max-new-tokens",
                 "4",
-            ],
-            build_runtime_command(args, package),
-        )
-
-    def test_build_runtime_command_forwards_profile_flag(self) -> None:
-        package = Path("packages/model_x/vulkan_resident_package.json")
-        args = runtime_args(
-            prompt="Hello",
-            inspect_runtime=False,
-            inspect_package=False,
-            inspect_patch=False,
-            inspect_placement=False,
-            inspect_device_slice=None,
-            device=None,
-            place_pedal=[],
-            bind_device=[],
-            duplicate_after=[],
-            chain=None,
-            max_new_tokens=4,
-            context_size=None,
-            vulkan_device_index=None,
-            no_special_tokens=False,
-            keep_special_tokens=False,
-            generated_only=False,
-            profile=True,
-            json=False,
-            runtime_bin=Path("/tmp/llmoop-runtime"),
-        )
-
-        self.assertEqual(
-            [
-                "/tmp/llmoop-runtime",
-                "--package",
-                str(package),
-                "--prompt",
-                "Hello",
-                "--max-new-tokens",
-                "4",
-                "--profile",
             ],
             build_runtime_command(args, package),
         )
@@ -276,48 +233,6 @@ class RuntimeCliCommandTest(unittest.TestCase):
                 "4",
                 "--speculative-draft-tokens",
                 "5",
-            ],
-            build_runtime_command(args, package),
-        )
-
-    def test_build_runtime_command_forwards_profile_runs(self) -> None:
-        package = Path("packages/model_x/vulkan_resident_package.json")
-        args = runtime_args(
-            prompt="Hello",
-            inspect_runtime=False,
-            inspect_package=False,
-            inspect_patch=False,
-            inspect_placement=False,
-            inspect_device_slice=None,
-            device=None,
-            place_pedal=[],
-            bind_device=[],
-            duplicate_after=[],
-            chain=None,
-            max_new_tokens=4,
-            context_size=None,
-            vulkan_device_index=None,
-            no_special_tokens=False,
-            keep_special_tokens=False,
-            generated_only=False,
-            profile=False,
-            profile_runs=3,
-            json=True,
-            runtime_bin=Path("/tmp/llmoop-runtime"),
-        )
-
-        self.assertEqual(
-            [
-                "/tmp/llmoop-runtime",
-                "--package",
-                str(package),
-                "--prompt",
-                "Hello",
-                "--max-new-tokens",
-                "4",
-                "--profile-runs",
-                "3",
-                "--json",
             ],
             build_runtime_command(args, package),
         )
