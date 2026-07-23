@@ -1539,6 +1539,86 @@ mod tests {
     }
 
     #[test]
+    fn scheduler_batch_step_admits_waiting_prefill_alongside_running_prefill_when_capacity_exists()
+    {
+        let mut scheduler = RuntimeStreamScheduler::new();
+        scheduler.add_stream("long_stream").unwrap();
+        scheduler.add_stream("new_stream").unwrap();
+        scheduler
+            .enqueue_input_event(
+                "long_stream",
+                RuntimeStreamInputEvent::new("long_event", [1, 2, 3, 4, 5], 1),
+            )
+            .unwrap();
+
+        let first = scheduler.schedule_batch_step(budget(1)).unwrap();
+        assert_eq!(first.batches.len(), 1);
+        assert_eq!(
+            first.batches[0].activations[0].kind,
+            RuntimeStreamActivationKind::PrefillChunk {
+                token_offset: 0,
+                token_ids: vec![1, 2],
+            }
+        );
+        scheduler
+            .complete_activation(
+                first.batches[0].activations[0].id,
+                RuntimeStreamActivationOutcome::prefill_complete(),
+            )
+            .unwrap();
+
+        scheduler
+            .enqueue_input_event(
+                "new_stream",
+                RuntimeStreamInputEvent::new("new_event", [9, 10], 1),
+            )
+            .unwrap();
+
+        let next = scheduler.schedule_batch_step(budget(2)).unwrap();
+
+        assert_eq!(next.batches.len(), 1);
+        assert_eq!(
+            next.batches[0].kind,
+            RuntimeStreamActivationBatchKind::PrefillChunk {
+                execution_class_id: "default".to_string(),
+                token_count: 2,
+            }
+        );
+        let scheduled = next.batches[0]
+            .activations
+            .iter()
+            .map(|activation| {
+                (
+                    activation.stream_id.as_str(),
+                    activation.kind.clone(),
+                    activation.state_reservations.len(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            scheduled,
+            vec![
+                (
+                    "long_stream",
+                    RuntimeStreamActivationKind::PrefillChunk {
+                        token_offset: 2,
+                        token_ids: vec![3, 4],
+                    },
+                    0,
+                ),
+                (
+                    "new_stream",
+                    RuntimeStreamActivationKind::PrefillChunk {
+                        token_offset: 0,
+                        token_ids: vec![9, 10],
+                    },
+                    0,
+                ),
+            ]
+        );
+    }
+
+    #[test]
     fn scheduler_batch_run_requires_exact_outcomes_for_every_activation() {
         let mut scheduler = RuntimeStreamScheduler::new();
         scheduler.add_stream("stream_a").unwrap();
