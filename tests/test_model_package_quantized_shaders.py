@@ -90,7 +90,7 @@ def test_parallel_linear_shader_selector_supports_fp8_weight_scale_pairs() -> No
     assert shader_file_for_node(circuit, node, tensor_index, dimensions) == (
         "parallel_linear_2way_fp8_e4m3_b128x128_5120x5120.comp"
     )
-    assert workgroup_count_x_for_node(circuit, node, tensor_index) == 160
+    assert workgroup_count_x_for_node(circuit, node, tensor_index) == 320
 
 
 def test_linear_shader_selector_supports_internal_q8_0_weights() -> None:
@@ -166,9 +166,9 @@ def test_compiler_renders_native_block_scaled_fp8_linear_shaders(
     copy_shader_templates(shader_source_dir, tmp_path, shader_files)
 
     expected_tile_rows = {
-        "linear_fp8_e4m3_b128x128_5120x17408.comp": 64,
-        "linear_bias_fp8_e4m3_b128x128_5120x17408.comp": 64,
-        "linear_residual_fp8_e4m3_b128x128_17408x5120.comp": 32,
+        "linear_fp8_e4m3_b128x128_5120x17408.comp": 16,
+        "linear_bias_fp8_e4m3_b128x128_5120x17408.comp": 16,
+        "linear_residual_fp8_e4m3_b128x128_17408x5120.comp": 16,
     }
     for shader_file in shader_files:
         shader = (tmp_path / shader_file).read_text()
@@ -183,7 +183,7 @@ def test_compiler_renders_native_block_scaled_fp8_linear_shaders(
         assert "fp8_dot4_acc32" in shader
         assert "shared fe4m3vec4 quantized_input" in shader
         assert "subgroupClusteredMax" in shader
-        assert "for (uint word = lane;" in shader
+        assert "word < INPUT_FP8_WORDS" in shader
         assert "WeightScaleInv" in shader
         assert "{{" not in shader
     assert (
@@ -401,8 +401,8 @@ def test_compiler_tiles_dense_fp8_dispatch_without_changing_bf16_dispatch() -> N
         "params": ["gate_weight", "up_weight"],
     }
 
-    assert workgroup_count_x_for_node(circuit, linear, fp8_tensor_index) == 272
-    assert workgroup_count_x_for_node(circuit, fused_ffn, fp8_tensor_index) == 544
+    assert workgroup_count_x_for_node(circuit, linear, fp8_tensor_index) == 1088
+    assert workgroup_count_x_for_node(circuit, fused_ffn, fp8_tensor_index) == 1088
     assert workgroup_count_x_for_node(circuit, linear, bf16_tensor_index) == 8704
     assert workgroup_count_x_for_node(circuit, fused_ffn, bf16_tensor_index) == 8704
 
