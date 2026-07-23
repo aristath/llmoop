@@ -32,10 +32,8 @@ mod tests {
     #[test]
     fn spirv_words_round_trip_through_file() {
         let words = vec![0x0723_0203, 0x0001_0000, 0x0008_000b, 42];
-        let path = std::env::temp_dir().join(format!(
-            "nerve-spirv-round-trip-{}.spv",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("nerve-spirv-round-trip-{}.spv", std::process::id()));
 
         write_spirv_words(&path, &words).unwrap();
         assert_eq!(read_spirv_words(&path).unwrap(), words);

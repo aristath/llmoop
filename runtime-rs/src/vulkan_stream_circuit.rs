@@ -15,9 +15,9 @@ use sha2::{Digest, Sha256};
 use smallvec::SmallVec;
 
 use crate::stream_circuit::{
-    EdgeTransport, CircuitParamsArtifact, CircuitRuntimeRole, CircuitStateArtifact,
-    LOWERED_EXECUTION_GRAPH_SCHEMA, LoweredCircuitRef, LoweredExecutionGraph, LoweredExecutionGraphGraph,
-    LoweredExecutionGraphSource, LoweredExecutionGraphSummary, ComponentEdgePlacement,
+    CircuitParamsArtifact, CircuitRuntimeRole, CircuitStateArtifact, ComponentEdgePlacement,
+    EdgeTransport, LOWERED_EXECUTION_GRAPH_SCHEMA, LoweredCircuitRef, LoweredExecutionGraph,
+    LoweredExecutionGraphGraph, LoweredExecutionGraphSource, LoweredExecutionGraphSummary,
     RUNTIME_DEFAULT_LOGICAL_DEVICE_ID, ResolvedCircuitArtifact, ResolvedLoweredExecutionGraph,
     StreamCircuit, StreamCircuitGraphBoundary, StreamCircuitNodeInstanceStatePolicy,
     StreamCircuitPlacementPlan, StreamCircuitPlacementSpec, StreamCircuitRuntimeGraph,
