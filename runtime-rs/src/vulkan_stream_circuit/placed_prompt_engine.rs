@@ -1,14 +1,14 @@
 #[derive(Default)]
 pub struct VulkanResidentInProcessPlacedPromptEngine {
     streams: BTreeMap<String, VulkanResidentInProcessPlacedPromptStream>,
-    active_queue: VecDeque<String>,
+    runtime_scheduler: RuntimeStreamScheduler,
 }
 
 impl VulkanResidentInProcessPlacedPromptEngine {
     pub fn new() -> Self {
         Self {
             streams: BTreeMap::new(),
-            active_queue: VecDeque::new(),
+            runtime_scheduler: RuntimeStreamScheduler::new(),
         }
     }
 
@@ -24,10 +24,8 @@ impl VulkanResidentInProcessPlacedPromptEngine {
         if self.streams.contains_key(&stream_id) {
             return Err(VulkanResidentInProcessPlacedPromptEngineError::DuplicateStream(stream_id));
         }
+        self.runtime_scheduler.add_stream(stream_id.clone())?;
         let snapshot = placed_prompt_engine_stream_snapshot(&stream_id, &stream);
-        if !stream.is_idle() {
-            self.activate_stream_id(&stream_id);
-        }
         self.streams.insert(stream_id, stream);
         Ok(snapshot)
     }
@@ -52,7 +50,14 @@ impl VulkanResidentInProcessPlacedPromptEngine {
             })?;
             stream.enqueue_input_event(event)
         };
-        self.activate_stream_id(stream_id);
+        self.runtime_scheduler.enqueue_input_event(
+            stream_id,
+            RuntimeStreamInputEvent::new(
+                queued_input_event.input_event.id.clone(),
+                queued_input_event.input_event.token_ids.clone(),
+                queued_input_event.input_event.max_public_tokens,
+            ),
+        )?;
         Ok(VulkanResidentInProcessPlacedPromptEngineQueuedInputEvent {
             stream_id: stream_id.to_string(),
             queued_input_event,
@@ -76,10 +81,9 @@ impl VulkanResidentInProcessPlacedPromptEngine {
             let stream_control_run = stream.interrupt(reason)?;
             (stream_control_run, !stream.is_idle())
         };
-        if stream_still_active {
-            self.activate_stream_id(stream_id);
-        } else {
-            self.active_queue.retain(|active| active != stream_id);
+        if !stream_still_active {
+            self.runtime_scheduler
+                .interrupt_stream(stream_id, "placed prompt stream interrupt")?;
         }
         Ok(VulkanResidentInProcessPlacedPromptEngineControlRun {
             stream_id: stream_id.to_string(),
@@ -105,7 +109,7 @@ impl VulkanResidentInProcessPlacedPromptEngine {
             (stream_control_run, !stream.is_idle())
         };
         if stream_still_active {
-            self.activate_stream_id(stream_id);
+            self.runtime_scheduler.close_stream_after_current(stream_id)?;
         }
         Ok(VulkanResidentInProcessPlacedPromptEngineControlRun {
             stream_id: stream_id.to_string(),
@@ -214,47 +218,56 @@ impl VulkanResidentInProcessPlacedPromptEngine {
         let start_snapshot = self.snapshot();
         let mut input_runs = Vec::new();
         let mut output_events = Vec::new();
-        self.refresh_active_queue();
+        let scheduler_budget = RuntimeStreamSchedulerBudget::new(
+            1,
+            VULKAN_BACKEND_LOOP_MAX_WINDOW,
+            VULKAN_BACKEND_LOOP_MAX_WINDOW,
+        )
+        .with_max_decode_tokens_per_activation(VULKAN_BACKEND_LOOP_MAX_WINDOW);
 
         while input_runs.len() < max_input_events {
-            let Some(stream_id) = self.active_queue.pop_front() else {
+            let scheduler_step = self
+                .runtime_scheduler
+                .schedule_step(scheduler_budget.clone())?;
+            if scheduler_step.activations.is_empty() {
                 break;
-            };
-            let stream = self.streams.get_mut(&stream_id).ok_or_else(|| {
-                VulkanResidentInProcessPlacedPromptEngineError::UnknownStream {
-                    stream_id: stream_id.clone(),
-                }
-            })?;
-            if stream.is_idle() {
-                continue;
             }
-            let callback_stream_id = stream_id.clone();
-            let Some(submitted_run) =
-                stream.run_next_queued_input_event_with_output(|output_event| {
-                    on_output_event(VulkanResidentTokenRuntimeSchedulerOutputEvent {
-                        stream_id: callback_stream_id.clone(),
-                        output_event,
+
+            for activation in scheduler_step.activations {
+                if input_runs.len() >= max_input_events {
+                    break;
+                }
+                let stream_id = activation.stream_id.clone();
+                let stream = self.streams.get_mut(&stream_id).ok_or_else(|| {
+                    VulkanResidentInProcessPlacedPromptEngineError::UnknownStream {
+                        stream_id: stream_id.clone(),
+                    }
+                })?;
+                let callback_stream_id = stream_id.clone();
+                let scheduled_run =
+                    stream.run_runtime_scheduler_activation_with_output(&activation, |output_event| {
+                        on_output_event(VulkanResidentTokenRuntimeSchedulerOutputEvent {
+                            stream_id: callback_stream_id.clone(),
+                            output_event,
+                        });
+                    })?;
+                self.runtime_scheduler
+                    .complete_activation(activation.id, scheduled_run.outcome.clone())?;
+
+                let stream_output_events = placed_prompt_engine_output_events_for(
+                    &stream_id,
+                    &scheduled_run.output_events,
+                );
+                output_events.extend(stream_output_events.iter().cloned());
+                if let Some(submitted_run) = scheduled_run.completed_input_run {
+                    let stream_generated_token_ids = submitted_run.generated_token_ids.clone();
+                    input_runs.push(VulkanResidentInProcessPlacedPromptEngineInputRun {
+                        stream_id,
+                        submitted_run,
+                        output_events: stream_output_events,
+                        generated_token_ids: stream_generated_token_ids,
                     });
-                })?
-            else {
-                continue;
-            };
-            let stream_still_active = !stream.is_idle();
-            let stream_output_events =
-                placed_prompt_engine_output_events_for(&stream_id, &submitted_run.output_events);
-            let stream_generated_token_ids = stream_output_events
-                .iter()
-                .map(|event| event.output_event.token_id)
-                .collect::<Vec<_>>();
-            output_events.extend(stream_output_events.iter().cloned());
-            input_runs.push(VulkanResidentInProcessPlacedPromptEngineInputRun {
-                stream_id: stream_id.clone(),
-                submitted_run,
-                output_events: stream_output_events,
-                generated_token_ids: stream_generated_token_ids,
-            });
-            if stream_still_active {
-                self.active_queue.push_back(stream_id);
+                }
             }
         }
 
@@ -302,23 +315,6 @@ impl VulkanResidentInProcessPlacedPromptEngine {
         }
     }
 
-    fn activate_stream_id(&mut self, stream_id: &str) {
-        if !self.active_queue.iter().any(|active| active == stream_id) {
-            self.active_queue.push_back(stream_id.to_string());
-        }
-    }
-
-    fn refresh_active_queue(&mut self) {
-        let active_stream_ids = self
-            .streams
-            .iter()
-            .filter(|(_, stream)| !stream.is_idle())
-            .map(|(stream_id, _)| stream_id.clone())
-            .collect::<Vec<_>>();
-        for stream_id in active_stream_ids {
-            self.activate_stream_id(&stream_id);
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -420,6 +416,7 @@ pub enum VulkanResidentInProcessPlacedPromptEngineError {
     DuplicateStream(String),
     UnknownStream { stream_id: String },
     Stream(VulkanResidentInProcessPlacedRuntimeError),
+    Scheduler(RuntimeStreamSchedulerError),
 }
 
 impl Display for VulkanResidentInProcessPlacedPromptEngineError {
@@ -438,6 +435,7 @@ impl Display for VulkanResidentInProcessPlacedPromptEngineError {
                 )
             }
             Self::Stream(error) => write!(f, "{error}"),
+            Self::Scheduler(error) => write!(f, "{error}"),
         }
     }
 }
@@ -449,6 +447,12 @@ impl From<VulkanResidentInProcessPlacedRuntimeError>
 {
     fn from(error: VulkanResidentInProcessPlacedRuntimeError) -> Self {
         Self::Stream(error)
+    }
+}
+
+impl From<RuntimeStreamSchedulerError> for VulkanResidentInProcessPlacedPromptEngineError {
+    fn from(error: RuntimeStreamSchedulerError) -> Self {
+        Self::Scheduler(error)
     }
 }
 
@@ -485,4 +489,3 @@ fn placed_prompt_engine_stream_snapshot(
         idle: stream.is_idle(),
     }
 }
-

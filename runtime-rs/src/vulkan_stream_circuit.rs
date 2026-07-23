@@ -28,6 +28,8 @@ use crate::stream_plan::{
 };
 use crate::stream_runtime::{
     RuntimeStreamActivation, RuntimeStreamActivationKind, RuntimeStreamActivationOutcome,
+    RuntimeStreamInputEvent, RuntimeStreamScheduler, RuntimeStreamSchedulerBudget,
+    RuntimeStreamSchedulerError,
 };
 use crate::tensor_storage::TensorStorage;
 use crate::vulkan::{DEFAULT_COMPUTE_LOCAL_SIZE_X, DEFAULT_SPIRV_ENTRY_POINT, read_spirv_words};
