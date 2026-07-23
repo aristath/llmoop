@@ -55,6 +55,11 @@ def test_compiler_renders_sparse_moe_and_scaled_residual_components(tmp_path: Pa
     assert "const uint INTERMEDIATE_SIZE = 512u;" in gate_up
     assert "const uint INTERMEDIATE_SIZE = 512u;" in down
     assert "const uint HIDDEN_SIZE = 1024u;" in reduce
+    assert "route >= EXPERTS_PER_TOKEN" in gate_up
+    assert "route >= EXPERTS_PER_TOKEN" in down
+    assert "for (uint route = 0u; route < EXPERTS_PER_TOKEN; route++)" in reduce
+    assert "route < NUM_EXPERTS" not in gate_up
+    assert "route < NUM_EXPERTS" not in down
     assert all(
         "{{" not in (tmp_path / shader_file).read_text() for shader_file in shader_files
     )
@@ -300,3 +305,53 @@ def test_compiler_rejects_mismatched_int4_sparse_expert_scales() -> None:
             tensor_index,
             {"hidden_size": 32, "intermediate_size": 16},
         )
+
+
+def test_sparse_moe_workgroups_scale_with_selected_routes_not_total_experts() -> None:
+    circuit = {
+        "parameters": {
+            "refs": {
+                "moe_input": {"tensor": "experts.gate_up"},
+                "moe_output": {"tensor": "experts.down"},
+            }
+        }
+    }
+    tensor_index = {
+        "tensors": {
+            "experts.gate_up": {
+                "dtype": "BF16",
+                "shape": [256, 2048, 2048],
+                "layout": "row_major",
+            },
+            "experts.down": {
+                "dtype": "BF16",
+                "shape": [256, 2048, 1024],
+                "layout": "row_major",
+            },
+        }
+    }
+    attrs = {
+        "hidden_size": 2048,
+        "intermediate_size": 1024,
+        "experts_per_token": 8,
+    }
+    small_expert_pool = {
+        "id": "sparse_moe_gate_up",
+        "op": "sparse_moe_gate_up",
+        "params": ["moe_input"],
+        "attrs": {**attrs, "num_experts": 32},
+    }
+    large_expert_pool = {
+        **small_expert_pool,
+        "attrs": {**attrs, "num_experts": 256},
+    }
+    down = {
+        "id": "sparse_moe_down",
+        "op": "sparse_moe_down",
+        "params": ["moe_output"],
+        "attrs": {**attrs, "num_experts": 256},
+    }
+
+    assert workgroup_count_x_for_node(circuit, small_expert_pool, tensor_index) == 4096
+    assert workgroup_count_x_for_node(circuit, large_expert_pool, tensor_index) == 4096
+    assert workgroup_count_x_for_node(circuit, down, tensor_index) == 8192
