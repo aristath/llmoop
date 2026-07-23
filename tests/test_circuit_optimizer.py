@@ -626,7 +626,7 @@ class VulkanCircuitOptimizerTest(unittest.TestCase):
         self.assertEqual(
             ["a_weight", "b_weight", "c_weight"], fused["params"]
         )
-        self.assertEqual([1, 1, 1], fused["attrs"]["branch_parameter_counts"])
+        self.assertNotIn("branch_parameter_counts", fused["attrs"])
 
         pair = optimize_circuit_for_vulkan(
             {"nodes": nodes[:2]},

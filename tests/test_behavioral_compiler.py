@@ -166,6 +166,74 @@ def test_exact_candidate_gate_proves_fused_parallel_ffn_projection() -> None:
     )
 
 
+def test_exact_candidate_gate_proves_fp8_parallel_linear_parameter_pairs() -> None:
+    source = {
+        "schema": "llmoop.stream_circuit.v1",
+        "source": {"pedal_id": "layer_00"},
+        "boundary": {
+            "inputs": [{"id": "input", "source": "x"}],
+            "outputs": [
+                {"id": "query", "source": "q"},
+                {"id": "key", "source": "k"},
+            ],
+        },
+        "state_ports": [],
+        "parameters": {
+            "refs": {
+                "q_weight": {"tensor": "q.weight"},
+                "q_weight_scale_inv": {"tensor": "q.weight_scale_inv"},
+                "k_weight": {"tensor": "k.weight"},
+                "k_weight_scale_inv": {"tensor": "k.weight_scale_inv"},
+            }
+        },
+        "behavioral_error_contract": {"mode": "source_reference_circuit"},
+        "nodes": [
+            {
+                "id": "q_projection",
+                "op": "linear",
+                "inputs": ["x"],
+                "outputs": ["q"],
+                "params": ["q_weight", "q_weight_scale_inv"],
+            },
+            {
+                "id": "k_projection",
+                "op": "linear",
+                "inputs": ["x"],
+                "outputs": ["k"],
+                "params": ["k_weight", "k_weight_scale_inv"],
+            },
+        ],
+    }
+    candidate = deepcopy(source)
+    candidate["nodes"] = [
+        {
+            "id": "q_projection__k_projection",
+            "op": "parallel_linear_2way",
+            "inputs": ["x"],
+            "outputs": ["q", "k"],
+            "params": [
+                "q_weight",
+                "q_weight_scale_inv",
+                "k_weight",
+                "k_weight_scale_inv",
+            ],
+            "attrs": {
+                "compiled_from": ["q_projection", "k_projection"],
+                "branch_count": 2,
+                "branch_parameter_counts": [2, 2],
+            },
+        }
+    ]
+
+    evidence = prove_exact_circuit_candidate(
+        pedal_id="layer_00", source=source, candidate=candidate
+    )
+
+    assert evidence["status"] == "passed"
+    assert evidence["candidate_kind"] == "exact_reference"
+    assert evidence["rewrites"][0]["proof_contract"] == "parallel_linear_exact_bf16.v1"
+
+
 def test_exact_candidate_gate_rejects_dropped_source_behavior() -> None:
     source = source_circuit()
     candidate = deepcopy(source)

@@ -632,6 +632,13 @@ def _fuse_parallel_linears(
             or not can_fuse(group)
         ):
             continue
+        branch_parameter_counts = [len(node["params"]) for node in group]
+        attrs = {
+            "compiled_from": [node["id"] for node in group],
+            "branch_count": count,
+        }
+        if any(parameter_count != 1 for parameter_count in branch_parameter_counts):
+            attrs["branch_parameter_counts"] = branch_parameter_counts
         return (
             {
                 "id": "__".join(node["id"] for node in group),
@@ -641,13 +648,7 @@ def _fuse_parallel_linears(
                 "params": [
                     parameter_id for node in group for parameter_id in node["params"]
                 ],
-                "attrs": {
-                    "compiled_from": [node["id"] for node in group],
-                    "branch_count": count,
-                    "branch_parameter_counts": [
-                        len(node["params"]) for node in group
-                    ],
-                },
+                "attrs": attrs,
             },
             count,
         )

@@ -468,6 +468,9 @@ def _validate_exact_rewrite_semantics(
             "compiled_from": source_ids,
             "branch_count": len(region),
         }
+        branch_parameter_counts = [len(node.get("params", [])) for node in region]
+        if any(parameter_count != 1 for parameter_count in branch_parameter_counts):
+            expected_attrs["branch_parameter_counts"] = branch_parameter_counts
     elif op == "linear_residual":
         _require_empty_attrs(pedal_id, op, region)
         expected_attrs = {
