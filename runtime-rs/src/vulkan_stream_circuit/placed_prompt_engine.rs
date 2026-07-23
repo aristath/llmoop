@@ -248,9 +248,6 @@ impl VulkanResidentInProcessPlacedPromptEngine {
 
             for batch in scheduler_step.batches {
                 for activation in batch.activations {
-                    if input_runs.len() >= max_input_events {
-                        break;
-                    }
                     let stream_id = activation.stream_id.clone();
                     let stream = self.streams.get_mut(&stream_id).ok_or_else(|| {
                         VulkanResidentInProcessPlacedPromptEngineError::UnknownStream {
