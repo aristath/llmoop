@@ -120,6 +120,7 @@ impl RuntimePrefixStateCache {
         if self.capacity_entries == 0 {
             return Ok(());
         }
+        validate_source_matches_prefix_key(&key, source)?;
         let cached_stream_id = self.next_cached_stream_id()?;
         let cached_table = source.fork(arena, cached_stream_id.clone())?;
         if let Some(mut old) = self.entries.remove(&key) {
@@ -304,6 +305,44 @@ fn stable_hash_bytes(mut hash: u64, bytes: &[u8]) -> u64 {
     hash
 }
 
+fn validate_source_matches_prefix_key(
+    key: &RuntimePrefixStateCacheKey,
+    source: &TransientStateTable,
+) -> Result<(), RuntimePrefixStateCacheError> {
+    let source_snapshot = source.snapshot();
+    for state_key in &key.state_keys {
+        let entry = source_snapshot
+            .entries
+            .iter()
+            .find(|entry| entry.key == *state_key)
+            .ok_or_else(|| {
+                RuntimePrefixStateCacheError(format!(
+                    "prefix cache source stream {:?} has no state {}.{}",
+                    source_snapshot.stream_id, state_key.node_instance_id, state_key.state_id
+                ))
+            })?;
+        if entry.logical_activation_count != key.token_count {
+            return Err(RuntimePrefixStateCacheError(format!(
+                "prefix cache key for {} tokens does not match source state {}.{} with {} activations",
+                key.token_count,
+                state_key.node_instance_id,
+                state_key.state_id,
+                entry.logical_activation_count
+            )));
+        }
+        if entry.logical_activation_count % entry.shape.activation_capacity != 0 {
+            return Err(RuntimePrefixStateCacheError(format!(
+                "prefix cache source state {}.{} has {} activations, which is not aligned to block capacity {}",
+                state_key.node_instance_id,
+                state_key.state_id,
+                entry.logical_activation_count,
+                entry.shape.activation_capacity
+            )));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -365,6 +404,48 @@ mod tests {
         assert_eq!(cache.snapshot().entry_count, 1);
         assert_eq!(arena.ref_count(first_block).unwrap(), 1);
         assert_eq!(arena.ref_count(second_block).unwrap(), 2);
+    }
+
+    #[test]
+    fn prefix_cache_rejects_non_block_aligned_state() {
+        let mut arena = TransientStateArena::new();
+        let mut source = TransientStateTable::new("source").unwrap();
+        source.declare_state(key("kv"), shape()).unwrap();
+        source
+            .append_activations(&mut arena, &key("kv"), 1)
+            .unwrap();
+        let mut cache = RuntimePrefixStateCache::new(1);
+
+        let error = cache
+            .insert(&mut arena, cache_key(&[1], vec![key("kv")]), &source)
+            .unwrap_err();
+
+        assert!(error.0.contains("is not aligned to block capacity"));
+        assert_eq!(cache.snapshot().entry_count, 0);
+        assert_eq!(arena.snapshot().unwrap().blocks[0].ref_count, 1);
+    }
+
+    #[test]
+    fn prefix_cache_rejects_key_that_does_not_match_source_state_depth() {
+        let mut arena = TransientStateArena::new();
+        let mut source = TransientStateTable::new("source").unwrap();
+        source.declare_state(key("kv"), shape()).unwrap();
+        source
+            .append_activations(&mut arena, &key("kv"), 2)
+            .unwrap();
+        let mut cache = RuntimePrefixStateCache::new(1);
+
+        let error = cache
+            .insert(
+                &mut arena,
+                cache_key(&[1, 2, 3, 4], vec![key("kv")]),
+                &source,
+            )
+            .unwrap_err();
+
+        assert!(error.0.contains("does not match source state"));
+        assert_eq!(cache.snapshot().entry_count, 0);
+        assert_eq!(arena.snapshot().unwrap().blocks[0].ref_count, 1);
     }
 
     #[test]

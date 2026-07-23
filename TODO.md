@@ -330,13 +330,17 @@ Current status:
 - A backend-neutral retained prefix-state cache can keep state tables alive
   independently from the source stream, restore them into compatible streams,
   and evict older entries while releasing retained blocks.
+- Cache insertion now verifies that each cached state entry exactly matches the
+  prefix token depth and ends on a full transient-state block boundary, so the
+  cache cannot silently store partial-block prefixes.
 - The cache can perform longest-compatible-prefix lookup for a longer incoming
   token stream, and the scheduler exposes wrappers that construct keys from
   stream execution class plus runtime graph identity instead of forcing callers
   to hand-roll cache keys.
 - Tests guard shared block ref counts, source-reset survival, per-component
-  sharing, key normalization, eviction release, longest-prefix lookup, and
-  execution-class mismatch rejection.
+  sharing, key normalization, eviction release, block-alignment rejection,
+  state-depth mismatch rejection, longest-prefix lookup, and execution-class
+  mismatch rejection.
 - This is not finished prompt prefix caching yet: block-aligned prompt
   admission, automatic cache insert/restore around normal prompt events,
   runtime modifier serialization, and backend page-backed bindings still need
