@@ -300,8 +300,38 @@ impl RuntimeStreamState {
     ) -> Result<Self, RuntimeStreamSchedulerError> {
         let stream_id = stream_id.into();
         let execution_class_id = execution_class_id.into();
+        Self::with_transient_state_table(
+            stream_id.clone(),
+            execution_class_id,
+            TransientStateTable::new(stream_id)?,
+        )
+    }
+
+    fn with_transient_state_table(
+        stream_id: impl Into<String>,
+        execution_class_id: impl Into<String>,
+        transient_state_table: TransientStateTable,
+    ) -> Result<Self, RuntimeStreamSchedulerError> {
+        let stream_id = stream_id.into();
+        let execution_class_id = execution_class_id.into();
+        if stream_id.is_empty() {
+            return Err(RuntimeStreamSchedulerError(
+                "stream id must not be empty".to_string(),
+            ));
+        }
+        if execution_class_id.is_empty() {
+            return Err(RuntimeStreamSchedulerError(
+                "stream execution class id must not be empty".to_string(),
+            ));
+        }
+        if transient_state_table.stream_id() != stream_id {
+            return Err(RuntimeStreamSchedulerError(format!(
+                "transient state table stream id {:?} does not match runtime stream id {:?}",
+                transient_state_table.stream_id(),
+                stream_id
+            )));
+        }
         Ok(Self {
-            transient_state_table: TransientStateTable::new(stream_id.clone())?,
             stream_id,
             execution_class_id,
             status: RuntimeStreamStatus::Idle,
@@ -312,6 +342,7 @@ impl RuntimeStreamState {
             completed_input_event_count: 0,
             scheduled_activation_count: 0,
             generated_token_count: 0,
+            transient_state_table,
         })
     }
 
@@ -477,6 +508,59 @@ impl RuntimeStreamScheduler {
         stream_id: &str,
     ) -> Result<TransientStateTableSnapshot, RuntimeStreamSchedulerError> {
         Ok(self.stream(stream_id)?.transient_state_table.snapshot())
+    }
+
+    pub fn fork_stream_transient_state(
+        &mut self,
+        source_stream_id: &str,
+        target_stream_id: impl Into<String>,
+        execution_class_id: impl Into<String>,
+    ) -> Result<RuntimeStreamSnapshot, RuntimeStreamSchedulerError> {
+        let target_stream_id = target_stream_id.into();
+        let execution_class_id = execution_class_id.into();
+        if target_stream_id.is_empty() {
+            return Err(RuntimeStreamSchedulerError(
+                "forked stream id must not be empty".to_string(),
+            ));
+        }
+        if execution_class_id.is_empty() {
+            return Err(RuntimeStreamSchedulerError(
+                "forked stream execution class id must not be empty".to_string(),
+            ));
+        }
+        if self.streams.contains_key(&target_stream_id) {
+            return Err(RuntimeStreamSchedulerError(format!(
+                "stream {target_stream_id:?} already exists"
+            )));
+        }
+
+        let source_table = self.stream(source_stream_id)?.transient_state_table.clone();
+        let forked_table = source_table.fork(&mut self.transient_state_arena, &target_stream_id)?;
+        let stream = RuntimeStreamState::with_transient_state_table(
+            target_stream_id.clone(),
+            execution_class_id,
+            forked_table,
+        )?;
+        let snapshot = stream.snapshot();
+        self.streams.insert(target_stream_id, stream);
+        Ok(snapshot)
+    }
+
+    pub fn share_stream_state(
+        &mut self,
+        target_stream_id: &str,
+        source_stream_id: &str,
+        key: &TransientStateKey,
+    ) -> Result<RuntimeStreamSnapshot, RuntimeStreamSchedulerError> {
+        let source_table = self.stream(source_stream_id)?.transient_state_table.clone();
+        let arena = &mut self.transient_state_arena;
+        let target = self.streams.get_mut(target_stream_id).ok_or_else(|| {
+            RuntimeStreamSchedulerError(format!("unknown stream {target_stream_id:?}"))
+        })?;
+        target
+            .transient_state_table
+            .share_state_from(arena, &source_table, key)?;
+        Ok(target.snapshot())
     }
 
     pub fn enqueue_input_event(
@@ -1362,6 +1446,157 @@ mod tests {
             scheduler.snapshot().transient_state_arena.free_block_count,
             1
         );
+    }
+
+    #[test]
+    fn scheduler_forks_stream_transient_state_without_copying_blocks() {
+        let mut scheduler = RuntimeStreamScheduler::new();
+        scheduler
+            .add_stream_with_state_declarations("source", [(state_key(), state_shape())])
+            .unwrap();
+        scheduler
+            .enqueue_input_event("source", RuntimeStreamInputEvent::new("event_0", [1, 2], 8))
+            .unwrap();
+        let prefill = scheduler.schedule_step(budget(1)).unwrap().activations[0].clone();
+        scheduler
+            .complete_activation(
+                prefill.id,
+                RuntimeStreamActivationOutcome::prefill_complete(),
+            )
+            .unwrap();
+
+        let forked = scheduler
+            .fork_stream_transient_state("source", "child", "same_package")
+            .unwrap();
+
+        assert_eq!(forked.stream_id, "child");
+        assert_eq!(forked.execution_class_id, "same_package");
+        assert_eq!(forked.status, RuntimeStreamStatus::Idle);
+        assert_eq!(forked.queued_input_event_count, 0);
+        assert_eq!(forked.current_input_event_id, None);
+        assert_eq!(forked.transient_state_entry_count, 1);
+        assert_eq!(forked.transient_state_block_count, 1);
+        assert_eq!(forked.transient_state_logical_activation_count, 2);
+        let arena = scheduler.transient_state_arena_snapshot().unwrap();
+        assert_eq!(arena.live_block_count, 1);
+        assert_eq!(arena.blocks[0].ref_count, 2);
+
+        scheduler
+            .interrupt_stream("source", "discard source")
+            .unwrap();
+
+        let child_state = scheduler.stream_transient_state_snapshot("child").unwrap();
+        assert_eq!(child_state.block_count, 1);
+        assert_eq!(child_state.logical_activation_count, 2);
+        let arena_after_source_reset = scheduler.transient_state_arena_snapshot().unwrap();
+        assert_eq!(arena_after_source_reset.live_block_count, 1);
+        assert_eq!(arena_after_source_reset.free_block_count, 0);
+        assert_eq!(arena_after_source_reset.blocks[0].ref_count, 1);
+    }
+
+    #[test]
+    fn scheduler_rejects_invalid_fork_before_retaining_blocks() {
+        let mut scheduler = RuntimeStreamScheduler::new();
+        scheduler
+            .add_stream_with_state_declarations("source", [(state_key(), state_shape())])
+            .unwrap();
+        scheduler
+            .enqueue_input_event("source", RuntimeStreamInputEvent::new("event_0", [1, 2], 8))
+            .unwrap();
+        let prefill = scheduler.schedule_step(budget(1)).unwrap().activations[0].clone();
+        scheduler
+            .complete_activation(
+                prefill.id,
+                RuntimeStreamActivationOutcome::prefill_complete(),
+            )
+            .unwrap();
+
+        let before = scheduler.transient_state_arena_snapshot().unwrap();
+        let error = scheduler
+            .fork_stream_transient_state("source", "child", "")
+            .unwrap_err();
+        let after = scheduler.transient_state_arena_snapshot().unwrap();
+
+        assert!(
+            error
+                .0
+                .contains("forked stream execution class id must not be empty")
+        );
+        assert_eq!(after, before);
+        assert_eq!(scheduler.snapshot().stream_count, 1);
+    }
+
+    #[test]
+    fn scheduler_shares_single_component_state_between_streams() {
+        let kv = state_key();
+        let conv = TransientStateKey::new("layer_00", "conv_state");
+        let shape = state_shape();
+        let mut scheduler = RuntimeStreamScheduler::new();
+        scheduler
+            .add_stream_with_state_declarations(
+                "source",
+                [(kv.clone(), shape.clone()), (conv.clone(), shape.clone())],
+            )
+            .unwrap();
+        scheduler
+            .add_stream_with_state_declarations("target", [(kv.clone(), shape.clone())])
+            .unwrap();
+        scheduler
+            .enqueue_input_event("source", RuntimeStreamInputEvent::new("event_0", [1, 2], 8))
+            .unwrap();
+        let prefill = scheduler.schedule_step(budget(1)).unwrap().activations[0].clone();
+        scheduler
+            .complete_activation(
+                prefill.id,
+                RuntimeStreamActivationOutcome::prefill_complete(),
+            )
+            .unwrap();
+
+        let shared = scheduler
+            .share_stream_state("target", "source", &kv)
+            .unwrap();
+
+        assert_eq!(shared.stream_id, "target");
+        assert_eq!(shared.status, RuntimeStreamStatus::Idle);
+        assert_eq!(shared.transient_state_entry_count, 1);
+        assert_eq!(shared.transient_state_block_count, 1);
+        assert_eq!(shared.transient_state_logical_activation_count, 2);
+        let source_state = scheduler.stream_transient_state_snapshot("source").unwrap();
+        let target_state = scheduler.stream_transient_state_snapshot("target").unwrap();
+        let source_kv_blocks = source_state
+            .entries
+            .iter()
+            .find(|entry| entry.key == kv)
+            .unwrap()
+            .block_ids
+            .clone();
+        let source_conv_blocks = source_state
+            .entries
+            .iter()
+            .find(|entry| entry.key == conv)
+            .unwrap()
+            .block_ids
+            .clone();
+        let target_kv_blocks = target_state.entries[0].block_ids.clone();
+        assert_eq!(target_kv_blocks, source_kv_blocks);
+        assert_ne!(target_kv_blocks, source_conv_blocks);
+
+        let arena = scheduler.transient_state_arena_snapshot().unwrap();
+        assert_eq!(arena.live_block_count, 2);
+        let kv_ref_count = arena
+            .blocks
+            .iter()
+            .find(|block| block.block_id == target_kv_blocks[0])
+            .unwrap()
+            .ref_count;
+        let conv_ref_count = arena
+            .blocks
+            .iter()
+            .find(|block| block.block_id == source_conv_blocks[0])
+            .unwrap()
+            .ref_count;
+        assert_eq!(kv_ref_count, 2);
+        assert_eq!(conv_ref_count, 1);
     }
 
     #[test]

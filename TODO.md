@@ -318,6 +318,20 @@ Once block-managed transient state exists:
 
 This maps to vLLM prefix caching while preserving NERVE's transient-circuit semantics.
 
+Current status:
+
+- The runtime now exposes backend-neutral stream state fork/share operations on
+  top of the ref-counted transient state arena. A stream can branch into a new
+  idle stream with the same resident transient blocks, and individual component
+  state can be shared into another stream without copying unrelated state.
+- Tests guard that shared blocks are retained by ref count, that source reset
+  does not destroy forked child state, and that per-component sharing does not
+  accidentally merge every state entry.
+- This is not finished prefix caching yet: prompt/state hash keys, cache
+  admission, block-aligned lookup, eviction policy, runtime graph identity in
+  keys, and backend page-backed bindings still need to be wired into normal
+  prompt admission.
+
 ### 12. Make graph/kernel reuse explicit
 
 Avoid rebuilding execution shape on every prompt or token.
