@@ -155,6 +155,48 @@ impl RuntimePrefixStateCache {
         Ok(true)
     }
 
+    pub fn longest_matching_key<I>(
+        &self,
+        execution_class_id: impl Into<String>,
+        runtime_graph_id: impl Into<String>,
+        token_ids: &[u32],
+        runtime_modifier_bytes: &[u8],
+        state_keys: I,
+    ) -> Result<Option<RuntimePrefixStateCacheKey>, RuntimePrefixStateCacheError>
+    where
+        I: IntoIterator<Item = TransientStateKey>,
+    {
+        let execution_class_id = execution_class_id.into();
+        if execution_class_id.is_empty() {
+            return Err(RuntimePrefixStateCacheError(
+                "prefix cache execution class id must not be empty".to_string(),
+            ));
+        }
+        let runtime_graph_id = runtime_graph_id.into();
+        if runtime_graph_id.is_empty() {
+            return Err(RuntimePrefixStateCacheError(
+                "prefix cache runtime graph id must not be empty".to_string(),
+            ));
+        }
+        if token_ids.is_empty() {
+            return Ok(None);
+        }
+        let state_keys = state_keys.into_iter().collect::<Vec<_>>();
+        for token_count in (1..=token_ids.len()).rev() {
+            let key = RuntimePrefixStateCacheKey::from_token_prefix(
+                execution_class_id.clone(),
+                runtime_graph_id.clone(),
+                &token_ids[..token_count],
+                runtime_modifier_bytes,
+                state_keys.clone(),
+            )?;
+            if self.entries.contains_key(&key) {
+                return Ok(Some(key));
+            }
+        }
+        Ok(None)
+    }
+
     pub fn snapshot(&self) -> RuntimePrefixStateCacheSnapshot {
         let mut entries = self
             .entries
@@ -323,5 +365,49 @@ mod tests {
         assert_eq!(cache.snapshot().entry_count, 1);
         assert_eq!(arena.ref_count(first_block).unwrap(), 1);
         assert_eq!(arena.ref_count(second_block).unwrap(), 2);
+    }
+
+    #[test]
+    fn prefix_cache_finds_longest_compatible_token_prefix() {
+        let mut arena = TransientStateArena::new();
+        let mut short = TransientStateTable::new("short_source").unwrap();
+        let mut long = TransientStateTable::new("long_source").unwrap();
+        short.declare_state(key("kv"), shape()).unwrap();
+        long.declare_state(key("kv"), shape()).unwrap();
+        short.append_activations(&mut arena, &key("kv"), 2).unwrap();
+        long.append_activations(&mut arena, &key("kv"), 4).unwrap();
+        let mut cache = RuntimePrefixStateCache::new(4);
+        cache
+            .insert(&mut arena, cache_key(&[1, 2], vec![key("kv")]), &short)
+            .unwrap();
+        cache
+            .insert(&mut arena, cache_key(&[1, 2, 3, 4], vec![key("kv")]), &long)
+            .unwrap();
+
+        let matched = cache
+            .longest_matching_key(
+                "package_a",
+                "graph_a",
+                &[1, 2, 3, 4, 5, 6],
+                b"reasoning=true",
+                [key("kv")],
+            )
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(matched.token_count, 4);
+        assert_eq!(matched.token_hash, stable_token_prefix_hash(&[1, 2, 3, 4]));
+        assert_eq!(
+            cache
+                .longest_matching_key(
+                    "package_a",
+                    "graph_a",
+                    &[1, 2, 3, 4, 5, 6],
+                    b"reasoning=false",
+                    [key("kv")]
+                )
+                .unwrap(),
+            None
+        );
     }
 }

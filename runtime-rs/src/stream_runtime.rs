@@ -603,6 +603,29 @@ impl RuntimeStreamScheduler {
         Ok(())
     }
 
+    pub fn cache_stream_prefix_state_for_tokens<I>(
+        &mut self,
+        stream_id: &str,
+        runtime_graph_id: impl Into<String>,
+        token_ids: &[u32],
+        runtime_modifier_bytes: &[u8],
+        state_keys: I,
+    ) -> Result<RuntimePrefixStateCacheKey, RuntimeStreamSchedulerError>
+    where
+        I: IntoIterator<Item = TransientStateKey>,
+    {
+        let execution_class_id = self.stream(stream_id)?.execution_class_id.clone();
+        let key = RuntimePrefixStateCacheKey::from_token_prefix(
+            execution_class_id,
+            runtime_graph_id,
+            token_ids,
+            runtime_modifier_bytes,
+            state_keys,
+        )?;
+        self.cache_stream_prefix_state(stream_id, key.clone())?;
+        Ok(key)
+    }
+
     pub fn restore_stream_prefix_state(
         &mut self,
         target_stream_id: &str,
@@ -625,6 +648,32 @@ impl RuntimeStreamScheduler {
                 &mut target.transient_state_table,
             )
             .map_err(RuntimeStreamSchedulerError::from)
+    }
+
+    pub fn restore_longest_stream_prefix_state<I>(
+        &mut self,
+        target_stream_id: &str,
+        runtime_graph_id: impl Into<String>,
+        token_ids: &[u32],
+        runtime_modifier_bytes: &[u8],
+        state_keys: I,
+    ) -> Result<Option<RuntimePrefixStateCacheKey>, RuntimeStreamSchedulerError>
+    where
+        I: IntoIterator<Item = TransientStateKey>,
+    {
+        let target_execution_class_id = self.stream(target_stream_id)?.execution_class_id.clone();
+        let Some(key) = self.prefix_state_cache.longest_matching_key(
+            target_execution_class_id,
+            runtime_graph_id,
+            token_ids,
+            runtime_modifier_bytes,
+            state_keys,
+        )?
+        else {
+            return Ok(None);
+        };
+        self.restore_stream_prefix_state(target_stream_id, &key)?;
+        Ok(Some(key))
     }
 
     pub fn enqueue_input_event(

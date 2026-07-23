@@ -558,6 +558,112 @@ fn scheduler_prefix_cache_rejects_execution_class_mismatch_without_mutation() {
 }
 
 #[test]
+fn scheduler_restores_longest_matching_prefix_state() {
+    let mut scheduler = RuntimeStreamScheduler::with_prefix_state_cache_capacity(4);
+    scheduler
+        .add_stream_with_state_declarations_and_execution_class(
+            "short_source",
+            "package_a",
+            [(state_key(), state_shape())],
+        )
+        .unwrap();
+    scheduler
+        .add_stream_with_state_declarations_and_execution_class(
+            "long_source",
+            "package_a",
+            [(state_key(), state_shape())],
+        )
+        .unwrap();
+
+    scheduler
+        .enqueue_input_event(
+            "short_source",
+            RuntimeStreamInputEvent::new("short_event", [1, 2], 0),
+        )
+        .unwrap();
+    let short_prefill = scheduler.schedule_step(budget(1)).unwrap().activations[0].clone();
+    scheduler
+        .complete_activation(
+            short_prefill.id,
+            RuntimeStreamActivationOutcome::prefill_complete(),
+        )
+        .unwrap();
+
+    scheduler
+        .enqueue_input_event(
+            "long_source",
+            RuntimeStreamInputEvent::new("long_event", [1, 2, 3, 4], 0),
+        )
+        .unwrap();
+    for _ in 0..2 {
+        let prefill = scheduler.schedule_step(budget(1)).unwrap().activations[0].clone();
+        scheduler
+            .complete_activation(
+                prefill.id,
+                RuntimeStreamActivationOutcome::prefill_complete(),
+            )
+            .unwrap();
+    }
+
+    let short_key = scheduler
+        .cache_stream_prefix_state_for_tokens(
+            "short_source",
+            "graph_a",
+            &[1, 2],
+            b"reasoning=true",
+            [state_key()],
+        )
+        .unwrap();
+    let long_key = scheduler
+        .cache_stream_prefix_state_for_tokens(
+            "long_source",
+            "graph_a",
+            &[1, 2, 3, 4],
+            b"reasoning=true",
+            [state_key()],
+        )
+        .unwrap();
+    scheduler
+        .add_stream_with_state_declarations_and_execution_class(
+            "target",
+            "package_a",
+            [(state_key(), state_shape())],
+        )
+        .unwrap();
+
+    let matched = scheduler
+        .restore_longest_stream_prefix_state(
+            "target",
+            "graph_a",
+            &[1, 2, 3, 4, 5],
+            b"reasoning=true",
+            [state_key()],
+        )
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(matched, long_key);
+    assert_ne!(matched, short_key);
+    assert_eq!(
+        scheduler
+            .stream_transient_state_snapshot("target")
+            .unwrap()
+            .logical_activation_count,
+        4
+    );
+    assert_eq!(
+        scheduler
+            .prefix_state_cache_snapshot()
+            .entries
+            .iter()
+            .find(|entry| entry.key == long_key)
+            .unwrap()
+            .use_count,
+        1
+    );
+}
+
+#[test]
 fn scheduler_run_drives_executor_until_stream_is_idle() {
     let mut scheduler = RuntimeStreamScheduler::new();
     scheduler.add_stream("stream_a").unwrap();
