@@ -11,5 +11,6 @@ runtime-rs/target/
 lowered/
 packages/
 transpiled/
+compiled_models/
 
 .DS_Store
