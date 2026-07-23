@@ -168,6 +168,7 @@ def test_discovers_nested_hybrid_decoder_by_tensor_structure() -> None:
             "rope_parameters": {
                 "rope_theta": 10000000.0,
                 "partial_rotary_factor": 0.25,
+                "mrope_interleaved": True,
             },
             "eos_token_id": 248044,
         },
@@ -177,6 +178,7 @@ def test_discovers_nested_hybrid_decoder_by_tensor_structure() -> None:
     assert structure.model_type == "synthetic_hybrid_text"
     assert structure.head_width == 256
     assert structure.rotary_width == 64
+    assert structure.rope_interleaved is True
     assert structure.rms_norm_weight_offset == 1.0
     assert structure.token_ids["eos"] == 248044
     assert [layer.operator_type for layer in structure.layers] == [
@@ -196,6 +198,8 @@ def test_discovers_nested_hybrid_decoder_by_tensor_structure() -> None:
     assert split["attrs"]["layout"] == "per_head_interleaved"
     assert split["attrs"]["blocks"] == 8
     assert split["attrs"]["block_part_width"] == 256
+    rope = next(node for node in attention_circuit["nodes"] if node["id"] == "q_rope")
+    assert rope["attrs"]["interleaved"] is True
 
 
 def test_discovers_sparse_moe_and_model_specific_numerics_by_structure(
@@ -379,4 +383,3 @@ def test_discovers_fused_qkv_and_gate_up_projections_by_shape() -> None:
     assert nodes["qkv_split"]["attrs"] == {"part_widths": [16, 8, 8]}
     assert nodes["ffn_gate_up_projection"]["params"] == ["ffn_gate_up"]
     assert nodes["ffn_gate_up_split"]["attrs"] == {"part_width": 12}
-

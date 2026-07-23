@@ -187,7 +187,7 @@ def discover_model_structure(
             if first_attention is not None
             else discover_rope_theta(decoder_config)
         ),
-        rope_interleaved=bool(decoder_config.get("rope_interleaved", False)),
+        rope_interleaved=discover_rope_interleaved(decoder_config),
         rms_norm_weight_offset=rms_norm_weight_offset,
         embedding_scale=discover_embedding_scale(
             decoder_config,
@@ -1661,3 +1661,14 @@ def discover_rope_theta(config: Json) -> float:
     if "rope_theta" in config:
         return float(config["rope_theta"])
     raise ModelTranspileError("could not discover RoPE theta from model config")
+
+
+def discover_rope_interleaved(config: Json) -> bool:
+    if "rope_interleaved" in config:
+        return bool(config["rope_interleaved"])
+    rope_parameters = config.get("rope_parameters")
+    if isinstance(rope_parameters, dict):
+        for key in ("mrope_interleaved", "rope_interleaved", "interleaved"):
+            if key in rope_parameters:
+                return bool(rope_parameters[key])
+    return bool(config.get("mrope_interleaved", False))

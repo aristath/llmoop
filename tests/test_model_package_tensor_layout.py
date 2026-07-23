@@ -85,7 +85,15 @@ def test_compiler_derives_fp8_output_projection_tensor_pair(tmp_path: Path) -> N
                         "params": {"weight": {"tensor": source_tensor}},
                     },
                 ]
-            }
+            },
+            "draft_execution_graphs": [
+                {
+                    "id": "draft_00",
+                    "output_transducer": {
+                        "params": {"projection": {"tensor": source_tensor}}
+                    },
+                }
+            ],
         }
     }
 
@@ -100,6 +108,11 @@ def test_compiler_derives_fp8_output_projection_tensor_pair(tmp_path: Path) -> N
     assert tensor_index["tensors"][weight]["byte_count"] == 16 * 128
     assert tensor_index["tensors"][scale]["dtype"] == "BF16"
     assert tensor_index["tensors"][scale]["shape"] == [1, 1]
+    draft_output = model_graph["graph"]["draft_execution_graphs"][0][
+        "output_transducer"
+    ]["params"]
+    assert draft_output["projection"]["tensor"] == weight
+    assert draft_output["weight_scale_inv"]["tensor"] == scale
 
     destinations = {
         weight: tmp_path / "weight.safetensors",

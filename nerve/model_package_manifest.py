@@ -732,6 +732,35 @@ def speculative_decoder_specs(
         output_refs = output_circuit["parameters"]["refs"]
         norm_tensor = output_refs["norm"]["tensor"]
         projection_tensor = output_refs["projection"]["tensor"]
+        projection_scale_tensor = output_refs.get("weight_scale_inv", {}).get(
+            "tensor"
+        )
+        projection_dtype = tensor_dtype(tensor_index, projection_tensor)
+        if projection_dtype == "F8_E4M3" and not isinstance(
+            projection_scale_tensor, str
+        ):
+            raise ModelCompileError(
+                f"FP8 draft output projection tensor {projection_tensor!r} has no scale tensor"
+            )
+        if projection_dtype == "BF16" and projection_scale_tensor is not None:
+            raise ModelCompileError(
+                "BF16 draft output projection must not bind an FP8 scale tensor"
+            )
+        projection_scale_dtype = (
+            tensor_dtype(tensor_index, projection_scale_tensor)
+            if isinstance(projection_scale_tensor, str)
+            else None
+        )
+        projection_scale_shape = (
+            tensor_shape(tensor_index, projection_scale_tensor)
+            if isinstance(projection_scale_tensor, str)
+            else None
+        )
+        projection_scale_byte_capacity = (
+            tensor_byte_count(tensor_index, projection_scale_tensor)
+            if isinstance(projection_scale_tensor, str)
+            else None
+        )
         decoders.append(
             {
                 "id": draft["id"],
@@ -761,19 +790,17 @@ def speculative_decoder_specs(
                         tensor_index, norm_tensor
                     ),
                     "projection_parameter_tensor": projection_tensor,
-                    "projection_parameter_dtype": tensor_dtype(
-                        tensor_index, projection_tensor
-                    ),
+                    "projection_parameter_dtype": projection_dtype,
                     "projection_parameter_shape": tensor_shape(
                         tensor_index, projection_tensor
                     ),
                     "projection_parameter_byte_capacity": tensor_byte_count(
                         tensor_index, projection_tensor
                     ),
-                    "projection_scale_parameter_tensor": None,
-                    "projection_scale_parameter_dtype": None,
-                    "projection_scale_parameter_shape": None,
-                    "projection_scale_parameter_byte_capacity": None,
+                    "projection_scale_parameter_tensor": projection_scale_tensor,
+                    "projection_scale_parameter_dtype": projection_scale_dtype,
+                    "projection_scale_parameter_shape": projection_scale_shape,
+                    "projection_scale_parameter_byte_capacity": projection_scale_byte_capacity,
                     "input_frame_byte_capacity": frame_bytes,
                     "output_hidden_byte_capacity": frame_bytes,
                     "logits_byte_capacity": logits_bytes,

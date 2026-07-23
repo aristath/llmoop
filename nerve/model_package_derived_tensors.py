@@ -24,6 +24,12 @@ def derive_output_projection_tensors(model_graph: Json, tensor_index: Json) -> N
         scale_tensor = f"{source_tensor}_scale_inv"
         if scale_tensor in tensor_index["tensors"]:
             params["weight_scale_inv"] = {"tensor": scale_tensor}
+            update_draft_output_projection_params(
+                model_graph,
+                source_tensor=source_tensor,
+                weight_tensor=source_tensor,
+                scale_tensor=scale_tensor,
+            )
         return
     if dtype != "BF16":
         return
@@ -78,6 +84,29 @@ def derive_output_projection_tensors(model_graph: Json, tensor_index: Json) -> N
     params["weight_scale_inv"] = {"tensor": derived_scale}
     output_projection["compiled_parameter_dtype"] = "F8_E4M3"
     output_projection["compiled_from_tensor"] = source_tensor
+    update_draft_output_projection_params(
+        model_graph,
+        source_tensor=source_tensor,
+        weight_tensor=derived_weight,
+        scale_tensor=derived_scale,
+    )
+
+
+def update_draft_output_projection_params(
+    model_graph: Json,
+    *,
+    source_tensor: str,
+    weight_tensor: str,
+    scale_tensor: str,
+) -> None:
+    for draft in model_graph["graph"].get("draft_execution_graphs", []):
+        output = draft.get("output_transducer", {})
+        params = output.get("params", {})
+        projection = params.get("projection")
+        if not isinstance(projection, dict) or projection.get("tensor") != source_tensor:
+            continue
+        params["projection"] = {"tensor": weight_tensor}
+        params["weight_scale_inv"] = {"tensor": scale_tensor}
 
 
 def output_projection_component(model_graph: Json) -> Json:
