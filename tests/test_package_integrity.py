@@ -420,6 +420,7 @@ def minimal_package(root: Path) -> dict[str, object]:
                         "execution_index": 0,
                         "node_id": "project",
                         "op": "linear",
+                        "execution_domain": "decode",
                         "shader_path": "shaders/kernel.spv",
                         "batch_mode": "serial_lanes",
                         "batch_implementations": [],
@@ -554,8 +555,10 @@ def test_package_integrity_rejects_batch_requirements_that_do_not_match_spirv(
     kernel["batch_mode"] = "weight_shared"
     kernel["batch_implementations"] = [
         {
+            "execution_domain": "decode_and_prefill",
             "lane_tile_width": 4,
             "exact_primary_equivalence": True,
+            "exact_causal_sequence_equivalence": True,
             "device_requirements": {
                 "vulkan_device_extensions": [],
                 "vulkan_features": ["shader_int8"],

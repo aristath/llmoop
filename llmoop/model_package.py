@@ -100,6 +100,9 @@ SPIRV_CAPABILITY_VULKAN_SUBGROUP_OPERATION_REQUIREMENTS = {
 KNOWN_VULKAN_SUBGROUP_OPERATIONS = frozenset(
     SPIRV_CAPABILITY_VULKAN_SUBGROUP_OPERATION_REQUIREMENTS.values()
 )
+KNOWN_PEDAL_KERNEL_EXECUTION_DOMAINS = frozenset(
+    {"decode", "prefill", "decode_and_prefill"}
+)
 SUPPORTED_SPIRV_CAPABILITIES = frozenset(
     {0, 1}
     | SPIRV_CAPABILITY_VULKAN_FEATURE_REQUIREMENTS.keys()
@@ -481,7 +484,7 @@ def build_vulkan_resident_package_manifest(
                 can_fuse_bf16_linear_split(circuit, node, tensor_index)
             ),
             can_fuse_parallel_linears=lambda nodes, circuit=circuit: (
-                can_fuse_bf16_parallel_linears(circuit, nodes, tensor_index)
+                can_fuse_native_parallel_linears(circuit, nodes, tensor_index)
             ),
             can_fuse_parallel_linear_silu_multiply=lambda projection, activation, circuit=circuit: (
                 can_fuse_parallel_linear_silu_multiply(
@@ -1001,6 +1004,7 @@ def pedal_kernel_spec(
         "execution_index": execution_index,
         "node_id": node["id"],
         "op": node["op"],
+        "execution_domain": "decode",
         "shader_path": f"shaders/{shader_file}",
         "local_size_x": local_size_x,
         "workgroup_count_x": workgroup_count_x,
@@ -1016,8 +1020,10 @@ def pedal_kernel_spec(
     if causal_scan_stages is not None:
         spec["batch_implementations"].append(
             {
+                "execution_domain": "prefill",
                 "lane_tile_width": CAUSAL_SCAN_LANE_TILE_WIDTH,
                 "exact_primary_equivalence": False,
+                "exact_causal_sequence_equivalence": True,
                 "device_requirements": {
                     "vulkan_device_extensions": [],
                     "vulkan_features": [],
@@ -1030,8 +1036,10 @@ def pedal_kernel_spec(
         if scalar_batch_shader_file is not None and cooperative_shader_file is not None:
             spec["batch_implementations"].append(
                 {
+                    "execution_domain": "prefill",
                     "lane_tile_width": COOPERATIVE_BATCH_LANE_TILE_WIDTH,
                     "exact_primary_equivalence": False,
+                    "exact_causal_sequence_equivalence": False,
                     "device_requirements": {
                         "vulkan_device_extensions": [],
                         "vulkan_features": [],
@@ -1053,8 +1061,10 @@ def pedal_kernel_spec(
         if frame_parallel_shader_file is not None:
             spec["batch_implementations"].append(
                 {
+                    "execution_domain": "prefill",
                     "lane_tile_width": 1,
                     "exact_primary_equivalence": True,
+                    "exact_causal_sequence_equivalence": True,
                     "device_requirements": {
                         "vulkan_device_extensions": [],
                         "vulkan_features": [],
@@ -1082,8 +1092,10 @@ def pedal_kernel_spec(
                 )
             spec["batch_implementations"].append(
                 {
+                    "execution_domain": "decode_and_prefill",
                     "lane_tile_width": tile_width,
                     "exact_primary_equivalence": True,
+                    "exact_causal_sequence_equivalence": True,
                     "device_requirements": {
                         "vulkan_device_extensions": [],
                         "vulkan_features": [],
@@ -1120,6 +1132,15 @@ def frame_parallel_batch_shader_file(shader_file: str) -> str | None:
             shader_file.replace("_bf16_", "_batch1_bf16_", 1)
             .replace("_fp8_e4m3_", "_batch1_fp8_e4m3_", 1)
             .replace("_int4_ct_", "_batch1_int4_ct_", 1)
+        )
+    if re.fullmatch(
+        r"parallel_linear_[23]way_fp8_e4m3_b\d+x\d+_\d+x\d+\.comp",
+        shader_file,
+    ):
+        return shader_file.replace(
+            "parallel_linear_",
+            "parallel_linear_batch1_",
+            1,
         )
     if re.fullmatch(
         r"moe_reduce_bf16_h\d+_k\d+_scale[0-9eE+.-]+\.comp", shader_file
@@ -1392,6 +1413,27 @@ def weight_shared_batch_shader_file(
                 f"parallel_linear_silu_multiply_batch{tile}_fp8_e4m3_",
                 1,
             )
+    parallel_fp8 = re.fullmatch(
+        r"parallel_linear_([23])way_fp8_e4m3_b(\d+)x(\d+)_(\d+)x(\d+)\.comp",
+        shader_file,
+    )
+    if parallel_fp8 is not None:
+        _branch_count, block_rows, _block_columns, _input_size, output_size = map(
+            int, parallel_fp8.groups()
+        )
+        tile = tile_width or min(
+            SCALAR_BATCH_LANE_TILE_WIDTH,
+            max(1, FP8_LINEAR_MIN_WORKGROUPS // block_rows),
+        )
+        if output_size > 0:
+            tile = min(tile, output_size)
+        if tile <= 1:
+            return None
+        return shader_file.replace(
+            "parallel_linear_",
+            f"parallel_linear_batch{tile}_",
+            1,
+        )
     fused_bf16_ffn = re.fullmatch(
         r"parallel_linear_silu_multiply_bf16_"
         r"(\d+)x(\d+)\.comp",
@@ -1522,41 +1564,81 @@ def shader_file_for_node(
     if op in {"parallel_linear_2way", "parallel_linear_3way"}:
         expected_branch_count = 2 if op == "parallel_linear_2way" else 3
         branch_count = int(node["attrs"]["branch_count"])
+        branch_parameter_counts = [
+            int(count)
+            for count in node["attrs"].get(
+                "branch_parameter_counts", [1] * branch_count
+            )
+        ]
         if (
             branch_count != expected_branch_count
-            or branch_count != len(node["params"])
+            or len(branch_parameter_counts) != branch_count
+            or sum(branch_parameter_counts) != len(node["params"])
             or branch_count != len(node["outputs"])
         ):
             raise ModelCompileError(
                 f"parallel-linear node {node['id']!r} has inconsistent branch metadata"
             )
+        branch_params = []
+        offset = 0
+        for count in branch_parameter_counts:
+            branch_params.append(node["params"][offset : offset + count])
+            offset += count
         shapes = [
-            parameter_shape_for_id(circuit, parameter_id, tensor_index)
-            for parameter_id in node["params"]
+            parameter_shape_for_id(circuit, parameter_ids[0], tensor_index)
+            for parameter_ids in branch_params
         ]
         input_widths = {int(shape[1]) for shape in shapes if len(shape) == 2}
         dtypes = {
-            parameter_dtype_for_id(circuit, parameter_id, tensor_index)
-            for parameter_id in node["params"]
+            parameter_dtype_for_id(circuit, parameter_ids[0], tensor_index)
+            for parameter_ids in branch_params
         }
         if (
             len(shapes) != branch_count
             or any(len(shape) != 2 for shape in shapes)
             or len(input_widths) != 1
-            or dtypes != {"BF16"}
+            or dtypes not in ({"BF16"}, {"F8_E4M3"})
         ):
             raise ModelCompileError(
                 f"parallel-linear node {node['id']!r} has incompatible shapes {shapes}"
             )
         output_widths = [int(shape[0]) for shape in shapes]
         layouts = {
-            parameter_layout_for_id(circuit, parameter_id, tensor_index)
-            for parameter_id in node["params"]
+            parameter_layout_for_id(circuit, parameter_ids[0], tensor_index)
+            for parameter_ids in branch_params
         }
         if layouts != {ROW_MAJOR_LAYOUT}:
             raise ModelCompileError(
                 f"parallel-linear node {node['id']!r} has unsupported layouts "
                 f"{sorted(layouts)}"
+            )
+        if dtypes == {"F8_E4M3"}:
+            block_shapes = {
+                fp8_block_shape_for_node(
+                    circuit,
+                    {
+                        "id": f"{node['id']}__branch_{index}",
+                        "params": parameter_ids,
+                    },
+                    tensor_index,
+                )
+                for index, parameter_ids in enumerate(branch_params)
+            }
+            if len(block_shapes) != 1 or any(
+                len(parameter_ids) != 2 for parameter_ids in branch_params
+            ):
+                raise ModelCompileError(
+                    f"parallel-linear FP8 node {node['id']!r} has incompatible block scales"
+                )
+            block_rows, block_columns = block_shapes.pop()
+            if len(set(output_widths)) != 1:
+                raise ModelCompileError(
+                    f"parallel-linear FP8 node {node['id']!r} requires equal output widths"
+                )
+            input_width = input_widths.pop()
+            return (
+                f"parallel_linear_{branch_count}way_fp8_e4m3_"
+                f"b{block_rows}x{block_columns}_{input_width}x{output_widths[0]}.comp"
             )
         input_width = input_widths.pop()
         return (
@@ -2177,10 +2259,35 @@ def workgroup_count_x_for_node(circuit: Json, node: Json, tensor_index: Json) ->
             int(branch["norm"]["head_count"]) for branch in node["attrs"]["branches"]
         )
     if node["op"] in {"parallel_linear_2way", "parallel_linear_3way"}:
+        branch_count = int(node["attrs"]["branch_count"])
+        branch_parameter_counts = [
+            int(count)
+            for count in node["attrs"].get(
+                "branch_parameter_counts", [1] * branch_count
+            )
+        ]
+        branch_weight_ids = []
+        offset = 0
+        for count in branch_parameter_counts:
+            branch_weight_ids.append(node["params"][offset])
+            offset += count
+        if {
+            parameter_dtype_for_id(circuit, parameter_id, tensor_index)
+            for parameter_id in branch_weight_ids
+        } == {"F8_E4M3"}:
+            output_sizes = [
+                int(parameter_shape_for_id(circuit, parameter_id, tensor_index)[0])
+                for parameter_id in branch_weight_ids
+            ]
+            return max(
+                (output_size + fp8_linear_tile_rows(output_size) - 1)
+                // fp8_linear_tile_rows(output_size)
+                for output_size in output_sizes
+            )
         return sum(
             (int(parameter_shape_for_id(circuit, parameter_id, tensor_index)[0]) + 1)
             // 2
-            for parameter_id in node["params"]
+            for parameter_id in branch_weight_ids
         )
     if node["op"] == "parallel_linear_silu_multiply":
         out_features, _ = parameter_shape_for_id(
@@ -3011,6 +3118,114 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
                     f"OUTPUT_{label}_WORDS" for label in labels
                 ),
                 "BRANCH_SELECTION": "\n".join(branch_lines),
+                "WEIGHT_READS": weight_reads,
+                "OUTPUT_WRITES": output_writes,
+            },
+        )
+
+    parallel_fp8 = re.fullmatch(
+        r"parallel_linear_(?:batch(\d+)_)?([23])way_fp8_e4m3_"
+        r"b(\d+)x(\d+)_(\d+)x(\d+)\.comp",
+        shader_file,
+    )
+    if parallel_fp8 is not None:
+        batch_tile_width = (
+            int(parallel_fp8.group(1))
+            if parallel_fp8.group(1) is not None
+            else None
+        )
+        branch_count = int(parallel_fp8.group(2))
+        block_rows = int(parallel_fp8.group(3))
+        block_columns = int(parallel_fp8.group(4))
+        input_size = int(parallel_fp8.group(5))
+        output_size = int(parallel_fp8.group(6))
+        output_tile_rows = fp8_linear_tile_rows(output_size)
+        if (
+            branch_count not in {2, 3}
+            or (batch_tile_width is not None and batch_tile_width <= 0)
+            or block_rows <= 0
+            or block_columns != 128
+            or input_size <= 0
+            or input_size % block_columns != 0
+            or output_size <= 0
+            or output_size % 2 != 0
+        ):
+            raise ModelCompileError(
+                f"invalid fused FP8 parallel-linear shader shape {shader_file!r}"
+            )
+        labels = [chr(ord("A") + index) for index in range(branch_count)]
+        output_bindings = "\n\n".join(
+            f"layout(set = 0, binding = {index + 1}) buffer Output{label} {{\n"
+            "    uint words[];\n"
+            f"}} output_{label.lower()};"
+            for index, label in enumerate(labels)
+        )
+        weight_bindings = "\n\n".join(
+            "\n\n".join(
+                [
+                    f"layout(set = 0, binding = {branch_count + index * 2 + 1}) "
+                    f"readonly buffer Weight{label} {{\n"
+                    "    uint words[];\n"
+                    f"}} weight_{label.lower()};",
+                    f"layout(set = 0, binding = {branch_count + index * 2 + 2}) "
+                    f"readonly buffer WeightScaleInv{label} {{\n"
+                    "    uint words[];\n"
+                    f"}} weight_scale_inv_{label.lower()};",
+                ]
+            )
+            for index, label in enumerate(labels)
+        )
+        weight_scale_reads = "\n".join(
+            "    if (branch == "
+            f"{index}u) return read_bf16_word("
+            f"weight_scale_inv_{label.lower()}.words[index >> 1u], index);"
+            for index, label in enumerate(labels[:-1])
+        )
+        weight_scale_reads += (
+            "\n    return read_bf16_word(weight_scale_inv_"
+            + labels[-1].lower()
+            + ".words[index >> 1u], index);"
+        )
+        weight_reads = "\n".join(
+            "    if (branch == "
+            f"{index}u) {{ uint packed = weight_{label.lower()}.words[index >> 2u]; "
+            "return uintBitsToFloate4m3EXT(u8vec4(uint8_t(packed), "
+            "uint8_t(packed >> 8u), uint8_t(packed >> 16u), "
+            "uint8_t(packed >> 24u))); }"
+            for index, label in enumerate(labels[:-1])
+        )
+        weight_reads += (
+            "\n    uint packed = weight_"
+            + labels[-1].lower()
+            + ".words[index >> 2u]; return uintBitsToFloate4m3EXT(u8vec4("
+            "uint8_t(packed), uint8_t(packed >> 8u), uint8_t(packed >> 16u), "
+            "uint8_t(packed >> 24u)));"
+        )
+        output_writes = "\n".join(
+            f"    if (branch == {index}u) {{ output_{label.lower()}.words[index] = value; return; }}"
+            for index, label in enumerate(labels[:-1])
+        )
+        output_writes += (
+            "\n    output_" + labels[-1].lower() + ".words[index] = value;"
+        )
+        return render_shader_template(
+            source_dir,
+            (
+                "parallel_linear_batch_fp8_e4m3.comp.template"
+                if batch_tile_width is not None
+                else "parallel_linear_fp8_e4m3.comp.template"
+            ),
+            {
+                "BATCH_TILE_WIDTH": str(batch_tile_width or 1),
+                "BRANCH_COUNT": str(branch_count),
+                "BLOCK_ROWS": str(block_rows),
+                "BLOCK_COLUMNS": str(block_columns),
+                "INPUT_SIZE": str(input_size),
+                "OUTPUT_SIZE": str(output_size),
+                "OUTPUT_TILE_ROWS": str(output_tile_rows),
+                "OUTPUT_BINDINGS": output_bindings,
+                "WEIGHT_BINDINGS": weight_bindings,
+                "WEIGHT_SCALE_READS": weight_scale_reads,
                 "WEIGHT_READS": weight_reads,
                 "OUTPUT_WRITES": output_writes,
             },
@@ -5318,6 +5533,10 @@ def validate_compiled_pedal_executions(
                 or kernel.get("execution_index") != index
                 or kernel.get("node_id") != node.get("id")
                 or kernel.get("op") != node.get("op")
+                or kernel.get("execution_domain") not in {
+                    "decode",
+                    "decode_and_prefill",
+                }
                 or not isinstance(kernel.get("shader_path"), str)
                 or not kernel["shader_path"]
             ):
@@ -5336,6 +5555,15 @@ def validate_compiled_pedal_executions(
                     valid_batch_implementation(implementation)
                     for implementation in batch_implementations
                 )
+                and (
+                    batch_mode != "causal_scan"
+                    or all(
+                        implementation["execution_domain"]
+                        in {"prefill", "decode_and_prefill"}
+                        and implementation["exact_causal_sequence_equivalence"]
+                        for implementation in batch_implementations
+                    )
+                )
             ):
                 continue
             raise ModelCompileError(
@@ -5346,6 +5574,7 @@ def validate_compiled_pedal_executions(
 def valid_batch_implementation(implementation: Any) -> bool:
     if not isinstance(implementation, dict):
         return False
+    execution_domain = implementation.get("execution_domain")
     requirements = implementation.get("device_requirements")
     extensions = (
         requirements.get("vulkan_device_extensions")
@@ -5360,10 +5589,13 @@ def valid_batch_implementation(implementation: Any) -> bool:
     subgroup_size = requirements.get("subgroup_size") if requirements else None
     stages = implementation.get("stages")
     return (
+        execution_domain in KNOWN_PEDAL_KERNEL_EXECUTION_DOMAINS
+        and
         isinstance(implementation.get("lane_tile_width"), int)
         and not isinstance(implementation.get("lane_tile_width"), bool)
         and implementation["lane_tile_width"] > 0
         and isinstance(implementation.get("exact_primary_equivalence"), bool)
+        and isinstance(implementation.get("exact_causal_sequence_equivalence"), bool)
         and isinstance(stages, list)
         and bool(stages)
         and all(valid_batch_stage(stage) for stage in stages)
@@ -5768,13 +6000,23 @@ def can_fuse_bf16_linear_split(circuit: Json, node: Json, tensor_index: Json) ->
     )
 
 
-def can_fuse_bf16_parallel_linears(
+def can_fuse_native_parallel_linears(
     circuit: Json, nodes: list[Json], tensor_index: Json
 ) -> bool:
     shapes = [parameter_shape_for_node(circuit, node, tensor_index) for node in nodes]
-    layouts = {parameter_layout_for_node(circuit, node, tensor_index) for node in nodes}
-    return (
+    try:
+        parameter_groups = [node["params"] for node in nodes]
+        dtypes = {
+            parameter_dtype_for_node(circuit, node, tensor_index) for node in nodes
+        }
+        layouts = {
+            parameter_layout_for_node(circuit, node, tensor_index) for node in nodes
+        }
+    except (KeyError, ModelCompileError):
+        return False
+    valid_geometry = (
         len(nodes) in {2, 3}
+        and len(shapes) == len(nodes)
         and all(
             len(shape) == 2
             and all(
@@ -5783,11 +6025,24 @@ def can_fuse_bf16_parallel_linears(
             for shape in shapes
         )
         and len({int(shape[1]) for shape in shapes}) == 1
-        and all(
-            parameter_dtype_for_node(circuit, node, tensor_index) == "BF16"
-            for node in nodes
-        )
         and layouts == {ROW_MAJOR_LAYOUT}
+    )
+    if not valid_geometry:
+        return False
+    if dtypes == {"BF16"}:
+        return all(len(parameters) == 1 for parameters in parameter_groups)
+    if dtypes != {"F8_E4M3"}:
+        return False
+    try:
+        block_shapes = {
+            fp8_block_shape_for_node(circuit, node, tensor_index) for node in nodes
+        }
+    except ModelCompileError:
+        return False
+    return (
+        all(len(parameters) == 2 for parameters in parameter_groups)
+        and len(block_shapes) == 1
+        and all(shapes[0] == shape for shape in shapes)
     )
 
 

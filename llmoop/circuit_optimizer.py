@@ -624,7 +624,7 @@ def _fuse_parallel_linears(
                 node.get("op") != "linear"
                 or node.get("inputs") != shared_inputs
                 or len(node.get("outputs", [])) != 1
-                or len(node.get("params", [])) != 1
+                or not _linear_params_are_fusible(node.get("params", []))
                 or node.get("state_reads")
                 or node.get("state_writes")
                 for node in group
@@ -638,10 +638,15 @@ def _fuse_parallel_linears(
                 "op": f"parallel_linear_{count}way",
                 "inputs": deepcopy(shared_inputs),
                 "outputs": [node["outputs"][0] for node in group],
-                "params": [node["params"][0] for node in group],
+                "params": [
+                    parameter_id for node in group for parameter_id in node["params"]
+                ],
                 "attrs": {
                     "compiled_from": [node["id"] for node in group],
                     "branch_count": count,
+                    "branch_parameter_counts": [
+                        len(node["params"]) for node in group
+                    ],
                 },
             },
             count,

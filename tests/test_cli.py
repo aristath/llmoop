@@ -712,15 +712,26 @@ class CompiledPackageTest(unittest.TestCase):
             )
             for node, kernel in zip(nodes, execution["kernels"], strict=True):
                 self.assertIn(
+                    kernel["execution_domain"],
+                    {"decode", "decode_and_prefill"},
+                )
+                self.assertIn(
                     kernel["batch_mode"],
                     {"serial_lanes", "weight_shared", "causal_scan"},
                 )
                 if kernel["batch_mode"] in {"weight_shared", "causal_scan"}:
                     self.assertGreaterEqual(len(kernel["batch_implementations"]), 1)
                     for implementation in kernel["batch_implementations"]:
+                        self.assertIn(
+                            implementation["execution_domain"],
+                            {"decode", "prefill", "decode_and_prefill"},
+                        )
                         self.assertGreater(implementation["lane_tile_width"], 0)
                         self.assertIsInstance(
                             implementation["exact_primary_equivalence"], bool
+                        )
+                        self.assertIsInstance(
+                            implementation["exact_causal_sequence_equivalence"], bool
                         )
                         self.assertIn("device_requirements", implementation)
                         self.assertGreaterEqual(len(implementation["stages"]), 1)

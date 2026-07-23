@@ -922,6 +922,7 @@ pub struct VulkanResidentKernelDispatch {
     base_workgroup_z: u32,
     push_constant_byte_count: u32,
     buffer_accesses: Vec<VulkanResidentKernelBufferAccessRecord>,
+    semantic_label: Option<String>,
 }
 
 /// Owns the Vulkan recording/submission resources for a composed sequence of
@@ -1135,8 +1136,12 @@ fn print_resident_kernel_timestamp_summary(
         return;
     }
 
-    let mut groups = HashMap::<(u32, u32, usize, u32), (usize, f64)>::new();
+    let mut shape_groups = HashMap::<(u32, u32, usize, u32), (usize, f64)>::new();
+    let mut semantic_groups = HashMap::<String, (usize, f64)>::new();
+    let mut pedal_groups = HashMap::<String, (usize, f64)>::new();
+    let mut op_groups = HashMap::<String, (usize, f64)>::new();
     let mut intervals = Vec::with_capacity(steps.len());
+    let mut semantic_intervals = Vec::with_capacity(steps.len());
     for (step_index, step) in steps.iter().enumerate() {
         let elapsed_ticks = timestamps[step_index + 1].saturating_sub(timestamps[step_index]);
         let elapsed_ns = elapsed_ticks as f64 * f64::from(timestamp_period_ns);
@@ -1146,10 +1151,26 @@ fn print_resident_kernel_timestamp_summary(
             step.dispatch.descriptor_count,
             step.dispatch.push_constant_byte_count,
         );
-        let group = groups.entry(key).or_insert((0, 0.0));
+        let group = shape_groups.entry(key).or_insert((0, 0.0));
         group.0 += 1;
         group.1 += elapsed_ns;
         intervals.push((step_index, key, elapsed_ns));
+        if let Some(label) = step.dispatch.semantic_label() {
+            let group = semantic_groups.entry(label.to_string()).or_insert((0, 0.0));
+            group.0 += 1;
+            group.1 += elapsed_ns;
+            if let Some(pedal_id) = semantic_label_field(label, "pedal") {
+                let group = pedal_groups.entry(pedal_id.to_string()).or_insert((0, 0.0));
+                group.0 += 1;
+                group.1 += elapsed_ns;
+            }
+            if let Some(op) = semantic_label_field(label, "op") {
+                let group = op_groups.entry(op.to_string()).or_insert((0, 0.0));
+                group.0 += 1;
+                group.1 += elapsed_ns;
+            }
+            semantic_intervals.push((step_index, label.to_string(), elapsed_ns));
+        }
     }
 
     let total_ns = timestamps
@@ -1166,7 +1187,43 @@ fn print_resident_kernel_timestamp_summary(
         (host_elapsed_ns as f64 - total_ns).max(0.0) / 1_000_000.0,
     );
 
-    let mut groups = groups.into_iter().collect::<Vec<_>>();
+    print_resident_kernel_named_timestamp_groups("grouped pedal intervals", pedal_groups);
+    print_resident_kernel_named_timestamp_groups("grouped op intervals", op_groups);
+
+    if !semantic_groups.is_empty() {
+        let mut groups = semantic_groups.into_iter().collect::<Vec<_>>();
+        groups.sort_by(|left, right| {
+            right
+                .1
+                .1
+                .partial_cmp(&left.1.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        eprintln!("  grouped semantic intervals:");
+        for (label, (count, elapsed_ns)) in groups {
+            eprintln!(
+                "    {label} count={count:<3} total_us={:.3} avg_us={:.3}",
+                elapsed_ns / 1_000.0,
+                elapsed_ns / count as f64 / 1_000.0,
+            );
+        }
+
+        semantic_intervals.sort_by(|left, right| {
+            right
+                .2
+                .partial_cmp(&left.2)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        eprintln!("  slowest semantic intervals:");
+        for (step_index, label, elapsed_ns) in semantic_intervals.into_iter().take(12) {
+            eprintln!(
+                "    step={step_index:<3} {label} elapsed_us={:.3}",
+                elapsed_ns / 1_000.0,
+            );
+        }
+    }
+
+    let mut groups = shape_groups.into_iter().collect::<Vec<_>>();
     groups.sort_by(|left, right| {
         right
             .1
@@ -1196,6 +1253,39 @@ fn print_resident_kernel_timestamp_summary(
         eprintln!(
             "    step={step_index:<3} workgroups={workgroups_x}x{workgroups_y:<5} descriptors={descriptors:<2} push_bytes={push_bytes:<3} elapsed_us={:.3}",
             elapsed_ns / 1_000.0,
+        );
+    }
+}
+
+fn semantic_label_field<'a>(label: &'a str, field: &str) -> Option<&'a str> {
+    let prefix = format!("{field}=");
+    label
+        .split_ascii_whitespace()
+        .find_map(|part| part.strip_prefix(&prefix))
+        .filter(|value| !value.is_empty())
+}
+
+fn print_resident_kernel_named_timestamp_groups(
+    heading: &str,
+    groups: HashMap<String, (usize, f64)>,
+) {
+    if groups.is_empty() {
+        return;
+    }
+    let mut groups = groups.into_iter().collect::<Vec<_>>();
+    groups.sort_by(|left, right| {
+        right
+            .1
+            .1
+            .partial_cmp(&left.1.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    eprintln!("  {heading}:");
+    for (label, (count, elapsed_ns)) in groups {
+        eprintln!(
+            "    {label} count={count:<3} total_us={:.3} avg_us={:.3}",
+            elapsed_ns / 1_000.0,
+            elapsed_ns / count as f64 / 1_000.0,
         );
     }
 }
@@ -1375,6 +1465,10 @@ impl Drop for VulkanResidentBufferCopyBatch {
 }
 
 impl VulkanResidentKernelDispatch {
+    pub fn semantic_label(&self) -> Option<&str> {
+        self.semantic_label.as_deref()
+    }
+
     pub fn descriptor_count(&self) -> usize {
         self.descriptor_count
     }
@@ -2611,13 +2705,33 @@ impl VulkanComputeDevice {
         local_size_x: u32,
         push_constant_byte_count: u32,
     ) -> Result<VulkanResidentKernelDispatch, VulkanError> {
-        self.create_resident_kernel_dispatch_2d(
+        self.create_resident_kernel_dispatch_labeled(
+            spirv_words,
+            buffers,
+            workgroup_count_x,
+            local_size_x,
+            push_constant_byte_count,
+            None,
+        )
+    }
+
+    pub fn create_resident_kernel_dispatch_labeled(
+        &self,
+        spirv_words: &[u32],
+        buffers: &[VulkanResidentKernelBufferBinding<'_>],
+        workgroup_count_x: u32,
+        local_size_x: u32,
+        push_constant_byte_count: u32,
+        semantic_label: Option<String>,
+    ) -> Result<VulkanResidentKernelDispatch, VulkanError> {
+        self.create_resident_kernel_dispatch_2d_labeled(
             spirv_words,
             buffers,
             workgroup_count_x,
             1,
             local_size_x,
             push_constant_byte_count,
+            semantic_label,
         )
     }
 
@@ -2630,6 +2744,27 @@ impl VulkanComputeDevice {
         local_size_x: u32,
         push_constant_byte_count: u32,
     ) -> Result<VulkanResidentKernelDispatch, VulkanError> {
+        self.create_resident_kernel_dispatch_2d_labeled(
+            spirv_words,
+            buffers,
+            workgroup_count_x,
+            workgroup_count_y,
+            local_size_x,
+            push_constant_byte_count,
+            None,
+        )
+    }
+
+    pub fn create_resident_kernel_dispatch_2d_labeled(
+        &self,
+        spirv_words: &[u32],
+        buffers: &[VulkanResidentKernelBufferBinding<'_>],
+        workgroup_count_x: u32,
+        workgroup_count_y: u32,
+        local_size_x: u32,
+        push_constant_byte_count: u32,
+        semantic_label: Option<String>,
+    ) -> Result<VulkanResidentKernelDispatch, VulkanError> {
         self.create_resident_kernel_dispatch_2d_with_base_z(
             spirv_words,
             buffers,
@@ -2638,6 +2773,7 @@ impl VulkanComputeDevice {
             0,
             local_size_x,
             push_constant_byte_count,
+            semantic_label,
         )
     }
 
@@ -2651,6 +2787,7 @@ impl VulkanComputeDevice {
         base_workgroup_z: u32,
         local_size_x: u32,
         push_constant_byte_count: u32,
+        semantic_label: Option<String>,
     ) -> Result<VulkanResidentKernelDispatch, VulkanError> {
         if spirv_words.is_empty() {
             return Err(VulkanError("SPIR-V module must not be empty".to_string()));
@@ -2782,6 +2919,7 @@ impl VulkanComputeDevice {
                 base_workgroup_z,
                 push_constant_byte_count,
                 buffer_accesses,
+                semantic_label,
             })
         }
     }
@@ -4852,6 +4990,19 @@ mod tests {
             buffer: vk::Buffer::from_raw(buffer),
             access,
         }
+    }
+
+    #[test]
+    fn semantic_timestamp_labels_expose_pedal_and_op_fields() {
+        let label = "kernel=linear_00 pedal=block_00 node=attn_qkv op=parallel_linear_2way lane=3";
+
+        assert_eq!(semantic_label_field(label, "pedal"), Some("block_00"));
+        assert_eq!(
+            semantic_label_field(label, "op"),
+            Some("parallel_linear_2way")
+        );
+        assert_eq!(semantic_label_field(label, "node"), Some("attn_qkv"));
+        assert_eq!(semantic_label_field(label, "missing"), None);
     }
 
     #[test]

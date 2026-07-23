@@ -3160,12 +3160,13 @@ impl VulkanMountedPlacedStreamCircuit {
             })?;
         let buffer_bindings = self.resident_kernel_buffer_bindings_for_bound_dispatch(dispatch)?;
         device
-            .create_resident_kernel_dispatch(
+            .create_resident_kernel_dispatch_labeled(
                 &artifact.words,
                 &buffer_bindings,
                 artifact.artifact.workgroup_count_x,
                 artifact.artifact.local_size_x,
                 push_constant_byte_count(&dispatch.push_constants)?,
+                Some(vulkan_dispatch_semantic_label(dispatch, None)),
             )
             .map_err(VulkanMountedPlacedResidentKernelDispatchError::Vulkan)
     }
@@ -6955,9 +6956,12 @@ fn select_pedal_batch_kernel_artifact_where<'a>(
         .filter(|artifact| {
             artifact.pedal_id == pedal_id
                 && artifact.node_id == node_id
+                && artifact
+                    .execution_domain
+                    .supports_batch_mode(execution_mode)
                 && (artifact.batch_mode == VulkanResidentPedalKernelBatchMode::WeightShared
                     || execution_mode == VulkanPedalBatchExecutionMode::CausalSequence)
-                && artifact.exact_primary_equivalence
+                && artifact.is_exact_for(execution_mode)
                 && compatible(artifact)
         })
         .min_by_key(|artifact| {
@@ -7339,13 +7343,14 @@ impl VulkanResidentPedalBatchSliceRunner {
                 };
                 for stage in &batch_artifact.stages {
                     let resident = device
-                        .create_resident_kernel_dispatch_2d(
+                        .create_resident_kernel_dispatch_2d_labeled(
                             &stage.spirv_words,
                             &bindings,
                             stage.workgroup_count_x,
                             workgroup_count_y,
                             stage.local_size_x,
                             VULKAN_PEDAL_BATCH_CONTROL_BYTE_CAPACITY,
+                            Some(vulkan_dispatch_semantic_label(dispatch, Some("batch"))),
                         )
                         .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
                     steps.push(VulkanPedalBatchDispatchStep {
@@ -7412,7 +7417,7 @@ impl VulkanResidentPedalBatchSliceRunner {
                     dispatch.uses_stream_tick.then_some(stream_control_buffer),
                 )?;
                 let resident = device
-                    .create_resident_kernel_dispatch(
+                    .create_resident_kernel_dispatch_labeled(
                         &artifact.words,
                         &bindings,
                         artifact.artifact.workgroup_count_x,
@@ -7422,6 +7427,10 @@ impl VulkanResidentPedalBatchSliceRunner {
                                 format!("invalid pedal batch push constants: {error}"),
                             ))
                         })?,
+                        Some(vulkan_dispatch_semantic_label(
+                            dispatch,
+                            Some(&format!("lane={lane_index}")),
+                        )),
                     )
                     .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
                 steps.push(VulkanPedalBatchDispatchStep {
@@ -8034,6 +8043,16 @@ impl VulkanDistributedPedalBatchRunners {
                                 shard.base_workgroup_z,
                                 stage.local_size_x,
                                 VULKAN_PEDAL_BATCH_CONTROL_BYTE_CAPACITY,
+                                Some(format!(
+                                    "pedal={} node={} distributed_batch=device:{} rows={}..{} base_z={} distribution={:?}",
+                                    planned.pedal_id,
+                                    planned.node_id,
+                                    shard.device_id,
+                                    shard.row_start,
+                                    shard.row_start + shard.row_count,
+                                    shard.base_workgroup_z,
+                                    planned.distribution,
+                                )),
                             )
                             .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?,
                     );
@@ -12568,6 +12587,7 @@ pub struct VulkanResidentPedalKernelSpec {
     pub execution_index: usize,
     pub node_id: String,
     pub op: String,
+    pub execution_domain: VulkanResidentPedalKernelExecutionDomain,
     pub shader_path: String,
     pub local_size_x: u32,
     pub workgroup_count_x: u32,
@@ -12577,8 +12597,10 @@ pub struct VulkanResidentPedalKernelSpec {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VulkanResidentPedalBatchImplementationSpec {
+    pub execution_domain: VulkanResidentPedalKernelExecutionDomain,
     pub lane_tile_width: u32,
     pub exact_primary_equivalence: bool,
+    pub exact_causal_sequence_equivalence: bool,
     pub device_requirements: VulkanResidentVulkanDeviceRequirements,
     pub stages: Vec<VulkanResidentPedalBatchStageSpec>,
 }
@@ -12607,6 +12629,39 @@ pub enum VulkanResidentPedalKernelBatchMode {
     SerialLanes,
     WeightShared,
     CausalScan,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VulkanResidentPedalKernelExecutionDomain {
+    Decode,
+    Prefill,
+    DecodeAndPrefill,
+}
+
+impl VulkanResidentPedalKernelExecutionDomain {
+    fn supports_decode(self) -> bool {
+        matches!(
+            self,
+            VulkanResidentPedalKernelExecutionDomain::Decode
+                | VulkanResidentPedalKernelExecutionDomain::DecodeAndPrefill
+        )
+    }
+
+    fn supports_prefill(self) -> bool {
+        matches!(
+            self,
+            VulkanResidentPedalKernelExecutionDomain::Prefill
+                | VulkanResidentPedalKernelExecutionDomain::DecodeAndPrefill
+        )
+    }
+
+    fn supports_batch_mode(self, mode: VulkanPedalBatchExecutionMode) -> bool {
+        match mode {
+            VulkanPedalBatchExecutionMode::IndependentCandidates => self.supports_decode(),
+            VulkanPedalBatchExecutionMode::CausalSequence => self.supports_prefill(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -12672,11 +12727,22 @@ pub struct VulkanResidentPedalKernelShaderRef {
 struct VulkanResidentPedalBatchKernelArtifact {
     pedal_id: String,
     node_id: String,
+    execution_domain: VulkanResidentPedalKernelExecutionDomain,
     batch_mode: VulkanResidentPedalKernelBatchMode,
     lane_tile_width: usize,
     exact_primary_equivalence: bool,
+    exact_causal_sequence_equivalence: bool,
     device_requirements: VulkanResidentVulkanDeviceRequirements,
     stages: Vec<VulkanResidentPedalBatchStageArtifact>,
+}
+
+impl VulkanResidentPedalBatchKernelArtifact {
+    fn is_exact_for(&self, mode: VulkanPedalBatchExecutionMode) -> bool {
+        match mode {
+            VulkanPedalBatchExecutionMode::IndependentCandidates => self.exact_primary_equivalence,
+            VulkanPedalBatchExecutionMode::CausalSequence => self.exact_causal_sequence_equivalence,
+        }
+    }
 }
 
 struct VulkanResidentPedalBatchStageArtifact {
@@ -19428,6 +19494,12 @@ fn validate_pedal_executions(
                     package_id, pedal.pedal_id, kernel.node_id
                 )));
             }
+            if !kernel.execution_domain.supports_decode() {
+                return Err(VulkanResidentTokenModelPackageError::new(format!(
+                    "resident model package {:?} declares non-decode primary execution domain {:?} for {}.{}",
+                    package_id, kernel.execution_domain, pedal.pedal_id, kernel.node_id
+                )));
+            }
             let implementations_are_valid =
                 kernel.batch_implementations.iter().all(|implementation| {
                     let extensions = &implementation.device_requirements.vulkan_device_extensions;
@@ -19444,6 +19516,13 @@ fn validate_pedal_executions(
                         .collect::<Vec<_>>();
                     implementation.lane_tile_width > 0
                         && !implementation.stages.is_empty()
+                        && match kernel.batch_mode {
+                            VulkanResidentPedalKernelBatchMode::SerialLanes => false,
+                            VulkanResidentPedalKernelBatchMode::WeightShared => true,
+                            VulkanResidentPedalKernelBatchMode::CausalScan => {
+                                implementation.execution_domain.supports_prefill()
+                            }
+                        }
                         && implementation.stages.iter().all(|stage| {
                             !stage.shader_path.is_empty()
                                 && stage.local_size_x > 0
@@ -20581,9 +20660,12 @@ fn load_resident_pedal_batch_kernels(
                 artifacts.push(VulkanResidentPedalBatchKernelArtifact {
                     pedal_id: pedal.pedal_id.clone(),
                     node_id: kernel.node_id.clone(),
+                    execution_domain: implementation.execution_domain,
                     batch_mode: kernel.batch_mode,
                     lane_tile_width: implementation.lane_tile_width as usize,
                     exact_primary_equivalence: implementation.exact_primary_equivalence,
+                    exact_causal_sequence_equivalence: implementation
+                        .exact_causal_sequence_equivalence,
                     device_requirements: implementation.device_requirements.clone(),
                     stages: implementation
                         .stages
@@ -24218,6 +24300,21 @@ pub struct VulkanMountedPlacedBoundDispatch {
     pub descriptors: Vec<VulkanMountedPlacedBoundDescriptor>,
     pub push_constants: Vec<VulkanKernelScalarBinding>,
     pub uses_stream_tick: bool,
+}
+
+fn vulkan_dispatch_semantic_label(
+    dispatch: &VulkanMountedPlacedBoundDispatch,
+    execution_detail: Option<&str>,
+) -> String {
+    let mut label = format!(
+        "kernel={} pedal={} node={} op={}",
+        dispatch.kernel_id, dispatch.pedal_id, dispatch.node_id, dispatch.op
+    );
+    if let Some(detail) = execution_detail {
+        label.push(' ');
+        label.push_str(detail);
+    }
+    label
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -28767,9 +28864,11 @@ mod tests {
             |lane_tile_width, exact_primary_equivalence| VulkanResidentPedalBatchKernelArtifact {
                 pedal_id: "processor".to_string(),
                 node_id: "project".to_string(),
+                execution_domain: VulkanResidentPedalKernelExecutionDomain::DecodeAndPrefill,
                 batch_mode: VulkanResidentPedalKernelBatchMode::WeightShared,
                 lane_tile_width,
                 exact_primary_equivalence,
+                exact_causal_sequence_equivalence: exact_primary_equivalence,
                 device_requirements: VulkanResidentVulkanDeviceRequirements::default(),
                 stages: Vec::new(),
             };
@@ -28816,13 +28915,102 @@ mod tests {
     }
 
     #[test]
+    fn pedal_batches_select_only_artifacts_for_the_requested_execution_domain() {
+        let artifact = |execution_domain, lane_tile_width| VulkanResidentPedalBatchKernelArtifact {
+            pedal_id: "processor".to_string(),
+            node_id: "project".to_string(),
+            execution_domain,
+            batch_mode: VulkanResidentPedalKernelBatchMode::WeightShared,
+            lane_tile_width,
+            exact_primary_equivalence: true,
+            exact_causal_sequence_equivalence: true,
+            device_requirements: VulkanResidentVulkanDeviceRequirements::default(),
+            stages: Vec::new(),
+        };
+        let artifacts = vec![
+            artifact(VulkanResidentPedalKernelExecutionDomain::Prefill, 4),
+            artifact(VulkanResidentPedalKernelExecutionDomain::Decode, 8),
+            artifact(
+                VulkanResidentPedalKernelExecutionDomain::DecodeAndPrefill,
+                16,
+            ),
+        ];
+
+        let decode = select_pedal_batch_kernel_artifact(
+            &artifacts,
+            "processor",
+            "project",
+            VulkanPedalBatchExecutionMode::IndependentCandidates,
+            4,
+        )
+        .unwrap();
+        assert_eq!(
+            decode.execution_domain,
+            VulkanResidentPedalKernelExecutionDomain::Decode
+        );
+        assert_eq!(decode.lane_tile_width, 8);
+
+        let prefill = select_pedal_batch_kernel_artifact(
+            &artifacts,
+            "processor",
+            "project",
+            VulkanPedalBatchExecutionMode::CausalSequence,
+            4,
+        )
+        .unwrap();
+        assert_eq!(
+            prefill.execution_domain,
+            VulkanResidentPedalKernelExecutionDomain::DecodeAndPrefill
+        );
+        assert_eq!(prefill.lane_tile_width, 16);
+    }
+
+    #[test]
+    fn pedal_batches_use_causal_exactness_for_temporal_prefill_kernels() {
+        let artifacts = vec![VulkanResidentPedalBatchKernelArtifact {
+            pedal_id: "processor".to_string(),
+            node_id: "attention".to_string(),
+            execution_domain: VulkanResidentPedalKernelExecutionDomain::Prefill,
+            batch_mode: VulkanResidentPedalKernelBatchMode::CausalScan,
+            lane_tile_width: 64,
+            exact_primary_equivalence: false,
+            exact_causal_sequence_equivalence: true,
+            device_requirements: VulkanResidentVulkanDeviceRequirements::default(),
+            stages: Vec::new(),
+        }];
+
+        assert!(
+            select_pedal_batch_kernel_artifact(
+                &artifacts,
+                "processor",
+                "attention",
+                VulkanPedalBatchExecutionMode::IndependentCandidates,
+                4,
+            )
+            .is_none()
+        );
+        let causal = select_pedal_batch_kernel_artifact(
+            &artifacts,
+            "processor",
+            "attention",
+            VulkanPedalBatchExecutionMode::CausalSequence,
+            4,
+        )
+        .unwrap();
+        assert!(causal.exact_causal_sequence_equivalence);
+        assert!(!causal.exact_primary_equivalence);
+    }
+
+    #[test]
     fn pedal_batch_execution_contract_requires_matching_shader_mode() {
         let execution = |batch_mode, batch_shader_path: Option<String>| {
             let batch_implementations = batch_shader_path
                 .into_iter()
                 .map(|shader_path| VulkanResidentPedalBatchImplementationSpec {
+                    execution_domain: VulkanResidentPedalKernelExecutionDomain::DecodeAndPrefill,
                     lane_tile_width: 16,
                     exact_primary_equivalence: true,
+                    exact_causal_sequence_equivalence: true,
                     device_requirements: VulkanResidentVulkanDeviceRequirements::default(),
                     stages: vec![VulkanResidentPedalBatchStageSpec {
                         shader_path,
@@ -28839,6 +29027,7 @@ mod tests {
                     execution_index: 0,
                     node_id: "project".to_string(),
                     op: "linear".to_string(),
+                    execution_domain: VulkanResidentPedalKernelExecutionDomain::Decode,
                     shader_path: "shaders/project.spv".to_string(),
                     local_size_x: 64,
                     workgroup_count_x: 1,

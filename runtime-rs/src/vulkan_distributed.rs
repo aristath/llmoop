@@ -1101,6 +1101,16 @@ fn create_distributed_resident_dispatch(
             planned_shard.base_workgroup_z,
             artifact.artifact.local_size_x,
             0,
+            Some(format!(
+                "pedal={} node={} distributed=device:{} rows={}..{} base_z={} distribution={:?}",
+                planned_dispatch.pedal_id,
+                planned_dispatch.node_id,
+                planned_shard.device_id,
+                planned_shard.row_start,
+                planned_shard.row_start + planned_shard.row_count,
+                planned_shard.base_workgroup_z,
+                planned_dispatch.distribution,
+            )),
         )
         .map_err(|error| {
             VulkanDistributedDispatchRunnerError(format!(

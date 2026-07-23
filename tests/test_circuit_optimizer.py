@@ -626,12 +626,44 @@ class VulkanCircuitOptimizerTest(unittest.TestCase):
         self.assertEqual(
             ["a_weight", "b_weight", "c_weight"], fused["params"]
         )
+        self.assertEqual([1, 1, 1], fused["attrs"]["branch_parameter_counts"])
 
         pair = optimize_circuit_for_vulkan(
             {"nodes": nodes[:2]},
             can_fuse_parallel_linears=lambda group: len(group) == 2,
         )
         self.assertEqual("parallel_linear_2way", pair["nodes"][0]["op"])
+
+    def test_fuses_fp8_parallel_linears_with_weight_scale_pairs(self) -> None:
+        nodes = [
+            {
+                "id": branch,
+                "op": "linear",
+                "inputs": ["hidden"],
+                "outputs": [f"{branch}_out"],
+                "params": [f"{branch}_weight", f"{branch}_weight_scale_inv"],
+            }
+            for branch in ("a", "b")
+        ]
+
+        optimized = optimize_circuit_for_vulkan(
+            {"nodes": nodes},
+            can_fuse_parallel_linears=lambda group: len(group) == 2,
+        )
+
+        self.assertEqual(1, len(optimized["nodes"]))
+        fused = optimized["nodes"][0]
+        self.assertEqual("parallel_linear_2way", fused["op"])
+        self.assertEqual(
+            [
+                "a_weight",
+                "a_weight_scale_inv",
+                "b_weight",
+                "b_weight_scale_inv",
+            ],
+            fused["params"],
+        )
+        self.assertEqual([2, 2], fused["attrs"]["branch_parameter_counts"])
 
     def test_does_not_fuse_linears_with_different_inputs(self) -> None:
         circuit = {

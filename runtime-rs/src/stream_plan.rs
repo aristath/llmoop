@@ -1210,8 +1210,9 @@ fn infer_parallel_linear_output_shapes(
         _ => unreachable!("parallel-linear shape inference called for {}", node.op),
     };
     let declared_branch_count = attr_usize(node, "branch_count");
-    if node.params.len() != expected_branch_count
-        || node.outputs.len() != expected_branch_count
+    let branch_parameter_counts =
+        parallel_linear_branch_parameter_counts(node, expected_branch_count)?;
+    if node.outputs.len() != expected_branch_count
         || declared_branch_count != Some(expected_branch_count)
     {
         return Err(CircuitPlanError(format!(
@@ -1224,13 +1225,28 @@ fn infer_parallel_linear_output_shapes(
             expected_branch_count
         )));
     }
+    if branch_parameter_counts.iter().sum::<usize>() != node.params.len() {
+        return Err(CircuitPlanError(format!(
+            "{} node {} parallel-linear branch parameter counts {:?} do not cover {} parameters",
+            pedal_id,
+            node.id,
+            branch_parameter_counts,
+            node.params.len()
+        )));
+    }
     let Some(tensor_index) = tensor_index else {
         return Ok(vec![None; node.outputs.len()]);
     };
     let input_shape = first_input_shape(node, signals);
     let input_width = input_shape.as_ref().and_then(|shape| shape.last()).copied();
-    node.params
-        .iter()
+    let mut branch_weight_ids = Vec::with_capacity(expected_branch_count);
+    let mut offset = 0usize;
+    for count in branch_parameter_counts {
+        branch_weight_ids.push(&node.params[offset]);
+        offset += count;
+    }
+    branch_weight_ids
+        .into_iter()
         .map(|param_id| {
             let parameter = params.get(param_id).ok_or_else(|| {
                 CircuitPlanError(format!(
@@ -1266,6 +1282,44 @@ fn infer_parallel_linear_output_shapes(
                 *last = weight_shape[0];
             }
             Ok(Some(output_shape))
+        })
+        .collect()
+}
+
+fn parallel_linear_branch_parameter_counts(
+    node: &CircuitNode,
+    expected_branch_count: usize,
+) -> Result<Vec<usize>, CircuitPlanError> {
+    let Some(value) = node.attrs.get("branch_parameter_counts") else {
+        return Ok(vec![1; expected_branch_count]);
+    };
+    let Some(counts) = value.as_array() else {
+        return Err(CircuitPlanError(format!(
+            "parallel-linear node {} branch_parameter_counts must be an array",
+            node.id
+        )));
+    };
+    if counts.len() != expected_branch_count {
+        return Err(CircuitPlanError(format!(
+            "parallel-linear node {} branch_parameter_counts has {} entries; expected {}",
+            node.id,
+            counts.len(),
+            expected_branch_count
+        )));
+    }
+    counts
+        .iter()
+        .map(|count| {
+            count
+                .as_u64()
+                .and_then(|value| usize::try_from(value).ok())
+                .filter(|value| *value > 0)
+                .ok_or_else(|| {
+                    CircuitPlanError(format!(
+                        "parallel-linear node {} has invalid branch parameter count {:?}",
+                        node.id, count
+                    ))
+                })
         })
         .collect()
 }
@@ -1781,6 +1835,116 @@ mod tests {
         .unwrap_err();
 
         assert!(error.0.contains("expected 3"), "{}", error.0);
+    }
+
+    #[test]
+    fn infers_fp8_parallel_linear_output_shapes_from_branch_weight_parameters() {
+        let node = crate::stream_circuit::CircuitNode {
+            id: "qk".to_string(),
+            op: "parallel_linear_2way".to_string(),
+            inputs: vec!["hidden".to_string()],
+            outputs: vec!["q".to_string(), "k".to_string()],
+            params: vec![
+                "q_weight".to_string(),
+                "q_weight_scale_inv".to_string(),
+                "k_weight".to_string(),
+                "k_weight_scale_inv".to_string(),
+            ],
+            state_reads: Vec::new(),
+            state_writes: Vec::new(),
+            attrs: serde_json::json!({
+                "branch_count": 2,
+                "branch_parameter_counts": [2, 2]
+            }),
+        };
+        let signals = BTreeMap::from([(
+            "hidden".to_string(),
+            PlannedSignal {
+                id: "hidden".to_string(),
+                producer: SignalProducer::BoundaryInput,
+                consumers: vec!["qk".to_string()],
+                shape: Some(vec![5120]),
+                storage: SignalStorage::Boundary,
+                is_boundary_output: false,
+            },
+        )]);
+        let params = BTreeMap::from([
+            (
+                "q_weight".to_string(),
+                ParameterRef {
+                    tensor: Some("q.weight".to_string()),
+                    role: None,
+                    extra: serde_json::Map::new(),
+                },
+            ),
+            (
+                "q_weight_scale_inv".to_string(),
+                ParameterRef {
+                    tensor: Some("q.weight_scale_inv".to_string()),
+                    role: None,
+                    extra: serde_json::Map::new(),
+                },
+            ),
+            (
+                "k_weight".to_string(),
+                ParameterRef {
+                    tensor: Some("k.weight".to_string()),
+                    role: None,
+                    extra: serde_json::Map::new(),
+                },
+            ),
+            (
+                "k_weight_scale_inv".to_string(),
+                ParameterRef {
+                    tensor: Some("k.weight_scale_inv".to_string()),
+                    role: None,
+                    extra: serde_json::Map::new(),
+                },
+            ),
+        ]);
+        let weight = |rows| TensorMetadata {
+            dtype: "F8_E4M3".to_string(),
+            shape: vec![rows, 5120],
+            logical_shape: None,
+            parameter_count: None,
+            byte_count: None,
+            data_offsets: None,
+            source_file: None,
+            data_sha256: None,
+            layout: None,
+        };
+        let scale = TensorMetadata {
+            dtype: "BF16".to_string(),
+            shape: vec![40, 40],
+            logical_shape: None,
+            parameter_count: None,
+            byte_count: None,
+            data_offsets: None,
+            source_file: None,
+            data_sha256: None,
+            layout: None,
+        };
+        let tensor_index = TensorIndex {
+            schema: TENSOR_INDEX_SCHEMA.to_string(),
+            tensors: BTreeMap::from([
+                ("q.weight".to_string(), weight(5120)),
+                ("q.weight_scale_inv".to_string(), scale.clone()),
+                ("k.weight".to_string(), weight(5120)),
+                ("k.weight_scale_inv".to_string(), scale),
+            ]),
+        };
+
+        assert_eq!(
+            infer_parallel_linear_output_shapes(
+                "attention",
+                &node,
+                &signals,
+                &params,
+                Some(&tensor_index),
+            )
+            .unwrap(),
+            vec![Some(vec![5120]), Some(vec![5120])]
+        );
     }
 
     #[test]

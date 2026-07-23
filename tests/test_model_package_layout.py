@@ -150,6 +150,12 @@ def test_compiler_selects_only_compatible_weight_shared_batch_kernels() -> None:
         weight_shared_batch_shader_file("parallel_linear_2way_bf16_1024x2560_2560.comp")
         == "parallel_linear_batch16_2way_bf16_1024x2560_2560.comp"
     )
+    assert (
+        weight_shared_batch_shader_file(
+            "parallel_linear_2way_fp8_e4m3_b128x128_5120x5120.comp"
+        )
+        == "parallel_linear_batch16_2way_fp8_e4m3_b128x128_5120x5120.comp"
+    )
     assert weight_shared_batch_shader_file(
         "parallel_linear_silu_multiply_fp8_e4m3_b128x128_5120x17408.comp"
     ) == ("parallel_linear_silu_multiply_batch16_fp8_e4m3_b128x128_5120x17408.comp")
@@ -229,8 +235,11 @@ def test_compiler_orders_frame_parallel_before_portable_batch_implementation() -
     )
 
     frame_parallel, *portable = spec["batch_implementations"]
+    assert spec["execution_domain"] == "decode"
+    assert frame_parallel["execution_domain"] == "prefill"
     assert frame_parallel["lane_tile_width"] == 1
     assert frame_parallel["exact_primary_equivalence"] is True
+    assert frame_parallel["exact_causal_sequence_equivalence"] is True
     assert frame_parallel["device_requirements"] == {
         "vulkan_device_extensions": [],
         "vulkan_features": [],
@@ -248,6 +257,10 @@ def test_compiler_orders_frame_parallel_before_portable_batch_implementation() -
     ]
     assert all(
         implementation["exact_primary_equivalence"] is True
+        for implementation in portable
+    )
+    assert all(
+        implementation["exact_causal_sequence_equivalence"] is True
         for implementation in portable
     )
 
@@ -306,6 +319,17 @@ def test_compiler_selects_stateful_causal_scan_kernels() -> None:
             "workgroup_count_x": 4,
         },
     ]
+    attention_spec = pedal_kernel_spec(
+        execution_index=0,
+        node={"id": "attention", "op": "append_scaled_dot_product_attention"},
+        shader_file="append_gqa_attention_bf16_q16_kv4_d256_scale0.0625__sc7.comp",
+        local_size_x=attention_local_size,
+        workgroup_count_x=16,
+    )
+    temporal = attention_spec["batch_implementations"][0]
+    assert temporal["execution_domain"] == "prefill"
+    assert temporal["exact_primary_equivalence"] is False
+    assert temporal["exact_causal_sequence_equivalence"] is True
 
 
 def test_compiler_renders_temporal_attention_stages(tmp_path: Path) -> None:
@@ -395,8 +419,10 @@ def test_projection_pedal_compiles_ordered_target_native_and_scalar_implementati
     assert "batch_lane_tile_width" not in spec
     cooperative, *exact = spec["batch_implementations"]
     assert cooperative == {
+        "execution_domain": "prefill",
         "lane_tile_width": 64,
         "exact_primary_equivalence": False,
+        "exact_causal_sequence_equivalence": False,
         "device_requirements": {
             "vulkan_device_extensions": [],
             "vulkan_features": [],
@@ -423,8 +449,10 @@ def test_projection_pedal_compiles_ordered_target_native_and_scalar_implementati
     for implementation in exact:
         tile_width = implementation["lane_tile_width"]
         assert implementation == {
+            "execution_domain": "decode_and_prefill",
             "lane_tile_width": tile_width,
             "exact_primary_equivalence": True,
+            "exact_causal_sequence_equivalence": True,
             "device_requirements": {
                 "vulkan_device_extensions": [],
                 "vulkan_features": [],
@@ -714,20 +742,30 @@ def test_compiler_renders_parallel_linear_shaders(tmp_path: Path) -> None:
     shader_source_dir = Path(__file__).parents[1] / "runtime-rs" / "shaders"
     pair = "parallel_linear_2way_bf16_1024x2560_2560.comp"
     triple = "parallel_linear_3way_bf16_1024x1024_512_512.comp"
+    fp8_pair = "parallel_linear_batch16_2way_fp8_e4m3_b128x128_5120x5120.comp"
 
-    copy_shader_templates(shader_source_dir, tmp_path, {pair, triple})
+    copy_shader_templates(shader_source_dir, tmp_path, {pair, triple, fp8_pair})
 
     pair_source = (tmp_path / pair).read_text()
     triple_source = (tmp_path / triple).read_text()
+    fp8_pair_source = (tmp_path / fp8_pair).read_text()
     assert "binding = 3) readonly buffer WeightA" in pair_source
     assert "binding = 4) readonly buffer WeightB" in pair_source
     assert "const uint OUTPUT_A_WORDS = 2560u / 2u;" in pair_source
     assert "binding = 6) readonly buffer WeightC" in triple_source
     assert "const uint OUTPUT_C_WORDS = 512u / 2u;" in triple_source
+    assert "binding = 3) readonly buffer WeightA" in fp8_pair_source
+    assert "binding = 4) readonly buffer WeightScaleInvA" in fp8_pair_source
+    assert "binding = 5) readonly buffer WeightB" in fp8_pair_source
+    assert "binding = 6) readonly buffer WeightScaleInvB" in fp8_pair_source
+    assert "shared fe4m3vec4 quantized_input[INPUT_FP8_WORDS];" in fp8_pair_source
+    assert "for (uint branch = 0u; branch < BRANCH_COUNT; branch++)" in fp8_pair_source
     assert "PAIRED_WEIGHT_LAYOUT" not in pair_source
     assert "PAIRED_WEIGHT_LAYOUT" not in triple_source
+    assert "PAIRED_WEIGHT_LAYOUT" not in fp8_pair_source
     assert "{{" not in pair_source
     assert "{{" not in triple_source
+    assert "{{" not in fp8_pair_source
 
 
 def test_compiler_renders_fused_parallel_ffn_projection_shader(
@@ -983,6 +1021,61 @@ def test_parallel_linear_shader_selector_rejects_invalid_metadata_and_layout() -
         shader_file_for_node(circuit, node, tensor_index, dimensions)
 
 
+def test_parallel_linear_shader_selector_supports_fp8_weight_scale_pairs() -> None:
+    node = {
+        "id": "qk",
+        "op": "parallel_linear_2way",
+        "inputs": ["hidden"],
+        "outputs": ["q", "k"],
+        "params": [
+            "q_weight",
+            "q_weight_scale_inv",
+            "k_weight",
+            "k_weight_scale_inv",
+        ],
+        "attrs": {"branch_count": 2, "branch_parameter_counts": [2, 2]},
+    }
+    circuit = {
+        "parameters": {
+            "refs": {
+                parameter_id: {"tensor": parameter_id}
+                for parameter_id in node["params"]
+            }
+        }
+    }
+    tensor_index = {
+        "tensors": {
+            "q_weight": {
+                "dtype": "F8_E4M3",
+                "shape": [5120, 5120],
+                "layout": ROW_MAJOR_LAYOUT,
+            },
+            "k_weight": {
+                "dtype": "F8_E4M3",
+                "shape": [5120, 5120],
+                "layout": ROW_MAJOR_LAYOUT,
+            },
+            "q_weight_scale_inv": {
+                "dtype": "BF16",
+                "shape": [40, 40],
+                "layout": ROW_MAJOR_LAYOUT,
+            },
+            "k_weight_scale_inv": {
+                "dtype": "BF16",
+                "shape": [40, 40],
+                "layout": ROW_MAJOR_LAYOUT,
+            },
+        }
+    }
+
+    dimensions = {"hidden_size": 5120, "intermediate_size": 5120}
+
+    assert shader_file_for_node(circuit, node, tensor_index, dimensions) == (
+        "parallel_linear_2way_fp8_e4m3_b128x128_5120x5120.comp"
+    )
+    assert workgroup_count_x_for_node(circuit, node, tensor_index) == 160
+
+
 def test_compiler_renders_native_block_scaled_fp8_linear_shaders(
     tmp_path: Path,
 ) -> None:
@@ -1188,6 +1281,8 @@ def test_compiler_parallelizes_only_selected_sparse_expert_routes() -> None:
         implementation["lane_tile_width"]
         for implementation in spec["batch_implementations"]
     ] == [1]
+    assert spec["execution_domain"] == "decode"
+    assert spec["batch_implementations"][0]["execution_domain"] == "prefill"
     assert spec["batch_implementations"][0]["stages"] == [
         {
             "shader_path": (
