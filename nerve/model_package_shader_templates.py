@@ -543,7 +543,7 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
                 "BLOCK_COLUMNS": str(block_columns),
                 "INPUT_SIZE": str(input_size),
                 "VOCAB_SIZE": str(vocab_size),
-                "OUTPUT_TILE_ROWS": str(fp8_linear_tile_rows(vocab_size)),
+                "OUTPUT_TILE_ROWS": str(FP8_OUTPUT_PROJECTION_TILE_ROWS),
                 "OUTPUT_SCALE": output_scale,
             },
         )

@@ -47,6 +47,7 @@ const uint INPUT_FP8_WORDS = INPUT_SIZE / 4u;
 const uint INPUT_BLOCKS = INPUT_SIZE / BLOCK_COLUMNS;
 const uint BLOCK_FP8_WORDS = BLOCK_COLUMNS / 4u;
 const uint SCALE_COLUMNS = INPUT_BLOCKS;
+const uint ROW_CLUSTER_LANES = 32u;
 const float OUTPUT_SCALE = {{OUTPUT_SCALE}};
 
 shared fe4m3vec4 quantized_input[INPUT_FP8_WORDS];
@@ -114,14 +115,17 @@ void main() {
     barrier();
 
     uint first_row = gl_WorkGroupID.x * OUTPUT_TILE_ROWS;
-    uint local_row = gl_SubgroupID;
+    uint rows_per_subgroup = gl_SubgroupSize / ROW_CLUSTER_LANES;
+    uint row_cluster = gl_SubgroupInvocationID / ROW_CLUSTER_LANES;
+    uint row_lane = gl_SubgroupInvocationID & (ROW_CLUSTER_LANES - 1u);
+    uint local_row = gl_SubgroupID * rows_per_subgroup + row_cluster;
     uint row = first_row + local_row;
     float sum = 0.0;
     if (local_row < OUTPUT_TILE_ROWS && row < VOCAB_SIZE) {
         for (
-            uint word = gl_SubgroupInvocationID;
+            uint word = row_lane;
             word < INPUT_FP8_WORDS;
-            word += gl_SubgroupSize
+            word += ROW_CLUSTER_LANES
         ) {
             uint block = word / BLOCK_FP8_WORDS;
             sum = fma(
@@ -135,8 +139,8 @@ void main() {
             );
         }
     }
-    sum = subgroupAdd(sum);
-    if (local_row < OUTPUT_TILE_ROWS && gl_SubgroupInvocationID == 0u) {
+    sum = subgroupClusteredAdd(sum, ROW_CLUSTER_LANES);
+    if (local_row < OUTPUT_TILE_ROWS && row_lane == 0u) {
         output_rows[local_row] = sum;
     }
     barrier();

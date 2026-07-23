@@ -52,7 +52,10 @@ def test_compiler_renders_fp8_output_projection_shaders(tmp_path: Path) -> None:
         assert "binding = 3) readonly buffer ProjectionWeightScaleInv" in source
         assert "const uint BLOCK_ROWS = 16u;" in source
         assert "const uint BLOCK_COLUMNS = 128u;" in source
-        assert "const uint OUTPUT_TILE_ROWS = 16u;" in source
+        assert "const uint OUTPUT_TILE_ROWS = 32u;" in source
+        assert "const uint ROW_CLUSTER_LANES = 32u;" in source
+        assert "uint local_row = gl_SubgroupID * rows_per_subgroup + row_cluster;" in source
+        assert "sum = subgroupClusteredAdd(sum, ROW_CLUSTER_LANES);" in source
         assert "fp8_dot4_acc32" in source
         assert "{{" not in source
     assert "layout(push_constant) uniform BatchControl" not in decode

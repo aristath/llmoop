@@ -287,7 +287,7 @@ def build_vulkan_resident_package_manifest(
     )
     output_scale = 1.0 / logits_scale
     if projection_dtype == "F8_E4M3":
-        projection_tile_rows = fp8_linear_tile_rows(vocab_size)
+        projection_tile_rows = FP8_OUTPUT_PROJECTION_TILE_ROWS
         projection_shader_file = (
             f"tied_output_projection_fp8_e4m3_b{projection_block_rows}x"
             f"{projection_block_columns}_{vocab_size}x{hidden_size}"
