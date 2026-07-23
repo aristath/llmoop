@@ -263,6 +263,19 @@ Required pieces:
 - Acceptance-rate and accepted-token stats in normal runtime output.
 - Correct behavior with thinking/reasoning models enabled normally.
 
+Current status:
+
+- The compiler discovers structural MTP/draft graphs and lowers them as
+  auxiliary execution graphs with draft input adapters, draft processors, draft
+  output transducers, and explicit transactional state contracts.
+- The runtime can mount speculative decoder packages, run draft steps, verify a
+  target prefix, restore rejected tentative state, catch the draft decoder up to
+  the accepted prefix, and report proposed/accepted draft tokens plus timing in
+  normal chat output.
+- This is not finished: scheduler-native lookahead slots, multi-draft routing,
+  larger validation on real thinking models, and warmed benchmarks with MTP
+  enabled are still required.
+
 ### 10. Treat prefill as a first-class workload
 
 Long context is a normal use case, not an edge case.
