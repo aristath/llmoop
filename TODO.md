@@ -36,6 +36,13 @@ Implement a scheduler that operates on streams and stream activations:
 
 The scheduler should schedule stream events, not convert NERVE into a stateless request/response server.
 
+Current status:
+
+- Core stream scheduler exists and tracks persistent streams, queued input events, prefill chunks, decode feedback windows, active/idle/interrupted/closing state, and normal executor-driven runs.
+- Decode activations can represent bounded feedback windows instead of forcing one-token host stepping.
+- Prefill completion can account for the first emitted feedback token when the backend samples from the final prompt activation.
+- The placed Vulkan prompt engine now routes normal prompt/chat execution through the core stream scheduler while keeping the model mounted.
+
 ### 2. Replace flat transient context with block-managed transient circuit state
 
 KV is not conceptually a disposable cache in NERVE. It is stream-owned transient circuit state.
@@ -62,6 +69,12 @@ Required pieces:
 - Support for attention KV, recurrent state, Mamba state, conv state, and other component-owned transient state.
 
 This should remove the architectural need for arbitrary tiny capacity limits while preserving bounded, explicit resource management.
+
+Current status:
+
+- A backend-neutral transient state arena and per-stream state tables exist.
+- State blocks are page-like, reusable, ref-counted, resettable, forkable, and snapshot-able.
+- The stream scheduler reserves transient state slots per scheduled activation for declared stream-owned state.
 
 ### 3. Preserve layer components as runtime/editing/placement boundaries
 
