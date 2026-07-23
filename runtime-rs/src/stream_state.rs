@@ -423,6 +423,10 @@ impl TransientStateTable {
         }
     }
 
+    pub fn state_keys(&self) -> Vec<TransientStateKey> {
+        self.entries.keys().cloned().collect()
+    }
+
     fn entry(&self, key: &TransientStateKey) -> Result<&TransientStateEntry, TransientStateError> {
         self.entries.get(key).ok_or_else(|| {
             TransientStateError(format!(

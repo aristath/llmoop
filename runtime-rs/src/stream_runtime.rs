@@ -2,6 +2,12 @@ use std::collections::{BTreeMap, VecDeque};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 
+use crate::stream_state::{
+    TransientStateArena, TransientStateArenaSnapshot, TransientStateBlockShape,
+    TransientStateError, TransientStateKey, TransientStateSlot, TransientStateTable,
+    TransientStateTableSnapshot,
+};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RuntimeStreamStatus {
     Idle,
@@ -52,11 +58,18 @@ impl RuntimeStreamActivationKind {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuntimeStreamStateReservation {
+    pub key: TransientStateKey,
+    pub slots: Vec<TransientStateSlot>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuntimeStreamActivation {
     pub id: u64,
     pub stream_id: String,
     pub input_event_id: String,
     pub kind: RuntimeStreamActivationKind,
+    pub state_reservations: Vec<RuntimeStreamStateReservation>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -120,6 +133,9 @@ pub struct RuntimeStreamSnapshot {
     pub completed_input_event_count: usize,
     pub scheduled_activation_count: usize,
     pub generated_token_count: usize,
+    pub transient_state_entry_count: usize,
+    pub transient_state_block_count: usize,
+    pub transient_state_logical_activation_count: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -127,6 +143,7 @@ pub struct RuntimeStreamSchedulerSnapshot {
     pub stream_count: usize,
     pub active_stream_count: usize,
     pub in_flight_activation_count: usize,
+    pub transient_state_arena: TransientStateArenaSnapshot,
     pub streams: Vec<RuntimeStreamSnapshot>,
 }
 
@@ -140,6 +157,12 @@ impl Display for RuntimeStreamSchedulerError {
 }
 
 impl Error for RuntimeStreamSchedulerError {}
+
+impl From<TransientStateError> for RuntimeStreamSchedulerError {
+    fn from(error: TransientStateError) -> Self {
+        Self(error.to_string())
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct RuntimeStreamCurrentEvent {
@@ -179,12 +202,15 @@ struct RuntimeStreamState {
     completed_input_event_count: usize,
     scheduled_activation_count: usize,
     generated_token_count: usize,
+    transient_state_table: TransientStateTable,
 }
 
 impl RuntimeStreamState {
-    fn new(stream_id: impl Into<String>) -> Self {
-        Self {
-            stream_id: stream_id.into(),
+    fn new(stream_id: impl Into<String>) -> Result<Self, RuntimeStreamSchedulerError> {
+        let stream_id = stream_id.into();
+        Ok(Self {
+            transient_state_table: TransientStateTable::new(stream_id.clone())?,
+            stream_id,
             status: RuntimeStreamStatus::Idle,
             closing_after_current: false,
             queued_input_events: VecDeque::new(),
@@ -193,7 +219,7 @@ impl RuntimeStreamState {
             completed_input_event_count: 0,
             scheduled_activation_count: 0,
             generated_token_count: 0,
-        }
+        })
     }
 
     fn has_in_flight_work(&self) -> bool {
@@ -232,6 +258,7 @@ impl RuntimeStreamState {
     }
 
     fn snapshot(&self) -> RuntimeStreamSnapshot {
+        let transient_state = self.transient_state_table.snapshot();
         RuntimeStreamSnapshot {
             stream_id: self.stream_id.clone(),
             status: self.status,
@@ -244,6 +271,9 @@ impl RuntimeStreamState {
             completed_input_event_count: self.completed_input_event_count,
             scheduled_activation_count: self.scheduled_activation_count,
             generated_token_count: self.generated_token_count,
+            transient_state_entry_count: transient_state.entry_count,
+            transient_state_block_count: transient_state.block_count,
+            transient_state_logical_activation_count: transient_state.logical_activation_count,
         }
     }
 }
@@ -253,6 +283,7 @@ pub struct RuntimeStreamScheduler {
     streams: BTreeMap<String, RuntimeStreamState>,
     active_queue: VecDeque<String>,
     in_flight: BTreeMap<u64, RuntimeStreamActivation>,
+    transient_state_arena: TransientStateArena,
     next_activation_id: u64,
 }
 
@@ -276,10 +307,34 @@ impl RuntimeStreamScheduler {
                 "stream {stream_id:?} already exists"
             )));
         }
-        let stream = RuntimeStreamState::new(stream_id.clone());
+        let stream = RuntimeStreamState::new(stream_id.clone())?;
         let snapshot = stream.snapshot();
         self.streams.insert(stream_id, stream);
         Ok(snapshot)
+    }
+
+    pub fn declare_stream_state(
+        &mut self,
+        stream_id: &str,
+        key: TransientStateKey,
+        shape: TransientStateBlockShape,
+    ) -> Result<RuntimeStreamSnapshot, RuntimeStreamSchedulerError> {
+        let stream = self.stream_mut(stream_id)?;
+        stream.transient_state_table.declare_state(key, shape)?;
+        Ok(stream.snapshot())
+    }
+
+    pub fn transient_state_arena_snapshot(
+        &self,
+    ) -> Result<TransientStateArenaSnapshot, RuntimeStreamSchedulerError> {
+        Ok(self.transient_state_arena.snapshot()?)
+    }
+
+    pub fn stream_transient_state_snapshot(
+        &self,
+        stream_id: &str,
+    ) -> Result<TransientStateTableSnapshot, RuntimeStreamSchedulerError> {
+        Ok(self.stream(stream_id)?.transient_state_table.snapshot())
     }
 
     pub fn enqueue_input_event(
@@ -336,10 +391,16 @@ impl RuntimeStreamScheduler {
         for activation_id in in_flight_ids {
             self.in_flight.remove(&activation_id);
         }
-        let stream = self.stream_mut(stream_id)?;
-        stream.in_flight_activation_ids.clear();
-        stream.status = RuntimeStreamStatus::Interrupted;
-        let snapshot = stream.snapshot();
+        let snapshot = {
+            let arena = &mut self.transient_state_arena;
+            let stream = self.streams.get_mut(stream_id).ok_or_else(|| {
+                RuntimeStreamSchedulerError(format!("unknown stream {stream_id:?}"))
+            })?;
+            stream.in_flight_activation_ids.clear();
+            stream.transient_state_table.reset_all(arena)?;
+            stream.status = RuntimeStreamStatus::Interrupted;
+            stream.snapshot()
+        };
         self.active_queue.retain(|candidate| candidate != stream_id);
         Ok(snapshot)
     }
@@ -471,6 +532,10 @@ impl RuntimeStreamScheduler {
             stream_count: self.streams.len(),
             active_stream_count: self.active_stream_count(),
             in_flight_activation_count: self.in_flight.len(),
+            transient_state_arena: self
+                .transient_state_arena
+                .snapshot()
+                .expect("validated transient state block shapes remain snapshot-safe"),
             streams: self
                 .streams
                 .values()
@@ -490,48 +555,86 @@ impl RuntimeStreamScheduler {
             .checked_add(1)
             .ok_or_else(|| RuntimeStreamSchedulerError("activation id overflow".to_string()))?;
 
-        let stream = self.stream_mut(stream_id)?;
-        if stream.has_in_flight_work() {
-            return Ok(None);
-        }
-        if stream.current_event.is_none() {
-            let Some(event) = stream.queued_input_events.pop_front() else {
-                stream.refresh_status();
+        let (input_event_id, kind, state_keys) = {
+            let stream = self.stream_mut(stream_id)?;
+            if stream.has_in_flight_work() {
+                return Ok(None);
+            }
+            if stream.current_event.is_none() {
+                let Some(event) = stream.queued_input_events.pop_front() else {
+                    stream.refresh_status();
+                    return Ok(None);
+                };
+                stream.current_event = Some(RuntimeStreamCurrentEvent::new(event));
+            }
+            let current = stream
+                .current_event
+                .as_ref()
+                .expect("current event was just installed");
+            let input_event_id = current.event.id.clone();
+            let kind = if !current.prompt_done() {
+                let token_offset = current.next_prompt_token_index;
+                let token_limit =
+                    (token_offset + max_prefill_tokens).min(current.event.token_ids.len());
+                RuntimeStreamActivationKind::PrefillChunk {
+                    token_offset,
+                    token_ids: current.event.token_ids[token_offset..token_limit].to_vec(),
+                }
+            } else if !current.generation_done() {
+                RuntimeStreamActivationKind::DecodeFeedback {
+                    feedback_depth: current.next_feedback_depth,
+                }
+            } else {
                 return Ok(None);
             };
-            stream.current_event = Some(RuntimeStreamCurrentEvent::new(event));
-        }
-        let current = stream
-            .current_event
-            .as_ref()
-            .expect("current event was just installed");
-        let input_event_id = current.event.id.clone();
-        let kind = if !current.prompt_done() {
-            let token_offset = current.next_prompt_token_index;
-            let token_limit =
-                (token_offset + max_prefill_tokens).min(current.event.token_ids.len());
-            RuntimeStreamActivationKind::PrefillChunk {
-                token_offset,
-                token_ids: current.event.token_ids[token_offset..token_limit].to_vec(),
-            }
-        } else if !current.generation_done() {
-            RuntimeStreamActivationKind::DecodeFeedback {
-                feedback_depth: current.next_feedback_depth,
-            }
-        } else {
-            return Ok(None);
+            (
+                input_event_id,
+                kind,
+                stream.transient_state_table.state_keys(),
+            )
         };
+        let state_reservations =
+            self.reserve_activation_state(stream_id, &state_keys, kind.work_units())?;
         let activation = RuntimeStreamActivation {
             id: activation_id,
             stream_id: stream_id.to_string(),
             input_event_id,
             kind,
+            state_reservations,
         };
+        let stream = self.stream_mut(stream_id)?;
         stream.in_flight_activation_ids.push(activation_id);
         stream.scheduled_activation_count = stream.scheduled_activation_count.saturating_add(1);
         stream.refresh_status();
         self.in_flight.insert(activation_id, activation.clone());
         Ok(Some(activation))
+    }
+
+    fn reserve_activation_state(
+        &mut self,
+        stream_id: &str,
+        state_keys: &[TransientStateKey],
+        work_units: usize,
+    ) -> Result<Vec<RuntimeStreamStateReservation>, RuntimeStreamSchedulerError> {
+        if state_keys.is_empty() || work_units == 0 {
+            return Ok(Vec::new());
+        }
+        let arena = &mut self.transient_state_arena;
+        let stream = self
+            .streams
+            .get_mut(stream_id)
+            .ok_or_else(|| RuntimeStreamSchedulerError(format!("unknown stream {stream_id:?}")))?;
+        state_keys
+            .iter()
+            .map(|key| {
+                Ok(RuntimeStreamStateReservation {
+                    key: key.clone(),
+                    slots: stream
+                        .transient_state_table
+                        .append_activations(arena, key, work_units)?,
+                })
+            })
+            .collect()
     }
 
     fn next_schedulable_stream_id(&mut self) -> Option<String> {
@@ -608,6 +711,14 @@ mod tests {
 
     fn budget(max_activations: usize) -> RuntimeStreamSchedulerBudget {
         RuntimeStreamSchedulerBudget::new(max_activations, 2, 16)
+    }
+
+    fn state_key() -> TransientStateKey {
+        TransientStateKey::new("layer_00", "kv_memory")
+    }
+
+    fn state_shape() -> TransientStateBlockShape {
+        TransientStateBlockShape::new(16, 2).unwrap()
     }
 
     #[test]
@@ -733,5 +844,106 @@ mod tests {
         assert_eq!(interrupted.in_flight_activation_count, 0);
         assert_eq!(scheduler.snapshot().stream_count, 1);
         assert_eq!(scheduler.snapshot().in_flight_activation_count, 0);
+    }
+
+    #[test]
+    fn scheduler_reserves_transient_state_slots_for_prefill_and_decode() {
+        let mut scheduler = RuntimeStreamScheduler::new();
+        scheduler.add_stream("stream_a").unwrap();
+        scheduler
+            .declare_stream_state("stream_a", state_key(), state_shape())
+            .unwrap();
+        scheduler
+            .enqueue_input_event(
+                "stream_a",
+                RuntimeStreamInputEvent::new("event_0", [1, 2, 3], 1),
+            )
+            .unwrap();
+
+        let first = scheduler.schedule_step(budget(1)).unwrap().activations[0].clone();
+        assert_eq!(first.kind.work_units(), 2);
+        assert_eq!(first.state_reservations.len(), 1);
+        assert_eq!(first.state_reservations[0].slots.len(), 2);
+        assert_eq!(
+            first.state_reservations[0].slots[0].block_activation_offset,
+            0
+        );
+        assert_eq!(
+            first.state_reservations[0].slots[1].block_activation_offset,
+            1
+        );
+        assert_eq!(
+            scheduler.snapshot().transient_state_arena.live_block_count,
+            1
+        );
+        scheduler
+            .complete_activation(first.id, RuntimeStreamActivationOutcome::prefill_complete())
+            .unwrap();
+
+        let second = scheduler.schedule_step(budget(1)).unwrap().activations[0].clone();
+        assert_eq!(second.kind.work_units(), 1);
+        assert_eq!(second.state_reservations[0].slots.len(), 1);
+        assert_eq!(
+            second.state_reservations[0].slots[0].block_activation_offset,
+            0
+        );
+        assert_eq!(
+            scheduler.snapshot().transient_state_arena.live_block_count,
+            2
+        );
+        scheduler
+            .complete_activation(
+                second.id,
+                RuntimeStreamActivationOutcome::prefill_complete(),
+            )
+            .unwrap();
+
+        let decode = scheduler.schedule_step(budget(1)).unwrap().activations[0].clone();
+        assert!(matches!(
+            decode.kind,
+            RuntimeStreamActivationKind::DecodeFeedback { .. }
+        ));
+        assert_eq!(decode.state_reservations[0].slots.len(), 1);
+        assert_eq!(
+            decode.state_reservations[0].slots[0].block_activation_offset,
+            1
+        );
+    }
+
+    #[test]
+    fn scheduler_interrupt_releases_transient_state_reservations() {
+        let mut scheduler = RuntimeStreamScheduler::new();
+        scheduler.add_stream("stream_a").unwrap();
+        scheduler
+            .declare_stream_state("stream_a", state_key(), state_shape())
+            .unwrap();
+        scheduler
+            .enqueue_input_event(
+                "stream_a",
+                RuntimeStreamInputEvent::new("event_0", [1, 2], 8),
+            )
+            .unwrap();
+        let scheduled = scheduler.schedule_step(budget(1)).unwrap();
+        assert_eq!(
+            scheduled.activations[0].state_reservations[0].slots.len(),
+            2
+        );
+        assert_eq!(
+            scheduler.snapshot().transient_state_arena.live_block_count,
+            1
+        );
+
+        let interrupted = scheduler.interrupt_stream("stream_a", "cancel").unwrap();
+
+        assert_eq!(interrupted.transient_state_block_count, 0);
+        assert_eq!(interrupted.transient_state_logical_activation_count, 0);
+        assert_eq!(
+            scheduler.snapshot().transient_state_arena.live_block_count,
+            0
+        );
+        assert_eq!(
+            scheduler.snapshot().transient_state_arena.free_block_count,
+            1
+        );
     }
 }
