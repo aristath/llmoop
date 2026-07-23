@@ -141,10 +141,10 @@ def test_compiler_selects_and_renders_fused_block_scaled_fp8_ffn_shader(
     assert "binding = 3) readonly buffer GateScaleInv" in source
     assert "binding = 5) readonly buffer UpScaleInv" in source
     assert "const uint BLOCK_ROWS = 128u;" in source
-    assert "const uint OUTPUT_TILE_ROWS = 32u;" in source
+    assert "const uint OUTPUT_TILE_ROWS = 16u;" in source
     assert "shared fe4m3vec4 quantized_input" in source
     assert "fp8_dot4_acc32" in source
-    assert "for (uint word = lane;" in source
+    assert "uint word = gl_SubgroupInvocationID;" in source
     assert "rounded_silu" in source
     assert "{{" not in source
 
@@ -273,4 +273,3 @@ def test_compiler_renders_projected_recurrent_depthwise_shader(
     assert "const uint OUTPUT_GATE_INDEX = 1u;" in source
     assert "PAIRED_WEIGHT_LAYOUT" not in source
     assert "{{" not in source
-
