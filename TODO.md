@@ -291,6 +291,18 @@ Implement:
 
 Prefill speed and decode speed should be measured separately by default.
 
+Current status:
+
+- The stream scheduler emits chunked prefill activations and can batch
+  compatible prefill chunks across streams when activation/work budgets allow.
+- Prefill and decode token counts, activation counts, batch counts, and timings
+  are reported separately in normal prompt/chat output.
+- The runtime default generation budget is 65,536 new tokens rather than a tiny
+  benchmark-oriented cap.
+- This is not finished: true page-backed resident state bindings, prefill/decode
+  interleaving under memory pressure, and real long-context validation are still
+  required.
+
 ### 11. Add prefix/state reuse after block-managed state exists
 
 Do not start with clever prefix caching before the state allocator is solid.
@@ -320,6 +332,18 @@ Required pieces:
 - Stable graph identity based on runtime graph, placement, shape class, and state layout.
 
 This is the Vulkan/SPIR-V analogue of graph reservation/reuse in llama.cpp and CUDA graph capture/replay in vLLM.
+
+Current status:
+
+- Mounted Vulkan dispatch segments keep pipelines, descriptors, command buffers,
+  and fences resident for the lifetime of the mounted model.
+- Resident kernel sequences are cached by execution variant/lane and replay
+  recorded commands when their dispatch shape has no dynamic push constants.
+- Normal chat output includes resident sequence record/reuse/submit counters, so
+  graph/kernel reuse is visible without a special profiling mode.
+- This is not finished: stable runtime graph identity, reusable prefill/decode
+  template catalogs, and hot-path metadata updates for page-backed state still
+  need to be made explicit.
 
 ## Validation expectations
 
