@@ -138,11 +138,11 @@ def copy_tensor_package(
     compiled_sources = []
     tensors = sorted(packaged["tensors"].items())
     total = len(tensors)
-    derived_fp8_groups_written: set[str] = set()
-    derived_fp8_tensors_written: set[str] = set()
+    derived_groups_written: set[str] = set()
+    derived_tensors_written: set[str] = set()
     for index, (tensor_name, info) in enumerate(tensors, start=1):
         check_compile_cancelled(cancel_requested)
-        if tensor_name in derived_fp8_tensors_written:
+        if tensor_name in derived_tensors_written:
             continue
         if progress is not None:
             progress(index, total, tensor_name)
@@ -154,7 +154,7 @@ def copy_tensor_package(
             isinstance(derivation, dict)
             and derivation.get("kind") == "bf16_to_fp8_e4m3_scale"
         ):
-            if str(derivation["group"]) not in derived_fp8_groups_written:
+            if str(derivation["group"]) not in derived_groups_written:
                 raise ModelCompileError(
                     f"derived FP8 scale tensor {tensor_name!r} was visited before "
                     "its weight tensor"
@@ -208,8 +208,35 @@ def copy_tensor_package(
                         },
                     }
                 )
-            derived_fp8_groups_written.add(str(derivation["group"]))
-            derived_fp8_tensors_written.update({tensor_name, scale_tensor_name})
+            derived_groups_written.add(str(derivation["group"]))
+            derived_tensors_written.update({tensor_name, scale_tensor_name})
+            continue
+        if (
+            isinstance(derivation, dict)
+            and derivation.get("kind") == "fp8_e4m3_to_q8_0"
+        ):
+            header_bytes, data_sha256 = write_compiled_derived_q8_0_from_fp8_e4m3(
+                tensor_name=tensor_name,
+                info=info,
+                destination=destination,
+                layout=layout,
+            )
+            relative_destination = relative_json_path(package_dir, destination)
+            info["source_file"] = relative_destination
+            info["data_offsets"] = [0, int(info["byte_count"])]
+            info["data_sha256"] = data_sha256
+            info["layout"] = layout
+            info.pop("derived", None)
+            compiled_sources.append(
+                {
+                    "path": relative_destination,
+                    "safetensors_header_bytes": header_bytes,
+                    "metadata": {
+                        "format": "nerve",
+                        "layout": layout,
+                    },
+                }
+            )
             continue
         if info.get("source_parts"):
             header_bytes, data_sha256 = write_compiled_composite_tensor(

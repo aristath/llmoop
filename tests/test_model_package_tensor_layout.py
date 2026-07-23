@@ -1,8 +1,15 @@
 from model_package_layout_common import *
 from nerve.model_package_derived_tensors import derive_output_projection_tensors
 from nerve.model_package_tensors import (
+    e4m3fn_to_f32,
+    f32_to_bf16_bytes,
+    f32_to_e4m3fn,
     write_compiled_derived_fp8_e4m3_output_projection,
+    write_compiled_derived_q8_0_from_fp8_e4m3,
 )
+
+import numpy as np
+
 
 def test_write_compiled_tensor_preserves_canonical_row_major_order(
     tmp_path: Path,
@@ -130,6 +137,91 @@ def test_compiler_derives_fp8_output_projection_tensor_pair(tmp_path: Path) -> N
     assert set(digests) == {weight, scale}
     assert destinations[weight].stat().st_size > 16 * 128
     assert destinations[scale].stat().st_size > 2
+
+
+def test_compiler_writes_internal_q8_0_blocks_from_block_scaled_fp8(
+    tmp_path: Path,
+) -> None:
+    tensor_name = "layer.weight.__nerve_q8_0"
+    source_tensor = "layer.weight"
+    scale_tensor = "layer.weight_scale_inv"
+    source_values = np.linspace(-4.0, 4.0, 64, dtype=np.float32).reshape(2, 32)
+    fp8_bytes = f32_to_e4m3fn(source_values).tobytes(order="C")
+    scale_bytes = f32_to_bf16_bytes(np.asarray([1.0], dtype=np.float32))
+    source_header = {
+        source_tensor: {
+            "dtype": "F8_E4M3",
+            "shape": [2, 32],
+            "data_offsets": [0, len(fp8_bytes)],
+        }
+    }
+    scale_header = {
+        scale_tensor: {
+            "dtype": "BF16",
+            "shape": [1, 1],
+            "data_offsets": [0, len(scale_bytes)],
+        }
+    }
+    source_header_payload = json.dumps(source_header).encode("utf-8")
+    scale_header_payload = json.dumps(scale_header).encode("utf-8")
+    source = tmp_path / "source.safetensors"
+    scale_source = tmp_path / "scale.safetensors"
+    source.write_bytes(
+        struct.pack("<Q", len(source_header_payload))
+        + source_header_payload
+        + fp8_bytes
+    )
+    scale_source.write_bytes(
+        struct.pack("<Q", len(scale_header_payload))
+        + scale_header_payload
+        + scale_bytes
+    )
+    destination = tmp_path / "q8.safetensors"
+
+    header_bytes, data_sha256 = write_compiled_derived_q8_0_from_fp8_e4m3(
+        tensor_name=tensor_name,
+        info={
+            "dtype": "Q8_0",
+            "shape": [2, 1, 9],
+            "logical_shape": [2, 32],
+            "byte_count": 2 * 36,
+            "derived": {
+                "kind": "fp8_e4m3_to_q8_0",
+                "source_tensor": source_tensor,
+                "source_file": str(source),
+                "source_header_bytes": len(source_header_payload),
+                "data_offsets": [0, len(fp8_bytes)],
+                "source_shape": [2, 32],
+                "scale_tensor": scale_tensor,
+                "scale_source_file": str(scale_source),
+                "scale_source_header_bytes": len(scale_header_payload),
+                "scale_data_offsets": [0, len(scale_bytes)],
+                "scale_shape": [1, 1],
+            },
+        },
+        destination=destination,
+        layout=ROW_MAJOR_LAYOUT,
+    )
+
+    compiled = destination.read_bytes()
+    stored_header_bytes = struct.unpack("<Q", compiled[:8])[0]
+    header = json.loads(compiled[8 : 8 + stored_header_bytes])
+    payload = compiled[8 + stored_header_bytes :]
+    assert header_bytes == stored_header_bytes
+    assert len(data_sha256) == 64
+    assert header[tensor_name]["dtype"] == "Q8_0"
+    assert header[tensor_name]["shape"] == [2, 1, 9]
+    assert len(payload) == 72
+
+    expected = e4m3fn_to_f32(np.frombuffer(fp8_bytes, dtype=np.uint8)).reshape(2, 32)
+    reconstructed = np.empty((2, 32), dtype=np.float32)
+    for row in range(2):
+        block = payload[row * 36 : (row + 1) * 36]
+        scale_word = np.frombuffer(block[:2], dtype="<u2").astype(np.uint32) << 16
+        scale_value = scale_word.view(np.float32)[0]
+        quantized = np.frombuffer(block[4:], dtype=np.int8).astype(np.float32)
+        reconstructed[row, :] = quantized * scale_value
+    assert np.max(np.abs(reconstructed - expected)) < 0.04
 
 
 def test_compiler_renders_row_major_matrix_and_transducer_shaders(

@@ -236,6 +236,129 @@ def write_compiled_derived_fp8_e4m3_output_projection(
     }
 
 
+def write_compiled_derived_q8_0_from_fp8_e4m3(
+    *,
+    tensor_name: str,
+    info: Json,
+    destination: Path,
+    layout: str,
+) -> tuple[int, str]:
+    if layout != ROW_MAJOR_LAYOUT:
+        raise ModelCompileError("derived Q8_0 tensors require row-major layout")
+    derivation = info.get("derived")
+    if not isinstance(derivation, dict) or derivation.get("kind") != "fp8_e4m3_to_q8_0":
+        raise ModelCompileError(
+            f"tensor {tensor_name!r} is not a derived FP8-to-Q8_0 tensor"
+        )
+
+    logical_shape = [int(value) for value in info.get("logical_shape", info["shape"])]
+    if len(logical_shape) != 2:
+        raise ModelCompileError(
+            f"derived Q8_0 tensor {tensor_name!r} requires a rank-2 logical shape"
+        )
+    output_rows, input_columns = logical_shape
+    if input_columns <= 0 or input_columns % Q8_0_GROUP_SIZE != 0:
+        raise ModelCompileError(
+            f"derived Q8_0 tensor {tensor_name!r} requires {Q8_0_GROUP_SIZE}-column "
+            f"alignment, got shape {logical_shape}"
+        )
+    group_count = input_columns // Q8_0_GROUP_SIZE
+    expected_byte_count = output_rows * group_count * Q8_0_BLOCK_BYTE_COUNT
+    if int(info["byte_count"]) != expected_byte_count:
+        raise ModelCompileError(
+            f"derived Q8_0 tensor {tensor_name!r} byte count {info['byte_count']} "
+            f"does not match expected {expected_byte_count}"
+        )
+
+    source_shape = [int(value) for value in derivation["source_shape"]]
+    scale_shape = [int(value) for value in derivation["scale_shape"]]
+    if source_shape != logical_shape:
+        raise ModelCompileError(
+            f"derived Q8_0 tensor {tensor_name!r} source shape {source_shape} "
+            f"does not match logical shape {logical_shape}"
+        )
+    block_rows, block_columns = regular_block_shape(source_shape, scale_shape)
+    if block_columns <= 0 or input_columns % block_columns != 0:
+        raise ModelCompileError(
+            f"derived Q8_0 tensor {tensor_name!r} has invalid FP8 block geometry "
+            f"{block_rows}x{block_columns}"
+        )
+
+    source = Path(derivation["source_file"])
+    scale_source = Path(derivation["scale_source_file"])
+    if not source.is_file():
+        raise ModelCompileError(f"derived Q8_0 FP8 source does not exist: {source}")
+    if not scale_source.is_file():
+        raise ModelCompileError(
+            f"derived Q8_0 scale source does not exist: {scale_source}"
+        )
+
+    source_bytes = read_source_tensor_payload(
+        source=source,
+        source_header_bytes=int(derivation["source_header_bytes"]),
+        data_offsets=[int(value) for value in derivation["data_offsets"]],
+    )
+    scale_bytes = read_source_tensor_payload(
+        source=scale_source,
+        source_header_bytes=int(derivation["scale_source_header_bytes"]),
+        data_offsets=[int(value) for value in derivation["scale_data_offsets"]],
+    )
+    if len(source_bytes) != output_rows * input_columns:
+        raise ModelCompileError(
+            f"derived Q8_0 FP8 payload for {tensor_name!r} has {len(source_bytes)} "
+            f"bytes; expected {output_rows * input_columns}"
+        )
+    if len(scale_bytes) != scale_shape[0] * scale_shape[1] * 2:
+        raise ModelCompileError(
+            f"derived Q8_0 scale payload for {tensor_name!r} has {len(scale_bytes)} "
+            f"bytes; expected {scale_shape[0] * scale_shape[1] * 2}"
+        )
+
+    fp8_values = e4m3fn_to_f32(
+        np.frombuffer(source_bytes, dtype=np.uint8).reshape(output_rows, input_columns)
+    )
+    scales = bf16_bytes_to_f32_matrix(scale_bytes, scale_shape[0], scale_shape[1])
+    dequantized = np.empty((output_rows, input_columns), dtype=np.float32)
+    for row_start in range(0, output_rows, block_rows):
+        row_end = min(row_start + block_rows, output_rows)
+        scale_row = row_start // block_rows
+        for column_start in range(0, input_columns, block_columns):
+            column_end = min(column_start + block_columns, input_columns)
+            scale_column = column_start // block_columns
+            dequantized[row_start:row_end, column_start:column_end] = (
+                fp8_values[row_start:row_end, column_start:column_end]
+                * scales[scale_row, scale_column]
+            )
+
+    header = compiled_safetensors_header(
+        tensor_name,
+        dtype="Q8_0",
+        shape=[output_rows, group_count, Q8_0_BLOCK_BYTE_COUNT // 4],
+        byte_count=expected_byte_count,
+        layout=layout,
+    )
+    data_digest = sha256()
+    with destination.open("wb") as destination_handle:
+        destination_handle.write(struct.pack("<Q", len(header)))
+        destination_handle.write(header)
+        for row in range(output_rows):
+            for group in range(group_count):
+                start = group * Q8_0_GROUP_SIZE
+                stop = start + Q8_0_GROUP_SIZE
+                values = dequantized[row, start:stop]
+                max_abs = float(np.max(np.abs(values))) if values.size else 0.0
+                scale = max_abs / 127.0 if max_abs > 0.0 else 1.0
+                quantized = np.rint(values / scale).astype(np.int32)
+                quantized = np.clip(quantized, -127, 127).astype(np.int8, copy=False)
+                scale_word = f32_to_bf16_bytes(np.asarray([scale], dtype=np.float32))
+                block = bytearray(Q8_0_BLOCK_BYTE_COUNT)
+                block[0:2] = scale_word
+                block[4:] = quantized.tobytes(order="C")
+                destination_handle.write(block)
+                data_digest.update(block)
+    return len(header), data_digest.hexdigest()
+
+
 def compiled_safetensors_header(
     tensor_name: str,
     *,
@@ -261,6 +384,42 @@ def bf16_bytes_to_f32_matrix(data: bytes, rows: int, columns: int) -> np.ndarray
     bf16 = np.frombuffer(data, dtype="<u2").reshape(rows, columns)
     bits = bf16.astype(np.uint32) << 16
     return bits.view(np.float32)
+
+
+def read_source_tensor_payload(
+    *,
+    source: Path,
+    source_header_bytes: int,
+    data_offsets: list[int],
+) -> bytes:
+    byte_count = data_offsets[1] - data_offsets[0]
+    if byte_count < 0:
+        raise ModelCompileError(f"tensor source {source} has invalid offsets")
+    with source.open("rb") as source_handle:
+        source_handle.seek(8 + source_header_bytes + data_offsets[0])
+        data = source_handle.read(byte_count)
+    if len(data) != byte_count:
+        raise ModelCompileError(
+            f"unexpected end of tensor source {source}; read {len(data)} of {byte_count}"
+        )
+    return data
+
+
+def e4m3fn_to_f32(values: np.ndarray) -> np.ndarray:
+    raw = np.asarray(values, dtype=np.uint8)
+    sign = np.where((raw & np.uint8(0x80)) != 0, -1.0, 1.0).astype(np.float32)
+    exponent = ((raw >> np.uint8(3)) & np.uint8(0x0F)).astype(np.int32)
+    mantissa = (raw & np.uint8(0x07)).astype(np.float32)
+    normal = exponent != 0
+    decoded = np.zeros(raw.shape, dtype=np.float32)
+    if np.any(normal):
+        decoded[normal] = (
+            (1.0 + mantissa[normal] / 8.0)
+            * np.exp2(exponent[normal].astype(np.float32) - 7.0)
+        )
+    if np.any(~normal):
+        decoded[~normal] = mantissa[~normal] / 512.0
+    return decoded * sign
 
 
 def f32_to_bf16_bytes(values: np.ndarray) -> bytes:
