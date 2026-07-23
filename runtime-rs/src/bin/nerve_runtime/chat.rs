@@ -259,6 +259,13 @@ struct RuntimeChatTurn {
     streamed: bool,
     timing: RuntimePromptTimingReport,
     execution_counters: VulkanResidentExecutionCounters,
+    speculative_cycle_count: usize,
+    proposed_draft_token_count: usize,
+    accepted_draft_token_count: usize,
+    speculative_emitted_token_count: usize,
+    speculative_draft_time_ns: u64,
+    speculative_target_verification_time_ns: u64,
+    speculative_draft_catch_up_time_ns: u64,
 }
 
 fn run_chat_repl<C, T, F>(
@@ -364,6 +371,15 @@ where
             }
             print_runtime_timing_stats("stats", &turn.timing);
             print_runtime_execution_counters(&turn.execution_counters);
+            print_runtime_speculative_stats(
+                turn.speculative_cycle_count,
+                turn.proposed_draft_token_count,
+                turn.accepted_draft_token_count,
+                turn.speculative_emitted_token_count,
+                turn.speculative_draft_time_ns,
+                turn.speculative_target_verification_time_ns,
+                turn.speculative_draft_catch_up_time_ns,
+            );
             chat_session.commit_assistant_turn(input_text, &assistant_content);
             Ok(true)
         }
@@ -556,4 +572,3 @@ fn first_special_token_id(token_ids: &[u32], special_token_ids: &BTreeSet<u32>) 
         .copied()
         .find(|token_id| special_token_ids.contains(token_id))
 }
-

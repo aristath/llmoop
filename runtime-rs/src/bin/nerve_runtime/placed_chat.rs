@@ -124,6 +124,48 @@ fn run_placed_chat(
                 streamed: true,
                 timing,
                 execution_counters,
+                speculative_cycle_count: submitted_run
+                    .submitted_run
+                    .session_run
+                    .run
+                    .speculative_decode
+                    .cycle_count,
+                proposed_draft_token_count: submitted_run
+                    .submitted_run
+                    .session_run
+                    .run
+                    .speculative_decode
+                    .proposed_draft_token_count,
+                accepted_draft_token_count: submitted_run
+                    .submitted_run
+                    .session_run
+                    .run
+                    .speculative_decode
+                    .accepted_draft_token_count,
+                speculative_emitted_token_count: submitted_run
+                    .submitted_run
+                    .session_run
+                    .run
+                    .speculative_decode
+                    .emitted_token_count,
+                speculative_draft_time_ns: submitted_run
+                    .submitted_run
+                    .session_run
+                    .run
+                    .speculative_decode
+                    .draft_time_ns,
+                speculative_target_verification_time_ns: submitted_run
+                    .submitted_run
+                    .session_run
+                    .run
+                    .speculative_decode
+                    .target_verification_time_ns,
+                speculative_draft_catch_up_time_ns: submitted_run
+                    .submitted_run
+                    .session_run
+                    .run
+                    .speculative_decode
+                    .draft_catch_up_time_ns,
             })
         },
     )
@@ -303,35 +345,14 @@ fn print_placed_prompt_report(
 }
 
 fn print_speculative_profile(report: &RuntimePlacedPromptRunReport) {
-    if report.speculative_cycle_count == 0 {
-        return;
-    }
-    let acceptance = if report.proposed_draft_token_count == 0 {
-        0.0
-    } else {
-        100.0 * report.accepted_draft_token_count as f64 / report.proposed_draft_token_count as f64
-    };
-    println!("speculative:");
-    println!("  cycles={}", report.speculative_cycle_count);
-    println!(
-        "  drafts proposed={} accepted={} acceptance={acceptance:.2}%",
-        report.proposed_draft_token_count, report.accepted_draft_token_count
-    );
-    println!(
-        "  emitted_tokens={}",
-        report.speculative_emitted_token_count
-    );
-    println!(
-        "  draft_ms={:.3}",
-        nanos_to_millis(report.speculative_draft_time_ns)
-    );
-    println!(
-        "  target_verification_ms={:.3}",
-        nanos_to_millis(report.speculative_target_verification_time_ns)
-    );
-    println!(
-        "  draft_catch_up_ms={:.3}",
-        nanos_to_millis(report.speculative_draft_catch_up_time_ns)
+    print_runtime_speculative_stats(
+        report.speculative_cycle_count,
+        report.proposed_draft_token_count,
+        report.accepted_draft_token_count,
+        report.speculative_emitted_token_count,
+        report.speculative_draft_time_ns,
+        report.speculative_target_verification_time_ns,
+        report.speculative_draft_catch_up_time_ns,
     );
 }
 

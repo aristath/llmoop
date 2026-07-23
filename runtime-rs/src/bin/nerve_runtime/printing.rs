@@ -111,6 +111,41 @@ fn print_runtime_execution_counters(counters: &VulkanResidentExecutionCounters) 
     println!("  resident_copy_waits={}", counters.resident_copy_waits);
 }
 
+fn print_runtime_speculative_stats(
+    cycle_count: usize,
+    proposed_draft_token_count: usize,
+    accepted_draft_token_count: usize,
+    emitted_token_count: usize,
+    draft_time_ns: u64,
+    target_verification_time_ns: u64,
+    draft_catch_up_time_ns: u64,
+) {
+    if cycle_count == 0 {
+        return;
+    }
+    let acceptance = if proposed_draft_token_count == 0 {
+        0.0
+    } else {
+        100.0 * accepted_draft_token_count as f64 / proposed_draft_token_count as f64
+    };
+    println!("speculative:");
+    println!("  cycles={cycle_count}");
+    println!(
+        "  drafts proposed={} accepted={} acceptance={acceptance:.2}%",
+        proposed_draft_token_count, accepted_draft_token_count
+    );
+    println!("  emitted_tokens={emitted_token_count}");
+    println!("  draft_ms={:.3}", nanos_to_millis(draft_time_ns));
+    println!(
+        "  target_verification_ms={:.3}",
+        nanos_to_millis(target_verification_time_ns)
+    );
+    println!(
+        "  draft_catch_up_ms={:.3}",
+        nanos_to_millis(draft_catch_up_time_ns)
+    );
+}
+
 fn print_placed_component_timing_profile(
     summaries: &[RuntimePlacedComponentTimingSummaryReport],
     max_rows: usize,
