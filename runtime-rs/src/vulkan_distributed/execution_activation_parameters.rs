@@ -42,7 +42,7 @@ pub struct VulkanDistributedDispatchSubmission {
 }
 
 impl VulkanDistributedExecutionPlan {
-    pub fn for_placed_pedals(
+    pub fn for_placed_components(
         device_ids: &[String],
         storage_buffer_offset_alignment: usize,
     ) -> Result<Self, VulkanDistributedPlanError> {
@@ -113,7 +113,7 @@ impl VulkanDistributedExecutionPlan {
                     .ok_or_else(|| {
                         VulkanDistributedPlanError(format!(
                             "distributed dispatch {}.{} has no artifact for family {:?}",
-                            dispatch.pedal_id, dispatch.node_id, dispatch.reusable_family_id
+                            dispatch.component_id, dispatch.node_id, dispatch.reusable_family_id
                         ))
                     })?;
                 let Some(planned) = plan_dispatch(
@@ -212,7 +212,7 @@ fn distributed_dispatches_can_share_sequence(
     consumer: &VulkanDistributedDispatchPlan,
 ) -> bool {
     producer.owner_device_id == consumer.owner_device_id
-        && producer.pedal_id == consumer.pedal_id
+        && producer.component_id == consumer.component_id
         && producer.dispatch_index.checked_add(1) == Some(consumer.dispatch_index)
         && producer.distribution == VulkanDistributedDispatchDistribution::ExpertRange
         && consumer.distribution == VulkanDistributedDispatchDistribution::ExpertRange
@@ -234,7 +234,7 @@ fn same_distributed_activation(
     left: &VulkanDistributedActivationSlot,
     right: &VulkanDistributedActivationSlot,
 ) -> bool {
-    left.pedal_id == right.pedal_id
+    left.component_id == right.component_id
         && left.signal_id == right.signal_id
         && left.slot == right.slot
         && left.byte_capacity == right.byte_capacity
@@ -245,7 +245,7 @@ fn same_distributed_activation(
 pub struct VulkanDistributedDispatchPlan {
     pub owner_device_id: String,
     pub dispatch_index: usize,
-    pub pedal_id: String,
+    pub component_id: String,
     pub node_id: String,
     pub reusable_family_id: String,
     pub input_byte_capacity: usize,
@@ -270,7 +270,7 @@ pub enum VulkanDistributedDispatchDistribution {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VulkanDistributedActivationSlot {
     pub binding: usize,
-    pub pedal_id: String,
+    pub component_id: String,
     pub signal_id: String,
     pub slot: usize,
     pub byte_capacity: usize,
@@ -309,13 +309,13 @@ impl VulkanDistributedActivationBufferPlan {
             if participant_device_ids.is_empty() {
                 return Err(VulkanDistributedPlanError(format!(
                     "distributed dispatch {}.{} has no device shards",
-                    dispatch.pedal_id, dispatch.node_id
+                    dispatch.component_id, dispatch.node_id
                 )));
             }
             if !participant_device_ids.contains(dispatch.owner_device_id.as_str()) {
                 return Err(VulkanDistributedPlanError(format!(
                     "distributed dispatch {}.{} does not include its owner {:?}",
-                    dispatch.pedal_id, dispatch.node_id, dispatch.owner_device_id
+                    dispatch.component_id, dispatch.node_id, dispatch.owner_device_id
                 )));
             }
             if let Some(device_id) = participant_device_ids
@@ -324,7 +324,7 @@ impl VulkanDistributedActivationBufferPlan {
             {
                 return Err(VulkanDistributedPlanError(format!(
                     "distributed dispatch {}.{} uses device {device_id:?} outside the execution pool",
-                    dispatch.pedal_id, dispatch.node_id
+                    dispatch.component_id, dispatch.node_id
                 )));
             }
 
@@ -394,12 +394,12 @@ impl VulkanDistributedActivationBufferPlan {
     pub fn allocation(
         &self,
         owner_device_id: &str,
-        pedal_id: &str,
+        component_id: &str,
         slot: usize,
     ) -> Option<&VulkanDistributedActivationBufferAllocation> {
         self.allocations.iter().find(|allocation| {
             allocation.owner_device_id == owner_device_id
-                && allocation.pedal_id == pedal_id
+                && allocation.component_id == component_id
                 && allocation.slot == slot
         })
     }
@@ -408,7 +408,7 @@ impl VulkanDistributedActivationBufferPlan {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VulkanDistributedActivationBufferAllocation {
     pub owner_device_id: String,
-    pub pedal_id: String,
+    pub component_id: String,
     pub slot: usize,
     pub byte_capacity: usize,
     pub signal_ids: Vec<String>,
@@ -462,7 +462,7 @@ impl VulkanDistributedActivationBuffers {
                 .ok_or_else(|| {
                     VulkanDistributedActivationBufferError(format!(
                         "distributed activation {}.slot_{} lane capacity overflowed",
-                        planned.pedal_id, planned.slot
+                        planned.component_id, planned.slot
                     ))
                 })?;
             let owner = device_for(&planned.owner_device_id).map_err(|error| {
@@ -488,7 +488,7 @@ impl VulkanDistributedActivationBuffers {
                 .map_err(|error| {
                     VulkanDistributedActivationBufferError(format!(
                         "failed to allocate {} shared activation bytes for {}.slot_{}: {error}",
-                        byte_capacity, planned.pedal_id, planned.slot
+                        byte_capacity, planned.component_id, planned.slot
                     ))
                 })?;
             let mut device_buffers = BTreeMap::new();
@@ -504,14 +504,14 @@ impl VulkanDistributedActivationBuffers {
                         .map_err(|error| {
                             VulkanDistributedActivationBufferError(format!(
                                 "failed to import {}.slot_{} on {device_id:?}: {error}",
-                                planned.pedal_id, planned.slot
+                                planned.component_id, planned.slot
                             ))
                         })?,
                 );
                 if device_buffers.insert(device_id.clone(), buffer).is_some() {
                     return Err(VulkanDistributedActivationBufferError(format!(
                         "distributed activation {}.slot_{} repeats device {device_id:?}",
-                        planned.pedal_id, planned.slot
+                        planned.component_id, planned.slot
                     )));
                 }
             }
@@ -549,7 +549,7 @@ impl VulkanDistributedActivationBuffers {
     pub fn activation_buffer(
         &self,
         owner_device_id: &str,
-        pedal_id: &str,
+        component_id: &str,
         slot: usize,
         device_id: &str,
     ) -> Option<&Arc<VulkanResidentBuffer>> {
@@ -557,7 +557,7 @@ impl VulkanDistributedActivationBuffers {
             .iter()
             .find(|allocation| {
                 allocation.planned.owner_device_id == owner_device_id
-                    && allocation.planned.pedal_id == pedal_id
+                    && allocation.planned.component_id == component_id
                     && allocation.planned.slot == slot
             })
             .and_then(|allocation| allocation.device_buffers.get(device_id))
@@ -575,7 +575,7 @@ impl VulkanDistributedActivationBuffers {
                     .device_buffers
                     .get(owner_device_id)
                     .map(|buffer| VulkanActivationSlotBufferOverride {
-                        pedal_id: allocation.planned.pedal_id.clone(),
+                        component_id: allocation.planned.component_id.clone(),
                         slot: allocation.planned.slot,
                         buffer: Arc::clone(buffer),
                     })
@@ -604,7 +604,7 @@ impl Error for VulkanDistributedActivationBufferError {}
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct VulkanDistributedActivationBufferAllocationKey {
     owner_device_id: String,
-    pedal_id: String,
+    component_id: String,
     slot: usize,
 }
 
@@ -662,7 +662,7 @@ impl VulkanDistributedParameterAllocationPlan {
                 if !device_ids.contains(shard.device_id.as_str()) {
                     return Err(VulkanDistributedPlanError(format!(
                         "distributed parameter shard for {}.{} uses device {:?} outside the execution pool",
-                        dispatch.pedal_id, dispatch.node_id, shard.device_id
+                        dispatch.component_id, dispatch.node_id, shard.device_id
                     )));
                 }
                 for fragment in &shard.parameters {

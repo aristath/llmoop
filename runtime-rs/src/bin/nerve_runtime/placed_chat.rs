@@ -193,8 +193,8 @@ fn execute_placed_prompt_run(
         tick_count,
         total_scheduler_turns,
     );
-    let pedal_timings = Vec::new();
-    let pedal_timing_summaries = Vec::new();
+    let component_timings = Vec::new();
+    let component_timing_summaries = Vec::new();
     let transport_stats_by_tick = Vec::new();
     let transport_published_packet_count = run.transport_stats.published_packet_count;
     let transport_published_byte_count = run.transport_stats.published_byte_count;
@@ -215,10 +215,10 @@ fn execute_placed_prompt_run(
         device_count: stream_snapshot.device_ids.len(),
         device_ids: stream_snapshot.device_ids.clone(),
         bound_devices: bound_devices_report(&bound_devices),
-        cable_routes: bound_cable_routes_report(&bound_devices, &placement.cables),
-        runtime_patch: runtime_patch_report(args),
+        edge_routes: bound_edge_routes_report(&bound_devices, &placement.edges),
+        runtime_graph: runtime_graph_report(args),
         device_bindings: runtime_device_bindings_report(args, &stream_snapshot.device_ids),
-        hosted_pedal_count: stream_snapshot.hosted_pedal_count,
+        hosted_component_count: stream_snapshot.hosted_component_count,
         context_window_activations: stream_snapshot.context_window_activations,
         scheduled_token_activations: *scheduled_token_activations,
         tokenizer: tokenizer_options_report(args),
@@ -243,8 +243,8 @@ fn execute_placed_prompt_run(
             by_tick: transport_stats_by_tick,
         },
         timing,
-        pedal_timings,
-        pedal_timing_summaries,
+        component_timings,
+        component_timing_summaries,
         speculative_cycle_count: run.speculative_decode.cycle_count,
         proposed_draft_token_count: run.speculative_decode.proposed_draft_token_count,
         accepted_draft_token_count: run.speculative_decode.accepted_draft_token_count,
@@ -268,7 +268,7 @@ fn print_placed_prompt_report(
         print_runtime_timing_stats("stats", &report.timing);
         print_runtime_execution_counters(&vulkan_resident_execution_counters());
         print_speculative_profile(report);
-        print_placed_pedal_timing_profile(&report.pedal_timing_summaries, 5);
+        print_placed_component_timing_profile(&report.component_timing_summaries, 5);
     }
     Ok(())
 }

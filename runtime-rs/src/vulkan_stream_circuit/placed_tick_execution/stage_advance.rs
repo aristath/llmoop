@@ -1,9 +1,9 @@
 fn advance_compact_slice_with_distributed_dependencies<'a, 'batch>(
     slice: &mut VulkanMountedPlacedResidentInProcessStreamTickSlice<'a>,
     device_by_id: &BTreeMap<String, &'a VulkanComputeDevice>,
-    transport: &mut VulkanInProcessPlacedCableTransport,
+    transport: &mut VulkanInProcessPlacedEdgeTransport,
     distributed_runners: &VulkanDistributedDispatchRunners,
-    cable_synchronizations: &VulkanPlacedCableTimelineSynchronizations,
+    edge_synchronizations: &VulkanPlacedEdgeTimelineSynchronizations,
     submission: VulkanPlacedSliceSubmissionContext<'a, 'batch>,
 ) -> Result<usize, VulkanMountedPlacedResidentInProcessStreamTickError> {
     let VulkanPlacedSliceSubmissionContext {
@@ -33,35 +33,35 @@ fn advance_compact_slice_with_distributed_dependencies<'a, 'batch>(
         None;
     let mut ready_dependency = None;
     let mut completion_dependency = None;
-    let mut pending_cable_wait_points = Vec::new();
+    let mut pending_edge_wait_points = Vec::new();
 
     while slice.cursor.next_stage_index < slice.cursor.tick_plan.stages.len() {
         let stage = &slice.cursor.tick_plan.stages[slice.cursor.next_stage_index];
         match stage {
-            VulkanMountedPlacedStreamTickStage::ReceiveCable { cable_index, .. } => {
+            VulkanMountedPlacedStreamTickStage::ReceiveEdge { edge_index, .. } => {
                 let incoming = slice
                     .mounted
-                    .cable_io
-                    .incoming_buffer(*cable_index)
+                    .edge_io
+                    .incoming_buffer(*edge_index)
                     .ok_or_else(|| {
                         VulkanMountedPlacedResidentInProcessStreamTickError::StreamTick(
                             VulkanMountedPlacedResidentStreamTickError::Transport(
-                                VulkanPlacedCableTransportError::MissingIncomingCable {
+                                VulkanPlacedEdgeTransportError::MissingIncomingEdge {
                                     device_id: slice.device_id().to_string(),
-                                    cable_index: *cable_index,
+                                    edge_index: *edge_index,
                                 },
                             ),
                         )
                     })?;
-                let cable_key =
-                    VulkanPlacedCablePacketKey::from_incoming_endpoint(&incoming.endpoint);
-                let uses_shared_allocation = transport.cable_uses_shared_allocation(&cable_key);
+                let edge_key =
+                    VulkanPlacedEdgePacketKey::from_incoming_endpoint(&incoming.endpoint);
+                let uses_shared_allocation = transport.edge_uses_shared_allocation(&edge_key);
                 if !uses_shared_allocation {
                     if submission_batch.is_some() {
                         return Err(
                             VulkanMountedPlacedResidentInProcessStreamTickError::Schedule(
                                 VulkanError(format!(
-                                    "deferred placed submission requires shared cable {cable_key:?}"
+                                    "deferred placed submission requires shared edge {edge_key:?}"
                                 )),
                             ),
                         );
@@ -76,20 +76,20 @@ fn advance_compact_slice_with_distributed_dependencies<'a, 'batch>(
                         can_wait_submitted,
                     )?;
                 }
-                match transport.receive_incoming_cable(slice.mounted, *cable_index) {
+                match transport.receive_incoming_edge(slice.mounted, *edge_index) {
                     Ok(_) => {
                         if uses_shared_allocation
-                            && let Some(wait_point) = cable_synchronizations
+                            && let Some(wait_point) = edge_synchronizations
                                 .take_destination_wait(&incoming.endpoint)
                                 .map_err(
                                     VulkanMountedPlacedResidentInProcessStreamTickError::Schedule,
                                 )?
                         {
-                            pending_cable_wait_points.push(wait_point);
+                            pending_edge_wait_points.push(wait_point);
                         }
                         slice.cursor.complete_current_stage();
                     }
-                    Err(VulkanPlacedCableTransportError::MissingPacket { .. }) => break,
+                    Err(VulkanPlacedEdgeTransportError::MissingPacket { .. }) => break,
                     Err(error) => {
                         return Err(
                             VulkanMountedPlacedResidentInProcessStreamTickError::StreamTick(
@@ -263,7 +263,7 @@ fn advance_compact_slice_with_distributed_dependencies<'a, 'batch>(
                         );
                     }
                 };
-                wait_points.append(&mut pending_cable_wait_points);
+                wait_points.append(&mut pending_edge_wait_points);
                 if slice.execution_plan.first_dispatch_segment_stage_index()
                     == Some(segment.start_stage_index)
                     && feedback_turn.is_some_and(|turn| {
@@ -326,28 +326,28 @@ fn advance_compact_slice_with_distributed_dependencies<'a, 'batch>(
                         );
                     }
                 };
-                if let Some(VulkanMountedPlacedStreamTickStage::PublishCable {
-                    cable_index, ..
+                if let Some(VulkanMountedPlacedStreamTickStage::PublishEdge {
+                    edge_index, ..
                 }) = slice.cursor.tick_plan.stages.get(segment.end_stage_index)
                 {
                     let outgoing = slice
                         .mounted
-                        .cable_io
-                        .outgoing_buffer(*cable_index)
+                        .edge_io
+                        .outgoing_buffer(*edge_index)
                         .ok_or_else(|| {
                             VulkanMountedPlacedResidentInProcessStreamTickError::StreamTick(
                                 VulkanMountedPlacedResidentStreamTickError::Transport(
-                                    VulkanPlacedCableTransportError::MissingOutgoingCable {
+                                    VulkanPlacedEdgeTransportError::MissingOutgoingEdge {
                                         device_id: slice.device_id().to_string(),
-                                        cable_index: *cable_index,
+                                        edge_index: *edge_index,
                                     },
                                 ),
                             )
                         })?;
-                    let cable_key =
-                        VulkanPlacedCablePacketKey::from_outgoing_endpoint(&outgoing.endpoint);
-                    if transport.cable_uses_shared_allocation(&cable_key)
-                        && let Some(signal_point) = cable_synchronizations
+                    let edge_key =
+                        VulkanPlacedEdgePacketKey::from_outgoing_endpoint(&outgoing.endpoint);
+                    if transport.edge_uses_shared_allocation(&edge_key)
+                        && let Some(signal_point) = edge_synchronizations
                             .prepare_source_signal(&outgoing.endpoint)
                             .map_err(
                                 VulkanMountedPlacedResidentInProcessStreamTickError::Schedule,
@@ -463,29 +463,29 @@ fn advance_compact_slice_with_distributed_dependencies<'a, 'batch>(
                     slice.cursor.complete_current_stage();
                 }
             }
-            VulkanMountedPlacedStreamTickStage::PublishCable { cable_index, .. } => {
+            VulkanMountedPlacedStreamTickStage::PublishEdge { edge_index, .. } => {
                 let outgoing = slice
                     .mounted
-                    .cable_io
-                    .outgoing_buffer(*cable_index)
+                    .edge_io
+                    .outgoing_buffer(*edge_index)
                     .ok_or_else(|| {
                         VulkanMountedPlacedResidentInProcessStreamTickError::StreamTick(
                             VulkanMountedPlacedResidentStreamTickError::Transport(
-                                VulkanPlacedCableTransportError::MissingOutgoingCable {
+                                VulkanPlacedEdgeTransportError::MissingOutgoingEdge {
                                     device_id: slice.device_id().to_string(),
-                                    cable_index: *cable_index,
+                                    edge_index: *edge_index,
                                 },
                             ),
                         )
                     })?;
-                let cable_key =
-                    VulkanPlacedCablePacketKey::from_outgoing_endpoint(&outgoing.endpoint);
-                if !transport.cable_uses_shared_allocation(&cable_key) {
+                let edge_key =
+                    VulkanPlacedEdgePacketKey::from_outgoing_endpoint(&outgoing.endpoint);
+                if !transport.edge_uses_shared_allocation(&edge_key) {
                     if submission_batch.is_some() {
                         return Err(
                             VulkanMountedPlacedResidentInProcessStreamTickError::Schedule(
                                 VulkanError(format!(
-                                    "deferred placed submission requires shared cable {cable_key:?}"
+                                    "deferred placed submission requires shared edge {edge_key:?}"
                                 )),
                             ),
                         );
@@ -501,7 +501,7 @@ fn advance_compact_slice_with_distributed_dependencies<'a, 'batch>(
                     )?;
                 }
                 transport
-                    .publish_outgoing_cable(slice.mounted, *cable_index)
+                    .publish_outgoing_edge(slice.mounted, *edge_index)
                     .map_err(|error| {
                         VulkanMountedPlacedResidentInProcessStreamTickError::StreamTick(
                             VulkanMountedPlacedResidentStreamTickError::Transport(error),
@@ -511,12 +511,12 @@ fn advance_compact_slice_with_distributed_dependencies<'a, 'batch>(
             }
         }
     }
-    if !pending_cable_wait_points.is_empty() {
+    if !pending_edge_wait_points.is_empty() {
         return Err(
             VulkanMountedPlacedResidentInProcessStreamTickError::Schedule(VulkanError(format!(
-                "device {:?} completed without consuming {} cable timeline dependencies",
+                "device {:?} completed without consuming {} edge timeline dependencies",
                 slice.device_id(),
-                pending_cable_wait_points.len()
+                pending_edge_wait_points.len()
             ))),
         );
     }

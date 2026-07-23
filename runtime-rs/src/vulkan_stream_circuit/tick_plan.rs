@@ -7,10 +7,10 @@ pub struct VulkanMountedPlacedStreamTickPlan {
     pub receive_stage_count: usize,
     pub dispatch_stage_count: usize,
     pub publish_stage_count: usize,
-    pub local_cable_read_count: usize,
-    pub local_cable_write_count: usize,
-    pub incoming_cable_read_count: usize,
-    pub outgoing_cable_write_count: usize,
+    pub local_edge_read_count: usize,
+    pub local_edge_write_count: usize,
+    pub incoming_edge_read_count: usize,
+    pub outgoing_edge_write_count: usize,
     pub model_input_read_count: usize,
     pub model_output_write_count: usize,
     pub can_execute: bool,
@@ -24,43 +24,43 @@ impl VulkanMountedPlacedStreamTickPlan {
         let mut received_endpoints = BTreeSet::<(usize, usize)>::new();
         let mut published_endpoints = BTreeSet::<(usize, usize)>::new();
 
-        let mut local_cable_read_count = 0usize;
-        let mut local_cable_write_count = 0usize;
-        let mut incoming_cable_read_count = 0usize;
-        let mut outgoing_cable_write_count = 0usize;
+        let mut local_edge_read_count = 0usize;
+        let mut local_edge_write_count = 0usize;
+        let mut incoming_edge_read_count = 0usize;
+        let mut outgoing_edge_write_count = 0usize;
         let mut model_input_read_count = 0usize;
         let mut model_output_write_count = 0usize;
 
         for dispatch in &mounted_bound_plan.dispatches {
             let dispatch_stage =
                 VulkanMountedPlacedStreamTickDispatch::from_bound_dispatch(dispatch);
-            local_cable_read_count += dispatch_stage
+            local_edge_read_count += dispatch_stage
                 .reads
                 .iter()
-                .filter(|io| matches!(io, VulkanMountedPlacedStreamTickIo::LocalCableBuffer { .. }))
+                .filter(|io| matches!(io, VulkanMountedPlacedStreamTickIo::LocalEdgeBuffer { .. }))
                 .count();
-            local_cable_write_count += dispatch_stage
+            local_edge_write_count += dispatch_stage
                 .writes
                 .iter()
-                .filter(|io| matches!(io, VulkanMountedPlacedStreamTickIo::LocalCableBuffer { .. }))
+                .filter(|io| matches!(io, VulkanMountedPlacedStreamTickIo::LocalEdgeBuffer { .. }))
                 .count();
-            incoming_cable_read_count += dispatch_stage
+            incoming_edge_read_count += dispatch_stage
                 .reads
                 .iter()
                 .filter(|io| {
                     matches!(
                         io,
-                        VulkanMountedPlacedStreamTickIo::IncomingCableBuffer { .. }
+                        VulkanMountedPlacedStreamTickIo::IncomingEdgeBuffer { .. }
                     )
                 })
                 .count();
-            outgoing_cable_write_count += dispatch_stage
+            outgoing_edge_write_count += dispatch_stage
                 .writes
                 .iter()
                 .filter(|io| {
                     matches!(
                         io,
-                        VulkanMountedPlacedStreamTickIo::OutgoingCableBuffer { .. }
+                        VulkanMountedPlacedStreamTickIo::OutgoingEdgeBuffer { .. }
                     )
                 })
                 .count();
@@ -76,19 +76,19 @@ impl VulkanMountedPlacedStreamTickPlan {
                 .count();
 
             for descriptor in &dispatch.descriptors {
-                if let VulkanMountedPlacedBoundDescriptorTarget::IncomingCableBuffer { endpoint } =
+                if let VulkanMountedPlacedBoundDescriptorTarget::IncomingEdgeBuffer { endpoint } =
                     &descriptor.target
                     && received_endpoints
-                        .insert((endpoint.endpoint.cable_index, endpoint.buffer_index))
+                        .insert((endpoint.endpoint.edge_index, endpoint.buffer_index))
                 {
-                    stages.push(VulkanMountedPlacedStreamTickStage::ReceiveCable {
+                    stages.push(VulkanMountedPlacedStreamTickStage::ReceiveEdge {
                         stage_index: stages.len(),
-                        cable_index: endpoint.endpoint.cable_index,
+                        edge_index: endpoint.endpoint.edge_index,
                         endpoint_id: endpoint.endpoint.endpoint_id.clone(),
                         buffer_index: endpoint.buffer_index,
                         byte_capacity: endpoint.byte_capacity,
                         remote_device_id: endpoint.endpoint.remote_device_id.clone(),
-                        remote_pedal_id: endpoint.endpoint.remote_pedal_id.clone(),
+                        remote_component_id: endpoint.endpoint.remote_component_id.clone(),
                     });
                 }
             }
@@ -99,19 +99,19 @@ impl VulkanMountedPlacedStreamTickPlan {
             });
 
             for descriptor in &dispatch.descriptors {
-                if let VulkanMountedPlacedBoundDescriptorTarget::OutgoingCableBuffer { endpoint } =
+                if let VulkanMountedPlacedBoundDescriptorTarget::OutgoingEdgeBuffer { endpoint } =
                     &descriptor.target
                     && published_endpoints
-                        .insert((endpoint.endpoint.cable_index, endpoint.buffer_index))
+                        .insert((endpoint.endpoint.edge_index, endpoint.buffer_index))
                 {
-                    stages.push(VulkanMountedPlacedStreamTickStage::PublishCable {
+                    stages.push(VulkanMountedPlacedStreamTickStage::PublishEdge {
                         stage_index: stages.len(),
-                        cable_index: endpoint.endpoint.cable_index,
+                        edge_index: endpoint.endpoint.edge_index,
                         endpoint_id: endpoint.endpoint.endpoint_id.clone(),
                         buffer_index: endpoint.buffer_index,
                         byte_capacity: endpoint.byte_capacity,
                         remote_device_id: endpoint.endpoint.remote_device_id.clone(),
-                        remote_pedal_id: endpoint.endpoint.remote_pedal_id.clone(),
+                        remote_component_id: endpoint.endpoint.remote_component_id.clone(),
                     });
                 }
             }
@@ -130,10 +130,10 @@ impl VulkanMountedPlacedStreamTickPlan {
             receive_stage_count,
             dispatch_stage_count,
             publish_stage_count,
-            local_cable_read_count,
-            local_cable_write_count,
-            incoming_cable_read_count,
-            outgoing_cable_write_count,
+            local_edge_read_count,
+            local_edge_write_count,
+            incoming_edge_read_count,
+            outgoing_edge_write_count,
             model_input_read_count,
             model_output_write_count,
             can_execute: false,
@@ -152,14 +152,14 @@ impl VulkanMountedPlacedStreamTickPlan {
             } else {
                 attempted_stage_count += 1;
                 let reason = match stage {
-                    VulkanMountedPlacedStreamTickStage::ReceiveCable { .. } => {
-                        VulkanMountedPlacedStreamTickBlockReason::CableReceiveTransportUnavailable
+                    VulkanMountedPlacedStreamTickStage::ReceiveEdge { .. } => {
+                        VulkanMountedPlacedStreamTickBlockReason::EdgeReceiveTransportUnavailable
                     }
                     VulkanMountedPlacedStreamTickStage::Dispatch { .. } => {
                         VulkanMountedPlacedStreamTickBlockReason::KernelDispatchUnavailable
                     }
-                    VulkanMountedPlacedStreamTickStage::PublishCable { .. } => {
-                        VulkanMountedPlacedStreamTickBlockReason::CablePublishTransportUnavailable
+                    VulkanMountedPlacedStreamTickStage::PublishEdge { .. } => {
+                        VulkanMountedPlacedStreamTickBlockReason::EdgePublishTransportUnavailable
                     }
                 };
                 blocked = Some((stage.stage_index(), reason.clone()));
@@ -210,7 +210,7 @@ impl VulkanMountedPlacedStreamTickPlan {
     pub fn advance_with_in_process_transport(
         &self,
         mounted: &VulkanMountedPlacedStreamCircuit,
-        transport: &mut VulkanInProcessPlacedCableTransport,
+        transport: &mut VulkanInProcessPlacedEdgeTransport,
         stream_tick: u64,
     ) -> Result<VulkanMountedPlacedStreamTickRun, VulkanMountedPlacedStreamTickTransportError> {
         if self.device_id != mounted.device_id() {
@@ -233,15 +233,15 @@ impl VulkanMountedPlacedStreamTickPlan {
             } else {
                 attempted_stage_count += 1;
                 match stage {
-                    VulkanMountedPlacedStreamTickStage::ReceiveCable { cable_index, .. } => {
-                        match transport.receive_incoming_cable(mounted, *cable_index) {
+                    VulkanMountedPlacedStreamTickStage::ReceiveEdge { edge_index, .. } => {
+                        match transport.receive_incoming_edge(mounted, *edge_index) {
                             Ok(_) => {
                                 completed_stage_count += 1;
                                 VulkanMountedPlacedStreamTickStageStatus::Completed
                             }
-                            Err(VulkanPlacedCableTransportError::MissingPacket { .. }) => {
+                            Err(VulkanPlacedEdgeTransportError::MissingPacket { .. }) => {
                                 let reason =
-                                    VulkanMountedPlacedStreamTickBlockReason::CableReceiveTransportUnavailable;
+                                    VulkanMountedPlacedStreamTickBlockReason::EdgeReceiveTransportUnavailable;
                                 blocked = Some((stage.stage_index(), reason.clone()));
                                 VulkanMountedPlacedStreamTickStageStatus::Blocked { reason }
                             }
@@ -258,9 +258,9 @@ impl VulkanMountedPlacedStreamTickPlan {
                         blocked = Some((stage.stage_index(), reason.clone()));
                         VulkanMountedPlacedStreamTickStageStatus::Blocked { reason }
                     }
-                    VulkanMountedPlacedStreamTickStage::PublishCable { cable_index, .. } => {
+                    VulkanMountedPlacedStreamTickStage::PublishEdge { edge_index, .. } => {
                         transport
-                            .publish_outgoing_cable(mounted, *cable_index)
+                            .publish_outgoing_edge(mounted, *edge_index)
                             .map_err(VulkanMountedPlacedStreamTickTransportError::Transport)?;
                         completed_stage_count += 1;
                         VulkanMountedPlacedStreamTickStageStatus::Completed
@@ -306,18 +306,18 @@ impl VulkanMountedPlacedStreamTickPlan {
         })
     }
 
-    pub fn advance_with_resident_pedalboard_and_in_process_transport(
+    pub fn advance_with_resident_execution_graph_and_in_process_transport(
         &self,
         device: &VulkanComputeDevice,
         mounted: &VulkanMountedPlacedStreamCircuit,
         mounted_bound_plan: &VulkanMountedPlacedBoundDispatchPlan,
         loaded_manifest: &VulkanLoadedReusableKernelArtifactManifest,
-        transport: &mut VulkanInProcessPlacedCableTransport,
+        transport: &mut VulkanInProcessPlacedEdgeTransport,
         stream_tick: u64,
     ) -> Result<VulkanMountedPlacedResidentStreamTickRun, VulkanMountedPlacedResidentStreamTickError>
     {
         let mut cursor = self.resident_stream_tick_cursor(stream_tick);
-        cursor.advance_with_resident_pedals_and_in_process_transport(
+        cursor.advance_with_resident_components_and_in_process_transport(
             device,
             mounted,
             mounted_bound_plan,

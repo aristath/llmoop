@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-use crate::stream_circuit::ResolvedLoweredPedalboard;
+use crate::stream_circuit::ResolvedLoweredExecutionGraph;
 
 pub(crate) fn compiled_artifact_dir(env_var: &str, root_name: &str, marker_file: &str) -> PathBuf {
     if let Ok(path) = std::env::var(env_var) {
@@ -66,15 +66,15 @@ fn discover_fixture_artifact_id() -> String {
 }
 
 fn is_structural_test_fixture(path: &Path) -> bool {
-    let index_path = path.join("pedalboard.circuits.json");
-    let Ok(graph) = ResolvedLoweredPedalboard::from_index_file(index_path) else {
+    let index_path = path.join("execution_graph.circuits.json");
+    let Ok(graph) = ResolvedLoweredExecutionGraph::from_index_file(index_path) else {
         return false;
     };
     let operator_types = graph
         .circuits
         .iter()
         .filter(|artifact| artifact.circuit.runtime_role.is_signal_processor())
-        .map(|artifact| artifact.pedal.operator_type.as_str())
+        .map(|artifact| artifact.component.operator_type.as_str())
         .collect::<Vec<_>>();
 
     graph

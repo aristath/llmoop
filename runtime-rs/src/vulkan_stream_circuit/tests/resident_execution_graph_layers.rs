@@ -77,13 +77,11 @@ fn resident_greedy_running_stream_stop_after_current_processes_one_feedback_then
     assert_eq!(stream.public_outputs().len(), 1);
     assert_eq!(stream.private_feedback_history().len(), 1);
 }
-
-#[test]
-fn resident_pedalboard_runner_executes_layer_00_to_layer_01_over_local_cable() {
+fn resident_execution_graph_runner_executes_layer_00_to_layer_01_over_local_edge() {
     let device = match VulkanComputeDevice::new() {
         Ok(device) => device,
         Err(error) => {
-            eprintln!("skipping resident pedalboard runner: {error}");
+            eprintln!("skipping resident execution_graph runner: {error}");
             return;
         }
     };
@@ -91,22 +89,22 @@ fn resident_pedalboard_runner_executes_layer_00_to_layer_01_over_local_cable() {
         mount_fixture_model_single_device_stream_circuit(&device);
     let Some(loaded_manifest) = layer_00_level_1_loaded_kernel_pack(&mounted, &mounted_bound)
     else {
-        eprintln!("skipping resident pedalboard runner: no GLSL to SPIR-V compiler found");
+        eprintln!("skipping resident execution_graph runner: no GLSL to SPIR-V compiler found");
         return;
     };
-    let pedal_ids = prepare_fixture_model_resident_prefix(&mounted, &tensor_index, 1);
+    let component_ids = prepare_fixture_model_resident_prefix(&mounted, &tensor_index, 1);
 
     let runner = create_fixture_model_resident_prefix_runner(
         &device,
         &mounted,
         &mounted_bound,
         &loaded_manifest,
-        &pedal_ids,
+        &component_ids,
     );
-    assert_fixture_model_resident_prefix_runner(&runner, &pedal_ids, 32, 104, 0);
+    assert_fixture_model_resident_prefix_runner(&runner, &component_ids, 32, 104, 0);
 
     let run = runner.run_zeroed_push_constants(&device).unwrap();
-    assert_fixture_model_resident_prefix_run(&run, &pedal_ids, 32);
+    assert_fixture_model_resident_prefix_run(&run, &component_ids, 32);
 
     let layer_00_output_dispatch = mounted_bound.dispatch("layer_00", "ffn_residual").unwrap();
     let layer_00_output_bindings = mounted
@@ -134,11 +132,11 @@ fn resident_pedalboard_runner_executes_layer_00_to_layer_01_over_local_cable() {
 }
 
 #[test]
-fn resident_pedalboard_runner_executes_attention_layer_02_with_per_pedal_kv_state() {
+fn resident_execution_graph_runner_executes_attention_layer_02_with_per_component_kv_state() {
     let device = match VulkanComputeDevice::new() {
         Ok(device) => device,
         Err(error) => {
-            eprintln!("skipping resident attention pedalboard runner: {error}");
+            eprintln!("skipping resident attention execution_graph runner: {error}");
             return;
         }
     };
@@ -151,25 +149,25 @@ fn resident_pedalboard_runner_executes_attention_layer_02_with_per_pedal_kv_stat
         )
     else {
         eprintln!(
-            "skipping resident attention pedalboard runner: no GLSL to SPIR-V compiler found"
+            "skipping resident attention execution_graph runner: no GLSL to SPIR-V compiler found"
         );
         return;
     };
-    let pedal_ids = prepare_fixture_model_resident_prefix(&mounted, &tensor_index, 2);
+    let component_ids = prepare_fixture_model_resident_prefix(&mounted, &tensor_index, 2);
 
     let runner = create_fixture_model_resident_prefix_runner(
         &device,
         &mounted,
         &mounted_bound,
         &loaded_manifest,
-        &pedal_ids,
+        &component_ids,
     );
-    assert_fixture_model_resident_prefix_runner(&runner, &pedal_ids, 51, 171, 0);
+    assert_fixture_model_resident_prefix_runner(&runner, &component_ids, 51, 171, 0);
 
     let run = runner
         .run_with_stream_control(&device, fixture_model_stream_control(&mounted, 0))
         .unwrap();
-    assert_fixture_model_resident_prefix_run(&run, &pedal_ids, 51);
+    assert_fixture_model_resident_prefix_run(&run, &component_ids, 51);
 
     let kv_memory = mounted
         .buffers
@@ -191,7 +189,7 @@ fn resident_pedalboard_runner_executes_attention_layer_02_with_per_pedal_kv_stat
 }
 
 #[test]
-fn resident_attention_pedal_reuses_kv_state_across_stream_ticks() {
+fn resident_attention_component_reuses_kv_state_across_stream_ticks() {
     let device = match VulkanComputeDevice::new() {
         Ok(device) => device,
         Err(error) => {
@@ -212,17 +210,17 @@ fn resident_attention_pedal_reuses_kv_state_across_stream_ticks() {
         );
         return;
     };
-    let pedal_ids = prepare_fixture_model_resident_prefix(&mounted, &tensor_index, 2);
+    let component_ids = prepare_fixture_model_resident_prefix(&mounted, &tensor_index, 2);
 
     let runner = create_fixture_model_resident_prefix_runner(
         &device,
         &mounted,
         &mounted_bound,
         &loaded_manifest,
-        &pedal_ids,
+        &component_ids,
     );
     let layer_02_runner = mounted
-        .create_resident_pedal_runner(&device, &mounted_bound, "layer_02", &loaded_manifest)
+        .create_resident_component_runner(&device, &mounted_bound, "layer_02", &loaded_manifest)
         .unwrap();
     let dynamic_state_capacity_activations =
         mounted.buffers.dynamic_state_capacity_activations as u32;
@@ -293,7 +291,7 @@ fn resident_attention_pedal_reuses_kv_state_across_stream_ticks() {
 }
 
 #[test]
-fn resident_pedalboard_runner_executes_attention_output_into_next_conv_layer() {
+fn resident_execution_graph_runner_executes_attention_output_into_next_conv_layer() {
     let device = match VulkanComputeDevice::new() {
         Ok(device) => device,
         Err(error) => {
@@ -312,21 +310,21 @@ fn resident_pedalboard_runner_executes_attention_output_into_next_conv_layer() {
         eprintln!("skipping resident layer_03 prefix runner: no GLSL to SPIR-V compiler found");
         return;
     };
-    let pedal_ids = prepare_fixture_model_resident_prefix(&mounted, &tensor_index, 3);
+    let component_ids = prepare_fixture_model_resident_prefix(&mounted, &tensor_index, 3);
 
     let runner = create_fixture_model_resident_prefix_runner(
         &device,
         &mounted,
         &mounted_bound,
         &loaded_manifest,
-        &pedal_ids,
+        &component_ids,
     );
-    assert_fixture_model_resident_prefix_runner(&runner, &pedal_ids, 67, 223, 0);
+    assert_fixture_model_resident_prefix_runner(&runner, &component_ids, 67, 223, 0);
 
     let run = runner
         .run_with_stream_control(&device, fixture_model_stream_control(&mounted, 0))
         .unwrap();
-    assert_fixture_model_resident_prefix_run(&run, &pedal_ids, 67);
+    assert_fixture_model_resident_prefix_run(&run, &component_ids, 67);
 
     let layer_03_output_dispatch = mounted_bound.dispatch("layer_03", "ffn_residual").unwrap();
     let layer_03_output_bindings = mounted
@@ -342,7 +340,7 @@ fn resident_pedalboard_runner_executes_attention_output_into_next_conv_layer() {
 }
 
 #[test]
-fn resident_pedalboard_runner_executes_second_attention_layer_with_independent_kv_state() {
+fn resident_execution_graph_runner_executes_second_attention_layer_with_independent_kv_state() {
     let device = match VulkanComputeDevice::new() {
         Ok(device) => device,
         Err(error) => {
@@ -361,21 +359,21 @@ fn resident_pedalboard_runner_executes_second_attention_layer_with_independent_k
         eprintln!("skipping resident layer_04 prefix runner: no GLSL to SPIR-V compiler found");
         return;
     };
-    let pedal_ids = prepare_fixture_model_resident_prefix(&mounted, &tensor_index, 4);
+    let component_ids = prepare_fixture_model_resident_prefix(&mounted, &tensor_index, 4);
 
     let runner = create_fixture_model_resident_prefix_runner(
         &device,
         &mounted,
         &mounted_bound,
         &loaded_manifest,
-        &pedal_ids,
+        &component_ids,
     );
-    assert_fixture_model_resident_prefix_runner(&runner, &pedal_ids, 86, 290, 0);
+    assert_fixture_model_resident_prefix_runner(&runner, &component_ids, 86, 290, 0);
 
     let run = runner
         .run_with_stream_control(&device, fixture_model_stream_control(&mounted, 0))
         .unwrap();
-    assert_fixture_model_resident_prefix_run(&run, &pedal_ids, 86);
+    assert_fixture_model_resident_prefix_run(&run, &component_ids, 86);
 
     let layer_02_kv = mounted
         .buffers
@@ -409,7 +407,7 @@ fn resident_pedalboard_runner_executes_second_attention_layer_with_independent_k
 }
 
 #[test]
-fn resident_pedalboard_runner_executes_second_attention_output_into_next_conv_layer() {
+fn resident_execution_graph_runner_executes_second_attention_output_into_next_conv_layer() {
     let device = match VulkanComputeDevice::new() {
         Ok(device) => device,
         Err(error) => {
@@ -428,21 +426,21 @@ fn resident_pedalboard_runner_executes_second_attention_output_into_next_conv_la
         eprintln!("skipping resident layer_05 prefix runner: no GLSL to SPIR-V compiler found");
         return;
     };
-    let pedal_ids = prepare_fixture_model_resident_prefix(&mounted, &tensor_index, 5);
+    let component_ids = prepare_fixture_model_resident_prefix(&mounted, &tensor_index, 5);
 
     let runner = create_fixture_model_resident_prefix_runner(
         &device,
         &mounted,
         &mounted_bound,
         &loaded_manifest,
-        &pedal_ids,
+        &component_ids,
     );
-    assert_fixture_model_resident_prefix_runner(&runner, &pedal_ids, 102, 342, 0);
+    assert_fixture_model_resident_prefix_runner(&runner, &component_ids, 102, 342, 0);
 
     let run = runner
         .run_with_stream_control(&device, fixture_model_stream_control(&mounted, 0))
         .unwrap();
-    assert_fixture_model_resident_prefix_run(&run, &pedal_ids, 102);
+    assert_fixture_model_resident_prefix_run(&run, &component_ids, 102);
 
     let layer_02_kv = mounted
         .buffers
@@ -476,7 +474,7 @@ fn resident_pedalboard_runner_executes_second_attention_output_into_next_conv_la
 }
 
 #[test]
-fn resident_pedalboard_runner_executes_third_attention_layer_with_independent_kv_state() {
+fn resident_execution_graph_runner_executes_third_attention_layer_with_independent_kv_state() {
     let device = match VulkanComputeDevice::new() {
         Ok(device) => device,
         Err(error) => {
@@ -495,21 +493,21 @@ fn resident_pedalboard_runner_executes_third_attention_layer_with_independent_kv
         eprintln!("skipping resident layer_06 prefix runner: no GLSL to SPIR-V compiler found");
         return;
     };
-    let pedal_ids = prepare_fixture_model_resident_prefix(&mounted, &tensor_index, 6);
+    let component_ids = prepare_fixture_model_resident_prefix(&mounted, &tensor_index, 6);
 
     let runner = create_fixture_model_resident_prefix_runner(
         &device,
         &mounted,
         &mounted_bound,
         &loaded_manifest,
-        &pedal_ids,
+        &component_ids,
     );
-    assert_fixture_model_resident_prefix_runner(&runner, &pedal_ids, 121, 409, 0);
+    assert_fixture_model_resident_prefix_runner(&runner, &component_ids, 121, 409, 0);
 
     let run = runner
         .run_with_stream_control(&device, fixture_model_stream_control(&mounted, 0))
         .unwrap();
-    assert_fixture_model_resident_prefix_run(&run, &pedal_ids, 121);
+    assert_fixture_model_resident_prefix_run(&run, &component_ids, 121);
 
     let layer_02_kv = mounted
         .buffers
@@ -553,7 +551,7 @@ fn resident_pedalboard_runner_executes_third_attention_layer_with_independent_kv
 }
 
 #[test]
-fn resident_pedalboard_runner_executes_third_attention_output_into_next_conv_layer() {
+fn resident_execution_graph_runner_executes_third_attention_output_into_next_conv_layer() {
     let device = match VulkanComputeDevice::new() {
         Ok(device) => device,
         Err(error) => {
@@ -572,21 +570,21 @@ fn resident_pedalboard_runner_executes_third_attention_output_into_next_conv_lay
         eprintln!("skipping resident layer_07 prefix runner: no GLSL to SPIR-V compiler found");
         return;
     };
-    let pedal_ids = prepare_fixture_model_resident_prefix(&mounted, &tensor_index, 7);
+    let component_ids = prepare_fixture_model_resident_prefix(&mounted, &tensor_index, 7);
 
     let runner = create_fixture_model_resident_prefix_runner(
         &device,
         &mounted,
         &mounted_bound,
         &loaded_manifest,
-        &pedal_ids,
+        &component_ids,
     );
-    assert_fixture_model_resident_prefix_runner(&runner, &pedal_ids, 137, 461, 0);
+    assert_fixture_model_resident_prefix_runner(&runner, &component_ids, 137, 461, 0);
 
     let run = runner
         .run_with_stream_control(&device, fixture_model_stream_control(&mounted, 0))
         .unwrap();
-    assert_fixture_model_resident_prefix_run(&run, &pedal_ids, 137);
+    assert_fixture_model_resident_prefix_run(&run, &component_ids, 137);
 
     let layer_02_kv = mounted
         .buffers
@@ -630,7 +628,7 @@ fn resident_pedalboard_runner_executes_third_attention_output_into_next_conv_lay
 }
 
 #[test]
-fn resident_pedalboard_runner_executes_fourth_attention_layer_with_independent_kv_state() {
+fn resident_execution_graph_runner_executes_fourth_attention_layer_with_independent_kv_state() {
     let device = match VulkanComputeDevice::new() {
         Ok(device) => device,
         Err(error) => {
@@ -649,21 +647,21 @@ fn resident_pedalboard_runner_executes_fourth_attention_layer_with_independent_k
         eprintln!("skipping resident layer_08 prefix runner: no GLSL to SPIR-V compiler found");
         return;
     };
-    let pedal_ids = prepare_fixture_model_resident_prefix(&mounted, &tensor_index, 8);
+    let component_ids = prepare_fixture_model_resident_prefix(&mounted, &tensor_index, 8);
 
     let runner = create_fixture_model_resident_prefix_runner(
         &device,
         &mounted,
         &mounted_bound,
         &loaded_manifest,
-        &pedal_ids,
+        &component_ids,
     );
-    assert_fixture_model_resident_prefix_runner(&runner, &pedal_ids, 156, 528, 0);
+    assert_fixture_model_resident_prefix_runner(&runner, &component_ids, 156, 528, 0);
 
     let run = runner
         .run_with_stream_control(&device, fixture_model_stream_control(&mounted, 0))
         .unwrap();
-    assert_fixture_model_resident_prefix_run(&run, &pedal_ids, 156);
+    assert_fixture_model_resident_prefix_run(&run, &component_ids, 156);
 
     let layer_02_kv = mounted
         .buffers
@@ -718,7 +716,7 @@ fn resident_pedalboard_runner_executes_fourth_attention_layer_with_independent_k
 }
 
 #[test]
-fn resident_pedalboard_runner_executes_fourth_attention_output_into_next_conv_layer() {
+fn resident_execution_graph_runner_executes_fourth_attention_output_into_next_conv_layer() {
     let device = match VulkanComputeDevice::new() {
         Ok(device) => device,
         Err(error) => {
@@ -737,21 +735,21 @@ fn resident_pedalboard_runner_executes_fourth_attention_output_into_next_conv_la
         eprintln!("skipping resident layer_09 prefix runner: no GLSL to SPIR-V compiler found");
         return;
     };
-    let pedal_ids = prepare_fixture_model_resident_prefix(&mounted, &tensor_index, 9);
+    let component_ids = prepare_fixture_model_resident_prefix(&mounted, &tensor_index, 9);
 
     let runner = create_fixture_model_resident_prefix_runner(
         &device,
         &mounted,
         &mounted_bound,
         &loaded_manifest,
-        &pedal_ids,
+        &component_ids,
     );
-    assert_fixture_model_resident_prefix_runner(&runner, &pedal_ids, 172, 580, 0);
+    assert_fixture_model_resident_prefix_runner(&runner, &component_ids, 172, 580, 0);
 
     let run = runner
         .run_with_stream_control(&device, fixture_model_stream_control(&mounted, 0))
         .unwrap();
-    assert_fixture_model_resident_prefix_run(&run, &pedal_ids, 172);
+    assert_fixture_model_resident_prefix_run(&run, &component_ids, 172);
 
     let layer_02_kv = mounted
         .buffers
@@ -806,7 +804,7 @@ fn resident_pedalboard_runner_executes_fourth_attention_output_into_next_conv_la
 }
 
 #[test]
-fn resident_pedalboard_runner_executes_fifth_attention_layer_with_independent_kv_state() {
+fn resident_execution_graph_runner_executes_fifth_attention_layer_with_independent_kv_state() {
     let device = match VulkanComputeDevice::new() {
         Ok(device) => device,
         Err(error) => {
@@ -825,21 +823,21 @@ fn resident_pedalboard_runner_executes_fifth_attention_layer_with_independent_kv
         eprintln!("skipping resident layer_10 prefix runner: no GLSL to SPIR-V compiler found");
         return;
     };
-    let pedal_ids = prepare_fixture_model_resident_prefix(&mounted, &tensor_index, 10);
+    let component_ids = prepare_fixture_model_resident_prefix(&mounted, &tensor_index, 10);
 
     let runner = create_fixture_model_resident_prefix_runner(
         &device,
         &mounted,
         &mounted_bound,
         &loaded_manifest,
-        &pedal_ids,
+        &component_ids,
     );
-    assert_fixture_model_resident_prefix_runner(&runner, &pedal_ids, 191, 647, 0);
+    assert_fixture_model_resident_prefix_runner(&runner, &component_ids, 191, 647, 0);
 
     let run = runner
         .run_with_stream_control(&device, fixture_model_stream_control(&mounted, 0))
         .unwrap();
-    assert_fixture_model_resident_prefix_run(&run, &pedal_ids, 191);
+    assert_fixture_model_resident_prefix_run(&run, &component_ids, 191);
 
     let layer_02_kv = mounted
         .buffers
@@ -906,7 +904,7 @@ fn resident_pedalboard_runner_executes_fifth_attention_layer_with_independent_kv
 }
 
 #[test]
-fn resident_pedalboard_runner_executes_fifth_attention_output_into_next_conv_layer() {
+fn resident_execution_graph_runner_executes_fifth_attention_output_into_next_conv_layer() {
     let device = match VulkanComputeDevice::new() {
         Ok(device) => device,
         Err(error) => {
@@ -925,21 +923,21 @@ fn resident_pedalboard_runner_executes_fifth_attention_output_into_next_conv_lay
         eprintln!("skipping resident layer_11 prefix runner: no GLSL to SPIR-V compiler found");
         return;
     };
-    let pedal_ids = prepare_fixture_model_resident_prefix(&mounted, &tensor_index, 11);
+    let component_ids = prepare_fixture_model_resident_prefix(&mounted, &tensor_index, 11);
 
     let runner = create_fixture_model_resident_prefix_runner(
         &device,
         &mounted,
         &mounted_bound,
         &loaded_manifest,
-        &pedal_ids,
+        &component_ids,
     );
-    assert_fixture_model_resident_prefix_runner(&runner, &pedal_ids, 207, 699, 0);
+    assert_fixture_model_resident_prefix_runner(&runner, &component_ids, 207, 699, 0);
 
     let run = runner
         .run_with_stream_control(&device, fixture_model_stream_control(&mounted, 0))
         .unwrap();
-    assert_fixture_model_resident_prefix_run(&run, &pedal_ids, 207);
+    assert_fixture_model_resident_prefix_run(&run, &component_ids, 207);
 
     let layer_02_kv = mounted
         .buffers
@@ -1006,7 +1004,7 @@ fn resident_pedalboard_runner_executes_fifth_attention_output_into_next_conv_lay
 }
 
 #[test]
-fn resident_pedalboard_runner_executes_final_attention_layer_with_independent_kv_state() {
+fn resident_execution_graph_runner_executes_final_attention_layer_with_independent_kv_state() {
     let device = match VulkanComputeDevice::new() {
         Ok(device) => device,
         Err(error) => {
@@ -1025,21 +1023,21 @@ fn resident_pedalboard_runner_executes_final_attention_layer_with_independent_kv
         eprintln!("skipping resident layer_12 prefix runner: no GLSL to SPIR-V compiler found");
         return;
     };
-    let pedal_ids = prepare_fixture_model_resident_prefix(&mounted, &tensor_index, 12);
+    let component_ids = prepare_fixture_model_resident_prefix(&mounted, &tensor_index, 12);
 
     let runner = create_fixture_model_resident_prefix_runner(
         &device,
         &mounted,
         &mounted_bound,
         &loaded_manifest,
-        &pedal_ids,
+        &component_ids,
     );
-    assert_fixture_model_resident_prefix_runner(&runner, &pedal_ids, 226, 766, 0);
+    assert_fixture_model_resident_prefix_runner(&runner, &component_ids, 226, 766, 0);
 
     let run = runner
         .run_with_stream_control(&device, fixture_model_stream_control(&mounted, 0))
         .unwrap();
-    assert_fixture_model_resident_prefix_run(&run, &pedal_ids, 226);
+    assert_fixture_model_resident_prefix_run(&run, &component_ids, 226);
 
     let layer_02_kv = mounted
         .buffers
@@ -1119,7 +1117,7 @@ fn resident_pedalboard_runner_executes_final_attention_layer_with_independent_kv
 }
 
 #[test]
-fn resident_pedalboard_runner_executes_full_fixture_model_layer_stack() {
+fn resident_execution_graph_runner_executes_full_fixture_model_layer_stack() {
     let device = match VulkanComputeDevice::new() {
         Ok(device) => device,
         Err(error) => {
@@ -1140,21 +1138,21 @@ fn resident_pedalboard_runner_executes_full_fixture_model_layer_stack() {
         );
         return;
     };
-    let pedal_ids = prepare_fixture_model_resident_prefix(&mounted, &tensor_index, 13);
+    let component_ids = prepare_fixture_model_resident_prefix(&mounted, &tensor_index, 13);
 
     let runner = create_fixture_model_resident_prefix_runner(
         &device,
         &mounted,
         &mounted_bound,
         &loaded_manifest,
-        &pedal_ids,
+        &component_ids,
     );
-    assert_fixture_model_resident_prefix_runner(&runner, &pedal_ids, 242, 818, 0);
+    assert_fixture_model_resident_prefix_runner(&runner, &component_ids, 242, 818, 0);
 
     let run = runner
         .run_with_stream_control(&device, fixture_model_stream_control(&mounted, 0))
         .unwrap();
-    assert_fixture_model_resident_prefix_run(&run, &pedal_ids, 242);
+    assert_fixture_model_resident_prefix_run(&run, &component_ids, 242);
 
     let layer_02_kv = mounted
         .buffers
@@ -1233,4 +1231,3 @@ fn resident_pedalboard_runner_executes_full_fixture_model_layer_stack() {
     );
 }
 
-#[test]

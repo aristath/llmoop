@@ -1,4 +1,4 @@
-fn mounted_single_device_stream_circuit_binds_local_cable_buffers() {
+fn mounted_single_device_stream_circuit_binds_local_edge_buffers() {
     let device = match VulkanComputeDevice::new() {
         Ok(device) => device,
         Err(error) => {
@@ -23,10 +23,10 @@ fn mounted_single_device_stream_circuit_binds_local_cable_buffers() {
     )
     .unwrap();
 
-    assert_eq!(resident.hosted_pedal_ids.len(), 14);
-    assert_eq!(resident.local_cables.len(), 13);
-    assert_eq!(resident.incoming_cables.len(), 0);
-    assert_eq!(resident.outgoing_cables.len(), 0);
+    assert_eq!(resident.hosted_component_ids.len(), 14);
+    assert_eq!(resident.local_edges.len(), 13);
+    assert_eq!(resident.incoming_edges.len(), 0);
+    assert_eq!(resident.outgoing_edges.len(), 0);
 
     let placed_plan =
         VulkanPlacedStreamCircuitPlan::from_plans(&execution_plan, &resource_plan, resident)
@@ -104,37 +104,37 @@ fn mounted_single_device_stream_circuit_binds_local_cable_buffers() {
     assert_eq!(mounted.boundary_io.plan.total_byte_capacity, Some(4_096));
     assert_eq!(mounted.boundary_io.total_byte_capacity, 4_096);
     let model_input = mounted.boundary_io.input_buffer("input_frame").unwrap();
-    assert_eq!(model_input.boundary.pedal_id, "layer_00");
+    assert_eq!(model_input.boundary.component_id, "layer_00");
     assert_eq!(model_input.boundary.port_id, "input_frame");
     assert_eq!(model_input.boundary.shape, vec![1024]);
     assert_eq!(model_input.byte_capacity, 2_048);
     model_input.buffer.write_bytes(&[1, 2, 3, 4]).unwrap();
     assert_eq!(model_input.buffer.read_bytes(4).unwrap(), vec![1, 2, 3, 4]);
     let model_output = mounted.boundary_io.output_buffer("output_frame").unwrap();
-    assert_eq!(model_output.boundary.pedal_id, "layer_13");
+    assert_eq!(model_output.boundary.component_id, "layer_13");
     assert_eq!(model_output.boundary.port_id, "output_frame");
     assert_eq!(model_output.byte_capacity, 2_048);
-    assert_eq!(mounted.cable_io.plan.local_cable_count, 13);
-    assert_eq!(mounted.cable_io.plan.total_endpoint_count, 0);
-    assert_eq!(mounted.cable_io.plan.total_buffer_count, 13);
-    assert_eq!(mounted.cable_io.plan.total_byte_capacity, Some(26_624));
-    assert_eq!(mounted.cable_io.local_buffers.len(), 13);
-    assert_eq!(mounted.cable_io.incoming_buffers.len(), 0);
-    assert_eq!(mounted.cable_io.outgoing_buffers.len(), 0);
-    assert_eq!(mounted.cable_io.total_byte_capacity, 26_624);
-    let first_local_cable = mounted.cable_io.local_cable_buffer(0).unwrap();
-    assert_eq!(first_local_cable.cable.cable_id, "cable_0_local");
-    assert_eq!(first_local_cable.cable.source_pedal_id, "layer_00");
-    assert_eq!(first_local_cable.cable.destination_pedal_id, "layer_01");
-    assert_eq!(first_local_cable.cable.byte_capacity, Some(2_048));
-    assert_eq!(first_local_cable.byte_capacity, 2_048);
-    assert_eq!(first_local_cable.buffer.byte_capacity(), 2_048);
-    first_local_cable
+    assert_eq!(mounted.edge_io.plan.local_edge_count, 13);
+    assert_eq!(mounted.edge_io.plan.total_endpoint_count, 0);
+    assert_eq!(mounted.edge_io.plan.total_buffer_count, 13);
+    assert_eq!(mounted.edge_io.plan.total_byte_capacity, Some(26_624));
+    assert_eq!(mounted.edge_io.local_buffers.len(), 13);
+    assert_eq!(mounted.edge_io.incoming_buffers.len(), 0);
+    assert_eq!(mounted.edge_io.outgoing_buffers.len(), 0);
+    assert_eq!(mounted.edge_io.total_byte_capacity, 26_624);
+    let first_local_edge = mounted.edge_io.local_edge_buffer(0).unwrap();
+    assert_eq!(first_local_edge.edge.edge_id, "edge_0_local");
+    assert_eq!(first_local_edge.edge.source_component_id, "layer_00");
+    assert_eq!(first_local_edge.edge.destination_component_id, "layer_01");
+    assert_eq!(first_local_edge.edge.byte_capacity, Some(2_048));
+    assert_eq!(first_local_edge.byte_capacity, 2_048);
+    assert_eq!(first_local_edge.buffer.byte_capacity(), 2_048);
+    first_local_edge
         .buffer
         .write_bytes(&[11, 12, 13, 14])
         .unwrap();
     assert_eq!(
-        first_local_cable.buffer.read_bytes(4).unwrap(),
+        first_local_edge.buffer.read_bytes(4).unwrap(),
         vec![11, 12, 13, 14]
     );
 
@@ -156,9 +156,9 @@ fn mounted_single_device_stream_circuit_binds_local_cable_buffers() {
     assert_eq!(placed_bound.device_id, "gpu0");
     assert_eq!(placed_bound.dispatches.len(), 242);
     assert_eq!(placed_bound.model_boundary_descriptor_count, 3);
-    assert_eq!(placed_bound.local_cable_descriptor_count, 39);
-    assert_eq!(placed_bound.incoming_cable_descriptor_count, 0);
-    assert_eq!(placed_bound.outgoing_cable_descriptor_count, 0);
+    assert_eq!(placed_bound.local_edge_descriptor_count, 39);
+    assert_eq!(placed_bound.incoming_edge_descriptor_count, 0);
+    assert_eq!(placed_bound.outgoing_edge_descriptor_count, 0);
 
     let mounted_bound = mounted
         .mounted_placed_bound_dispatch_plan(&manifest)
@@ -170,10 +170,10 @@ fn mounted_single_device_stream_circuit_binds_local_cable_buffers() {
         placed_bound.total_descriptor_count
     );
     assert_eq!(mounted_bound.model_boundary_descriptor_count, 3);
-    assert_eq!(mounted_bound.local_cable_descriptor_count, 39);
-    assert_eq!(mounted_bound.cable_endpoint_descriptor_count, 0);
-    assert_eq!(mounted_bound.incoming_cable_descriptor_count, 0);
-    assert_eq!(mounted_bound.outgoing_cable_descriptor_count, 0);
+    assert_eq!(mounted_bound.local_edge_descriptor_count, 39);
+    assert_eq!(mounted_bound.edge_endpoint_descriptor_count, 0);
+    assert_eq!(mounted_bound.incoming_edge_descriptor_count, 0);
+    assert_eq!(mounted_bound.outgoing_edge_descriptor_count, 0);
 
     let tick_plan = mounted.stream_tick_plan(&manifest).unwrap();
     assert_eq!(tick_plan.device_id, "gpu0");
@@ -182,10 +182,10 @@ fn mounted_single_device_stream_circuit_binds_local_cable_buffers() {
     assert_eq!(tick_plan.receive_stage_count, 0);
     assert_eq!(tick_plan.dispatch_stage_count, 242);
     assert_eq!(tick_plan.publish_stage_count, 0);
-    assert_eq!(tick_plan.local_cable_read_count, 26);
-    assert_eq!(tick_plan.local_cable_write_count, 13);
-    assert_eq!(tick_plan.incoming_cable_read_count, 0);
-    assert_eq!(tick_plan.outgoing_cable_write_count, 0);
+    assert_eq!(tick_plan.local_edge_read_count, 26);
+    assert_eq!(tick_plan.local_edge_write_count, 13);
+    assert_eq!(tick_plan.incoming_edge_read_count, 0);
+    assert_eq!(tick_plan.outgoing_edge_write_count, 0);
     assert_eq!(tick_plan.model_input_read_count, 2);
     assert_eq!(tick_plan.model_output_write_count, 1);
     assert_eq!(
@@ -195,7 +195,7 @@ fn mounted_single_device_stream_circuit_binds_local_cable_buffers() {
             dispatch: VulkanMountedPlacedStreamTickDispatch {
                 dispatch_index: 0,
                 kernel_id: "layer_00.operator_norm".to_string(),
-                pedal_id: "layer_00".to_string(),
+                component_id: "layer_00".to_string(),
                 node_id: "operator_norm".to_string(),
                 op: "rms_norm".to_string(),
                 descriptor_count: mounted_bound
@@ -1827,14 +1827,14 @@ fn mounted_single_device_stream_circuit_binds_local_cable_buffers() {
             .last()
             .unwrap()
             .target,
-        VulkanMountedPlacedBoundDescriptorTarget::LocalCableOutputBuffer {
-            cable: VulkanPlacedLocalCableBufferBinding {
+        VulkanMountedPlacedBoundDescriptorTarget::LocalEdgeOutputBuffer {
+            edge: VulkanPlacedLocalEdgeBufferBinding {
                 buffer_index: 0,
-                cable: mounted
-                    .cable_io
-                    .local_cable_buffer(0)
+                edge: mounted
+                    .edge_io
+                    .local_edge_buffer(0)
                     .unwrap()
-                    .cable
+                    .edge
                     .clone(),
                 byte_capacity: 2_048,
             },
@@ -1846,14 +1846,14 @@ fn mounted_single_device_stream_circuit_binds_local_cable_buffers() {
             .unwrap()
             .descriptors[0]
             .target,
-        VulkanMountedPlacedBoundDescriptorTarget::LocalCableInputBuffer {
-            cable: VulkanPlacedLocalCableBufferBinding {
+        VulkanMountedPlacedBoundDescriptorTarget::LocalEdgeInputBuffer {
+            edge: VulkanPlacedLocalEdgeBufferBinding {
                 buffer_index: 0,
-                cable: mounted
-                    .cable_io
-                    .local_cable_buffer(0)
+                edge: mounted
+                    .edge_io
+                    .local_edge_buffer(0)
                     .unwrap()
-                    .cable
+                    .edge
                     .clone(),
                 byte_capacity: 2_048,
             },
@@ -1865,14 +1865,14 @@ fn mounted_single_device_stream_circuit_binds_local_cable_buffers() {
             .unwrap()
             .descriptors[0]
             .target,
-        VulkanMountedPlacedBoundDescriptorTarget::LocalCableInputBuffer {
-            cable: VulkanPlacedLocalCableBufferBinding {
+        VulkanMountedPlacedBoundDescriptorTarget::LocalEdgeInputBuffer {
+            edge: VulkanPlacedLocalEdgeBufferBinding {
                 buffer_index: 0,
-                cable: mounted
-                    .cable_io
-                    .local_cable_buffer(0)
+                edge: mounted
+                    .edge_io
+                    .local_edge_buffer(0)
                     .unwrap()
-                    .cable
+                    .edge
                     .clone(),
                 byte_capacity: 2_048,
             },
@@ -1894,12 +1894,12 @@ fn mounted_single_device_stream_circuit_binds_local_cable_buffers() {
         VulkanMountedPlacedStreamTickStage::Dispatch { dispatch, .. } => dispatch,
         stage => panic!("expected layer_01 operator_norm dispatch, got {stage:?}"),
     };
-    assert_eq!(layer_01_norm_tick.pedal_id, "layer_01");
+    assert_eq!(layer_01_norm_tick.component_id, "layer_01");
     assert_eq!(layer_01_norm_tick.node_id, "operator_norm");
     assert_eq!(
         layer_01_norm_tick.reads,
-        vec![VulkanMountedPlacedStreamTickIo::LocalCableBuffer {
-            cable_index: 0,
+        vec![VulkanMountedPlacedStreamTickIo::LocalEdgeBuffer {
+            edge_index: 0,
             buffer_index: 0,
             byte_capacity: 2_048,
         }]

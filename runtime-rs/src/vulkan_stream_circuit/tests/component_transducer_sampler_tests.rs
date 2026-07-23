@@ -1,9 +1,9 @@
 #[test]
-fn resident_pedal_runner_executes_layer_00_end_to_end() {
+fn resident_component_runner_executes_layer_00_end_to_end() {
     let device = match VulkanComputeDevice::new() {
         Ok(device) => device,
         Err(error) => {
-            eprintln!("skipping layer_00 resident pedal runner: {error}");
+            eprintln!("skipping layer_00 resident component runner: {error}");
             return;
         }
     };
@@ -11,16 +11,16 @@ fn resident_pedal_runner_executes_layer_00_end_to_end() {
         mount_fixture_model_single_device_stream_circuit(&device);
     let Some(loaded_manifest) = layer_00_level_1_loaded_kernel_pack(&mounted, &mounted_bound)
     else {
-        eprintln!("skipping layer_00 resident pedal runner: no GLSL to SPIR-V compiler found");
+        eprintln!("skipping layer_00 resident component runner: no GLSL to SPIR-V compiler found");
         return;
     };
     load_layer_00_parameters(&mounted, &tensor_index);
     write_layer_00_unit_input_and_zero_state(&mounted);
 
     let runner = mounted
-        .create_resident_pedal_runner(&device, &mounted_bound, "layer_00", &loaded_manifest)
+        .create_resident_component_runner(&device, &mounted_bound, "layer_00", &loaded_manifest)
         .unwrap();
-    assert_eq!(runner.pedal_id, "layer_00");
+    assert_eq!(runner.component_id, "layer_00");
     assert_eq!(runner.dispatch_count(), 16);
     assert_eq!(runner.total_descriptor_count, 52);
     assert_eq!(runner.total_push_constant_byte_count, 0);
@@ -38,7 +38,7 @@ fn resident_pedal_runner_executes_layer_00_end_to_end() {
             },
         )
         .unwrap();
-    assert_eq!(run.pedal_id, "layer_00");
+    assert_eq!(run.component_id, "layer_00");
     assert_eq!(run.dispatch_count(), 16);
     assert_eq!(
         run.node_ids(),
@@ -74,8 +74,6 @@ fn resident_pedal_runner_executes_layer_00_end_to_end() {
         ]
     );
 }
-
-#[test]
 fn resident_input_transducer_feeds_layer_00_from_token_embedding() {
     let device = match VulkanComputeDevice::new() {
         Ok(device) => device,
@@ -201,12 +199,12 @@ fn resident_input_transducer_feeds_layer_00_from_token_embedding() {
     load_layer_00_parameters(&mounted, &tensor_index);
     zero_fixture_model_temporal_memory(&mounted, "layer_00");
     let runner = mounted
-        .create_resident_pedal_runner(&device, &mounted_bound, "layer_00", &loaded_manifest)
+        .create_resident_component_runner(&device, &mounted_bound, "layer_00", &loaded_manifest)
         .unwrap();
     let run = runner
         .run_with_stream_control(&device, fixture_model_stream_control(&mounted, 0))
         .unwrap();
-    assert_eq!(run.pedal_id, "layer_00");
+    assert_eq!(run.component_id, "layer_00");
     assert_eq!(run.dispatch_count(), 16);
 
     let final_residual_dispatch = mounted_bound.dispatch("layer_00", "ffn_residual").unwrap();
@@ -370,7 +368,7 @@ fn resident_greedy_sampler_selects_largest_logit() {
         },
     )
     .unwrap();
-    assert_eq!(runner.sampler_id, FIXTURE_MODEL_GREEDY_SAMPLER_PEDAL_ID);
+    assert_eq!(runner.sampler_id, FIXTURE_MODEL_GREEDY_SAMPLER_COMPONENT_ID);
     assert_eq!(runner.logits_byte_capacity, FIXTURE_MODEL_LOGITS_BYTES);
     assert_eq!(
         runner.output_byte_capacity,
@@ -381,7 +379,7 @@ fn resident_greedy_sampler_selects_largest_logit() {
     assert_eq!(runner.push_constant_byte_count, 0);
 
     let run = runner.run(&device).unwrap();
-    assert_eq!(run.sampler_id, FIXTURE_MODEL_GREEDY_SAMPLER_PEDAL_ID);
+    assert_eq!(run.sampler_id, FIXTURE_MODEL_GREEDY_SAMPLER_COMPONENT_ID);
     assert_eq!(run.token_id, token_1024 as u32);
     assert_eq!(run.selected_logit_bits, 9.25f32.to_bits());
     assert_eq!(run.control_flags, 0);
@@ -981,4 +979,3 @@ fn resident_temperature_top_64_sampler_matches_explicit_random_signal() {
     }
 }
 
-#[test]

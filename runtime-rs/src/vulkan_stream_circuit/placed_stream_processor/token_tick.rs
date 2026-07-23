@@ -11,14 +11,14 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
         VulkanMountedPlacedResidentInProcessStreamTickRun,
         VulkanResidentInProcessPlacedRuntimeError,
     > {
-        let mut transport = VulkanInProcessPlacedCableTransport::new();
+        let mut transport = VulkanInProcessPlacedEdgeTransport::new();
         self.run_stream_tick_in_process_with_transport(device, &mut transport, stream_tick)
     }
 
     pub fn run_stream_tick_in_process_with_transport(
         &self,
         device: &VulkanComputeDevice,
-        transport: &mut VulkanInProcessPlacedCableTransport,
+        transport: &mut VulkanInProcessPlacedEdgeTransport,
         stream_tick: u64,
     ) -> Result<
         VulkanMountedPlacedResidentInProcessStreamTickRun,
@@ -42,7 +42,7 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
             transport,
             &self.activation_schedule,
             Some(&self.distributed_dispatch_runners),
-            Some(&self.cable_synchronizations),
+            Some(&self.edge_synchronizations),
             VulkanPlacedSubmissionContext::SYNCHRONOUS,
         )
         .map_err(VulkanResidentInProcessPlacedRuntimeError::Tick)
@@ -56,7 +56,7 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
         VulkanMountedPlacedResidentInProcessStreamTickRun,
         VulkanResidentInProcessPlacedRuntimeError,
     > {
-        let mut transport = VulkanInProcessPlacedCableTransport::new();
+        let mut transport = VulkanInProcessPlacedEdgeTransport::new();
         self.run_stream_tick_on_bound_devices_in_process_with_transport(
             devices,
             &mut transport,
@@ -67,7 +67,7 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
     pub fn run_stream_tick_on_bound_devices_in_process_with_transport(
         &self,
         devices: &BTreeMap<String, Rc<VulkanComputeDevice>>,
-        transport: &mut VulkanInProcessPlacedCableTransport,
+        transport: &mut VulkanInProcessPlacedEdgeTransport,
         stream_tick: u64,
     ) -> Result<
         VulkanMountedPlacedResidentInProcessStreamTickRun,
@@ -99,7 +99,7 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
             transport,
             &self.activation_schedule,
             Some(&self.distributed_dispatch_runners),
-            Some(&self.cable_synchronizations),
+            Some(&self.edge_synchronizations),
             VulkanPlacedSubmissionContext::SYNCHRONOUS,
         )
         .map_err(VulkanResidentInProcessPlacedRuntimeError::Tick)
@@ -204,7 +204,7 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
     fn run_prepared_token_tick_slices_deferred<'a>(
         &'a self,
         tick_slices: &mut SmallVec<[VulkanMountedPlacedResidentInProcessStreamTickSlice<'a>; 4]>,
-        transport: &mut VulkanInProcessPlacedCableTransport,
+        transport: &mut VulkanInProcessPlacedEdgeTransport,
         output_device: &VulkanComputeDevice,
     ) -> Result<
         VulkanMountedPlacedResidentInProcessStreamTickRun,
@@ -222,7 +222,7 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
                 transport,
                 &self.activation_schedule,
                 Some(&self.distributed_dispatch_runners),
-                Some(&self.cable_synchronizations),
+                Some(&self.edge_synchronizations),
                 VulkanPlacedSubmissionContext {
                     policy: VulkanPlacedSubmissionPolicy {
                         write_stream_control: true,
@@ -257,7 +257,7 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
     fn execute_prepared_token_id_stream_tick_in_process_with_transport(
         &self,
         device: &VulkanComputeDevice,
-        transport: &mut VulkanInProcessPlacedCableTransport,
+        transport: &mut VulkanInProcessPlacedEdgeTransport,
         stream_tick: u64,
         tail: VulkanResidentPlacedTokenTickTail,
     ) -> Result<
@@ -271,7 +271,7 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
     fn run_prepared_token_id_stream_tick_in_process_with_transport(
         &self,
         device: &VulkanComputeDevice,
-        transport: &mut VulkanInProcessPlacedCableTransport,
+        transport: &mut VulkanInProcessPlacedEdgeTransport,
         input: VulkanResidentPlacedTokenInput,
         stream_tick: u64,
         tail: VulkanResidentPlacedTokenTickTail,
@@ -319,7 +319,7 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
     fn execute_prepared_token_id_stream_tick_on_bound_devices_in_process_with_transport(
         &self,
         devices: &BTreeMap<String, Rc<VulkanComputeDevice>>,
-        transport: &mut VulkanInProcessPlacedCableTransport,
+        transport: &mut VulkanInProcessPlacedEdgeTransport,
         stream_tick: u64,
         tail: VulkanResidentPlacedTokenTickTail,
     ) -> Result<
@@ -343,7 +343,7 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
     fn run_prepared_token_id_stream_tick_on_bound_devices_in_process_with_transport(
         &self,
         devices: &BTreeMap<String, Rc<VulkanComputeDevice>>,
-        transport: &mut VulkanInProcessPlacedCableTransport,
+        transport: &mut VulkanInProcessPlacedEdgeTransport,
         input: VulkanResidentPlacedTokenInput,
         stream_tick: u64,
         tail: VulkanResidentPlacedTokenTickTail,
@@ -398,7 +398,7 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
         VulkanResidentInProcessPlacedSingleTokenTickRun,
         VulkanResidentInProcessPlacedRuntimeError,
     > {
-        let mut transport = VulkanInProcessPlacedCableTransport::new();
+        let mut transport = VulkanInProcessPlacedEdgeTransport::new();
         self.run_token_id_stream_tick_in_process_with_transport(
             device,
             &mut transport,
@@ -410,7 +410,7 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
     pub fn run_token_id_stream_tick_in_process_with_transport(
         &self,
         device: &VulkanComputeDevice,
-        transport: &mut VulkanInProcessPlacedCableTransport,
+        transport: &mut VulkanInProcessPlacedEdgeTransport,
         token_id: u32,
         stream_tick: u64,
     ) -> Result<
@@ -436,7 +436,7 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
         VulkanResidentInProcessPlacedSingleTokenTickRun,
         VulkanResidentInProcessPlacedRuntimeError,
     > {
-        let mut transport = VulkanInProcessPlacedCableTransport::new();
+        let mut transport = VulkanInProcessPlacedEdgeTransport::new();
         self.run_token_id_stream_tick_on_bound_devices_in_process_with_transport(
             devices,
             &mut transport,
@@ -448,7 +448,7 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
     pub fn run_token_id_stream_tick_on_bound_devices_in_process_with_transport(
         &self,
         devices: &BTreeMap<String, Rc<VulkanComputeDevice>>,
-        transport: &mut VulkanInProcessPlacedCableTransport,
+        transport: &mut VulkanInProcessPlacedEdgeTransport,
         token_id: u32,
         stream_tick: u64,
     ) -> Result<
@@ -474,7 +474,7 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
         VulkanResidentInProcessPlacedSingleTokenSampleRun,
         VulkanResidentInProcessPlacedRuntimeError,
     > {
-        let mut transport = VulkanInProcessPlacedCableTransport::new();
+        let mut transport = VulkanInProcessPlacedEdgeTransport::new();
         self.sample_token_id_stream_tick_in_process_with_transport(
             device,
             &mut transport,
@@ -486,7 +486,7 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
     pub fn sample_token_id_stream_tick_in_process_with_transport(
         &self,
         device: &VulkanComputeDevice,
-        transport: &mut VulkanInProcessPlacedCableTransport,
+        transport: &mut VulkanInProcessPlacedEdgeTransport,
         token_id: u32,
         stream_tick: u64,
     ) -> Result<

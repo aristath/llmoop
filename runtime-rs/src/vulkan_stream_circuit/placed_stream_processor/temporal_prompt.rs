@@ -36,12 +36,12 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
             }
             let outgoing = &self.device_slices[current]
                 .mounted
-                .cable_io
+                .edge_io
                 .outgoing_buffers;
             let [outgoing] = outgoing.as_slice() else {
                 return Err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop(
                     VulkanError(format!(
-                        "placed verification pipeline device {:?} has {} outgoing activation cables; expected one",
+                        "placed verification pipeline device {:?} has {} outgoing activation edges; expected one",
                         self.device_slices[current].device_id,
                         outgoing.len()
                     )),
@@ -54,14 +54,14 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
                     slice.device_id == outgoing.endpoint.remote_device_id
                         && slice
                             .mounted
-                            .cable_io
-                            .incoming_buffer(outgoing.endpoint.cable_index)
+                            .edge_io
+                            .incoming_buffer(outgoing.endpoint.edge_index)
                             .is_some()
                 })
                 .ok_or_else(|| {
                     VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(format!(
-                        "placed verification pipeline cable {} has no mounted destination {:?}",
-                        outgoing.endpoint.cable_index, outgoing.endpoint.remote_device_id
+                        "placed verification pipeline edge {} has no mounted destination {:?}",
+                        outgoing.endpoint.edge_index, outgoing.endpoint.remote_device_id
                     )))
                 })?;
         }
@@ -90,7 +90,7 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
         let mut width = available_token_count;
         for slice in &self.device_slices {
             let (_, signal_buffer_plan) =
-                pedal_batch_signal_buffer_plan(&slice.mounted, &slice.mounted_bound.dispatches)?;
+                component_batch_signal_buffer_plan(&slice.mounted, &slice.mounted_bound.dispatches)?;
             let signal_bytes_per_lane =
                 signal_buffer_plan
                     .iter()
@@ -114,7 +114,7 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
                 .batch_kernels
                 .iter()
                 .filter(|artifact| {
-                    artifact.batch_mode == VulkanResidentPedalKernelBatchMode::CausalScan
+                    artifact.batch_mode == VulkanResidentComponentKernelBatchMode::CausalScan
                 })
                 .map(|artifact| artifact.lane_tile_width)
                 .min()
@@ -122,17 +122,17 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
                 width = width.min(causal_scan_tile_width);
             }
 
-            let mut scalar_dispatches_per_lane_by_pedal = BTreeMap::<&str, usize>::new();
+            let mut scalar_dispatches_per_lane_by_component = BTreeMap::<&str, usize>::new();
             for dispatch in &slice.mounted_bound.dispatches {
                 if !slice.package_slice.batch_kernels.iter().any(|artifact| {
-                    artifact.pedal_id == dispatch.pedal_id && artifact.node_id == dispatch.node_id
+                    artifact.component_id == dispatch.component_id && artifact.node_id == dispatch.node_id
                 }) {
-                    *scalar_dispatches_per_lane_by_pedal
-                        .entry(&dispatch.pedal_id)
+                    *scalar_dispatches_per_lane_by_component
+                        .entry(&dispatch.component_id)
                         .or_default() += 1;
                 }
             }
-            let scalar_dispatches_per_lane = scalar_dispatches_per_lane_by_pedal
+            let scalar_dispatches_per_lane = scalar_dispatches_per_lane_by_component
                 .values()
                 .copied()
                 .max()
@@ -155,7 +155,7 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
             .temporal_block_execution
             .borrow()
             .as_ref()
-            .is_some_and(|runner| runner.pedalboard.lane_capacity >= block_width)
+            .is_some_and(|runner| runner.execution_graph.lane_capacity >= block_width)
         {
             return Ok(());
         }
@@ -165,11 +165,11 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
                 "temporal pipeline is empty".to_string(),
             ))
         })?;
-        let pedalboard = VulkanResidentPlacedPedalBatchRunner::new(
+        let execution_graph = VulkanResidentPlacedComponentBatchRunner::new(
             devices,
             &self.device_slices,
             block_width,
-            VulkanPedalBatchExecutionMode::CausalSequence,
+            VulkanComponentBatchExecutionMode::CausalSequence,
             &self.model.distributed_execution_plan,
             &self.model.distributed_parameter_buffers,
         )?;
@@ -189,8 +189,8 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
                     },
                 )
             })?;
-        let input_signal = pedalboard.slice(first_device_index)?.signal_buffer(
-            &VulkanPedalBatchSignalKey::ModelInput(
+        let input_signal = execution_graph.slice(first_device_index)?.signal_buffer(
+            &VulkanComponentBatchSignalKey::ModelInput(
                 self.model.input_transducer_spec.output_signal_id.clone(),
             ),
         )?;
@@ -245,8 +245,8 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
                 device_id: self.model.output_device_id.clone(),
             }
         })?;
-        let output_signal = pedalboard.slice(last_device_index)?.signal_buffer(
-            &VulkanPedalBatchSignalKey::ModelOutput(
+        let output_signal = execution_graph.slice(last_device_index)?.signal_buffer(
+            &VulkanComponentBatchSignalKey::ModelOutput(
                 self.model.output_transducer_spec.input_signal_id.clone(),
             ),
         )?;
@@ -285,7 +285,7 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
             .collect::<Result<Vec<_>, _>>()?;
         *self.temporal_block_execution.borrow_mut() =
             Some(VulkanResidentPlacedTemporalBlockRunner {
-                pedalboard,
+                execution_graph,
                 input_embedding,
                 input_frame_copies,
                 output_frame_copies,
@@ -351,10 +351,10 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
             .record_input_tokens(output_device, input_token_ids)
             .map_err(VulkanResidentInProcessPlacedRuntimeError::Sampler)?;
 
-        let mut transport_stats = VulkanPlacedCableTransportStats::default();
+        let mut transport_stats = VulkanPlacedEdgeTransportStats::default();
         for (pipeline_index, device_index) in runner.pipeline.iter().copied().enumerate() {
             let slice = &self.device_slices[device_index];
-            runner.pedalboard.run_causal_sequence(
+            runner.execution_graph.run_causal_sequence(
                 devices,
                 device_index,
                 &slice.device_id,
@@ -364,19 +364,19 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
                 capacity,
             )?;
             if let Some(next_device_index) = runner.pipeline.get(pipeline_index + 1).copied() {
-                let [outgoing] = slice.mounted.cable_io.outgoing_buffers.as_slice() else {
+                let [outgoing] = slice.mounted.edge_io.outgoing_buffers.as_slice() else {
                     return Err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop(
                         VulkanError(format!(
-                            "temporal pipeline device {:?} has {} outgoing cables; expected one",
+                            "temporal pipeline device {:?} has {} outgoing edges; expected one",
                             slice.device_id,
-                            slice.mounted.cable_io.outgoing_buffers.len()
+                            slice.mounted.edge_io.outgoing_buffers.len()
                         )),
                     ));
                 };
-                runner.pedalboard.transfer_cable(
+                runner.execution_graph.transfer_edge(
                     device_index,
                     next_device_index,
-                    outgoing.endpoint.cable_index,
+                    outgoing.endpoint.edge_index,
                 )?;
                 let transferred_bytes =
                     outgoing.byte_capacity.saturating_mul(input_token_ids.len());
@@ -528,10 +528,10 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
                     "verification state transaction is not mounted".to_string(),
                 ))
             })?;
-            let batch_execution_guard = self.pedal_batch_execution.borrow();
+            let batch_execution_guard = self.component_batch_execution.borrow();
             let batch_execution = batch_execution_guard.as_ref().ok_or_else(|| {
                 VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(
-                    "pedal batch execution is not mounted".to_string(),
+                    "component batch execution is not mounted".to_string(),
                 ))
             })?;
             for (pipeline_index, device_index) in pipeline.iter().copied().enumerate() {
@@ -552,19 +552,19 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
                     capacity,
                 )?;
                 if let Some(next_device_index) = pipeline.get(pipeline_index + 1).copied() {
-                    let [outgoing] = slice.mounted.cable_io.outgoing_buffers.as_slice() else {
+                    let [outgoing] = slice.mounted.edge_io.outgoing_buffers.as_slice() else {
                         return Err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop(
                             VulkanError(format!(
-                                "placed verification device {:?} has {} outgoing cables; expected one",
+                                "placed verification device {:?} has {} outgoing edges; expected one",
                                 slice.device_id,
-                                slice.mounted.cable_io.outgoing_buffers.len()
+                                slice.mounted.edge_io.outgoing_buffers.len()
                             )),
                         ));
                     };
-                    batch_execution.transfer_cable(
+                    batch_execution.transfer_edge(
                         device_index,
                         next_device_index,
-                        outgoing.endpoint.cable_index,
+                        outgoing.endpoint.edge_index,
                     )?;
                 }
             }
@@ -613,12 +613,12 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
                         },
                     )
                 })?;
-            let batch_execution = self.pedal_batch_execution.borrow();
+            let batch_execution = self.component_batch_execution.borrow();
             let raw_output = batch_execution
                 .as_ref()
-                .expect("verification pedal batch was initialized")
+                .expect("verification component batch was initialized")
                 .slice(output_device_index)?
-                .signal_buffer(&VulkanPedalBatchSignalKey::ModelOutput(
+                .signal_buffer(&VulkanComponentBatchSignalKey::ModelOutput(
                     self.model.output_transducer_spec.input_signal_id.clone(),
                 ))?;
             let runner = VulkanResidentBatchedOutputProjectionRunner::new(

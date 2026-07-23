@@ -6,7 +6,7 @@ impl App {
         let mut sequence = self.last_valid_sequence.clone();
         if let Some(layer) = sequence.get(index).copied() {
             sequence.insert(index + 1, layer);
-            self.replace_board_from_visual(sequence, Some(index + 1));
+            self.replace_graph_from_visual(sequence, Some(index + 1));
         }
     }
 
@@ -15,12 +15,12 @@ impl App {
             return;
         };
         if self.last_valid_sequence.len() <= 1 {
-            self.status = "A pedalboard must contain at least one pedal".to_string();
+            self.status = "An execution graph must contain at least one node".to_string();
             return;
         }
         let mut sequence = self.last_valid_sequence.clone();
         sequence.remove(index);
-        self.replace_board_from_visual(sequence, Some(index.saturating_sub(1)));
+        self.replace_graph_from_visual(sequence, Some(index.saturating_sub(1)));
     }
 
     fn move_selected(&mut self, delta: i32) {
@@ -34,13 +34,13 @@ impl App {
         let selected_id = self.selected_instance_id.clone();
         let mut sequence = self.last_valid_sequence.clone();
         sequence.swap(index, target);
-        self.replace_board_from_visual(sequence, None);
+        self.replace_graph_from_visual(sequence, None);
         if let Some(selected_id) = selected_id {
             self.select_instance(&selected_id);
         }
     }
 
-    fn replace_board_from_visual(&mut self, sequence: Vec<usize>, select_index: Option<usize>) {
+    fn replace_graph_from_visual(&mut self, sequence: Vec<usize>, select_index: Option<usize>) {
         let Some(editor) = &mut self.editor else {
             return;
         };
@@ -54,7 +54,7 @@ impl App {
                 } else {
                     self.ensure_selection_exists();
                 }
-                self.status = "Board draft updated · not mounted".to_string();
+                self.status = "Graph draft updated · not mounted".to_string();
             }
             Err(error) => self.status = error.to_string(),
         }

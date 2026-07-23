@@ -26,7 +26,7 @@ impl VulkanResidentInProcessPlacedModelPackage {
             .map(Path::to_path_buf)
             .unwrap_or_else(|| PathBuf::from("."));
         let runtime_model = manifest
-            .mount_runtime_patch_controls(None, &BTreeMap::new(), &[], None)
+            .mount_runtime_graph_controls(None, &BTreeMap::new(), &[], None)
             .map_err(VulkanResidentInProcessPlacedRuntimeError::Package)?;
         Self::from_runtime_model_for_devices(
             device,
@@ -90,15 +90,15 @@ impl VulkanResidentInProcessPlacedModelPackage {
         let package_id = runtime_model.package.package_id.clone();
         let (input_processor_id, output_processor_id) = runtime_model
             .circuit_graph
-            .signal_processor_endpoint_pedal_ids()
+            .signal_processor_endpoint_component_ids()
             .map_err(VulkanResidentInProcessPlacedRuntimeError::Package)?;
         let input_device_id = runtime_model
             .placement
-            .device_for_pedal(&input_processor_id)
+            .device_for_component(&input_processor_id)
             .to_string();
         let output_device_id = runtime_model
             .placement
-            .device_for_pedal(&output_processor_id)
+            .device_for_component(&output_processor_id)
             .to_string();
         let capacity = dynamic_state_capacity_activations
             .unwrap_or(runtime_model.package.max_context_activations);
@@ -193,7 +193,7 @@ impl VulkanResidentInProcessPlacedModelPackage {
             .circuit_graph
             .signal_processor_device_ids(&runtime_model.placement);
         let mut device_slice_plans = Vec::with_capacity(device_ids.len());
-        let mut hosted_pedal_count = 0usize;
+        let mut hosted_component_count = 0usize;
 
         for device_id in &device_ids {
             let slice_device = device_for(device_id)?;
@@ -206,12 +206,12 @@ impl VulkanResidentInProcessPlacedModelPackage {
                 capacity,
             )
             .map_err(VulkanResidentInProcessPlacedRuntimeError::Package)?;
-            hosted_pedal_count = hosted_pedal_count
-                .checked_add(package_slice.hosted_pedal_count)
+            hosted_component_count = hosted_component_count
+                .checked_add(package_slice.hosted_component_count)
                 .ok_or_else(|| {
                     VulkanResidentInProcessPlacedRuntimeError::Package(
                         VulkanResidentTokenModelPackageError::new(
-                            "placed package hosted pedal count overflowed",
+                            "placed package hosted component count overflowed",
                         ),
                     )
                 })?;
@@ -234,7 +234,7 @@ impl VulkanResidentInProcessPlacedModelPackage {
             .into_iter()
             .max()
             .unwrap_or(1);
-        let distributed_execution_plan = VulkanDistributedExecutionPlan::for_placed_pedals(
+        let distributed_execution_plan = VulkanDistributedExecutionPlan::for_placed_components(
             &device_ids,
             storage_buffer_offset_alignment,
         )
@@ -362,7 +362,7 @@ impl VulkanResidentInProcessPlacedModelPackage {
             dynamic_state_capacity_activations: capacity,
             device_count: device_ids.len(),
             device_ids,
-            hosted_pedal_count,
+            hosted_component_count,
             transducer_parameter_count,
             transducer_parameter_bytes,
             input_transducer_parameter_buffers,
@@ -514,13 +514,13 @@ impl VulkanResidentInProcessPlacedModelPackage {
         .map_err(|error| {
             VulkanResidentInProcessPlacedRuntimeError::Package(
                 VulkanResidentTokenModelPackageError::new(format!(
-                    "failed to allocate distributed Vulkan activation cables: {error}"
+                    "failed to allocate distributed Vulkan activation edges: {error}"
                 )),
             )
         })?;
         let VulkanPlacedDeviceLinks {
-            endpoint_overrides: shared_cable_endpoint_overrides,
-            synchronizations: cable_synchronizations,
+            endpoint_overrides: shared_edge_endpoint_overrides,
+            synchronizations: edge_synchronizations,
             stream_control_buffers,
         } = create_placed_device_links(&self.device_slices, &device_for)?;
         let mut devices = Vec::with_capacity(self.device_slices.len());
@@ -532,7 +532,7 @@ impl VulkanResidentInProcessPlacedModelPackage {
                 .create_mounted_stream_circuit_with_buffer_overrides(
                     device,
                     &activation_overrides,
-                    shared_cable_endpoint_overrides
+                    shared_edge_endpoint_overrides
                         .get(&package_slice.device_id)
                         .map(Vec::as_slice)
                         .unwrap_or_default(),
@@ -574,9 +574,9 @@ impl VulkanResidentInProcessPlacedModelPackage {
                 .map_err(VulkanResidentInProcessPlacedRuntimeError::ResidentDispatch)?;
             devices.push(VulkanResidentInProcessPlacedStreamProcessorDevice {
                 device_id: package_slice.device_id.clone(),
-                hosted_pedal_count: package_slice.hosted_pedal_count,
-                incoming_cable_count: package_slice.incoming_cable_count,
-                outgoing_cable_count: package_slice.outgoing_cable_count,
+                hosted_component_count: package_slice.hosted_component_count,
+                incoming_edge_count: package_slice.incoming_edge_count,
+                outgoing_edge_count: package_slice.outgoing_edge_count,
                 dispatch_count: mounted_bound.dispatches.len(),
                 package_slice: package_slice.clone(),
                 mounted,
@@ -706,7 +706,7 @@ impl VulkanResidentInProcessPlacedModelPackage {
             model: self.clone(),
             distributed_dispatch_runners,
             _distributed_activation_buffers: distributed_activation_buffers,
-            cable_synchronizations,
+            edge_synchronizations,
             input_transducer,
             output_transducer,
             sampler,
@@ -716,7 +716,7 @@ impl VulkanResidentInProcessPlacedModelPackage {
             device_slices: devices,
             speculative_decoders,
             verification_state_transactions: RefCell::new(None),
-            pedal_batch_execution: RefCell::new(None),
+            component_batch_execution: RefCell::new(None),
             verification_input_embedding: RefCell::new(None),
             temporal_block_execution: RefCell::new(None),
             batched_output_projection: RefCell::new(None),

@@ -1,38 +1,38 @@
-    fn placement_plan_keeps_every_stream_entity_as_a_deployable_pedal() {
+    fn placement_plan_keeps_every_stream_entity_as_a_deployable_component() {
         let resolved =
-            ResolvedLoweredPedalboard::from_index_file(fixture_model_index_path()).unwrap();
+            ResolvedLoweredExecutionGraph::from_index_file(fixture_model_index_path()).unwrap();
 
         let placement = resolved.single_device_placement_plan("gpu0").unwrap();
 
         assert_eq!(placement.schema, STREAM_CIRCUIT_PLACEMENT_SCHEMA);
-        assert_eq!(placement.wiring, "explicit_graph");
-        assert_eq!(placement.pedals.len(), 17);
-        assert_eq!(placement.cables.len(), 17);
-        assert_eq!(placement.local_cable_count, 17);
-        assert_eq!(placement.cross_device_cable_count, 0);
+        assert_eq!(placement.topology, "explicit_graph");
+        assert_eq!(placement.components.len(), 17);
+        assert_eq!(placement.edges.len(), 17);
+        assert_eq!(placement.local_edge_count, 17);
+        assert_eq!(placement.cross_device_edge_count, 0);
         assert_eq!(
-            placement.pedal("layer_00").unwrap(),
-            &PedalPlacement {
-                pedal_index: 1,
-                pedal_id: "layer_00".to_string(),
+            placement.component("layer_00").unwrap(),
+            &ComponentPlacement {
+                component_index: 1,
+                component_id: "layer_00".to_string(),
                 circuit_id: "layer_00_shortconv_circuit_v1".to_string(),
                 operator_type: "conv".to_string(),
                 device_id: "gpu0".to_string(),
             }
         );
 
-        let first_cable = &placement.cables[0];
-        assert_eq!(first_cable.source_pedal_id, "input_transducer");
-        assert_eq!(first_cable.destination_pedal_id, "layer_00");
-        assert_eq!(first_cable.signal, "frame");
-        assert_eq!(first_cable.shape, vec![1024]);
-        assert_eq!(first_cable.source_port_id, "output_frame");
-        assert_eq!(first_cable.destination_port_id, "input_frame");
-        assert_eq!(first_cable.source_pedal_port.as_deref(), Some("frame"));
-        assert_eq!(first_cable.destination_pedal_port.as_deref(), Some("input"));
+        let first_edge = &placement.edges[0];
+        assert_eq!(first_edge.source_component_id, "input_transducer");
+        assert_eq!(first_edge.destination_component_id, "layer_00");
+        assert_eq!(first_edge.signal, "frame");
+        assert_eq!(first_edge.shape, vec![1024]);
+        assert_eq!(first_edge.source_port_id, "output_frame");
+        assert_eq!(first_edge.destination_port_id, "input_frame");
+        assert_eq!(first_edge.source_component_port.as_deref(), Some("frame"));
+        assert_eq!(first_edge.destination_component_port.as_deref(), Some("input"));
         assert_eq!(
-            first_cable.transport,
-            CableTransport::LocalBuffer {
+            first_edge.transport,
+            EdgeTransport::LocalBuffer {
                 device_id: "gpu0".to_string(),
             }
         );
@@ -41,82 +41,82 @@
     #[test]
     fn bypassed_instance_is_retained_in_draft_and_removed_from_execution_graph() {
         let source =
-            ResolvedLoweredPedalboard::from_index_file(fixture_model_index_path()).unwrap();
-        let patch = StreamCircuitRuntimePatch::from_source_series(&source, "gpu0")
+            ResolvedLoweredExecutionGraph::from_index_file(fixture_model_index_path()).unwrap();
+        let runtime_graph = StreamCircuitRuntimeGraph::from_source_series(&source, "gpu0")
             .unwrap()
             .with_instance_enabled("layer_01", false)
             .unwrap();
 
-        let effective = source.instantiate_runtime_patch(&patch).unwrap();
-        let placement = effective.placement_plan(&patch.placement_spec()).unwrap();
+        let effective = source.instantiate_runtime_graph(&runtime_graph).unwrap();
+        let placement = effective.placement_plan(&runtime_graph.placement_spec()).unwrap();
 
-        assert_eq!(patch.instances.len(), 17);
-        assert!(!patch.instances[2].enabled);
+        assert_eq!(runtime_graph.instances.len(), 17);
+        assert!(!runtime_graph.instances[2].enabled);
         assert_eq!(effective.circuits.len(), 16);
         assert!(
             effective
                 .circuits
                 .iter()
-                .all(|circuit| circuit.pedal.id != "layer_01")
+                .all(|circuit| circuit.component.id != "layer_01")
         );
         let bypass = placement
-            .cables
+            .edges
             .iter()
-            .find(|cable| cable.source_pedal_id == "layer_00")
+            .find(|edge| edge.source_component_id == "layer_00")
             .unwrap();
-        assert_eq!(bypass.destination_pedal_id, "layer_02");
+        assert_eq!(bypass.destination_component_id, "layer_02");
     }
 
     #[test]
-    fn placement_plan_changes_cables_not_pedalboard_when_devices_differ() {
+    fn placement_plan_changes_edges_not_execution_graph_when_devices_differ() {
         let resolved =
-            ResolvedLoweredPedalboard::from_index_file(fixture_model_index_path()).unwrap();
+            ResolvedLoweredExecutionGraph::from_index_file(fixture_model_index_path()).unwrap();
         let spec = StreamCircuitPlacementSpec::new("gpu0")
-            .with_pedal_device("layer_01", "cpu0")
-            .with_pedal_device("layer_02", "gpu1")
-            .with_pedal_device("layer_03", "lan:worker-a");
+            .with_component_device("layer_01", "cpu0")
+            .with_component_device("layer_02", "gpu1")
+            .with_component_device("layer_03", "lan:worker-a");
 
         let placement = resolved.placement_plan(&spec).unwrap();
 
-        assert_eq!(placement.pedals.len(), 17);
-        assert_eq!(placement.cables.len(), 17);
-        assert_eq!(placement.local_cable_count, 13);
-        assert_eq!(placement.cross_device_cable_count, 4);
+        assert_eq!(placement.components.len(), 17);
+        assert_eq!(placement.edges.len(), 17);
+        assert_eq!(placement.local_edge_count, 13);
+        assert_eq!(placement.cross_device_edge_count, 4);
         assert_eq!(
             placement
-                .pedal("layer_01")
-                .map(|pedal| pedal.device_id.as_str()),
+                .component("layer_01")
+                .map(|component| component.device_id.as_str()),
             Some("cpu0")
         );
         assert_eq!(
             placement
-                .pedal("layer_02")
-                .map(|pedal| pedal.device_id.as_str()),
+                .component("layer_02")
+                .map(|component| component.device_id.as_str()),
             Some("gpu1")
         );
         assert_eq!(
             placement
-                .pedal("layer_03")
-                .map(|pedal| pedal.device_id.as_str()),
+                .component("layer_03")
+                .map(|component| component.device_id.as_str()),
             Some("lan:worker-a")
         );
         assert_eq!(
             placement
-                .pedal("layer_04")
-                .map(|pedal| pedal.device_id.as_str()),
+                .component("layer_04")
+                .map(|component| component.device_id.as_str()),
             Some("gpu0")
         );
 
-        let cross = placement.cross_device_cables();
+        let cross = placement.cross_device_edges();
         assert_eq!(cross.len(), 4);
         assert_eq!(
             cross
                 .iter()
-                .map(|cable| (
-                    cable.source_pedal_id.as_str(),
-                    cable.source_device_id.as_str(),
-                    cable.destination_pedal_id.as_str(),
-                    cable.destination_device_id.as_str()
+                .map(|edge| (
+                    edge.source_component_id.as_str(),
+                    edge.source_device_id.as_str(),
+                    edge.destination_component_id.as_str(),
+                    edge.destination_device_id.as_str()
                 ))
                 .collect::<Vec<_>>(),
             vec![
@@ -128,7 +128,7 @@
         );
         assert_eq!(
             cross[2].transport,
-            CableTransport::CrossDevice {
+            EdgeTransport::CrossDevice {
                 from_device_id: "gpu1".to_string(),
                 to_device_id: "lan:worker-a".to_string(),
             }
@@ -136,45 +136,45 @@
     }
 
     #[test]
-    fn runtime_cable_routes_classify_logical_and_physical_routes() {
+    fn runtime_edge_routes_classify_logical_and_physical_routes() {
         let resolved =
-            ResolvedLoweredPedalboard::from_index_file(fixture_model_index_path()).unwrap();
+            ResolvedLoweredExecutionGraph::from_index_file(fixture_model_index_path()).unwrap();
         let spec = StreamCircuitPlacementSpec::new("gpu0")
-            .with_pedal_device("layer_01", "gpu1")
-            .with_pedal_device("layer_02", "gpu2");
+            .with_component_device("layer_01", "gpu1")
+            .with_component_device("layer_02", "gpu2");
         let placement = resolved.placement_plan(&spec).unwrap();
 
-        let routes = placement.runtime_cable_routes(|device_id| {
+        let routes = placement.runtime_edge_routes(|device_id| {
             let (target, physical_device_index) = match device_id {
                 "gpu0" | "gpu1" => (Some("vulkan:0".to_string()), Some(0)),
                 "gpu2" => (Some("vulkan:1".to_string()), Some(1)),
                 _ => (None, None),
             };
-            RuntimeCableRouteTarget {
+            RuntimeEdgeRouteTarget {
                 target,
                 physical_device_index,
                 binding_source: "test".to_string(),
             }
         });
 
-        assert_eq!(routes.schema, RUNTIME_CABLE_ROUTES_SCHEMA);
-        assert_eq!(routes.cable_count, 17);
-        assert_eq!(routes.logical_local_cable_count, 14);
-        assert_eq!(routes.logical_cross_device_cable_count, 3);
-        assert_eq!(routes.same_physical_target_cable_count, 1);
-        assert_eq!(routes.cross_physical_target_cable_count, 2);
-        assert_eq!(routes.unresolved_target_cable_count, 0);
+        assert_eq!(routes.schema, RUNTIME_EDGE_ROUTES_SCHEMA);
+        assert_eq!(routes.edge_count, 17);
+        assert_eq!(routes.logical_local_edge_count, 14);
+        assert_eq!(routes.logical_cross_device_edge_count, 3);
+        assert_eq!(routes.same_physical_target_edge_count, 1);
+        assert_eq!(routes.cross_physical_target_edge_count, 2);
+        assert_eq!(routes.unresolved_target_edge_count, 0);
         assert_eq!(
             routes.routes[1].route_kind,
-            RuntimeCableRouteKind::SamePhysicalTarget
+            RuntimeEdgeRouteKind::SamePhysicalTarget
         );
         assert_eq!(
             routes.routes[2].route_kind,
-            RuntimeCableRouteKind::CrossPhysicalTarget
+            RuntimeEdgeRouteKind::CrossPhysicalTarget
         );
         assert_eq!(
             routes.routes[0].route_kind,
-            RuntimeCableRouteKind::LogicalLocal
+            RuntimeEdgeRouteKind::LogicalLocal
         );
 
         let payload = serde_json::to_value(&routes).unwrap();

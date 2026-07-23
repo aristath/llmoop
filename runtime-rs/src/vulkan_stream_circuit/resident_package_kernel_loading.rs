@@ -54,17 +54,17 @@ fn resident_package_loaded_kernel_manifest_for_slice_plans(
     })
 }
 
-fn resident_package_pedal_kernel_shader_refs(
-    pedal_executions: &[VulkanResidentPedalExecutionSpec],
-) -> Vec<VulkanResidentPedalKernelShaderRef> {
-    pedal_executions
+fn resident_package_component_kernel_shader_refs(
+    component_executions: &[VulkanResidentComponentExecutionSpec],
+) -> Vec<VulkanResidentComponentKernelShaderRef> {
+    component_executions
         .iter()
-        .flat_map(|pedal| {
-            pedal
+        .flat_map(|component| {
+            component
                 .kernels
                 .iter()
-                .map(|kernel| VulkanResidentPedalKernelShaderRef {
-                    pedal_id: pedal.pedal_id.clone(),
+                .map(|kernel| VulkanResidentComponentKernelShaderRef {
+                    component_id: component.component_id.clone(),
                     node_id: kernel.node_id.clone(),
                     shader_path: kernel.shader_path.clone(),
                     local_size_x: kernel.local_size_x,
@@ -74,15 +74,15 @@ fn resident_package_pedal_kernel_shader_refs(
         .collect()
 }
 
-fn resident_package_pedal_kernel_shader_refs_for_prepared_dispatches(
-    pedal_executions: &[VulkanResidentPedalExecutionSpec],
+fn resident_package_component_kernel_shader_refs_for_prepared_dispatches(
+    component_executions: &[VulkanResidentComponentExecutionSpec],
     prepared_plan: &VulkanPreparedDispatchPlan,
-) -> Vec<VulkanResidentPedalKernelShaderRef> {
-    resident_package_pedal_kernel_shader_refs(pedal_executions)
+) -> Vec<VulkanResidentComponentKernelShaderRef> {
+    resident_package_component_kernel_shader_refs(component_executions)
         .into_iter()
         .filter(|shader| {
             prepared_plan
-                .dispatch(&shader.pedal_id, &shader.node_id)
+                .dispatch(&shader.component_id, &shader.node_id)
                 .is_some()
         })
         .collect()
@@ -92,7 +92,7 @@ fn loaded_kernel_pack_from_package_shader_refs(
     manifest_dir: &Path,
     placed_plan: &VulkanPlacedStreamCircuitPlan,
     prepared_plan: &VulkanPreparedDispatchPlan,
-    dispatch_shaders: &[VulkanResidentPedalKernelShaderRef],
+    dispatch_shaders: &[VulkanResidentComponentKernelShaderRef],
 ) -> Result<VulkanLoadedReusableKernelArtifactManifest, VulkanResidentTokenModelPackageError> {
     let mut loaded_artifacts = Vec::new();
     let mut loaded_families = BTreeSet::new();
@@ -100,11 +100,11 @@ fn loaded_kernel_pack_from_package_shader_refs(
 
     for shader in dispatch_shaders {
         let dispatch = prepared_plan
-            .dispatch(&shader.pedal_id, &shader.node_id)
+            .dispatch(&shader.component_id, &shader.node_id)
             .ok_or_else(|| {
                 VulkanResidentTokenModelPackageError::new(format!(
                     "mounted dispatch {}.{} declared by resident model package is missing",
-                    shader.pedal_id, shader.node_id
+                    shader.component_id, shader.node_id
                 ))
             })?;
         if !loaded_families.insert(dispatch.reusable_family_id.clone()) {
@@ -125,7 +125,7 @@ fn loaded_kernel_pack_from_package_shader_refs(
             .ok_or_else(|| {
                 VulkanResidentTokenModelPackageError::new(format!(
                     "reusable kernel family {:?} declared by mounted dispatch {}.{} is missing",
-                    dispatch.reusable_family_id, shader.pedal_id, shader.node_id
+                    dispatch.reusable_family_id, shader.component_id, shader.node_id
                 ))
             })?;
         loaded_artifacts.push(VulkanLoadedReusableKernelArtifact {
@@ -166,21 +166,21 @@ fn loaded_kernel_pack_from_package_shader_refs(
     })
 }
 
-fn load_resident_pedal_batch_kernels(
+fn load_resident_component_batch_kernels(
     device: &VulkanComputeDevice,
     manifest_dir: &Path,
-    pedal_executions: &[VulkanResidentPedalExecutionSpec],
+    component_executions: &[VulkanResidentComponentExecutionSpec],
     prepared_plan: &VulkanPreparedDispatchPlan,
-) -> Result<Vec<VulkanResidentPedalBatchKernelArtifact>, VulkanResidentTokenModelPackageError> {
+) -> Result<Vec<VulkanResidentComponentBatchKernelArtifact>, VulkanResidentTokenModelPackageError> {
     let mut artifacts = Vec::new();
-    for pedal in pedal_executions {
-        for kernel in &pedal.kernels {
+    for component in component_executions {
+        for kernel in &component.kernels {
             if !matches!(
                 kernel.batch_mode,
-                VulkanResidentPedalKernelBatchMode::WeightShared
-                    | VulkanResidentPedalKernelBatchMode::CausalScan
+                VulkanResidentComponentKernelBatchMode::WeightShared
+                    | VulkanResidentComponentKernelBatchMode::CausalScan
             ) || prepared_plan
-                .dispatch(&pedal.pedal_id, &kernel.node_id)
+                .dispatch(&component.component_id, &kernel.node_id)
                 .is_none()
             {
                 continue;
@@ -192,15 +192,15 @@ fn load_resident_pedal_batch_kernels(
                 .collect::<Vec<_>>();
             if supported.is_empty() {
                 return Err(VulkanResidentTokenModelPackageError::new(format!(
-                    "pedal kernel {}.{} has no batch implementation compatible with Vulkan device {:?}",
-                    pedal.pedal_id,
+                    "component kernel {}.{} has no batch implementation compatible with Vulkan device {:?}",
+                    component.component_id,
                     kernel.node_id,
                     device.device_name(),
                 )));
             }
             for implementation in supported {
-                artifacts.push(VulkanResidentPedalBatchKernelArtifact {
-                    pedal_id: pedal.pedal_id.clone(),
+                artifacts.push(VulkanResidentComponentBatchKernelArtifact {
+                    component_id: component.component_id.clone(),
                     node_id: kernel.node_id.clone(),
                     execution_domain: implementation.execution_domain,
                     batch_mode: kernel.batch_mode,
@@ -213,7 +213,7 @@ fn load_resident_pedal_batch_kernels(
                         .stages
                         .iter()
                         .map(|stage| {
-                            Ok(VulkanResidentPedalBatchStageArtifact {
+                            Ok(VulkanResidentComponentBatchStageArtifact {
                                 spirv_words: load_required_resident_model_package_shader(
                                     manifest_dir,
                                     &stage.shader_path,
@@ -232,7 +232,7 @@ fn load_resident_pedal_batch_kernels(
 
 fn batch_implementation_is_supported(
     device: &VulkanComputeDevice,
-    implementation: &VulkanResidentPedalBatchImplementationSpec,
+    implementation: &VulkanResidentComponentBatchImplementationSpec,
 ) -> bool {
     batch_device_requirements_are_supported(
         device,
@@ -243,7 +243,7 @@ fn batch_implementation_is_supported(
 
 fn batch_kernel_artifact_is_supported(
     device: &VulkanComputeDevice,
-    artifact: &VulkanResidentPedalBatchKernelArtifact,
+    artifact: &VulkanResidentComponentBatchKernelArtifact,
 ) -> bool {
     batch_device_requirements_are_supported(
         device,

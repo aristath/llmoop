@@ -27,7 +27,7 @@ impl VulkanDistributedParameterExclusionPlan {
             if tensors.is_empty() {
                 return Err(VulkanDistributedPlanError(format!(
                     "distributed dispatch {}.{} has no parameter tensors",
-                    dispatch.pedal_id, dispatch.node_id
+                    dispatch.component_id, dispatch.node_id
                 )));
             }
             if distributed_dispatch_tensors
@@ -36,7 +36,7 @@ impl VulkanDistributedParameterExclusionPlan {
             {
                 return Err(VulkanDistributedPlanError(format!(
                     "distributed execution plan repeats dispatch {}.{} at index {} on {:?}",
-                    dispatch.pedal_id,
+                    dispatch.component_id,
                     dispatch.node_id,
                     dispatch.dispatch_index,
                     dispatch.owner_device_id
@@ -73,7 +73,7 @@ impl VulkanDistributedParameterExclusionPlan {
                     if &parameter_tensors != distributed_tensors {
                         return Err(VulkanDistributedPlanError(format!(
                             "distributed dispatch {}.{} parameter tensors changed between preparation and physical lowering",
-                            dispatch.pedal_id, dispatch.node_id
+                            dispatch.component_id, dispatch.node_id
                         )));
                     }
                     matched_dispatches.insert(key);
@@ -82,7 +82,7 @@ impl VulkanDistributedParameterExclusionPlan {
                 }) {
                     return Err(VulkanDistributedPlanError(format!(
                         "cannot exclude distributed tensor {tensor:?} on {device_id:?}; canonical dispatch {}.{} still uses it",
-                        dispatch.pedal_id, dispatch.node_id
+                        dispatch.component_id, dispatch.node_id
                     )));
                 }
             }
@@ -93,7 +93,7 @@ impl VulkanDistributedParameterExclusionPlan {
         {
             return Err(VulkanDistributedPlanError(format!(
                 "distributed dispatch {}.{} at index {} on {:?} is absent from prepared plans",
-                missing.pedal_id, missing.node_id, missing.dispatch_index, missing.owner_device_id
+                missing.component_id, missing.node_id, missing.dispatch_index, missing.owner_device_id
             )));
         }
 
@@ -179,7 +179,7 @@ pub struct VulkanDistributedDeviceParameterExclusions {
 struct VulkanDistributedDispatchKey {
     owner_device_id: String,
     dispatch_index: usize,
-    pedal_id: String,
+    component_id: String,
     node_id: String,
 }
 
@@ -188,7 +188,7 @@ impl VulkanDistributedDispatchKey {
         Self {
             owner_device_id: dispatch.owner_device_id.clone(),
             dispatch_index: dispatch.dispatch_index,
-            pedal_id: dispatch.pedal_id.clone(),
+            component_id: dispatch.component_id.clone(),
             node_id: dispatch.node_id.clone(),
         }
     }
@@ -197,7 +197,7 @@ impl VulkanDistributedDispatchKey {
         Self {
             owner_device_id: owner_device_id.to_string(),
             dispatch_index: dispatch.dispatch_index,
-            pedal_id: dispatch.pedal_id.clone(),
+            component_id: dispatch.component_id.clone(),
             node_id: dispatch.node_id.clone(),
         }
     }

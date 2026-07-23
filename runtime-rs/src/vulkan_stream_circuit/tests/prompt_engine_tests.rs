@@ -8,7 +8,7 @@ fn placed_prompt_engine_owns_streams_and_submits_input_events() {
         }
     };
     let runtime_model = fixture_model_runtime_model_with_placement(
-        StreamCircuitPlacementSpec::new("gpu0").with_pedal_device("layer_02", "gpu1"),
+        StreamCircuitPlacementSpec::new("gpu0").with_component_device("layer_02", "gpu1"),
     );
     let manifest_path = fixture_model_package_manifest_path();
     let manifest_dir = manifest_path.parent().unwrap();
@@ -100,7 +100,7 @@ fn placed_prompt_engine_single_submit_runs_the_engine_queue() {
         }
     };
     let runtime_model = fixture_model_runtime_model_with_placement(
-        StreamCircuitPlacementSpec::new("gpu0").with_pedal_device("layer_02", "gpu1"),
+        StreamCircuitPlacementSpec::new("gpu0").with_component_device("layer_02", "gpu1"),
     );
     let manifest_path = fixture_model_package_manifest_path();
     let manifest_dir = manifest_path.parent().unwrap();
@@ -195,7 +195,7 @@ fn placed_prompt_engine_runs_queued_streams_until_idle() {
         }
     };
     let runtime_model = fixture_model_runtime_model_with_placement(
-        StreamCircuitPlacementSpec::new("gpu0").with_pedal_device("layer_02", "gpu1"),
+        StreamCircuitPlacementSpec::new("gpu0").with_component_device("layer_02", "gpu1"),
     );
     let manifest_path = fixture_model_package_manifest_path();
     let manifest_dir = manifest_path.parent().unwrap();
@@ -297,7 +297,7 @@ fn placed_prompt_engine_batches_input_events_across_streams() {
         }
     };
     let runtime_model = fixture_model_runtime_model_with_placement(
-        StreamCircuitPlacementSpec::new("gpu0").with_pedal_device("layer_02", "gpu1"),
+        StreamCircuitPlacementSpec::new("gpu0").with_component_device("layer_02", "gpu1"),
     );
     let manifest_path = fixture_model_package_manifest_path();
     let manifest_dir = manifest_path.parent().unwrap();
@@ -382,7 +382,7 @@ fn placed_prompt_engine_preserves_queued_work_at_input_event_budget() {
         }
     };
     let runtime_model = fixture_model_runtime_model_with_placement(
-        StreamCircuitPlacementSpec::new("gpu0").with_pedal_device("layer_02", "gpu1"),
+        StreamCircuitPlacementSpec::new("gpu0").with_component_device("layer_02", "gpu1"),
     );
     let manifest_path = fixture_model_package_manifest_path();
     let manifest_dir = manifest_path.parent().unwrap();
@@ -460,11 +460,11 @@ fn placed_prompt_engine_preserves_queued_work_at_input_event_budget() {
 }
 
 #[test]
-fn placed_model_package_runs_runtime_patched_duplicate_layer() {
+fn placed_model_package_runs_runtime_graphed_duplicate_layer() {
     let device = match VulkanComputeDevice::new() {
         Ok(device) => device,
         Err(error) => {
-            eprintln!("skipping placed model package duplicate layer patch: {error}");
+            eprintln!("skipping placed model package duplicate layer runtime graph: {error}");
             return;
         }
     };
@@ -473,15 +473,15 @@ fn placed_model_package_runs_runtime_patched_duplicate_layer() {
     let manifest_dir = manifest_path.parent().unwrap();
     let source_graph = manifest
         .circuit_graph
-        .to_resolved_lowered_pedalboard(manifest_dir)
+        .to_resolved_lowered_execution_graph(manifest_dir)
         .unwrap();
-    let patch = StreamCircuitRuntimePatch::from_source_series(&source_graph, "gpu0")
+    let runtime_graph = StreamCircuitRuntimeGraph::from_source_series(&source_graph, "gpu0")
         .unwrap()
         .duplicate_after_instance(&source_graph, "layer_05", "layer_05_repeat")
         .unwrap()
         .with_instance_device("layer_05_repeat", "gpu1")
         .unwrap();
-    let runtime_model = manifest.mount_runtime_patch(&patch).unwrap();
+    let runtime_model = manifest.mount_runtime_graph(&runtime_graph).unwrap();
 
     let placed_model = Arc::new(
         VulkanResidentInProcessPlacedModelPackage::from_runtime_model_for_devices(
@@ -497,8 +497,8 @@ fn placed_model_package_runs_runtime_patched_duplicate_layer() {
         .unwrap();
     assert_eq!(placed_model.device_ids, vec!["gpu0", "gpu1"]);
     assert_eq!(placed_model.device_count, 2);
-    assert_eq!(placed_model.hosted_pedal_count, 15);
-    assert_eq!(placed_package.device("gpu1").unwrap().hosted_pedal_count, 1);
+    assert_eq!(placed_model.hosted_component_count, 15);
+    assert_eq!(placed_package.device("gpu1").unwrap().hosted_component_count, 1);
 
     let run = placed_package
         .sample_token_id_stream_tick_in_process(&device, 1, 0)

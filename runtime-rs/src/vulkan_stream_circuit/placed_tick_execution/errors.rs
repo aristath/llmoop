@@ -25,7 +25,7 @@ pub enum VulkanMountedPlacedStreamTickTransportError {
         plan_device_id: String,
         mounted_device_id: String,
     },
-    Transport(VulkanPlacedCableTransportError),
+    Transport(VulkanPlacedEdgeTransportError),
 }
 
 impl Display for VulkanMountedPlacedStreamTickTransportError {

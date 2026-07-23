@@ -4,7 +4,7 @@ pub struct VulkanMountedPlacedResidentStreamTickCursor {
     pub stream_tick: u64,
     pub next_stage_index: usize,
     pub completed_stage_count: usize,
-    pub pedal_runs: Vec<VulkanMountedPlacedResidentPedalRun>,
+    pub component_runs: Vec<VulkanMountedPlacedResidentComponentRun>,
     capture_execution_trace: bool,
     last_blocked: Option<(usize, VulkanMountedPlacedStreamTickBlockReason)>,
 }
@@ -24,7 +24,7 @@ impl VulkanMountedPlacedResidentStreamTickCursor {
             stream_tick,
             next_stage_index: 0,
             completed_stage_count: 0,
-            pedal_runs: Vec::new(),
+            component_runs: Vec::new(),
             capture_execution_trace,
             last_blocked: None,
         }
@@ -34,13 +34,13 @@ impl VulkanMountedPlacedResidentStreamTickCursor {
         self.next_stage_index == self.tick_plan.stages.len()
     }
 
-    pub fn advance_with_resident_pedals_and_in_process_transport(
+    pub fn advance_with_resident_components_and_in_process_transport(
         &mut self,
         device: &VulkanComputeDevice,
         mounted: &VulkanMountedPlacedStreamCircuit,
         mounted_bound_plan: &VulkanMountedPlacedBoundDispatchPlan,
         loaded_manifest: &VulkanLoadedReusableKernelArtifactManifest,
-        transport: &mut VulkanInProcessPlacedCableTransport,
+        transport: &mut VulkanInProcessPlacedEdgeTransport,
     ) -> Result<
         VulkanMountedPlacedResidentStreamTickCursorAdvance,
         VulkanMountedPlacedResidentStreamTickError,
@@ -70,7 +70,7 @@ impl VulkanMountedPlacedResidentStreamTickCursor {
         mounted: &VulkanMountedPlacedStreamCircuit,
         execution_plan: &VulkanMountedPlacedResidentStreamTickExecutionPlan,
         dispatch_extensions: &VulkanMountedPlacedResidentStreamTickDispatchExtensions<'_>,
-        transport: &mut VulkanInProcessPlacedCableTransport,
+        transport: &mut VulkanInProcessPlacedEdgeTransport,
     ) -> Result<
         VulkanMountedPlacedResidentStreamTickCursorAdvance,
         VulkanMountedPlacedResidentStreamTickError,
@@ -108,12 +108,12 @@ impl VulkanMountedPlacedResidentStreamTickCursor {
         while self.next_stage_index < self.tick_plan.stages.len() {
             let stage = &self.tick_plan.stages[self.next_stage_index];
             match stage {
-                VulkanMountedPlacedStreamTickStage::ReceiveCable { cable_index, .. } => {
-                    match transport.receive_incoming_cable(mounted, *cable_index) {
+                VulkanMountedPlacedStreamTickStage::ReceiveEdge { edge_index, .. } => {
+                    match transport.receive_incoming_edge(mounted, *edge_index) {
                         Ok(_) => self.complete_current_stage(),
-                        Err(VulkanPlacedCableTransportError::MissingPacket { .. }) => {
+                        Err(VulkanPlacedEdgeTransportError::MissingPacket { .. }) => {
                             let reason =
-                                VulkanMountedPlacedStreamTickBlockReason::CableReceiveTransportUnavailable;
+                                VulkanMountedPlacedStreamTickBlockReason::EdgeReceiveTransportUnavailable;
                             self.last_blocked = Some((stage.stage_index(), reason));
                             return Ok(self.advance_report(completed_before));
                         }
@@ -146,7 +146,7 @@ impl VulkanMountedPlacedResidentStreamTickCursor {
                                 },
                             )
                         })?;
-                    self.pedal_runs.extend(
+                    self.component_runs.extend(
                         segment
                             .run_with_stream_control(
                                 device,
@@ -174,9 +174,9 @@ impl VulkanMountedPlacedResidentStreamTickCursor {
                         self.complete_current_stage();
                     }
                 }
-                VulkanMountedPlacedStreamTickStage::PublishCable { cable_index, .. } => {
+                VulkanMountedPlacedStreamTickStage::PublishEdge { edge_index, .. } => {
                     transport
-                        .publish_outgoing_cable(mounted, *cable_index)
+                        .publish_outgoing_edge(mounted, *edge_index)
                         .map_err(VulkanMountedPlacedResidentStreamTickError::Transport)?;
                     self.complete_current_stage();
                 }
@@ -333,12 +333,12 @@ impl VulkanMountedPlacedResidentStreamTickCursor {
                 status,
                 can_execute: true,
             },
-            pedalboard_run: if !self.capture_execution_trace || self.pedal_runs.is_empty() {
+            execution_graph_run: if !self.capture_execution_trace || self.component_runs.is_empty() {
                 None
             } else {
-                Some(VulkanMountedPlacedResidentPedalboardRun {
+                Some(VulkanMountedPlacedResidentExecutionGraphRun {
                     device_id: self.tick_plan.device_id.clone(),
-                    pedal_runs: self.pedal_runs.clone(),
+                    component_runs: self.component_runs.clone(),
                 })
             },
         }
@@ -410,7 +410,7 @@ pub struct VulkanMountedPlacedResidentInProcessStreamTickRun {
     pub completed_stage_delta: usize,
     pub completed_slice_count: usize,
     pub pending_slice_count: usize,
-    pub transport_stats: VulkanPlacedCableTransportStats,
+    pub transport_stats: VulkanPlacedEdgeTransportStats,
     pub device_runs: Vec<VulkanMountedPlacedResidentStreamTickRun>,
 }
 
@@ -444,7 +444,7 @@ impl VulkanMountedPlacedResidentInProcessSchedule {
         }
 
         let mut next_stage_indices = vec![0usize; tick_plans.len()];
-        let mut ready_cables = BTreeSet::<VulkanPlacedCablePacketKey>::new();
+        let mut ready_edges = BTreeSet::<VulkanPlacedEdgePacketKey>::new();
         let mut turns = Vec::new();
 
         while tick_plans
@@ -457,28 +457,28 @@ impl VulkanMountedPlacedResidentInProcessSchedule {
                 let completed_before = next_stage_indices[device_index];
                 while next_stage_indices[device_index] < plan.stages.len() {
                     match &plan.stages[next_stage_indices[device_index]] {
-                        VulkanMountedPlacedStreamTickStage::ReceiveCable {
-                            cable_index,
+                        VulkanMountedPlacedStreamTickStage::ReceiveEdge {
+                            edge_index,
                             remote_device_id,
                             ..
                         } => {
-                            let key = VulkanPlacedCablePacketKey {
-                                cable_index: *cable_index,
+                            let key = VulkanPlacedEdgePacketKey {
+                                edge_index: *edge_index,
                                 from_device_id: remote_device_id.clone(),
                                 to_device_id: plan.device_id.clone(),
                             };
-                            if !ready_cables.remove(&key) {
+                            if !ready_edges.remove(&key) {
                                 break;
                             }
                         }
                         VulkanMountedPlacedStreamTickStage::Dispatch { .. } => {}
-                        VulkanMountedPlacedStreamTickStage::PublishCable {
-                            cable_index,
+                        VulkanMountedPlacedStreamTickStage::PublishEdge {
+                            edge_index,
                             remote_device_id,
                             ..
                         } => {
-                            ready_cables.insert(VulkanPlacedCablePacketKey {
-                                cable_index: *cable_index,
+                            ready_edges.insert(VulkanPlacedEdgePacketKey {
+                                edge_index: *edge_index,
                                 from_device_id: plan.device_id.clone(),
                                 to_device_id: remote_device_id.clone(),
                             });
@@ -505,10 +505,10 @@ impl VulkanMountedPlacedResidentInProcessSchedule {
             turns.push(turn);
         }
 
-        if !ready_cables.is_empty() {
+        if !ready_edges.is_empty() {
             return Err(VulkanError(format!(
-                "placed activation topology leaves unconsumed cables {:?}",
-                ready_cables.into_iter().collect::<Vec<_>>()
+                "placed activation topology leaves unconsumed edges {:?}",
+                ready_edges.into_iter().collect::<Vec<_>>()
             )));
         }
 

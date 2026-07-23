@@ -137,14 +137,14 @@ mod tests {
         app.install_editor(editor);
         for (width, height) in [(80, 24), (40, 12)] {
             let rendered = rendered_text(&mut app, width, height);
-            assert!(rendered.contains("SIGNAL BOARD"));
-            assert!(rendered.contains("PEDALBOARD"));
+            assert!(rendered.contains("SIGNAL GRAPH"));
+            assert!(rendered.contains("EXECUTION GRAPH"));
             assert!(rendered.contains("ZERO-BASED"));
         }
     }
 
     #[test]
-    fn model_selector_and_pedal_modal_keep_actions_visible_in_small_terminals() {
+    fn model_selector_and_node_modal_keep_actions_visible_in_small_terminals() {
         let mut app = App::new();
         let rendered = rendered_text(&mut app, 40, 12);
         assert!(rendered.contains("OPEN MODEL"));
@@ -165,10 +165,10 @@ mod tests {
                 "scope": "instance"
             }),
         );
-        let property = super::super::app::PedalPropertyDraft::new(schema, serde_json::json!(4));
-        let mut modal = PedalModalState {
+        let property = super::super::app::NodePropertyDraft::new(schema, serde_json::json!(4));
+        let mut modal = NodeModalState {
             instance_id: "layer_00".to_string(),
-            source: crate::RuntimeEditorSourcePedal {
+            source: crate::RuntimeEditorSourceComponent {
                 source_id: "layer_00".to_string(),
                 layer_index: Some(0),
                 operator_type: "transformer".to_string(),
@@ -190,7 +190,7 @@ mod tests {
             device_index: 0,
             original_device_id: "gpu0".to_string(),
             enabled: true,
-            policy: PedalPolicyKind::Independent,
+            policy: NodePolicyKind::Independent,
             policy_targets: Vec::new(),
             policy_target_index: 0,
             properties: vec![property],
@@ -198,9 +198,9 @@ mod tests {
             error: None,
         };
         modal.focus_row = modal.apply_row();
-        app.overlay = Some(Overlay::Pedal(modal));
+        app.overlay = Some(Overlay::Node(modal));
         let rendered = rendered_text(&mut app, 40, 12);
-        assert!(rendered.contains("LAYER 0"));
+        assert!(rendered.contains("NODE"));
         assert!(rendered.contains("Apply"));
         assert!(rendered.contains("Cancel"));
     }

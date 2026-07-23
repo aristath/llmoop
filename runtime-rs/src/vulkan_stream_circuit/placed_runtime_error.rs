@@ -17,7 +17,7 @@ pub enum VulkanResidentInProcessPlacedRuntimeError {
     InputTransducer(VulkanResidentInputEmbeddingTransducerRunnerError),
     OutputTransducer(VulkanResidentOutputTransducerRunnerError),
     Sampler(VulkanResidentSamplerRunnerError),
-    FeedbackCable(VulkanError),
+    FeedbackEdge(VulkanError),
     BackendLoop(VulkanError),
 }
 
@@ -55,7 +55,7 @@ impl Display for VulkanResidentInProcessPlacedRuntimeError {
             Self::InputTransducer(error) => Display::fmt(error, f),
             Self::OutputTransducer(error) => Display::fmt(error, f),
             Self::Sampler(error) => Display::fmt(error, f),
-            Self::FeedbackCable(error) => Display::fmt(error, f),
+            Self::FeedbackEdge(error) => Display::fmt(error, f),
             Self::BackendLoop(error) => Display::fmt(error, f),
         }
     }

@@ -1,112 +1,112 @@
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum VulkanPlacedCableDirection {
+pub enum VulkanPlacedEdgeDirection {
     Incoming,
     Outgoing,
 }
 
-pub struct VulkanPlacedCableIoBuffers {
-    pub plan: VulkanPlacedCableIoPlan,
-    pub local_buffers: Vec<VulkanPlacedLocalCableBufferAllocation>,
-    pub incoming_buffers: Vec<VulkanPlacedCableBufferAllocation>,
-    pub outgoing_buffers: Vec<VulkanPlacedCableBufferAllocation>,
+pub struct VulkanPlacedEdgeIoBuffers {
+    pub plan: VulkanPlacedEdgeIoPlan,
+    pub local_buffers: Vec<VulkanPlacedLocalEdgeBufferAllocation>,
+    pub incoming_buffers: Vec<VulkanPlacedEdgeBufferAllocation>,
+    pub outgoing_buffers: Vec<VulkanPlacedEdgeBufferAllocation>,
     pub total_byte_capacity: usize,
 }
 
-impl VulkanPlacedCableIoBuffers {
+impl VulkanPlacedEdgeIoBuffers {
     pub fn local_buffer(
         &self,
-        cable_index: usize,
-    ) -> Option<(usize, &VulkanPlacedLocalCableBufferAllocation)> {
+        edge_index: usize,
+    ) -> Option<(usize, &VulkanPlacedLocalEdgeBufferAllocation)> {
         self.local_buffers
             .iter()
             .enumerate()
-            .find(|(_, buffer)| buffer.cable.cable_index == cable_index)
+            .find(|(_, buffer)| buffer.edge.edge_index == edge_index)
     }
 
-    pub fn local_cable_buffer(
+    pub fn local_edge_buffer(
         &self,
-        cable_index: usize,
-    ) -> Option<&VulkanPlacedLocalCableBufferAllocation> {
+        edge_index: usize,
+    ) -> Option<&VulkanPlacedLocalEdgeBufferAllocation> {
         self.local_buffers
             .iter()
-            .find(|buffer| buffer.cable.cable_index == cable_index)
+            .find(|buffer| buffer.edge.edge_index == edge_index)
     }
 
     pub fn buffer(
         &self,
-        direction: VulkanPlacedCableDirection,
-        cable_index: usize,
-    ) -> Option<(usize, &VulkanPlacedCableBufferAllocation)> {
+        direction: VulkanPlacedEdgeDirection,
+        edge_index: usize,
+    ) -> Option<(usize, &VulkanPlacedEdgeBufferAllocation)> {
         match direction {
-            VulkanPlacedCableDirection::Incoming => self
+            VulkanPlacedEdgeDirection::Incoming => self
                 .incoming_buffers
                 .iter()
                 .enumerate()
-                .find(|(_, buffer)| buffer.endpoint.cable_index == cable_index),
-            VulkanPlacedCableDirection::Outgoing => self
+                .find(|(_, buffer)| buffer.endpoint.edge_index == edge_index),
+            VulkanPlacedEdgeDirection::Outgoing => self
                 .outgoing_buffers
                 .iter()
                 .enumerate()
-                .find(|(_, buffer)| buffer.endpoint.cable_index == cable_index),
+                .find(|(_, buffer)| buffer.endpoint.edge_index == edge_index),
         }
     }
 
     pub fn incoming_buffer(
         &self,
-        cable_index: usize,
-    ) -> Option<&VulkanPlacedCableBufferAllocation> {
+        edge_index: usize,
+    ) -> Option<&VulkanPlacedEdgeBufferAllocation> {
         self.incoming_buffers
             .iter()
-            .find(|buffer| buffer.endpoint.cable_index == cable_index)
+            .find(|buffer| buffer.endpoint.edge_index == edge_index)
     }
 
     pub fn outgoing_buffer(
         &self,
-        cable_index: usize,
-    ) -> Option<&VulkanPlacedCableBufferAllocation> {
+        edge_index: usize,
+    ) -> Option<&VulkanPlacedEdgeBufferAllocation> {
         self.outgoing_buffers
             .iter()
-            .find(|buffer| buffer.endpoint.cable_index == cable_index)
+            .find(|buffer| buffer.endpoint.edge_index == edge_index)
     }
 }
 
-pub struct VulkanPlacedLocalCableBufferAllocation {
-    pub cable: VulkanPlacedLocalCable,
+pub struct VulkanPlacedLocalEdgeBufferAllocation {
+    pub edge: VulkanPlacedLocalEdge,
     pub byte_capacity: usize,
     pub buffer: VulkanResidentBuffer,
 }
 
-pub struct VulkanPlacedCableBufferAllocation {
-    pub endpoint: VulkanPlacedCableEndpoint,
+pub struct VulkanPlacedEdgeBufferAllocation {
+    pub endpoint: VulkanPlacedEdgeEndpoint,
     pub byte_capacity: usize,
     pub buffer: Arc<VulkanResidentBuffer>,
 }
 
-pub struct VulkanPlacedCableEndpointBufferOverride {
-    pub direction: VulkanPlacedCableDirection,
-    pub cable_index: usize,
+pub struct VulkanPlacedEdgeEndpointBufferOverride {
+    pub direction: VulkanPlacedEdgeDirection,
+    pub edge_index: usize,
     pub buffer: Arc<VulkanResidentBuffer>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct VulkanPlacedCablePacketKey {
-    pub cable_index: usize,
+pub struct VulkanPlacedEdgePacketKey {
+    pub edge_index: usize,
     pub from_device_id: String,
     pub to_device_id: String,
 }
 
-impl VulkanPlacedCablePacketKey {
-    pub fn from_outgoing_endpoint(endpoint: &VulkanPlacedCableEndpoint) -> Self {
+impl VulkanPlacedEdgePacketKey {
+    pub fn from_outgoing_endpoint(endpoint: &VulkanPlacedEdgeEndpoint) -> Self {
         Self {
-            cable_index: endpoint.cable_index,
+            edge_index: endpoint.edge_index,
             from_device_id: endpoint.local_device_id.clone(),
             to_device_id: endpoint.remote_device_id.clone(),
         }
     }
 
-    pub fn from_incoming_endpoint(endpoint: &VulkanPlacedCableEndpoint) -> Self {
+    pub fn from_incoming_endpoint(endpoint: &VulkanPlacedEdgeEndpoint) -> Self {
         Self {
-            cable_index: endpoint.cable_index,
+            edge_index: endpoint.edge_index,
             from_device_id: endpoint.remote_device_id.clone(),
             to_device_id: endpoint.local_device_id.clone(),
         }
@@ -114,33 +114,33 @@ impl VulkanPlacedCablePacketKey {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct VulkanPlacedCablePacket {
-    pub key: VulkanPlacedCablePacketKey,
+pub struct VulkanPlacedEdgePacket {
+    pub key: VulkanPlacedEdgePacketKey,
     pub signal: String,
-    pub source_pedal_id: String,
-    pub destination_pedal_id: String,
+    pub source_component_id: String,
+    pub destination_component_id: String,
     pub byte_count: usize,
     pub bytes: Vec<u8>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct VulkanPlacedCableTransportReceipt {
-    pub key: VulkanPlacedCablePacketKey,
+pub struct VulkanPlacedEdgeTransportReceipt {
+    pub key: VulkanPlacedEdgePacketKey,
     pub signal: String,
     pub byte_count: usize,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct VulkanPlacedCableTransportReceiveBatch {
-    pub received: Vec<VulkanPlacedCableTransportReceipt>,
-    pub missing_packets: Vec<VulkanPlacedCablePacketKey>,
+pub struct VulkanPlacedEdgeTransportReceiveBatch {
+    pub received: Vec<VulkanPlacedEdgeTransportReceipt>,
+    pub missing_packets: Vec<VulkanPlacedEdgePacketKey>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct VulkanPlacedCableTransportStats {
+pub struct VulkanPlacedEdgeTransportStats {
     pub pending_packet_count: usize,
     pub pending_byte_count: usize,
-    pub pending_direct_cable_count: usize,
+    pub pending_direct_edge_count: usize,
     pub pending_direct_byte_count: usize,
     pub published_packet_count: usize,
     pub published_byte_count: usize,
@@ -152,11 +152,11 @@ pub struct VulkanPlacedCableTransportStats {
     pub direct_receive_byte_count: usize,
 }
 
-impl VulkanPlacedCableTransportStats {
+impl VulkanPlacedEdgeTransportStats {
     fn accumulate(&mut self, tick: &Self) {
         self.pending_packet_count = tick.pending_packet_count;
         self.pending_byte_count = tick.pending_byte_count;
-        self.pending_direct_cable_count = tick.pending_direct_cable_count;
+        self.pending_direct_edge_count = tick.pending_direct_edge_count;
         self.pending_direct_byte_count = tick.pending_direct_byte_count;
         self.published_packet_count = self
             .published_packet_count

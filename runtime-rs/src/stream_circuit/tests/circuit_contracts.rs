@@ -4,7 +4,7 @@
             "schema": STREAM_CIRCUIT_SCHEMA,
             "id": "fixture_circuit",
             "source": {
-                "pedal_id": "fixture_pedal",
+                "component_id": "fixture_component",
                 "source_layer_index": null,
                 "source_operator_type": "fixture"
             },
@@ -16,14 +16,14 @@
                     "id": "input_frame",
                     "signal": "frame",
                     "shape": [8],
-                    "pedal_port": "input"
+                    "component_port": "input"
                 }],
                 "outputs": [{
                     "id": "output_frame",
                     "signal": "frame",
                     "shape": [8],
                     "source": "output_frame",
-                    "pedal_port": "output"
+                    "component_port": "output"
                 }]
             },
             "parameters": {
@@ -69,9 +69,9 @@
 
         let mut malformed = circuit.clone();
         malformed.boundary.inputs[0].shape.clear();
-        malformed.boundary.outputs[0].pedal_port = Some(String::new());
+        malformed.boundary.outputs[0].component_port = Some(String::new());
         let malformed_error = malformed.validate_contract().unwrap_err().to_string();
         assert!(malformed_error.contains("shape must contain positive dimensions"));
-        assert!(malformed_error.contains("must map to a non-empty pedal_port"));
+        assert!(malformed_error.contains("must map to a non-empty component_port"));
     }
 

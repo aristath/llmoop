@@ -13,7 +13,7 @@ fn move_text_cursor(buffer: &mut TextBuffer, motion: CursorMotion, selecting: bo
     }
 }
 
-fn change_pedal_modal(modal: &mut PedalModalState, delta: i32) {
+fn change_node_modal(modal: &mut NodeModalState, delta: i32) {
     match modal.focus_row {
         0 if !modal.device_ids.is_empty() => {
             modal.device_index = cycle_index(modal.device_index, modal.device_ids.len(), delta)
@@ -26,14 +26,14 @@ fn change_pedal_modal(modal: &mut PedalModalState, delta: i32) {
                 3
             };
             let current = match modal.policy {
-                PedalPolicyKind::Independent => 0,
-                PedalPolicyKind::Clone => 1,
-                PedalPolicyKind::Share => 2,
+                NodePolicyKind::Independent => 0,
+                NodePolicyKind::Clone => 1,
+                NodePolicyKind::Share => 2,
             };
             modal.policy = match cycle_index(current, choices, delta) {
-                0 => PedalPolicyKind::Independent,
-                1 => PedalPolicyKind::Clone,
-                _ => PedalPolicyKind::Share,
+                0 => NodePolicyKind::Independent,
+                1 => NodePolicyKind::Clone,
+                _ => NodePolicyKind::Share,
             };
         }
         3 if !modal.policy_targets.is_empty() => {
@@ -41,14 +41,14 @@ fn change_pedal_modal(modal: &mut PedalModalState, delta: i32) {
                 cycle_index(modal.policy_target_index, modal.policy_targets.len(), delta);
         }
         _ => {
-            if let Some(property) = focused_property_mut(modal) {
+            if let Some(property) = focused_node_property_mut(modal) {
                 property.change(delta);
             }
         }
     }
 }
 
-fn focused_property_mut(modal: &mut PedalModalState) -> Option<&mut PedalPropertyDraft> {
+fn focused_node_property_mut(modal: &mut NodeModalState) -> Option<&mut NodePropertyDraft> {
     let index = modal.property_index()?;
     modal.properties.get_mut(index)
 }
@@ -136,8 +136,8 @@ fn compiler_stage_label(kind: &str) -> &str {
         "DiscoveryStarted" => "Discovering source structure",
         "SourceDiscovered" => "Source structure discovered",
         "ValidationStarted" => "Validating source artifacts",
-        "PedalTranspiled" => "Transpiling source pedals",
-        "PedalLoweringStarted" => "Lowering pedal circuits",
+        "ComponentTranspiled" => "Transpiling source components",
+        "ComponentLoweringStarted" => "Lowering component circuits",
         "ArtifactWritingStarted" => "Writing package artifacts",
         "TensorPackagingStarted" => "Packaging tensors",
         "ShaderCompilationStarted" => "Compiling GPU circuits",
@@ -181,7 +181,7 @@ mod tests {
                 "scope": "INSTANCE"
             }),
         );
-        let mut property = PedalPropertyDraft::new(schema, serde_json::json!(4));
+        let mut property = NodePropertyDraft::new(schema, serde_json::json!(4));
         assert!(property.editable());
         assert!(!property.changed());
         assert!(property.error.is_none());
@@ -214,7 +214,7 @@ mod tests {
                 "scope": "instance"
             }),
         );
-        let missing = PedalPropertyDraft::new(missing, Value::Null);
+        let missing = NodePropertyDraft::new(missing, Value::Null);
         assert!(
             missing
                 .error
@@ -276,7 +276,7 @@ mod tests {
     }
 
     #[test]
-    fn loaded_board_visual_actions_keep_one_authoritative_numeric_sequence() {
+    fn loaded_graph_visual_actions_keep_one_authoritative_numeric_sequence() {
         let Some(package) = env::var_os("NERVE_TEST_PACKAGE_DIR") else {
             return;
         };
@@ -301,9 +301,9 @@ mod tests {
                 &app.editor
                     .as_ref()
                     .unwrap()
-                    .source_pedals()
+                    .source_components()
                     .iter()
-                    .filter_map(|pedal| pedal.layer_index)
+                    .filter_map(|component| component.layer_index)
                     .collect()
             )
             .unwrap(),

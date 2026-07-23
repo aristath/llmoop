@@ -22,7 +22,7 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
             VulkanResidentPlacedTokenInput::ResidentFeedback(_) => {
                 Ok(self.input_transducer.completed_run(token_id))
             }
-            VulkanResidentPlacedTokenInput::CableFeedback(_) => {
+            VulkanResidentPlacedTokenInput::EdgeFeedback(_) => {
                 Ok(self.input_transducer.completed_run(token_id))
             }
         }
@@ -50,7 +50,7 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
         (VulkanResidentQueueSubmissionTemplate<'a>, Vec<u64>),
         VulkanResidentInProcessPlacedRuntimeError,
     > {
-        let mut transport = VulkanInProcessPlacedCableTransport::new();
+        let mut transport = VulkanInProcessPlacedEdgeTransport::new();
         let submission_batch = VulkanResidentQueueSubmissionBatch::new();
         let mut output_timeline_values = Vec::with_capacity(tick_count);
         for tick_index in 0..tick_count {
@@ -123,7 +123,7 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
                 &mut transport,
                 &self.activation_schedule,
                 Some(&self.distributed_dispatch_runners),
-                Some(&self.cable_synchronizations),
+                Some(&self.edge_synchronizations),
                 VulkanPlacedSubmissionContext {
                     policy: VulkanPlacedSubmissionPolicy {
                         write_stream_control: false,
@@ -162,7 +162,7 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
         tick_count: usize,
     ) -> Result<Vec<u64>, VulkanResidentInProcessPlacedRuntimeError> {
         // Feedback eligibility requires a completed, bridged traversal of the
-        // same board for every tick. Each feedback edge, remote cable, and
+        // same graph for every tick. Each feedback edge, remote edge, and
         // distributed dispatch therefore advances once per replayed tick, so
         // the mounted queue template can use one uniform timeline offset.
         if let Some(feedback_synchronization) = feedback_synchronization {
@@ -170,7 +170,7 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
                 .advance_replayed_turns(tick_count)
                 .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
         }
-        self.cable_synchronizations
+        self.edge_synchronizations
             .advance_replayed_dependencies(tick_count)
             .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
         self.distributed_dispatch_runners

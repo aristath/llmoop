@@ -33,7 +33,7 @@ fn descriptor_bindings_for_kernel(
             VulkanKernelDescriptorUsage::StateRead,
             state.state_id.clone(),
             VulkanKernelDescriptorResource::State {
-                pedal_id: state.pedal_id.clone(),
+                component_id: state.component_id.clone(),
                 binding: state.clone(),
             },
         );
@@ -44,7 +44,7 @@ fn descriptor_bindings_for_kernel(
             VulkanKernelDescriptorUsage::StateWrite,
             state.state_id.clone(),
             VulkanKernelDescriptorResource::State {
-                pedal_id: state.pedal_id.clone(),
+                component_id: state.component_id.clone(),
                 binding: state.clone(),
             },
         );
@@ -78,11 +78,11 @@ fn push_descriptor_binding(
 fn parameter_binding_index(
     resource_plan: &StreamCircuitResourcePlan,
     resident_plan: &VulkanStreamCircuitResidentPlan,
-    hosted_pedals: Option<&BTreeSet<String>>,
+    hosted_components: Option<&BTreeSet<String>>,
 ) -> Result<BTreeMap<(String, String), VulkanParameterBinding>, VulkanBindingPlanError> {
-    let hosts_pedal = |pedal_id: &str| {
-        hosted_pedals
-            .map(|pedals| pedals.contains(pedal_id))
+    let hosts_component = |component_id: &str| {
+        hosted_components
+            .map(|components| components.contains(component_id))
             .unwrap_or(true)
     };
     let resident_by_tensor: BTreeMap<_, _> = resident_plan
@@ -96,7 +96,7 @@ fn parameter_binding_index(
         let hosted_uses = parameter
             .uses
             .iter()
-            .filter(|use_ref| hosts_pedal(&use_ref.pedal_id))
+            .filter(|use_ref| hosts_component(&use_ref.component_id))
             .collect::<Vec<_>>();
         if hosted_uses.is_empty() {
             continue;
@@ -110,7 +110,7 @@ fn parameter_binding_index(
                 ))
             })?;
         for use_ref in hosted_uses {
-            let key = (use_ref.pedal_id.clone(), use_ref.param_id.clone());
+            let key = (use_ref.component_id.clone(), use_ref.param_id.clone());
             let previous = bindings.insert(
                 key.clone(),
                 VulkanParameterBinding {
@@ -138,11 +138,11 @@ fn state_binding_index(
 ) -> Result<BTreeMap<(String, String), VulkanStateBinding>, VulkanBindingPlanError> {
     let mut bindings = BTreeMap::new();
     for state in &resident_plan.stream_state_buffers {
-        let key = (state.pedal_id.clone(), state.state_id.clone());
+        let key = (state.component_id.clone(), state.state_id.clone());
         let previous = bindings.insert(
             key.clone(),
             VulkanStateBinding {
-                pedal_id: state.pedal_id.clone(),
+                component_id: state.component_id.clone(),
                 state_id: state.state_id.clone(),
                 state_type: state.state_type.clone(),
                 static_bytes: state.static_bytes,
@@ -157,17 +157,17 @@ fn state_binding_index(
         }
     }
 
-    let hosted_pedals = resident_plan
+    let hosted_components = resident_plan
         .activation_banks
         .iter()
-        .map(|bank| bank.pedal_id.as_str())
+        .map(|bank| bank.component_id.as_str())
         .collect::<BTreeSet<_>>();
     let mut aliases = BTreeMap::new();
     for state in &resource_plan.state_allocations {
-        if !hosted_pedals.contains(state.pedal_id.as_str()) {
+        if !hosted_components.contains(state.component_id.as_str()) {
             continue;
         }
-        let target = (state.pedal_id.clone(), state.state_id.clone());
+        let target = (state.component_id.clone(), state.state_id.clone());
         let Some(source) = state
             .sharing
             .as_deref()
@@ -183,7 +183,7 @@ fn state_binding_index(
     let planned = resource_plan
         .state_allocations
         .iter()
-        .map(|state| ((state.pedal_id.as_str(), state.state_id.as_str()), state))
+        .map(|state| ((state.component_id.as_str(), state.state_id.as_str()), state))
         .collect::<BTreeMap<_, _>>();
 
     for (target, initial_source) in &aliases {
@@ -251,17 +251,17 @@ fn shared_state_source(sharing: &str) -> Result<Option<(String, String)>, Vulkan
 }
 
 fn parse_state_source(source: &str) -> Result<(String, String), VulkanBindingPlanError> {
-    let Some((pedal_id, state_id)) = source.rsplit_once('.') else {
+    let Some((component_id, state_id)) = source.rsplit_once('.') else {
         return Err(VulkanBindingPlanError(format!(
-            "shared state source {source:?} must be PEDAL_ID.STATE_ID"
+            "shared state source {source:?} must be COMPONENT_ID.STATE_ID"
         )));
     };
-    if pedal_id.is_empty() || state_id.is_empty() {
+    if component_id.is_empty() || state_id.is_empty() {
         return Err(VulkanBindingPlanError(format!(
-            "shared state source {source:?} must contain non-empty pedal and state ids"
+            "shared state source {source:?} must contain non-empty component and state ids"
         )));
     }
-    Ok((pedal_id.to_string(), state_id.to_string()))
+    Ok((component_id.to_string(), state_id.to_string()))
 }
 
 type VulkanActivationBindingIndex =
@@ -274,7 +274,7 @@ fn activation_binding_index(
     for bank in &resident_plan.activation_banks {
         for slot in &bank.slots {
             for signal_id in &slot.signal_ids {
-                let key = (bank.pedal_id.clone(), signal_id.clone());
+                let key = (bank.component_id.clone(), signal_id.clone());
                 let previous =
                     bindings.insert(key.clone(), (slot.slot, slot.bytes, slot.max_elements));
                 if previous.is_some() {
@@ -310,7 +310,7 @@ fn bind_circuit(
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(VulkanCircuitBindingPlan {
-        pedal_id: circuit.pedal_id.clone(),
+        component_id: circuit.component_id.clone(),
         circuit_id: circuit.circuit_id.clone(),
         input_ports: circuit.input_ports.clone(),
         output_ports: circuit.output_ports.clone(),
@@ -356,12 +356,12 @@ fn bind_node(
         .iter()
         .map(|param_id| {
             parameter_bindings
-                .get(&(circuit.pedal_id.clone(), param_id.clone()))
+                .get(&(circuit.component_id.clone(), param_id.clone()))
                 .cloned()
                 .ok_or_else(|| {
                     VulkanBindingPlanError(format!(
                         "{} node {} parameter {:?} is not bound",
-                        circuit.pedal_id, node.id, param_id
+                        circuit.component_id, node.id, param_id
                     ))
                 })
         })
@@ -392,12 +392,12 @@ fn bind_state_refs(
         .iter()
         .map(|state_id| {
             state_bindings
-                .get(&(circuit.pedal_id.clone(), state_id.clone()))
+                .get(&(circuit.component_id.clone(), state_id.clone()))
                 .cloned()
                 .ok_or_else(|| {
                     VulkanBindingPlanError(format!(
                         "{} node {} state {:?} is not bound",
-                        circuit.pedal_id, node.id, state_id
+                        circuit.component_id, node.id, state_id
                     ))
                 })
         })
@@ -414,7 +414,7 @@ fn bind_signal(
     let signal = circuit.signal(signal_id).ok_or_else(|| {
         VulkanBindingPlanError(format!(
             "{} node {} signal {:?} is not planned",
-            circuit.pedal_id, node.id, signal_id
+            circuit.component_id, node.id, signal_id
         ))
     })?;
 
@@ -425,15 +425,15 @@ fn bind_signal(
             SignalStorage::Boundary => VulkanSignalResource::BoundaryInput,
             SignalStorage::State => {
                 let state = state_bindings
-                    .get(&(circuit.pedal_id.clone(), signal_id.to_string()))
+                    .get(&(circuit.component_id.clone(), signal_id.to_string()))
                     .ok_or_else(|| {
                         VulkanBindingPlanError(format!(
                             "{} signal {:?} has no state buffer binding",
-                            circuit.pedal_id, signal_id
+                            circuit.component_id, signal_id
                         ))
                     })?;
                 VulkanSignalResource::StateBuffer {
-                    pedal_id: state.pedal_id.clone(),
+                    component_id: state.component_id.clone(),
                     state_id: state.state_id.clone(),
                     static_bytes: state.static_bytes,
                     bytes_per_activation: state.bytes_per_activation,
@@ -441,17 +441,17 @@ fn bind_signal(
             }
             SignalStorage::Activation => {
                 let (slot, bytes, max_elements) = activation_bindings
-                    .get(&(circuit.pedal_id.clone(), signal_id.to_string()))
+                    .get(&(circuit.component_id.clone(), signal_id.to_string()))
                     .ok_or_else(|| {
                         VulkanBindingPlanError(format!(
                             "{} signal {:?} has no activation slot binding",
-                            circuit.pedal_id, signal_id
+                            circuit.component_id, signal_id
                         ))
                     })?;
                 let signal_bytes =
                     activation_signal_byte_capacity(circuit, node, signal, *bytes, *max_elements)?;
                 VulkanSignalResource::ActivationSlot {
-                    pedal_id: circuit.pedal_id.clone(),
+                    component_id: circuit.component_id.clone(),
                     slot: *slot,
                     bytes: *bytes,
                     signal_bytes,
@@ -460,15 +460,15 @@ fn bind_signal(
             SignalStorage::StateView => {
                 let state_id = state_view_state_id(circuit, signal_id)?;
                 let state = state_bindings
-                    .get(&(circuit.pedal_id.clone(), state_id.clone()))
+                    .get(&(circuit.component_id.clone(), state_id.clone()))
                     .ok_or_else(|| {
                         VulkanBindingPlanError(format!(
                             "{} state-view signal {:?} has no state buffer binding for {:?}",
-                            circuit.pedal_id, signal_id, state_id
+                            circuit.component_id, signal_id, state_id
                         ))
                     })?;
                 VulkanSignalResource::StateView {
-                    pedal_id: state.pedal_id.clone(),
+                    component_id: state.component_id.clone(),
                     state_id: state.state_id.clone(),
                     static_bytes: state.static_bytes,
                     bytes_per_activation: state.bytes_per_activation,
@@ -502,26 +502,26 @@ fn activation_signal_byte_capacity(
         }
         return Err(VulkanBindingPlanError(format!(
             "{} node {} activation signal {:?} has an invalid zero-element slot of {slot_bytes} bytes",
-            circuit.pedal_id, node.id, signal.id
+            circuit.component_id, node.id, signal.id
         )));
     }
     if slot_bytes % slot_max_elements != 0 {
         return Err(VulkanBindingPlanError(format!(
             "{} node {} activation signal {:?} slot capacity {slot_bytes} is not divisible by {slot_max_elements} elements",
-            circuit.pedal_id, node.id, signal.id
+            circuit.component_id, node.id, signal.id
         )));
     }
     let element_bytes = slot_bytes / slot_max_elements;
     let signal_bytes = signal_elements.checked_mul(element_bytes).ok_or_else(|| {
         VulkanBindingPlanError(format!(
             "{} node {} activation signal {:?} byte capacity overflowed",
-            circuit.pedal_id, node.id, signal.id
+            circuit.component_id, node.id, signal.id
         ))
     })?;
     if signal_bytes > slot_bytes {
         return Err(VulkanBindingPlanError(format!(
             "{} node {} activation signal {:?} requires {signal_bytes} bytes, exceeding slot capacity {slot_bytes}",
-            circuit.pedal_id, node.id, signal.id
+            circuit.component_id, node.id, signal.id
         )));
     }
     Ok(Some(signal_bytes))
@@ -534,13 +534,13 @@ fn state_view_state_id(
     let signal = circuit.signal(signal_id).ok_or_else(|| {
         VulkanBindingPlanError(format!(
             "{} signal {:?} is not planned",
-            circuit.pedal_id, signal_id
+            circuit.component_id, signal_id
         ))
     })?;
     let SignalProducer::Node { node_id } = &signal.producer else {
         return Err(VulkanBindingPlanError(format!(
             "{} state-view signal {:?} is not produced by a node",
-            circuit.pedal_id, signal_id
+            circuit.component_id, signal_id
         )));
     };
     let producer = circuit
@@ -550,7 +550,7 @@ fn state_view_state_id(
         .ok_or_else(|| {
             VulkanBindingPlanError(format!(
                 "{} state-view signal {:?} producer {:?} is not planned",
-                circuit.pedal_id, signal_id, node_id
+                circuit.component_id, signal_id, node_id
             ))
         })?;
     producer
@@ -561,7 +561,7 @@ fn state_view_state_id(
         .ok_or_else(|| {
             VulkanBindingPlanError(format!(
                 "{} state-view signal {:?} producer {:?} does not reference state",
-                circuit.pedal_id, signal_id, node_id
+                circuit.component_id, signal_id, node_id
             ))
         })
 }

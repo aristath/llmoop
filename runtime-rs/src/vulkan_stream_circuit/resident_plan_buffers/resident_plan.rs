@@ -23,7 +23,7 @@ impl VulkanStreamCircuitResidentPlan {
         tensor_index: Option<&TensorIndex>,
         activation_element_bytes: Option<usize>,
     ) -> Result<Self, VulkanResidentPlanError> {
-        Self::from_resource_plan_with_hosted_pedals(
+        Self::from_resource_plan_with_hosted_components(
             resource_plan,
             None,
             tensor_index,
@@ -31,15 +31,15 @@ impl VulkanStreamCircuitResidentPlan {
         )
     }
 
-    fn from_resource_plan_with_hosted_pedals(
+    fn from_resource_plan_with_hosted_components(
         resource_plan: &StreamCircuitResourcePlan,
-        hosted_pedals: Option<&BTreeSet<String>>,
+        hosted_components: Option<&BTreeSet<String>>,
         tensor_index: Option<&TensorIndex>,
         activation_element_bytes: Option<usize>,
     ) -> Result<Self, VulkanResidentPlanError> {
-        let hosts_pedal = |pedal_id: &str| {
-            hosted_pedals
-                .map(|pedals| pedals.contains(pedal_id))
+        let hosts_component = |component_id: &str| {
+            hosted_components
+                .map(|components| components.contains(component_id))
                 .unwrap_or(true)
         };
         let mut permanent_parameters = Vec::with_capacity(resource_plan.parameters.len());
@@ -50,7 +50,7 @@ impl VulkanStreamCircuitResidentPlan {
             let hosted_use_count = parameter
                 .uses
                 .iter()
-                .filter(|use_ref| hosts_pedal(&use_ref.pedal_id))
+                .filter(|use_ref| hosts_component(&use_ref.component_id))
                 .count();
             if hosted_use_count == 0 {
                 continue;
@@ -84,7 +84,7 @@ impl VulkanStreamCircuitResidentPlan {
         let mut per_stream_dynamic_state_bytes_per_activation = Some(0usize);
 
         for state in &resource_plan.state_allocations {
-            if !hosts_pedal(&state.pedal_id) {
+            if !hosts_component(&state.component_id) {
                 continue;
             }
             if state
@@ -133,7 +133,7 @@ impl VulkanStreamCircuitResidentPlan {
             )?;
 
             stream_state_buffers.push(VulkanResidentStateBuffer {
-                pedal_id: state.pedal_id.clone(),
+                component_id: state.component_id.clone(),
                 state_id: state.state_id.clone(),
                 state_type: state.state_type.clone(),
                 layout: state.layout.clone(),
@@ -154,7 +154,7 @@ impl VulkanStreamCircuitResidentPlan {
         let mut unresolved_activation_slots = Vec::new();
 
         for bank in &resource_plan.activation_banks {
-            if !hosts_pedal(&bank.pedal_id) {
+            if !hosts_component(&bank.component_id) {
                 continue;
             }
             let mut slots = Vec::with_capacity(bank.slots.len());
@@ -170,7 +170,7 @@ impl VulkanStreamCircuitResidentPlan {
                     _ => {
                         per_stream_activation_slot_elements = None;
                         unresolved_activation_slots
-                            .push(format!("{}.slot_{}", bank.pedal_id, slot.slot));
+                            .push(format!("{}.slot_{}", bank.component_id, slot.slot));
                     }
                 }
 
@@ -183,7 +183,7 @@ impl VulkanStreamCircuitResidentPlan {
             }
 
             activation_banks.push(VulkanResidentActivationBank {
-                pedal_id: bank.pedal_id.clone(),
+                component_id: bank.component_id.clone(),
                 circuit_id: bank.circuit_id.clone(),
                 slot_count: bank.slot_count,
                 slots,
@@ -192,12 +192,12 @@ impl VulkanStreamCircuitResidentPlan {
         let circuit_count = resource_plan
             .activation_banks
             .iter()
-            .filter(|bank| hosts_pedal(&bank.pedal_id))
+            .filter(|bank| hosts_component(&bank.component_id))
             .count();
         let state_view_signal_count = resource_plan
             .activation_banks
             .iter()
-            .filter(|bank| hosts_pedal(&bank.pedal_id))
+            .filter(|bank| hosts_component(&bank.component_id))
             .map(|bank| bank.state_view_signal_count)
             .sum();
 
@@ -223,10 +223,10 @@ impl VulkanStreamCircuitResidentPlan {
         })
     }
 
-    pub fn activation_bank(&self, pedal_id: &str) -> Option<&VulkanResidentActivationBank> {
+    pub fn activation_bank(&self, component_id: &str) -> Option<&VulkanResidentActivationBank> {
         self.activation_banks
             .iter()
-            .find(|bank| bank.pedal_id == pedal_id)
+            .find(|bank| bank.component_id == component_id)
     }
 
     pub fn allocate_stream_buffers(
@@ -254,29 +254,29 @@ impl VulkanStreamCircuitResidentPlan {
 
         for activation_override in activation_overrides {
             let key = (
-                activation_override.pedal_id.clone(),
+                activation_override.component_id.clone(),
                 activation_override.slot,
             );
             if override_index.insert(key, activation_override).is_some() {
                 return Err(VulkanError(format!(
                     "activation buffer override repeats {}.slot_{}",
-                    activation_override.pedal_id, activation_override.slot
+                    activation_override.component_id, activation_override.slot
                 )));
             }
             if !device.owns_resident_buffer(&activation_override.buffer) {
                 return Err(VulkanError(format!(
                     "activation buffer override {}.slot_{} belongs to a different Vulkan logical device",
-                    activation_override.pedal_id, activation_override.slot
+                    activation_override.component_id, activation_override.slot
                 )));
             }
             if !activation_override.buffer.is_shared_host_backed() {
                 return Err(VulkanError(format!(
                     "activation buffer override {}.slot_{} is not backed by shared host memory",
-                    activation_override.pedal_id, activation_override.slot
+                    activation_override.component_id, activation_override.slot
                 )));
             }
             let slot = self
-                .activation_bank(&activation_override.pedal_id)
+                .activation_bank(&activation_override.component_id)
                 .and_then(|bank| {
                     bank.slots
                         .iter()
@@ -285,19 +285,19 @@ impl VulkanStreamCircuitResidentPlan {
                 .ok_or_else(|| {
                     VulkanError(format!(
                         "activation buffer override {}.slot_{} does not address a resident activation slot",
-                        activation_override.pedal_id, activation_override.slot
+                        activation_override.component_id, activation_override.slot
                     ))
                 })?;
             let required_byte_capacity = slot.bytes.ok_or_else(|| {
                 VulkanError(format!(
                     "{} activation slot {} has unknown byte size",
-                    activation_override.pedal_id, activation_override.slot
+                    activation_override.component_id, activation_override.slot
                 ))
             })?;
             if activation_override.buffer.byte_capacity() < required_byte_capacity {
                 return Err(VulkanError(format!(
                     "activation buffer override {}.slot_{} has {} bytes but requires {required_byte_capacity}",
-                    activation_override.pedal_id,
+                    activation_override.component_id,
                     activation_override.slot,
                     activation_override.buffer.byte_capacity()
                 )));
@@ -313,7 +313,7 @@ impl VulkanStreamCircuitResidentPlan {
                 "stream state buffer allocation",
             )?;
             state_buffers.push(VulkanStreamStateBufferAllocation {
-                pedal_id: state.pedal_id.clone(),
+                component_id: state.component_id.clone(),
                 state_id: state.state_id.clone(),
                 state_type: state.state_type.clone(),
                 byte_capacity,
@@ -329,7 +329,7 @@ impl VulkanStreamCircuitResidentPlan {
                 let byte_capacity = slot.bytes.ok_or_else(|| {
                     VulkanError(format!(
                         "{} activation slot {} has unknown byte size",
-                        bank.pedal_id, slot.slot
+                        bank.component_id, slot.slot
                     ))
                 })?;
                 total_byte_capacity = checked_add_bytes(
@@ -338,7 +338,7 @@ impl VulkanStreamCircuitResidentPlan {
                     "activation slot buffer allocation",
                 )?;
                 let activation_override =
-                    override_index.remove(&(bank.pedal_id.clone(), slot.slot));
+                    override_index.remove(&(bank.component_id.clone(), slot.slot));
                 let (buffer, shared_across_devices) = match activation_override {
                     Some(activation_override) => (Arc::clone(&activation_override.buffer), true),
                     None => (
@@ -347,7 +347,7 @@ impl VulkanStreamCircuitResidentPlan {
                     ),
                 };
                 activation_slot_buffers.push(VulkanActivationSlotBufferAllocation {
-                    pedal_id: bank.pedal_id.clone(),
+                    component_id: bank.component_id.clone(),
                     circuit_id: bank.circuit_id.clone(),
                     slot: slot.slot,
                     signal_ids: slot.signal_ids.clone(),

@@ -1,6 +1,6 @@
 pub struct VulkanResidentStreamProcessor {
     pub device_id: String,
-    pub pedal_count: usize,
+    pub component_count: usize,
     pub per_tick_dispatch_count: usize,
     pub per_tick_descriptor_count: usize,
     pub per_tick_push_constant_byte_count: u32,
@@ -27,7 +27,7 @@ impl VulkanResidentStreamProcessor {
             VulkanResidentStateTransactionBank::new(device, &mounted.buffers, backend_loop_window)?;
         Ok(Self {
             device_id: loop_runner.device_id.clone(),
-            pedal_count: loop_runner.pedal_count,
+            component_count: loop_runner.component_count,
             per_tick_dispatch_count: loop_runner.per_tick_dispatch_count,
             per_tick_descriptor_count: loop_runner.per_tick_descriptor_count,
             per_tick_push_constant_byte_count: loop_runner.per_tick_push_constant_byte_count,

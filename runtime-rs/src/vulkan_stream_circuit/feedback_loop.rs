@@ -1,6 +1,6 @@
 pub struct VulkanResidentFeedbackLoopRunner {
     pub device_id: String,
-    pub pedal_count: usize,
+    pub component_count: usize,
     pub per_tick_dispatch_count: usize,
     pub per_tick_descriptor_count: usize,
     pub per_tick_push_constant_byte_count: u32,
@@ -28,7 +28,7 @@ impl VulkanResidentFeedbackLoopRunner {
 
         Ok(Self {
             device_id: tick_runner.device_id.clone(),
-            pedal_count: tick_runner.pedal_count,
+            component_count: tick_runner.component_count,
             per_tick_dispatch_count,
             per_tick_descriptor_count,
             per_tick_push_constant_byte_count,
@@ -147,8 +147,8 @@ impl VulkanResidentFeedbackLoopRunner {
                     .iter()
                     .map(|dispatch| VulkanResidentKernelSequenceStep::new(dispatch, &[])),
             );
-            for pedal in &self.tick_runner.pedalboard.pedals {
-                for dispatch in &pedal.dispatches {
+            for component in &self.tick_runner.execution_graph.components {
+                for dispatch in &component.dispatches {
                     sequence_steps.push(VulkanResidentKernelSequenceStep::new(
                         &dispatch.resident_dispatch,
                         &[],
@@ -202,7 +202,7 @@ impl VulkanResidentFeedbackLoopRunner {
                     .tick_runner
                     .input_transducer
                     .completed_run(input_token_id),
-                pedalboard_run: self.tick_runner.completed_pedalboard_run.clone(),
+                execution_graph_run: self.tick_runner.completed_execution_graph_run.clone(),
                 output_run: Some(self.tick_runner.completed_output_run.clone()),
                 dispatch_count: self.tick_runner.dispatch_count,
                 total_descriptor_count: self.tick_runner.total_descriptor_count,

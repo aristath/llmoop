@@ -45,7 +45,7 @@ impl CompilerEvent {
     }
 
     pub fn current_item(&self) -> Option<&str> {
-        ["pedal_id", "tensor_name", "shader_name"]
+        ["component_id", "component_id", "tensor_name", "shader_name"]
             .into_iter()
             .find_map(|key| self.value(key).and_then(Value::as_str))
     }
@@ -345,7 +345,7 @@ mod tests {
     #[test]
     fn compiler_event_exposes_progress_and_nested_package_path() {
         let event: CompilerEvent = serde_json::from_str(
-            r#"{"schema":"nerve.compiler_event.v1","sequence":7,"type":"PedalLoweringStarted","current":3,"total":12,"pedal_id":"layer_02"}"#,
+            r#"{"schema":"nerve.compiler_event.v1","sequence":7,"type":"ComponentLoweringStarted","current":3,"total":12,"component_id":"layer_02"}"#,
         )
         .unwrap();
         assert_eq!(event.progress(), Some((3, 12)));

@@ -131,22 +131,22 @@ fn validate_single_device_resident_package_placement(
     device_id: &str,
     placement_plan: &StreamCircuitPlacementPlan,
 ) -> Result<(), VulkanResidentTokenModelPackageError> {
-    let remote_pedals = placement_plan
-        .pedals
+    let remote_components = placement_plan
+        .components
         .iter()
-        .filter(|pedal| pedal.device_id != device_id)
-        .map(|pedal| format!("{}@{}", pedal.pedal_id, pedal.device_id))
+        .filter(|component| component.device_id != device_id)
+        .map(|component| format!("{}@{}", component.component_id, component.device_id))
         .collect::<Vec<_>>();
-    if !remote_pedals.is_empty() {
+    if !remote_components.is_empty() {
         return Err(VulkanResidentTokenModelPackageError::new(format!(
-            "single-device resident package for {device_id:?} cannot host remote pedals: {}",
-            remote_pedals.join(", ")
+            "single-device resident package for {device_id:?} cannot host remote components: {}",
+            remote_components.join(", ")
         )));
     }
-    if placement_plan.cross_device_cable_count != 0 {
+    if placement_plan.cross_device_edge_count != 0 {
         return Err(VulkanResidentTokenModelPackageError::new(format!(
-            "single-device resident package for {device_id:?} cannot host {} cross-device cables",
-            placement_plan.cross_device_cable_count
+            "single-device resident package for {device_id:?} cannot host {} cross-device edges",
+            placement_plan.cross_device_edge_count
         )));
     }
     Ok(())

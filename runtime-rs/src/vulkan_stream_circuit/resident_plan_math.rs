@@ -54,7 +54,7 @@ fn stream_state_byte_capacity(
             if dynamic_state_capacity_activations == 0 {
                 return Err(VulkanError(format!(
                     "{}.{} requires non-zero dynamic state capacity",
-                    state.pedal_id, state.state_id
+                    state.component_id, state.state_id
                 )));
             }
             let state_capacity = state
@@ -66,7 +66,7 @@ fn stream_state_byte_capacity(
                 .ok_or_else(|| {
                     VulkanError(format!(
                         "{}.{} dynamic state byte capacity overflowed",
-                        state.pedal_id, state.state_id
+                        state.component_id, state.state_id
                     ))
                 })?
         }
@@ -75,13 +75,13 @@ fn stream_state_byte_capacity(
     let total = static_bytes.checked_add(dynamic_bytes).ok_or_else(|| {
         VulkanError(format!(
             "{}.{} state byte capacity overflowed",
-            state.pedal_id, state.state_id
+            state.component_id, state.state_id
         ))
     })?;
     if total == 0 {
         return Err(VulkanError(format!(
             "{}.{} has unknown or zero byte capacity",
-            state.pedal_id, state.state_id
+            state.component_id, state.state_id
         )));
     }
     Ok(total)

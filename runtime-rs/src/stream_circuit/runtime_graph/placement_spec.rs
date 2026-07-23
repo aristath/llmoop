@@ -3,7 +3,7 @@ pub struct StreamCircuitPlacementSpec {
     pub schema: String,
     pub default_device_id: String,
     #[serde(default)]
-    pub pedal_devices: BTreeMap<String, String>,
+    pub node_devices: BTreeMap<String, String>,
 }
 
 impl StreamCircuitPlacementSpec {
@@ -11,22 +11,22 @@ impl StreamCircuitPlacementSpec {
         Self {
             schema: STREAM_CIRCUIT_PLACEMENT_SCHEMA.to_string(),
             default_device_id: default_device_id.into(),
-            pedal_devices: BTreeMap::new(),
+            node_devices: BTreeMap::new(),
         }
     }
 
-    pub fn with_pedal_device(
+    pub fn with_component_device(
         mut self,
-        pedal_id: impl Into<String>,
+        component_id: impl Into<String>,
         device_id: impl Into<String>,
     ) -> Self {
-        self.pedal_devices.insert(pedal_id.into(), device_id.into());
+        self.node_devices.insert(component_id.into(), device_id.into());
         self
     }
 
-    pub fn device_for_pedal(&self, pedal_id: &str) -> &str {
-        self.pedal_devices
-            .get(pedal_id)
+    pub fn device_for_component(&self, component_id: &str) -> &str {
+        self.node_devices
+            .get(component_id)
             .map(String::as_str)
             .unwrap_or(&self.default_device_id)
     }

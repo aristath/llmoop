@@ -365,7 +365,7 @@ fn resident_token_engine_owns_device_scheduler_and_registered_stream() {
     assert_eq!(initial.streams.len(), 1);
     assert_eq!(initial.streams[0].stream_id, "engine_stream_0");
     assert_eq!(initial.streams[0].device_id, "gpu0");
-    assert_eq!(initial.streams[0].pedal_count, 14);
+    assert_eq!(initial.streams[0].component_count, 14);
     assert_eq!(initial.streams[0].dynamic_state_capacity_activations, 8);
     assert_eq!(initial.scheduler.registered_runtime_count, 1);
     assert_eq!(initial.scheduler.active_runtime_count, 0);
@@ -726,7 +726,7 @@ fn resident_token_engine_creates_two_streams_from_one_shared_model() {
         stream_b.residency,
         VulkanResidentTokenEngineStreamResidency::SharedModel
     );
-    assert_eq!(stream_a.pedal_count, stream_b.pedal_count);
+    assert_eq!(stream_a.component_count, stream_b.component_count);
     assert_eq!(
         stream_a.dynamic_state_capacity_activations,
         stream_b.dynamic_state_capacity_activations

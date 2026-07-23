@@ -1,6 +1,6 @@
 pub fn run_mounted_placed_resident_stream_tick_slices_in_process(
     slices: &mut [VulkanMountedPlacedResidentInProcessStreamTickSlice<'_>],
-    transport: &mut VulkanInProcessPlacedCableTransport,
+    transport: &mut VulkanInProcessPlacedEdgeTransport,
 ) -> Result<
     VulkanMountedPlacedResidentInProcessStreamTickRun,
     VulkanMountedPlacedResidentInProcessStreamTickError,
@@ -18,7 +18,7 @@ pub fn run_mounted_placed_resident_stream_tick_slices_in_process(
 
 fn run_mounted_placed_resident_stream_tick_slices_in_process_with_schedule(
     slices: &mut [VulkanMountedPlacedResidentInProcessStreamTickSlice<'_>],
-    transport: &mut VulkanInProcessPlacedCableTransport,
+    transport: &mut VulkanInProcessPlacedEdgeTransport,
     schedule: &VulkanMountedPlacedResidentInProcessSchedule,
 ) -> Result<
     VulkanMountedPlacedResidentInProcessStreamTickRun,
@@ -39,10 +39,10 @@ fn run_mounted_placed_resident_stream_tick_slices_in_process_with_schedule_and_d
     'batch,
 >(
     slices: &mut [VulkanMountedPlacedResidentInProcessStreamTickSlice<'a>],
-    transport: &mut VulkanInProcessPlacedCableTransport,
+    transport: &mut VulkanInProcessPlacedEdgeTransport,
     schedule: &VulkanMountedPlacedResidentInProcessSchedule,
     distributed_runners: Option<&VulkanDistributedDispatchRunners>,
-    cable_synchronizations: Option<&VulkanPlacedCableTimelineSynchronizations>,
+    edge_synchronizations: Option<&VulkanPlacedEdgeTimelineSynchronizations>,
     submission: VulkanPlacedSubmissionContext<'a, 'batch>,
 ) -> Result<
     VulkanMountedPlacedResidentInProcessStreamTickRun,
@@ -113,13 +113,13 @@ fn run_mounted_placed_resident_stream_tick_slices_in_process_with_schedule_and_d
         );
     }
     transport.reset_tick_state();
-    register_in_process_direct_cable_copies(slices, transport)?;
-    if cable_synchronizations
-        .is_some_and(VulkanPlacedCableTimelineSynchronizations::has_pending_dependencies)
+    register_in_process_direct_edge_copies(slices, transport)?;
+    if edge_synchronizations
+        .is_some_and(VulkanPlacedEdgeTimelineSynchronizations::has_pending_dependencies)
     {
         return Err(
             VulkanMountedPlacedResidentInProcessStreamTickError::Schedule(VulkanError(
-                "placed cable timeline state leaked across stream ticks".to_string(),
+                "placed edge timeline state leaked across stream ticks".to_string(),
             )),
         );
     }
@@ -138,9 +138,9 @@ fn run_mounted_placed_resident_stream_tick_slices_in_process_with_schedule_and_d
             if let Some(runners) = distributed_runners
                 && !slices[*device_index].cursor.capture_execution_trace
             {
-                let cable_synchronizations = cable_synchronizations.ok_or_else(|| {
+                let edge_synchronizations = edge_synchronizations.ok_or_else(|| {
                     VulkanMountedPlacedResidentInProcessStreamTickError::Schedule(VulkanError(
-                        "compact placed execution requires mounted cable timeline synchronization"
+                        "compact placed execution requires mounted edge timeline synchronization"
                             .to_string(),
                     ))
                 })?;
@@ -150,7 +150,7 @@ fn run_mounted_placed_resident_stream_tick_slices_in_process_with_schedule_and_d
                         &device_by_id,
                         transport,
                         runners,
-                        cable_synchronizations,
+                        edge_synchronizations,
                         VulkanPlacedSliceSubmissionContext {
                             policy: submission_policy,
                             state_transaction: state_transactions
@@ -275,12 +275,12 @@ fn run_mounted_placed_resident_stream_tick_slices_in_process_with_schedule_and_d
             ))),
         );
     }
-    if cable_synchronizations
-        .is_some_and(VulkanPlacedCableTimelineSynchronizations::has_pending_dependencies)
+    if edge_synchronizations
+        .is_some_and(VulkanPlacedEdgeTimelineSynchronizations::has_pending_dependencies)
     {
         return Err(
             VulkanMountedPlacedResidentInProcessStreamTickError::Schedule(VulkanError(
-                "placed cable timeline dependencies were not consumed".to_string(),
+                "placed edge timeline dependencies were not consumed".to_string(),
             )),
         );
     }
@@ -321,7 +321,7 @@ fn pending_in_process_stream_tick_device_ids(
 
 fn in_process_stream_tick_run_snapshot(
     slices: &[VulkanMountedPlacedResidentInProcessStreamTickSlice<'_>],
-    transport: &VulkanInProcessPlacedCableTransport,
+    transport: &VulkanInProcessPlacedEdgeTransport,
     status: VulkanMountedPlacedResidentInProcessStreamTickRunStatus,
     scheduler_turn_count: usize,
     completed_stage_delta: usize,

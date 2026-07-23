@@ -15,12 +15,12 @@ use sha2::{Digest, Sha256};
 use smallvec::SmallVec;
 
 use crate::stream_circuit::{
-    CableTransport, CircuitParamsArtifact, CircuitRuntimeRole, CircuitStateArtifact,
-    LOWERED_PEDALBOARD_SCHEMA, LoweredCircuitRef, LoweredPedalboard, LoweredPedalboardGraph,
-    LoweredPedalboardSource, LoweredPedalboardSummary, PedalCablePlacement,
-    RUNTIME_DEFAULT_LOGICAL_DEVICE_ID, ResolvedCircuitArtifact, ResolvedLoweredPedalboard,
-    StreamCircuit, StreamCircuitGraphBoundary, StreamCircuitPedalInstanceStatePolicy,
-    StreamCircuitPlacementPlan, StreamCircuitPlacementSpec, StreamCircuitRuntimePatch,
+    EdgeTransport, CircuitParamsArtifact, CircuitRuntimeRole, CircuitStateArtifact,
+    LOWERED_EXECUTION_GRAPH_SCHEMA, LoweredCircuitRef, LoweredExecutionGraph, LoweredExecutionGraphGraph,
+    LoweredExecutionGraphSource, LoweredExecutionGraphSummary, ComponentEdgePlacement,
+    RUNTIME_DEFAULT_LOGICAL_DEVICE_ID, ResolvedCircuitArtifact, ResolvedLoweredExecutionGraph,
+    StreamCircuit, StreamCircuitGraphBoundary, StreamCircuitNodeInstanceStatePolicy,
+    StreamCircuitPlacementPlan, StreamCircuitPlacementSpec, StreamCircuitRuntimeGraph,
 };
 use crate::stream_plan::{
     CircuitActivationPlan, PlannedNode, PlannedParameterResource, PlannedPort, SignalProducer,
@@ -60,15 +60,15 @@ const CONTRACT_DIGEST_ALGORITHM: &str = "nerve.json_tree_sha256.v1";
 const VULKAN_STREAM_CONTROL_BYTE_CAPACITY: usize = 5 * std::mem::size_of::<u32>();
 const VULKAN_STREAM_CONTROL_TOKEN_BYTE_CAPACITY: usize = std::mem::size_of::<u32>();
 const VULKAN_STREAM_CONTROL_METADATA_OFFSET: usize = VULKAN_STREAM_CONTROL_TOKEN_BYTE_CAPACITY;
-const VULKAN_PEDAL_BATCH_CONTROL_BYTE_CAPACITY: u32 = 4 * std::mem::size_of::<u32>() as u32;
+const VULKAN_COMPONENT_BATCH_CONTROL_BYTE_CAPACITY: u32 = 4 * std::mem::size_of::<u32>() as u32;
 const VULKAN_SAMPLER_HISTORY_RECORD_BYTE_CAPACITY: usize = 4 * std::mem::size_of::<u32>();
 pub const VULKAN_BACKEND_LOOP_MAX_WINDOW: usize = 64;
 const VULKAN_BACKEND_LOOP_SNAPSHOT_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 
 include!("vulkan_stream_circuit/resident_plan_buffers.rs");
-include!("vulkan_stream_circuit/cable_plan.rs");
-include!("vulkan_stream_circuit/cable_buffers.rs");
-include!("vulkan_stream_circuit/cable_transport.rs");
+include!("vulkan_stream_circuit/edge_plan.rs");
+include!("vulkan_stream_circuit/edge_buffers.rs");
+include!("vulkan_stream_circuit/edge_transport.rs");
 include!("vulkan_stream_circuit/circuit_binding.rs");
 include!("vulkan_stream_circuit/circuit_mount.rs");
 include!("vulkan_stream_circuit/input_transducer.rs");
@@ -79,12 +79,12 @@ include!("vulkan_stream_circuit/single_token_tick.rs");
 include!("vulkan_stream_circuit/feedback_loop.rs");
 include!("vulkan_stream_circuit/speculative_decode.rs");
 include!("vulkan_stream_circuit/state_transaction.rs");
-include!("vulkan_stream_circuit/pedal_batch_buffers.rs");
-include!("vulkan_stream_circuit/pedal_batch_kernel_selection.rs");
-include!("vulkan_stream_circuit/pedal_batch_slice_runner.rs");
-include!("vulkan_stream_circuit/pedal_batch_distributed.rs");
-include!("vulkan_stream_circuit/pedal_batch_temporal.rs");
-include!("vulkan_stream_circuit/placed_pedal_batch_runner.rs");
+include!("vulkan_stream_circuit/component_batch_buffers.rs");
+include!("vulkan_stream_circuit/component_batch_kernel_selection.rs");
+include!("vulkan_stream_circuit/component_batch_slice_runner.rs");
+include!("vulkan_stream_circuit/component_batch_distributed.rs");
+include!("vulkan_stream_circuit/component_batch_temporal.rs");
+include!("vulkan_stream_circuit/placed_component_batch_runner.rs");
 include!("vulkan_stream_circuit/stream_processor.rs");
 include!("vulkan_stream_circuit/token_stream.rs");
 include!("vulkan_stream_circuit/token_runtime.rs");
@@ -105,8 +105,8 @@ include!("vulkan_stream_circuit/resident_package_planning.rs");
 include!("vulkan_stream_circuit/resident_package_resource_loading.rs");
 include!("vulkan_stream_circuit/resident_package_kernel_loading.rs");
 include!("vulkan_stream_circuit/token_engine_codec.rs");
-include!("vulkan_stream_circuit/mounted_pedal.rs");
-include!("vulkan_stream_circuit/mounted_pedalboard_runner.rs");
+include!("vulkan_stream_circuit/mounted_component.rs");
+include!("vulkan_stream_circuit/mounted_execution_graph_runner.rs");
 include!("vulkan_stream_circuit/dispatch_segment_runner.rs");
 include!("vulkan_stream_circuit/stream_tick_execution_plan.rs");
 include!("vulkan_stream_circuit/stream_control_bytes.rs");

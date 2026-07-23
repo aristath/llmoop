@@ -138,7 +138,7 @@ fn action_from_key(app: &App, key: KeyEvent) -> Option<AppAction> {
             KeyCode::Down => Some(AppAction::ModalNext),
             _ => None,
         },
-        Some(Overlay::Pedal(_)) => match key.code {
+        Some(Overlay::Node(_)) => match key.code {
             KeyCode::Esc => Some(AppAction::CloseOverlay),
             KeyCode::Up => Some(AppAction::ModalPrevious),
             KeyCode::Down => Some(AppAction::ModalNext),
@@ -202,11 +202,11 @@ fn action_from_key(app: &App, key: KeyEvent) -> Option<AppAction> {
             KeyCode::Char('q') if !ctrl && !alt => Some(AppAction::Quit),
             KeyCode::Left if alt => Some(AppAction::MoveSelected(-1)),
             KeyCode::Right if alt => Some(AppAction::MoveSelected(1)),
-            KeyCode::Left | KeyCode::Char('h') => Some(AppAction::SelectPreviousPedal),
-            KeyCode::Right | KeyCode::Char('l') => Some(AppAction::SelectNextPedal),
-            KeyCode::Home => Some(AppAction::SelectFirstPedal),
-            KeyCode::End => Some(AppAction::SelectLastPedal),
-            KeyCode::Enter => Some(AppAction::OpenSelectedPedal),
+            KeyCode::Left | KeyCode::Char('h') => Some(AppAction::SelectPreviousNode),
+            KeyCode::Right | KeyCode::Char('l') => Some(AppAction::SelectNextNode),
+            KeyCode::Home => Some(AppAction::SelectFirstNode),
+            KeyCode::End => Some(AppAction::SelectLastNode),
+            KeyCode::Enter => Some(AppAction::OpenSelectedNode),
             KeyCode::Delete => Some(AppAction::RemoveSelected),
             _ => None,
         },
@@ -220,15 +220,15 @@ fn action_from_mouse(app: &App, mouse: MouseEvent) -> Option<AppAction> {
             Some(Overlay::ModelSelector(_)) | Some(Overlay::Compiler(_)) => {
                 Some(AppAction::ModalPrevious)
             }
-            Some(Overlay::Pedal(_)) => Some(AppAction::ModalChange(-1)),
-            _ => Some(AppAction::PanBoard(-1)),
+            Some(Overlay::Node(_)) => Some(AppAction::ModalChange(-1)),
+            _ => Some(AppAction::PanGraph(-1)),
         },
         MouseEventKind::ScrollDown => match app.overlay {
             Some(Overlay::ModelSelector(_)) | Some(Overlay::Compiler(_)) => {
                 Some(AppAction::ModalNext)
             }
-            Some(Overlay::Pedal(_)) => Some(AppAction::ModalChange(1)),
-            _ => Some(AppAction::PanBoard(1)),
+            Some(Overlay::Node(_)) => Some(AppAction::ModalChange(1)),
+            _ => Some(AppAction::PanGraph(1)),
         },
         _ => None,
     }
@@ -294,14 +294,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn key_mapping_keeps_board_and_text_meanings_separate() {
+    fn key_mapping_keeps_device_and_text_meanings_separate() {
         let mut app = App::new();
         app.overlay = None;
-        app.focus = FocusRegion::Board;
+        app.focus = FocusRegion::Graph;
         let left = KeyEvent::new(KeyCode::Left, KeyModifiers::NONE);
         assert_eq!(
             action_from_key(&app, left),
-            Some(AppAction::SelectPreviousPedal)
+            Some(AppAction::SelectPreviousNode)
         );
         app.focus = FocusRegion::Sequence;
         assert_eq!(
@@ -314,11 +314,11 @@ mod tests {
     }
 
     #[test]
-    fn mouse_hit_resolves_to_same_open_pedal_action() {
+    fn mouse_hit_resolves_to_same_open_component_action() {
         let mut app = App::new();
         app.hit_map.insert(
             ratatui::layout::Rect::new(2, 3, 10, 4),
-            super::super::app::HitTarget::Pedal("layer_00".to_string()),
+            super::super::app::HitTarget::Node("layer_00".to_string()),
         );
         let mouse = MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
@@ -328,7 +328,7 @@ mod tests {
         };
         assert_eq!(
             action_from_mouse(&app, mouse),
-            Some(AppAction::OpenPedal("layer_00".to_string()))
+            Some(AppAction::OpenNode("layer_00".to_string()))
         );
     }
 }

@@ -5,7 +5,7 @@ pub struct VulkanResidentInProcessPlacedModelPackage {
     pub dynamic_state_capacity_activations: usize,
     pub device_ids: Vec<String>,
     pub device_count: usize,
-    pub hosted_pedal_count: usize,
+    pub hosted_component_count: usize,
     pub transducer_parameter_count: usize,
     pub transducer_parameter_bytes: usize,
     input_transducer_parameter_buffers: Arc<VulkanPermanentParameterBuffers>,

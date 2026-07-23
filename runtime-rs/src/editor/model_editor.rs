@@ -34,15 +34,15 @@ impl RuntimeModelEditor {
             .resolved_source_graph(package_root.clone())
             .map_err(|error| RuntimeEditorError(error.to_string()))?;
         let draft = manifest
-            .runtime_patch_from_controls(None, &BTreeMap::new(), &[], None)
+            .runtime_graph_from_controls(None, &BTreeMap::new(), &[], None)
             .map_err(|error| RuntimeEditorError(error.to_string()))?;
-        let source_pedals = source_pedals(&manifest);
-        let source_by_layer = source_pedals
+        let source_components = source_components(&manifest);
+        let source_by_layer = source_components
             .iter()
-            .filter_map(|pedal| {
-                pedal
+            .filter_map(|component| {
+                component
                     .layer_index
-                    .map(|layer_index| (layer_index, pedal.source_id.clone()))
+                    .map(|layer_index| (layer_index, component.source_id.clone()))
             })
             .fold(
                 BTreeMap::<usize, Vec<String>>::new(),
@@ -51,9 +51,9 @@ impl RuntimeModelEditor {
                     by_layer
                 },
             );
-        let source_ids = source_pedals
+        let source_ids = source_components
             .iter()
-            .map(|pedal| pedal.source_id.clone())
+            .map(|component| component.source_id.clone())
             .collect();
         let available_devices = devices(RUNTIME_DEFAULT_LOGICAL_DEVICE_ID);
         Ok(Self {
@@ -61,7 +61,7 @@ impl RuntimeModelEditor {
             package_root,
             manifest,
             source_graph,
-            source_pedals,
+            source_components,
             source_by_layer,
             source_ids,
             available_devices,
@@ -85,8 +85,8 @@ impl RuntimeModelEditor {
         self.manifest.max_context_activations
     }
 
-    pub fn source_pedals(&self) -> &[RuntimeEditorSourcePedal] {
-        &self.source_pedals
+    pub fn source_components(&self) -> &[RuntimeEditorSourceComponent] {
+        &self.source_components
     }
 
     pub fn available_devices(&self) -> &[RuntimeAvailableDevice] {
@@ -97,18 +97,18 @@ impl RuntimeModelEditor {
         self.available_devices = discover_runtime_devices(&self.draft.default_device_id, None);
     }
 
-    pub fn draft(&self) -> &StreamCircuitRuntimePatch {
+    pub fn draft(&self) -> &StreamCircuitRuntimeGraph {
         &self.draft
     }
 
     pub fn layer_sequence(&self) -> Vec<usize> {
         let layer_by_source = self
-            .source_pedals
+            .source_components
             .iter()
-            .filter_map(|pedal| {
-                pedal
+            .filter_map(|component| {
+                component
                     .layer_index
-                    .map(|layer_index| (pedal.source_id.as_str(), layer_index))
+                    .map(|layer_index| (component.source_id.as_str(), layer_index))
             })
             .collect::<BTreeMap<_, _>>();
         self.draft
@@ -116,7 +116,7 @@ impl RuntimeModelEditor {
             .iter()
             .filter_map(|instance| {
                 layer_by_source
-                    .get(instance.source_pedal_id.as_str())
+                    .get(instance.source_component_id.as_str())
                     .copied()
             })
             .collect()
@@ -127,29 +127,29 @@ impl RuntimeModelEditor {
             .instances
             .iter()
             .filter(|instance| instance.enabled)
-            .map(|instance| instance.source_pedal_id.clone())
+            .map(|instance| instance.source_component_id.clone())
             .collect()
     }
 
     pub fn instances(&self) -> Vec<RuntimeEditorInstance> {
         let layer_by_source = self
-            .source_pedals
+            .source_components
             .iter()
-            .map(|pedal| (pedal.source_id.as_str(), pedal.layer_index))
+            .map(|component| (component.source_id.as_str(), component.layer_index))
             .collect::<BTreeMap<_, _>>();
         let mut occurrences = BTreeMap::<&str, usize>::new();
         self.draft
             .instances
             .iter()
             .filter_map(|instance| {
-                let layer_index = *layer_by_source.get(instance.source_pedal_id.as_str())?;
+                let layer_index = *layer_by_source.get(instance.source_component_id.as_str())?;
                 let occurrence = occurrences
-                    .entry(instance.source_pedal_id.as_str())
+                    .entry(instance.source_component_id.as_str())
                     .and_modify(|value| *value += 1)
                     .or_insert(1);
                 Some(RuntimeEditorInstance {
                     instance_id: instance.instance_id.clone(),
-                    source_id: instance.source_pedal_id.clone(),
+                    source_id: instance.source_component_id.clone(),
                     layer_index,
                     occurrence: *occurrence,
                     device_id: instance.device_id.clone(),
@@ -181,7 +181,7 @@ impl RuntimeModelEditor {
                 })?;
                 if sources.len() != 1 {
                     return Err(RuntimeEditorError(format!(
-                        "layer {layer_index} has {} source pedals; edit the source sequence by id",
+                        "layer {layer_index} has {} source components; edit the source sequence by id",
                         sources.len()
                     )));
                 }
@@ -201,7 +201,7 @@ impl RuntimeModelEditor {
             .map(|instance| {
                 (
                     instance.instance_id.clone(),
-                    instance.source_pedal_id.clone(),
+                    instance.source_component_id.clone(),
                 )
             })
             .collect::<Vec<_>>();
@@ -215,12 +215,12 @@ impl RuntimeModelEditor {
     fn instances_for_source_sequence(
         &self,
         source_sequence: &[String],
-    ) -> Result<Vec<StreamCircuitPedalInstance>, RuntimeEditorError> {
+    ) -> Result<Vec<StreamCircuitNodeInstance>, RuntimeEditorError> {
         let mut previous_by_source =
-            BTreeMap::<String, VecDeque<StreamCircuitPedalInstance>>::new();
+            BTreeMap::<String, VecDeque<StreamCircuitNodeInstance>>::new();
         for instance in &self.draft.instances {
             previous_by_source
-                .entry(instance.source_pedal_id.clone())
+                .entry(instance.source_component_id.clone())
                 .or_default()
                 .push_back(instance.clone());
         }
@@ -230,7 +230,7 @@ impl RuntimeModelEditor {
         for source_id in source_sequence {
             if !self.source_ids.contains(source_id) {
                 return Err(RuntimeEditorError(format!(
-                    "unknown source pedal {source_id:?}"
+                    "unknown source component {source_id:?}"
                 )));
             }
             let occurrence = occurrence_by_source
@@ -246,13 +246,13 @@ impl RuntimeModelEditor {
             } else {
                 let instance_id = allocate_instance_id(source_id, *occurrence, &used_instance_ids);
                 used_instance_ids.insert(instance_id.clone());
-                StreamCircuitPedalInstance {
+                StreamCircuitNodeInstance {
                     instance_id,
-                    source_pedal_id: source_id.clone(),
+                    source_component_id: source_id.clone(),
                     device_id: self.draft.default_device_id.clone(),
                     enabled: true,
                     control_values: BTreeMap::new(),
-                    state_policy: StreamCircuitPedalInstanceStatePolicy::Fresh,
+                    state_policy: StreamCircuitNodeInstanceStatePolicy::Fresh,
                 }
             };
             instances.push(instance);
@@ -268,11 +268,11 @@ impl RuntimeModelEditor {
         let available = self.available_devices.iter().any(|device| {
             device.device_id == device_id
                 && device.available
-                && device.can_host_runtime_pedals_on_physical_device != Some(false)
+                && device.can_host_runtime_components_on_physical_device != Some(false)
         });
         if !available {
             return Err(RuntimeEditorError(format!(
-                "runtime device {device_id:?} is unavailable or cannot host this pedal"
+                "runtime device {device_id:?} is unavailable or cannot host this component"
             )));
         }
         self.draft = self
@@ -302,9 +302,9 @@ impl RuntimeModelEditor {
         control_id: &str,
         value: Value,
     ) -> Result<(), RuntimeEditorError> {
-        let source = self.source_pedal_for_instance(instance_id).ok_or_else(|| {
+        let source = self.source_component_for_instance(instance_id).ok_or_else(|| {
             RuntimeEditorError(format!(
-                "runtime patch has no pedal instance {instance_id:?}"
+                "runtime graph has no node instance {instance_id:?}"
             ))
         })?;
         let schema = source
@@ -313,7 +313,7 @@ impl RuntimeModelEditor {
             .find(|schema| schema.id == control_id)
             .ok_or_else(|| {
                 RuntimeEditorError(format!(
-                    "source pedal {} declares no control {control_id:?}",
+                    "source component {} declares no control {control_id:?}",
                     source.source_id
                 ))
             })?;
@@ -325,7 +325,7 @@ impl RuntimeModelEditor {
             .find(|instance| instance.instance_id == instance_id)
             .ok_or_else(|| {
                 RuntimeEditorError(format!(
-                    "runtime patch has no pedal instance {instance_id:?}"
+                    "runtime graph has no node instance {instance_id:?}"
                 ))
             })?;
         instance
@@ -347,7 +347,7 @@ impl RuntimeModelEditor {
         if let Some(value) = instance.control_values.get(control_id) {
             return Some(value.clone());
         }
-        self.source_pedal_for_instance(instance_id)?
+        self.source_component_for_instance(instance_id)?
             .control_schemas
             .iter()
             .find(|schema| schema.id == control_id)
@@ -362,7 +362,7 @@ impl RuntimeModelEditor {
     pub fn set_instance_state_policy(
         &mut self,
         instance_id: &str,
-        state_policy: StreamCircuitPedalInstanceStatePolicy,
+        state_policy: StreamCircuitNodeInstanceStatePolicy,
     ) -> Result<(), RuntimeEditorError> {
         let instance = self
             .draft
@@ -371,7 +371,7 @@ impl RuntimeModelEditor {
             .find(|instance| instance.instance_id == instance_id)
             .ok_or_else(|| {
                 RuntimeEditorError(format!(
-                    "runtime patch has no pedal instance {instance_id:?}"
+                    "runtime graph has no node instance {instance_id:?}"
                 ))
             })?;
         instance.state_policy = state_policy;
@@ -384,7 +384,7 @@ impl RuntimeModelEditor {
             if !self.available_devices.iter().any(|device| {
                 device.device_id == instance.device_id
                     && device.available
-                    && device.can_host_runtime_pedals_on_physical_device != Some(false)
+                    && device.can_host_runtime_components_on_physical_device != Some(false)
             }) {
                 errors.push(format!(
                     "instance {} is assigned to unavailable device {}",
@@ -392,9 +392,9 @@ impl RuntimeModelEditor {
                 ));
             }
             if let Some(source) = self
-                .source_pedals
+                .source_components
                 .iter()
-                .find(|source| source.source_id == instance.source_pedal_id)
+                .find(|source| source.source_id == instance.source_component_id)
             {
                 for (control_id, value) in &instance.control_values {
                     match source
@@ -424,7 +424,7 @@ impl RuntimeModelEditor {
         }
         let placement = if errors.is_empty() {
             self.source_graph
-                .instantiate_runtime_patch(&self.draft)
+                .instantiate_runtime_graph(&self.draft)
                 .and_then(|graph| graph.placement_plan(&self.draft.placement_spec()))
                 .map_err(|error| errors.push(error.to_string()))
                 .ok()
@@ -439,20 +439,20 @@ impl RuntimeModelEditor {
         }
     }
 
-    pub fn source_pedal_for_instance(
+    pub fn source_component_for_instance(
         &self,
         instance_id: &str,
-    ) -> Option<&RuntimeEditorSourcePedal> {
+    ) -> Option<&RuntimeEditorSourceComponent> {
         let source_id = self
             .draft
             .instances
             .iter()
             .find(|instance| instance.instance_id == instance_id)?
-            .source_pedal_id
+            .source_component_id
             .as_str();
-        self.source_pedals
+        self.source_components
             .iter()
-            .find(|pedal| pedal.source_id == source_id)
+            .find(|component| component.source_id == source_id)
     }
 }
 
@@ -490,7 +490,7 @@ pub(crate) fn load_runtime_model_editor_without_hardware(
             selected_by_default: Some(true),
             selected_by_runtime: Some(true),
             runtime_binding: Some("test_only".to_string()),
-            can_host_runtime_pedals_on_physical_device: Some(true),
+            can_host_runtime_components_on_physical_device: Some(true),
             notes: vec!["hardware discovery disabled for this test".to_string()],
             error: None,
         }],

@@ -1,11 +1,11 @@
 /// A maximal sequence of dispatch stages that can execute without crossing a
-/// cable transport boundary. The sequence keeps its pipelines, descriptors,
+/// edge transport boundary. The sequence keeps its pipelines, descriptors,
 /// command buffer, and fence resident for the lifetime of the mounted model.
 pub struct VulkanMountedPlacedResidentDispatchSegmentRunner {
     pub start_stage_index: usize,
     pub end_stage_index: usize,
     pub dispatch_count: usize,
-    dispatches: Vec<VulkanMountedPlacedResidentPedalDispatch>,
+    dispatches: Vec<VulkanMountedPlacedResidentComponentDispatch>,
     stream_control_buffer: Arc<VulkanResidentBuffer>,
     sequences: RefCell<BTreeMap<u8, VulkanResidentKernelSequence>>,
     feedback_sequences: RefCell<Vec<VulkanResidentKernelSequence>>,
@@ -67,10 +67,10 @@ impl VulkanMountedPlacedResidentDispatchSegmentRunner {
                 bound_dispatch,
                 loaded_manifest,
             )?;
-            dispatches.push(VulkanMountedPlacedResidentPedalDispatch {
+            dispatches.push(VulkanMountedPlacedResidentComponentDispatch {
                 dispatch_index: bound_dispatch.dispatch_index,
                 kernel_id: bound_dispatch.kernel_id.clone(),
-                pedal_id: bound_dispatch.pedal_id.clone(),
+                component_id: bound_dispatch.component_id.clone(),
                 node_id: bound_dispatch.node_id.clone(),
                 op: bound_dispatch.op.clone(),
                 reusable_family_id: bound_dispatch.reusable_family_id.clone(),
@@ -315,7 +315,7 @@ impl VulkanMountedPlacedResidentDispatchSegmentRunner {
         sequence_variant: u8,
         capture_execution_trace: bool,
     ) -> Result<
-        Vec<VulkanMountedPlacedResidentPedalRun>,
+        Vec<VulkanMountedPlacedResidentComponentRun>,
         VulkanMountedPlacedResidentKernelDispatchError,
     > {
         self.stream_control_buffer
@@ -348,7 +348,7 @@ impl VulkanMountedPlacedResidentDispatchSegmentRunner {
                 .map(|start| {
                     let execution_time_ns =
                         u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
-                    self.completed_pedal_runs(execution_time_ns)
+                    self.completed_component_runs(execution_time_ns)
                 })
                 .unwrap_or_default());
         }
@@ -383,18 +383,18 @@ impl VulkanMountedPlacedResidentDispatchSegmentRunner {
             .map(|start| {
                 let execution_time_ns =
                     u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
-                self.completed_pedal_runs(execution_time_ns)
+                self.completed_component_runs(execution_time_ns)
             })
             .unwrap_or_default())
     }
 
-    fn completed_pedal_runs(
+    fn completed_component_runs(
         &self,
         execution_time_ns: u64,
-    ) -> Vec<VulkanMountedPlacedResidentPedalRun> {
-        let mut pedal_runs = Vec::<VulkanMountedPlacedResidentPedalRun>::new();
+    ) -> Vec<VulkanMountedPlacedResidentComponentRun> {
+        let mut component_runs = Vec::<VulkanMountedPlacedResidentComponentRun>::new();
         for (dispatch_offset, dispatch) in self.dispatches.iter().enumerate() {
-            let dispatch_run = VulkanMountedPlacedResidentPedalDispatchRun {
+            let dispatch_run = VulkanMountedPlacedResidentComponentDispatchRun {
                 dispatch_index: dispatch.dispatch_index,
                 kernel_id: dispatch.kernel_id.clone(),
                 node_id: dispatch.node_id.clone(),
@@ -410,18 +410,18 @@ impl VulkanMountedPlacedResidentDispatchSegmentRunner {
                     0
                 },
             };
-            if let Some(pedal_run) = pedal_runs
+            if let Some(component_run) = component_runs
                 .last_mut()
-                .filter(|run| run.pedal_id == dispatch.pedal_id)
+                .filter(|run| run.component_id == dispatch.component_id)
             {
-                pedal_run.dispatch_runs.push(dispatch_run);
+                component_run.dispatch_runs.push(dispatch_run);
             } else {
-                pedal_runs.push(VulkanMountedPlacedResidentPedalRun {
-                    pedal_id: dispatch.pedal_id.clone(),
+                component_runs.push(VulkanMountedPlacedResidentComponentRun {
+                    component_id: dispatch.component_id.clone(),
                     dispatch_runs: vec![dispatch_run],
                 });
             }
         }
-        pedal_runs
+        component_runs
     }
 }

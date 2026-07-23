@@ -162,7 +162,7 @@ impl VulkanComputeDeviceCatalog {
             }
             // Logical-device features cannot be added later. Enable every supported
             // feature in the runtime's SPIR-V contract so this device can safely
-            // host different compiled pedal packages without being recreated.
+            // host different compiled component packages without being recreated.
             let mut enabled_shader_features =
                 physical_device_standard_shader_features(instance, physical_device);
             if shader_float8_support.shader_float8 {

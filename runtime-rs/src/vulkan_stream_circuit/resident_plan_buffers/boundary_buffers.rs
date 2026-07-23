@@ -26,19 +26,19 @@ impl VulkanModelBoundaryBufferPlan {
             for input in &circuit.input_ports {
                 if placed_plan
                     .placed_resident_plan
-                    .local_cables
+                    .local_edges
                     .iter()
-                    .chain(&placed_plan.placed_resident_plan.incoming_cables)
-                    .any(|cable| {
-                        cable.destination_pedal_id == circuit.pedal_id
-                            && cable.destination_port_id == input.id
+                    .chain(&placed_plan.placed_resident_plan.incoming_edges)
+                    .any(|edge| {
+                        edge.destination_component_id == circuit.component_id
+                            && edge.destination_port_id == input.id
                     })
                 {
                     continue;
                 }
                 let boundary = VulkanModelBoundaryBuffer::from_port(
                     inputs.len(),
-                    &circuit.pedal_id,
+                    &circuit.component_id,
                     input,
                     signal_element_bytes,
                 )?;
@@ -53,19 +53,19 @@ impl VulkanModelBoundaryBufferPlan {
             for output in &circuit.output_ports {
                 if placed_plan
                     .placed_resident_plan
-                    .local_cables
+                    .local_edges
                     .iter()
-                    .chain(&placed_plan.placed_resident_plan.outgoing_cables)
-                    .any(|cable| {
-                        cable.source_pedal_id == circuit.pedal_id
-                            && cable.source_port_id == output.id
+                    .chain(&placed_plan.placed_resident_plan.outgoing_edges)
+                    .any(|edge| {
+                        edge.source_component_id == circuit.component_id
+                            && edge.source_port_id == output.id
                     })
                 {
                     continue;
                 }
                 let boundary = VulkanModelBoundaryBuffer::from_port(
                     outputs.len(),
-                    &circuit.pedal_id,
+                    &circuit.component_id,
                     output,
                     signal_element_bytes,
                 )?;
@@ -157,7 +157,7 @@ pub struct VulkanModelBoundaryBuffer {
     pub shape: Vec<usize>,
     pub element_count: usize,
     pub byte_capacity: Option<usize>,
-    pub pedal_id: String,
+    pub component_id: String,
     pub port_id: String,
     pub source_signal_id: Option<String>,
 }
@@ -165,20 +165,20 @@ pub struct VulkanModelBoundaryBuffer {
 impl VulkanModelBoundaryBuffer {
     fn from_port(
         buffer_index: usize,
-        pedal_id: &str,
+        component_id: &str,
         port: &PlannedPort,
         signal_element_bytes: Option<usize>,
     ) -> Result<Self, VulkanModelBoundaryBufferPlanError> {
         let element_count = product(&port.shape).ok_or_else(|| {
             VulkanModelBoundaryBufferPlanError(format!(
                 "{} model boundary port {:?} shape {:?} overflows",
-                pedal_id, port.id, port.shape
+                component_id, port.id, port.shape
             ))
         })?;
         if element_count == 0 {
             return Err(VulkanModelBoundaryBufferPlanError(format!(
                 "{} model boundary port {:?} shape {:?} has zero elements",
-                pedal_id, port.id, port.shape
+                component_id, port.id, port.shape
             )));
         }
         let byte_capacity = signal_element_bytes
@@ -186,7 +186,7 @@ impl VulkanModelBoundaryBuffer {
                 element_count.checked_mul(bytes).ok_or_else(|| {
                     VulkanModelBoundaryBufferPlanError(format!(
                         "{} model boundary port {:?} byte capacity overflowed",
-                        pedal_id, port.id
+                        component_id, port.id
                     ))
                 })
             })
@@ -199,7 +199,7 @@ impl VulkanModelBoundaryBuffer {
             shape: port.shape.clone(),
             element_count,
             byte_capacity,
-            pedal_id: pedal_id.to_string(),
+            component_id: component_id.to_string(),
             port_id: port.id.clone(),
             source_signal_id: port.source.clone(),
         })

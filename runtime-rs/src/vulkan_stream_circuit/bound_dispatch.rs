@@ -2,7 +2,7 @@
 pub struct VulkanPlacedBoundDispatch {
     pub dispatch_index: usize,
     pub kernel_id: String,
-    pub pedal_id: String,
+    pub component_id: String,
     pub circuit_id: String,
     pub node_index: usize,
     pub node_id: String,
@@ -29,24 +29,24 @@ pub enum VulkanPlacedBoundDescriptorTarget {
     Resident { target: VulkanBoundDescriptorTarget },
     ModelInput { signal_id: String },
     ModelOutput { signal_id: String },
-    LocalCableInput { cable: PedalCablePlacement },
-    LocalCableOutput { cable: PedalCablePlacement },
-    IncomingCable { cable: PedalCablePlacement },
-    OutgoingCable { cable: PedalCablePlacement },
+    LocalEdgeInput { edge: ComponentEdgePlacement },
+    LocalEdgeOutput { edge: ComponentEdgePlacement },
+    IncomingEdge { edge: ComponentEdgePlacement },
+    OutgoingEdge { edge: ComponentEdgePlacement },
 }
 
 impl VulkanPlacedBoundDescriptorTarget {
     fn from_bound_target(
-        pedal_id: &str,
+        component_id: &str,
         target: &VulkanBoundDescriptorTarget,
         placed_resident_plan: &VulkanPlacedStreamCircuitResidentPlan,
     ) -> Self {
         match target {
             VulkanBoundDescriptorTarget::BoundaryInput { signal_id } => {
-                classify_boundary_input(pedal_id, signal_id, placed_resident_plan)
+                classify_boundary_input(component_id, signal_id, placed_resident_plan)
             }
             VulkanBoundDescriptorTarget::BoundaryOutput { signal_id } => {
-                classify_boundary_output(pedal_id, signal_id, placed_resident_plan)
+                classify_boundary_output(component_id, signal_id, placed_resident_plan)
             }
             _ => Self::Resident {
                 target: target.clone(),
@@ -56,29 +56,29 @@ impl VulkanPlacedBoundDescriptorTarget {
 }
 
 fn classify_boundary_input(
-    pedal_id: &str,
+    component_id: &str,
     signal_id: &str,
     placed_resident_plan: &VulkanPlacedStreamCircuitResidentPlan,
 ) -> VulkanPlacedBoundDescriptorTarget {
-    if let Some(cable) = placed_resident_plan
-        .local_cables
+    if let Some(edge) = placed_resident_plan
+        .local_edges
         .iter()
-        .find(|cable| {
-            cable.destination_pedal_id == pedal_id && cable.destination_port_id == signal_id
+        .find(|edge| {
+            edge.destination_component_id == component_id && edge.destination_port_id == signal_id
         })
         .cloned()
     {
-        return VulkanPlacedBoundDescriptorTarget::LocalCableInput { cable };
+        return VulkanPlacedBoundDescriptorTarget::LocalEdgeInput { edge };
     }
-    if let Some(cable) = placed_resident_plan
-        .incoming_cables
+    if let Some(edge) = placed_resident_plan
+        .incoming_edges
         .iter()
-        .find(|cable| {
-            cable.destination_pedal_id == pedal_id && cable.destination_port_id == signal_id
+        .find(|edge| {
+            edge.destination_component_id == component_id && edge.destination_port_id == signal_id
         })
         .cloned()
     {
-        return VulkanPlacedBoundDescriptorTarget::IncomingCable { cable };
+        return VulkanPlacedBoundDescriptorTarget::IncomingEdge { edge };
     }
     VulkanPlacedBoundDescriptorTarget::ModelInput {
         signal_id: signal_id.to_string(),
@@ -86,25 +86,25 @@ fn classify_boundary_input(
 }
 
 fn classify_boundary_output(
-    pedal_id: &str,
+    component_id: &str,
     signal_id: &str,
     placed_resident_plan: &VulkanPlacedStreamCircuitResidentPlan,
 ) -> VulkanPlacedBoundDescriptorTarget {
-    if let Some(cable) = placed_resident_plan
-        .local_cables
+    if let Some(edge) = placed_resident_plan
+        .local_edges
         .iter()
-        .find(|cable| cable.source_pedal_id == pedal_id && cable.source_port_id == signal_id)
+        .find(|edge| edge.source_component_id == component_id && edge.source_port_id == signal_id)
         .cloned()
     {
-        return VulkanPlacedBoundDescriptorTarget::LocalCableOutput { cable };
+        return VulkanPlacedBoundDescriptorTarget::LocalEdgeOutput { edge };
     }
-    if let Some(cable) = placed_resident_plan
-        .outgoing_cables
+    if let Some(edge) = placed_resident_plan
+        .outgoing_edges
         .iter()
-        .find(|cable| cable.source_pedal_id == pedal_id && cable.source_port_id == signal_id)
+        .find(|edge| edge.source_component_id == component_id && edge.source_port_id == signal_id)
         .cloned()
     {
-        return VulkanPlacedBoundDescriptorTarget::OutgoingCable { cable };
+        return VulkanPlacedBoundDescriptorTarget::OutgoingEdge { edge };
     }
     VulkanPlacedBoundDescriptorTarget::ModelOutput {
         signal_id: signal_id.to_string(),
@@ -115,7 +115,7 @@ fn classify_boundary_output(
 pub struct VulkanBoundDispatch {
     pub dispatch_index: usize,
     pub kernel_id: String,
-    pub pedal_id: String,
+    pub component_id: String,
     pub circuit_id: String,
     pub node_index: usize,
     pub node_id: String,
@@ -152,7 +152,7 @@ pub enum VulkanBoundDescriptorTarget {
     },
     ActivationSlot {
         buffer_index: usize,
-        pedal_id: String,
+        component_id: String,
         signal_id: String,
         circuit_id: String,
         slot: usize,
@@ -161,7 +161,7 @@ pub enum VulkanBoundDescriptorTarget {
     },
     StreamStateBuffer {
         buffer_index: usize,
-        pedal_id: String,
+        component_id: String,
         state_id: String,
         state_type: String,
         byte_capacity: usize,
@@ -170,7 +170,7 @@ pub enum VulkanBoundDescriptorTarget {
     },
     StreamStateView {
         buffer_index: usize,
-        pedal_id: String,
+        component_id: String,
         state_id: String,
         state_type: String,
         byte_capacity: usize,
@@ -206,19 +206,19 @@ impl VulkanBoundDescriptorTarget {
                 byte_count: *byte_count,
             }),
             VulkanDescriptorResourceAddress::ActivationSlot {
-                pedal_id,
+                component_id,
                 signal_id,
                 slot,
                 byte_capacity,
                 signal_byte_capacity,
             } => {
                 let buffer_index = buffers
-                    .activation_slot_buffer_index(pedal_id, *slot)
+                    .activation_slot_buffer_index(component_id, *slot)
                     .ok_or_else(
                         || VulkanBoundDispatchPlanError::MissingActivationSlotBuffer {
                             dispatch_index: dispatch.dispatch_index,
                             binding: descriptor.binding,
-                            pedal_id: pedal_id.clone(),
+                            component_id: component_id.clone(),
                             slot: *slot,
                         },
                     )?;
@@ -231,7 +231,7 @@ impl VulkanBoundDescriptorTarget {
                 )?;
                 Ok(Self::ActivationSlot {
                     buffer_index,
-                    pedal_id: pedal_id.clone(),
+                    component_id: component_id.clone(),
                     signal_id: signal_id.clone(),
                     circuit_id: buffer.circuit_id.clone(),
                     slot: *slot,
@@ -240,7 +240,7 @@ impl VulkanBoundDescriptorTarget {
                 })
             }
             VulkanDescriptorResourceAddress::StateBuffer {
-                pedal_id,
+                component_id,
                 state_id,
                 state_type,
                 byte_capacity,
@@ -249,11 +249,11 @@ impl VulkanBoundDescriptorTarget {
             } => {
                 let buffer_index =
                     buffers
-                        .state_buffer_index(pedal_id, state_id)
+                        .state_buffer_index(component_id, state_id)
                         .ok_or_else(|| VulkanBoundDispatchPlanError::MissingStateBuffer {
                             dispatch_index: dispatch.dispatch_index,
                             binding: descriptor.binding,
-                            pedal_id: pedal_id.clone(),
+                            component_id: component_id.clone(),
                             state_id: state_id.clone(),
                         })?;
                 let buffer = &buffers.state_buffers[buffer_index];
@@ -265,7 +265,7 @@ impl VulkanBoundDescriptorTarget {
                 )?;
                 Ok(Self::StreamStateBuffer {
                     buffer_index,
-                    pedal_id: pedal_id.clone(),
+                    component_id: component_id.clone(),
                     state_id: state_id.clone(),
                     state_type: state_type.clone(),
                     byte_capacity: *byte_capacity,
@@ -274,7 +274,7 @@ impl VulkanBoundDescriptorTarget {
                 })
             }
             VulkanDescriptorResourceAddress::StateView {
-                pedal_id,
+                component_id,
                 state_id,
                 state_type,
                 byte_capacity,
@@ -283,11 +283,11 @@ impl VulkanBoundDescriptorTarget {
             } => {
                 let buffer_index =
                     buffers
-                        .state_buffer_index(pedal_id, state_id)
+                        .state_buffer_index(component_id, state_id)
                         .ok_or_else(|| VulkanBoundDispatchPlanError::MissingStateBuffer {
                             dispatch_index: dispatch.dispatch_index,
                             binding: descriptor.binding,
-                            pedal_id: pedal_id.clone(),
+                            component_id: component_id.clone(),
                             state_id: state_id.clone(),
                         })?;
                 let buffer = &buffers.state_buffers[buffer_index];
@@ -299,7 +299,7 @@ impl VulkanBoundDescriptorTarget {
                 )?;
                 Ok(Self::StreamStateView {
                     buffer_index,
-                    pedal_id: pedal_id.clone(),
+                    component_id: component_id.clone(),
                     state_id: state_id.clone(),
                     state_type: state_type.clone(),
                     byte_capacity: *byte_capacity,
@@ -331,32 +331,32 @@ fn validate_bound_byte_capacity(
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum VulkanBoundDispatchPlanError {
     PreparedDispatch(VulkanPreparedDispatchPlanError),
-    CableIoDeviceMismatch {
+    EdgeIoDeviceMismatch {
         plan_device_id: String,
-        cable_io_device_id: String,
+        edge_io_device_id: String,
     },
     MissingStateBuffer {
         dispatch_index: usize,
         binding: usize,
-        pedal_id: String,
+        component_id: String,
         state_id: String,
     },
     MissingActivationSlotBuffer {
         dispatch_index: usize,
         binding: usize,
-        pedal_id: String,
+        component_id: String,
         slot: usize,
     },
-    MissingCableEndpointBuffer {
+    MissingEdgeEndpointBuffer {
         dispatch_index: usize,
         binding: usize,
-        direction: VulkanPlacedCableDirection,
-        cable_index: usize,
+        direction: VulkanPlacedEdgeDirection,
+        edge_index: usize,
     },
-    MissingLocalCableBuffer {
+    MissingLocalEdgeBuffer {
         dispatch_index: usize,
         binding: usize,
-        cable_index: usize,
+        edge_index: usize,
     },
     ByteCapacityMismatch {
         dispatch_index: usize,
@@ -364,17 +364,17 @@ pub enum VulkanBoundDispatchPlanError {
         expected_byte_capacity: usize,
         mounted_byte_capacity: usize,
     },
-    LocalCableByteCapacityMismatch {
+    LocalEdgeByteCapacityMismatch {
         dispatch_index: usize,
         binding: usize,
-        cable_index: usize,
-        cable_byte_capacity: Option<usize>,
+        edge_index: usize,
+        edge_byte_capacity: Option<usize>,
         mounted_byte_capacity: usize,
     },
-    CableEndpointByteCapacityMismatch {
+    EdgeEndpointByteCapacityMismatch {
         dispatch_index: usize,
         binding: usize,
-        cable_index: usize,
+        edge_index: usize,
         endpoint_byte_capacity: Option<usize>,
         mounted_byte_capacity: usize,
     },
@@ -384,47 +384,47 @@ impl Display for VulkanBoundDispatchPlanError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::PreparedDispatch(error) => Display::fmt(error, f),
-            Self::CableIoDeviceMismatch {
+            Self::EdgeIoDeviceMismatch {
                 plan_device_id,
-                cable_io_device_id,
+                edge_io_device_id,
             } => write!(
                 f,
-                "placed bound plan for device {plan_device_id:?} cannot bind cable I/O for device {cable_io_device_id:?}"
+                "placed bound plan for device {plan_device_id:?} cannot bind edge I/O for device {edge_io_device_id:?}"
             ),
             Self::MissingStateBuffer {
                 dispatch_index,
                 binding,
-                pedal_id,
+                component_id,
                 state_id,
             } => write!(
                 f,
-                "dispatch {dispatch_index} descriptor {binding} references missing stream state buffer {pedal_id}.{state_id}"
+                "dispatch {dispatch_index} descriptor {binding} references missing stream state buffer {component_id}.{state_id}"
             ),
             Self::MissingActivationSlotBuffer {
                 dispatch_index,
                 binding,
-                pedal_id,
+                component_id,
                 slot,
             } => write!(
                 f,
-                "dispatch {dispatch_index} descriptor {binding} references missing activation slot buffer {pedal_id}.slot_{slot}"
+                "dispatch {dispatch_index} descriptor {binding} references missing activation slot buffer {component_id}.slot_{slot}"
             ),
-            Self::MissingCableEndpointBuffer {
+            Self::MissingEdgeEndpointBuffer {
                 dispatch_index,
                 binding,
                 direction,
-                cable_index,
+                edge_index,
             } => write!(
                 f,
-                "dispatch {dispatch_index} descriptor {binding} references missing {direction:?} cable endpoint buffer for cable {cable_index}"
+                "dispatch {dispatch_index} descriptor {binding} references missing {direction:?} edge endpoint buffer for edge {edge_index}"
             ),
-            Self::MissingLocalCableBuffer {
+            Self::MissingLocalEdgeBuffer {
                 dispatch_index,
                 binding,
-                cable_index,
+                edge_index,
             } => write!(
                 f,
-                "dispatch {dispatch_index} descriptor {binding} references missing local cable buffer for cable {cable_index}"
+                "dispatch {dispatch_index} descriptor {binding} references missing local edge buffer for edge {edge_index}"
             ),
             Self::ByteCapacityMismatch {
                 dispatch_index,
@@ -435,25 +435,25 @@ impl Display for VulkanBoundDispatchPlanError {
                 f,
                 "dispatch {dispatch_index} descriptor {binding} expects {expected_byte_capacity} bytes but mounted buffer has {mounted_byte_capacity} bytes"
             ),
-            Self::LocalCableByteCapacityMismatch {
+            Self::LocalEdgeByteCapacityMismatch {
                 dispatch_index,
                 binding,
-                cable_index,
-                cable_byte_capacity,
+                edge_index,
+                edge_byte_capacity,
                 mounted_byte_capacity,
             } => write!(
                 f,
-                "dispatch {dispatch_index} descriptor {binding} local cable {cable_index} expects {cable_byte_capacity:?} bytes but mounted buffer has {mounted_byte_capacity} bytes"
+                "dispatch {dispatch_index} descriptor {binding} local edge {edge_index} expects {edge_byte_capacity:?} bytes but mounted buffer has {mounted_byte_capacity} bytes"
             ),
-            Self::CableEndpointByteCapacityMismatch {
+            Self::EdgeEndpointByteCapacityMismatch {
                 dispatch_index,
                 binding,
-                cable_index,
+                edge_index,
                 endpoint_byte_capacity,
                 mounted_byte_capacity,
             } => write!(
                 f,
-                "dispatch {dispatch_index} descriptor {binding} cable {cable_index} endpoint expects {endpoint_byte_capacity:?} bytes but mounted buffer has {mounted_byte_capacity} bytes"
+                "dispatch {dispatch_index} descriptor {binding} edge {edge_index} endpoint expects {endpoint_byte_capacity:?} bytes but mounted buffer has {mounted_byte_capacity} bytes"
             ),
         }
     }

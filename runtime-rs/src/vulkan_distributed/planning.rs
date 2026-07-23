@@ -29,7 +29,7 @@ fn accumulate_activation_allocation(
     if activation.byte_capacity == 0 {
         return Err(VulkanDistributedPlanError(format!(
             "distributed activation {}.slot_{} has zero capacity",
-            activation.pedal_id, activation.slot
+            activation.component_id, activation.slot
         )));
     }
     if activation.signal_byte_capacity == 0
@@ -37,7 +37,7 @@ fn accumulate_activation_allocation(
     {
         return Err(VulkanDistributedPlanError(format!(
             "distributed activation {}.slot_{} has signal {:?} capacity {} outside its {}-byte slot",
-            activation.pedal_id,
+            activation.component_id,
             activation.slot,
             activation.signal_id,
             activation.signal_byte_capacity,
@@ -46,7 +46,7 @@ fn accumulate_activation_allocation(
     }
     let key = VulkanDistributedActivationBufferAllocationKey {
         owner_device_id: owner_device_id.to_string(),
-        pedal_id: activation.pedal_id.clone(),
+        component_id: activation.component_id.clone(),
         slot: activation.slot,
     };
     let allocation =
@@ -54,7 +54,7 @@ fn accumulate_activation_allocation(
             .entry(key)
             .or_insert_with(|| VulkanDistributedActivationBufferAllocation {
                 owner_device_id: owner_device_id.to_string(),
-                pedal_id: activation.pedal_id.clone(),
+                component_id: activation.component_id.clone(),
                 slot: activation.slot,
                 byte_capacity: activation.byte_capacity,
                 signal_ids: Vec::new(),
@@ -65,7 +65,7 @@ fn accumulate_activation_allocation(
     if allocation.byte_capacity != activation.byte_capacity {
         return Err(VulkanDistributedPlanError(format!(
             "distributed activation {}.slot_{} has conflicting capacities {} and {}",
-            activation.pedal_id,
+            activation.component_id,
             activation.slot,
             allocation.byte_capacity,
             activation.byte_capacity
@@ -206,7 +206,7 @@ fn plan_parallel_projection_dispatch(
         // Physical sharding is an optional optimization. Quantized projection
         // families carry auxiliary scale/zero-point tensors in addition to
         // their matrices and need a family-specific sharding contract. Keep
-        // those dispatches on their pedal's owner device until such a contract
+        // those dispatches on their component's owner device until such a contract
         // is available; layer placement still distributes the model itself.
         return Ok(None);
     };
@@ -345,7 +345,7 @@ fn plan_parallel_projection_dispatch(
     Ok(Some(VulkanDistributedDispatchPlan {
         owner_device_id: owner_device_id.to_string(),
         dispatch_index: dispatch.dispatch_index,
-        pedal_id: dispatch.pedal_id.clone(),
+        component_id: dispatch.component_id.clone(),
         node_id: dispatch.node_id.clone(),
         reusable_family_id: dispatch.reusable_family_id.clone(),
         input_byte_capacity,
@@ -504,7 +504,7 @@ fn plan_sparse_expert_dispatch(
     Ok(Some(VulkanDistributedDispatchPlan {
         owner_device_id: owner_device_id.to_string(),
         dispatch_index: dispatch.dispatch_index,
-        pedal_id: dispatch.pedal_id.clone(),
+        component_id: dispatch.component_id.clone(),
         node_id: dispatch.node_id.clone(),
         reusable_family_id: dispatch.reusable_family_id.clone(),
         input_byte_capacity,
@@ -593,14 +593,14 @@ fn activation_slot(
         .find(|descriptor| descriptor.binding == binding)
         .and_then(|descriptor| match &descriptor.resource {
             VulkanDescriptorResourceAddress::ActivationSlot {
-                pedal_id,
+                component_id,
                 signal_id,
                 slot,
                 byte_capacity,
                 signal_byte_capacity,
             } => Some(VulkanDistributedActivationSlot {
                 binding,
-                pedal_id: pedal_id.clone(),
+                component_id: component_id.clone(),
                 signal_id: signal_id.clone(),
                 slot: *slot,
                 byte_capacity: *byte_capacity,
@@ -716,7 +716,7 @@ fn dispatch_error(
 ) -> VulkanDistributedPlanError {
     VulkanDistributedPlanError(format!(
         "distributed dispatch {}.{} {message}",
-        dispatch.pedal_id, dispatch.node_id
+        dispatch.component_id, dispatch.node_id
     ))
 }
 

@@ -10,7 +10,7 @@ impl VulkanStreamCircuitBindingPlan {
         resource_plan: &StreamCircuitResourcePlan,
         resident_plan: &VulkanStreamCircuitResidentPlan,
     ) -> Result<Self, VulkanBindingPlanError> {
-        Self::from_plans_with_hosted_pedals(execution_plan, resource_plan, resident_plan, None)
+        Self::from_plans_with_hosted_components(execution_plan, resource_plan, resident_plan, None)
     }
 
     pub fn from_placed_resident_plan(
@@ -18,37 +18,37 @@ impl VulkanStreamCircuitBindingPlan {
         resource_plan: &StreamCircuitResourcePlan,
         placed_resident_plan: &VulkanPlacedStreamCircuitResidentPlan,
     ) -> Result<Self, VulkanBindingPlanError> {
-        let hosted_pedals = placed_resident_plan
-            .hosted_pedal_ids
+        let hosted_components = placed_resident_plan
+            .hosted_component_ids
             .iter()
             .cloned()
             .collect::<BTreeSet<_>>();
-        Self::from_plans_with_hosted_pedals(
+        Self::from_plans_with_hosted_components(
             execution_plan,
             resource_plan,
             &placed_resident_plan.resident_plan,
-            Some(&hosted_pedals),
+            Some(&hosted_components),
         )
     }
 
-    fn from_plans_with_hosted_pedals(
+    fn from_plans_with_hosted_components(
         execution_plan: &StreamCircuitExecutionPlan,
         resource_plan: &StreamCircuitResourcePlan,
         resident_plan: &VulkanStreamCircuitResidentPlan,
-        hosted_pedals: Option<&BTreeSet<String>>,
+        hosted_components: Option<&BTreeSet<String>>,
     ) -> Result<Self, VulkanBindingPlanError> {
-        let hosts_pedal = |pedal_id: &str| {
-            hosted_pedals
-                .map(|pedals| pedals.contains(pedal_id))
+        let hosts_component = |component_id: &str| {
+            hosted_components
+                .map(|components| components.contains(component_id))
                 .unwrap_or(true)
         };
         let hosted_circuit_count = execution_plan
             .circuits
             .iter()
-            .filter(|circuit| hosts_pedal(&circuit.pedal_id))
+            .filter(|circuit| hosts_component(&circuit.component_id))
             .count();
 
-        if hosted_pedals.is_none()
+        if hosted_components.is_none()
             && (execution_plan.circuits.len() != resident_plan.circuit_count
                 || resource_plan.circuit_count != resident_plan.circuit_count)
         {
@@ -67,14 +67,14 @@ impl VulkanStreamCircuitBindingPlan {
         }
 
         let parameter_bindings =
-            parameter_binding_index(resource_plan, resident_plan, hosted_pedals)?;
+            parameter_binding_index(resource_plan, resident_plan, hosted_components)?;
         let state_bindings = state_binding_index(resource_plan, resident_plan)?;
         let activation_bindings = activation_binding_index(resident_plan)?;
 
         let circuits = execution_plan
             .circuits
             .iter()
-            .filter(|circuit| hosts_pedal(&circuit.pedal_id))
+            .filter(|circuit| hosts_component(&circuit.component_id))
             .map(|circuit| {
                 bind_circuit(
                     circuit,
@@ -98,10 +98,10 @@ impl VulkanStreamCircuitBindingPlan {
             .sum()
     }
 
-    pub fn circuit(&self, pedal_id: &str) -> Option<&VulkanCircuitBindingPlan> {
+    pub fn circuit(&self, component_id: &str) -> Option<&VulkanCircuitBindingPlan> {
         self.circuits
             .iter()
-            .find(|circuit| circuit.pedal_id == pedal_id)
+            .find(|circuit| circuit.component_id == component_id)
     }
 }
 
@@ -164,7 +164,7 @@ impl VulkanPlacedStreamCircuitPlan {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VulkanCircuitBindingPlan {
-    pub pedal_id: String,
+    pub component_id: String,
     pub circuit_id: String,
     pub input_ports: Vec<PlannedPort>,
     pub output_ports: Vec<PlannedPort>,
@@ -221,19 +221,19 @@ pub enum VulkanSignalResource {
     BoundaryInput,
     BoundaryOutput,
     StateBuffer {
-        pedal_id: String,
+        component_id: String,
         state_id: String,
         static_bytes: Option<usize>,
         bytes_per_activation: Option<usize>,
     },
     StateView {
-        pedal_id: String,
+        component_id: String,
         state_id: String,
         static_bytes: Option<usize>,
         bytes_per_activation: Option<usize>,
     },
     ActivationSlot {
-        pedal_id: String,
+        component_id: String,
         slot: usize,
         bytes: Option<usize>,
         signal_bytes: Option<usize>,
@@ -250,7 +250,7 @@ pub struct VulkanParameterBinding {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VulkanStateBinding {
-    pub pedal_id: String,
+    pub component_id: String,
     pub state_id: String,
     pub state_type: String,
     pub static_bytes: Option<usize>,

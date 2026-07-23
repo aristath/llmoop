@@ -15,9 +15,9 @@ mod tests {
     };
 
     #[test]
-    fn placed_pedals_do_not_implicitly_shard_their_internal_dispatches() {
+    fn placed_components_do_not_implicitly_shard_their_internal_dispatches() {
         let device_ids = vec!["gpu0".to_string(), "gpu1".to_string()];
-        let plan = VulkanDistributedExecutionPlan::for_placed_pedals(&device_ids, 256).unwrap();
+        let plan = VulkanDistributedExecutionPlan::for_placed_components(&device_ids, 256).unwrap();
 
         assert_eq!(plan.device_ids, device_ids);
         assert!(plan.dispatches.is_empty());
@@ -55,10 +55,10 @@ mod tests {
         let dispatch = &plan.dispatches[0];
         assert_eq!(dispatch.owner_device_id, "owner");
         assert_eq!(dispatch.row_alignment, 2);
-        assert_eq!(dispatch.input_activation.pedal_id, "pedal");
+        assert_eq!(dispatch.input_activation.component_id, "component");
         assert_eq!(dispatch.input_activation.signal_id, "normalized");
         assert_eq!(dispatch.input_activation.slot, 0);
-        assert_eq!(dispatch.output_activation.pedal_id, "pedal");
+        assert_eq!(dispatch.output_activation.component_id, "component");
         assert_eq!(dispatch.output_activation.signal_id, "hidden");
         assert_eq!(dispatch.output_activation.slot, 1);
         assert_eq!(
@@ -107,7 +107,7 @@ mod tests {
             },
             name: signal.to_string(),
             resource: VulkanDescriptorResourceAddress::ActivationSlot {
-                pedal_id: "moe".to_string(),
+                component_id: "moe".to_string(),
                 signal_id: signal.to_string(),
                 slot,
                 byte_capacity: bytes,
@@ -130,7 +130,7 @@ mod tests {
             dispatches: vec![VulkanPreparedDispatch {
                 dispatch_index: 9,
                 kernel_id: "moe.sparse-down".to_string(),
-                pedal_id: "moe".to_string(),
+                component_id: "moe".to_string(),
                 circuit_id: "moe-circuit".to_string(),
                 node_index: 4,
                 node_id: "sparse-down".to_string(),
@@ -394,10 +394,10 @@ mod tests {
         assert_eq!(activation_plan.reference_count, 2);
         assert_eq!(activation_plan.total_shared_byte_capacity, 32);
         assert_eq!(
-            activation_plan.allocation("owner", "pedal", 0).unwrap(),
+            activation_plan.allocation("owner", "component", 0).unwrap(),
             &VulkanDistributedActivationBufferAllocation {
                 owner_device_id: "owner".to_string(),
-                pedal_id: "pedal".to_string(),
+                component_id: "component".to_string(),
                 slot: 0,
                 byte_capacity: 8,
                 signal_ids: vec!["normalized".to_string()],
@@ -413,7 +413,7 @@ mod tests {
         );
         assert_eq!(
             activation_plan
-                .allocation("owner", "pedal", 1)
+                .allocation("owner", "component", 1)
                 .unwrap()
                 .output_use_count,
             1
@@ -454,7 +454,7 @@ mod tests {
         assert_eq!(activation_plan.import_count, 8);
         assert_eq!(activation_plan.reference_count, 4);
         assert_eq!(activation_plan.total_shared_byte_capacity, 32);
-        let input = activation_plan.allocation("owner", "pedal", 0).unwrap();
+        let input = activation_plan.allocation("owner", "component", 0).unwrap();
         assert_eq!(input.input_use_count, 2);
         assert_eq!(
             input.signal_ids,
@@ -476,7 +476,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("activation pedal.slot_0 has conflicting capacities 8 and 16")
+                .contains("activation component.slot_0 has conflicting capacities 8 and 16")
         );
     }
 
@@ -573,11 +573,11 @@ mod tests {
     }
 
     #[test]
-    fn immutable_parameter_shards_are_reused_by_duplicated_pedals() {
+    fn immutable_parameter_shards_are_reused_by_duplicated_components() {
         let mut execution_plan = fixture_plan("row_major");
         let mut duplicate = execution_plan.dispatches[0].clone();
         duplicate.dispatch_index = 8;
-        duplicate.pedal_id = "duplicated-pedal".to_string();
+        duplicate.component_id = "duplicated-component".to_string();
         duplicate.node_id = "duplicated-ffn".to_string();
         execution_plan.dispatches.push(duplicate);
 
@@ -684,7 +684,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("canonical dispatch pedal.canonical-use still uses it")
+                .contains("canonical dispatch component.canonical-use still uses it")
         );
     }
 
@@ -730,7 +730,7 @@ mod tests {
                 },
                 name: name.to_string(),
                 resource: VulkanDescriptorResourceAddress::ActivationSlot {
-                    pedal_id: "pedal".to_string(),
+                    component_id: "component".to_string(),
                     signal_id: signal.to_string(),
                     slot: binding,
                     byte_capacity: bytes,
@@ -752,8 +752,8 @@ mod tests {
             reusable_family_count: 1,
             dispatches: vec![VulkanPreparedDispatch {
                 dispatch_index: 7,
-                kernel_id: "pedal.ffn".to_string(),
-                pedal_id: "pedal".to_string(),
+                kernel_id: "component.ffn".to_string(),
+                component_id: "component".to_string(),
                 circuit_id: "circuit".to_string(),
                 node_index: 3,
                 node_id: "ffn".to_string(),

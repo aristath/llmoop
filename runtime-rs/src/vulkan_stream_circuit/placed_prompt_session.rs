@@ -3,7 +3,7 @@ pub struct VulkanResidentInProcessPlacedPromptSession {
     pub completed_prompt_event_count: usize,
     pub generated_token_count: usize,
     pub output_token_count: usize,
-    transport: VulkanInProcessPlacedCableTransport,
+    transport: VulkanInProcessPlacedEdgeTransport,
 }
 
 impl VulkanResidentInProcessPlacedPromptSession {
@@ -13,15 +13,15 @@ impl VulkanResidentInProcessPlacedPromptSession {
             completed_prompt_event_count: 0,
             generated_token_count: 0,
             output_token_count: 0,
-            transport: VulkanInProcessPlacedCableTransport::new(),
+            transport: VulkanInProcessPlacedEdgeTransport::new(),
         }
     }
 
-    pub fn transport_direct_cable_binding_count(&self) -> usize {
-        self.transport.direct_cable_binding_count()
+    pub fn transport_direct_edge_binding_count(&self) -> usize {
+        self.transport.direct_edge_binding_count()
     }
 
-    pub fn transport_stats(&self) -> VulkanPlacedCableTransportStats {
+    pub fn transport_stats(&self) -> VulkanPlacedEdgeTransportStats {
         self.transport.stats()
     }
 

@@ -2,8 +2,8 @@ fn render_help(frame: &mut Frame<'_>) {
     let area = centered_rect(frame.area(), 66, 72, 52, 18);
     frame.render_widget(Clear, area);
     let lines = vec![
-        Line::styled("PEDALBOARD", Style::default().fg(SIGNAL).bold()),
-        Line::raw("←/→ or h/l   select pedal"),
+        Line::styled("EXECUTION GRAPH", Style::default().fg(SIGNAL).bold()),
+        Line::raw("←/→ or h/l   select node"),
         Line::raw("Enter         edit selected instance"),
         Line::raw("Ctrl+D        duplicate selected instance"),
         Line::raw("Delete        remove selected instance"),
@@ -32,4 +32,3 @@ fn render_help(frame: &mut Frame<'_>) {
         area,
     );
 }
-

@@ -1,17 +1,17 @@
-pub struct VulkanMountedPlacedResidentPedalRunner {
-    pub pedal_id: String,
-    pub dispatches: Vec<VulkanMountedPlacedResidentPedalDispatch>,
+pub struct VulkanMountedPlacedResidentComponentRunner {
+    pub component_id: String,
+    pub dispatches: Vec<VulkanMountedPlacedResidentComponentDispatch>,
     pub total_descriptor_count: usize,
     pub total_push_constant_byte_count: u32,
     stream_control_buffer: Arc<VulkanResidentBuffer>,
 }
 
-impl VulkanMountedPlacedResidentPedalRunner {
+impl VulkanMountedPlacedResidentComponentRunner {
     fn from_mounted_bound_plan(
         device: &VulkanComputeDevice,
         mounted: &VulkanMountedPlacedStreamCircuit,
         mounted_bound_plan: &VulkanMountedPlacedBoundDispatchPlan,
-        pedal_id: &str,
+        component_id: &str,
         loaded_manifest: &VulkanLoadedReusableKernelArtifactManifest,
     ) -> Result<Self, VulkanMountedPlacedResidentKernelDispatchError> {
         let mut dispatches = Vec::new();
@@ -21,7 +21,7 @@ impl VulkanMountedPlacedResidentPedalRunner {
         for dispatch in mounted_bound_plan
             .dispatches
             .iter()
-            .filter(|dispatch| dispatch.pedal_id == pedal_id)
+            .filter(|dispatch| dispatch.component_id == component_id)
         {
             let resident_dispatch = mounted.create_resident_kernel_dispatch_for_bound_dispatch(
                 device,
@@ -30,18 +30,18 @@ impl VulkanMountedPlacedResidentPedalRunner {
             )?;
             total_descriptor_count = total_descriptor_count
                 .checked_add(resident_dispatch.descriptor_count())
-                .ok_or(VulkanMountedPlacedResidentKernelDispatchError::PedalRunnerDescriptorCountOverflow {
-                    pedal_id: pedal_id.to_string(),
+                .ok_or(VulkanMountedPlacedResidentKernelDispatchError::ComponentRunnerDescriptorCountOverflow {
+                    component_id: component_id.to_string(),
                 })?;
             total_push_constant_byte_count = total_push_constant_byte_count
                 .checked_add(resident_dispatch.push_constant_byte_count())
-                .ok_or(VulkanMountedPlacedResidentKernelDispatchError::PedalRunnerPushConstantByteCountOverflow {
-                    pedal_id: pedal_id.to_string(),
+                .ok_or(VulkanMountedPlacedResidentKernelDispatchError::ComponentRunnerPushConstantByteCountOverflow {
+                    component_id: component_id.to_string(),
                 })?;
-            dispatches.push(VulkanMountedPlacedResidentPedalDispatch {
+            dispatches.push(VulkanMountedPlacedResidentComponentDispatch {
                 dispatch_index: dispatch.dispatch_index,
                 kernel_id: dispatch.kernel_id.clone(),
-                pedal_id: dispatch.pedal_id.clone(),
+                component_id: dispatch.component_id.clone(),
                 node_id: dispatch.node_id.clone(),
                 op: dispatch.op.clone(),
                 reusable_family_id: dispatch.reusable_family_id.clone(),
@@ -52,14 +52,14 @@ impl VulkanMountedPlacedResidentPedalRunner {
 
         if dispatches.is_empty() {
             return Err(
-                VulkanMountedPlacedResidentKernelDispatchError::MissingPedalDispatches {
-                    pedal_id: pedal_id.to_string(),
+                VulkanMountedPlacedResidentKernelDispatchError::MissingComponentDispatches {
+                    component_id: component_id.to_string(),
                 },
             );
         }
 
         Ok(Self {
-            pedal_id: pedal_id.to_string(),
+            component_id: component_id.to_string(),
             dispatches,
             total_descriptor_count,
             total_push_constant_byte_count,
@@ -74,7 +74,7 @@ impl VulkanMountedPlacedResidentPedalRunner {
     pub fn run_zeroed_push_constants(
         &self,
         device: &VulkanComputeDevice,
-    ) -> Result<VulkanMountedPlacedResidentPedalRun, VulkanMountedPlacedResidentKernelDispatchError>
+    ) -> Result<VulkanMountedPlacedResidentComponentRun, VulkanMountedPlacedResidentKernelDispatchError>
     {
         self.run_with_push_constant_bytes(device, |dispatch| {
             Ok(vec![
@@ -89,7 +89,7 @@ impl VulkanMountedPlacedResidentPedalRunner {
         &self,
         device: &VulkanComputeDevice,
         control: VulkanMountedPlacedStreamControl,
-    ) -> Result<VulkanMountedPlacedResidentPedalRun, VulkanMountedPlacedResidentKernelDispatchError>
+    ) -> Result<VulkanMountedPlacedResidentComponentRun, VulkanMountedPlacedResidentKernelDispatchError>
     {
         self.stream_control_buffer
             .write_bytes_at(
@@ -106,10 +106,10 @@ impl VulkanMountedPlacedResidentPedalRunner {
         &self,
         device: &VulkanComputeDevice,
         mut push_constant_bytes_for: F,
-    ) -> Result<VulkanMountedPlacedResidentPedalRun, VulkanMountedPlacedResidentKernelDispatchError>
+    ) -> Result<VulkanMountedPlacedResidentComponentRun, VulkanMountedPlacedResidentKernelDispatchError>
     where
         F: FnMut(
-            &VulkanMountedPlacedResidentPedalDispatch,
+            &VulkanMountedPlacedResidentComponentDispatch,
         ) -> Result<Vec<u8>, VulkanMountedPlacedResidentKernelDispatchError>,
     {
         let mut dispatch_runs = Vec::with_capacity(self.dispatches.len());
@@ -120,7 +120,7 @@ impl VulkanMountedPlacedResidentPedalRunner {
                 .run_resident_kernel_dispatch(&dispatch.resident_dispatch, &push_constants)
                 .map_err(VulkanMountedPlacedResidentKernelDispatchError::Vulkan)?;
             let run_time_ns = u64::try_from(run_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
-            dispatch_runs.push(VulkanMountedPlacedResidentPedalDispatchRun {
+            dispatch_runs.push(VulkanMountedPlacedResidentComponentDispatchRun {
                 dispatch_index: dispatch.dispatch_index,
                 kernel_id: dispatch.kernel_id.clone(),
                 node_id: dispatch.node_id.clone(),
@@ -133,19 +133,19 @@ impl VulkanMountedPlacedResidentPedalRunner {
             });
         }
 
-        Ok(VulkanMountedPlacedResidentPedalRun {
-            pedal_id: self.pedal_id.clone(),
+        Ok(VulkanMountedPlacedResidentComponentRun {
+            component_id: self.component_id.clone(),
             dispatch_runs,
         })
     }
 
-    fn completed_sequence_run(&self) -> VulkanMountedPlacedResidentPedalRun {
-        VulkanMountedPlacedResidentPedalRun {
-            pedal_id: self.pedal_id.clone(),
+    fn completed_sequence_run(&self) -> VulkanMountedPlacedResidentComponentRun {
+        VulkanMountedPlacedResidentComponentRun {
+            component_id: self.component_id.clone(),
             dispatch_runs: self
                 .dispatches
                 .iter()
-                .map(|dispatch| VulkanMountedPlacedResidentPedalDispatchRun {
+                .map(|dispatch| VulkanMountedPlacedResidentComponentDispatchRun {
                     dispatch_index: dispatch.dispatch_index,
                     kernel_id: dispatch.kernel_id.clone(),
                     node_id: dispatch.node_id.clone(),
@@ -163,10 +163,10 @@ impl VulkanMountedPlacedResidentPedalRunner {
     }
 }
 
-pub struct VulkanMountedPlacedResidentPedalDispatch {
+pub struct VulkanMountedPlacedResidentComponentDispatch {
     pub dispatch_index: usize,
     pub kernel_id: String,
-    pub pedal_id: String,
+    pub component_id: String,
     pub node_id: String,
     pub op: String,
     pub reusable_family_id: String,
@@ -175,12 +175,12 @@ pub struct VulkanMountedPlacedResidentPedalDispatch {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct VulkanMountedPlacedResidentPedalRun {
-    pub pedal_id: String,
-    pub dispatch_runs: Vec<VulkanMountedPlacedResidentPedalDispatchRun>,
+pub struct VulkanMountedPlacedResidentComponentRun {
+    pub component_id: String,
+    pub dispatch_runs: Vec<VulkanMountedPlacedResidentComponentDispatchRun>,
 }
 
-impl VulkanMountedPlacedResidentPedalRun {
+impl VulkanMountedPlacedResidentComponentRun {
     pub fn dispatch_count(&self) -> usize {
         self.dispatch_runs.len()
     }
@@ -200,7 +200,7 @@ impl VulkanMountedPlacedResidentPedalRun {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct VulkanMountedPlacedResidentPedalDispatchRun {
+pub struct VulkanMountedPlacedResidentComponentDispatchRun {
     pub dispatch_index: usize,
     pub kernel_id: String,
     pub node_id: String,

@@ -140,41 +140,41 @@ impl VulkanResidentSpeculativeDecoderProcessor {
                 &hidden_input.buffer,
                 adapter.target_hidden_byte_capacity,
             )
-            .map_err(VulkanResidentInProcessPlacedRuntimeError::FeedbackCable)?;
+            .map_err(VulkanResidentInProcessPlacedRuntimeError::FeedbackEdge)?;
         let recursive_hidden_copy = device
             .create_resident_buffer_copy(
                 output_transducer.normalized_frame_buffer(),
                 &hidden_input.buffer,
                 adapter.target_hidden_byte_capacity,
             )
-            .map_err(VulkanResidentInProcessPlacedRuntimeError::FeedbackCable)?;
+            .map_err(VulkanResidentInProcessPlacedRuntimeError::FeedbackEdge)?;
         let pending_target_hidden = device
             .create_resident_buffer(adapter.target_hidden_byte_capacity)
-            .map_err(VulkanResidentInProcessPlacedRuntimeError::FeedbackCable)?;
+            .map_err(VulkanResidentInProcessPlacedRuntimeError::FeedbackEdge)?;
         pending_target_hidden
             .write_bytes(&vec![0u8; adapter.target_hidden_byte_capacity])
-            .map_err(VulkanResidentInProcessPlacedRuntimeError::FeedbackCable)?;
+            .map_err(VulkanResidentInProcessPlacedRuntimeError::FeedbackEdge)?;
         let pending_hidden_input_copy = device
             .create_resident_buffer_copy(
                 &pending_target_hidden,
                 &hidden_input.buffer,
                 adapter.target_hidden_byte_capacity,
             )
-            .map_err(VulkanResidentInProcessPlacedRuntimeError::FeedbackCable)?;
+            .map_err(VulkanResidentInProcessPlacedRuntimeError::FeedbackEdge)?;
         let update_pending_hidden_copy = device
             .create_resident_buffer_copy(
                 target_hidden,
                 &pending_target_hidden,
                 adapter.target_hidden_byte_capacity,
             )
-            .map_err(VulkanResidentInProcessPlacedRuntimeError::FeedbackCable)?;
+            .map_err(VulkanResidentInProcessPlacedRuntimeError::FeedbackEdge)?;
         let restore_target_hidden_copy = device
             .create_resident_buffer_copy(
                 &pending_target_hidden,
                 target_hidden,
                 adapter.target_hidden_byte_capacity,
             )
-            .map_err(VulkanResidentInProcessPlacedRuntimeError::FeedbackCable)?;
+            .map_err(VulkanResidentInProcessPlacedRuntimeError::FeedbackEdge)?;
         let state_transaction =
             VulkanResidentStateTransactionBank::new_transactional(device, &mounted.buffers, 1)
                 .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
@@ -218,7 +218,7 @@ impl VulkanResidentSpeculativeDecoderProcessor {
     fn restore_baseline(&self) -> Result<(), VulkanResidentInProcessPlacedRuntimeError> {
         self.restore_target_hidden_copy
             .run(self.restore_target_hidden_copy.byte_len())
-            .map_err(VulkanResidentInProcessPlacedRuntimeError::FeedbackCable)?;
+            .map_err(VulkanResidentInProcessPlacedRuntimeError::FeedbackEdge)?;
         self.state_transaction
             .restore_baseline(&self.mounted.buffers)
             .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
@@ -491,7 +491,7 @@ impl VulkanResidentSpeculativeDecoderProcessor {
     fn commit_target_hidden(&self) -> Result<(), VulkanResidentInProcessPlacedRuntimeError> {
         self.update_pending_hidden_copy
             .run(self.update_pending_hidden_copy.byte_len())
-            .map_err(VulkanResidentInProcessPlacedRuntimeError::FeedbackCable)
+            .map_err(VulkanResidentInProcessPlacedRuntimeError::FeedbackEdge)
     }
 }
 

@@ -13,18 +13,18 @@ fn inspect_runtime_topology(
         runtime_report_default_vulkan_physical_device_index(args),
     );
     let source_graph = manifest.resolved_source_graph(manifest_dir.to_path_buf())?;
-    let patch = manifest.runtime_patch_from_controls(
+    let runtime_graph = manifest.runtime_graph_from_controls(
         args.default_device_id.as_deref(),
-        &args.pedal_devices,
+        &args.node_devices,
         &args.duplicate_after,
         args.source_chain.as_deref(),
     )?;
-    let effective_graph = source_graph.instantiate_runtime_patch(&patch)?;
-    let placement = effective_graph.placement_plan(&patch.placement_spec())?;
-    let placement_device_ids = placement_device_ids(&placement.pedals);
-    let runtime_routes = runtime_cable_routes_report(args, &placement.cables);
+    let effective_graph = source_graph.instantiate_runtime_graph(&runtime_graph)?;
+    let placement = effective_graph.placement_plan(&runtime_graph.placement_spec())?;
+    let placement_device_ids = placement_device_ids(&placement.components);
+    let runtime_routes = runtime_edge_routes_report(args, &placement.edges);
     let device_bindings = runtime_device_bindings_report(args, &placement_device_ids);
-    let source_pedals = source_pedals_report(&manifest);
+    let source_components = source_components_report(&manifest);
     let payload = RuntimeTopologyReport {
         ok: true,
         schema: RUNTIME_TOPOLOGY_SCHEMA.to_string(),
@@ -35,26 +35,26 @@ fn inspect_runtime_topology(
         config_path: manifest.config_path.clone(),
         tokenizer: serde_json::to_value(&manifest.tokenizer)?,
         available_devices,
-        compiled: RuntimeCompiledPedalboardSummary {
-            wiring: manifest.circuit_graph.wiring.clone(),
-            source_pedal_count: source_pedals.len(),
-            source_pedals,
+        compiled: RuntimeCompiledExecutionGraphSummary {
+            topology: manifest.circuit_graph.topology.clone(),
+            source_component_count: source_components.len(),
+            source_components,
             max_context_activations: manifest.max_context_activations,
         },
-        runtime_patch_controls: runtime_patch_report(args),
-        runtime_patch: patch,
-        effective: RuntimeEffectivePedalboardTopology {
-            wiring: placement.wiring,
-            pedal_count: placement.pedals.len(),
-            cable_count: placement.cables.len(),
-            local_cable_count: placement.local_cable_count,
-            cross_device_cable_count: placement.cross_device_cable_count,
+        runtime_graph_controls: runtime_graph_report(args),
+        runtime_graph: runtime_graph,
+        effective: RuntimeEffectiveExecutionGraphTopology {
+            topology: placement.topology,
+            component_count: placement.components.len(),
+            edge_count: placement.edges.len(),
+            local_edge_count: placement.local_edge_count,
+            cross_device_edge_count: placement.cross_device_edge_count,
             device_count: placement_device_ids.len(),
             device_ids: placement_device_ids,
             device_bindings,
-            cable_routes: runtime_routes,
-            pedals: placement.pedals,
-            cables: placement.cables,
+            edge_routes: runtime_routes,
+            components: placement.components,
+            edges: placement.edges,
         },
     };
 
@@ -62,26 +62,26 @@ fn inspect_runtime_topology(
         println!("{}", serde_json::to_string_pretty(&payload)?);
     } else {
         println!("package_id={}", payload.package_id);
-        println!("source_pedal_count={}", payload.compiled.source_pedal_count);
-        println!("effective_pedal_count={}", payload.effective.pedal_count);
+        println!("source_component_count={}", payload.compiled.source_component_count);
+        println!("effective_node_count={}", payload.effective.component_count);
         println!("device_count={}", payload.effective.device_count);
         println!(
-            "cross_device_cable_count={}",
-            payload.effective.cross_device_cable_count
+            "cross_device_edge_count={}",
+            payload.effective.cross_device_edge_count
         );
         println!(
-            "same_physical_target_cable_count={}",
+            "same_physical_target_edge_count={}",
             payload
                 .effective
-                .cable_routes
-                .same_physical_target_cable_count
+                .edge_routes
+                .same_physical_target_edge_count
         );
         println!(
-            "cross_physical_target_cable_count={}",
+            "cross_physical_target_edge_count={}",
             payload
                 .effective
-                .cable_routes
-                .cross_physical_target_cable_count
+                .edge_routes
+                .cross_physical_target_edge_count
         );
     }
 
@@ -102,8 +102,8 @@ fn inspect_package(
         default_device_id,
         runtime_report_default_vulkan_physical_device_index(args),
     );
-    let source_pedals = source_pedals_report(&manifest);
-    let source_pedal_count = source_pedals.len();
+    let source_components = source_components_report(&manifest);
+    let source_component_count = source_components.len();
     let payload = RuntimePackageInspectionReport {
         ok: true,
         package_manifest: package_manifest.to_path_buf(),
@@ -112,12 +112,12 @@ fn inspect_package(
         package_id: manifest.package_id.clone(),
         config_path: manifest.config_path.clone(),
         tokenizer: serde_json::to_value(&manifest.tokenizer)?,
-        compiled_wiring: manifest.circuit_graph.wiring.clone(),
-        runtime_patch: runtime_patch_report(args),
+        compiled_topology: manifest.circuit_graph.topology.clone(),
+        runtime_graph: runtime_graph_report(args),
         device_bindings: runtime_device_bindings_report(args, &[]),
         max_context_activations: manifest.max_context_activations,
-        source_pedal_count,
-        source_pedals,
+        source_component_count,
+        source_components,
         available_devices,
     };
 
@@ -125,12 +125,12 @@ fn inspect_package(
         println!("{}", serde_json::to_string_pretty(&payload)?);
     } else {
         println!("package_id={}", payload.package_id);
-        println!("source_pedal_count={}", payload.source_pedal_count);
-        println!("compiled_wiring={}", payload.compiled_wiring);
-        for pedal in &payload.source_pedals {
+        println!("source_component_count={}", payload.source_component_count);
+        println!("compiled_topology={}", payload.compiled_topology);
+        for component in &payload.source_components {
             println!(
                 "{} {} kernels={} state_ports={}",
-                pedal.pedal_id, pedal.operator_type, pedal.kernel_count, pedal.state_port_count
+                component.component_id, component.operator_type, component.kernel_count, component.state_port_count
             );
         }
     }
@@ -138,47 +138,47 @@ fn inspect_package(
     Ok(())
 }
 
-fn source_pedals_report(manifest: &VulkanResidentModelPackageManifest) -> Vec<RuntimeSourcePedal> {
-    let execution_by_pedal = manifest
-        .pedal_executions
+fn source_components_report(manifest: &VulkanResidentModelPackageManifest) -> Vec<RuntimeSourceComponent> {
+    let execution_by_component = manifest
+        .component_executions
         .iter()
-        .map(|execution| (execution.pedal_id.as_str(), execution))
+        .map(|execution| (execution.component_id.as_str(), execution))
         .collect::<BTreeMap<_, _>>();
 
     manifest
         .circuit_graph
-        .pedals
+        .components
         .iter()
         .enumerate()
-        .map(|(pedal_index, pedal)| {
-            let execution = execution_by_pedal.get(pedal.pedal_id.as_str());
-            RuntimeSourcePedal {
-                pedal_index,
-                pedal_id: pedal.pedal_id.clone(),
-                operator_type: pedal.operator_type.clone(),
-                runtime_role: pedal.circuit.runtime_role,
-                implementation: pedal.implementation.clone(),
-                behavioral_role: pedal.behavioral_role.clone(),
-                source_layer_index: pedal.circuit.source.source_layer_index,
-                circuit_id: pedal.circuit.id.clone(),
-                input_ports: pedal
+        .map(|(component_index, component)| {
+            let execution = execution_by_component.get(component.component_id.as_str());
+            RuntimeSourceComponent {
+                component_index,
+                component_id: component.component_id.clone(),
+                operator_type: component.operator_type.clone(),
+                runtime_role: component.circuit.runtime_role,
+                implementation: component.implementation.clone(),
+                behavioral_role: component.behavioral_role.clone(),
+                source_layer_index: component.circuit.source.source_layer_index,
+                circuit_id: component.circuit.id.clone(),
+                input_ports: component
                     .circuit
                     .boundary
                     .inputs
                     .iter()
                     .map(package_port_report)
                     .collect::<Vec<_>>(),
-                output_ports: pedal
+                output_ports: component
                     .circuit
                     .boundary
                     .outputs
                     .iter()
                     .map(package_port_report)
                     .collect::<Vec<_>>(),
-                state_port_count: pedal.circuit.state_ports.len(),
-                parameter_ref_count: pedal.params.refs.len(),
-                node_count: pedal.circuit.nodes.len(),
-                kernel_count: match pedal.runtime_role {
+                state_port_count: component.circuit.state_ports.len(),
+                parameter_ref_count: component.params.refs.len(),
+                node_count: component.circuit.nodes.len(),
+                kernel_count: match component.runtime_role {
                     nerve_runtime::CircuitRuntimeRole::SignalProcessor => execution
                         .map(|execution| execution.kernels.len())
                         .unwrap_or(0),
@@ -201,43 +201,43 @@ fn inspect_available_devices(
     discover_runtime_devices(default_device_id, selected_vulkan_device_index)
 }
 
-fn inspect_patch(
+fn inspect_graph(
     args: &Args,
     package_manifest: &Path,
     manifest_dir: &Path,
     manifest: VulkanResidentModelPackageManifest,
 ) -> Result<(), Box<dyn Error>> {
     let source_graph = manifest.resolved_source_graph(manifest_dir.to_path_buf())?;
-    let patch = manifest.runtime_patch_from_controls(
+    let runtime_graph = manifest.runtime_graph_from_controls(
         args.default_device_id.as_deref(),
-        &args.pedal_devices,
+        &args.node_devices,
         &args.duplicate_after,
         args.source_chain.as_deref(),
     )?;
-    let effective_graph = source_graph.instantiate_runtime_patch(&patch)?;
-    let placement = effective_graph.placement_plan(&patch.placement_spec())?;
-    let placement_device_ids = placement_device_ids(&placement.pedals);
-    let instance_count = patch.instances.len();
-    let cable_count = placement.cables.len();
-    let payload = RuntimePatchInspectionReport {
+    let effective_graph = source_graph.instantiate_runtime_graph(&runtime_graph)?;
+    let placement = effective_graph.placement_plan(&runtime_graph.placement_spec())?;
+    let placement_device_ids = placement_device_ids(&placement.components);
+    let instance_count = runtime_graph.instances.len();
+    let edge_count = placement.edges.len();
+    let payload = RuntimeGraphInspectionReport {
         ok: true,
         package_manifest: package_manifest.to_path_buf(),
         package_root: manifest_dir.to_path_buf(),
         package_id: manifest.package_id.clone(),
-        compiled_source_pedal_count: source_graph.circuits.len(),
-        runtime_patch_controls: runtime_patch_report(args),
-        runtime_patch: patch,
+        compiled_source_component_count: source_graph.circuits.len(),
+        runtime_graph_controls: runtime_graph_report(args),
+        runtime_graph: runtime_graph,
         device_bindings: runtime_device_bindings_report(args, &placement_device_ids),
-        effective_pedal_count: instance_count,
-        effective_cable_count: cable_count,
-        placement: RuntimePatchPlacementReport {
+        effective_component_count: instance_count,
+        effective_edge_count: edge_count,
+        placement: RuntimeGraphPlacementReport {
             schema: placement.schema,
-            wiring: placement.wiring,
-            local_cable_count: placement.local_cable_count,
-            cross_device_cable_count: placement.cross_device_cable_count,
-            runtime_routes: runtime_cable_routes_report(args, &placement.cables),
-            pedals: placement.pedals,
-            cables: placement.cables,
+            topology: placement.topology,
+            local_edge_count: placement.local_edge_count,
+            cross_device_edge_count: placement.cross_device_edge_count,
+            runtime_routes: runtime_edge_routes_report(args, &placement.edges),
+            components: placement.components,
+            edges: placement.edges,
         },
     };
 
@@ -245,16 +245,16 @@ fn inspect_patch(
         println!("{}", serde_json::to_string_pretty(&payload)?);
     } else {
         println!("package_id={}", payload.package_id);
-        println!("effective_pedal_count={}", payload.effective_pedal_count);
-        println!("effective_cable_count={}", payload.effective_cable_count);
+        println!("effective_node_count={}", payload.effective_component_count);
+        println!("effective_edge_count={}", payload.effective_edge_count);
         println!(
-            "cross_device_cable_count={}",
-            payload.placement.cross_device_cable_count
+            "cross_device_edge_count={}",
+            payload.placement.cross_device_edge_count
         );
-        for pedal in &payload.placement.pedals {
+        for component in &payload.placement.components {
             println!(
                 "{} circuit={} device={}",
-                pedal.pedal_id, pedal.circuit_id, pedal.device_id
+                component.component_id, component.circuit_id, component.device_id
             );
         }
     }
@@ -262,13 +262,13 @@ fn inspect_patch(
     Ok(())
 }
 
-fn package_port_report(port: &CircuitPort) -> RuntimePedalPortSummary {
-    RuntimePedalPortSummary {
+fn package_port_report(port: &CircuitPort) -> RuntimeComponentPortSummary {
+    RuntimeComponentPortSummary {
         id: port.id.clone(),
         signal: port.signal.clone(),
         shape: port.shape.clone(),
         source: port.source.clone(),
-        pedal_port: port.pedal_port.clone(),
+        component_port: port.component_port.clone(),
     }
 }
 
@@ -301,9 +301,9 @@ fn inspect_device_slice(
         println!("{}", serde_json::to_string_pretty(&payload)?);
     } else {
         println!("device_id={}", payload.device_id);
-        println!("hosted_pedal_count={}", payload.hosted_pedal_count);
-        println!("incoming_cable_count={}", payload.incoming_cable_count);
-        println!("outgoing_cable_count={}", payload.outgoing_cable_count);
+        println!("hosted_node_count={}", payload.hosted_component_count);
+        println!("incoming_edge_count={}", payload.incoming_edge_count);
+        println!("outgoing_edge_count={}", payload.outgoing_edge_count);
         println!("dispatch_count={}", payload.dispatch_count);
         println!("descriptor_count={}", payload.descriptor_count);
         println!("tick_stage_count={}", payload.tick_plan.stage_count);
@@ -345,10 +345,10 @@ fn inspect_placement(
         ok: true,
         package_manifest: package_manifest.to_path_buf(),
         context_window_activations: capacity,
-        runtime_patch: runtime_patch_report(args),
+        runtime_graph: runtime_graph_report(args),
         device_bindings: runtime_device_bindings_report(args, &device_ids),
         bound_devices: bound_devices_report(&bound_devices),
-        cable_routes: bound_cable_routes_report(&bound_devices, &placement.cables),
+        edge_routes: bound_edge_routes_report(&bound_devices, &placement.edges),
         device_count: device_ids.len(),
         device_ids,
         devices: slices,
@@ -360,11 +360,11 @@ fn inspect_placement(
         println!("device_count={}", payload.device_count);
         for device in &payload.devices {
             println!(
-                "{} pedals={} incoming={} outgoing={} dispatches={}",
+                "{} nodes={} incoming={} outgoing={} dispatches={}",
                 device.device_id,
-                device.hosted_pedal_count,
-                device.incoming_cable_count,
-                device.outgoing_cable_count,
+                device.hosted_component_count,
+                device.incoming_edge_count,
+                device.outgoing_edge_count,
                 device.dispatch_count
             );
         }
@@ -408,57 +408,57 @@ fn inspect_device_slice_payload(
         device_name: device.device_name().to_string(),
         device_id: slice.device_id,
         context_window_activations: capacity,
-        hosted_pedals: resident_plan.hosted_pedal_ids.clone(),
-        local_cables: resident_plan
-            .local_cables
+        hosted_components: resident_plan.hosted_component_ids.clone(),
+        local_edges: resident_plan
+            .local_edges
             .iter()
-            .map(|cable| RuntimeLocalCableBufferReport {
-                cable_index: cable.cable_index,
-                signal: cable.signal.clone(),
-                source_pedal_id: cable.source_pedal_id.clone(),
-                destination_pedal_id: cable.destination_pedal_id.clone(),
-                device_id: cable.source_device_id.clone(),
+            .map(|edge| RuntimeLocalEdgeBufferReport {
+                edge_index: edge.edge_index,
+                signal: edge.signal.clone(),
+                source_component_id: edge.source_component_id.clone(),
+                destination_component_id: edge.destination_component_id.clone(),
+                device_id: edge.source_device_id.clone(),
                 byte_capacity: mounted
-                    .cable_io
-                    .local_cable_buffer(cable.cable_index)
+                    .edge_io
+                    .local_edge_buffer(edge.edge_index)
                     .map(|buffer| buffer.byte_capacity),
             })
             .collect::<Vec<_>>(),
-        incoming_cables: resident_plan
-            .incoming_cables
+        incoming_edges: resident_plan
+            .incoming_edges
             .iter()
-            .map(|cable| RuntimeRemoteCableBufferReport {
-                cable_index: cable.cable_index,
-                signal: cable.signal.clone(),
-                source_device_id: cable.source_device_id.clone(),
-                source_pedal_id: cable.source_pedal_id.clone(),
-                destination_device_id: cable.destination_device_id.clone(),
-                destination_pedal_id: cable.destination_pedal_id.clone(),
+            .map(|edge| RuntimeRemoteEdgeBufferReport {
+                edge_index: edge.edge_index,
+                signal: edge.signal.clone(),
+                source_device_id: edge.source_device_id.clone(),
+                source_component_id: edge.source_component_id.clone(),
+                destination_device_id: edge.destination_device_id.clone(),
+                destination_component_id: edge.destination_component_id.clone(),
                 byte_capacity: mounted
-                    .cable_io
-                    .incoming_buffer(cable.cable_index)
+                    .edge_io
+                    .incoming_buffer(edge.edge_index)
                     .map(|buffer| buffer.byte_capacity),
             })
             .collect::<Vec<_>>(),
-        outgoing_cables: resident_plan
-            .outgoing_cables
+        outgoing_edges: resident_plan
+            .outgoing_edges
             .iter()
-            .map(|cable| RuntimeRemoteCableBufferReport {
-                cable_index: cable.cable_index,
-                signal: cable.signal.clone(),
-                source_device_id: cable.source_device_id.clone(),
-                source_pedal_id: cable.source_pedal_id.clone(),
-                destination_device_id: cable.destination_device_id.clone(),
-                destination_pedal_id: cable.destination_pedal_id.clone(),
+            .map(|edge| RuntimeRemoteEdgeBufferReport {
+                edge_index: edge.edge_index,
+                signal: edge.signal.clone(),
+                source_device_id: edge.source_device_id.clone(),
+                source_component_id: edge.source_component_id.clone(),
+                destination_device_id: edge.destination_device_id.clone(),
+                destination_component_id: edge.destination_component_id.clone(),
                 byte_capacity: mounted
-                    .cable_io
-                    .outgoing_buffer(cable.cable_index)
+                    .edge_io
+                    .outgoing_buffer(edge.edge_index)
                     .map(|buffer| buffer.byte_capacity),
             })
             .collect::<Vec<_>>(),
-        hosted_pedal_count: slice.hosted_pedal_count,
-        incoming_cable_count: slice.incoming_cable_count,
-        outgoing_cable_count: slice.outgoing_cable_count,
+        hosted_component_count: slice.hosted_component_count,
+        incoming_edge_count: slice.incoming_edge_count,
+        outgoing_edge_count: slice.outgoing_edge_count,
         permanent_parameter_count: slice.permanent_parameter_count,
         permanent_parameter_bytes: slice.permanent_parameter_bytes,
         reusable_kernel_word_count: slice.reusable_kernel_word_count,
@@ -466,21 +466,20 @@ fn inspect_device_slice_payload(
         dispatch_count: mounted_bound.dispatches.len(),
         descriptor_count: mounted_bound.total_descriptor_count,
         model_boundary_descriptor_count: mounted_bound.model_boundary_descriptor_count,
-        incoming_cable_descriptor_count: mounted_bound.incoming_cable_descriptor_count,
-        outgoing_cable_descriptor_count: mounted_bound.outgoing_cable_descriptor_count,
+        incoming_edge_descriptor_count: mounted_bound.incoming_edge_descriptor_count,
+        outgoing_edge_descriptor_count: mounted_bound.outgoing_edge_descriptor_count,
         tick_plan: RuntimeDeviceTickPlanReport {
             stage_count: tick_plan.stage_count,
             receive_stage_count: tick_plan.receive_stage_count,
             dispatch_stage_count: tick_plan.dispatch_stage_count,
             publish_stage_count: tick_plan.publish_stage_count,
-            local_cable_read_count: tick_plan.local_cable_read_count,
-            local_cable_write_count: tick_plan.local_cable_write_count,
-            incoming_cable_read_count: tick_plan.incoming_cable_read_count,
-            outgoing_cable_write_count: tick_plan.outgoing_cable_write_count,
+            local_edge_read_count: tick_plan.local_edge_read_count,
+            local_edge_write_count: tick_plan.local_edge_write_count,
+            incoming_edge_read_count: tick_plan.incoming_edge_read_count,
+            outgoing_edge_write_count: tick_plan.outgoing_edge_write_count,
             model_input_read_count: tick_plan.model_input_read_count,
             model_output_write_count: tick_plan.model_output_write_count,
             can_execute: tick_plan.can_execute,
         },
     })
 }
-

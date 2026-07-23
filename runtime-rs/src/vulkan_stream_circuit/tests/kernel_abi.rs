@@ -1,5 +1,5 @@
 #[test]
-fn kernel_interfaces_describe_fixture_model_compiled_pedal_abi() {
+fn kernel_interfaces_describe_fixture_model_compiled_component_abi() {
     let graph = fixture_model_execution_graph();
     let tensor_index = TensorIndex::from_json_file(fixture_model_tensor_index_path()).unwrap();
     let execution_plan =
@@ -46,7 +46,7 @@ fn kernel_interfaces_describe_fixture_model_compiled_pedal_abi() {
     assert_eq!(
         conv_in.outputs[0].resource,
         VulkanSignalResource::ActivationSlot {
-            pedal_id: "layer_00".to_string(),
+            component_id: "layer_00".to_string(),
             slot: 1,
             bytes: Some(6144),
             signal_bytes: Some(6144),
@@ -68,7 +68,7 @@ fn kernel_interfaces_describe_fixture_model_compiled_pedal_abi() {
     assert_eq!(
         q_rope.outputs[0].resource,
         VulkanSignalResource::ActivationSlot {
-            pedal_id: "layer_02".to_string(),
+            component_id: "layer_02".to_string(),
             slot: 2,
             bytes: Some(5120),
             signal_bytes: Some(2048),
@@ -86,7 +86,7 @@ fn kernel_interfaces_describe_fixture_model_compiled_pedal_abi() {
     assert_eq!(
         kv_append.inputs[2].resource,
         VulkanSignalResource::StateBuffer {
-            pedal_id: "layer_02".to_string(),
+            component_id: "layer_02".to_string(),
             state_id: "kv_memory".to_string(),
             static_bytes: None,
             bytes_per_activation: Some(2048),
@@ -128,8 +128,8 @@ fn stream_control_buffer_bytes_follow_kernel_abi_order() {
 }
 
 #[test]
-fn pedal_batch_lane_controls_preserve_each_token_identity() {
-    let controls = pedal_batch_lane_stream_control_bytes(&[9259, 1902], 41, 65_536).unwrap();
+fn component_batch_lane_controls_preserve_each_token_identity() {
+    let controls = component_batch_lane_stream_control_bytes(&[9259, 1902], 41, 65_536).unwrap();
 
     assert_eq!(controls.len(), 2);
     assert_eq!(&controls[0][0..4], &9259u32.to_le_bytes());
@@ -192,7 +192,7 @@ fn dispatch_plan_orders_fixture_model_kernel_commands_for_stream_ticks() {
     assert_eq!(first.dispatch_index, 0);
     assert_eq!(first.circuit_index, 0);
     assert_eq!(first.kernel_id, "layer_00.operator_norm");
-    assert_eq!(first.pedal_id, "layer_00");
+    assert_eq!(first.component_id, "layer_00");
     assert_eq!(first.node_index, 0);
     assert_eq!(first.op, "rms_norm");
     assert_eq!(first.descriptor_bindings.len(), 3);
@@ -246,7 +246,7 @@ fn dispatch_plan_orders_fixture_model_kernel_commands_for_stream_ticks() {
         VulkanKernelDescriptorResource::Signal(VulkanSignalBinding {
             signal_id: "kv_memory".to_string(),
             resource: VulkanSignalResource::StateBuffer {
-                pedal_id: "layer_02".to_string(),
+                component_id: "layer_02".to_string(),
                 state_id: "kv_memory".to_string(),
                 static_bytes: None,
                 bytes_per_activation: Some(2048),
@@ -256,9 +256,9 @@ fn dispatch_plan_orders_fixture_model_kernel_commands_for_stream_ticks() {
     assert_eq!(
         kv_append.descriptor_bindings[6].resource,
         VulkanKernelDescriptorResource::State {
-            pedal_id: "layer_02".to_string(),
+            component_id: "layer_02".to_string(),
             binding: VulkanStateBinding {
-                pedal_id: "layer_02".to_string(),
+                component_id: "layer_02".to_string(),
                 state_id: "kv_memory".to_string(),
                 state_type: "append_only_attention_memory".to_string(),
                 static_bytes: None,

@@ -15,27 +15,27 @@ fn create_distributed_resident_dispatch(
     let input = activation_buffers
         .activation_buffer(
             &planned_dispatch.owner_device_id,
-            &planned_dispatch.input_activation.pedal_id,
+            &planned_dispatch.input_activation.component_id,
             planned_dispatch.input_activation.slot,
             &planned_shard.device_id,
         )
         .ok_or_else(|| {
             VulkanDistributedDispatchRunnerError(format!(
                 "distributed dispatch {}.{} has no input activation on {:?}",
-                planned_dispatch.pedal_id, planned_dispatch.node_id, planned_shard.device_id
+                planned_dispatch.component_id, planned_dispatch.node_id, planned_shard.device_id
             ))
         })?;
     let output = activation_buffers
         .activation_buffer(
             &planned_dispatch.owner_device_id,
-            &planned_dispatch.output_activation.pedal_id,
+            &planned_dispatch.output_activation.component_id,
             planned_dispatch.output_activation.slot,
             &planned_shard.device_id,
         )
         .ok_or_else(|| {
             VulkanDistributedDispatchRunnerError(format!(
                 "distributed dispatch {}.{} has no output activation on {:?}",
-                planned_dispatch.pedal_id, planned_dispatch.node_id, planned_shard.device_id
+                planned_dispatch.component_id, planned_dispatch.node_id, planned_shard.device_id
             ))
         })?;
     let mut bindings = Vec::with_capacity(
@@ -57,14 +57,14 @@ fn create_distributed_resident_dispatch(
         let buffer = activation_buffers
             .activation_buffer(
                 &planned_dispatch.owner_device_id,
-                &auxiliary.pedal_id,
+                &auxiliary.component_id,
                 auxiliary.slot,
                 &planned_shard.device_id,
             )
             .ok_or_else(|| {
                 VulkanDistributedDispatchRunnerError(format!(
                     "distributed dispatch {}.{} has no auxiliary input {} on {:?}",
-                    planned_dispatch.pedal_id,
+                    planned_dispatch.component_id,
                     planned_dispatch.node_id,
                     auxiliary.signal_id,
                     planned_shard.device_id
@@ -107,7 +107,7 @@ fn create_distributed_resident_dispatch(
             .ok_or_else(|| {
                 VulkanDistributedDispatchRunnerError(format!(
                     "distributed dispatch {}.{} has no tensor {:?} range at byte {} with length {} on {:?}",
-                    planned_dispatch.pedal_id,
+                    planned_dispatch.component_id,
                     planned_dispatch.node_id,
                     fragment.tensor,
                     fragment.byte_offset,
@@ -140,8 +140,8 @@ fn create_distributed_resident_dispatch(
             artifact.artifact.local_size_x,
             0,
             Some(format!(
-                "pedal={} node={} distributed=device:{} rows={}..{} base_z={} distribution={:?}",
-                planned_dispatch.pedal_id,
+                "component={} node={} distributed=device:{} rows={}..{} base_z={} distribution={:?}",
+                planned_dispatch.component_id,
                 planned_dispatch.node_id,
                 planned_shard.device_id,
                 planned_shard.row_start,
@@ -153,7 +153,7 @@ fn create_distributed_resident_dispatch(
         .map_err(|error| {
             VulkanDistributedDispatchRunnerError(format!(
                 "failed to create distributed dispatch {}.{} shard on {:?}: {error}",
-                planned_dispatch.pedal_id, planned_dispatch.node_id, planned_shard.device_id
+                planned_dispatch.component_id, planned_dispatch.node_id, planned_shard.device_id
             ))
         })
 }
@@ -199,7 +199,7 @@ impl VulkanDistributedDispatchRunners {
                                 "distributed group {}..{} has no shard {shard_index} for {}.{}",
                                 leader.dispatch_index,
                                 tail.dispatch_index,
-                                planned_dispatch.pedal_id,
+                                planned_dispatch.component_id,
                                 planned_dispatch.node_id
                             ))
                         })?;
@@ -217,7 +217,7 @@ impl VulkanDistributedDispatchRunners {
                         .ok_or_else(|| {
                             VulkanDistributedDispatchRunnerError(format!(
                                 "distributed dispatch {}.{} is missing loaded family {:?}",
-                                planned_dispatch.pedal_id,
+                                planned_dispatch.component_id,
                                 planned_dispatch.node_id,
                                 planned_dispatch.reusable_family_id
                             ))
@@ -286,7 +286,7 @@ impl VulkanDistributedDispatchRunners {
                 {
                     return Err(VulkanDistributedDispatchRunnerError(format!(
                         "distributed dispatch {}.{} requires persistent opaque-file timeline semaphores on owner {:?} and helper {:?}",
-                        leader.pedal_id,
+                        leader.component_id,
                         leader.node_id,
                         planned_group.owner_device_id,
                         planned_shard.device_id
@@ -540,7 +540,7 @@ impl VulkanDistributedDispatchRunners {
                 }
                 return Err(VulkanDistributedDispatchRunnerError(format!(
                     "failed to submit distributed dispatch {}.{} shard on {:?}: {error}",
-                    dispatch.planned.leader().pedal_id,
+                    dispatch.planned.leader().component_id,
                     dispatch.planned.leader().node_id,
                     shard.device_id
                 )));
@@ -551,7 +551,7 @@ impl VulkanDistributedDispatchRunners {
         Ok(VulkanDistributedDispatchRun {
             owner_device_id: owner_device_id.to_string(),
             dispatch_index,
-            pedal_id: dispatch.planned.leader().pedal_id.clone(),
+            component_id: dispatch.planned.leader().component_id.clone(),
             node_id: dispatch.planned.tail().node_id.clone(),
             shard_count: dispatch.shards.len(),
         })
@@ -593,7 +593,7 @@ impl VulkanDistributedDispatchRunners {
             {
                 first_error = Some(format!(
                     "failed waiting for distributed dispatch {}.{} shard on {:?}: {error}",
-                    dispatch.planned.leader().pedal_id,
+                    dispatch.planned.leader().component_id,
                     dispatch.planned.tail().node_id,
                     shard.device_id
                 ));
@@ -638,7 +638,7 @@ impl VulkanDistributedDispatchRunners {
                 }
                 return Err(VulkanDistributedDispatchRunnerError(format!(
                     "failed to submit distributed dispatch {}.{} shard on {:?}: {error}",
-                    dispatch.planned.leader().pedal_id,
+                    dispatch.planned.leader().component_id,
                     dispatch.planned.tail().node_id,
                     shard.device_id
                 )));
@@ -652,7 +652,7 @@ impl VulkanDistributedDispatchRunners {
             {
                 first_wait_error = Some(format!(
                     "failed waiting for distributed dispatch {}.{} shard on {:?}: {error}",
-                    dispatch.planned.leader().pedal_id,
+                    dispatch.planned.leader().component_id,
                     dispatch.planned.tail().node_id,
                     shard.device_id
                 ));
@@ -664,7 +664,7 @@ impl VulkanDistributedDispatchRunners {
         Ok(VulkanDistributedDispatchRun {
             owner_device_id: owner_device_id.to_string(),
             dispatch_index,
-            pedal_id: dispatch.planned.leader().pedal_id.clone(),
+            component_id: dispatch.planned.leader().component_id.clone(),
             node_id: dispatch.planned.tail().node_id.clone(),
             shard_count: dispatch.shards.len(),
         })
@@ -675,7 +675,7 @@ impl VulkanDistributedDispatchRunners {
 pub struct VulkanDistributedDispatchRun {
     pub owner_device_id: String,
     pub dispatch_index: usize,
-    pub pedal_id: String,
+    pub component_id: String,
     pub node_id: String,
     pub shard_count: usize,
 }

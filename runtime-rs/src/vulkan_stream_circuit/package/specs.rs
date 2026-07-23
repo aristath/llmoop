@@ -17,7 +17,7 @@ pub struct VulkanResidentModelPackageManifest {
     pub input_transducer: VulkanResidentInputEmbeddingTransducerPackageSpec,
     pub output_transducer: VulkanResidentOutputTransducerPackageSpec,
     pub sampler: VulkanResidentSamplerPackageSpec,
-    pub pedal_executions: Vec<VulkanResidentPedalExecutionSpec>,
+    pub component_executions: Vec<VulkanResidentComponentExecutionSpec>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub speculative_decoders: Vec<VulkanResidentSpeculativeDecoderPackageSpec>,
     pub artifact_integrity: VulkanResidentPackageArtifactIntegrity,
@@ -26,10 +26,10 @@ pub struct VulkanResidentModelPackageManifest {
 #[derive(Clone, Debug, PartialEq)]
 pub struct VulkanResidentRuntimeModel {
     pub package: VulkanResidentModelPackageManifest,
-    pub patch: StreamCircuitRuntimePatch,
+    pub runtime_graph: StreamCircuitRuntimeGraph,
     pub placement: StreamCircuitPlacementSpec,
     pub circuit_graph: VulkanResidentPackageCircuitGraph,
-    pub pedal_executions: Vec<VulkanResidentPedalExecutionSpec>,
+    pub component_executions: Vec<VulkanResidentComponentExecutionSpec>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -46,8 +46,8 @@ pub struct VulkanResidentPackageArtifactDigest {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct VulkanResidentPackagePedalCircuit {
-    pub pedal_id: String,
+pub struct VulkanResidentPackageComponentCircuit {
+    pub component_id: String,
     pub operator_type: String,
     pub runtime_role: crate::stream_circuit::CircuitRuntimeRole,
     pub implementation: String,
@@ -97,38 +97,38 @@ pub struct VulkanResidentSamplerKernelPackageSpec {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct VulkanResidentPedalExecutionSpec {
-    pub pedal_id: String,
+pub struct VulkanResidentComponentExecutionSpec {
+    pub component_id: String,
     pub operator_type: String,
     pub implementation: String,
-    pub kernels: Vec<VulkanResidentPedalKernelSpec>,
+    pub kernels: Vec<VulkanResidentComponentKernelSpec>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct VulkanResidentPedalKernelSpec {
+pub struct VulkanResidentComponentKernelSpec {
     pub execution_index: usize,
     pub node_id: String,
     pub op: String,
-    pub execution_domain: VulkanResidentPedalKernelExecutionDomain,
+    pub execution_domain: VulkanResidentComponentKernelExecutionDomain,
     pub shader_path: String,
     pub local_size_x: u32,
     pub workgroup_count_x: u32,
-    pub batch_mode: VulkanResidentPedalKernelBatchMode,
-    pub batch_implementations: Vec<VulkanResidentPedalBatchImplementationSpec>,
+    pub batch_mode: VulkanResidentComponentKernelBatchMode,
+    pub batch_implementations: Vec<VulkanResidentComponentBatchImplementationSpec>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct VulkanResidentPedalBatchImplementationSpec {
-    pub execution_domain: VulkanResidentPedalKernelExecutionDomain,
+pub struct VulkanResidentComponentBatchImplementationSpec {
+    pub execution_domain: VulkanResidentComponentKernelExecutionDomain,
     pub lane_tile_width: u32,
     pub exact_primary_equivalence: bool,
     pub exact_causal_sequence_equivalence: bool,
     pub device_requirements: VulkanResidentVulkanDeviceRequirements,
-    pub stages: Vec<VulkanResidentPedalBatchStageSpec>,
+    pub stages: Vec<VulkanResidentComponentBatchStageSpec>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct VulkanResidentPedalBatchStageSpec {
+pub struct VulkanResidentComponentBatchStageSpec {
     pub shader_path: String,
     pub local_size_x: u32,
     pub workgroup_count_x: u32,
@@ -147,7 +147,7 @@ pub struct VulkanResidentVulkanDeviceRequirements {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum VulkanResidentPedalKernelBatchMode {
+pub enum VulkanResidentComponentKernelBatchMode {
     SerialLanes,
     WeightShared,
     CausalScan,
@@ -155,33 +155,33 @@ pub enum VulkanResidentPedalKernelBatchMode {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum VulkanResidentPedalKernelExecutionDomain {
+pub enum VulkanResidentComponentKernelExecutionDomain {
     Decode,
     Prefill,
     DecodeAndPrefill,
 }
 
-impl VulkanResidentPedalKernelExecutionDomain {
+impl VulkanResidentComponentKernelExecutionDomain {
     pub(super) fn supports_decode(self) -> bool {
         matches!(
             self,
-            VulkanResidentPedalKernelExecutionDomain::Decode
-                | VulkanResidentPedalKernelExecutionDomain::DecodeAndPrefill
+            VulkanResidentComponentKernelExecutionDomain::Decode
+                | VulkanResidentComponentKernelExecutionDomain::DecodeAndPrefill
         )
     }
 
     pub(super) fn supports_prefill(self) -> bool {
         matches!(
             self,
-            VulkanResidentPedalKernelExecutionDomain::Prefill
-                | VulkanResidentPedalKernelExecutionDomain::DecodeAndPrefill
+            VulkanResidentComponentKernelExecutionDomain::Prefill
+                | VulkanResidentComponentKernelExecutionDomain::DecodeAndPrefill
         )
     }
 
-    pub(super) fn supports_batch_mode(self, mode: VulkanPedalBatchExecutionMode) -> bool {
+    pub(super) fn supports_batch_mode(self, mode: VulkanComponentBatchExecutionMode) -> bool {
         match mode {
-            VulkanPedalBatchExecutionMode::IndependentCandidates => self.supports_decode(),
-            VulkanPedalBatchExecutionMode::CausalSequence => self.supports_prefill(),
+            VulkanComponentBatchExecutionMode::IndependentCandidates => self.supports_decode(),
+            VulkanComponentBatchExecutionMode::CausalSequence => self.supports_prefill(),
         }
     }
 }
@@ -195,14 +195,14 @@ pub struct VulkanResidentSpeculativeDecoderPackageSpec {
     pub circuit_graph: VulkanResidentPackageCircuitGraph,
     pub input_adapter: VulkanResidentDraftInputAdapterPackageSpec,
     pub output_transducer: VulkanResidentDraftOutputTransducerPackageSpec,
-    pub pedal_executions: Vec<VulkanResidentPedalExecutionSpec>,
+    pub component_executions: Vec<VulkanResidentComponentExecutionSpec>,
     pub state_contract: Value,
     pub verification_contract: Value,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VulkanResidentDraftInputAdapterPackageSpec {
-    pub pedal_id: String,
+    pub component_id: String,
     pub token_embedding_signal_id: String,
     pub target_hidden_signal_id: String,
     pub output_signal_id: String,
@@ -213,7 +213,7 @@ pub struct VulkanResidentDraftInputAdapterPackageSpec {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VulkanResidentDraftOutputTransducerPackageSpec {
-    pub pedal_id: String,
+    pub component_id: String,
     pub input_signal_id: String,
     pub hidden_signal_id: String,
     pub logits_signal_id: String,
@@ -238,8 +238,8 @@ pub struct VulkanResidentDraftOutputTransducerPackageSpec {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct VulkanResidentPedalKernelShaderRef {
-    pub pedal_id: String,
+pub struct VulkanResidentComponentKernelShaderRef {
+    pub component_id: String,
     pub node_id: String,
     pub shader_path: String,
     pub local_size_x: u32,

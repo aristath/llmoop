@@ -8,7 +8,7 @@ fn placed_prompt_stream_owns_package_devices_and_session() {
         }
     };
     let runtime_model = fixture_model_runtime_model_with_placement(
-        StreamCircuitPlacementSpec::new("gpu0").with_pedal_device("layer_02", "gpu1"),
+        StreamCircuitPlacementSpec::new("gpu0").with_component_device("layer_02", "gpu1"),
     );
     let manifest_path = fixture_model_package_manifest_path();
     let manifest_dir = manifest_path.parent().unwrap();
@@ -137,7 +137,7 @@ fn placed_prompt_stream_runs_resident_feedback_across_bridged_slices() {
     drop(stream);
 
     let bridged_runtime_model = fixture_model_runtime_model_with_placement(
-        StreamCircuitPlacementSpec::new("gpu0").with_pedal_device("layer_02", "gpu1"),
+        StreamCircuitPlacementSpec::new("gpu0").with_component_device("layer_02", "gpu1"),
     );
     let bridged_devices = BTreeMap::from([
         ("gpu0".to_string(), device.clone()),
@@ -207,11 +207,11 @@ fn placed_prompt_stream_runs_resident_feedback_across_bridged_slices() {
     assert_eq!(bridged_second.session_run.run.scheduler_turn_count, 8);
     assert_eq!(
         resident_first.session_run.run.transport_stats,
-        VulkanPlacedCableTransportStats::default()
+        VulkanPlacedEdgeTransportStats::default()
     );
     assert_eq!(
         resident_second.session_run.run.transport_stats,
-        VulkanPlacedCableTransportStats::default()
+        VulkanPlacedEdgeTransportStats::default()
     );
     assert_eq!(
         bridged_first
@@ -242,7 +242,7 @@ fn placed_prompt_stream_queues_input_events_and_emits_output_events() {
         }
     };
     let runtime_model = fixture_model_runtime_model_with_placement(
-        StreamCircuitPlacementSpec::new("gpu0").with_pedal_device("layer_02", "gpu1"),
+        StreamCircuitPlacementSpec::new("gpu0").with_component_device("layer_02", "gpu1"),
     );
     let manifest_path = fixture_model_package_manifest_path();
     let manifest_dir = manifest_path.parent().unwrap();
@@ -315,7 +315,7 @@ fn placed_prompt_stream_drains_queued_input_events_until_idle() {
         }
     };
     let runtime_model = fixture_model_runtime_model_with_placement(
-        StreamCircuitPlacementSpec::new("gpu0").with_pedal_device("layer_02", "gpu1"),
+        StreamCircuitPlacementSpec::new("gpu0").with_component_device("layer_02", "gpu1"),
     );
     let manifest_path = fixture_model_package_manifest_path();
     let manifest_dir = manifest_path.parent().unwrap();

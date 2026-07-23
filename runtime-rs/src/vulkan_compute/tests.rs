@@ -167,10 +167,10 @@ mod tests {
     }
 
     #[test]
-    fn semantic_timestamp_labels_expose_pedal_and_op_fields() {
-        let label = "kernel=linear_00 pedal=block_00 node=attn_qkv op=parallel_linear_2way lane=3";
+    fn semantic_timestamp_labels_expose_component_and_op_fields() {
+        let label = "kernel=linear_00 component=block_00 node=attn_qkv op=parallel_linear_2way lane=3";
 
-        assert_eq!(semantic_label_field(label, "pedal"), Some("block_00"));
+        assert_eq!(semantic_label_field(label, "component"), Some("block_00"));
         assert_eq!(
             semantic_label_field(label, "op"),
             Some("parallel_linear_2way")

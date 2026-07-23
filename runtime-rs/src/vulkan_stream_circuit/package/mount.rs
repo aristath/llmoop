@@ -50,9 +50,9 @@ impl VulkanResidentModelPackageManifest {
         let source_graph = manifest
             .resolved_source_graph(package_root)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
-        validate_pedal_executions_against_graph(
+        validate_component_executions_against_graph(
             &manifest.package_id,
-            &manifest.pedal_executions,
+            &manifest.component_executions,
             &source_graph,
         )
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
@@ -67,171 +67,171 @@ impl VulkanResidentModelPackageManifest {
         fs::write(path, bytes)
     }
 
-    pub fn mount_runtime_patch_controls(
+    pub fn mount_runtime_graph_controls(
         self,
         default_device_id: Option<&str>,
-        pedal_devices: &BTreeMap<String, String>,
+        node_devices: &BTreeMap<String, String>,
         duplicate_after: &[(String, String)],
         source_chain: Option<&[(String, String)]>,
     ) -> Result<VulkanResidentRuntimeModel, VulkanResidentTokenModelPackageError> {
-        let patch = self.runtime_patch_from_controls(
+        let runtime_graph = self.runtime_graph_from_controls(
             default_device_id,
-            pedal_devices,
+            node_devices,
             duplicate_after,
             source_chain,
         )?;
 
-        self.mount_runtime_patch(&patch)
+        self.mount_runtime_graph(&runtime_graph)
     }
 
-    pub fn runtime_patch_from_controls(
+    pub fn runtime_graph_from_controls(
         &self,
         default_device_id: Option<&str>,
-        pedal_devices: &BTreeMap<String, String>,
+        node_devices: &BTreeMap<String, String>,
         duplicate_after: &[(String, String)],
         source_chain: Option<&[(String, String)]>,
-    ) -> Result<StreamCircuitRuntimePatch, VulkanResidentTokenModelPackageError> {
+    ) -> Result<StreamCircuitRuntimeGraph, VulkanResidentTokenModelPackageError> {
         let source_graph = self
             .circuit_graph
-            .to_resolved_lowered_pedalboard(PathBuf::from("."))?;
+            .to_resolved_lowered_execution_graph(PathBuf::from("."))?;
         let default_device_id = default_device_id
             .unwrap_or(RUNTIME_DEFAULT_LOGICAL_DEVICE_ID)
             .to_string();
-        let mut patch =
-            StreamCircuitRuntimePatch::from_source_series(&source_graph, default_device_id)
+        let mut runtime_graph =
+            StreamCircuitRuntimeGraph::from_source_series(&source_graph, default_device_id)
                 .map_err(|error| VulkanResidentTokenModelPackageError::new(error.to_string()))?;
         if let Some(source_chain) = source_chain {
-            patch = patch
+            runtime_graph = runtime_graph
                 .with_signal_processor_chain(&source_graph, source_chain)
                 .map_err(|error| VulkanResidentTokenModelPackageError::new(error.to_string()))?;
         }
         for (after_instance_id, new_instance_id) in duplicate_after {
-            patch = patch
+            runtime_graph = runtime_graph
                 .duplicate_after_instance(&source_graph, after_instance_id, new_instance_id)
                 .map_err(|error| VulkanResidentTokenModelPackageError::new(error.to_string()))?;
         }
-        for (instance_id, device_id) in pedal_devices {
-            let instance = patch
+        for (instance_id, device_id) in node_devices {
+            let instance = runtime_graph
                 .instances
                 .iter()
                 .find(|instance| instance.instance_id == *instance_id)
                 .ok_or_else(|| {
                     VulkanResidentTokenModelPackageError::new(format!(
-                        "runtime patch has no pedal instance {instance_id:?}"
+                        "runtime graph has no node instance {instance_id:?}"
                     ))
                 })?;
             let source = source_graph
                 .circuits
                 .iter()
-                .find(|artifact| artifact.pedal.id == instance.source_pedal_id)
-                .expect("validated runtime patch source must exist");
-            if !source.pedal.runtime_role.is_signal_processor() {
+                .find(|artifact| artifact.component.id == instance.source_component_id)
+                .expect("validated runtime graph source must exist");
+            if !source.component.runtime_role.is_signal_processor() {
                 return Err(VulkanResidentTokenModelPackageError::new(format!(
-                    "pedal {instance_id:?} is attached to the processor boundary and cannot be placed independently by the Vulkan backend"
+                    "component {instance_id:?} is attached to the processor boundary and cannot be placed independently by the Vulkan backend"
                 )));
             }
-            patch = patch
+            runtime_graph = runtime_graph
                 .with_instance_device(instance_id, device_id)
                 .map_err(|error| VulkanResidentTokenModelPackageError::new(error.to_string()))?;
         }
-        attach_generation_pedal_devices_for_vulkan(patch, &source_graph)
+        attach_generation_node_devices_for_vulkan(runtime_graph, &source_graph)
             .map_err(|error| VulkanResidentTokenModelPackageError::new(error.to_string()))
     }
 
     pub fn resolved_source_graph(
         &self,
         package_root: impl Into<PathBuf>,
-    ) -> Result<ResolvedLoweredPedalboard, VulkanResidentTokenModelPackageError> {
+    ) -> Result<ResolvedLoweredExecutionGraph, VulkanResidentTokenModelPackageError> {
         self.circuit_graph
-            .to_resolved_lowered_pedalboard(package_root)
+            .to_resolved_lowered_execution_graph(package_root)
     }
 
-    pub fn mount_runtime_patch(
+    pub fn mount_runtime_graph(
         self,
-        patch: &StreamCircuitRuntimePatch,
+        runtime_graph: &StreamCircuitRuntimeGraph,
     ) -> Result<VulkanResidentRuntimeModel, VulkanResidentTokenModelPackageError> {
         let source_graph = self
             .circuit_graph
-            .to_resolved_lowered_pedalboard(PathBuf::from("."))?;
-        let patch = attach_generation_pedal_devices_for_vulkan(patch.clone(), &source_graph)
+            .to_resolved_lowered_execution_graph(PathBuf::from("."))?;
+        let runtime_graph = attach_generation_node_devices_for_vulkan(runtime_graph.clone(), &source_graph)
             .map_err(|error| VulkanResidentTokenModelPackageError::new(error.to_string()))?;
-        patch
+        runtime_graph
             .validate_against_graph(&source_graph)
             .map_err(|error| VulkanResidentTokenModelPackageError::new(error.to_string()))?;
 
-        let source_pedals = self
+        let source_components = self
             .circuit_graph
-            .pedals
+            .components
             .iter()
-            .map(|pedal| (pedal.pedal_id.as_str(), pedal))
+            .map(|component| (component.component_id.as_str(), component))
             .collect::<BTreeMap<_, _>>();
         let source_executions = self
-            .pedal_executions
+            .component_executions
             .iter()
-            .map(|execution| (execution.pedal_id.as_str(), execution))
+            .map(|execution| (execution.component_id.as_str(), execution))
             .collect::<BTreeMap<_, _>>();
 
-        let ordered_instance_ids = patch
+        let ordered_instance_ids = runtime_graph
             .topological_instance_ids(&source_graph)
             .map_err(|error| VulkanResidentTokenModelPackageError::new(error.to_string()))?;
         let enabled_instance_count = ordered_instance_ids.len();
-        let mut pedals = Vec::with_capacity(enabled_instance_count);
-        let mut pedal_executions = Vec::with_capacity(enabled_instance_count);
-        let mut placement = StreamCircuitPlacementSpec::new(patch.default_device_id.clone());
+        let mut components = Vec::with_capacity(enabled_instance_count);
+        let mut component_executions = Vec::with_capacity(enabled_instance_count);
+        let mut placement = StreamCircuitPlacementSpec::new(runtime_graph.default_device_id.clone());
 
         for instance_id in ordered_instance_ids {
-            let instance = patch
+            let instance = runtime_graph
                 .instances
                 .iter()
                 .find(|instance| instance.instance_id == instance_id)
                 .expect("validated topological instance id must exist");
-            let source_pedal = source_pedals
-                .get(instance.source_pedal_id.as_str())
+            let source_component = source_components
+                .get(instance.source_component_id.as_str())
                 .ok_or_else(|| {
                     VulkanResidentTokenModelPackageError::new(format!(
-                        "runtime patch instance {} references unknown source pedal {}",
-                        instance.instance_id, instance.source_pedal_id
+                        "runtime graph instance {} references unknown source component {}",
+                        instance.instance_id, instance.source_component_id
                     ))
                 })?;
-            let mut pedal = (*source_pedal).clone();
-            pedal.pedal_id = instance.instance_id.clone();
-            pedal.circuit.source.pedal_id = instance.instance_id.clone();
-            apply_runtime_patch_state_policy(&mut pedal, &patch, instance);
-            pedals.push(pedal);
+            let mut component = (*source_component).clone();
+            component.component_id = instance.instance_id.clone();
+            component.circuit.source.component_id = instance.instance_id.clone();
+            apply_runtime_graph_state_policy(&mut component, &runtime_graph, instance);
+            components.push(component);
 
-            if source_pedal.runtime_role.is_signal_processor() {
+            if source_component.runtime_role.is_signal_processor() {
                 let source_execution = source_executions
-                    .get(instance.source_pedal_id.as_str())
+                    .get(instance.source_component_id.as_str())
                     .ok_or_else(|| {
                         VulkanResidentTokenModelPackageError::new(format!(
-                            "runtime patch signal processor {} has no execution spec",
-                            instance.source_pedal_id
+                            "runtime graph signal processor {} has no execution spec",
+                            instance.source_component_id
                         ))
                     })?;
                 let mut execution = (*source_execution).clone();
-                execution.pedal_id = instance.instance_id.clone();
-                pedal_executions.push(execution);
+                execution.component_id = instance.instance_id.clone();
+                component_executions.push(execution);
             }
 
-            if instance.device_id != patch.default_device_id {
-                placement = placement.with_pedal_device(&instance.instance_id, &instance.device_id);
+            if instance.device_id != runtime_graph.default_device_id {
+                placement = placement.with_component_device(&instance.instance_id, &instance.device_id);
             }
         }
 
         let mut circuit_graph = self.circuit_graph.clone();
-        circuit_graph.wiring = patch.wiring.clone();
-        circuit_graph.cables = patch
-            .effective_cables()
+        circuit_graph.topology = runtime_graph.topology.clone();
+        circuit_graph.edges = runtime_graph
+            .effective_edges()
             .map_err(|error| VulkanResidentTokenModelPackageError::new(error.to_string()))?;
-        circuit_graph.boundary = patch.boundary.clone();
-        circuit_graph.pedals = pedals;
+        circuit_graph.boundary = runtime_graph.boundary.clone();
+        circuit_graph.components = components;
         validate_generation_execution_contract(&self, &circuit_graph)?;
         Ok(VulkanResidentRuntimeModel {
             package: self,
-            patch,
+            runtime_graph,
             placement,
             circuit_graph,
-            pedal_executions,
+            component_executions,
         })
     }
 }
@@ -239,9 +239,9 @@ impl VulkanResidentModelPackageManifest {
 impl VulkanResidentRuntimeModel {
     pub fn placement_device_ids(&self) -> Vec<String> {
         self.circuit_graph
-            .pedals
+            .components
             .iter()
-            .map(|pedal| self.placement.device_for_pedal(&pedal.pedal_id).to_string())
+            .map(|component| self.placement.device_for_component(&component.component_id).to_string())
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect()
@@ -250,9 +250,9 @@ impl VulkanResidentRuntimeModel {
     pub fn resolved_graph(
         &self,
         package_root: impl Into<PathBuf>,
-    ) -> Result<ResolvedLoweredPedalboard, VulkanResidentTokenModelPackageError> {
+    ) -> Result<ResolvedLoweredExecutionGraph, VulkanResidentTokenModelPackageError> {
         self.circuit_graph
-            .to_resolved_lowered_pedalboard(package_root)
+            .to_resolved_lowered_execution_graph(package_root)
     }
 
     pub fn coalesce_placement_to_device(mut self, device_id: impl Into<String>) -> Self {
@@ -261,23 +261,23 @@ impl VulkanResidentRuntimeModel {
     }
 }
 
-pub(crate) fn attach_generation_pedal_devices_for_vulkan(
-    mut patch: StreamCircuitRuntimePatch,
-    graph: &ResolvedLoweredPedalboard,
-) -> Result<StreamCircuitRuntimePatch, crate::stream_circuit::CircuitPlacementError> {
-    patch.validate_against_graph(graph)?;
+pub(crate) fn attach_generation_node_devices_for_vulkan(
+    mut runtime_graph: StreamCircuitRuntimeGraph,
+    graph: &ResolvedLoweredExecutionGraph,
+) -> Result<StreamCircuitRuntimeGraph, crate::stream_circuit::CircuitPlacementError> {
+    runtime_graph.validate_against_graph(graph)?;
     let source_by_id = graph
         .circuits
         .iter()
-        .map(|artifact| (artifact.pedal.id.as_str(), artifact))
+        .map(|artifact| (artifact.component.id.as_str(), artifact))
         .collect::<BTreeMap<_, _>>();
-    let role_for = |instance: &crate::stream_circuit::StreamCircuitPedalInstance| {
-        source_by_id[instance.source_pedal_id.as_str()]
-            .pedal
+    let role_for = |instance: &crate::stream_circuit::StreamCircuitNodeInstance| {
+        source_by_id[instance.source_component_id.as_str()]
+            .component
             .runtime_role
     };
     let instances_with_role = |role: CircuitRuntimeRole| {
-        patch
+        runtime_graph
             .instances
             .iter()
             .filter(|instance| role_for(instance) == role)
@@ -305,28 +305,28 @@ pub(crate) fn attach_generation_pedal_devices_for_vulkan(
         ));
     };
     let sampler_id = sampler_id.clone();
-    let processor_ids = patch
+    let processor_ids = runtime_graph
         .instances
         .iter()
         .filter(|instance| role_for(instance).is_signal_processor())
         .map(|instance| instance.instance_id.as_str())
         .collect::<BTreeSet<_>>();
-    let input_edges = patch
-        .cables
+    let input_edges = runtime_graph
+        .edges
         .iter()
-        .filter(|cable| {
-            cable.connection.is_forward()
-                && cable.source.pedal_id == input_transducer_id
-                && processor_ids.contains(cable.destination.pedal_id.as_str())
+        .filter(|edge| {
+            edge.connection.is_forward()
+                && edge.source.component_id == input_transducer_id
+                && processor_ids.contains(edge.destination.component_id.as_str())
         })
         .collect::<Vec<_>>();
-    let output_edges = patch
-        .cables
+    let output_edges = runtime_graph
+        .edges
         .iter()
-        .filter(|cable| {
-            cable.connection.is_forward()
-                && processor_ids.contains(cable.source.pedal_id.as_str())
-                && cable.destination.pedal_id == output_transducer_id
+        .filter(|edge| {
+            edge.connection.is_forward()
+                && processor_ids.contains(edge.source.component_id.as_str())
+                && edge.destination.component_id == output_transducer_id
         })
         .collect::<Vec<_>>();
     let ([input_edge], [output_edge]) = (input_edges.as_slice(), output_edges.as_slice()) else {
@@ -335,14 +335,14 @@ pub(crate) fn attach_generation_pedal_devices_for_vulkan(
                 .to_string(),
         ));
     };
-    let device_by_instance = patch
+    let device_by_instance = runtime_graph
         .instances
         .iter()
         .map(|instance| (instance.instance_id.as_str(), instance.device_id.clone()))
         .collect::<BTreeMap<_, _>>();
-    let input_device = device_by_instance[input_edge.destination.pedal_id.as_str()].clone();
-    let output_device = device_by_instance[output_edge.source.pedal_id.as_str()].clone();
-    for instance in &mut patch.instances {
+    let input_device = device_by_instance[input_edge.destination.component_id.as_str()].clone();
+    let output_device = device_by_instance[output_edge.source.component_id.as_str()].clone();
+    for instance in &mut runtime_graph.instances {
         if instance.instance_id == input_transducer_id {
             instance.device_id = input_device.clone();
         } else if instance.instance_id == output_transducer_id || instance.instance_id == sampler_id
@@ -350,45 +350,45 @@ pub(crate) fn attach_generation_pedal_devices_for_vulkan(
             instance.device_id = output_device.clone();
         }
     }
-    patch.validate_against_graph(graph)?;
-    Ok(patch)
+    runtime_graph.validate_against_graph(graph)?;
+    Ok(runtime_graph)
 }
 
-fn apply_runtime_patch_state_policy(
-    pedal: &mut VulkanResidentPackagePedalCircuit,
-    patch: &StreamCircuitRuntimePatch,
-    instance: &crate::stream_circuit::StreamCircuitPedalInstance,
+fn apply_runtime_graph_state_policy(
+    component: &mut VulkanResidentPackageComponentCircuit,
+    runtime_graph: &StreamCircuitRuntimeGraph,
+    instance: &crate::stream_circuit::StreamCircuitNodeInstance,
 ) {
     let (mode, mut source_instance_id) = match &instance.state_policy {
-        StreamCircuitPedalInstanceStatePolicy::Fresh => return,
-        StreamCircuitPedalInstanceStatePolicy::CloneFrom { instance_id } => {
+        StreamCircuitNodeInstanceStatePolicy::Fresh => return,
+        StreamCircuitNodeInstanceStatePolicy::CloneFrom { instance_id } => {
             ("clone_from", instance_id.as_str())
         }
-        StreamCircuitPedalInstanceStatePolicy::ShareWith { instance_id } => {
+        StreamCircuitNodeInstanceStatePolicy::ShareWith { instance_id } => {
             ("shared_from", instance_id.as_str())
         }
     };
     if mode == "clone_from" {
         loop {
-            let source = patch
+            let source = runtime_graph
                 .instances
                 .iter()
                 .find(|candidate| candidate.instance_id == source_instance_id)
                 .expect("validated state source instance must exist");
             match &source.state_policy {
-                StreamCircuitPedalInstanceStatePolicy::ShareWith { instance_id } => {
+                StreamCircuitNodeInstanceStatePolicy::ShareWith { instance_id } => {
                     source_instance_id = instance_id;
                 }
-                StreamCircuitPedalInstanceStatePolicy::Fresh
-                | StreamCircuitPedalInstanceStatePolicy::CloneFrom { .. } => break,
+                StreamCircuitNodeInstanceStatePolicy::Fresh
+                | StreamCircuitNodeInstanceStatePolicy::CloneFrom { .. } => break,
             }
         }
     }
     let source_prefix = format!("{mode}:{source_instance_id}.");
-    for state in &mut pedal.state.state_ports {
+    for state in &mut component.state.state_ports {
         state.sharing = Some(format!("{source_prefix}{}", state.id));
     }
-    for state in &mut pedal.circuit.state_ports {
+    for state in &mut component.circuit.state_ports {
         state.sharing = Some(format!("{source_prefix}{}", state.id));
     }
 }

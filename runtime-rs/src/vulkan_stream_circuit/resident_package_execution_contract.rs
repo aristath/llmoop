@@ -1,32 +1,32 @@
-fn validate_pedal_executions(
+fn validate_component_executions(
     package_id: &str,
-    pedal_executions: &[VulkanResidentPedalExecutionSpec],
+    component_executions: &[VulkanResidentComponentExecutionSpec],
 ) -> Result<(), VulkanResidentTokenModelPackageError> {
-    if pedal_executions.is_empty() {
+    if component_executions.is_empty() {
         return Err(VulkanResidentTokenModelPackageError::new(format!(
-            "resident model package {:?} does not declare pedal executions",
+            "resident model package {:?} does not declare component executions",
             package_id
         )));
     }
     let mut declared_kernels = BTreeSet::new();
-    for pedal in pedal_executions {
-        if pedal.kernels.is_empty() {
+    for component in component_executions {
+        if component.kernels.is_empty() {
             return Err(VulkanResidentTokenModelPackageError::new(format!(
-                "resident model package {:?} declares pedal {:?} with no executable kernels",
-                package_id, pedal.pedal_id
+                "resident model package {:?} declares component {:?} with no executable kernels",
+                package_id, component.component_id
             )));
         }
-        for kernel in &pedal.kernels {
-            if !declared_kernels.insert((pedal.pedal_id.as_str(), kernel.node_id.as_str())) {
+        for kernel in &component.kernels {
+            if !declared_kernels.insert((component.component_id.as_str(), kernel.node_id.as_str())) {
                 return Err(VulkanResidentTokenModelPackageError::new(format!(
-                    "resident model package {:?} declares duplicate pedal kernel {}.{}",
-                    package_id, pedal.pedal_id, kernel.node_id
+                    "resident model package {:?} declares duplicate component kernel {}.{}",
+                    package_id, component.component_id, kernel.node_id
                 )));
             }
             if !kernel.execution_domain.supports_decode() {
                 return Err(VulkanResidentTokenModelPackageError::new(format!(
                     "resident model package {:?} declares non-decode primary execution domain {:?} for {}.{}",
-                    package_id, kernel.execution_domain, pedal.pedal_id, kernel.node_id
+                    package_id, kernel.execution_domain, component.component_id, kernel.node_id
                 )));
             }
             let implementations_are_valid =
@@ -46,9 +46,9 @@ fn validate_pedal_executions(
                     implementation.lane_tile_width > 0
                         && !implementation.stages.is_empty()
                         && match kernel.batch_mode {
-                            VulkanResidentPedalKernelBatchMode::SerialLanes => false,
-                            VulkanResidentPedalKernelBatchMode::WeightShared => true,
-                            VulkanResidentPedalKernelBatchMode::CausalScan => {
+                            VulkanResidentComponentKernelBatchMode::SerialLanes => false,
+                            VulkanResidentComponentKernelBatchMode::WeightShared => true,
+                            VulkanResidentComponentKernelBatchMode::CausalScan => {
                                 implementation.execution_domain.supports_prefill()
                             }
                         }
@@ -76,18 +76,18 @@ fn validate_pedal_executions(
                             .is_none_or(|subgroup_size| subgroup_size > 0)
                 });
             let valid_batch_contract = match kernel.batch_mode {
-                VulkanResidentPedalKernelBatchMode::SerialLanes => {
+                VulkanResidentComponentKernelBatchMode::SerialLanes => {
                     kernel.batch_implementations.is_empty()
                 }
-                VulkanResidentPedalKernelBatchMode::WeightShared
-                | VulkanResidentPedalKernelBatchMode::CausalScan => {
+                VulkanResidentComponentKernelBatchMode::WeightShared
+                | VulkanResidentComponentKernelBatchMode::CausalScan => {
                     !kernel.batch_implementations.is_empty() && implementations_are_valid
                 }
             };
             if !valid_batch_contract {
                 return Err(VulkanResidentTokenModelPackageError::new(format!(
                     "resident model package {:?} declares invalid {:?} execution metadata for {}.{}",
-                    package_id, kernel.batch_mode, pedal.pedal_id, kernel.node_id
+                    package_id, kernel.batch_mode, component.component_id, kernel.node_id
                 )));
             }
         }
@@ -159,17 +159,17 @@ fn validate_generation_execution_contract(
             manifest.package_id
         )));
     }
-    let pedals_with_role = |role: crate::stream_circuit::CircuitRuntimeRole| {
+    let components_with_role = |role: crate::stream_circuit::CircuitRuntimeRole| {
         circuit_graph
-            .pedals
+            .components
             .iter()
-            .filter(|pedal| pedal.runtime_role == role)
+            .filter(|component| component.runtime_role == role)
             .collect::<Vec<_>>()
     };
-    let inputs = pedals_with_role(crate::stream_circuit::CircuitRuntimeRole::InputTransducer);
-    let outputs = pedals_with_role(crate::stream_circuit::CircuitRuntimeRole::OutputTransducer);
-    let samplers = pedals_with_role(crate::stream_circuit::CircuitRuntimeRole::Sampler);
-    let processors = pedals_with_role(crate::stream_circuit::CircuitRuntimeRole::SignalProcessor);
+    let inputs = components_with_role(crate::stream_circuit::CircuitRuntimeRole::InputTransducer);
+    let outputs = components_with_role(crate::stream_circuit::CircuitRuntimeRole::OutputTransducer);
+    let samplers = components_with_role(crate::stream_circuit::CircuitRuntimeRole::Sampler);
+    let processors = components_with_role(crate::stream_circuit::CircuitRuntimeRole::SignalProcessor);
     if inputs.len() != 1 || outputs.len() != 1 || samplers.len() != 1 || processors.is_empty() {
         return Err(VulkanResidentTokenModelPackageError::new(format!(
             "resident model package {:?} generation graph requires one input transducer, one output transducer, one sampler, and at least one signal processor",
@@ -181,44 +181,44 @@ fn validate_generation_execution_contract(
     let sampler = samplers[0];
     let processor_ids = processors
         .iter()
-        .map(|pedal| pedal.pedal_id.as_str())
+        .map(|component| component.component_id.as_str())
         .collect::<BTreeSet<_>>();
     let forward = circuit_graph
-        .cables
+        .edges
         .iter()
-        .filter(|cable| cable.connection.is_forward())
+        .filter(|edge| edge.connection.is_forward())
         .collect::<Vec<_>>();
     let input_edges = forward
         .iter()
         .copied()
-        .filter(|cable| {
-            cable.source.pedal_id == input.pedal_id
-                && processor_ids.contains(cable.destination.pedal_id.as_str())
+        .filter(|edge| {
+            edge.source.component_id == input.component_id
+                && processor_ids.contains(edge.destination.component_id.as_str())
         })
         .collect::<Vec<_>>();
     let output_edges = forward
         .iter()
         .copied()
-        .filter(|cable| {
-            processor_ids.contains(cable.source.pedal_id.as_str())
-                && cable.destination.pedal_id == output.pedal_id
+        .filter(|edge| {
+            processor_ids.contains(edge.source.component_id.as_str())
+                && edge.destination.component_id == output.component_id
         })
         .collect::<Vec<_>>();
     let sampler_edges = forward
         .iter()
         .copied()
-        .filter(|cable| {
-            cable.source.pedal_id == output.pedal_id
-                && cable.destination.pedal_id == sampler.pedal_id
+        .filter(|edge| {
+            edge.source.component_id == output.component_id
+                && edge.destination.component_id == sampler.component_id
         })
         .collect::<Vec<_>>();
     let feedback_edges = circuit_graph
-        .cables
+        .edges
         .iter()
-        .filter(|cable| {
-            !cable.connection.is_forward()
-                && cable.source.pedal_id == sampler.pedal_id
-                && cable.destination.pedal_id == input.pedal_id
+        .filter(|edge| {
+            !edge.connection.is_forward()
+                && edge.source.component_id == sampler.component_id
+                && edge.destination.component_id == input.component_id
         })
         .collect::<Vec<_>>();
     if [
@@ -250,7 +250,7 @@ fn validate_generation_execution_contract(
         || sampler_nodes[0].outputs.len() != 1
     {
         return Err(VulkanResidentTokenModelPackageError::new(format!(
-            "resident model package {:?} generation system pedals have invalid node boundaries",
+            "resident model package {:?} generation system components have invalid node boundaries",
             manifest.package_id
         )));
     }
@@ -269,7 +269,7 @@ fn validate_generation_execution_contract(
         || feedback_edges[0].destination.port_id != input_token_port
     {
         return Err(VulkanResidentTokenModelPackageError::new(format!(
-            "resident model package {:?} generation cables do not match system-pedal ports",
+            "resident model package {:?} generation edges do not match system-component ports",
             manifest.package_id
         )));
     }
@@ -280,7 +280,7 @@ fn validate_generation_execution_contract(
         .iter()
         .map(|port| {
             (
-                port.endpoint.pedal_id.as_str(),
+                port.endpoint.component_id.as_str(),
                 port.endpoint.port_id.as_str(),
             )
         })
@@ -291,7 +291,7 @@ fn validate_generation_execution_contract(
         .iter()
         .map(|port| {
             (
-                port.endpoint.pedal_id.as_str(),
+                port.endpoint.component_id.as_str(),
                 port.endpoint.port_id.as_str(),
             )
         })
@@ -299,12 +299,12 @@ fn validate_generation_execution_contract(
     if circuit_graph.boundary.external_inputs.len() != 2
         || external_input_endpoints
             != BTreeSet::from([
-                (input.pedal_id.as_str(), input_token_port),
-                (sampler.pedal_id.as_str(), sampler_random_port),
+                (input.component_id.as_str(), input_token_port),
+                (sampler.component_id.as_str(), sampler_random_port),
             ])
         || circuit_graph.boundary.public_outputs.len() != 1
         || public_output_endpoints
-            != BTreeSet::from([(sampler.pedal_id.as_str(), sampler_token_port)])
+            != BTreeSet::from([(sampler.component_id.as_str(), sampler_token_port)])
     {
         return Err(VulkanResidentTokenModelPackageError::new(format!(
             "resident model package {:?} must expose one input-transducer input, one sampler random seed, and one sampler public output",
@@ -325,7 +325,7 @@ fn validate_generation_execution_contract(
         || manifest.input_transducer.batch_shader_path.is_empty()
     {
         return Err(VulkanResidentTokenModelPackageError::new(format!(
-            "resident model package {:?} input-transducer execution does not match its circuit pedal",
+            "resident model package {:?} input-transducer execution does not match its circuit component",
             manifest.package_id
         )));
     }
@@ -394,7 +394,7 @@ fn validate_generation_execution_contract(
         || manifest.output_transducer.projection_batch_lane_tile_width == 0
     {
         return Err(VulkanResidentTokenModelPackageError::new(format!(
-            "resident model package {:?} output-transducer execution does not match its circuit pedal",
+            "resident model package {:?} output-transducer execution does not match its circuit component",
             manifest.package_id
         )));
     }
@@ -443,32 +443,32 @@ fn validate_generation_execution_contract(
         && !manifest.sampler.kernels.is_empty();
     if !sampler_matches {
         return Err(VulkanResidentTokenModelPackageError::new(format!(
-            "resident model package {:?} sampler execution does not match its circuit pedal",
+            "resident model package {:?} sampler execution does not match its circuit component",
             manifest.package_id
         )));
     }
     Ok(())
 }
 
-fn validate_pedal_executions_against_graph(
+fn validate_component_executions_against_graph(
     package_id: &str,
-    pedal_executions: &[VulkanResidentPedalExecutionSpec],
-    graph: &ResolvedLoweredPedalboard,
+    component_executions: &[VulkanResidentComponentExecutionSpec],
+    graph: &ResolvedLoweredExecutionGraph,
 ) -> Result<(), VulkanResidentTokenModelPackageError> {
-    validate_pedal_executions(package_id, pedal_executions)?;
-    let execution_by_pedal = pedal_executions
+    validate_component_executions(package_id, component_executions)?;
+    let execution_by_component = component_executions
         .iter()
-        .map(|execution| (execution.pedal_id.as_str(), execution))
+        .map(|execution| (execution.component_id.as_str(), execution))
         .collect::<BTreeMap<_, _>>();
-    let graph_pedals = graph
+    let graph_components = graph
         .circuits
         .iter()
         .filter(|artifact| artifact.circuit.runtime_role.is_signal_processor())
-        .map(|artifact| artifact.pedal.id.as_str())
+        .map(|artifact| artifact.component.id.as_str())
         .collect::<BTreeSet<_>>();
-    if execution_by_pedal.keys().copied().collect::<BTreeSet<_>>() != graph_pedals {
+    if execution_by_component.keys().copied().collect::<BTreeSet<_>>() != graph_components {
         return Err(VulkanResidentTokenModelPackageError::new(format!(
-            "resident model package {:?} pedal executions do not match its circuit graph",
+            "resident model package {:?} component executions do not match its circuit graph",
             package_id
         )));
     }
@@ -477,19 +477,19 @@ fn validate_pedal_executions_against_graph(
         .iter()
         .filter(|artifact| artifact.circuit.runtime_role.is_signal_processor())
     {
-        let execution = execution_by_pedal[artifact.pedal.id.as_str()];
-        if execution.operator_type != artifact.pedal.operator_type
-            || execution.implementation != artifact.pedal.implementation
+        let execution = execution_by_component[artifact.component.id.as_str()];
+        if execution.operator_type != artifact.component.operator_type
+            || execution.implementation != artifact.component.implementation
         {
             return Err(VulkanResidentTokenModelPackageError::new(format!(
-                "resident model package {:?} execution identity for pedal {} does not match its circuit",
-                package_id, artifact.pedal.id
+                "resident model package {:?} execution identity for component {} does not match its circuit",
+                package_id, artifact.component.id
             )));
         }
         if execution.kernels.len() != artifact.circuit.nodes.len() {
             return Err(VulkanResidentTokenModelPackageError::new(format!(
-                "resident model package {:?} pedal {} execution does not cover every circuit node",
-                package_id, artifact.pedal.id
+                "resident model package {:?} component {} execution does not cover every circuit node",
+                package_id, artifact.component.id
             )));
         }
         for (expected_index, (kernel, node)) in execution
@@ -504,8 +504,8 @@ fn validate_pedal_executions_against_graph(
                 || kernel.shader_path.is_empty()
             {
                 return Err(VulkanResidentTokenModelPackageError::new(format!(
-                    "resident model package {:?} pedal {} kernel {} does not match its circuit node",
-                    package_id, artifact.pedal.id, expected_index
+                    "resident model package {:?} component {} kernel {} does not match its circuit node",
+                    package_id, artifact.component.id, expected_index
                 )));
             }
         }
@@ -513,69 +513,69 @@ fn validate_pedal_executions_against_graph(
     Ok(())
 }
 
-fn validate_pedal_executions_against_mounted_dispatches(
+fn validate_component_executions_against_mounted_dispatches(
     package_id: &str,
-    pedal_executions: &[VulkanResidentPedalExecutionSpec],
+    component_executions: &[VulkanResidentComponentExecutionSpec],
     mounted_bound: &VulkanMountedPlacedBoundDispatchPlan,
 ) -> Result<(), VulkanResidentTokenModelPackageError> {
-    let declared_pedals = pedal_executions
+    let declared_components = component_executions
         .iter()
-        .map(|pedal| pedal.pedal_id.as_str())
+        .map(|component| component.component_id.as_str())
         .collect::<BTreeSet<_>>();
-    let mounted_pedals = mounted_bound
+    let mounted_components = mounted_bound
         .dispatches
         .iter()
-        .map(|dispatch| dispatch.pedal_id.as_str())
+        .map(|dispatch| dispatch.component_id.as_str())
         .collect::<BTreeSet<_>>();
 
-    let missing_pedals = mounted_pedals
-        .difference(&declared_pedals)
+    let missing_components = mounted_components
+        .difference(&declared_components)
         .copied()
         .collect::<Vec<_>>();
-    if !missing_pedals.is_empty() {
+    if !missing_components.is_empty() {
         return Err(VulkanResidentTokenModelPackageError::new(format!(
-            "resident model package {:?} is missing pedal executions for mounted pedals: {}",
+            "resident model package {:?} is missing component executions for mounted components: {}",
             package_id,
-            missing_pedals.join(", ")
+            missing_components.join(", ")
         )));
     }
 
-    let unknown_pedals = declared_pedals
-        .difference(&mounted_pedals)
+    let unknown_components = declared_components
+        .difference(&mounted_components)
         .copied()
         .collect::<Vec<_>>();
-    if !unknown_pedals.is_empty() {
+    if !unknown_components.is_empty() {
         return Err(VulkanResidentTokenModelPackageError::new(format!(
-            "resident model package {:?} declares pedal executions for unknown mounted pedals: {}",
+            "resident model package {:?} declares component executions for unknown mounted components: {}",
             package_id,
-            unknown_pedals.join(", ")
+            unknown_components.join(", ")
         )));
     }
 
-    for pedal in pedal_executions {
+    for component in component_executions {
         let mounted_dispatches = mounted_bound
             .dispatches
             .iter()
-            .filter(|dispatch| dispatch.pedal_id == pedal.pedal_id)
+            .filter(|dispatch| dispatch.component_id == component.component_id)
             .collect::<Vec<_>>();
-        if pedal.kernels.len() != mounted_dispatches.len() {
+        if component.kernels.len() != mounted_dispatches.len() {
             return Err(VulkanResidentTokenModelPackageError::new(format!(
-                "resident model package {:?} declares {} kernels for pedal {}, but mounted dispatch plan has {}",
+                "resident model package {:?} declares {} kernels for component {}, but mounted dispatch plan has {}",
                 package_id,
-                pedal.kernels.len(),
-                pedal.pedal_id,
+                component.kernels.len(),
+                component.component_id,
                 mounted_dispatches.len()
             )));
         }
 
         for (expected_index, (kernel, dispatch)) in
-            pedal.kernels.iter().zip(mounted_dispatches).enumerate()
+            component.kernels.iter().zip(mounted_dispatches).enumerate()
         {
             if kernel.execution_index != expected_index {
                 return Err(VulkanResidentTokenModelPackageError::new(format!(
-                    "resident model package {:?} declares pedal {} kernel {} with execution_index {}, expected {}",
+                    "resident model package {:?} declares component {} kernel {} with execution_index {}, expected {}",
                     package_id,
-                    pedal.pedal_id,
+                    component.component_id,
                     kernel.node_id,
                     kernel.execution_index,
                     expected_index
@@ -583,21 +583,21 @@ fn validate_pedal_executions_against_mounted_dispatches(
             }
             if kernel.node_id != dispatch.node_id {
                 return Err(VulkanResidentTokenModelPackageError::new(format!(
-                    "resident model package {:?} declares pedal {} execution_index {} as node {}, but mounted dispatch plan has node {}",
-                    package_id, pedal.pedal_id, expected_index, kernel.node_id, dispatch.node_id
+                    "resident model package {:?} declares component {} execution_index {} as node {}, but mounted dispatch plan has node {}",
+                    package_id, component.component_id, expected_index, kernel.node_id, dispatch.node_id
                 )));
             }
             if kernel.op != dispatch.op {
                 return Err(VulkanResidentTokenModelPackageError::new(format!(
-                    "resident model package {:?} declares pedal {} node {} op {}, but mounted dispatch plan has op {}",
-                    package_id, pedal.pedal_id, kernel.node_id, kernel.op, dispatch.op
+                    "resident model package {:?} declares component {} node {} op {}, but mounted dispatch plan has op {}",
+                    package_id, component.component_id, kernel.node_id, kernel.op, dispatch.op
                 )));
             }
             if kernel.execution_index != dispatch.node_index {
                 return Err(VulkanResidentTokenModelPackageError::new(format!(
-                    "resident model package {:?} declares pedal {} node {} execution_index {}, but mounted dispatch plan has node_index {}",
+                    "resident model package {:?} declares component {} node {} execution_index {}, but mounted dispatch plan has node_index {}",
                     package_id,
-                    pedal.pedal_id,
+                    component.component_id,
                     kernel.node_id,
                     kernel.execution_index,
                     dispatch.node_index
@@ -609,60 +609,60 @@ fn validate_pedal_executions_against_mounted_dispatches(
     Ok(())
 }
 
-fn validate_pedal_executions_cover_prepared_dispatches(
+fn validate_component_executions_cover_prepared_dispatches(
     package_id: &str,
-    pedal_executions: &[VulkanResidentPedalExecutionSpec],
+    component_executions: &[VulkanResidentComponentExecutionSpec],
     prepared_plan: &VulkanPreparedDispatchPlan,
 ) -> Result<(), VulkanResidentTokenModelPackageError> {
-    let declared_pedals = pedal_executions
+    let declared_components = component_executions
         .iter()
-        .map(|pedal| pedal.pedal_id.as_str())
+        .map(|component| component.component_id.as_str())
         .collect::<BTreeSet<_>>();
-    let mounted_pedals = prepared_plan
+    let mounted_components = prepared_plan
         .dispatches
         .iter()
-        .map(|dispatch| dispatch.pedal_id.as_str())
+        .map(|dispatch| dispatch.component_id.as_str())
         .collect::<BTreeSet<_>>();
 
-    let missing_pedals = mounted_pedals
-        .difference(&declared_pedals)
+    let missing_components = mounted_components
+        .difference(&declared_components)
         .copied()
         .collect::<Vec<_>>();
-    if !missing_pedals.is_empty() {
+    if !missing_components.is_empty() {
         return Err(VulkanResidentTokenModelPackageError::new(format!(
-            "resident model package {:?} is missing pedal executions for mounted pedals: {}",
+            "resident model package {:?} is missing component executions for mounted components: {}",
             package_id,
-            missing_pedals.join(", ")
+            missing_components.join(", ")
         )));
     }
 
-    for pedal in pedal_executions
+    for component in component_executions
         .iter()
-        .filter(|pedal| mounted_pedals.contains(pedal.pedal_id.as_str()))
+        .filter(|component| mounted_components.contains(component.component_id.as_str()))
     {
         let mounted_dispatches = prepared_plan
             .dispatches
             .iter()
-            .filter(|dispatch| dispatch.pedal_id == pedal.pedal_id)
+            .filter(|dispatch| dispatch.component_id == component.component_id)
             .collect::<Vec<_>>();
-        if pedal.kernels.len() != mounted_dispatches.len() {
+        if component.kernels.len() != mounted_dispatches.len() {
             return Err(VulkanResidentTokenModelPackageError::new(format!(
-                "resident model package {:?} declares {} kernels for mounted pedal {}, but mounted dispatch plan has {}",
+                "resident model package {:?} declares {} kernels for mounted component {}, but mounted dispatch plan has {}",
                 package_id,
-                pedal.kernels.len(),
-                pedal.pedal_id,
+                component.kernels.len(),
+                component.component_id,
                 mounted_dispatches.len()
             )));
         }
 
         for (expected_index, (kernel, dispatch)) in
-            pedal.kernels.iter().zip(mounted_dispatches).enumerate()
+            component.kernels.iter().zip(mounted_dispatches).enumerate()
         {
             if kernel.execution_index != expected_index {
                 return Err(VulkanResidentTokenModelPackageError::new(format!(
-                    "resident model package {:?} declares pedal {} kernel {} with execution_index {}, expected {}",
+                    "resident model package {:?} declares component {} kernel {} with execution_index {}, expected {}",
                     package_id,
-                    pedal.pedal_id,
+                    component.component_id,
                     kernel.node_id,
                     kernel.execution_index,
                     expected_index
@@ -670,21 +670,21 @@ fn validate_pedal_executions_cover_prepared_dispatches(
             }
             if kernel.node_id != dispatch.node_id {
                 return Err(VulkanResidentTokenModelPackageError::new(format!(
-                    "resident model package {:?} declares mounted pedal {} execution_index {} as node {}, but mounted dispatch plan has node {}",
-                    package_id, pedal.pedal_id, expected_index, kernel.node_id, dispatch.node_id
+                    "resident model package {:?} declares mounted component {} execution_index {} as node {}, but mounted dispatch plan has node {}",
+                    package_id, component.component_id, expected_index, kernel.node_id, dispatch.node_id
                 )));
             }
             if kernel.op != dispatch.op {
                 return Err(VulkanResidentTokenModelPackageError::new(format!(
-                    "resident model package {:?} declares mounted pedal {} node {} op {}, but mounted dispatch plan has op {}",
-                    package_id, pedal.pedal_id, kernel.node_id, kernel.op, dispatch.op
+                    "resident model package {:?} declares mounted component {} node {} op {}, but mounted dispatch plan has op {}",
+                    package_id, component.component_id, kernel.node_id, kernel.op, dispatch.op
                 )));
             }
             if kernel.execution_index != dispatch.node_index {
                 return Err(VulkanResidentTokenModelPackageError::new(format!(
-                    "resident model package {:?} declares mounted pedal {} node {} execution_index {}, but mounted dispatch plan has node_index {}",
+                    "resident model package {:?} declares mounted component {} node {} execution_index {}, but mounted dispatch plan has node_index {}",
                     package_id,
-                    pedal.pedal_id,
+                    component.component_id,
                     kernel.node_id,
                     kernel.execution_index,
                     dispatch.node_index

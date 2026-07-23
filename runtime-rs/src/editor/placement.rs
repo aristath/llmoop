@@ -1,14 +1,14 @@
-pub fn placement_pedals_by_instance(
+pub fn placement_components_by_instance(
     validation: &RuntimeEditorValidation,
-) -> BTreeMap<&str, &PedalPlacement> {
+) -> BTreeMap<&str, &ComponentPlacement> {
     validation
         .placement
         .as_ref()
         .map(|placement| {
             placement
-                .pedals
+                .components
                 .iter()
-                .map(|pedal| (pedal.pedal_id.as_str(), pedal))
+                .map(|component| (component.component_id.as_str(), component))
                 .collect()
         })
         .unwrap_or_default()
@@ -94,7 +94,7 @@ mod tests {
     }
 
     #[test]
-    fn generic_editor_preserves_explicit_system_pedal_placement() {
+    fn generic_editor_preserves_explicit_system_component_placement() {
         let package = std::env::var("NERVE_TEST_PACKAGE_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|_| {
@@ -175,7 +175,7 @@ mod tests {
 
         let unsupported = runtime_editor_control_schema(
             1,
-            &serde_json::json!({"id":"control","type":"pedal_control"}),
+            &serde_json::json!({"id":"control","type":"component_control"}),
         );
         assert!(matches!(
             unsupported.kind,

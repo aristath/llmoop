@@ -1,8 +1,8 @@
 pub struct VulkanResidentInProcessPlacedStreamProcessorDevice {
     pub device_id: String,
-    pub hosted_pedal_count: usize,
-    pub incoming_cable_count: usize,
-    pub outgoing_cable_count: usize,
+    pub hosted_component_count: usize,
+    pub incoming_edge_count: usize,
+    pub outgoing_edge_count: usize,
     pub dispatch_count: usize,
     package_slice: Arc<VulkanResidentModelPackageDeviceSlice>,
     mounted: VulkanMountedPlacedStreamCircuit,
@@ -255,7 +255,7 @@ fn apply_placed_clone_state_policies(
         for (state_index_on_device, state) in
             device.mounted.buffers.state_buffers.iter().enumerate()
         {
-            let key = (state.pedal_id.clone(), state.state_id.clone());
+            let key = (state.component_id.clone(), state.state_id.clone());
             if state_index
                 .insert(key.clone(), (device_index, state_index_on_device))
                 .is_some()
@@ -300,7 +300,7 @@ fn inherit_matching_placed_stream_state(
     let source_by_id = source_devices
         .iter()
         .flat_map(|device| device.mounted.buffers.state_buffers.iter())
-        .map(|state| ((state.pedal_id.as_str(), state.state_id.as_str()), state))
+        .map(|state| ((state.component_id.as_str(), state.state_id.as_str()), state))
         .collect::<BTreeMap<_, _>>();
     let mut copied = BTreeSet::new();
     let mut total_copied = 0usize;
@@ -308,7 +308,7 @@ fn inherit_matching_placed_stream_state(
         .iter()
         .flat_map(|device| device.mounted.buffers.state_buffers.iter())
     {
-        let key = (target.pedal_id.as_str(), target.state_id.as_str());
+        let key = (target.component_id.as_str(), target.state_id.as_str());
         let Some(source) = source_by_id.get(&key) else {
             continue;
         };
@@ -318,7 +318,7 @@ fn inherit_matching_placed_stream_state(
         total_copied = total_copied.checked_add(bytes.len()).ok_or_else(|| {
             VulkanError("inherited placed state byte count overflowed".to_string())
         })?;
-        copied.insert((target.pedal_id.clone(), target.state_id.clone()));
+        copied.insert((target.component_id.clone(), target.state_id.clone()));
     }
     Ok((total_copied, copied))
 }
@@ -462,7 +462,7 @@ fn placed_token_input(
     } else if input_device_id == output_device_id {
         VulkanResidentPlacedTokenInput::ResidentFeedback(token_id)
     } else {
-        VulkanResidentPlacedTokenInput::CableFeedback(token_id)
+        VulkanResidentPlacedTokenInput::EdgeFeedback(token_id)
     }
 }
 
@@ -470,7 +470,7 @@ fn placed_token_input(
 enum VulkanResidentPlacedTokenInput {
     HostSupplied(u32),
     ResidentFeedback(u32),
-    CableFeedback(u32),
+    EdgeFeedback(u32),
 }
 
 impl VulkanResidentPlacedTokenInput {
@@ -478,28 +478,28 @@ impl VulkanResidentPlacedTokenInput {
         match self {
             Self::HostSupplied(token_id)
             | Self::ResidentFeedback(token_id)
-            | Self::CableFeedback(token_id) => token_id,
+            | Self::EdgeFeedback(token_id) => token_id,
         }
     }
 }
 
-fn pair_placed_cable_endpoints(
-    plans: &[VulkanPlacedCableIoPlan],
-) -> Result<Vec<(VulkanPlacedCableEndpoint, VulkanPlacedCableEndpoint)>, VulkanError> {
+fn pair_placed_edge_endpoints(
+    plans: &[VulkanPlacedEdgeIoPlan],
+) -> Result<Vec<(VulkanPlacedEdgeEndpoint, VulkanPlacedEdgeEndpoint)>, VulkanError> {
     let mut incoming_by_key = BTreeMap::new();
     for plan in plans {
         for endpoint in plan
             .endpoints
             .iter()
-            .filter(|endpoint| endpoint.direction == VulkanPlacedCableDirection::Incoming)
+            .filter(|endpoint| endpoint.direction == VulkanPlacedEdgeDirection::Incoming)
         {
-            let key = VulkanPlacedCablePacketKey::from_incoming_endpoint(endpoint);
+            let key = VulkanPlacedEdgePacketKey::from_incoming_endpoint(endpoint);
             if incoming_by_key
                 .insert(key.clone(), endpoint.clone())
                 .is_some()
             {
                 return Err(VulkanError(format!(
-                    "placed pedalboard repeats incoming cable endpoint {key:?}"
+                    "placed execution_graph repeats incoming edge endpoint {key:?}"
                 )));
             }
         }
@@ -511,28 +511,28 @@ fn pair_placed_cable_endpoints(
         for outgoing in plan
             .endpoints
             .iter()
-            .filter(|endpoint| endpoint.direction == VulkanPlacedCableDirection::Outgoing)
+            .filter(|endpoint| endpoint.direction == VulkanPlacedEdgeDirection::Outgoing)
         {
-            let key = VulkanPlacedCablePacketKey::from_outgoing_endpoint(outgoing);
+            let key = VulkanPlacedEdgePacketKey::from_outgoing_endpoint(outgoing);
             if !outgoing_keys.insert(key.clone()) {
                 return Err(VulkanError(format!(
-                    "placed pedalboard repeats outgoing cable endpoint {key:?}"
+                    "placed execution_graph repeats outgoing edge endpoint {key:?}"
                 )));
             }
             let incoming = incoming_by_key.remove(&key).ok_or_else(|| {
                 VulkanError(format!(
-                    "placed pedalboard has no incoming endpoint for cable {key:?}"
+                    "placed execution_graph has no incoming endpoint for edge {key:?}"
                 ))
             })?;
             let outgoing_byte_capacity = outgoing.byte_capacity.ok_or_else(|| {
-                VulkanError(format!("outgoing cable {key:?} has unknown byte capacity"))
+                VulkanError(format!("outgoing edge {key:?} has unknown byte capacity"))
             })?;
             let incoming_byte_capacity = incoming.byte_capacity.ok_or_else(|| {
-                VulkanError(format!("incoming cable {key:?} has unknown byte capacity"))
+                VulkanError(format!("incoming edge {key:?} has unknown byte capacity"))
             })?;
             if outgoing_byte_capacity != incoming_byte_capacity {
                 return Err(VulkanError(format!(
-                    "placed cable {key:?} has outgoing capacity {outgoing_byte_capacity} and incoming capacity {incoming_byte_capacity}"
+                    "placed edge {key:?} has outgoing capacity {outgoing_byte_capacity} and incoming capacity {incoming_byte_capacity}"
                 )));
             }
             pairs.push((outgoing.clone(), incoming));
@@ -540,38 +540,38 @@ fn pair_placed_cable_endpoints(
     }
     if let Some(key) = incoming_by_key.keys().next() {
         return Err(VulkanError(format!(
-            "placed pedalboard has no outgoing endpoint for cable {key:?}"
+            "placed execution_graph has no outgoing endpoint for edge {key:?}"
         )));
     }
     Ok(pairs)
 }
 
 struct VulkanPlacedDeviceLinks {
-    endpoint_overrides: BTreeMap<String, Vec<VulkanPlacedCableEndpointBufferOverride>>,
-    synchronizations: VulkanPlacedCableTimelineSynchronizations,
+    endpoint_overrides: BTreeMap<String, Vec<VulkanPlacedEdgeEndpointBufferOverride>>,
+    synchronizations: VulkanPlacedEdgeTimelineSynchronizations,
     stream_control_buffers: BTreeMap<String, Arc<VulkanResidentBuffer>>,
 }
 
 #[derive(Default)]
-struct VulkanPlacedCableTimelineSynchronizations {
-    cables: BTreeMap<VulkanPlacedCablePacketKey, VulkanPlacedCableTimelineSynchronization>,
+struct VulkanPlacedEdgeTimelineSynchronizations {
+    edges: BTreeMap<VulkanPlacedEdgePacketKey, VulkanPlacedEdgeTimelineSynchronization>,
 }
 
-struct VulkanPlacedCableTimelineSynchronization {
+struct VulkanPlacedEdgeTimelineSynchronization {
     source_signal: VulkanTimelineSemaphore,
     destination_wait: VulkanTimelineSemaphore,
     next_value: Cell<u64>,
     pending_value: Cell<Option<u64>>,
 }
 
-impl VulkanPlacedCableTimelineSynchronizations {
+impl VulkanPlacedEdgeTimelineSynchronizations {
     fn advance_replayed_dependencies(&self, count: usize) -> Result<(), VulkanError> {
         let count = u64::try_from(count)
-            .map_err(|_| VulkanError("placed cable replay width exceeds u64".to_string()))?;
-        for (key, synchronization) in &self.cables {
+            .map_err(|_| VulkanError("placed edge replay width exceeds u64".to_string()))?;
+        for (key, synchronization) in &self.edges {
             if synchronization.pending_value.get().is_some() {
                 return Err(VulkanError(format!(
-                    "cross-device cable {key:?} cannot replay with an unconsumed timeline dependency"
+                    "cross-device edge {key:?} cannot replay with an unconsumed timeline dependency"
                 )));
             }
             synchronization
@@ -580,17 +580,17 @@ impl VulkanPlacedCableTimelineSynchronizations {
                 .checked_add(count)
                 .ok_or_else(|| {
                     VulkanError(format!(
-                        "cross-device cable {key:?} exhausts its timeline values during replay"
+                        "cross-device edge {key:?} exhausts its timeline values during replay"
                     ))
                 })?;
         }
-        for synchronization in self.cables.values() {
+        for synchronization in self.edges.values() {
             synchronization.next_value.set(
                 synchronization
                     .next_value
                     .get()
                     .checked_add(count)
-                    .expect("placed cable replay advance was validated"),
+                    .expect("placed edge replay advance was validated"),
             );
         }
         Ok(())
@@ -598,21 +598,21 @@ impl VulkanPlacedCableTimelineSynchronizations {
 
     fn prepare_source_signal<'a>(
         &'a self,
-        endpoint: &VulkanPlacedCableEndpoint,
+        endpoint: &VulkanPlacedEdgeEndpoint,
     ) -> Result<Option<VulkanTimelineSemaphorePoint<'a>>, VulkanError> {
-        let key = VulkanPlacedCablePacketKey::from_outgoing_endpoint(endpoint);
-        let Some(synchronization) = self.cables.get(&key) else {
+        let key = VulkanPlacedEdgePacketKey::from_outgoing_endpoint(endpoint);
+        let Some(synchronization) = self.edges.get(&key) else {
             return Ok(None);
         };
         if synchronization.pending_value.get().is_some() {
             return Err(VulkanError(format!(
-                "cross-device cable {key:?} already has an unconsumed timeline dependency"
+                "cross-device edge {key:?} already has an unconsumed timeline dependency"
             )));
         }
         let value = synchronization.next_value.get();
         let next = value.checked_add(1).ok_or_else(|| {
             VulkanError(format!(
-                "cross-device cable {key:?} exhausted its timeline semaphore values"
+                "cross-device edge {key:?} exhausted its timeline semaphore values"
             ))
         })?;
         synchronization.next_value.set(next);
@@ -625,15 +625,15 @@ impl VulkanPlacedCableTimelineSynchronizations {
 
     fn take_destination_wait<'a>(
         &'a self,
-        endpoint: &VulkanPlacedCableEndpoint,
+        endpoint: &VulkanPlacedEdgeEndpoint,
     ) -> Result<Option<VulkanTimelineSemaphorePoint<'a>>, VulkanError> {
-        let key = VulkanPlacedCablePacketKey::from_incoming_endpoint(endpoint);
-        let Some(synchronization) = self.cables.get(&key) else {
+        let key = VulkanPlacedEdgePacketKey::from_incoming_endpoint(endpoint);
+        let Some(synchronization) = self.edges.get(&key) else {
             return Ok(None);
         };
         let value = synchronization.pending_value.take().ok_or_else(|| {
             VulkanError(format!(
-                "cross-device cable {key:?} has no queued timeline dependency"
+                "cross-device edge {key:?} has no queued timeline dependency"
             ))
         })?;
         Ok(Some(VulkanTimelineSemaphorePoint::new(
@@ -643,7 +643,7 @@ impl VulkanPlacedCableTimelineSynchronizations {
     }
 
     fn has_pending_dependencies(&self) -> bool {
-        self.cables
+        self.edges
             .values()
             .any(|synchronization| synchronization.pending_value.get().is_some())
     }
@@ -659,27 +659,27 @@ where
     let plans = device_slices
         .iter()
         .map(|slice| {
-            VulkanPlacedCableIoPlan::from_placed_resident_plan(
+            VulkanPlacedEdgeIoPlan::from_placed_resident_plan(
                 &slice.placed_plan.placed_resident_plan,
             )
             .map_err(|error| {
                 VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(format!(
-                    "failed to plan shared cable endpoints for {:?}: {error}",
+                    "failed to plan shared edge endpoints for {:?}: {error}",
                     slice.device_id
                 )))
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let cable_pairs = pair_placed_cable_endpoints(&plans)
+    let edge_pairs = pair_placed_edge_endpoints(&plans)
         .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
 
     let mut endpoint_overrides =
-        BTreeMap::<String, Vec<VulkanPlacedCableEndpointBufferOverride>>::new();
+        BTreeMap::<String, Vec<VulkanPlacedEdgeEndpointBufferOverride>>::new();
     let mut synchronizations = BTreeMap::new();
-    for (outgoing, incoming) in cable_pairs {
+    for (outgoing, incoming) in edge_pairs {
         let outgoing_byte_capacity = outgoing
             .byte_capacity
-            .expect("paired outgoing cable capacity was validated");
+            .expect("paired outgoing edge capacity was validated");
         let source_device = device_for(&outgoing.local_device_id)?;
         let destination_device = device_for(&incoming.local_device_id)?;
         let devices_share_queue = source_device.shares_logical_device_with(destination_device);
@@ -712,8 +712,8 @@ where
             {
                 return Err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop(
                     VulkanError(format!(
-                        "cross-device cable {:?} requires persistent opaque-file timeline semaphores",
-                        VulkanPlacedCablePacketKey::from_outgoing_endpoint(&outgoing)
+                        "cross-device edge {:?} requires persistent opaque-file timeline semaphores",
+                        VulkanPlacedEdgePacketKey::from_outgoing_endpoint(&outgoing)
                     )),
                 ));
             }
@@ -731,11 +731,11 @@ where
                         .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?,
                 )
                 .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
-            let key = VulkanPlacedCablePacketKey::from_outgoing_endpoint(&outgoing);
+            let key = VulkanPlacedEdgePacketKey::from_outgoing_endpoint(&outgoing);
             if synchronizations
                 .insert(
                     key.clone(),
-                    VulkanPlacedCableTimelineSynchronization {
+                    VulkanPlacedEdgeTimelineSynchronization {
                         source_signal,
                         destination_wait,
                         next_value: Cell::new(1),
@@ -746,7 +746,7 @@ where
             {
                 return Err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop(
                     VulkanError(format!(
-                        "cross-device cable synchronization repeats {key:?}"
+                        "cross-device edge synchronization repeats {key:?}"
                     )),
                 ));
             }
@@ -754,17 +754,17 @@ where
         endpoint_overrides
             .entry(outgoing.local_device_id.clone())
             .or_default()
-            .push(VulkanPlacedCableEndpointBufferOverride {
-                direction: VulkanPlacedCableDirection::Outgoing,
-                cable_index: outgoing.cable_index,
+            .push(VulkanPlacedEdgeEndpointBufferOverride {
+                direction: VulkanPlacedEdgeDirection::Outgoing,
+                edge_index: outgoing.edge_index,
                 buffer: outgoing_buffer,
             });
         endpoint_overrides
             .entry(incoming.local_device_id.clone())
             .or_default()
-            .push(VulkanPlacedCableEndpointBufferOverride {
-                direction: VulkanPlacedCableDirection::Incoming,
-                cable_index: incoming.cable_index,
+            .push(VulkanPlacedEdgeEndpointBufferOverride {
+                direction: VulkanPlacedEdgeDirection::Incoming,
+                edge_index: incoming.edge_index,
                 buffer: incoming_buffer,
             });
     }
@@ -820,8 +820,8 @@ where
     }
     Ok(VulkanPlacedDeviceLinks {
         endpoint_overrides,
-        synchronizations: VulkanPlacedCableTimelineSynchronizations {
-            cables: synchronizations,
+        synchronizations: VulkanPlacedEdgeTimelineSynchronizations {
+            edges: synchronizations,
         },
         stream_control_buffers,
     })

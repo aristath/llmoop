@@ -28,7 +28,7 @@ fn stream_control_metadata_bytes(
     bytes
 }
 
-fn pedal_batch_lane_stream_control_bytes(
+fn component_batch_lane_stream_control_bytes(
     input_token_ids: &[u32],
     start_stream_tick: u64,
     dynamic_state_capacity_activations: u32,
@@ -57,12 +57,12 @@ fn pedal_batch_lane_stream_control_bytes(
         .collect()
 }
 
-fn pedal_batch_control_bytes(
+fn component_batch_control_bytes(
     batch_width: u32,
     start_stream_tick: u64,
     dynamic_state_capacity_activations: u32,
-) -> [u8; VULKAN_PEDAL_BATCH_CONTROL_BYTE_CAPACITY as usize] {
-    let mut bytes = [0; VULKAN_PEDAL_BATCH_CONTROL_BYTE_CAPACITY as usize];
+) -> [u8; VULKAN_COMPONENT_BATCH_CONTROL_BYTE_CAPACITY as usize] {
+    let mut bytes = [0; VULKAN_COMPONENT_BATCH_CONTROL_BYTE_CAPACITY as usize];
     bytes[0..4].copy_from_slice(&batch_width.to_le_bytes());
     bytes[4..12].copy_from_slice(&start_stream_tick.to_le_bytes());
     bytes[12..16].copy_from_slice(&dynamic_state_capacity_activations.to_le_bytes());

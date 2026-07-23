@@ -33,9 +33,9 @@ fn run() -> Result<(), Box<dyn Error>> {
         let manifest = VulkanResidentModelPackageManifest::from_json_file(package_manifest)?;
         return inspect_package(&args, package_manifest, &manifest_dir, manifest);
     }
-    if args.inspect_patch {
+    if args.inspect_graph {
         let manifest = VulkanResidentModelPackageManifest::from_json_file(package_manifest)?;
-        return inspect_patch(&args, package_manifest, &manifest_dir, manifest);
+        return inspect_graph(&args, package_manifest, &manifest_dir, manifest);
     }
     let runtime_model = runtime_model(&args, package_manifest)?;
     if args.inspect_placement {

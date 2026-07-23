@@ -25,12 +25,12 @@ impl From<VulkanMountedPlacedResidentStreamTickError>
     }
 }
 
-fn register_in_process_direct_cable_copies(
+fn register_in_process_direct_edge_copies(
     slices: &[VulkanMountedPlacedResidentInProcessStreamTickSlice<'_>],
-    transport: &mut VulkanInProcessPlacedCableTransport,
+    transport: &mut VulkanInProcessPlacedEdgeTransport,
 ) -> Result<(), VulkanMountedPlacedResidentInProcessStreamTickError> {
     for source_slice in slices {
-        for outgoing in &source_slice.mounted.cable_io.outgoing_buffers {
+        for outgoing in &source_slice.mounted.edge_io.outgoing_buffers {
             let destination_slice = slices
                 .iter()
                 .find(|slice| slice.device_id() == outgoing.endpoint.remote_device_id);
@@ -39,13 +39,13 @@ fn register_in_process_direct_cable_copies(
             };
             let Some(incoming) = destination_slice
                 .mounted
-                .cable_io
-                .incoming_buffer(outgoing.endpoint.cable_index)
+                .edge_io
+                .incoming_buffer(outgoing.endpoint.edge_index)
             else {
                 continue;
             };
             transport
-                .register_direct_cable_copy(outgoing, incoming)
+                .register_direct_edge_copy(outgoing, incoming)
                 .map_err(VulkanMountedPlacedResidentStreamTickError::Transport)?;
         }
     }

@@ -24,7 +24,7 @@ impl VulkanResidentModelPackage {
             .map(Path::to_path_buf)
             .unwrap_or_else(|| PathBuf::from("."));
         let runtime_model =
-            manifest.mount_runtime_patch_controls(None, &BTreeMap::new(), &[], None)?;
+            manifest.mount_runtime_graph_controls(None, &BTreeMap::new(), &[], None)?;
         Self::from_runtime_model(
             device,
             &manifest_dir,
@@ -47,9 +47,9 @@ impl VulkanResidentModelPackage {
                 "resident dynamic state capacity must be at least 1 activation",
             ));
         }
-        validate_pedal_executions(
+        validate_component_executions(
             &runtime_model.package.package_id,
-            &runtime_model.pedal_executions,
+            &runtime_model.component_executions,
         )?;
 
         let tensor_index_path = resolve_resident_model_package_path(
@@ -145,18 +145,18 @@ impl VulkanResidentModelPackage {
                     "failed to bind Vulkan stream circuit dispatch plan: {error}"
                 ))
             })?;
-        validate_pedal_executions_against_mounted_dispatches(
+        validate_component_executions_against_mounted_dispatches(
             &runtime_model.package.package_id,
-            &runtime_model.pedal_executions,
+            &runtime_model.component_executions,
             &mounted_bound,
         )?;
-        let pedal_kernel_shaders =
-            resident_package_pedal_kernel_shader_refs(&runtime_model.pedal_executions);
+        let component_kernel_shaders =
+            resident_package_component_kernel_shader_refs(&runtime_model.component_executions);
         let loaded_manifest = loaded_kernel_pack_from_package_shader_refs(
             manifest_dir,
             &placed_plan,
             &prepared_plan,
-            &pedal_kernel_shaders,
+            &component_kernel_shaders,
         )?;
 
         Ok(Self {
@@ -244,10 +244,10 @@ impl VulkanResidentModelPackage {
                     "failed to initialize cloned stream state: {error}"
                 ))
             })?;
-        let pedal_ids = self
+        let component_ids = self
             .placed_plan
             .placed_resident_plan
-            .hosted_pedal_ids
+            .hosted_component_ids
             .clone();
         let input_transducer =
             VulkanResidentInputEmbeddingTransducerRunner::from_mounted_token_embedding(
@@ -262,16 +262,16 @@ impl VulkanResidentModelPackage {
                     "failed to create input token embedding transducer: {error}"
                 ))
             })?;
-        let pedalboard = mounted
-            .create_resident_pedalboard_runner(
+        let execution_graph = mounted
+            .create_resident_execution_graph_runner(
                 device,
                 &self.mounted_bound,
-                pedal_ids.iter().map(String::as_str),
+                component_ids.iter().map(String::as_str),
                 &self.loaded_manifest,
             )
             .map_err(|error| {
                 VulkanResidentTokenModelPackageError::new(format!(
-                    "failed to create resident pedalboard runner: {error}"
+                    "failed to create resident execution_graph runner: {error}"
                 ))
             })?;
         let output_transducer =
@@ -298,13 +298,13 @@ impl VulkanResidentModelPackage {
         )
         .map_err(|error| {
             VulkanResidentTokenModelPackageError::new(format!(
-                "failed to create sampler pedal: {error}"
+                "failed to create sampler component: {error}"
             ))
         })?;
         let tick_runner = VulkanResidentSingleTokenTickRunner::new(
             device,
             input_transducer,
-            pedalboard,
+            execution_graph,
             output_transducer,
         )
         .map_err(|error| {

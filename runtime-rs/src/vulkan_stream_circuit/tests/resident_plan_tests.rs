@@ -77,7 +77,7 @@ fn bounds_each_dynamic_state_buffer_by_its_own_activation_limit() {
     let artifact = graph
         .circuits
         .iter_mut()
-        .find(|artifact| artifact.pedal.id == "layer_02")
+        .find(|artifact| artifact.component.id == "layer_02")
         .unwrap();
     artifact
         .state
@@ -106,7 +106,7 @@ fn bounds_each_dynamic_state_buffer_by_its_own_activation_limit() {
     let state = resident_plan
         .stream_state_buffers
         .iter()
-        .find(|state| state.pedal_id == "layer_02" && state.state_id == "kv_memory")
+        .find(|state| state.component_id == "layer_02" && state.state_id == "kv_memory")
         .unwrap();
 
     assert_eq!(state.max_dynamic_activations, Some(2));
@@ -115,7 +115,7 @@ fn bounds_each_dynamic_state_buffer_by_its_own_activation_limit() {
 }
 
 #[test]
-fn placed_resident_plan_hosts_only_the_pedals_assigned_to_a_device() {
+fn placed_resident_plan_hosts_only_the_components_assigned_to_a_device() {
     let graph = fixture_model_execution_graph();
     let tensor_index = TensorIndex::from_json_file(fixture_model_tensor_index_path()).unwrap();
     let execution_plan =
@@ -123,9 +123,9 @@ fn placed_resident_plan_hosts_only_the_pedals_assigned_to_a_device() {
     let resource_plan =
         StreamCircuitResourcePlan::from_graph_and_plan(&graph, &execution_plan).unwrap();
     let placement_spec = StreamCircuitPlacementSpec::new("gpu0")
-        .with_pedal_device("layer_01", "cpu0")
-        .with_pedal_device("layer_02", "gpu1")
-        .with_pedal_device("layer_03", "lan:worker-a");
+        .with_component_device("layer_01", "cpu0")
+        .with_component_device("layer_02", "gpu1")
+        .with_component_device("layer_03", "lan:worker-a");
     let placement_plan = graph.placement_plan(&placement_spec).unwrap();
 
     let gpu0 = VulkanPlacedStreamCircuitResidentPlan::from_resource_plan_for_device(
@@ -163,97 +163,97 @@ fn placed_resident_plan_hosts_only_the_pedals_assigned_to_a_device() {
 
     assert_eq!(gpu0.backend_id, VULKAN_STREAM_CIRCUIT_BACKEND_ID);
     assert_eq!(gpu0.device_id, "gpu0");
-    assert_eq!(gpu0.hosted_pedal_ids.len(), 11);
-    assert!(gpu0.hosts_pedal("layer_00"));
-    assert!(!gpu0.hosts_pedal("layer_02"));
+    assert_eq!(gpu0.hosted_component_ids.len(), 11);
+    assert!(gpu0.hosts_component("layer_00"));
+    assert!(!gpu0.hosts_component("layer_02"));
     assert_eq!(gpu0.resident_plan.circuit_count, 11);
     assert_eq!(gpu0.resident_plan.permanent_parameters.len(), 103);
     assert_eq!(gpu0.resident_plan.stream_state_buffers.len(), 11);
     assert_eq!(gpu0.resident_plan.activation_banks.len(), 11);
     assert_eq!(gpu0.resident_plan.state_view_signal_count, 16);
     assert_eq!(gpu0.signal_element_bytes, Some(2));
-    assert_eq!(gpu0.local_cables.len(), 9);
-    assert_eq!(gpu0.incoming_cables.len(), 1);
-    assert_eq!(gpu0.outgoing_cables.len(), 1);
-    assert_eq!(gpu0.incoming_cables[0].source_pedal_id, "layer_03");
-    assert_eq!(gpu0.incoming_cables[0].destination_pedal_id, "layer_04");
-    assert_eq!(gpu0.outgoing_cables[0].source_pedal_id, "layer_00");
-    assert_eq!(gpu0.outgoing_cables[0].destination_pedal_id, "layer_01");
+    assert_eq!(gpu0.local_edges.len(), 9);
+    assert_eq!(gpu0.incoming_edges.len(), 1);
+    assert_eq!(gpu0.outgoing_edges.len(), 1);
+    assert_eq!(gpu0.incoming_edges[0].source_component_id, "layer_03");
+    assert_eq!(gpu0.incoming_edges[0].destination_component_id, "layer_04");
+    assert_eq!(gpu0.outgoing_edges[0].source_component_id, "layer_00");
+    assert_eq!(gpu0.outgoing_edges[0].destination_component_id, "layer_01");
 
-    let gpu0_cable_io = VulkanPlacedCableIoPlan::from_placed_resident_plan(&gpu0).unwrap();
-    assert_eq!(gpu0_cable_io.device_id, "gpu0");
-    assert_eq!(gpu0_cable_io.local_cable_count, 9);
-    assert_eq!(gpu0_cable_io.total_endpoint_count, 2);
-    assert_eq!(gpu0_cable_io.total_buffer_count, 11);
-    assert_eq!(gpu0_cable_io.incoming_endpoint_count, 1);
-    assert_eq!(gpu0_cable_io.outgoing_endpoint_count, 1);
-    assert_eq!(gpu0_cable_io.total_byte_capacity, Some(22_528));
-    let gpu0_local = &gpu0_cable_io.local_cables[0];
-    assert_eq!(gpu0_local.cable_id, "cable_4_local");
-    assert_eq!(gpu0_local.source_pedal_id, "layer_04");
-    assert_eq!(gpu0_local.destination_pedal_id, "layer_05");
+    let gpu0_edge_io = VulkanPlacedEdgeIoPlan::from_placed_resident_plan(&gpu0).unwrap();
+    assert_eq!(gpu0_edge_io.device_id, "gpu0");
+    assert_eq!(gpu0_edge_io.local_edge_count, 9);
+    assert_eq!(gpu0_edge_io.total_endpoint_count, 2);
+    assert_eq!(gpu0_edge_io.total_buffer_count, 11);
+    assert_eq!(gpu0_edge_io.incoming_endpoint_count, 1);
+    assert_eq!(gpu0_edge_io.outgoing_endpoint_count, 1);
+    assert_eq!(gpu0_edge_io.total_byte_capacity, Some(22_528));
+    let gpu0_local = &gpu0_edge_io.local_edges[0];
+    assert_eq!(gpu0_local.edge_id, "edge_4_local");
+    assert_eq!(gpu0_local.source_component_id, "layer_04");
+    assert_eq!(gpu0_local.destination_component_id, "layer_05");
     assert_eq!(gpu0_local.byte_capacity, Some(2_048));
 
-    assert_eq!(gpu1.hosted_pedal_ids, vec!["layer_02".to_string()]);
+    assert_eq!(gpu1.hosted_component_ids, vec!["layer_02".to_string()]);
     assert_eq!(gpu1.resident_plan.circuit_count, 1);
     assert_eq!(gpu1.resident_plan.permanent_parameters.len(), 11);
     assert_eq!(gpu1.resident_plan.stream_state_buffers.len(), 1);
     assert_eq!(gpu1.resident_plan.state_view_signal_count, 2);
-    assert_eq!(gpu1.incoming_cables[0].source_pedal_id, "layer_01");
-    assert_eq!(gpu1.outgoing_cables[0].destination_pedal_id, "layer_03");
-    let gpu1_cable_io = VulkanPlacedCableIoPlan::from_placed_resident_plan(&gpu1).unwrap();
-    assert_eq!(gpu1_cable_io.device_id, "gpu1");
-    assert_eq!(gpu1_cable_io.local_cable_count, 0);
-    assert_eq!(gpu1_cable_io.total_endpoint_count, 2);
-    assert_eq!(gpu1_cable_io.total_buffer_count, 2);
-    assert_eq!(gpu1_cable_io.total_byte_capacity, Some(4_096));
-    assert_eq!(gpu1_cable_io.unresolved_byte_cables, Vec::<usize>::new());
-    let gpu1_incoming = gpu1_cable_io
-        .endpoint(VulkanPlacedCableDirection::Incoming, 1)
+    assert_eq!(gpu1.incoming_edges[0].source_component_id, "layer_01");
+    assert_eq!(gpu1.outgoing_edges[0].destination_component_id, "layer_03");
+    let gpu1_edge_io = VulkanPlacedEdgeIoPlan::from_placed_resident_plan(&gpu1).unwrap();
+    assert_eq!(gpu1_edge_io.device_id, "gpu1");
+    assert_eq!(gpu1_edge_io.local_edge_count, 0);
+    assert_eq!(gpu1_edge_io.total_endpoint_count, 2);
+    assert_eq!(gpu1_edge_io.total_buffer_count, 2);
+    assert_eq!(gpu1_edge_io.total_byte_capacity, Some(4_096));
+    assert_eq!(gpu1_edge_io.unresolved_byte_edges, Vec::<usize>::new());
+    let gpu1_incoming = gpu1_edge_io
+        .endpoint(VulkanPlacedEdgeDirection::Incoming, 1)
         .unwrap();
-    assert_eq!(gpu1_incoming.endpoint_id, "cable_1_in");
+    assert_eq!(gpu1_incoming.endpoint_id, "edge_1_in");
     assert_eq!(gpu1_incoming.signal, "frame");
     assert_eq!(gpu1_incoming.shape, vec![1024]);
     assert_eq!(gpu1_incoming.element_count, 1024);
     assert_eq!(gpu1_incoming.byte_capacity, Some(2_048));
     assert_eq!(gpu1_incoming.local_device_id, "gpu1");
     assert_eq!(gpu1_incoming.remote_device_id, "cpu0");
-    assert_eq!(gpu1_incoming.local_pedal_id, "layer_02");
-    assert_eq!(gpu1_incoming.remote_pedal_id, "layer_01");
+    assert_eq!(gpu1_incoming.local_component_id, "layer_02");
+    assert_eq!(gpu1_incoming.remote_component_id, "layer_01");
     assert_eq!(gpu1_incoming.local_port_id, "input_frame");
     assert_eq!(gpu1_incoming.remote_port_id, "output_frame");
-    let gpu1_outgoing = gpu1_cable_io
-        .endpoint(VulkanPlacedCableDirection::Outgoing, 2)
+    let gpu1_outgoing = gpu1_edge_io
+        .endpoint(VulkanPlacedEdgeDirection::Outgoing, 2)
         .unwrap();
-    assert_eq!(gpu1_outgoing.endpoint_id, "cable_2_out");
+    assert_eq!(gpu1_outgoing.endpoint_id, "edge_2_out");
     assert_eq!(gpu1_outgoing.byte_capacity, Some(2_048));
     assert_eq!(gpu1_outgoing.local_device_id, "gpu1");
     assert_eq!(gpu1_outgoing.remote_device_id, "lan:worker-a");
-    assert_eq!(gpu1_outgoing.local_pedal_id, "layer_02");
-    assert_eq!(gpu1_outgoing.remote_pedal_id, "layer_03");
+    assert_eq!(gpu1_outgoing.local_component_id, "layer_02");
+    assert_eq!(gpu1_outgoing.remote_component_id, "layer_03");
 
-    assert_eq!(cpu0.hosted_pedal_ids, vec!["layer_01".to_string()]);
+    assert_eq!(cpu0.hosted_component_ids, vec!["layer_01".to_string()]);
     assert_eq!(cpu0.resident_plan.permanent_parameters.len(), 8);
     assert_eq!(cpu0.resident_plan.state_view_signal_count, 1);
-    assert_eq!(lan.hosted_pedal_ids, vec!["layer_03".to_string()]);
+    assert_eq!(lan.hosted_component_ids, vec!["layer_03".to_string()]);
     assert_eq!(lan.resident_plan.permanent_parameters.len(), 8);
     assert_eq!(lan.resident_plan.state_view_signal_count, 1);
 
-    let cable_plans = vec![
-        gpu0_cable_io,
-        gpu1_cable_io,
-        VulkanPlacedCableIoPlan::from_placed_resident_plan(&cpu0).unwrap(),
-        VulkanPlacedCableIoPlan::from_placed_resident_plan(&lan).unwrap(),
+    let edge_plans = vec![
+        gpu0_edge_io,
+        gpu1_edge_io,
+        VulkanPlacedEdgeIoPlan::from_placed_resident_plan(&cpu0).unwrap(),
+        VulkanPlacedEdgeIoPlan::from_placed_resident_plan(&lan).unwrap(),
     ];
-    let cable_pairs = pair_placed_cable_endpoints(&cable_plans).unwrap();
-    assert_eq!(cable_pairs.len(), 4);
-    assert!(cable_pairs.iter().all(|(outgoing, incoming)| {
-        VulkanPlacedCablePacketKey::from_outgoing_endpoint(outgoing)
-            == VulkanPlacedCablePacketKey::from_incoming_endpoint(incoming)
+    let edge_pairs = pair_placed_edge_endpoints(&edge_plans).unwrap();
+    assert_eq!(edge_pairs.len(), 4);
+    assert!(edge_pairs.iter().all(|(outgoing, incoming)| {
+        VulkanPlacedEdgePacketKey::from_outgoing_endpoint(outgoing)
+            == VulkanPlacedEdgePacketKey::from_incoming_endpoint(incoming)
             && outgoing.byte_capacity == incoming.byte_capacity
     }));
 
-    let mut incomplete_plans = cable_plans;
+    let mut incomplete_plans = edge_plans;
     let plan_with_incoming = incomplete_plans
         .iter_mut()
         .find(|plan| plan.incoming_endpoint_count > 0)
@@ -261,15 +261,15 @@ fn placed_resident_plan_hosts_only_the_pedals_assigned_to_a_device() {
     let incoming_index = plan_with_incoming
         .endpoints
         .iter()
-        .position(|endpoint| endpoint.direction == VulkanPlacedCableDirection::Incoming)
+        .position(|endpoint| endpoint.direction == VulkanPlacedEdgeDirection::Incoming)
         .unwrap();
     plan_with_incoming.endpoints.remove(incoming_index);
-    let error = pair_placed_cable_endpoints(&incomplete_plans).unwrap_err();
+    let error = pair_placed_edge_endpoints(&incomplete_plans).unwrap_err();
     assert!(error.to_string().contains("has no incoming endpoint"));
 }
 
 #[test]
-fn placed_stream_circuit_plan_dispatches_only_hosted_pedals() {
+fn placed_stream_circuit_plan_dispatches_only_hosted_components() {
     let graph = fixture_model_execution_graph();
     let tensor_index = TensorIndex::from_json_file(fixture_model_tensor_index_path()).unwrap();
     let execution_plan =
@@ -277,9 +277,9 @@ fn placed_stream_circuit_plan_dispatches_only_hosted_pedals() {
     let resource_plan =
         StreamCircuitResourcePlan::from_graph_and_plan(&graph, &execution_plan).unwrap();
     let placement_spec = StreamCircuitPlacementSpec::new("gpu0")
-        .with_pedal_device("layer_01", "cpu0")
-        .with_pedal_device("layer_02", "gpu1")
-        .with_pedal_device("layer_03", "lan:worker-a");
+        .with_component_device("layer_01", "cpu0")
+        .with_component_device("layer_02", "gpu1")
+        .with_component_device("layer_03", "lan:worker-a");
     let placement_plan = graph.placement_plan(&placement_spec).unwrap();
     let gpu0_resident = VulkanPlacedStreamCircuitResidentPlan::from_resource_plan_for_device(
         &resource_plan,
@@ -382,11 +382,11 @@ fn placed_stream_circuit_plan_dispatches_only_hosted_pedals() {
     assert!(matches!(
         kv_append.descriptors[2].resource,
         VulkanDescriptorResourceAddress::StateBuffer {
-            ref pedal_id,
+            ref component_id,
             ref state_id,
             byte_capacity: 8192,
             ..
-        } if pedal_id == "layer_02" && state_id == "kv_memory"
+        } if component_id == "layer_02" && state_id == "kv_memory"
     ));
 }
 

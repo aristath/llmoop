@@ -9,8 +9,8 @@ use serde_json::Value;
 
 use crate::{
     RuntimeEditorControlKind, RuntimeEditorControlSchema, RuntimeEditorInstance,
-    RuntimeEditorSourcePedal, RuntimeModelEditor, RuntimeModelPathKind,
-    StreamCircuitPedalInstanceStatePolicy, classify_runtime_model_path,
+    RuntimeEditorSourceComponent, RuntimeModelEditor, RuntimeModelPathKind,
+    StreamCircuitNodeInstanceStatePolicy, classify_runtime_model_path,
     validate_runtime_editor_control_value,
 };
 
@@ -22,7 +22,7 @@ use super::sequence::{SequenceParseError, TextBuffer, parse_layer_sequence};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FocusRegion {
     Sequence,
-    Board,
+    Graph,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -53,14 +53,14 @@ pub enum AppAction {
         selecting: bool,
     },
     SelectAllText,
-    SelectPreviousPedal,
-    SelectNextPedal,
-    SelectFirstPedal,
-    SelectLastPedal,
-    OpenSelectedPedal,
-    SelectPedal(String),
-    OpenPedal(String),
-    PanBoard(i16),
+    SelectPreviousNode,
+    SelectNextNode,
+    SelectFirstNode,
+    SelectLastNode,
+    OpenSelectedNode,
+    SelectNode(String),
+    OpenNode(String),
+    PanGraph(i16),
     DuplicateSelected,
     RemoveSelected,
     MoveSelected(i32),
@@ -72,7 +72,7 @@ pub enum AppAction {
     ModelBrowserSelect(usize),
     ModelBrowserOpen(usize),
     ModelAction,
-    ApplyPedal,
+    ApplyNode,
     CancelCompiler,
 }
 
@@ -80,7 +80,7 @@ pub enum AppAction {
 pub(crate) enum HitTarget {
     OpenModel,
     Sequence,
-    Pedal(String),
+    Node(String),
     PanLeft,
     PanRight,
     ModalApply,
@@ -274,31 +274,31 @@ pub(crate) struct CompilerProgressState {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum PedalPolicyKind {
+pub(crate) enum NodePolicyKind {
     Independent,
     Clone,
     Share,
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct PedalModalState {
+pub(crate) struct NodeModalState {
     pub instance_id: String,
-    pub source: RuntimeEditorSourcePedal,
+    pub source: RuntimeEditorSourceComponent,
     pub occurrence: usize,
     pub device_ids: Vec<String>,
     pub device_labels: Vec<String>,
     pub device_index: usize,
     pub original_device_id: String,
     pub enabled: bool,
-    pub policy: PedalPolicyKind,
+    pub policy: NodePolicyKind,
     pub policy_targets: Vec<String>,
     pub policy_target_index: usize,
-    pub properties: Vec<PedalPropertyDraft>,
+    pub properties: Vec<NodePropertyDraft>,
     pub focus_row: usize,
     pub error: Option<String>,
 }
 
-impl PedalModalState {
+impl NodeModalState {
     fn row_count(&self) -> usize {
         6 + self.properties.len()
     }
@@ -316,17 +316,17 @@ impl PedalModalState {
         self.apply_row() + 1
     }
 
-    fn state_policy(&self) -> StreamCircuitPedalInstanceStatePolicy {
+    fn state_policy(&self) -> StreamCircuitNodeInstanceStatePolicy {
         match self.policy {
-            PedalPolicyKind::Independent => StreamCircuitPedalInstanceStatePolicy::Fresh,
-            PedalPolicyKind::Clone => StreamCircuitPedalInstanceStatePolicy::CloneFrom {
+            NodePolicyKind::Independent => StreamCircuitNodeInstanceStatePolicy::Fresh,
+            NodePolicyKind::Clone => StreamCircuitNodeInstanceStatePolicy::CloneFrom {
                 instance_id: self
                     .policy_targets
                     .get(self.policy_target_index)
                     .cloned()
                     .unwrap_or_default(),
             },
-            PedalPolicyKind::Share => StreamCircuitPedalInstanceStatePolicy::ShareWith {
+            NodePolicyKind::Share => StreamCircuitNodeInstanceStatePolicy::ShareWith {
                 instance_id: self
                     .policy_targets
                     .get(self.policy_target_index)
@@ -338,7 +338,7 @@ impl PedalModalState {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct PedalPropertyDraft {
+pub(crate) struct NodePropertyDraft {
     pub schema: RuntimeEditorControlSchema,
     pub original_value: Value,
     pub value: Value,
@@ -346,7 +346,7 @@ pub(crate) struct PedalPropertyDraft {
     pub error: Option<String>,
 }
 
-impl PedalPropertyDraft {
+impl NodePropertyDraft {
     pub(crate) fn new(schema: RuntimeEditorControlSchema, value: Value) -> Self {
         let buffer = TextBuffer::new(control_value_text(&value));
         let mut property = Self {
@@ -491,7 +491,7 @@ impl PedalPropertyDraft {
 pub(crate) enum Overlay {
     ModelSelector(ModelSelectorState),
     Compiler(CompilerProgressState),
-    Pedal(PedalModalState),
+    Node(NodeModalState),
     Help,
 }
 
@@ -502,7 +502,7 @@ pub struct App {
     pub(crate) last_valid_sequence: Vec<usize>,
     pub(crate) focus: FocusRegion,
     pub(crate) selected_instance_id: Option<String>,
-    pub(crate) board_scroll: usize,
+    pub(crate) graph_scroll: usize,
     pub(crate) overlay: Option<Overlay>,
     help_return_overlay: Option<Overlay>,
     pub(crate) status: String,

@@ -161,48 +161,48 @@ fn validate_behavioral_validation_artifact(
         }
     }
 
-    let raw_pedals = raw_manifest
-        .pointer("/circuit_graph/pedals")
+    let raw_components = raw_manifest
+        .pointer("/circuit_graph/components")
         .and_then(Value::as_array)
         .ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
-                "resident model package has no raw circuit graph pedals",
+                "resident model package has no raw circuit graph components",
             )
         })?;
-    let mut all_raw_pedals = raw_pedals.iter().collect::<Vec<_>>();
+    let mut all_raw_components = raw_components.iter().collect::<Vec<_>>();
     if let Some(decoders) = raw_manifest
         .get("speculative_decoders")
         .and_then(Value::as_array)
     {
         for decoder in decoders {
-            let pedals = decoder
-                .pointer("/circuit_graph/pedals")
+            let components = decoder
+                .pointer("/circuit_graph/components")
                 .and_then(Value::as_array)
                 .ok_or_else(|| {
                     io::Error::new(
                         io::ErrorKind::InvalidData,
-                        "resident model package speculative decoder has no raw circuit graph pedals",
+                        "resident model package speculative decoder has no raw circuit graph components",
                     )
                 })?;
-            all_raw_pedals.extend(pedals);
+            all_raw_components.extend(components);
         }
     }
-    let mut expected_pedals = BTreeMap::new();
-    for pedal in all_raw_pedals {
-        let pedal_id = pedal
-            .get("pedal_id")
+    let mut expected_components = BTreeMap::new();
+    for component in all_raw_components {
+        let component_id = component
+            .get("component_id")
             .and_then(Value::as_str)
             .ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "resident model package contains a raw circuit without a pedal id",
+                    "resident model package contains a raw circuit without a component id",
                 )
             })?;
-        let circuit = pedal.get("circuit").ok_or_else(|| {
+        let circuit = component.get("circuit").ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("resident model package pedal {pedal_id:?} has no raw circuit"),
+                format!("resident model package component {component_id:?} has no raw circuit"),
             )
         })?;
         let node_count = circuit
@@ -212,16 +212,16 @@ fn validate_behavioral_validation_artifact(
             .ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
-                    format!("resident model package pedal {pedal_id:?} has no raw circuit nodes"),
+                    format!("resident model package component {component_id:?} has no raw circuit nodes"),
                 )
             })?;
-        if expected_pedals
-            .insert(pedal_id, (node_count, circuit))
+        if expected_components
+            .insert(component_id, (node_count, circuit))
             .is_some()
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("resident model package repeats raw pedal {pedal_id:?}"),
+                format!("resident model package repeats raw component {component_id:?}"),
             ));
         }
     }
@@ -237,36 +237,36 @@ fn validate_behavioral_validation_artifact(
                 ),
             )
         })?;
-    let mut proven_pedals = BTreeSet::new();
+    let mut proven_components = BTreeSet::new();
     let mut approximate_proof_count = 0usize;
     for circuit in circuits {
-        let pedal_id = circuit
-            .get("pedal_id")
+        let component_id = circuit
+            .get("component_id")
             .and_then(Value::as_str)
             .ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(
-                        "behavioral validation evidence {} contains a proof without a pedal id",
+                        "behavioral validation evidence {} contains a proof without a component id",
                         path.display()
                     ),
                 )
             })?;
-        if !proven_pedals.insert(pedal_id) {
+        if !proven_components.insert(component_id) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "behavioral validation evidence {} repeats pedal {pedal_id:?}",
+                    "behavioral validation evidence {} repeats component {component_id:?}",
                     path.display()
                 ),
             ));
         }
         let (expected_node_count, candidate_circuit) =
-            expected_pedals.get(pedal_id).ok_or_else(|| {
+            expected_components.get(component_id).ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(
-                        "behavioral validation evidence {} proves unknown pedal {pedal_id:?}",
+                        "behavioral validation evidence {} proves unknown component {component_id:?}",
                         path.display()
                     ),
                 )
@@ -289,7 +289,7 @@ fn validate_behavioral_validation_artifact(
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "behavioral validation evidence {} has an incomplete or stale proof for pedal {pedal_id:?}",
+                    "behavioral validation evidence {} has an incomplete or stale proof for component {component_id:?}",
                     path.display()
                 ),
             ));
@@ -304,7 +304,7 @@ fn validate_behavioral_validation_artifact(
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "behavioral validation evidence {} does not completely cover pedal {pedal_id:?}",
+                    "behavioral validation evidence {} does not completely cover component {component_id:?}",
                     path.display()
                 ),
             ));
@@ -314,16 +314,16 @@ fn validate_behavioral_validation_artifact(
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
-                "approximate behavioral validation evidence {} contains no approximate pedal proof",
+                "approximate behavioral validation evidence {} contains no approximate component proof",
                 path.display()
             ),
         ));
     }
-    if proven_pedals != expected_pedals.keys().copied().collect() {
+    if proven_components != expected_components.keys().copied().collect() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
-                "behavioral validation evidence {} does not prove every packaged pedal",
+                "behavioral validation evidence {} does not prove every packaged component",
                 path.display()
             ),
         ));
@@ -481,13 +481,13 @@ fn validate_resident_package_paths(
     for path in &manifest.tokenizer.files {
         validate_resident_package_relative_path("tokenizer file", path)?;
     }
-    for execution in &manifest.pedal_executions {
+    for execution in &manifest.component_executions {
         for kernel in &execution.kernels {
-            validate_resident_package_relative_path("pedal kernel shader", &kernel.shader_path)?;
+            validate_resident_package_relative_path("component kernel shader", &kernel.shader_path)?;
             for implementation in &kernel.batch_implementations {
                 for stage in &implementation.stages {
                     validate_resident_package_relative_path(
-                        "pedal batch implementation stage shader",
+                        "component batch implementation stage shader",
                         &stage.shader_path,
                     )?;
                 }
@@ -503,16 +503,16 @@ fn validate_resident_package_paths(
             "draft output projection shader",
             &decoder.output_transducer.projection_shader_path,
         )?;
-        for execution in &decoder.pedal_executions {
+        for execution in &decoder.component_executions {
             for kernel in &execution.kernels {
                 validate_resident_package_relative_path(
-                    "draft pedal kernel shader",
+                    "draft component kernel shader",
                     &kernel.shader_path,
                 )?;
                 for implementation in &kernel.batch_implementations {
                     for stage in &implementation.stages {
                         validate_resident_package_relative_path(
-                            "draft pedal batch implementation stage shader",
+                            "draft component batch implementation stage shader",
                             &stage.shader_path,
                         )?;
                     }
@@ -543,7 +543,7 @@ fn validate_resident_package_artifact_integrity(
             .to_string_lossy()
             .into_owned()
     });
-    let kernel_shaders = manifest.pedal_executions.iter().flat_map(|execution| {
+    let kernel_shaders = manifest.component_executions.iter().flat_map(|execution| {
         execution.kernels.iter().flat_map(|kernel| {
             std::iter::once(kernel.shader_path.clone()).chain(
                 kernel
@@ -560,7 +560,7 @@ fn validate_resident_package_artifact_integrity(
     });
     let draft_shaders = manifest.speculative_decoders.iter().flat_map(|decoder| {
         decoder
-            .pedal_executions
+            .component_executions
             .iter()
             .flat_map(|execution| {
                 execution.kernels.iter().flat_map(|kernel| {
@@ -690,11 +690,11 @@ fn validate_resident_package_spirv_requirements(
     package_root: &Path,
     manifest: &VulkanResidentModelPackageManifest,
 ) -> io::Result<()> {
-    let executions = manifest.pedal_executions.iter().chain(
+    let executions = manifest.component_executions.iter().chain(
         manifest
             .speculative_decoders
             .iter()
-            .flat_map(|decoder| decoder.pedal_executions.iter()),
+            .flat_map(|decoder| decoder.component_executions.iter()),
     );
     let mut mandatory_shader_paths = BTreeSet::from([
         manifest.input_transducer.shader_path.as_str(),
@@ -756,7 +756,7 @@ fn validate_resident_package_spirv_requirements(
                         io::ErrorKind::InvalidData,
                         format!(
                             "compiled batch implementation {}.{} does not declare the Vulkan requirements of its SPIR-V artifacts",
-                            execution.pedal_id, kernel.node_id
+                            execution.component_id, kernel.node_id
                         ),
                     ));
                 }

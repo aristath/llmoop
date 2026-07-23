@@ -11,11 +11,11 @@ use serde_json::{Map, Value};
 pub const STREAM_CIRCUIT_SCHEMA: &str = "nerve.stream_circuit.v1";
 pub const CIRCUIT_PARAMS_SCHEMA: &str = "nerve.circuit_params.v1";
 pub const CIRCUIT_STATE_SCHEMA: &str = "nerve.circuit_state.v1";
-pub const LOWERED_PEDALBOARD_SCHEMA: &str = "nerve.lowered_pedalboard.v1";
+pub const LOWERED_EXECUTION_GRAPH_SCHEMA: &str = "nerve.lowered_execution_graph.v1";
 pub const STREAM_CIRCUIT_PLACEMENT_SCHEMA: &str = "nerve.stream_circuit_placement.v1";
-pub const STREAM_CIRCUIT_RUNTIME_PATCH_SCHEMA: &str = "nerve.stream_circuit_runtime_patch.v1";
+pub const STREAM_CIRCUIT_RUNTIME_GRAPH_SCHEMA: &str = "nerve.stream_circuit_runtime_graph.v1";
 pub const RUNTIME_DEFAULT_LOGICAL_DEVICE_ID: &str = "runtime_default";
-pub const RUNTIME_CABLE_ROUTES_SCHEMA: &str = "nerve.runtime_cable_routes.v1";
+pub const RUNTIME_EDGE_ROUTES_SCHEMA: &str = "nerve.runtime_edge_routes.v1";
 pub const RUNTIME_DEVICE_BINDINGS_SCHEMA: &str = "nerve.runtime_device_bindings.v1";
 pub const RUNTIME_TOPOLOGY_SCHEMA: &str = "nerve.runtime_topology.v1";
 
@@ -50,7 +50,7 @@ pub struct CircuitPort {
     #[serde(default)]
     pub source: Option<String>,
     #[serde(default)]
-    pub pedal_port: Option<String>,
+    pub component_port: Option<String>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -67,7 +67,7 @@ pub struct CircuitBoundary {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CircuitSource {
-    pub pedal_id: String,
+    pub component_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_layer_index: Option<usize>,
     pub source_operator_type: String,
@@ -345,16 +345,16 @@ fn validate_boundary_port(port: &CircuitPort, direction: &str, issues: &mut Vec<
             port.id
         ));
     }
-    if port.pedal_port.as_deref().is_none_or(str::is_empty) {
+    if port.component_port.as_deref().is_none_or(str::is_empty) {
         issues.push(format!(
-            "boundary {direction} port {:?} must map to a non-empty pedal_port",
+            "boundary {direction} port {:?} must map to a non-empty component_port",
             port.id
         ));
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct LoweredPedalboardSource {
+pub struct LoweredExecutionGraphSource {
     pub format: String,
     pub artifact_root: String,
 }
@@ -372,23 +372,23 @@ pub struct LoweredCircuitRef {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StreamCircuitCableEndpoint {
-    pub pedal_id: String,
+pub struct StreamCircuitEdgeEndpoint {
+    pub component_id: String,
     pub port_id: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StreamCircuitGraphCable {
+pub struct StreamCircuitGraphEdge {
     pub id: String,
-    pub source: StreamCircuitCableEndpoint,
-    pub destination: StreamCircuitCableEndpoint,
+    pub source: StreamCircuitEdgeEndpoint,
+    pub destination: StreamCircuitEdgeEndpoint,
     pub connection: StreamCircuitConnection,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StreamCircuitGraphBoundaryPort {
     pub id: String,
-    pub endpoint: StreamCircuitCableEndpoint,
+    pub endpoint: StreamCircuitEdgeEndpoint,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -412,12 +412,12 @@ impl StreamCircuitConnection {
         matches!(self, Self::Forward)
     }
 
-    pub fn validate(&self, cable_id: &str) -> Result<(), CircuitPlacementError> {
+    pub fn validate(&self, edge_id: &str) -> Result<(), CircuitPlacementError> {
         if let Self::TemporalFeedback { delay_activations } = self
             && *delay_activations == 0
         {
             return Err(CircuitPlacementError(format!(
-                "runtime patch temporal feedback cable {cable_id} must delay at least one activation"
+                "runtime graph temporal feedback edge {edge_id} must delay at least one activation"
             )));
         }
         Ok(())
@@ -425,11 +425,11 @@ impl StreamCircuitConnection {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct LoweredPedalboardGraph {
-    pub wiring: String,
+pub struct LoweredExecutionGraphGraph {
+    pub topology: String,
     #[serde(default)]
     pub circuits: Vec<LoweredCircuitRef>,
-    pub cables: Vec<StreamCircuitGraphCable>,
+    pub edges: Vec<StreamCircuitGraphEdge>,
     pub boundary: StreamCircuitGraphBoundary,
     #[serde(default)]
     pub input_transducer: Value,
@@ -438,41 +438,41 @@ pub struct LoweredPedalboardGraph {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct LoweredPedalboardSummary {
+pub struct LoweredExecutionGraphSummary {
     pub circuit_count: usize,
     #[serde(default)]
     pub operator_counts: BTreeMap<String, usize>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct LoweredPedalboard {
+pub struct LoweredExecutionGraph {
     pub schema: String,
-    pub source: LoweredPedalboardSource,
+    pub source: LoweredExecutionGraphSource,
     #[serde(default)]
     pub architecture: Value,
     #[serde(default)]
     pub dimensions: Value,
-    pub graph: LoweredPedalboardGraph,
-    pub summary: LoweredPedalboardSummary,
+    pub graph: LoweredExecutionGraphGraph,
+    pub summary: LoweredExecutionGraphSummary,
     #[serde(default)]
     pub notes: Vec<String>,
 }
 
-impl LoweredPedalboard {
+impl LoweredExecutionGraph {
     pub fn from_json_file(path: impl AsRef<Path>) -> Result<Self, CircuitArtifactError> {
         read_json(path)
     }
 
     pub fn validate_index(&self) -> Result<(), CircuitArtifactError> {
         let mut issues = Vec::new();
-        if self.schema != LOWERED_PEDALBOARD_SCHEMA {
+        if self.schema != LOWERED_EXECUTION_GRAPH_SCHEMA {
             issues.push(format!(
-                "unsupported lowered pedalboard schema {:?}",
+                "unsupported lowered execution_graph schema {:?}",
                 self.schema
             ));
         }
         if self.graph.circuits.is_empty() {
-            issues.push("lowered pedalboard contains no circuits".to_string());
+            issues.push("lowered execution_graph contains no circuits".to_string());
         }
         if self.summary.circuit_count != self.graph.circuits.len() {
             issues.push(format!(
@@ -508,35 +508,35 @@ impl LoweredPedalboard {
             &mut issues,
         );
 
-        let mut cable_ids = BTreeSet::new();
-        for cable in &self.graph.cables {
-            if cable.id.is_empty() || !cable_ids.insert(cable.id.clone()) {
+        let mut edge_ids = BTreeSet::new();
+        for edge in &self.graph.edges {
+            if edge.id.is_empty() || !edge_ids.insert(edge.id.clone()) {
                 issues.push(format!(
-                    "invalid or duplicate graph cable id {:?}",
-                    cable.id
+                    "invalid or duplicate graph edge id {:?}",
+                    edge.id
                 ));
             }
-            if !ids.contains(&cable.source.pedal_id) {
+            if !ids.contains(&edge.source.component_id) {
                 issues.push(format!(
-                    "graph cable {} references unknown source pedal {:?}",
-                    cable.id, cable.source.pedal_id
+                    "graph edge {} references unknown source component {:?}",
+                    edge.id, edge.source.component_id
                 ));
             }
-            if !ids.contains(&cable.destination.pedal_id) {
+            if !ids.contains(&edge.destination.component_id) {
                 issues.push(format!(
-                    "graph cable {} references unknown destination pedal {:?}",
-                    cable.id, cable.destination.pedal_id
+                    "graph edge {} references unknown destination component {:?}",
+                    edge.id, edge.destination.component_id
                 ));
             }
             if matches!(
-                cable.connection,
+                edge.connection,
                 StreamCircuitConnection::TemporalFeedback {
                     delay_activations: 0
                 }
             ) {
                 issues.push(format!(
-                    "graph temporal feedback cable {} must delay at least one activation",
-                    cable.id
+                    "graph temporal feedback edge {} must delay at least one activation",
+                    edge.id
                 ));
             }
         }
@@ -545,7 +545,7 @@ impl LoweredPedalboard {
             Ok(())
         } else {
             Err(CircuitArtifactError(format!(
-                "lowered pedalboard validation failed:\n- {}",
+                "lowered execution_graph validation failed:\n- {}",
                 issues.join("\n- ")
             )))
         }
@@ -559,7 +559,7 @@ fn validate_index_boundary_ports(
     issues: &mut Vec<String>,
 ) {
     if ports.is_empty() {
-        issues.push(format!("lowered pedalboard declares no {kind}s"));
+        issues.push(format!("lowered execution_graph declares no {kind}s"));
         return;
     }
     let mut ids = BTreeSet::new();
@@ -568,64 +568,64 @@ fn validate_index_boundary_ports(
         if port.id.is_empty() || !ids.insert(port.id.as_str()) {
             issues.push(format!("invalid or duplicate {kind} id {:?}", port.id));
         }
-        if !circuit_ids.contains(&port.endpoint.pedal_id) {
+        if !circuit_ids.contains(&port.endpoint.component_id) {
             issues.push(format!(
-                "{kind} {} references unknown pedal {:?}",
-                port.id, port.endpoint.pedal_id
+                "{kind} {} references unknown component {:?}",
+                port.id, port.endpoint.component_id
             ));
         }
         if port.endpoint.port_id.is_empty()
             || !endpoints.insert((
-                port.endpoint.pedal_id.as_str(),
+                port.endpoint.component_id.as_str(),
                 port.endpoint.port_id.as_str(),
             ))
         {
             issues.push(format!(
                 "{kind} {} has an empty or duplicate endpoint {}.{}",
-                port.id, port.endpoint.pedal_id, port.endpoint.port_id
+                port.id, port.endpoint.component_id, port.endpoint.port_id
             ));
         }
     }
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct ResolvedLoweredPedalboard {
+pub struct ResolvedLoweredExecutionGraph {
     pub artifact_root: PathBuf,
-    pub index: LoweredPedalboard,
+    pub index: LoweredExecutionGraph,
     pub circuits: Vec<ResolvedCircuitArtifact>,
 }
 
-impl ResolvedLoweredPedalboard {
+impl ResolvedLoweredExecutionGraph {
     pub fn from_index_file(path: impl AsRef<Path>) -> Result<Self, CircuitArtifactError> {
         let path = path.as_ref();
         let artifact_root = path
             .parent()
             .ok_or_else(|| {
                 CircuitArtifactError(format!(
-                    "lowered pedalboard path {:?} does not have a parent directory",
+                    "lowered execution_graph path {:?} does not have a parent directory",
                     path
                 ))
             })?
             .to_path_buf();
-        let index = LoweredPedalboard::from_json_file(path)?;
+        let index = LoweredExecutionGraph::from_json_file(path)?;
         index.validate_index()?;
 
         let mut circuits = Vec::with_capacity(index.graph.circuits.len());
-        for pedal in &index.graph.circuits {
+        for component in &index.graph.circuits {
             let circuit = StreamCircuit::from_json_file(resolve_artifact_path(
                 &artifact_root,
-                &pedal.circuit,
+                &component.circuit,
             ))?;
             let params = CircuitParamsArtifact::from_json_file(resolve_artifact_path(
                 &artifact_root,
-                &pedal.params,
+                &component.params,
             ))?;
             let state = CircuitStateArtifact::from_json_file(resolve_artifact_path(
                 &artifact_root,
-                &pedal.state,
+                &component.state,
             ))?;
             let resolved = ResolvedCircuitArtifact {
-                pedal: pedal.clone(),
+                component: component.clone(),
                 circuit,
                 params,
                 state,
@@ -656,24 +656,24 @@ impl ResolvedLoweredPedalboard {
         StreamCircuitPlacementPlan::from_graph(self, spec)
     }
 
-    pub fn default_runtime_patch(
+    pub fn default_runtime_graph(
         &self,
         default_device_id: impl Into<String>,
-    ) -> Result<StreamCircuitRuntimePatch, CircuitPlacementError> {
-        StreamCircuitRuntimePatch::from_source_series(self, default_device_id)
+    ) -> Result<StreamCircuitRuntimeGraph, CircuitPlacementError> {
+        StreamCircuitRuntimeGraph::from_source_series(self, default_device_id)
     }
 
-    pub fn runtime_patch_from_placement(
+    pub fn runtime_graph_from_placement(
         &self,
         spec: &StreamCircuitPlacementSpec,
-    ) -> Result<StreamCircuitRuntimePatch, CircuitPlacementError> {
-        StreamCircuitRuntimePatch::from_placement_spec(self, spec)
+    ) -> Result<StreamCircuitRuntimeGraph, CircuitPlacementError> {
+        StreamCircuitRuntimeGraph::from_placement_spec(self, spec)
     }
 
-    pub fn instantiate_runtime_patch(
+    pub fn instantiate_runtime_graph(
         &self,
-        patch: &StreamCircuitRuntimePatch,
-    ) -> Result<ResolvedLoweredPedalboard, CircuitPlacementError> {
-        patch.instantiate_graph(self)
+        runtime_graph: &StreamCircuitRuntimeGraph,
+    ) -> Result<ResolvedLoweredExecutionGraph, CircuitPlacementError> {
+        runtime_graph.instantiate_graph(self)
     }
 }

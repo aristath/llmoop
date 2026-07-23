@@ -1,8 +1,8 @@
-fn render_pedal_modal(frame: &mut Frame<'_>, app: &mut App, modal: &PedalModalState) {
+fn render_node_modal(frame: &mut Frame<'_>, app: &mut App, modal: &NodeModalState) {
     let area = centered_rect(frame.area(), 70, 78, 54, 20);
     frame.render_widget(Clear, area);
     let title = format!(
-        " PEDAL {} · OCCURRENCE {} ",
+        " NODE {} · OCCURRENCE {} ",
         modal.source.source_id, modal.occurrence
     );
     let block = Block::default()
@@ -63,9 +63,9 @@ fn render_pedal_modal(frame: &mut Frame<'_>, app: &mut App, modal: &PedalModalSt
         .map(String::as_str)
         .unwrap_or("no compatible device");
     let policy = match modal.policy {
-        PedalPolicyKind::Independent => "Independent",
-        PedalPolicyKind::Clone => "Clone from another instance",
-        PedalPolicyKind::Share => "Share with another instance",
+        NodePolicyKind::Independent => "Independent",
+        NodePolicyKind::Clone => "Clone from another instance",
+        NodePolicyKind::Share => "Share with another instance",
     };
     let policy_target = modal
         .policy_targets
@@ -86,7 +86,7 @@ fn render_pedal_modal(frame: &mut Frame<'_>, app: &mut App, modal: &PedalModalSt
         );
         app.hit_map.insert(area, HitTarget::ModalRow(index));
     }
-    render_pedal_properties(frame, app, modal, rows[6]);
+    render_node_properties(frame, app, modal, rows[6]);
     if let Some(error) = &modal.error {
         frame.render_widget(
             Paragraph::new(truncate(error, rows[6].width as usize))
@@ -121,10 +121,10 @@ fn render_pedal_modal(frame: &mut Frame<'_>, app: &mut App, modal: &PedalModalSt
     );
 }
 
-fn render_pedal_properties(
+fn render_node_properties(
     frame: &mut Frame<'_>,
     app: &mut App,
-    modal: &PedalModalState,
+    modal: &NodeModalState,
     area: Rect,
 ) {
     let block = Block::default()
@@ -135,7 +135,7 @@ fn render_pedal_properties(
     frame.render_widget(block, area);
     if modal.properties.is_empty() {
         frame.render_widget(
-            Paragraph::new("No control schema declared by this source pedal.")
+            Paragraph::new("No control schema declared by this source component.")
                 .style(Style::default().fg(META)),
             inner,
         );
@@ -256,7 +256,7 @@ fn render_pedal_properties(
     }
 }
 
-fn property_display(property: &super::app::PedalPropertyDraft) -> String {
+fn property_display(property: &super::app::NodePropertyDraft) -> String {
     let units = property
         .schema
         .units
@@ -322,4 +322,3 @@ fn modal_row_style(focused: bool) -> Style {
         Style::default().fg(TEXT)
     }
 }
-

@@ -52,7 +52,7 @@ fn package_loader_rejects_shallow_and_stale_behavioral_evidence() {
     std::fs::write(&evidence_path, original_evidence).unwrap();
     let mut raw_manifest: Value =
         serde_json::from_slice(&std::fs::read(&source_manifest_path).unwrap()).unwrap();
-    raw_manifest["circuit_graph"]["pedals"][0]["circuit"]["nodes"][0]["attrs"]["adversarial_drift"] =
+    raw_manifest["circuit_graph"]["components"][0]["circuit"]["nodes"][0]["attrs"]["adversarial_drift"] =
         Value::from(true);
     std::fs::write(
         &manifest_path,
@@ -90,7 +90,7 @@ fn package_loader_rejects_compiler_owned_runtime_placement() {
             serde_json::json!({
                 "schema": "nerve.stream_circuit_placement.v1",
                 "default_device_id": "gpu0",
-                "pedal_devices": {}
+                "node_devices": {}
             }),
         ),
     ] {
@@ -168,7 +168,7 @@ fn package_loader_rejects_same_length_shader_corruption() {
 }
 
 #[test]
-fn package_loader_accepts_mixed_exact_and_approximate_pedal_proofs() {
+fn package_loader_accepts_mixed_exact_and_approximate_component_proofs() {
     let source_manifest_path = fixture_model_package_manifest_path();
     let source_manifest = fixture_model_package_manifest();
     let source_root = source_manifest_path.parent().unwrap();
@@ -228,80 +228,80 @@ fn package_loader_accepts_mixed_exact_and_approximate_pedal_proofs() {
     let error = VulkanResidentModelPackageManifest::from_json_file(&manifest_path)
         .unwrap_err()
         .to_string();
-    assert!(error.contains("no approximate pedal proof"));
+    assert!(error.contains("no approximate component proof"));
 
     std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
-fn runtime_patch_duplicates_package_pedals_in_memory() {
+fn runtime_graph_duplicates_package_components_in_memory() {
     let manifest = fixture_model_package_manifest();
     let source_graph = manifest
         .circuit_graph
-        .to_resolved_lowered_pedalboard(PathBuf::from("."))
+        .to_resolved_lowered_execution_graph(PathBuf::from("."))
         .unwrap();
-    let patch = StreamCircuitRuntimePatch::from_source_series(&source_graph, "gpu0")
+    let runtime_graph = StreamCircuitRuntimeGraph::from_source_series(&source_graph, "gpu0")
         .unwrap()
         .duplicate_after_instance(&source_graph, "layer_05", "layer_05_repeat")
         .unwrap()
         .with_instance_device("layer_05_repeat", "gpu1")
         .unwrap();
 
-    let patched = manifest.clone().mount_runtime_patch(&patch).unwrap();
+    let runtime_mounted = manifest.clone().mount_runtime_graph(&runtime_graph).unwrap();
 
-    assert_eq!(manifest.circuit_graph.pedals.len(), 17);
-    assert_eq!(manifest.pedal_executions.len(), 14);
+    assert_eq!(manifest.circuit_graph.components.len(), 17);
+    assert_eq!(manifest.component_executions.len(), 14);
     assert!(
         manifest
             .circuit_graph
-            .pedals
+            .components
             .iter()
-            .all(|pedal| pedal.pedal_id != "layer_05_repeat")
+            .all(|component| component.component_id != "layer_05_repeat")
     );
 
-    assert_eq!(patched.circuit_graph.pedals.len(), 18);
-    assert_eq!(patched.pedal_executions.len(), 15);
-    assert_eq!(patched.package, manifest);
+    assert_eq!(runtime_mounted.circuit_graph.components.len(), 18);
+    assert_eq!(runtime_mounted.component_executions.len(), 15);
+    assert_eq!(runtime_mounted.package, manifest);
     assert!(
-        patched
-            .patch
+        runtime_mounted
+            .runtime_graph
             .instances
             .iter()
             .any(|instance| instance.instance_id == "layer_05_repeat")
     );
     assert_eq!(
-        patched.placement.device_for_pedal("layer_05_repeat"),
+        runtime_mounted.placement.device_for_component("layer_05_repeat"),
         "gpu1"
     );
-    let repeated_pedal = patched
+    let repeated_component = runtime_mounted
         .circuit_graph
-        .pedals
+        .components
         .iter()
-        .find(|pedal| pedal.pedal_id == "layer_05_repeat")
+        .find(|component| component.component_id == "layer_05_repeat")
         .unwrap();
-    let source_pedal = manifest
+    let source_component = manifest
         .circuit_graph
-        .pedals
+        .components
         .iter()
-        .find(|pedal| pedal.pedal_id == "layer_05")
+        .find(|component| component.component_id == "layer_05")
         .unwrap();
-    assert_eq!(repeated_pedal.operator_type, source_pedal.operator_type);
-    assert_eq!(repeated_pedal.circuit.id, source_pedal.circuit.id);
-    assert_eq!(repeated_pedal.circuit.source.pedal_id, "layer_05_repeat");
+    assert_eq!(repeated_component.operator_type, source_component.operator_type);
+    assert_eq!(repeated_component.circuit.id, source_component.circuit.id);
+    assert_eq!(repeated_component.circuit.source.component_id, "layer_05_repeat");
     assert_eq!(
-        repeated_pedal.params.refs.keys().collect::<Vec<_>>(),
-        source_pedal.params.refs.keys().collect::<Vec<_>>()
+        repeated_component.params.refs.keys().collect::<Vec<_>>(),
+        source_component.params.refs.keys().collect::<Vec<_>>()
     );
 
-    let repeated_execution = patched
-        .pedal_executions
+    let repeated_execution = runtime_mounted
+        .component_executions
         .iter()
-        .find(|execution| execution.pedal_id == "layer_05_repeat")
+        .find(|execution| execution.component_id == "layer_05_repeat")
         .unwrap();
     let source_execution = manifest
-        .pedal_executions
+        .component_executions
         .iter()
-        .find(|execution| execution.pedal_id == "layer_05")
+        .find(|execution| execution.component_id == "layer_05")
         .unwrap();
     assert_eq!(repeated_execution.kernels, source_execution.kernels);
 }
@@ -311,13 +311,13 @@ fn runtime_model_coalesces_execution_placement_without_rewriting_the_patch() {
     let manifest = fixture_model_package_manifest();
     let source_graph = manifest
         .circuit_graph
-        .to_resolved_lowered_pedalboard(PathBuf::from("."))
+        .to_resolved_lowered_execution_graph(PathBuf::from("."))
         .unwrap();
-    let patch = StreamCircuitRuntimePatch::from_source_series(&source_graph, "gpu0")
+    let runtime_graph = StreamCircuitRuntimeGraph::from_source_series(&source_graph, "gpu0")
         .unwrap()
         .with_instance_device("layer_05", "gpu1")
         .unwrap();
-    let runtime_model = manifest.mount_runtime_patch(&patch).unwrap();
+    let runtime_model = manifest.mount_runtime_graph(&runtime_graph).unwrap();
     assert_eq!(
         runtime_model.placement_device_ids(),
         vec!["gpu0".to_string(), "gpu1".to_string()]
@@ -331,13 +331,13 @@ fn runtime_model_coalesces_execution_placement_without_rewriting_the_patch() {
         coalesced.placement_device_ids(),
         vec!["physical_gpu0".to_string()]
     );
-    assert_eq!(coalesced.patch, runtime_model.patch);
+    assert_eq!(coalesced.runtime_graph, runtime_model.runtime_graph);
     assert_eq!(coalesced.circuit_graph, runtime_model.circuit_graph);
-    assert_eq!(coalesced.pedal_executions, runtime_model.pedal_executions);
+    assert_eq!(coalesced.component_executions, runtime_model.component_executions);
 }
 
 #[test]
-fn vulkan_lowering_extracts_signal_processors_from_the_full_pedalboard() {
+fn vulkan_lowering_extracts_signal_processors_from_the_full_execution_graph() {
     let manifest = fixture_model_package_manifest();
     let graph = manifest
         .circuit_graph
@@ -351,34 +351,34 @@ fn vulkan_lowering_extracts_signal_processors_from_the_full_pedalboard() {
             .iter()
             .all(|artifact| artifact.circuit.runtime_role.is_signal_processor())
     );
-    assert_eq!(graph.index.graph.cables.len(), 13);
+    assert_eq!(graph.index.graph.edges.len(), 13);
     assert_eq!(
         graph.index.graph.boundary.external_inputs[0]
             .endpoint
-            .pedal_id,
+            .component_id,
         "layer_00"
     );
     assert_eq!(
         graph.index.graph.boundary.public_outputs[0]
             .endpoint
-            .pedal_id,
+            .component_id,
         "layer_13"
     );
 }
 
 #[test]
-fn placed_generation_endpoints_follow_wiring_not_system_pedal_order() {
+fn placed_generation_endpoints_follow_topology_not_system_component_order() {
     let manifest = fixture_model_package_manifest();
-    let (input_pedal, output_pedal) = manifest
+    let (input_component, output_component) = manifest
         .circuit_graph
-        .signal_processor_endpoint_pedal_ids()
+        .signal_processor_endpoint_component_ids()
         .unwrap();
     let placement = StreamCircuitPlacementSpec::new(RUNTIME_DEFAULT_LOGICAL_DEVICE_ID)
-        .with_pedal_device(&input_pedal, "gpu-input")
-        .with_pedal_device(&output_pedal, "gpu-output");
+        .with_component_device(&input_component, "gpu-input")
+        .with_component_device(&output_component, "gpu-output");
 
-    assert_eq!(input_pedal, "layer_00");
-    assert_eq!(output_pedal, "layer_13");
+    assert_eq!(input_component, "layer_00");
+    assert_eq!(output_component, "layer_13");
     assert_eq!(
         manifest
             .circuit_graph
@@ -392,21 +392,21 @@ fn placed_generation_endpoints_follow_wiring_not_system_pedal_order() {
 }
 
 #[test]
-fn fused_generation_pedals_follow_connected_processor_devices() {
+fn fused_generation_components_follow_connected_processor_devices() {
     let resolved = fixture_model_package_manifest()
         .circuit_graph
-        .to_resolved_lowered_pedalboard(PathBuf::from("."))
+        .to_resolved_lowered_execution_graph(PathBuf::from("."))
         .unwrap();
-    let patch = resolved
-        .default_runtime_patch("gpu0")
+    let runtime_graph = resolved
+        .default_runtime_graph("gpu0")
         .unwrap()
         .with_instance_device("layer_00", "gpu-input")
         .unwrap()
         .with_instance_device("layer_13", "gpu-output")
         .unwrap();
-    let patch = attach_generation_pedal_devices_for_vulkan(patch, &resolved).unwrap();
+    let runtime_graph = attach_generation_node_devices_for_vulkan(runtime_graph, &resolved).unwrap();
     let device_for = |instance_id: &str| {
-        patch
+        runtime_graph
             .instances
             .iter()
             .find(|instance| instance.instance_id == instance_id)
@@ -421,7 +421,7 @@ fn fused_generation_pedals_follow_connected_processor_devices() {
 }
 
 #[test]
-fn runtime_chain_control_preserves_generation_pedals_and_feedback() {
+fn runtime_chain_control_preserves_generation_components_and_feedback() {
     let manifest = fixture_model_package_manifest();
     let chain = vec![
         ("first".to_string(), "layer_00".to_string()),
@@ -429,23 +429,23 @@ fn runtime_chain_control_preserves_generation_pedals_and_feedback() {
         ("last".to_string(), "layer_13".to_string()),
     ];
 
-    let patch = manifest
-        .runtime_patch_from_controls(None, &BTreeMap::new(), &[], Some(&chain))
+    let runtime_graph = manifest
+        .runtime_graph_from_controls(None, &BTreeMap::new(), &[], Some(&chain))
         .unwrap();
 
-    assert_eq!(patch.instances.len(), 6);
-    for system_pedal in ["input_transducer", "output_transducer", "sampler"] {
+    assert_eq!(runtime_graph.instances.len(), 6);
+    for system_component in ["input_transducer", "output_transducer", "sampler"] {
         assert!(
-            patch
+            runtime_graph
                 .instances
                 .iter()
-                .any(|instance| instance.instance_id == system_pedal)
+                .any(|instance| instance.instance_id == system_component)
         );
     }
-    assert!(patch.cables.iter().any(|cable| {
-        cable.source.pedal_id == "sampler"
-            && cable.destination.pedal_id == "input_transducer"
-            && !cable.connection.is_forward()
+    assert!(runtime_graph.edges.iter().any(|edge| {
+        edge.source.component_id == "sampler"
+            && edge.destination.component_id == "input_transducer"
+            && !edge.connection.is_forward()
     }));
 }
 
@@ -472,16 +472,16 @@ fn generation_contract_rejects_execution_and_graph_drift() {
             .to_string();
     assert!(extension_error.contains("invalid required Vulkan device extensions"));
 
-    let mut wiring_drift = manifest;
-    wiring_drift
+    let mut topology_drift = manifest;
+    topology_drift
         .circuit_graph
-        .cables
-        .retain(|cable| cable.connection.is_forward());
-    let wiring_error =
-        validate_generation_execution_contract(&wiring_drift, &wiring_drift.circuit_graph)
+        .edges
+        .retain(|edge| edge.connection.is_forward());
+    let topology_error =
+        validate_generation_execution_contract(&topology_drift, &topology_drift.circuit_graph)
             .unwrap_err()
             .to_string();
-    assert!(wiring_error.contains("delayed sampler feedback"));
+    assert!(topology_error.contains("delayed sampler feedback"));
 
     let mut boundary_drift = fixture_model_package_manifest();
     boundary_drift.circuit_graph.boundary.public_outputs[0]

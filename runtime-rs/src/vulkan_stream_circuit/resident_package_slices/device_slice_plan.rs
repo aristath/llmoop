@@ -2,13 +2,13 @@ struct VulkanResidentModelPackageDeviceSlicePlan {
     package_id: String,
     device_id: String,
     dynamic_state_capacity_activations: usize,
-    hosted_pedal_count: usize,
-    incoming_cable_count: usize,
-    outgoing_cable_count: usize,
+    hosted_component_count: usize,
+    incoming_edge_count: usize,
+    outgoing_edge_count: usize,
     placed_plan: VulkanPlacedStreamCircuitPlan,
     prepared_plan: VulkanPreparedDispatchPlan,
     loaded_manifest: VulkanLoadedReusableKernelArtifactManifest,
-    batch_kernels: Vec<VulkanResidentPedalBatchKernelArtifact>,
+    batch_kernels: Vec<VulkanResidentComponentBatchKernelArtifact>,
 }
 
 impl VulkanResidentModelPackageDeviceSlicePlan {
@@ -67,9 +67,9 @@ impl VulkanResidentModelPackageDeviceSlicePlan {
                 missing_subgroup_operations.join(", ")
             )));
         }
-        validate_pedal_executions(
+        validate_component_executions(
             &runtime_model.package.package_id,
-            &runtime_model.pedal_executions,
+            &runtime_model.component_executions,
         )?;
 
         let (_resource_plan, _placement_plan, placed_plan) =
@@ -81,10 +81,10 @@ impl VulkanResidentModelPackageDeviceSlicePlan {
                 tensor_index,
                 runtime_model.package.activation_element_bytes,
             )?;
-        let hosted_pedal_count = placed_plan.binding_plan.circuits.len();
-        if hosted_pedal_count == 0 {
+        let hosted_component_count = placed_plan.binding_plan.circuits.len();
+        if hosted_component_count == 0 {
             return Err(VulkanResidentTokenModelPackageError::new(format!(
-                "resident model package {:?} has no pedals assigned to device {device_id:?}",
+                "resident model package {:?} has no components assigned to device {device_id:?}",
                 runtime_model.package.package_id
             )));
         }
@@ -96,26 +96,26 @@ impl VulkanResidentModelPackageDeviceSlicePlan {
                     "failed to prepare Vulkan dispatch plan for device {device_id:?}: {error}"
                 ))
             })?;
-        validate_pedal_executions_cover_prepared_dispatches(
+        validate_component_executions_cover_prepared_dispatches(
             &runtime_model.package.package_id,
-            &runtime_model.pedal_executions,
+            &runtime_model.component_executions,
             &prepared_plan,
         )?;
-        let pedal_kernel_shaders =
-            resident_package_pedal_kernel_shader_refs_for_prepared_dispatches(
-                &runtime_model.pedal_executions,
+        let component_kernel_shaders =
+            resident_package_component_kernel_shader_refs_for_prepared_dispatches(
+                &runtime_model.component_executions,
                 &prepared_plan,
             );
         let loaded_manifest = loaded_kernel_pack_from_package_shader_refs(
             manifest_dir,
             &placed_plan,
             &prepared_plan,
-            &pedal_kernel_shaders,
+            &component_kernel_shaders,
         )?;
-        let batch_kernels = load_resident_pedal_batch_kernels(
+        let batch_kernels = load_resident_component_batch_kernels(
             device,
             manifest_dir,
-            &runtime_model.pedal_executions,
+            &runtime_model.component_executions,
             &prepared_plan,
         )?;
 
@@ -123,9 +123,9 @@ impl VulkanResidentModelPackageDeviceSlicePlan {
             package_id: runtime_model.package.package_id.clone(),
             device_id: device_id.to_string(),
             dynamic_state_capacity_activations: capacity,
-            hosted_pedal_count,
-            incoming_cable_count: placed_plan.placed_resident_plan.incoming_cables.len(),
-            outgoing_cable_count: placed_plan.placed_resident_plan.outgoing_cables.len(),
+            hosted_component_count,
+            incoming_edge_count: placed_plan.placed_resident_plan.incoming_edges.len(),
+            outgoing_edge_count: placed_plan.placed_resident_plan.outgoing_edges.len(),
             placed_plan,
             prepared_plan,
             loaded_manifest,
@@ -171,9 +171,9 @@ impl VulkanResidentModelPackageDeviceSlicePlan {
             package_id: self.package_id,
             device_id: self.device_id,
             dynamic_state_capacity_activations: self.dynamic_state_capacity_activations,
-            hosted_pedal_count: self.hosted_pedal_count,
-            incoming_cable_count: self.incoming_cable_count,
-            outgoing_cable_count: self.outgoing_cable_count,
+            hosted_component_count: self.hosted_component_count,
+            incoming_edge_count: self.incoming_edge_count,
+            outgoing_edge_count: self.outgoing_edge_count,
             permanent_parameter_count: parameter_buffers.plan.parameter_count,
             permanent_parameter_bytes: parameter_buffers.total_byte_capacity,
             reusable_kernel_word_count: self.loaded_manifest.total_word_count,

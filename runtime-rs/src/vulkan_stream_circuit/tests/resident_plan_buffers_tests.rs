@@ -125,7 +125,7 @@ fn allocates_fixture_model_per_stream_vulkan_buffers_from_resident_plan() {
     let layer_00_state = buffers
         .state_buffers
         .iter()
-        .find(|buffer| buffer.pedal_id == "layer_00")
+        .find(|buffer| buffer.component_id == "layer_00")
         .unwrap();
     assert_eq!(layer_00_state.state_id, "temporal_memory");
     assert_eq!(layer_00_state.byte_capacity, 6_144);
@@ -134,7 +134,7 @@ fn allocates_fixture_model_per_stream_vulkan_buffers_from_resident_plan() {
     let layer_02_state = buffers
         .state_buffers
         .iter()
-        .find(|buffer| buffer.pedal_id == "layer_02")
+        .find(|buffer| buffer.component_id == "layer_02")
         .unwrap();
     assert_eq!(layer_02_state.state_id, "kv_memory");
     assert_eq!(layer_02_state.byte_capacity, 8_192);
@@ -143,7 +143,7 @@ fn allocates_fixture_model_per_stream_vulkan_buffers_from_resident_plan() {
     let layer_00_slot_1 = buffers
         .activation_slot_buffers
         .iter()
-        .find(|buffer| buffer.pedal_id == "layer_00" && buffer.slot == 1)
+        .find(|buffer| buffer.component_id == "layer_00" && buffer.slot == 1)
         .unwrap();
     assert_eq!(layer_00_slot_1.byte_capacity, 6_144);
     assert!(
@@ -207,7 +207,7 @@ fn binds_fixture_model_nodes_to_vulkan_resident_resources() {
     assert_eq!(
         conv_in.output("conv_projected").unwrap().resource,
         VulkanSignalResource::ActivationSlot {
-            pedal_id: "layer_00".to_string(),
+            component_id: "layer_00".to_string(),
             slot: 1,
             bytes: Some(6144),
             signal_bytes: Some(6144),
@@ -218,7 +218,7 @@ fn binds_fixture_model_nodes_to_vulkan_resident_resources() {
     assert_eq!(
         temporal_update.input("temporal_memory").unwrap().resource,
         VulkanSignalResource::StateBuffer {
-            pedal_id: "layer_00".to_string(),
+            component_id: "layer_00".to_string(),
             state_id: "temporal_memory".to_string(),
             static_bytes: Some(6144),
             bytes_per_activation: None,
@@ -227,7 +227,7 @@ fn binds_fixture_model_nodes_to_vulkan_resident_resources() {
     assert_eq!(
         temporal_update.output("temporal_window").unwrap().resource,
         VulkanSignalResource::StateView {
-            pedal_id: "layer_00".to_string(),
+            component_id: "layer_00".to_string(),
             state_id: "temporal_memory".to_string(),
             static_bytes: Some(6144),
             bytes_per_activation: None,
@@ -239,7 +239,7 @@ fn binds_fixture_model_nodes_to_vulkan_resident_resources() {
     assert_eq!(
         kv_append.input("kv_memory").unwrap().resource,
         VulkanSignalResource::StateBuffer {
-            pedal_id: "layer_02".to_string(),
+            component_id: "layer_02".to_string(),
             state_id: "kv_memory".to_string(),
             static_bytes: None,
             bytes_per_activation: Some(2048),
@@ -248,7 +248,7 @@ fn binds_fixture_model_nodes_to_vulkan_resident_resources() {
     assert_eq!(
         kv_append.output("k_memory").unwrap().resource,
         VulkanSignalResource::StateView {
-            pedal_id: "layer_02".to_string(),
+            component_id: "layer_02".to_string(),
             state_id: "kv_memory".to_string(),
             static_bytes: None,
             bytes_per_activation: Some(2048),
@@ -257,7 +257,7 @@ fn binds_fixture_model_nodes_to_vulkan_resident_resources() {
     assert_eq!(
         kv_append.output("v_memory").unwrap().resource,
         VulkanSignalResource::StateView {
-            pedal_id: "layer_02".to_string(),
+            component_id: "layer_02".to_string(),
             state_id: "kv_memory".to_string(),
             static_bytes: None,
             bytes_per_activation: Some(2048),
@@ -268,7 +268,7 @@ fn binds_fixture_model_nodes_to_vulkan_resident_resources() {
     assert_eq!(
         attention.input("q_positioned").unwrap().resource,
         VulkanSignalResource::ActivationSlot {
-            pedal_id: "layer_02".to_string(),
+            component_id: "layer_02".to_string(),
             slot: 2,
             bytes: Some(5120),
             signal_bytes: Some(2048),
@@ -281,7 +281,7 @@ fn binds_fixture_model_nodes_to_vulkan_resident_resources() {
     assert_eq!(
         attention.output("attention_out").unwrap().resource,
         VulkanSignalResource::ActivationSlot {
-            pedal_id: "layer_02".to_string(),
+            component_id: "layer_02".to_string(),
             slot: 0,
             bytes: Some(2048),
             signal_bytes: Some(2048),

@@ -1,4 +1,4 @@
-/// Resident execution structure for one placed device slice. Cable stages stay
+/// Resident execution structure for one placed device slice. Edge stages stay
 /// visible to the scheduler, while every uninterrupted dispatch region becomes
 /// one GPU submission.
 pub struct VulkanMountedPlacedResidentStreamTickExecutionPlan {
@@ -394,33 +394,33 @@ fn distributed_dispatch_stages(
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct VulkanMountedPlacedResidentPedalboardRun {
+pub struct VulkanMountedPlacedResidentExecutionGraphRun {
     pub device_id: String,
-    pub pedal_runs: Vec<VulkanMountedPlacedResidentPedalRun>,
+    pub component_runs: Vec<VulkanMountedPlacedResidentComponentRun>,
 }
 
-impl VulkanMountedPlacedResidentPedalboardRun {
-    pub fn pedal_count(&self) -> usize {
-        self.pedal_runs.len()
+impl VulkanMountedPlacedResidentExecutionGraphRun {
+    pub fn component_count(&self) -> usize {
+        self.component_runs.len()
     }
 
     pub fn dispatch_count(&self) -> usize {
-        self.pedal_runs
+        self.component_runs
             .iter()
-            .map(VulkanMountedPlacedResidentPedalRun::dispatch_count)
+            .map(VulkanMountedPlacedResidentComponentRun::dispatch_count)
             .sum()
     }
 
     pub fn run_time_ns(&self) -> u64 {
-        self.pedal_runs.iter().fold(0u64, |total, pedal| {
-            total.saturating_add(pedal.run_time_ns())
+        self.component_runs.iter().fold(0u64, |total, component| {
+            total.saturating_add(component.run_time_ns())
         })
     }
 
-    pub fn pedal_ids(&self) -> Vec<&str> {
-        self.pedal_runs
+    pub fn component_ids(&self) -> Vec<&str> {
+        self.component_runs
             .iter()
-            .map(|pedal| pedal.pedal_id.as_str())
+            .map(|component| component.component_id.as_str())
             .collect()
     }
 }

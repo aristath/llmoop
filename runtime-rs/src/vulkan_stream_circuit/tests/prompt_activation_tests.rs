@@ -1,5 +1,5 @@
 #[test]
-fn temporal_prompt_block_matches_scalar_ticks_and_pedal_state() {
+fn temporal_prompt_block_matches_scalar_ticks_and_component_state() {
     let Some(manifest_path) = std::env::var_os("NERVE_TEMPORAL_TEST_PACKAGE").map(PathBuf::from)
     else {
         eprintln!("skipping temporal prompt equivalence: NERVE_TEMPORAL_TEST_PACKAGE is unset");
@@ -19,12 +19,12 @@ fn temporal_prompt_block_matches_scalar_ticks_and_pedal_state() {
     let manifest = VulkanResidentModelPackageManifest::from_json_file(&manifest_path).unwrap();
     let state_dtypes = manifest
         .circuit_graph
-        .pedals
+        .components
         .iter()
-        .flat_map(|pedal| {
-            pedal.state.state_ports.iter().map(|state| {
+        .flat_map(|component| {
+            component.state.state_ports.iter().map(|state| {
                 (
-                    (pedal.pedal_id.clone(), state.id.clone()),
+                    (component.component_id.clone(), state.id.clone()),
                     state
                         .extra
                         .get("dtype")
@@ -36,7 +36,7 @@ fn temporal_prompt_block_matches_scalar_ticks_and_pedal_state() {
         })
         .collect::<BTreeMap<_, _>>();
     let runtime_model = manifest
-        .mount_runtime_patch_controls(None, &BTreeMap::new(), &[], None)
+        .mount_runtime_graph_controls(None, &BTreeMap::new(), &[], None)
         .unwrap();
     let logical_devices = runtime_model
         .circuit_graph
@@ -111,7 +111,7 @@ fn temporal_prompt_block_matches_scalar_ticks_and_pedal_state() {
             .iter()
             .zip(&scalar_slice.mounted.buffers.state_buffers)
         {
-            assert_eq!(temporal_state.pedal_id, scalar_state.pedal_id);
+            assert_eq!(temporal_state.component_id, scalar_state.component_id);
             assert_eq!(temporal_state.state_id, scalar_state.state_id);
             let temporal_bytes = temporal_state
                 .buffer
@@ -123,7 +123,7 @@ fn temporal_prompt_block_matches_scalar_ticks_and_pedal_state() {
                 .unwrap();
             if temporal_bytes != scalar_bytes {
                 let key = (
-                    temporal_state.pedal_id.clone(),
+                    temporal_state.component_id.clone(),
                     temporal_state.state_id.clone(),
                 );
                 let dtype = state_dtypes.get(&key).unwrap();
@@ -131,12 +131,12 @@ fn temporal_prompt_block_matches_scalar_ticks_and_pedal_state() {
                     numeric_state_error(&temporal_bytes, &scalar_bytes, dtype);
                 eprintln!(
                     "state error {}.{} ({dtype}): relative_rmse={relative_rmse:.6}, max_absolute_error={max_absolute_error:.6}",
-                    temporal_state.pedal_id, temporal_state.state_id
+                    temporal_state.component_id, temporal_state.state_id
                 );
                 assert!(
                     relative_rmse.is_finite() && relative_rmse < 0.02,
                     "state mismatch in {}.{} has relative RMSE {relative_rmse}",
-                    temporal_state.pedal_id,
+                    temporal_state.component_id,
                     temporal_state.state_id,
                 );
             }
@@ -198,7 +198,7 @@ fn placed_active_prompt_event_advances_one_activation_at_a_time() {
                 5,
                 3,
                 7,
-                &VulkanPlacedCableTransportStats::default(),
+                &VulkanPlacedEdgeTransportStats::default(),
                 None,
             )
             .unwrap(),
@@ -216,7 +216,7 @@ fn placed_active_prompt_event_advances_one_activation_at_a_time() {
             6,
             3,
             7,
-            &VulkanPlacedCableTransportStats::default(),
+            &VulkanPlacedEdgeTransportStats::default(),
             Some(30),
         )
         .unwrap()
@@ -237,7 +237,7 @@ fn placed_active_prompt_event_advances_one_activation_at_a_time() {
             7,
             3,
             7,
-            &VulkanPlacedCableTransportStats::default(),
+            &VulkanPlacedEdgeTransportStats::default(),
             Some(99),
         )
         .unwrap()
@@ -258,7 +258,7 @@ fn placed_active_prompt_event_advances_one_activation_at_a_time() {
                 8,
                 3,
                 7,
-                &VulkanPlacedCableTransportStats::default(),
+                &VulkanPlacedEdgeTransportStats::default(),
                 None,
             )
             .unwrap(),
@@ -294,7 +294,7 @@ fn placed_active_prompt_event_windows_only_open_private_feedback() {
             0,
             1,
             1,
-            &VulkanPlacedCableTransportStats::default(),
+            &VulkanPlacedEdgeTransportStats::default(),
             None,
         )
         .unwrap();
@@ -307,7 +307,7 @@ fn placed_active_prompt_event_windows_only_open_private_feedback() {
             1,
             1,
             1,
-            &VulkanPlacedCableTransportStats::default(),
+            &VulkanPlacedEdgeTransportStats::default(),
             Some(20),
         )
         .unwrap();
@@ -328,7 +328,7 @@ fn placed_active_prompt_event_windows_only_open_private_feedback() {
         0,
         1,
         1,
-        &VulkanPlacedCableTransportStats::default(),
+        &VulkanPlacedEdgeTransportStats::default(),
         Some(20),
     )
     .unwrap();
@@ -349,7 +349,7 @@ fn placed_active_prompt_event_exposes_repeated_full_feedback_windows() {
             0,
             1,
             1,
-            &VulkanPlacedCableTransportStats::default(),
+            &VulkanPlacedEdgeTransportStats::default(),
             Some(20),
         )
         .unwrap();
@@ -363,7 +363,7 @@ fn placed_active_prompt_event_exposes_repeated_full_feedback_windows() {
                 stream_tick,
                 1,
                 1,
-                &VulkanPlacedCableTransportStats::default(),
+                &VulkanPlacedEdgeTransportStats::default(),
                 Some(20),
             )
             .unwrap();
@@ -378,7 +378,7 @@ fn placed_active_prompt_event_exposes_repeated_full_feedback_windows() {
                 stream_tick,
                 1,
                 1,
-                &VulkanPlacedCableTransportStats::default(),
+                &VulkanPlacedEdgeTransportStats::default(),
                 Some(20),
             )
             .unwrap();
@@ -403,7 +403,7 @@ fn placed_active_prompt_event_without_output_drains_only_external_input() {
                     stream_tick,
                     1,
                     2,
-                    &VulkanPlacedCableTransportStats::default(),
+                    &VulkanPlacedEdgeTransportStats::default(),
                     None,
                 )
                 .unwrap()
@@ -432,7 +432,7 @@ fn placed_active_prompt_event_interrupt_closes_feedback_without_losing_state() {
             4,
             2,
             5,
-            &VulkanPlacedCableTransportStats::default(),
+            &VulkanPlacedEdgeTransportStats::default(),
             Some(20),
         )
         .unwrap()
@@ -475,7 +475,7 @@ fn placed_active_prompt_event_interrupt_excludes_unprocessed_prompt_input() {
             4,
             2,
             5,
-            &VulkanPlacedCableTransportStats::default(),
+            &VulkanPlacedEdgeTransportStats::default(),
             None,
         )
         .unwrap();
@@ -500,7 +500,7 @@ fn placed_active_prompt_event_stop_after_current_processes_closing_feedback() {
             4,
             2,
             5,
-            &VulkanPlacedCableTransportStats::default(),
+            &VulkanPlacedEdgeTransportStats::default(),
             Some(20),
         )
         .unwrap();
@@ -530,7 +530,7 @@ fn placed_active_prompt_event_stop_after_current_processes_closing_feedback() {
                 5,
                 2,
                 5,
-                &VulkanPlacedCableTransportStats::default(),
+                &VulkanPlacedEdgeTransportStats::default(),
                 None,
             )
             .unwrap()

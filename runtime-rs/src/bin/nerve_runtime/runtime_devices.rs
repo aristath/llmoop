@@ -1,7 +1,7 @@
-fn placement_device_ids(pedals: &[PedalPlacement]) -> Vec<String> {
-    let mut device_ids = pedals
+fn placement_device_ids(components: &[ComponentPlacement]) -> Vec<String> {
+    let mut device_ids = components
         .iter()
-        .map(|pedal| pedal.device_id.clone())
+        .map(|component| component.device_id.clone())
         .collect::<Vec<_>>();
     device_ids.sort();
     device_ids.dedup();
@@ -51,9 +51,9 @@ fn runtime_model(
     package_manifest: &Path,
 ) -> Result<VulkanResidentRuntimeModel, Box<dyn Error>> {
     let manifest = VulkanResidentModelPackageManifest::from_json_file(package_manifest)?;
-    Ok(manifest.mount_runtime_patch_controls(
+    Ok(manifest.mount_runtime_graph_controls(
         args.default_device_id.as_deref(),
-        &args.pedal_devices,
+        &args.node_devices,
         &args.duplicate_after,
         args.source_chain.as_deref(),
     )?)
@@ -186,22 +186,22 @@ fn bound_devices_report(bound_devices: &RuntimeBoundVulkanDevices) -> Vec<Runtim
         .collect::<Vec<_>>()
 }
 
-fn runtime_cable_routes_report(args: &Args, cables: &[PedalCablePlacement]) -> RuntimeCableRoutes {
-    RuntimeCableRoutes::from_cables(cables, |device_id| {
+fn runtime_edge_routes_report(args: &Args, edges: &[ComponentEdgePlacement]) -> RuntimeEdgeRoutes {
+    RuntimeEdgeRoutes::from_edges(edges, |device_id| {
         runtime_target_for_logical_device(args, device_id)
     })
 }
 
-fn bound_cable_routes_report(
+fn bound_edge_routes_report(
     bound_devices: &RuntimeBoundVulkanDevices,
-    cables: &[PedalCablePlacement],
-) -> RuntimeCableRoutes {
-    RuntimeCableRoutes::from_cables(cables, |device_id| {
+    edges: &[ComponentEdgePlacement],
+) -> RuntimeEdgeRoutes {
+    RuntimeEdgeRoutes::from_edges(edges, |device_id| {
         let physical_device_index = bound_devices
             .physical_device_indices
             .get(device_id)
             .copied();
-        RuntimeCableRouteTarget {
+        RuntimeEdgeRouteTarget {
             target: bound_devices.physical_device_ids.get(device_id).cloned(),
             physical_device_index,
             binding_source: "mounted".to_string(),
@@ -244,24 +244,24 @@ fn runtime_mount_physical_device_index(
 fn runtime_target_for_logical_device(
     args: &Args,
     logical_device_id: &str,
-) -> RuntimeCableRouteTarget {
+) -> RuntimeEdgeRouteTarget {
     if let Some(target) = args.device_bindings.get(logical_device_id) {
         let physical_device_index = resolve_runtime_vulkan_physical_device_ref(target)
             .ok()
             .flatten();
-        return RuntimeCableRouteTarget {
+        return RuntimeEdgeRouteTarget {
             target: Some(target.clone()),
             physical_device_index,
             binding_source: "explicit".to_string(),
         };
     }
     match resolve_runtime_vulkan_physical_device_ref(logical_device_id) {
-        Ok(Some(index)) => RuntimeCableRouteTarget {
+        Ok(Some(index)) => RuntimeEdgeRouteTarget {
             target: Some(logical_device_id.to_string()),
             physical_device_index: Some(index),
             binding_source: "device_id".to_string(),
         },
-        Ok(None) | Err(_) if logical_device_id.contains(':') => RuntimeCableRouteTarget {
+        Ok(None) | Err(_) if logical_device_id.contains(':') => RuntimeEdgeRouteTarget {
             target: Some(logical_device_id.to_string()),
             physical_device_index: None,
             binding_source: "device_id".to_string(),
@@ -270,7 +270,7 @@ fn runtime_target_for_logical_device(
             let default_physical_device_index =
                 runtime_report_default_vulkan_physical_device_index(args);
             let target = default_physical_device_index.map(|index| format!("vulkan:{index}"));
-            RuntimeCableRouteTarget {
+            RuntimeEdgeRouteTarget {
                 physical_device_index: default_physical_device_index,
                 target,
                 binding_source: if args.vulkan_device_index.is_some() {

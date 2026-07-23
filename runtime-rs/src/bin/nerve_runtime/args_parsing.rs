@@ -23,8 +23,8 @@ fn parse_args_from(raw: impl IntoIterator<Item = String>) -> Result<Args, String
             "--inspect-package" => {
                 parsed.inspect_package = true;
             }
-            "--inspect-patch" => {
-                parsed.inspect_patch = true;
+            "--inspect-graph" => {
+                parsed.inspect_graph = true;
             }
             "--inspect-placement" => {
                 parsed.inspect_placement = true;
@@ -38,16 +38,16 @@ fn parse_args_from(raw: impl IntoIterator<Item = String>) -> Result<Args, String
                     return Err("--device may only be supplied once".to_string());
                 }
             }
-            "--place-pedal" => {
+            "--place-node" => {
                 let assignment = next_value(&mut raw, &arg)?;
-                let (pedal_id, device_id) = parse_pedal_device_assignment(&assignment)?;
+                let (component_id, device_id) = parse_node_device_assignment(&assignment)?;
                 if parsed
-                    .pedal_devices
-                    .insert(pedal_id.clone(), device_id)
+                    .node_devices
+                    .insert(component_id.clone(), device_id)
                     .is_some()
                 {
                     return Err(format!(
-                        "duplicate runtime placement for pedal {pedal_id:?}"
+                        "duplicate runtime placement for node {component_id:?}"
                     ));
                 }
             }
@@ -144,12 +144,12 @@ fn parse_args_from(raw: impl IntoIterator<Item = String>) -> Result<Args, String
     }
     let inspect_mode_count = usize::from(parsed.inspect_runtime)
         + usize::from(parsed.inspect_package)
-        + usize::from(parsed.inspect_patch)
+        + usize::from(parsed.inspect_graph)
         + usize::from(parsed.inspect_placement)
         + usize::from(parsed.inspect_device_slice.is_some());
     if inspect_mode_count > 1 {
         return Err(
-            "--inspect-runtime, --inspect-package, --inspect-patch, --inspect-placement, and --inspect-device-slice are mutually exclusive"
+            "--inspect-runtime, --inspect-package, --inspect-graph, --inspect-placement, and --inspect-device-slice are mutually exclusive"
                 .to_string(),
         );
     }
@@ -241,15 +241,15 @@ fn parse_chat_template_variable(raw: &str) -> Result<(String, serde_json::Value)
     Ok((name.to_string(), value))
 }
 
-fn parse_pedal_device_assignment(raw: &str) -> Result<(String, String), String> {
-    let (pedal_id, device_id) = raw
+fn parse_node_device_assignment(raw: &str) -> Result<(String, String), String> {
+    let (component_id, device_id) = raw
         .split_once('=')
-        .ok_or_else(|| format!("invalid runtime placement {raw:?}; expected PEDAL_ID=DEVICE_ID"))?;
-    let pedal_id = pedal_id.trim();
+        .ok_or_else(|| format!("invalid runtime placement {raw:?}; expected NODE_ID=DEVICE_ID"))?;
+    let component_id = component_id.trim();
     let device_id = device_id.trim();
-    if pedal_id.is_empty() {
+    if component_id.is_empty() {
         return Err(format!(
-            "invalid runtime placement {raw:?}; pedal id must not be empty"
+            "invalid runtime placement {raw:?}; node id must not be empty"
         ));
     }
     if device_id.is_empty() {
@@ -257,7 +257,7 @@ fn parse_pedal_device_assignment(raw: &str) -> Result<(String, String), String> 
             "invalid runtime placement {raw:?}; device id must not be empty"
         ));
     }
-    Ok((pedal_id.to_string(), device_id.to_string()))
+    Ok((component_id.to_string(), device_id.to_string()))
 }
 
 fn parse_device_binding_assignment(raw: &str) -> Result<(String, String), String> {
@@ -432,9 +432,9 @@ fn parse_source_chain(raw: &str) -> Result<Vec<(String, String)>, String> {
                 "invalid runtime chain {raw:?}; chain items must not be empty"
             ));
         }
-        let (instance_id, source_pedal_id) =
-            if let Some((instance_id, source_pedal_id)) = raw_item.split_once('=') {
-                (instance_id.trim(), source_pedal_id.trim())
+        let (instance_id, source_component_id) =
+            if let Some((instance_id, source_component_id)) = raw_item.split_once('=') {
+                (instance_id.trim(), source_component_id.trim())
             } else {
                 (raw_item, raw_item)
             };
@@ -443,9 +443,9 @@ fn parse_source_chain(raw: &str) -> Result<Vec<(String, String)>, String> {
                 "invalid runtime chain item {raw_item:?}; instance id must not be empty"
             ));
         }
-        if source_pedal_id.is_empty() {
+        if source_component_id.is_empty() {
             return Err(format!(
-                "invalid runtime chain item {raw_item:?}; source pedal id must not be empty"
+                "invalid runtime chain item {raw_item:?}; source component id must not be empty"
             ));
         }
         if !instance_ids.insert(instance_id.to_string()) {
@@ -453,11 +453,11 @@ fn parse_source_chain(raw: &str) -> Result<Vec<(String, String)>, String> {
                 "invalid runtime chain {raw:?}; duplicate instance id {instance_id:?}"
             ));
         }
-        chain.push((instance_id.to_string(), source_pedal_id.to_string()));
+        chain.push((instance_id.to_string(), source_component_id.to_string()));
     }
 
     if chain.is_empty() {
-        return Err("runtime chain must contain at least one pedal".to_string());
+        return Err("runtime chain must contain at least one component".to_string());
     }
 
     Ok(chain)
@@ -480,4 +480,3 @@ fn next_value(raw: &mut impl Iterator<Item = String>, flag: &str) -> Result<Stri
     raw.next()
         .ok_or_else(|| format!("{flag} requires a value\n\n{}", usage()))
 }
-

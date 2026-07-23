@@ -21,7 +21,7 @@ pub enum VulkanKernelDescriptorResourceClass {
 pub struct VulkanKernelDispatchRef {
     pub dispatch_index: usize,
     pub kernel_id: String,
-    pub pedal_id: String,
+    pub component_id: String,
     pub circuit_index: usize,
     pub node_index: usize,
     pub node_id: String,
@@ -32,7 +32,7 @@ impl VulkanKernelDispatchRef {
         Self {
             dispatch_index: command.dispatch_index,
             kernel_id: command.kernel_id.clone(),
-            pedal_id: command.pedal_id.clone(),
+            component_id: command.component_id.clone(),
             circuit_index: command.circuit_index,
             node_index: command.node_index,
             node_id: command.node_id.clone(),

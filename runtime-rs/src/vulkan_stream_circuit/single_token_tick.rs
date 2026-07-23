@@ -1,14 +1,14 @@
 pub struct VulkanResidentSingleTokenTickRunner {
     pub device_id: String,
-    pub pedal_count: usize,
+    pub component_count: usize,
     pub dispatch_count: usize,
     pub total_descriptor_count: usize,
     pub total_push_constant_byte_count: u32,
     input_transducer: VulkanResidentInputEmbeddingTransducerRunner,
-    pedalboard: VulkanMountedPlacedResidentPedalboardRunner,
+    execution_graph: VulkanMountedPlacedResidentExecutionGraphRunner,
     output_transducer: VulkanResidentOutputTransducerRunner,
     stream_control_buffer: Arc<VulkanResidentBuffer>,
-    completed_pedalboard_run: Arc<VulkanMountedPlacedResidentPedalboardRun>,
+    completed_execution_graph_run: Arc<VulkanMountedPlacedResidentExecutionGraphRun>,
     completed_output_run: Arc<VulkanResidentOutputTransducerRun>,
     sequence: VulkanResidentKernelSequence,
     feedback_sequence: VulkanResidentKernelSequence,
@@ -25,40 +25,40 @@ impl VulkanResidentSingleTokenTickRunner {
     pub fn new(
         device: &VulkanComputeDevice,
         input_transducer: VulkanResidentInputEmbeddingTransducerRunner,
-        pedalboard: VulkanMountedPlacedResidentPedalboardRunner,
+        execution_graph: VulkanMountedPlacedResidentExecutionGraphRunner,
         output_transducer: VulkanResidentOutputTransducerRunner,
     ) -> Result<Self, VulkanResidentSingleTokenTickRunnerError> {
         let dispatch_count = 1usize
-            .checked_add(pedalboard.dispatch_count())
+            .checked_add(execution_graph.dispatch_count())
             .and_then(|count| count.checked_add(output_transducer.dispatch_count))
             .ok_or(VulkanResidentSingleTokenTickRunnerError::DispatchCountOverflow)?;
         let total_descriptor_count = input_transducer
             .descriptor_count
-            .checked_add(pedalboard.total_descriptor_count)
+            .checked_add(execution_graph.total_descriptor_count)
             .and_then(|count| count.checked_add(output_transducer.total_descriptor_count))
             .ok_or(VulkanResidentSingleTokenTickRunnerError::DescriptorCountOverflow)?;
         let total_push_constant_byte_count = input_transducer
             .push_constant_byte_count
-            .checked_add(pedalboard.total_push_constant_byte_count)
+            .checked_add(execution_graph.total_push_constant_byte_count)
             .and_then(|count| count.checked_add(output_transducer.total_push_constant_byte_count))
             .ok_or(VulkanResidentSingleTokenTickRunnerError::PushConstantByteCountOverflow)?;
         let sequence = device.create_resident_kernel_sequence()?;
         let feedback_sequence = device.create_resident_kernel_sequence()?;
         let stream_control_buffer = input_transducer.stream_control_buffer.clone();
-        let completed_pedalboard_run = Arc::new(pedalboard.completed_sequence_run());
+        let completed_execution_graph_run = Arc::new(execution_graph.completed_sequence_run());
         let completed_output_run = Arc::new(output_transducer.completed_run());
 
         Ok(Self {
-            device_id: pedalboard.device_id.clone(),
-            pedal_count: pedalboard.pedal_count(),
+            device_id: execution_graph.device_id.clone(),
+            component_count: execution_graph.component_count(),
             dispatch_count,
             total_descriptor_count,
             total_push_constant_byte_count,
             input_transducer,
-            pedalboard,
+            execution_graph,
             output_transducer,
             stream_control_buffer,
-            completed_pedalboard_run,
+            completed_execution_graph_run,
             completed_output_run,
             sequence,
             feedback_sequence,
@@ -95,10 +95,10 @@ impl VulkanResidentSingleTokenTickRunner {
             self.stream_control_buffer
                 .write_bytes(&stream_control_bytes(token_id, control))?;
         }
-        let mut pedal_push_constants = Vec::with_capacity(self.pedalboard.dispatch_count());
-        for pedal in &self.pedalboard.pedals {
-            for dispatch in &pedal.dispatches {
-                pedal_push_constants.push(stream_control_push_constant_bytes(
+        let mut component_push_constants = Vec::with_capacity(self.execution_graph.dispatch_count());
+        for component in &self.execution_graph.components {
+            for dispatch in &component.dispatches {
+                component_push_constants.push(stream_control_push_constant_bytes(
                     &dispatch.push_constants,
                     control,
                 )?);
@@ -120,14 +120,14 @@ impl VulkanResidentSingleTokenTickRunner {
                 .iter()
                 .map(|dispatch| VulkanResidentKernelSequenceStep::new(dispatch, &[])),
         );
-        let mut pedal_push_constant_index = 0usize;
-        for pedal in &self.pedalboard.pedals {
-            for dispatch in &pedal.dispatches {
+        let mut component_push_constant_index = 0usize;
+        for component in &self.execution_graph.components {
+            for dispatch in &component.dispatches {
                 sequence_steps.push(VulkanResidentKernelSequenceStep::new(
                     &dispatch.resident_dispatch,
-                    &pedal_push_constants[pedal_push_constant_index],
+                    &component_push_constants[component_push_constant_index],
                 ));
-                pedal_push_constant_index += 1;
+                component_push_constant_index += 1;
             }
         }
         if execution.emit_output {
@@ -170,7 +170,7 @@ impl VulkanResidentSingleTokenTickRunner {
             device_id: self.device_id.clone(),
             token_id,
             input_run,
-            pedalboard_run: self.completed_pedalboard_run.clone(),
+            execution_graph_run: self.completed_execution_graph_run.clone(),
             output_run: execution
                 .emit_output
                 .then(|| self.completed_output_run.clone()),
@@ -195,7 +195,7 @@ pub struct VulkanResidentSingleTokenTickRun {
     pub device_id: String,
     pub token_id: u32,
     pub input_run: VulkanResidentInputEmbeddingTransducerRun,
-    pub pedalboard_run: Arc<VulkanMountedPlacedResidentPedalboardRun>,
+    pub execution_graph_run: Arc<VulkanMountedPlacedResidentExecutionGraphRun>,
     pub output_run: Option<Arc<VulkanResidentOutputTransducerRun>>,
     pub dispatch_count: usize,
     pub total_descriptor_count: usize,
@@ -210,7 +210,7 @@ pub enum VulkanResidentSingleTokenTickRunnerError {
     PushConstantByteCountOverflow,
     Vulkan(VulkanError),
     InputTransducer(VulkanResidentInputEmbeddingTransducerRunnerError),
-    Pedalboard(VulkanMountedPlacedResidentKernelDispatchError),
+    ExecutionGraph(VulkanMountedPlacedResidentKernelDispatchError),
     OutputTransducer(VulkanResidentOutputTransducerRunnerError),
 }
 
@@ -228,7 +228,7 @@ impl Display for VulkanResidentSingleTokenTickRunnerError {
             }
             Self::Vulkan(error) => Display::fmt(error, f),
             Self::InputTransducer(error) => Display::fmt(error, f),
-            Self::Pedalboard(error) => Display::fmt(error, f),
+            Self::ExecutionGraph(error) => Display::fmt(error, f),
             Self::OutputTransducer(error) => Display::fmt(error, f),
         }
     }
@@ -254,7 +254,7 @@ impl From<VulkanMountedPlacedResidentKernelDispatchError>
     for VulkanResidentSingleTokenTickRunnerError
 {
     fn from(error: VulkanMountedPlacedResidentKernelDispatchError) -> Self {
-        Self::Pedalboard(error)
+        Self::ExecutionGraph(error)
     }
 }
 

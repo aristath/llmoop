@@ -37,17 +37,17 @@ fn tokenizer_options_report(args: &Args) -> RuntimeTokenizerOptionsReport {
     }
 }
 
-fn runtime_patch_report(args: &Args) -> RuntimePatchControls {
-    RuntimePatchControls {
+fn runtime_graph_report(args: &Args) -> RuntimeGraphControls {
+    RuntimeGraphControls {
         default_device_id: args.default_device_id.clone(),
-        pedal_devices: args.pedal_devices.clone(),
+        node_devices: args.node_devices.clone(),
         source_chain: args.source_chain.as_ref().map(|source_chain| {
             source_chain
                 .iter()
                 .map(
-                    |(instance_id, source_pedal_id)| RuntimePatchSourceChainEntry {
+                    |(instance_id, source_component_id)| RuntimeGraphSourceChainEntry {
                         instance_id: instance_id.clone(),
-                        source_pedal_id: source_pedal_id.clone(),
+                        source_component_id: source_component_id.clone(),
                     },
                 )
                 .collect::<Vec<_>>()
@@ -56,7 +56,7 @@ fn runtime_patch_report(args: &Args) -> RuntimePatchControls {
             .duplicate_after
             .iter()
             .map(
-                |(after_instance_id, new_instance_id)| RuntimePatchDuplicateAfterControl {
+                |(after_instance_id, new_instance_id)| RuntimeGraphDuplicateAfterControl {
                     after_instance_id: after_instance_id.clone(),
                     new_instance_id: new_instance_id.clone(),
                 },

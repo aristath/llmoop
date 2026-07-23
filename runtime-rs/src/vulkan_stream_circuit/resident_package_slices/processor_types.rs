@@ -1,7 +1,7 @@
 pub struct VulkanResidentInProcessPlacedStreamProcessor {
     distributed_dispatch_runners: VulkanDistributedDispatchRunners,
     _distributed_activation_buffers: VulkanDistributedActivationBuffers,
-    cable_synchronizations: VulkanPlacedCableTimelineSynchronizations,
+    edge_synchronizations: VulkanPlacedEdgeTimelineSynchronizations,
     model: Arc<VulkanResidentInProcessPlacedModelPackage>,
     input_transducer: VulkanResidentInputEmbeddingTransducerRunner,
     output_transducer: VulkanResidentOutputTransducerRunner,
@@ -12,7 +12,7 @@ pub struct VulkanResidentInProcessPlacedStreamProcessor {
     device_slices: Vec<VulkanResidentInProcessPlacedStreamProcessorDevice>,
     speculative_decoders: Vec<VulkanResidentSpeculativeDecoderProcessor>,
     verification_state_transactions: RefCell<Option<Vec<VulkanResidentStateTransactionBank>>>,
-    pedal_batch_execution: RefCell<Option<VulkanResidentPlacedPedalBatchRunner>>,
+    component_batch_execution: RefCell<Option<VulkanResidentPlacedComponentBatchRunner>>,
     verification_input_embedding: RefCell<Option<VulkanResidentBatchedInputEmbeddingRunner>>,
     temporal_block_execution: RefCell<Option<VulkanResidentPlacedTemporalBlockRunner>>,
     batched_output_projection: RefCell<Option<VulkanResidentBatchedOutputProjectionRunner>>,

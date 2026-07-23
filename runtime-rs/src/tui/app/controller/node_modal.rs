@@ -1,5 +1,5 @@
 impl App {
-    fn open_selected_pedal(&mut self) {
+    fn open_selected_node(&mut self) {
         let Some(editor) = &self.editor else {
             return;
         };
@@ -14,7 +14,7 @@ impl App {
         else {
             return;
         };
-        let Some(source) = editor.source_pedal_for_instance(instance_id).cloned() else {
+        let Some(source) = editor.source_component_for_instance(instance_id).cloned() else {
             return;
         };
         let devices = editor
@@ -36,7 +36,7 @@ impl App {
                     .unwrap_or_default();
                 let status = if !device.available {
                     " · UNAVAILABLE"
-                } else if device.can_host_runtime_pedals_on_physical_device == Some(false) {
+                } else if device.can_host_runtime_components_on_physical_device == Some(false) {
                     " · INCOMPATIBLE"
                 } else {
                     ""
@@ -74,12 +74,12 @@ impl App {
             .map(|candidate| candidate.instance_id.clone())
             .collect::<Vec<_>>();
         let (policy, target) = match &instance.state_policy {
-            StreamCircuitPedalInstanceStatePolicy::Fresh => (PedalPolicyKind::Independent, None),
-            StreamCircuitPedalInstanceStatePolicy::CloneFrom { instance_id } => {
-                (PedalPolicyKind::Clone, Some(instance_id))
+            StreamCircuitNodeInstanceStatePolicy::Fresh => (NodePolicyKind::Independent, None),
+            StreamCircuitNodeInstanceStatePolicy::CloneFrom { instance_id } => {
+                (NodePolicyKind::Clone, Some(instance_id))
             }
-            StreamCircuitPedalInstanceStatePolicy::ShareWith { instance_id } => {
-                (PedalPolicyKind::Share, Some(instance_id))
+            StreamCircuitNodeInstanceStatePolicy::ShareWith { instance_id } => {
+                (NodePolicyKind::Share, Some(instance_id))
             }
         };
         let policy_target_index = target
@@ -97,10 +97,10 @@ impl App {
                 let value = editor
                     .effective_instance_control_value(instance_id, &schema.id)
                     .unwrap_or(Value::Null);
-                PedalPropertyDraft::new(schema, value)
+                NodePropertyDraft::new(schema, value)
             })
             .collect();
-        self.overlay = Some(Overlay::Pedal(PedalModalState {
+        self.overlay = Some(Overlay::Node(NodeModalState {
             instance_id: instance.instance_id,
             source,
             occurrence: instance.occurrence,
@@ -118,8 +118,8 @@ impl App {
         }));
     }
 
-    fn apply_pedal_modal(&mut self) {
-        let Some(Overlay::Pedal(modal)) = &self.overlay else {
+    fn apply_node_modal(&mut self) {
+        let Some(Overlay::Node(modal)) = &self.overlay else {
             return;
         };
         let modal = modal.clone();
@@ -127,14 +127,14 @@ impl App {
             return;
         };
         let Some(device_id) = modal.device_ids.get(modal.device_index) else {
-            if let Some(Overlay::Pedal(modal)) = &mut self.overlay {
+            if let Some(Overlay::Node(modal)) = &mut self.overlay {
                 modal.error = Some("No compatible runtime device is available".to_string());
             }
             return;
         };
-        if modal.policy != PedalPolicyKind::Independent && modal.policy_targets.is_empty() {
-            if let Some(Overlay::Pedal(modal)) = &mut self.overlay {
-                modal.error = Some("This state policy needs another pedal instance".to_string());
+        if modal.policy != NodePolicyKind::Independent && modal.policy_targets.is_empty() {
+            if let Some(Overlay::Node(modal)) = &mut self.overlay {
+                modal.error = Some("This state policy needs another node instance".to_string());
             }
             return;
         }
@@ -143,7 +143,7 @@ impl App {
             .iter()
             .find(|property| property.editable() && property.error.is_some())
         {
-            if let Some(Overlay::Pedal(modal)) = &mut self.overlay {
+            if let Some(Overlay::Node(modal)) = &mut self.overlay {
                 modal.error = Some(format!(
                     "{}: {}",
                     property.schema.name,
@@ -209,7 +209,7 @@ impl App {
                 };
             }
             Err(error) => {
-                if let Some(Overlay::Pedal(modal)) = &mut self.overlay {
+                if let Some(Overlay::Node(modal)) = &mut self.overlay {
                     modal.error = Some(error.to_string());
                 }
             }

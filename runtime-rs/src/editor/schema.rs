@@ -1,5 +1,5 @@
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct RuntimeEditorSourcePedal {
+pub struct RuntimeEditorSourceComponent {
     pub source_id: String,
     pub layer_index: Option<usize>,
     pub operator_type: String,
@@ -67,7 +67,7 @@ pub struct RuntimeEditorInstance {
     pub device_id: String,
     pub enabled: bool,
     pub control_values: BTreeMap<String, Value>,
-    pub state_policy: StreamCircuitPedalInstanceStatePolicy,
+    pub state_policy: StreamCircuitNodeInstanceStatePolicy,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -83,10 +83,10 @@ pub struct RuntimeModelEditor {
     package_manifest_path: PathBuf,
     package_root: PathBuf,
     manifest: VulkanResidentModelPackageManifest,
-    source_graph: ResolvedLoweredPedalboard,
-    source_pedals: Vec<RuntimeEditorSourcePedal>,
+    source_graph: ResolvedLoweredExecutionGraph,
+    source_components: Vec<RuntimeEditorSourceComponent>,
     source_by_layer: BTreeMap<usize, Vec<String>>,
     source_ids: BTreeSet<String>,
     available_devices: Vec<RuntimeAvailableDevice>,
-    draft: StreamCircuitRuntimePatch,
+    draft: StreamCircuitRuntimeGraph,
 }

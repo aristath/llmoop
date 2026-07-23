@@ -1,22 +1,22 @@
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-enum VulkanPedalBatchSignalKey {
-    Activation { pedal_id: String, signal_id: String },
+enum VulkanComponentBatchSignalKey {
+    Activation { component_id: String, signal_id: String },
     ModelInput(String),
     ModelOutput(String),
-    LocalCable(usize),
-    IncomingCable(usize),
-    OutgoingCable(usize),
+    LocalEdge(usize),
+    IncomingEdge(usize),
+    OutgoingEdge(usize),
 }
 
-struct VulkanPedalBatchSignalBuffer {
+struct VulkanComponentBatchSignalBuffer {
     frame_byte_capacity: usize,
     buffer: Arc<VulkanResidentBuffer>,
     shared_device_buffers: BTreeMap<String, Arc<VulkanResidentBuffer>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct VulkanPedalBatchSignalLifetime {
-    key: VulkanPedalBatchSignalKey,
+struct VulkanComponentBatchSignalLifetime {
+    key: VulkanComponentBatchSignalKey,
     frame_byte_capacity: usize,
     host_visible: bool,
     first_dispatch: usize,
@@ -24,17 +24,17 @@ struct VulkanPedalBatchSignalLifetime {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct VulkanPedalBatchSignalBufferPlan {
+struct VulkanComponentBatchSignalBufferPlan {
     frame_byte_capacity: usize,
     host_visible: bool,
     last_dispatch: usize,
 }
 
-fn allocate_pedal_batch_signal_lifetimes(
-    mut lifetimes: Vec<VulkanPedalBatchSignalLifetime>,
+fn allocate_component_batch_signal_lifetimes(
+    mut lifetimes: Vec<VulkanComponentBatchSignalLifetime>,
 ) -> (
-    BTreeMap<VulkanPedalBatchSignalKey, usize>,
-    Vec<VulkanPedalBatchSignalBufferPlan>,
+    BTreeMap<VulkanComponentBatchSignalKey, usize>,
+    Vec<VulkanComponentBatchSignalBufferPlan>,
 ) {
     lifetimes.sort_by(|left, right| {
         left.first_dispatch
@@ -43,7 +43,7 @@ fn allocate_pedal_batch_signal_lifetimes(
             .then_with(|| left.key.cmp(&right.key))
     });
     let mut signal_buffer_indices = BTreeMap::new();
-    let mut buffers = Vec::<VulkanPedalBatchSignalBufferPlan>::new();
+    let mut buffers = Vec::<VulkanComponentBatchSignalBufferPlan>::new();
     for lifetime in lifetimes {
         let buffer_index = buffers
             .iter()
@@ -53,7 +53,7 @@ fn allocate_pedal_batch_signal_lifetimes(
                     && buffer.last_dispatch < lifetime.first_dispatch
             })
             .unwrap_or_else(|| {
-                buffers.push(VulkanPedalBatchSignalBufferPlan {
+                buffers.push(VulkanComponentBatchSignalBufferPlan {
                     frame_byte_capacity: lifetime.frame_byte_capacity,
                     host_visible: lifetime.host_visible,
                     last_dispatch: lifetime.last_dispatch,
@@ -66,39 +66,39 @@ fn allocate_pedal_batch_signal_lifetimes(
     (signal_buffer_indices, buffers)
 }
 
-fn pedal_batch_signal_buffer_plan(
+fn component_batch_signal_buffer_plan(
     mounted: &VulkanMountedPlacedStreamCircuit,
     dispatches: &[VulkanMountedPlacedBoundDispatch],
 ) -> Result<
     (
-        BTreeMap<VulkanPedalBatchSignalKey, usize>,
-        Vec<VulkanPedalBatchSignalBufferPlan>,
+        BTreeMap<VulkanComponentBatchSignalKey, usize>,
+        Vec<VulkanComponentBatchSignalBufferPlan>,
     ),
     VulkanResidentInProcessPlacedRuntimeError,
 > {
     let dispatch_count = dispatches.len();
-    let mut lifetimes = BTreeMap::<VulkanPedalBatchSignalKey, (usize, bool, usize, usize)>::new();
+    let mut lifetimes = BTreeMap::<VulkanComponentBatchSignalKey, (usize, bool, usize, usize)>::new();
     for (dispatch_index, dispatch) in dispatches.iter().enumerate() {
         for descriptor in &dispatch.descriptors {
             let Some((key, frame_byte_capacity)) =
-                pedal_batch_signal_target_with_mounted(mounted, descriptor)?
+                component_batch_signal_target_with_mounted(mounted, descriptor)?
             else {
                 continue;
             };
             let host_visible = matches!(
                 key,
-                VulkanPedalBatchSignalKey::IncomingCable(_)
-                    | VulkanPedalBatchSignalKey::OutgoingCable(_)
+                VulkanComponentBatchSignalKey::IncomingEdge(_)
+                    | VulkanComponentBatchSignalKey::OutgoingEdge(_)
             );
             let external_source = matches!(
                 key,
-                VulkanPedalBatchSignalKey::ModelInput(_)
-                    | VulkanPedalBatchSignalKey::IncomingCable(_)
+                VulkanComponentBatchSignalKey::ModelInput(_)
+                    | VulkanComponentBatchSignalKey::IncomingEdge(_)
             );
             let external_sink = matches!(
                 key,
-                VulkanPedalBatchSignalKey::ModelOutput(_)
-                    | VulkanPedalBatchSignalKey::OutgoingCable(_)
+                VulkanComponentBatchSignalKey::ModelOutput(_)
+                    | VulkanComponentBatchSignalKey::OutgoingEdge(_)
             );
             let first_dispatch = if external_source { 0 } else { dispatch_index };
             let last_dispatch = if external_sink {
@@ -122,7 +122,7 @@ fn pedal_batch_signal_buffer_plan(
                     {
                         return Err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop(
                             VulkanError(format!(
-                                "pedal batch signal {key:?} has incompatible physical requirements"
+                                "component batch signal {key:?} has incompatible physical requirements"
                             )),
                         ));
                     }
@@ -132,12 +132,12 @@ fn pedal_batch_signal_buffer_plan(
             }
         }
     }
-    Ok(allocate_pedal_batch_signal_lifetimes(
+    Ok(allocate_component_batch_signal_lifetimes(
         lifetimes
             .into_iter()
             .map(
                 |(key, (frame_byte_capacity, host_visible, first_dispatch, last_dispatch))| {
-                    VulkanPedalBatchSignalLifetime {
+                    VulkanComponentBatchSignalLifetime {
                         key,
                         frame_byte_capacity,
                         host_visible,

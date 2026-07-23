@@ -86,10 +86,10 @@ fn write_fixture_model_constant_output_frame(
         .unwrap();
 }
 
-fn zero_fixture_model_temporal_memory(mounted: &VulkanMountedPlacedStreamCircuit, pedal_id: &str) {
+fn zero_fixture_model_temporal_memory(mounted: &VulkanMountedPlacedStreamCircuit, component_id: &str) {
     let temporal_memory = mounted
         .buffers
-        .state_buffer(pedal_id, "temporal_memory")
+        .state_buffer(component_id, "temporal_memory")
         .unwrap();
     temporal_memory
         .buffer
@@ -97,8 +97,8 @@ fn zero_fixture_model_temporal_memory(mounted: &VulkanMountedPlacedStreamCircuit
         .unwrap();
 }
 
-fn zero_fixture_model_kv_memory(mounted: &VulkanMountedPlacedStreamCircuit, pedal_id: &str) {
-    let kv_memory = mounted.buffers.state_buffer(pedal_id, "kv_memory").unwrap();
+fn zero_fixture_model_kv_memory(mounted: &VulkanMountedPlacedStreamCircuit, component_id: &str) {
+    let kv_memory = mounted.buffers.state_buffer(component_id, "kv_memory").unwrap();
     kv_memory
         .buffer
         .write_bytes(&vec![0u8; kv_memory.byte_capacity])
@@ -123,7 +123,7 @@ fn fixture_model_layer_id(layer_index: usize) -> String {
     format!("layer_{layer_index:02}")
 }
 
-fn fixture_model_prefix_pedal_ids(last_layer_index: usize) -> Vec<String> {
+fn fixture_model_prefix_component_ids(last_layer_index: usize) -> Vec<String> {
     (0..=last_layer_index).map(fixture_model_layer_id).collect()
 }
 
@@ -143,13 +143,13 @@ fn load_fixture_model_layer_parameters(
 }
 
 fn zero_fixture_model_layer_state(mounted: &VulkanMountedPlacedStreamCircuit, layer_index: usize) {
-    let pedal_id = fixture_model_layer_id(layer_index);
+    let component_id = fixture_model_layer_id(layer_index);
     match fixture_model_layer_kind(layer_index) {
         FixtureModelLayerKind::ShortConv => {
-            zero_fixture_model_temporal_memory(mounted, &pedal_id);
+            zero_fixture_model_temporal_memory(mounted, &component_id);
         }
         FixtureModelLayerKind::Attention => {
-            zero_fixture_model_kv_memory(mounted, &pedal_id);
+            zero_fixture_model_kv_memory(mounted, &component_id);
         }
     }
 }
@@ -168,7 +168,7 @@ fn prepare_fixture_model_resident_prefix(
         zero_fixture_model_layer_state(mounted, layer_index);
     }
 
-    fixture_model_prefix_pedal_ids(last_layer_index)
+    fixture_model_prefix_component_ids(last_layer_index)
 }
 
 fn fixture_model_stream_control(
@@ -188,29 +188,29 @@ fn create_fixture_model_resident_prefix_runner(
     mounted: &VulkanMountedPlacedStreamCircuit,
     mounted_bound: &VulkanMountedPlacedBoundDispatchPlan,
     loaded_manifest: &VulkanLoadedReusableKernelArtifactManifest,
-    pedal_ids: &[String],
-) -> VulkanMountedPlacedResidentPedalboardRunner {
+    component_ids: &[String],
+) -> VulkanMountedPlacedResidentExecutionGraphRunner {
     mounted
-        .create_resident_pedalboard_runner(
+        .create_resident_execution_graph_runner(
             device,
             mounted_bound,
-            pedal_ids.iter().map(String::as_str),
+            component_ids.iter().map(String::as_str),
             loaded_manifest,
         )
         .unwrap()
 }
 
 fn assert_fixture_model_resident_prefix_runner(
-    runner: &VulkanMountedPlacedResidentPedalboardRunner,
-    pedal_ids: &[String],
+    runner: &VulkanMountedPlacedResidentExecutionGraphRunner,
+    component_ids: &[String],
     dispatch_count: usize,
     descriptor_count: usize,
     push_constant_byte_count: u32,
 ) {
-    let expected_pedal_ids = pedal_ids.iter().map(String::as_str).collect::<Vec<_>>();
+    let expected_component_ids = component_ids.iter().map(String::as_str).collect::<Vec<_>>();
     assert_eq!(runner.device_id, "gpu0");
-    assert_eq!(runner.pedal_count(), pedal_ids.len());
-    assert_eq!(runner.pedal_ids(), expected_pedal_ids);
+    assert_eq!(runner.component_count(), component_ids.len());
+    assert_eq!(runner.component_ids(), expected_component_ids);
     assert_eq!(runner.dispatch_count(), dispatch_count);
     assert_eq!(runner.total_descriptor_count, descriptor_count);
     assert_eq!(
@@ -220,14 +220,14 @@ fn assert_fixture_model_resident_prefix_runner(
 }
 
 fn assert_fixture_model_resident_prefix_run(
-    run: &VulkanMountedPlacedResidentPedalboardRun,
-    pedal_ids: &[String],
+    run: &VulkanMountedPlacedResidentExecutionGraphRun,
+    component_ids: &[String],
     dispatch_count: usize,
 ) {
-    let expected_pedal_ids = pedal_ids.iter().map(String::as_str).collect::<Vec<_>>();
+    let expected_component_ids = component_ids.iter().map(String::as_str).collect::<Vec<_>>();
     assert_eq!(run.device_id, "gpu0");
-    assert_eq!(run.pedal_count(), pedal_ids.len());
-    assert_eq!(run.pedal_ids(), expected_pedal_ids);
+    assert_eq!(run.component_count(), component_ids.len());
+    assert_eq!(run.component_ids(), expected_component_ids);
     assert_eq!(run.dispatch_count(), dispatch_count);
 }
 
@@ -411,8 +411,8 @@ fn loaded_kernel_pack_for_dispatch_shaders(
     let mut loaded_families = BTreeSet::new();
     let mut total_word_count = 0usize;
 
-    for (pedal_id, node_id, shader_file) in dispatch_shaders {
-        let dispatch = mounted_bound.dispatch(pedal_id, node_id).unwrap();
+    for (component_id, node_id, shader_file) in dispatch_shaders {
+        let dispatch = mounted_bound.dispatch(component_id, node_id).unwrap();
         if !loaded_families.insert(dispatch.reusable_family_id.clone()) {
             continue;
         }

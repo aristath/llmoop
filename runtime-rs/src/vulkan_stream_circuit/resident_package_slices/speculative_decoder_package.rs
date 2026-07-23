@@ -1,7 +1,7 @@
 pub struct VulkanResidentSpeculativeDecoderModelPackage {
     pub id: String,
     pub device_id: String,
-    pub hosted_pedal_count: usize,
+    pub hosted_component_count: usize,
     package: VulkanResidentSpeculativeDecoderPackageSpec,
     device_slice: Arc<VulkanResidentModelPackageDeviceSlice>,
     additional_parameter_buffers: Option<Arc<VulkanPermanentParameterBuffers>>,
@@ -29,26 +29,26 @@ impl VulkanResidentSpeculativeDecoderModelPackage {
         context: &VulkanResidentSpeculativeDecoderLoadContext<'_>,
     ) -> Result<Self, VulkanResidentInProcessPlacedRuntimeError> {
         let mut circuit_graph = decoder.circuit_graph.clone();
-        for pedal in &mut circuit_graph.pedals {
+        for component in &mut circuit_graph.components {
             if matches!(
-                pedal.runtime_role,
+                component.runtime_role,
                 CircuitRuntimeRole::DraftInputAdapter | CircuitRuntimeRole::DraftProcessor
             ) {
-                pedal.runtime_role = CircuitRuntimeRole::SignalProcessor;
-                pedal.circuit.runtime_role = CircuitRuntimeRole::SignalProcessor;
+                component.runtime_role = CircuitRuntimeRole::SignalProcessor;
+                component.circuit.runtime_role = CircuitRuntimeRole::SignalProcessor;
             }
         }
         let mut package = context.runtime_model.package.clone();
         package.package_id = format!("{}::{}", package.package_id, decoder.id);
         package.circuit_graph = circuit_graph.clone();
-        package.pedal_executions = decoder.pedal_executions.clone();
+        package.component_executions = decoder.component_executions.clone();
         package.speculative_decoders.clear();
         let draft_runtime_model = VulkanResidentRuntimeModel {
             package,
-            patch: context.runtime_model.patch.clone(),
+            runtime_graph: context.runtime_model.runtime_graph.clone(),
             placement: StreamCircuitPlacementSpec::new(device_id),
             circuit_graph,
-            pedal_executions: decoder.pedal_executions.clone(),
+            component_executions: decoder.component_executions.clone(),
         };
         let device_slice = Arc::new(
             VulkanResidentModelPackageDeviceSlice::from_runtime_model_for_device(
@@ -103,14 +103,14 @@ impl VulkanResidentSpeculativeDecoderModelPackage {
         )
         .map_err(VulkanResidentInProcessPlacedRuntimeError::Package)?;
         let mut input_embedding_spec = context.input_embedding_spec.clone();
-        input_embedding_spec.transducer_id = decoder.input_adapter.pedal_id.clone();
+        input_embedding_spec.transducer_id = decoder.input_adapter.component_id.clone();
         input_embedding_spec.output_signal_id =
             decoder.input_adapter.token_embedding_signal_id.clone();
 
         Ok(Self {
             id: decoder.id.clone(),
             device_id: device_id.to_string(),
-            hosted_pedal_count: device_slice.hosted_pedal_count,
+            hosted_component_count: device_slice.hosted_component_count,
             package: decoder.clone(),
             device_slice,
             additional_parameter_buffers,
@@ -136,19 +136,19 @@ impl VulkanResidentSpeculativeDecoderModelPackage {
         &self,
         input_signal_id: String,
     ) -> Result<VulkanResidentOutputTransducerSpec, VulkanResidentTokenModelPackageError> {
-        let pedal = self
+        let component = self
             .package
             .circuit_graph
-            .pedals
+            .components
             .iter()
-            .find(|pedal| pedal.pedal_id == self.package.output_transducer.pedal_id)
+            .find(|component| component.component_id == self.package.output_transducer.component_id)
             .ok_or_else(|| {
                 VulkanResidentTokenModelPackageError::new(format!(
-                    "speculative decoder {:?} has no output transducer pedal {:?}",
-                    self.id, self.package.output_transducer.pedal_id
+                    "speculative decoder {:?} has no output transducer component {:?}",
+                    self.id, self.package.output_transducer.component_id
                 ))
             })?;
-        let node_ids = pedal
+        let node_ids = component
             .circuit
             .nodes
             .iter()
@@ -163,7 +163,7 @@ impl VulkanResidentSpeculativeDecoderModelPackage {
         }
         let output = &self.package.output_transducer;
         Ok(VulkanResidentOutputTransducerSpec {
-            transducer_id: output.pedal_id.clone(),
+            transducer_id: output.component_id.clone(),
             input_signal_id,
             node_ids,
             norm_parameter_tensor: output.norm_parameter_tensor.clone(),

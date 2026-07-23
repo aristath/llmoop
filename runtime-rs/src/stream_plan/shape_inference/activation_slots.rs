@@ -37,7 +37,7 @@ fn planned_activation_slots(
 }
 
 fn validate_node_dependencies(
-    pedal_id: &str,
+    component_id: &str,
     node: &CircuitNode,
     available: &BTreeSet<String>,
     state_ids: &BTreeSet<&String>,
@@ -47,7 +47,7 @@ fn validate_node_dependencies(
         if !available.contains(input) {
             return Err(CircuitPlanError(format!(
                 "{} node {} input {:?} is not available at its schedule position",
-                pedal_id, node.id, input
+                component_id, node.id, input
             )));
         }
     }
@@ -55,7 +55,7 @@ fn validate_node_dependencies(
         if !param_ids.contains(param) {
             return Err(CircuitPlanError(format!(
                 "{} node {} parameter {:?} is not declared",
-                pedal_id, node.id, param
+                component_id, node.id, param
             )));
         }
     }
@@ -63,14 +63,14 @@ fn validate_node_dependencies(
         if !state_ids.contains(state) {
             return Err(CircuitPlanError(format!(
                 "{} node {} state {:?} is not declared",
-                pedal_id, node.id, state
+                component_id, node.id, state
             )));
         }
     }
     if node.outputs.is_empty() {
         return Err(CircuitPlanError(format!(
             "{} node {} has no outputs",
-            pedal_id, node.id
+            component_id, node.id
         )));
     }
     Ok(())
@@ -81,16 +81,16 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::stream_circuit::ResolvedLoweredPedalboard;
+    use crate::stream_circuit::ResolvedLoweredExecutionGraph;
     use crate::test_support::compiled_artifact_dir;
 
     fn fixture_model_index_path() -> PathBuf {
         compiled_artifact_dir(
             "NERVE_TEST_LOWERED_DIR",
             "lowered",
-            "pedalboard.circuits.json",
+            "execution_graph.circuits.json",
         )
-        .join("pedalboard.circuits.json")
+        .join("execution_graph.circuits.json")
     }
 
     fn fixture_model_tensor_index_path() -> PathBuf {
@@ -544,12 +544,12 @@ mod tests {
     }
 
     #[test]
-    fn plans_fixture_model_lowered_pedalboard_activation_schedule() {
-        let graph = ResolvedLoweredPedalboard::from_index_file(fixture_model_index_path()).unwrap();
+    fn plans_fixture_model_lowered_execution_graph_activation_schedule() {
+        let graph = ResolvedLoweredExecutionGraph::from_index_file(fixture_model_index_path()).unwrap();
 
         let plan = StreamCircuitExecutionPlan::from_graph(&graph).unwrap();
 
-        assert_eq!(plan.wiring, "explicit_graph");
+        assert_eq!(plan.topology, "explicit_graph");
         assert_eq!(plan.circuits.len(), 14);
         assert_eq!(plan.total_node_count(), 242);
         assert_eq!(plan.produced_signal_count(), 264);
@@ -564,7 +564,7 @@ mod tests {
 
         let layer_00 = &plan.circuits[0];
         let layer_00_frame = layer_00.activation_frame_plan();
-        assert_eq!(layer_00.pedal_id, "layer_00");
+        assert_eq!(layer_00.component_id, "layer_00");
         assert_eq!(layer_00.nodes.len(), 16);
         assert_eq!(layer_00.temporary_signals.len(), 16);
         assert_eq!(
@@ -607,7 +607,7 @@ mod tests {
 
     #[test]
     fn tensor_index_enables_fixture_model_signal_shape_planning() {
-        let graph = ResolvedLoweredPedalboard::from_index_file(fixture_model_index_path()).unwrap();
+        let graph = ResolvedLoweredExecutionGraph::from_index_file(fixture_model_index_path()).unwrap();
         let tensor_index = TensorIndex::from_json_file(fixture_model_tensor_index_path()).unwrap();
 
         let plan = StreamCircuitExecutionPlan::from_graph_with_tensor_index(&graph, &tensor_index)
@@ -663,7 +663,7 @@ mod tests {
         let layer_00_bank = resource_plan
             .activation_banks
             .iter()
-            .find(|bank| bank.pedal_id == "layer_00")
+            .find(|bank| bank.component_id == "layer_00")
             .unwrap();
         assert_eq!(layer_00_bank.slot_count, 4);
         assert_eq!(
@@ -678,7 +678,7 @@ mod tests {
         let layer_02_bank = resource_plan
             .activation_banks
             .iter()
-            .find(|bank| bank.pedal_id == "layer_02")
+            .find(|bank| bank.component_id == "layer_02")
             .unwrap();
         assert_eq!(layer_02_bank.slot_count, 4);
         assert_eq!(
@@ -721,7 +721,7 @@ mod tests {
 
     #[test]
     fn resource_plan_names_fixture_model_mount_resources() {
-        let graph = ResolvedLoweredPedalboard::from_index_file(fixture_model_index_path()).unwrap();
+        let graph = ResolvedLoweredExecutionGraph::from_index_file(fixture_model_index_path()).unwrap();
         let execution_plan = StreamCircuitExecutionPlan::from_graph(&graph).unwrap();
 
         let resource_plan =
@@ -747,7 +747,7 @@ mod tests {
             .find(|parameter| parameter.tensor == "model.layers.0.conv.in_proj.weight")
             .unwrap();
         assert_eq!(conv_in.uses.len(), 1);
-        assert_eq!(conv_in.uses[0].pedal_id, "layer_00");
+        assert_eq!(conv_in.uses[0].component_id, "layer_00");
         assert_eq!(conv_in.uses[0].param_id, "conv_in_projection");
         assert_eq!(
             conv_in.uses[0].role.as_deref(),
@@ -765,7 +765,7 @@ mod tests {
             embed_tokens
                 .uses
                 .iter()
-                .map(|parameter_use| parameter_use.pedal_id.as_str())
+                .map(|parameter_use| parameter_use.component_id.as_str())
                 .collect::<Vec<_>>(),
             vec![
                 "input_transducer.token_embedding",
@@ -790,7 +790,7 @@ mod tests {
             .unwrap();
         assert_eq!(embedding_norm.uses.len(), 1);
         assert_eq!(
-            embedding_norm.uses[0].pedal_id,
+            embedding_norm.uses[0].component_id,
             "output_transducer.output_norm"
         );
         assert_eq!(embedding_norm.uses[0].role.as_deref(), Some("rms_norm"));
@@ -811,7 +811,7 @@ mod tests {
         let layer_00_state = resource_plan
             .state_allocations
             .iter()
-            .find(|state| state.pedal_id == "layer_00")
+            .find(|state| state.component_id == "layer_00")
             .unwrap();
         assert_eq!(layer_00_state.state_id, "temporal_memory");
         assert_eq!(layer_00_state.shape, Some(vec![3, 1024]));
@@ -821,7 +821,7 @@ mod tests {
         let layer_02_state = resource_plan
             .state_allocations
             .iter()
-            .find(|state| state.pedal_id == "layer_02")
+            .find(|state| state.component_id == "layer_02")
             .unwrap();
         assert_eq!(layer_02_state.state_id, "kv_memory");
         assert_eq!(layer_02_state.shape, None);
@@ -831,7 +831,7 @@ mod tests {
         let layer_00_bank = resource_plan
             .activation_banks
             .iter()
-            .find(|bank| bank.pedal_id == "layer_00")
+            .find(|bank| bank.component_id == "layer_00")
             .unwrap();
         assert_eq!(layer_00_bank.temporary_signal_count, 16);
         assert_eq!(layer_00_bank.slot_count, 4);
@@ -840,7 +840,7 @@ mod tests {
         let layer_02_bank = resource_plan
             .activation_banks
             .iter()
-            .find(|bank| bank.pedal_id == "layer_02")
+            .find(|bank| bank.component_id == "layer_02")
             .unwrap();
         assert_eq!(layer_02_bank.temporary_signal_count, 17);
         assert_eq!(layer_02_bank.slot_count, 4);
@@ -848,7 +848,7 @@ mod tests {
 
     #[test]
     fn resource_plan_rejects_mismatched_execution_plan() {
-        let graph = ResolvedLoweredPedalboard::from_index_file(fixture_model_index_path()).unwrap();
+        let graph = ResolvedLoweredExecutionGraph::from_index_file(fixture_model_index_path()).unwrap();
         let mut execution_plan = StreamCircuitExecutionPlan::from_graph(&graph).unwrap();
         execution_plan.circuits.pop();
 
@@ -860,7 +860,7 @@ mod tests {
 
     #[test]
     fn activation_plan_tracks_signal_producers_and_consumers() {
-        let graph = ResolvedLoweredPedalboard::from_index_file(fixture_model_index_path()).unwrap();
+        let graph = ResolvedLoweredExecutionGraph::from_index_file(fixture_model_index_path()).unwrap();
         let plan = StreamCircuitExecutionPlan::from_graph(&graph).unwrap();
         let layer_00 = &plan.circuits[0];
 
@@ -922,7 +922,7 @@ mod tests {
             is_boundary_output: false,
         };
         let plan = CircuitActivationPlan {
-            pedal_id: "pedal".to_string(),
+            component_id: "component".to_string(),
             circuit_id: "circuit".to_string(),
             input_ports: Vec::new(),
             output_ports: Vec::new(),
@@ -966,7 +966,7 @@ mod tests {
 
     #[test]
     fn activation_plan_rejects_unscheduled_signal_dependency() {
-        let graph = ResolvedLoweredPedalboard::from_index_file(fixture_model_index_path()).unwrap();
+        let graph = ResolvedLoweredExecutionGraph::from_index_file(fixture_model_index_path()).unwrap();
         let mut circuit = graph.circuits[0].circuit.clone();
         circuit.nodes[0].inputs = vec!["not_available_yet".to_string()];
 

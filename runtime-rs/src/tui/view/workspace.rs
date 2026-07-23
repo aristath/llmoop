@@ -11,7 +11,7 @@ use crate::{RuntimeAvailableDevice, RuntimeEditorControlKind, RuntimeEditorInsta
 
 use super::app::{
     App, BrowserEntry, CompilerProgressState, FocusRegion, HitTarget, ModelSelectorFocus,
-    ModelSelectorState, Overlay, PedalModalState, PedalPolicyKind,
+    ModelSelectorState, Overlay, NodeModalState, NodePolicyKind,
 };
 use super::sequence::TextBuffer;
 
@@ -31,7 +31,7 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &mut App) {
         match overlay {
             Overlay::ModelSelector(selector) => render_model_selector(frame, app, &selector),
             Overlay::Compiler(progress) => render_compiler(frame, app, &progress),
-            Overlay::Pedal(modal) => render_pedal_modal(frame, app, &modal),
+            Overlay::Node(modal) => render_node_modal(frame, app, &modal),
             Overlay::Help => render_help(frame),
         }
     }
@@ -49,7 +49,7 @@ fn render_workspace(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         .split(area);
     render_header(frame, app, sections[0]);
     render_sequence(frame, app, sections[1]);
-    render_board(frame, app, sections[2]);
+    render_graph(frame, app, sections[2]);
     render_footer(frame, app, sections[3]);
 }
 
@@ -58,8 +58,8 @@ fn render_header(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         (
             editor.package_id().to_string(),
             format!(
-                "{} source pedals  ·  {} instances  ·  context {}",
-                editor.source_pedals().len(),
+                "{} source components  ·  {} node instances  ·  context {}",
+                editor.source_components().len(),
                 editor.instances().len(),
                 editor.max_context_activations()
             ),
@@ -72,7 +72,7 @@ fn render_header(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     };
     let title = Line::from(vec![
         Span::styled(" nerve ", Style::default().fg(SIGNAL).bold()),
-        Span::styled("SIGNAL BOARD", Style::default().fg(META)),
+        Span::styled("STREAM GRAPH", Style::default().fg(META)),
         Span::raw("  "),
         Span::styled(identity, Style::default().fg(TEXT).bold()),
     ]);
@@ -148,7 +148,7 @@ fn render_sequence(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         );
     } else {
         frame.render_widget(
-            Paragraph::new("valid draft · edits update the board immediately")
+            Paragraph::new("valid draft · edits update the graph immediately")
                 .style(Style::default().fg(META)),
             Rect::new(inner.x, inner.y.saturating_add(1), inner.width, 1),
         );
@@ -161,11 +161,11 @@ fn render_sequence(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     }
 }
 
-fn render_board(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
-    let focused = app.focus == FocusRegion::Board && app.overlay.is_none();
+fn render_graph(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
+    let focused = app.focus == FocusRegion::Graph && app.overlay.is_none();
     let block = Block::default()
         .title(Span::styled(
-            " LIVE PEDALBOARD · DRAFT ",
+            " LIVE EXECUTION GRAPH · DRAFT ",
             Style::default().fg(if focused { SIGNAL } else { META }),
         ))
         .borders(Borders::ALL)
@@ -178,7 +178,7 @@ fn render_board(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             Paragraph::new(vec![
                 Line::styled("The signal chain is empty.", Style::default().fg(TEXT)),
                 Line::styled(
-                    "Open a model to populate reusable source pedals.",
+                    "Open a model to populate reusable source components.",
                     Style::default().fg(META),
                 ),
             ])
@@ -188,10 +188,10 @@ fn render_board(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         return;
     }
 
-    let pedal_width = if inner.width >= 80 { 14 } else { 10 };
-    let cable_width = if inner.width >= 80 { 5 } else { 3 };
-    let unit_width = pedal_width + cable_width;
-    let visible_count = ((inner.width + cable_width) / unit_width).max(1) as usize;
+    let component_width = if inner.width >= 80 { 14 } else { 10 };
+    let edge_width = if inner.width >= 80 { 5 } else { 3 };
+    let unit_width = component_width + edge_width;
+    let visible_count = ((inner.width + edge_width) / unit_width).max(1) as usize;
     let selected_index = app
         .selected_instance_id
         .as_ref()
@@ -201,39 +201,39 @@ fn render_board(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                 .position(|instance| &instance.instance_id == id)
         })
         .unwrap_or(0);
-    if selected_index < app.board_scroll {
-        app.board_scroll = selected_index;
+    if selected_index < app.graph_scroll {
+        app.graph_scroll = selected_index;
     }
-    if selected_index >= app.board_scroll + visible_count {
-        app.board_scroll = selected_index + 1 - visible_count;
+    if selected_index >= app.graph_scroll + visible_count {
+        app.graph_scroll = selected_index + 1 - visible_count;
     }
-    app.board_scroll = app
-        .board_scroll
+    app.graph_scroll = app
+        .graph_scroll
         .min(instances.len().saturating_sub(visible_count));
 
     let shown = instances
         .iter()
-        .skip(app.board_scroll)
+        .skip(app.graph_scroll)
         .take(visible_count)
         .collect::<Vec<_>>();
-    let board_y = inner.y + inner.height.saturating_sub(6) / 2;
+    let graph_y = inner.y + inner.height.saturating_sub(6) / 2;
     let device_colors = device_color_map(&instances);
     for (visible_index, instance) in shown.iter().enumerate() {
-        let absolute_index = app.board_scroll + visible_index;
+        let absolute_index = app.graph_scroll + visible_index;
         let x = inner.x + visible_index as u16 * unit_width;
         if visible_index > 0 {
             let previous = &instances[absolute_index - 1];
             let transition = previous.device_id != instance.device_id;
-            render_cable(
+            render_edge(
                 frame,
-                Rect::new(x.saturating_sub(cable_width), board_y + 2, cable_width, 1),
+                Rect::new(x.saturating_sub(edge_width), graph_y + 2, edge_width, 1),
                 transition,
             );
         }
-        let pedal_area = Rect::new(x, board_y, pedal_width.min(inner.right() - x), 5);
-        render_pedal(
+        let component_area = Rect::new(x, graph_y, component_width.min(inner.right() - x), 5);
+        render_node(
             frame,
-            pedal_area,
+            component_area,
             instance,
             app.selected_instance_id.as_deref() == Some(instance.instance_id.as_str()),
             focused,
@@ -241,14 +241,14 @@ fn render_board(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             app.editor.as_ref().map(|editor| editor.available_devices()),
         );
         app.hit_map
-            .insert(pedal_area, HitTarget::Pedal(instance.instance_id.clone()));
+            .insert(component_area, HitTarget::Node(instance.instance_id.clone()));
     }
-    if app.board_scroll > 0 {
+    if app.graph_scroll > 0 {
         let left = Rect::new(inner.x, inner.bottom().saturating_sub(1), 3, 1);
         frame.render_widget(Paragraph::new("◀").style(Style::default().fg(SIGNAL)), left);
         app.hit_map.insert(left, HitTarget::PanLeft);
     }
-    if app.board_scroll + shown.len() < instances.len() {
+    if app.graph_scroll + shown.len() < instances.len() {
         let right = Rect::new(inner.right().saturating_sub(3), inner.bottom() - 1, 3, 1);
         frame.render_widget(
             Paragraph::new("▶")
@@ -260,8 +260,8 @@ fn render_board(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     }
     let position = format!(
         "signal {}–{} / {}",
-        app.board_scroll + 1,
-        app.board_scroll + shown.len(),
+        app.graph_scroll + 1,
+        app.graph_scroll + shown.len(),
         instances.len()
     );
     frame.render_widget(
@@ -272,8 +272,8 @@ fn render_board(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     );
 }
 
-fn render_cable(frame: &mut Frame<'_>, area: Rect, transition: bool) {
-    let cable = if transition {
+fn render_edge(frame: &mut Frame<'_>, area: Rect, transition: bool) {
+    let edge = if transition {
         match area.width {
             0 => "".to_string(),
             1 => "◆".to_string(),
@@ -288,17 +288,17 @@ fn render_cable(frame: &mut Frame<'_>, area: Rect, transition: bool) {
         "─".repeat(area.width as usize)
     };
     frame.render_widget(
-        Paragraph::new(cable).style(Style::default().fg(SIGNAL).bold()),
+        Paragraph::new(edge).style(Style::default().fg(SIGNAL).bold()),
         area,
     );
 }
 
-fn render_pedal(
+fn render_node(
     frame: &mut Frame<'_>,
     area: Rect,
     instance: &RuntimeEditorInstance,
     selected: bool,
-    board_focused: bool,
+    graph_focused: bool,
     device_color: Color,
     devices: Option<&[RuntimeAvailableDevice]>,
 ) {
@@ -306,7 +306,7 @@ fn render_pedal(
         devices.iter().any(|device| {
             device.device_id == instance.device_id
                 && device.available
-                && device.can_host_runtime_pedals_on_physical_device != Some(false)
+                && device.can_host_runtime_components_on_physical_device != Some(false)
         })
     });
     let border_color = if !device_available {
@@ -329,7 +329,7 @@ fn render_pedal(
                 .bold(),
         ))
         .borders(Borders::ALL)
-        .border_type(if selected && board_focused {
+        .border_type(if selected && graph_focused {
             BorderType::Double
         } else {
             BorderType::Rounded
@@ -369,9 +369,9 @@ fn render_footer(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     } else {
         match app.focus {
             FocusRegion::Sequence => {
-                "Type/paste sequence · Shift+arrows select · Tab board · Ctrl+O model · F1 help"
+                "Type/paste sequence · Shift+arrows select · Tab graph · Ctrl+O model · F1 help"
             }
-            FocusRegion::Board => {
+            FocusRegion::Graph => {
                 "←/→ select · Enter edit · Ctrl+D duplicate · Del remove · Alt+←/→ reorder · Tab sequence"
             }
         }
@@ -390,4 +390,3 @@ fn render_footer(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         area,
     );
 }
-

@@ -1,9 +1,9 @@
-impl VulkanResidentPlacedPedalBatchRunner {
+impl VulkanResidentPlacedComponentBatchRunner {
     fn new(
         devices: &BTreeMap<String, Rc<VulkanComputeDevice>>,
         placed_slices: &[VulkanResidentInProcessPlacedStreamProcessorDevice],
         lane_capacity: usize,
-        execution_mode: VulkanPedalBatchExecutionMode,
+        execution_mode: VulkanComponentBatchExecutionMode,
         distributed_execution_plan: &VulkanDistributedExecutionPlan,
         distributed_parameter_buffers: &VulkanDistributedParameterBuffers,
     ) -> Result<Self, VulkanResidentInProcessPlacedRuntimeError> {
@@ -15,7 +15,7 @@ impl VulkanResidentPlacedPedalBatchRunner {
                         device_id: slice.device_id.clone(),
                     }
                 })?;
-                VulkanResidentPedalBatchSliceRunner::new(
+                VulkanResidentComponentBatchSliceRunner::new(
                     devices,
                     device,
                     slice,
@@ -25,7 +25,7 @@ impl VulkanResidentPlacedPedalBatchRunner {
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let distributed_dispatches = VulkanDistributedPedalBatchRunners::new(
+        let distributed_dispatches = VulkanDistributedComponentBatchRunners::new(
             devices,
             placed_slices,
             &slices,
@@ -34,40 +34,40 @@ impl VulkanResidentPlacedPedalBatchRunner {
             lane_capacity,
             execution_mode,
         )?;
-        let mut cable_transfers = Vec::new();
+        let mut edge_transfers = Vec::new();
         for (source_device_index, placed_slice) in placed_slices.iter().enumerate() {
-            for outgoing in &placed_slice.mounted.cable_io.outgoing_buffers {
+            for outgoing in &placed_slice.mounted.edge_io.outgoing_buffers {
                 let destination_device_index = placed_slices
                     .iter()
                     .position(|candidate| {
                         candidate.device_id == outgoing.endpoint.remote_device_id
                             && candidate
                                 .mounted
-                                .cable_io
-                                .incoming_buffer(outgoing.endpoint.cable_index)
+                                .edge_io
+                                .incoming_buffer(outgoing.endpoint.edge_index)
                                 .is_some()
                     })
                     .ok_or_else(|| {
                         VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(
                             format!(
-                                "pedal batch cable {} has no destination device {:?}",
-                                outgoing.endpoint.cable_index, outgoing.endpoint.remote_device_id
+                                "component batch edge {} has no destination device {:?}",
+                                outgoing.endpoint.edge_index, outgoing.endpoint.remote_device_id
                             ),
                         ))
                     })?;
                 let source = slices[source_device_index].signal_buffer(
-                    &VulkanPedalBatchSignalKey::OutgoingCable(outgoing.endpoint.cable_index),
+                    &VulkanComponentBatchSignalKey::OutgoingEdge(outgoing.endpoint.edge_index),
                 )?;
                 let destination = slices[destination_device_index].signal_buffer(
-                    &VulkanPedalBatchSignalKey::IncomingCable(outgoing.endpoint.cable_index),
+                    &VulkanComponentBatchSignalKey::IncomingEdge(outgoing.endpoint.edge_index),
                 )?;
                 if source.frame_byte_capacity != destination.frame_byte_capacity
                     || source.buffer.byte_capacity() != destination.buffer.byte_capacity()
                 {
                     return Err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop(
                         VulkanError(format!(
-                            "pedal batch cable {} source and destination capacities differ",
-                            outgoing.endpoint.cable_index
+                            "component batch edge {} source and destination capacities differ",
+                            outgoing.endpoint.edge_index
                         )),
                     ));
                 }
@@ -85,7 +85,7 @@ impl VulkanResidentPlacedPedalBatchRunner {
                     })?;
                 let byte_len = source.buffer.byte_capacity();
                 let binding = if Rc::ptr_eq(source_device, destination_device) {
-                    VulkanPedalBatchCableTransferBinding::Resident(Box::new(
+                    VulkanComponentBatchEdgeTransferBinding::Resident(Box::new(
                         source_device
                             .create_resident_buffer_copy(
                                 &source.buffer,
@@ -95,17 +95,17 @@ impl VulkanResidentPlacedPedalBatchRunner {
                             .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?,
                     ))
                 } else {
-                    VulkanPedalBatchCableTransferBinding::Mapped(
+                    VulkanComponentBatchEdgeTransferBinding::Mapped(
                         source
                             .buffer
                             .create_persistently_mapped_copy_to(&destination.buffer, byte_len)
                             .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?,
                     )
                 };
-                cable_transfers.push(VulkanPedalBatchCableTransfer {
+                edge_transfers.push(VulkanComponentBatchEdgeTransfer {
                     source_device_index,
                     destination_device_index,
-                    cable_index: outgoing.endpoint.cable_index,
+                    edge_index: outgoing.endpoint.edge_index,
                     binding,
                 });
             }
@@ -114,38 +114,38 @@ impl VulkanResidentPlacedPedalBatchRunner {
             distributed_dispatches,
             lane_capacity,
             slices,
-            cable_transfers,
+            edge_transfers,
         })
     }
 
     fn slice(
         &self,
         index: usize,
-    ) -> Result<&VulkanResidentPedalBatchSliceRunner, VulkanResidentInProcessPlacedRuntimeError>
+    ) -> Result<&VulkanResidentComponentBatchSliceRunner, VulkanResidentInProcessPlacedRuntimeError>
     {
         self.slices.get(index).ok_or_else(|| {
             VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(format!(
-                "placed pedal batch has no device slice {index}"
+                "placed component batch has no device slice {index}"
             )))
         })
     }
 
-    fn transfer_cable(
+    fn transfer_edge(
         &self,
         source_device_index: usize,
         destination_device_index: usize,
-        cable_index: usize,
+        edge_index: usize,
     ) -> Result<(), VulkanResidentInProcessPlacedRuntimeError> {
-        self.cable_transfers
+        self.edge_transfers
             .iter()
             .find(|transfer| {
                 transfer.source_device_index == source_device_index
                     && transfer.destination_device_index == destination_device_index
-                    && transfer.cable_index == cable_index
+                    && transfer.edge_index == edge_index
             })
             .ok_or_else(|| {
                 VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(format!(
-                    "pedal batch has no cable transfer {source_device_index}->{destination_device_index}:{cable_index}"
+                    "component batch has no edge transfer {source_device_index}->{destination_device_index}:{edge_index}"
                 )))
             })?
             .run()
@@ -220,21 +220,21 @@ impl VulkanResidentPlacedPedalBatchRunner {
     }
 }
 
-fn pedal_batch_signal_target(
+fn component_batch_signal_target(
     descriptor: &VulkanMountedPlacedBoundDescriptor,
-) -> Result<Option<(VulkanPedalBatchSignalKey, usize)>, VulkanResidentInProcessPlacedRuntimeError> {
+) -> Result<Option<(VulkanComponentBatchSignalKey, usize)>, VulkanResidentInProcessPlacedRuntimeError> {
     let target = match &descriptor.target {
         VulkanMountedPlacedBoundDescriptorTarget::Resident {
             target:
                 VulkanBoundDescriptorTarget::ActivationSlot {
-                    pedal_id,
+                    component_id,
                     signal_id,
                     signal_byte_capacity,
                     ..
                 },
         } => Some((
-            VulkanPedalBatchSignalKey::Activation {
-                pedal_id: pedal_id.clone(),
+            VulkanComponentBatchSignalKey::Activation {
+                component_id: component_id.clone(),
                 signal_id: signal_id.clone(),
             },
             *signal_byte_capacity,
@@ -242,28 +242,28 @@ fn pedal_batch_signal_target(
         VulkanMountedPlacedBoundDescriptorTarget::Resident { .. } => None,
         VulkanMountedPlacedBoundDescriptorTarget::ModelInput { .. }
         | VulkanMountedPlacedBoundDescriptorTarget::ModelOutput { .. } => None,
-        VulkanMountedPlacedBoundDescriptorTarget::LocalCableInputBuffer { cable }
-        | VulkanMountedPlacedBoundDescriptorTarget::LocalCableOutputBuffer { cable } => Some((
-            VulkanPedalBatchSignalKey::LocalCable(cable.cable.cable_index),
-            cable.byte_capacity,
+        VulkanMountedPlacedBoundDescriptorTarget::LocalEdgeInputBuffer { edge }
+        | VulkanMountedPlacedBoundDescriptorTarget::LocalEdgeOutputBuffer { edge } => Some((
+            VulkanComponentBatchSignalKey::LocalEdge(edge.edge.edge_index),
+            edge.byte_capacity,
         )),
-        VulkanMountedPlacedBoundDescriptorTarget::IncomingCableBuffer { endpoint } => Some((
-            VulkanPedalBatchSignalKey::IncomingCable(endpoint.endpoint.cable_index),
+        VulkanMountedPlacedBoundDescriptorTarget::IncomingEdgeBuffer { endpoint } => Some((
+            VulkanComponentBatchSignalKey::IncomingEdge(endpoint.endpoint.edge_index),
             endpoint.byte_capacity,
         )),
-        VulkanMountedPlacedBoundDescriptorTarget::OutgoingCableBuffer { endpoint } => Some((
-            VulkanPedalBatchSignalKey::OutgoingCable(endpoint.endpoint.cable_index),
+        VulkanMountedPlacedBoundDescriptorTarget::OutgoingEdgeBuffer { endpoint } => Some((
+            VulkanComponentBatchSignalKey::OutgoingEdge(endpoint.endpoint.edge_index),
             endpoint.byte_capacity,
         )),
     };
     Ok(target)
 }
 
-fn pedal_batch_bindings<'a>(
+fn component_batch_bindings<'a>(
     mounted: &'a VulkanMountedPlacedStreamCircuit,
     dispatch: &VulkanMountedPlacedBoundDispatch,
-    signal_buffers: &'a [VulkanPedalBatchSignalBuffer],
-    signal_buffer_indices: &BTreeMap<VulkanPedalBatchSignalKey, usize>,
+    signal_buffers: &'a [VulkanComponentBatchSignalBuffer],
+    signal_buffer_indices: &BTreeMap<VulkanComponentBatchSignalKey, usize>,
     lane_index: Option<usize>,
     stream_control_buffer: Option<&'a VulkanResidentBuffer>,
 ) -> Result<Vec<VulkanResidentKernelBufferBinding<'a>>, VulkanResidentInProcessPlacedRuntimeError> {
@@ -273,7 +273,7 @@ fn pedal_batch_bindings<'a>(
     for descriptor in &dispatch.descriptors {
         let binding = u32::try_from(descriptor.binding).map_err(|_| {
             VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(
-                "pedal batch descriptor binding exceeds u32".to_string(),
+                "component batch descriptor binding exceeds u32".to_string(),
             ))
         })?;
         let access = match descriptor.usage {
@@ -286,12 +286,12 @@ fn pedal_batch_bindings<'a>(
             VulkanKernelDescriptorUsage::StateView => VulkanResidentKernelBufferAccess::ReadWrite,
         };
         if let Some((key, frame_byte_capacity)) =
-            pedal_batch_signal_target_with_mounted(mounted, descriptor)?
+            component_batch_signal_target_with_mounted(mounted, descriptor)?
         {
             let index = signal_buffer_indices.get(&key).ok_or_else(|| {
                 VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(format!(
-                    "pedal batch descriptor {}.{} has no signal buffer {key:?}",
-                    dispatch.pedal_id, dispatch.node_id
+                    "component batch descriptor {}.{} has no signal buffer {key:?}",
+                    dispatch.component_id, dispatch.node_id
                 )))
             })?;
             let allocation = &signal_buffers[*index];
@@ -299,7 +299,7 @@ fn pedal_batch_bindings<'a>(
                 (
                     lane_index.checked_mul(frame_byte_capacity).ok_or_else(|| {
                         VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(
-                            "pedal batch lane offset overflowed".to_string(),
+                            "component batch lane offset overflowed".to_string(),
                         ))
                     })?,
                     frame_byte_capacity,
@@ -322,7 +322,7 @@ fn pedal_batch_bindings<'a>(
                         .parameter_buffer(tensor)
                         .ok_or_else(|| {
                             VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(
-                                format!("pedal batch is missing parameter {tensor:?}"),
+                                format!("component batch is missing parameter {tensor:?}"),
                             ))
                         })?;
                     (&parameter.buffer, parameter.byte_capacity)
@@ -343,7 +343,7 @@ fn pedal_batch_bindings<'a>(
                         .get(*buffer_index)
                         .ok_or_else(|| {
                             VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(
-                                format!("pedal batch has no state buffer {buffer_index}"),
+                                format!("component batch has no state buffer {buffer_index}"),
                             ))
                         })?;
                     (&state.buffer, *byte_capacity)
@@ -353,8 +353,8 @@ fn pedal_batch_bindings<'a>(
                 | VulkanBoundDescriptorTarget::ActivationSlot { .. } => {
                     return Err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop(
                         VulkanError(format!(
-                            "pedal batch descriptor {}.{} has an unbound resident signal target",
-                            dispatch.pedal_id, dispatch.node_id
+                            "component batch descriptor {}.{} has an unbound resident signal target",
+                            dispatch.component_id, dispatch.node_id
                         )),
                     ));
                 }
@@ -370,7 +370,7 @@ fn pedal_batch_bindings<'a>(
             VulkanResidentKernelBufferBinding::new(
                 u32::try_from(dispatch.descriptors.len()).map_err(|_| {
                     VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(
-                        "pedal batch stream-control binding exceeds u32".to_string(),
+                        "component batch stream-control binding exceeds u32".to_string(),
                     ))
                 })?,
                 stream_control_buffer,
@@ -382,19 +382,19 @@ fn pedal_batch_bindings<'a>(
     Ok(bindings)
 }
 
-fn pedal_batch_signal_target_with_mounted(
+fn component_batch_signal_target_with_mounted(
     mounted: &VulkanMountedPlacedStreamCircuit,
     descriptor: &VulkanMountedPlacedBoundDescriptor,
-) -> Result<Option<(VulkanPedalBatchSignalKey, usize)>, VulkanResidentInProcessPlacedRuntimeError> {
+) -> Result<Option<(VulkanComponentBatchSignalKey, usize)>, VulkanResidentInProcessPlacedRuntimeError> {
     match &descriptor.target {
         VulkanMountedPlacedBoundDescriptorTarget::ModelInput { signal_id } => {
             let allocation = mounted.boundary_io.input_buffer(signal_id).ok_or_else(|| {
                 VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(format!(
-                    "pedal batch has no model input {signal_id:?}"
+                    "component batch has no model input {signal_id:?}"
                 )))
             })?;
             Ok(Some((
-                VulkanPedalBatchSignalKey::ModelInput(signal_id.clone()),
+                VulkanComponentBatchSignalKey::ModelInput(signal_id.clone()),
                 allocation.byte_capacity,
             )))
         }
@@ -404,15 +404,15 @@ fn pedal_batch_signal_target_with_mounted(
                 .output_buffer(signal_id)
                 .ok_or_else(|| {
                     VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(format!(
-                        "pedal batch has no model output {signal_id:?}"
+                        "component batch has no model output {signal_id:?}"
                     )))
                 })?;
             Ok(Some((
-                VulkanPedalBatchSignalKey::ModelOutput(signal_id.clone()),
+                VulkanComponentBatchSignalKey::ModelOutput(signal_id.clone()),
                 allocation.byte_capacity,
             )))
         }
-        _ => pedal_batch_signal_target(descriptor),
+        _ => component_batch_signal_target(descriptor),
     }
 }
 

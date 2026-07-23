@@ -112,7 +112,7 @@ impl VulkanResidentInProcessPlacedPromptStream {
             random_seed,
             &self.processor,
         )?;
-        self.session.transport = VulkanInProcessPlacedCableTransport::new();
+        self.session.transport = VulkanInProcessPlacedEdgeTransport::new();
         self.package = package;
         self.processor = processor;
         Ok(())
@@ -222,7 +222,7 @@ impl VulkanResidentInProcessPlacedPromptStream {
             let transport_stats = if block_index + 1 == block_width {
                 &block_run.transport_stats
             } else {
-                &VulkanPlacedCableTransportStats::default()
+                &VulkanPlacedEdgeTransportStats::default()
             };
             let sampled_token_id = (block_index + 1 == block_width)
                 .then_some(block_run.sampled_token_id)
@@ -530,7 +530,7 @@ impl VulkanResidentInProcessPlacedPromptStream {
                     stream_tick,
                     0,
                     0,
-                    &VulkanPlacedCableTransportStats::default(),
+                    &VulkanPlacedEdgeTransportStats::default(),
                     Some(sampled_token_id),
                 )?
             };
@@ -677,7 +677,7 @@ impl VulkanResidentInProcessPlacedPromptStream {
                             stream_tick,
                             scheduler_turn_count,
                             completed_stage_count,
-                            &VulkanPlacedCableTransportStats::default(),
+                            &VulkanPlacedEdgeTransportStats::default(),
                             activation
                                 .should_emit_public_output
                                 .then_some(sampled_token_id),

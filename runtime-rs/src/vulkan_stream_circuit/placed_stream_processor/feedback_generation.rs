@@ -16,7 +16,7 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
         let mut input_token_id = initial_token_id;
         let mut tick_runs = Vec::with_capacity(max_ticks);
         let mut sampled_token_ids = Vec::with_capacity(max_ticks);
-        let mut transport = VulkanInProcessPlacedCableTransport::new();
+        let mut transport = VulkanInProcessPlacedEdgeTransport::new();
 
         for tick_index in 0..max_ticks {
             let stream_tick =

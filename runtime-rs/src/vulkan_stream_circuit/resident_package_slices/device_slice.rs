@@ -18,7 +18,7 @@ impl VulkanResidentModelPackageDeviceSlice {
             .map(Path::to_path_buf)
             .unwrap_or_else(|| PathBuf::from("."));
         let runtime_model =
-            manifest.mount_runtime_patch_controls(None, &BTreeMap::new(), &[], None)?;
+            manifest.mount_runtime_graph_controls(None, &BTreeMap::new(), &[], None)?;
         Self::from_runtime_model_for_device(
             device,
             &manifest_dir,
@@ -84,7 +84,7 @@ impl VulkanResidentModelPackageDeviceSlice {
         &self,
         device: &VulkanComputeDevice,
         activation_overrides: &[VulkanActivationSlotBufferOverride],
-        cable_endpoint_overrides: &[VulkanPlacedCableEndpointBufferOverride],
+        edge_endpoint_overrides: &[VulkanPlacedEdgeEndpointBufferOverride],
         stream_control_override: Option<Arc<VulkanResidentBuffer>>,
     ) -> Result<VulkanMountedPlacedStreamCircuit, VulkanResidentTokenModelPackageError> {
         VulkanMountedPlacedStreamCircuit::
@@ -94,7 +94,7 @@ impl VulkanResidentModelPackageDeviceSlice {
             self.dynamic_state_capacity_activations,
             self.parameter_buffers.clone(),
             activation_overrides,
-            cable_endpoint_overrides,
+            edge_endpoint_overrides,
             stream_control_override,
         )
         .map_err(|error| {

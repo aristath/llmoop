@@ -9,7 +9,7 @@ pub struct VulkanResidentParameter {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VulkanResidentStateBuffer {
-    pub pedal_id: String,
+    pub component_id: String,
     pub state_id: String,
     pub state_type: String,
     pub layout: Option<String>,
@@ -23,7 +23,7 @@ pub struct VulkanResidentStateBuffer {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VulkanResidentActivationBank {
-    pub pedal_id: String,
+    pub component_id: String,
     pub circuit_id: String,
     pub slot_count: usize,
     pub slots: Vec<VulkanResidentActivationSlot>,
@@ -45,7 +45,7 @@ pub struct VulkanStreamCircuitStreamBuffers {
 }
 
 pub struct VulkanStreamStateBufferAllocation {
-    pub pedal_id: String,
+    pub component_id: String,
     pub state_id: String,
     pub state_type: String,
     pub byte_capacity: usize,
@@ -56,7 +56,7 @@ pub struct VulkanStreamStateBufferAllocation {
 }
 
 pub struct VulkanActivationSlotBufferAllocation {
-    pub pedal_id: String,
+    pub component_id: String,
     pub circuit_id: String,
     pub slot: usize,
     pub signal_ids: Vec<String>,
@@ -66,7 +66,7 @@ pub struct VulkanActivationSlotBufferAllocation {
 }
 
 pub struct VulkanActivationSlotBufferOverride {
-    pub pedal_id: String,
+    pub component_id: String,
     pub slot: usize,
     pub buffer: Arc<VulkanResidentBuffer>,
 }
@@ -74,34 +74,34 @@ pub struct VulkanActivationSlotBufferOverride {
 impl VulkanStreamCircuitStreamBuffers {
     pub fn state_buffer(
         &self,
-        pedal_id: &str,
+        component_id: &str,
         state_id: &str,
     ) -> Option<&VulkanStreamStateBufferAllocation> {
         self.state_buffers
             .iter()
-            .find(|buffer| buffer.pedal_id == pedal_id && buffer.state_id == state_id)
+            .find(|buffer| buffer.component_id == component_id && buffer.state_id == state_id)
     }
 
-    pub fn state_buffer_index(&self, pedal_id: &str, state_id: &str) -> Option<usize> {
+    pub fn state_buffer_index(&self, component_id: &str, state_id: &str) -> Option<usize> {
         self.state_buffers
             .iter()
-            .position(|buffer| buffer.pedal_id == pedal_id && buffer.state_id == state_id)
+            .position(|buffer| buffer.component_id == component_id && buffer.state_id == state_id)
     }
 
     pub fn activation_slot_buffer(
         &self,
-        pedal_id: &str,
+        component_id: &str,
         slot: usize,
     ) -> Option<&VulkanActivationSlotBufferAllocation> {
         self.activation_slot_buffers
             .iter()
-            .find(|buffer| buffer.pedal_id == pedal_id && buffer.slot == slot)
+            .find(|buffer| buffer.component_id == component_id && buffer.slot == slot)
     }
 
-    pub fn activation_slot_buffer_index(&self, pedal_id: &str, slot: usize) -> Option<usize> {
+    pub fn activation_slot_buffer_index(&self, component_id: &str, slot: usize) -> Option<usize> {
         self.activation_slot_buffers
             .iter()
-            .position(|buffer| buffer.pedal_id == pedal_id && buffer.slot == slot)
+            .position(|buffer| buffer.component_id == component_id && buffer.slot == slot)
     }
 
     pub fn zero_state_buffers(&self) -> Result<usize, VulkanError> {
@@ -126,12 +126,12 @@ impl VulkanStreamCircuitStreamBuffers {
         let source_by_id = source
             .state_buffers
             .iter()
-            .map(|state| ((state.pedal_id.as_str(), state.state_id.as_str()), state))
+            .map(|state| ((state.component_id.as_str(), state.state_id.as_str()), state))
             .collect::<BTreeMap<_, _>>();
         let mut copied = BTreeSet::new();
         let mut total_copied = 0usize;
         for target in &self.state_buffers {
-            let key = (target.pedal_id.as_str(), target.state_id.as_str());
+            let key = (target.component_id.as_str(), target.state_id.as_str());
             let Some(source) = source_by_id.get(&key) else {
                 continue;
             };
@@ -141,7 +141,7 @@ impl VulkanStreamCircuitStreamBuffers {
             total_copied = total_copied
                 .checked_add(bytes.len())
                 .ok_or_else(|| VulkanError("inherited state byte count overflowed".to_string()))?;
-            copied.insert((target.pedal_id.clone(), target.state_id.clone()));
+            copied.insert((target.component_id.clone(), target.state_id.clone()));
         }
         Ok((total_copied, copied))
     }
@@ -153,7 +153,7 @@ impl VulkanStreamCircuitStreamBuffers {
         let copies = ordered_clone_state_copies(
             self.state_buffers.iter().map(|state| {
                 (
-                    (state.pedal_id.clone(), state.state_id.clone()),
+                    (state.component_id.clone(), state.state_id.clone()),
                     state.clone_from.clone(),
                 )
             }),
@@ -232,13 +232,13 @@ fn validate_state_buffer_copy(
     {
         return Err(VulkanError(format!(
             "cannot inherit state {}.{} ({}, {} bytes, static {:?}, per activation {:?}) from incompatible state {}.{} ({}, {} bytes, static {:?}, per activation {:?})",
-            target.pedal_id,
+            target.component_id,
             target.state_id,
             target.state_type,
             target.byte_capacity,
             target.static_byte_capacity,
             target.bytes_per_activation,
-            source.pedal_id,
+            source.component_id,
             source.state_id,
             source.state_type,
             source.byte_capacity,

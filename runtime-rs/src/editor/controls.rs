@@ -106,7 +106,7 @@ pub fn validate_runtime_editor_control_value(
     }
     if schema.scope != "instance" {
         return Err(RuntimeEditorError(format!(
-            "control {:?} has {:?} scope; this editor changes pedal instances",
+            "control {:?} has {:?} scope; this editor changes node instances",
             schema.id, schema.scope
         )));
     }

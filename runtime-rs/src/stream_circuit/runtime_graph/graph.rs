@@ -1,16 +1,16 @@
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StreamCircuitRuntimePatch {
+pub struct StreamCircuitRuntimeGraph {
     pub schema: String,
-    pub wiring: String,
+    pub topology: String,
     pub default_device_id: String,
-    pub instances: Vec<StreamCircuitPedalInstance>,
-    pub cables: Vec<StreamCircuitGraphCable>,
+    pub instances: Vec<StreamCircuitNodeInstance>,
+    pub edges: Vec<StreamCircuitGraphEdge>,
     pub boundary: StreamCircuitGraphBoundary,
 }
 
-impl StreamCircuitRuntimePatch {
+impl StreamCircuitRuntimeGraph {
     pub fn from_source_series(
-        graph: &ResolvedLoweredPedalboard,
+        graph: &ResolvedLoweredExecutionGraph,
         default_device_id: impl Into<String>,
     ) -> Result<Self, CircuitPlacementError> {
         let spec = StreamCircuitPlacementSpec::new(default_device_id);
@@ -18,63 +18,63 @@ impl StreamCircuitRuntimePatch {
     }
 
     pub fn from_source_chain(
-        graph: &ResolvedLoweredPedalboard,
+        graph: &ResolvedLoweredExecutionGraph,
         default_device_id: impl Into<String>,
         chain: &[(String, String)],
     ) -> Result<Self, CircuitPlacementError> {
-        validate_runtime_patch_source_graph(graph)?;
+        validate_runtime_graph_source_graph(graph)?;
         let instances = chain
             .iter()
             .map(
-                |(instance_id, source_pedal_id)| StreamCircuitPedalInstance {
+                |(instance_id, source_component_id)| StreamCircuitNodeInstance {
                     instance_id: instance_id.clone(),
-                    source_pedal_id: source_pedal_id.clone(),
+                    source_component_id: source_component_id.clone(),
                     device_id: String::new(),
                     enabled: true,
                     control_values: BTreeMap::new(),
-                    state_policy: StreamCircuitPedalInstanceStatePolicy::Fresh,
+                    state_policy: StreamCircuitNodeInstanceStatePolicy::Fresh,
                 },
             )
             .collect::<Vec<_>>();
-        let cables = series_cables_for_instances(graph, &instances)?;
+        let edges = series_edges_for_instances(graph, &instances)?;
         let boundary = series_boundary_for_instances(graph, &instances)?;
-        let patch = Self {
-            schema: STREAM_CIRCUIT_RUNTIME_PATCH_SCHEMA.to_string(),
-            wiring: "explicit_graph".to_string(),
+        let runtime_graph = Self {
+            schema: STREAM_CIRCUIT_RUNTIME_GRAPH_SCHEMA.to_string(),
+            topology: "explicit_graph".to_string(),
             default_device_id: default_device_id.into(),
             instances,
-            cables,
+            edges,
             boundary,
         };
-        patch.with_default_devices().and_then(|patch| {
-            patch.validate_against_graph(graph)?;
-            Ok(patch)
+        runtime_graph.with_default_devices().and_then(|runtime_graph| {
+            runtime_graph.validate_against_graph(graph)?;
+            Ok(runtime_graph)
         })
     }
 
     pub fn from_placement_spec(
-        graph: &ResolvedLoweredPedalboard,
+        graph: &ResolvedLoweredExecutionGraph,
         spec: &StreamCircuitPlacementSpec,
     ) -> Result<Self, CircuitPlacementError> {
-        validate_runtime_patch_source_graph(graph)?;
+        validate_runtime_graph_source_graph(graph)?;
         validate_placement_spec_against_graph(graph, spec)?;
         Ok(Self {
-            schema: STREAM_CIRCUIT_RUNTIME_PATCH_SCHEMA.to_string(),
-            wiring: "explicit_graph".to_string(),
+            schema: STREAM_CIRCUIT_RUNTIME_GRAPH_SCHEMA.to_string(),
+            topology: "explicit_graph".to_string(),
             default_device_id: spec.default_device_id.clone(),
             instances: graph
                 .circuits
                 .iter()
-                .map(|artifact| StreamCircuitPedalInstance {
-                    instance_id: artifact.pedal.id.clone(),
-                    source_pedal_id: artifact.pedal.id.clone(),
-                    device_id: spec.device_for_pedal(&artifact.pedal.id).to_string(),
+                .map(|artifact| StreamCircuitNodeInstance {
+                    instance_id: artifact.component.id.clone(),
+                    source_component_id: artifact.component.id.clone(),
+                    device_id: spec.device_for_component(&artifact.component.id).to_string(),
                     enabled: true,
                     control_values: BTreeMap::new(),
-                    state_policy: StreamCircuitPedalInstanceStatePolicy::Fresh,
+                    state_policy: StreamCircuitNodeInstanceStatePolicy::Fresh,
                 })
                 .collect(),
-            cables: graph.index.graph.cables.clone(),
+            edges: graph.index.graph.edges.clone(),
             boundary: graph.index.graph.boundary.clone(),
         })
     }
@@ -83,7 +83,7 @@ impl StreamCircuitRuntimePatch {
         let mut spec = StreamCircuitPlacementSpec::new(self.default_device_id.clone());
         for instance in self.instances.iter().filter(|instance| instance.enabled) {
             if instance.device_id != self.default_device_id {
-                spec = spec.with_pedal_device(&instance.instance_id, &instance.device_id);
+                spec = spec.with_component_device(&instance.instance_id, &instance.device_id);
             }
         }
         spec
@@ -91,14 +91,14 @@ impl StreamCircuitRuntimePatch {
 
     pub fn duplicate_after_instance(
         mut self,
-        graph: &ResolvedLoweredPedalboard,
+        graph: &ResolvedLoweredExecutionGraph,
         after_instance_id: &str,
         new_instance_id: impl Into<String>,
     ) -> Result<Self, CircuitPlacementError> {
         let new_instance_id = new_instance_id.into();
         if new_instance_id.is_empty() {
             return Err(CircuitPlacementError(
-                "runtime patch duplicate instance id must not be empty".to_string(),
+                "runtime graph duplicate instance id must not be empty".to_string(),
             ));
         }
         if self
@@ -107,7 +107,7 @@ impl StreamCircuitRuntimePatch {
             .any(|instance| instance.instance_id == new_instance_id)
         {
             return Err(CircuitPlacementError(format!(
-                "runtime patch already has pedal instance {new_instance_id:?}"
+                "runtime graph already has node instance {new_instance_id:?}"
             )));
         }
         let after_index = self
@@ -116,29 +116,29 @@ impl StreamCircuitRuntimePatch {
             .position(|instance| instance.instance_id == after_instance_id)
             .ok_or_else(|| {
                 CircuitPlacementError(format!(
-                    "runtime patch has no pedal instance {after_instance_id:?}"
+                    "runtime graph has no node instance {after_instance_id:?}"
                 ))
             })?;
         let source = self.instances[after_index].clone();
-        let duplicate = StreamCircuitPedalInstance {
+        let duplicate = StreamCircuitNodeInstance {
             instance_id: new_instance_id.clone(),
-            source_pedal_id: source.source_pedal_id.clone(),
+            source_component_id: source.source_component_id.clone(),
             device_id: source.device_id.clone(),
             enabled: source.enabled,
             control_values: BTreeMap::new(),
-            state_policy: StreamCircuitPedalInstanceStatePolicy::Fresh,
+            state_policy: StreamCircuitNodeInstanceStatePolicy::Fresh,
         };
         let source_by_id = graph
             .circuits
             .iter()
-            .map(|artifact| (artifact.pedal.id.as_str(), artifact))
+            .map(|artifact| (artifact.component.id.as_str(), artifact))
             .collect::<BTreeMap<_, _>>();
         let source_artifact = source_by_id
-            .get(source.source_pedal_id.as_str())
+            .get(source.source_component_id.as_str())
             .ok_or_else(|| {
                 CircuitPlacementError(format!(
-                    "runtime patch instance {} references unknown source pedal {}",
-                    source.instance_id, source.source_pedal_id
+                    "runtime graph instance {} references unknown source component {}",
+                    source.instance_id, source.source_component_id
                 ))
             })?;
         let source_output = single_series_port(
@@ -152,57 +152,57 @@ impl StreamCircuitRuntimePatch {
             "input",
         )?;
         let outgoing = self
-            .cables
+            .edges
             .iter()
             .enumerate()
-            .filter(|(_, cable)| {
-                cable.source.pedal_id == after_instance_id && cable.connection.is_forward()
+            .filter(|(_, edge)| {
+                edge.source.component_id == after_instance_id && edge.connection.is_forward()
             })
             .map(|(index, _)| index)
             .collect::<Vec<_>>();
         if outgoing.len() > 1 {
             return Err(CircuitPlacementError(format!(
-                "cannot insert duplicate after branching pedal {after_instance_id:?}; wire the explicit graph instead"
+                "cannot insert duplicate after branching component {after_instance_id:?}; wire the explicit graph instead"
             )));
         }
         if outgoing
             .first()
-            .is_some_and(|index| self.cables[*index].source.port_id != source_output.id)
+            .is_some_and(|index| self.edges[*index].source.port_id != source_output.id)
         {
             return Err(CircuitPlacementError(format!(
-                "cannot insert duplicate after pedal {after_instance_id:?}: its outgoing cable does not use the sole series output"
+                "cannot insert duplicate after component {after_instance_id:?}: its outgoing edge does not use the sole series output"
             )));
         }
-        let inserted_cable = StreamCircuitGraphCable {
-            id: allocate_cable_id(&self.cables, after_instance_id, &new_instance_id),
-            source: StreamCircuitCableEndpoint {
-                pedal_id: after_instance_id.to_string(),
+        let inserted_edge = StreamCircuitGraphEdge {
+            id: allocate_edge_id(&self.edges, after_instance_id, &new_instance_id),
+            source: StreamCircuitEdgeEndpoint {
+                component_id: after_instance_id.to_string(),
                 port_id: source_output.id.clone(),
             },
-            destination: StreamCircuitCableEndpoint {
-                pedal_id: new_instance_id.clone(),
+            destination: StreamCircuitEdgeEndpoint {
+                component_id: new_instance_id.clone(),
                 port_id: duplicate_input.id.clone(),
             },
             connection: StreamCircuitConnection::Forward,
         };
         if let Some(outgoing_index) = outgoing.first().copied() {
-            self.cables[outgoing_index].source = StreamCircuitCableEndpoint {
-                pedal_id: new_instance_id.clone(),
+            self.edges[outgoing_index].source = StreamCircuitEdgeEndpoint {
+                component_id: new_instance_id.clone(),
                 port_id: source_output.id.clone(),
             };
-            self.cables.insert(outgoing_index, inserted_cable);
+            self.edges.insert(outgoing_index, inserted_edge);
         } else {
             for output in &mut self.boundary.public_outputs {
-                if output.endpoint.pedal_id == source.instance_id
+                if output.endpoint.component_id == source.instance_id
                     && output.endpoint.port_id == source_output.id
                 {
-                    output.endpoint = StreamCircuitCableEndpoint {
-                        pedal_id: new_instance_id.clone(),
+                    output.endpoint = StreamCircuitEdgeEndpoint {
+                        component_id: new_instance_id.clone(),
                         port_id: source_output.id.clone(),
                     };
                 }
             }
-            self.cables.push(inserted_cable);
+            self.edges.push(inserted_edge);
         }
         self.instances.insert(after_index + 1, duplicate);
         Ok(self)
@@ -210,7 +210,7 @@ impl StreamCircuitRuntimePatch {
 
     pub fn with_source_chain(
         self,
-        graph: &ResolvedLoweredPedalboard,
+        graph: &ResolvedLoweredExecutionGraph,
         chain: &[(String, String)],
     ) -> Result<Self, CircuitPlacementError> {
         let previous_instances = self
@@ -218,8 +218,8 @@ impl StreamCircuitRuntimePatch {
             .iter()
             .map(|instance| (instance.instance_id.clone(), instance.clone()))
             .collect::<BTreeMap<_, _>>();
-        let mut patch = Self::from_source_chain(graph, self.default_device_id, chain)?;
-        for instance in &mut patch.instances {
+        let mut runtime_graph = Self::from_source_chain(graph, self.default_device_id, chain)?;
+        for instance in &mut runtime_graph.instances {
             if let Some(previous) = previous_instances.get(&instance.instance_id) {
                 instance.device_id = previous.device_id.clone();
                 instance.enabled = previous.enabled;
@@ -227,40 +227,40 @@ impl StreamCircuitRuntimePatch {
                 instance.state_policy = previous.state_policy.clone();
             }
         }
-        patch.validate_against_graph(graph)?;
-        Ok(patch)
+        runtime_graph.validate_against_graph(graph)?;
+        Ok(runtime_graph)
     }
 
     pub fn with_signal_processor_chain(
         self,
-        graph: &ResolvedLoweredPedalboard,
+        graph: &ResolvedLoweredExecutionGraph,
         chain: &[(String, String)],
     ) -> Result<Self, CircuitPlacementError> {
         self.validate_against_graph(graph)?;
         if chain.is_empty() {
             return Err(CircuitPlacementError(
-                "signal-processor chain must contain at least one pedal".to_string(),
+                "signal-processor chain must contain at least one component".to_string(),
             ));
         }
 
         let source_by_id = graph
             .circuits
             .iter()
-            .map(|artifact| (artifact.pedal.id.as_str(), artifact))
+            .map(|artifact| (artifact.component.id.as_str(), artifact))
             .collect::<BTreeMap<_, _>>();
         let old_processor_ids = self
             .instances
             .iter()
             .filter(|instance| {
                 source_by_id
-                    .get(instance.source_pedal_id.as_str())
-                    .is_some_and(|source| source.pedal.runtime_role.is_signal_processor())
+                    .get(instance.source_component_id.as_str())
+                    .is_some_and(|source| source.component.runtime_role.is_signal_processor())
             })
             .map(|instance| instance.instance_id.as_str())
             .collect::<BTreeSet<_>>();
         if old_processor_ids.is_empty() {
             return Err(CircuitPlacementError(
-                "runtime patch contains no signal-processing pedals to replace".to_string(),
+                "runtime graph contains no signal-processing components to replace".to_string(),
             ));
         }
 
@@ -277,7 +277,7 @@ impl StreamCircuitRuntimePatch {
             .collect::<BTreeMap<_, _>>();
         let mut chain_instance_ids = BTreeSet::new();
         let mut processor_instances = Vec::with_capacity(chain.len());
-        for (instance_id, source_pedal_id) in chain {
+        for (instance_id, source_component_id) in chain {
             if instance_id.is_empty() || !chain_instance_ids.insert(instance_id.as_str()) {
                 return Err(CircuitPlacementError(format!(
                     "signal-processor chain contains an empty or duplicate instance id {instance_id:?}"
@@ -285,31 +285,31 @@ impl StreamCircuitRuntimePatch {
             }
             if preserved_instance_ids.contains(instance_id.as_str()) {
                 return Err(CircuitPlacementError(format!(
-                    "signal-processor instance id {instance_id:?} collides with a non-processor pedal"
+                    "signal-processor instance id {instance_id:?} collides with a non-processor component"
                 )));
             }
-            let source = source_by_id.get(source_pedal_id.as_str()).ok_or_else(|| {
+            let source = source_by_id.get(source_component_id.as_str()).ok_or_else(|| {
                 CircuitPlacementError(format!(
-                    "signal-processor chain references unknown source pedal {source_pedal_id:?}"
+                    "signal-processor chain references unknown source component {source_component_id:?}"
                 ))
             })?;
-            if !source.pedal.runtime_role.is_signal_processor() {
+            if !source.component.runtime_role.is_signal_processor() {
                 return Err(CircuitPlacementError(format!(
-                    "source pedal {source_pedal_id:?} has runtime role {:?}, not signal_processor",
-                    source.pedal.runtime_role
+                    "source component {source_component_id:?} has runtime role {:?}, not signal_processor",
+                    source.component.runtime_role
                 )));
             }
-            let mut instance = StreamCircuitPedalInstance {
+            let mut instance = StreamCircuitNodeInstance {
                 instance_id: instance_id.clone(),
-                source_pedal_id: source_pedal_id.clone(),
+                source_component_id: source_component_id.clone(),
                 device_id: self.default_device_id.clone(),
                 enabled: true,
                 control_values: BTreeMap::new(),
-                state_policy: StreamCircuitPedalInstanceStatePolicy::Fresh,
+                state_policy: StreamCircuitNodeInstanceStatePolicy::Fresh,
             };
             if let Some(previous) = previous_by_id.get(instance_id.as_str()) {
                 instance.device_id = previous.device_id.clone();
-                if previous.source_pedal_id == *source_pedal_id {
+                if previous.source_component_id == *source_component_id {
                     instance.enabled = previous.enabled;
                     instance.control_values = previous.control_values.clone();
                     instance.state_policy = previous.state_policy.clone();
@@ -319,46 +319,46 @@ impl StreamCircuitRuntimePatch {
         }
 
         if old_processor_ids.len() == self.instances.len() {
-            let mut patch = Self::from_source_chain(graph, self.default_device_id.clone(), chain)?;
-            patch.instances = processor_instances;
-            patch.validate_against_graph(graph)?;
-            return Ok(patch);
+            let mut runtime_graph = Self::from_source_chain(graph, self.default_device_id.clone(), chain)?;
+            runtime_graph.instances = processor_instances;
+            runtime_graph.validate_against_graph(graph)?;
+            return Ok(runtime_graph);
         }
 
         let crossing_inputs = self
-            .cables
+            .edges
             .iter()
-            .filter(|cable| {
-                cable.connection.is_forward()
-                    && !old_processor_ids.contains(cable.source.pedal_id.as_str())
-                    && old_processor_ids.contains(cable.destination.pedal_id.as_str())
+            .filter(|edge| {
+                edge.connection.is_forward()
+                    && !old_processor_ids.contains(edge.source.component_id.as_str())
+                    && old_processor_ids.contains(edge.destination.component_id.as_str())
             })
             .cloned()
             .collect::<Vec<_>>();
         let crossing_outputs = self
-            .cables
+            .edges
             .iter()
-            .filter(|cable| {
-                cable.connection.is_forward()
-                    && old_processor_ids.contains(cable.source.pedal_id.as_str())
-                    && !old_processor_ids.contains(cable.destination.pedal_id.as_str())
+            .filter(|edge| {
+                edge.connection.is_forward()
+                    && old_processor_ids.contains(edge.source.component_id.as_str())
+                    && !old_processor_ids.contains(edge.destination.component_id.as_str())
             })
             .cloned()
             .collect::<Vec<_>>();
         if crossing_inputs.len() != 1 || crossing_outputs.len() != 1 {
             return Err(CircuitPlacementError(format!(
-                "signal-processor chain replacement requires one forward input and output cable; found {} inputs and {} outputs",
+                "signal-processor chain replacement requires one forward input and output edge; found {} inputs and {} outputs",
                 crossing_inputs.len(),
                 crossing_outputs.len()
             )));
         }
-        if self.cables.iter().any(|cable| {
-            !cable.connection.is_forward()
-                && (old_processor_ids.contains(cable.source.pedal_id.as_str())
-                    || old_processor_ids.contains(cable.destination.pedal_id.as_str()))
+        if self.edges.iter().any(|edge| {
+            !edge.connection.is_forward()
+                && (old_processor_ids.contains(edge.source.component_id.as_str())
+                    || old_processor_ids.contains(edge.destination.component_id.as_str()))
         }) {
             return Err(CircuitPlacementError(
-                "signal-processor chain replacement cannot discard processor-local temporal wiring"
+                "signal-processor chain replacement cannot discard processor-local temporal topology"
                     .to_string(),
             ));
         }
@@ -367,7 +367,7 @@ impl StreamCircuitRuntimePatch {
             .external_inputs
             .iter()
             .chain(self.boundary.public_outputs.iter())
-            .any(|port| old_processor_ids.contains(port.endpoint.pedal_id.as_str()))
+            .any(|port| old_processor_ids.contains(port.endpoint.component_id.as_str()))
         {
             return Err(CircuitPlacementError(
                 "signal-processor chain replacement requires graph boundaries outside the processor chain"
@@ -381,8 +381,8 @@ impl StreamCircuitRuntimePatch {
         let last = processor_instances
             .last()
             .expect("non-empty processor chain must have a last instance");
-        let first_source = source_by_id[first.source_pedal_id.as_str()];
-        let last_source = source_by_id[last.source_pedal_id.as_str()];
+        let first_source = source_by_id[first.source_component_id.as_str()];
+        let last_source = source_by_id[last.source_component_id.as_str()];
         let first_input = single_series_port(
             &first_source.circuit.boundary.inputs,
             &first.instance_id,
@@ -409,24 +409,24 @@ impl StreamCircuitRuntimePatch {
             }
         }
 
-        let mut cables = self
-            .cables
+        let mut edges = self
+            .edges
             .iter()
-            .filter(|cable| {
-                !old_processor_ids.contains(cable.source.pedal_id.as_str())
-                    && !old_processor_ids.contains(cable.destination.pedal_id.as_str())
+            .filter(|edge| {
+                !old_processor_ids.contains(edge.source.component_id.as_str())
+                    && !old_processor_ids.contains(edge.destination.component_id.as_str())
             })
             .cloned()
             .collect::<Vec<_>>();
-        let mut input_cable = crossing_inputs[0].clone();
-        input_cable.destination = StreamCircuitCableEndpoint {
-            pedal_id: first.instance_id.clone(),
+        let mut input_edge = crossing_inputs[0].clone();
+        input_edge.destination = StreamCircuitEdgeEndpoint {
+            component_id: first.instance_id.clone(),
             port_id: first_input.id.clone(),
         };
-        cables.push(input_cable);
+        edges.push(input_edge);
         for pair in processor_instances.windows(2) {
-            let source = source_by_id[pair[0].source_pedal_id.as_str()];
-            let destination = source_by_id[pair[1].source_pedal_id.as_str()];
+            let source = source_by_id[pair[0].source_component_id.as_str()];
+            let destination = source_by_id[pair[1].source_component_id.as_str()];
             let source_output = single_series_port(
                 &source.circuit.boundary.outputs,
                 &pair[0].instance_id,
@@ -437,32 +437,32 @@ impl StreamCircuitRuntimePatch {
                 &pair[1].instance_id,
                 "input",
             )?;
-            let cable_id = allocate_cable_id(&cables, &pair[0].instance_id, &pair[1].instance_id);
-            cables.push(StreamCircuitGraphCable {
-                id: cable_id,
-                source: StreamCircuitCableEndpoint {
-                    pedal_id: pair[0].instance_id.clone(),
+            let edge_id = allocate_edge_id(&edges, &pair[0].instance_id, &pair[1].instance_id);
+            edges.push(StreamCircuitGraphEdge {
+                id: edge_id,
+                source: StreamCircuitEdgeEndpoint {
+                    component_id: pair[0].instance_id.clone(),
                     port_id: source_output.id.clone(),
                 },
-                destination: StreamCircuitCableEndpoint {
-                    pedal_id: pair[1].instance_id.clone(),
+                destination: StreamCircuitEdgeEndpoint {
+                    component_id: pair[1].instance_id.clone(),
                     port_id: destination_input.id.clone(),
                 },
                 connection: StreamCircuitConnection::Forward,
             });
         }
-        let mut output_cable = crossing_outputs[0].clone();
-        output_cable.source = StreamCircuitCableEndpoint {
-            pedal_id: last.instance_id.clone(),
+        let mut output_edge = crossing_outputs[0].clone();
+        output_edge.source = StreamCircuitEdgeEndpoint {
+            component_id: last.instance_id.clone(),
             port_id: last_output.id.clone(),
         };
-        cables.push(output_cable);
+        edges.push(output_edge);
 
-        let mut patch = self;
-        patch.instances = instances;
-        patch.cables = cables;
-        patch.validate_against_graph(graph)?;
-        Ok(patch)
+        let mut runtime_graph = self;
+        runtime_graph.instances = instances;
+        runtime_graph.edges = edges;
+        runtime_graph.validate_against_graph(graph)?;
+        Ok(runtime_graph)
     }
 
     pub fn with_instance_device(
@@ -473,7 +473,7 @@ impl StreamCircuitRuntimePatch {
         let device_id = device_id.into();
         if device_id.is_empty() {
             return Err(CircuitPlacementError(format!(
-                "runtime patch device id for instance {instance_id:?} must not be empty"
+                "runtime graph device id for instance {instance_id:?} must not be empty"
             )));
         }
         let instance = self
@@ -482,7 +482,7 @@ impl StreamCircuitRuntimePatch {
             .find(|instance| instance.instance_id == instance_id)
             .ok_or_else(|| {
                 CircuitPlacementError(format!(
-                    "runtime patch has no pedal instance {instance_id:?}"
+                    "runtime graph has no node instance {instance_id:?}"
                 ))
             })?;
         instance.device_id = device_id;
@@ -500,7 +500,7 @@ impl StreamCircuitRuntimePatch {
             .find(|instance| instance.instance_id == instance_id)
             .ok_or_else(|| {
                 CircuitPlacementError(format!(
-                    "runtime patch has no pedal instance {instance_id:?}"
+                    "runtime graph has no node instance {instance_id:?}"
                 ))
             })?;
         instance.enabled = enabled;
@@ -509,13 +509,13 @@ impl StreamCircuitRuntimePatch {
 
     pub fn instantiate_graph(
         &self,
-        graph: &ResolvedLoweredPedalboard,
-    ) -> Result<ResolvedLoweredPedalboard, CircuitPlacementError> {
+        graph: &ResolvedLoweredExecutionGraph,
+    ) -> Result<ResolvedLoweredExecutionGraph, CircuitPlacementError> {
         self.validate_against_graph(graph)?;
         let source_by_id = graph
             .circuits
             .iter()
-            .map(|artifact| (artifact.pedal.id.as_str(), artifact))
+            .map(|artifact| (artifact.component.id.as_str(), artifact))
             .collect::<BTreeMap<_, _>>();
         let mut circuits = Vec::with_capacity(self.instances.len());
         let mut circuit_refs = Vec::with_capacity(self.instances.len());
@@ -529,33 +529,33 @@ impl StreamCircuitRuntimePatch {
                 .find(|instance| instance.instance_id == instance_id)
                 .expect("validated topological instance id must exist");
             let source = source_by_id
-                .get(instance.source_pedal_id.as_str())
+                .get(instance.source_component_id.as_str())
                 .ok_or_else(|| {
                     CircuitPlacementError(format!(
-                        "runtime patch instance {} references unknown source pedal {}",
-                        instance.instance_id, instance.source_pedal_id
+                        "runtime graph instance {} references unknown source component {}",
+                        instance.instance_id, instance.source_component_id
                     ))
                 })?;
             let mut resolved = (*source).clone();
-            resolved.pedal.id = instance.instance_id.clone();
-            circuit_refs.push(resolved.pedal.clone());
+            resolved.component.id = instance.instance_id.clone();
+            circuit_refs.push(resolved.component.clone());
             *operator_counts
-                .entry(resolved.pedal.operator_type.clone())
+                .entry(resolved.component.operator_type.clone())
                 .or_insert(0) += 1;
             circuits.push(resolved);
         }
 
         let mut index = graph.index.clone();
-        index.graph.wiring = self.wiring.clone();
+        index.graph.topology = self.topology.clone();
         index.graph.circuits = circuit_refs;
-        index.graph.cables = self.effective_cables()?;
+        index.graph.edges = self.effective_edges()?;
         index.graph.boundary = self.boundary.clone();
-        index.summary = LoweredPedalboardSummary {
+        index.summary = LoweredExecutionGraphSummary {
             circuit_count: circuits.len(),
             operator_counts,
         };
 
-        Ok(ResolvedLoweredPedalboard {
+        Ok(ResolvedLoweredExecutionGraph {
             artifact_root: graph.artifact_root.clone(),
             index,
             circuits,
@@ -564,70 +564,70 @@ impl StreamCircuitRuntimePatch {
 
     pub fn validate_against_graph(
         &self,
-        graph: &ResolvedLoweredPedalboard,
+        graph: &ResolvedLoweredExecutionGraph,
     ) -> Result<(), CircuitPlacementError> {
-        validate_runtime_patch_source_graph(graph)?;
-        if self.schema != STREAM_CIRCUIT_RUNTIME_PATCH_SCHEMA {
+        validate_runtime_graph_source_graph(graph)?;
+        if self.schema != STREAM_CIRCUIT_RUNTIME_GRAPH_SCHEMA {
             return Err(CircuitPlacementError(format!(
-                "unsupported runtime patch schema {:?}",
+                "unsupported runtime graph schema {:?}",
                 self.schema
             )));
         }
-        if self.wiring != "explicit_graph" {
+        if self.topology != "explicit_graph" {
             return Err(CircuitPlacementError(format!(
-                "runtime patch wiring must be explicit_graph, got {:?}",
-                self.wiring
+                "runtime graph topology must be explicit_graph, got {:?}",
+                self.topology
             )));
         }
         if self.default_device_id.is_empty() {
             return Err(CircuitPlacementError(
-                "runtime patch default_device_id must not be empty".to_string(),
+                "runtime graph default_device_id must not be empty".to_string(),
             ));
         }
         if self.instances.is_empty() {
             return Err(CircuitPlacementError(
-                "runtime patch must contain at least one pedal instance".to_string(),
+                "runtime graph must contain at least one node instance".to_string(),
             ));
         }
         if !self.instances.iter().any(|instance| instance.enabled) {
             return Err(CircuitPlacementError(
-                "runtime patch must contain at least one enabled pedal instance".to_string(),
+                "runtime graph must contain at least one enabled node instance".to_string(),
             ));
         }
 
         let source_by_id = graph
             .circuits
             .iter()
-            .map(|artifact| (artifact.pedal.id.as_str(), artifact))
+            .map(|artifact| (artifact.component.id.as_str(), artifact))
             .collect::<BTreeMap<_, _>>();
         let mut instance_ids = BTreeSet::new();
         for instance in &self.instances {
             if instance.instance_id.is_empty() {
                 return Err(CircuitPlacementError(
-                    "runtime patch contains an instance with an empty id".to_string(),
+                    "runtime graph contains an instance with an empty id".to_string(),
                 ));
             }
             if !instance_ids.insert(instance.instance_id.as_str()) {
                 return Err(CircuitPlacementError(format!(
-                    "runtime patch contains duplicate pedal instance {:?}",
+                    "runtime graph contains duplicate node instance {:?}",
                     instance.instance_id
                 )));
             }
             if instance.device_id.is_empty() {
                 return Err(CircuitPlacementError(format!(
-                    "runtime patch instance {} has an empty device id",
+                    "runtime graph instance {} has an empty device id",
                     instance.instance_id
                 )));
             }
-            if !source_by_id.contains_key(instance.source_pedal_id.as_str()) {
+            if !source_by_id.contains_key(instance.source_component_id.as_str()) {
                 return Err(CircuitPlacementError(format!(
-                    "runtime patch instance {} references unknown source pedal {}",
-                    instance.instance_id, instance.source_pedal_id
+                    "runtime graph instance {} references unknown source component {}",
+                    instance.instance_id, instance.source_component_id
                 )));
             }
             if !instance.control_values.is_empty() {
                 return Err(CircuitPlacementError(format!(
-                    "runtime patch instance {} supplies control values, but executable pedal controls are not implemented",
+                    "runtime graph instance {} supplies control values, but executable component controls are not implemented",
                     instance.instance_id
                 )));
             }
@@ -635,7 +635,7 @@ impl StreamCircuitRuntimePatch {
         }
         validate_state_policy_dependencies(&self.instances)?;
 
-        validate_explicit_cables(self, &source_by_id)?;
+        validate_explicit_edges(self, &source_by_id)?;
         self.topological_instance_ids(graph)?;
 
         Ok(())
@@ -644,7 +644,7 @@ impl StreamCircuitRuntimePatch {
     fn with_default_devices(mut self) -> Result<Self, CircuitPlacementError> {
         if self.default_device_id.is_empty() {
             return Err(CircuitPlacementError(
-                "runtime patch default_device_id must not be empty".to_string(),
+                "runtime graph default_device_id must not be empty".to_string(),
             ));
         }
         for instance in &mut self.instances {
@@ -655,14 +655,14 @@ impl StreamCircuitRuntimePatch {
         Ok(self)
     }
 
-    pub fn effective_cables(&self) -> Result<Vec<StreamCircuitGraphCable>, CircuitPlacementError> {
-        effective_runtime_patch_cables(&self.instances, &self.cables)
+    pub fn effective_edges(&self) -> Result<Vec<StreamCircuitGraphEdge>, CircuitPlacementError> {
+        effective_runtime_graph_edges(&self.instances, &self.edges)
     }
 
     pub fn topological_instance_ids(
         &self,
-        _graph: &ResolvedLoweredPedalboard,
+        _graph: &ResolvedLoweredExecutionGraph,
     ) -> Result<Vec<String>, CircuitPlacementError> {
-        topological_runtime_patch_order(&self.instances, &self.effective_cables()?)
+        topological_runtime_graph_order(&self.instances, &self.effective_edges()?)
     }
 }

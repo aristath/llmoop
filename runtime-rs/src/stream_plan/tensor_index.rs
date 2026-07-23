@@ -7,7 +7,7 @@ use std::path::Path;
 use serde::Deserialize;
 
 use crate::stream_circuit::{
-    CircuitNode, CircuitPort, ParameterRef, ResolvedCircuitArtifact, ResolvedLoweredPedalboard,
+    CircuitNode, CircuitPort, ParameterRef, ResolvedCircuitArtifact, ResolvedLoweredExecutionGraph,
     StatePort, StreamCircuit,
 };
 

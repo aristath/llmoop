@@ -205,40 +205,40 @@ mod tests {
                 selected_by_default: false,
             },
         ];
-        let logical_device_ids = vec!["board_a".to_string(), "board_b".to_string()];
+        let logical_device_ids = vec!["device_a".to_string(), "device_b".to_string()];
         let colocated = runtime_physical_device_bindings_in(
             &Args::default(),
             &logical_device_ids,
             &available_devices,
         )
         .unwrap();
-        assert_eq!(colocated.get("board_a"), Some(&2));
-        assert_eq!(colocated.get("board_b"), Some(&2));
+        assert_eq!(colocated.get("device_a"), Some(&2));
+        assert_eq!(colocated.get("device_b"), Some(&2));
         assert_eq!(colocated.values().collect::<BTreeSet<_>>().len(), 1);
 
         let mut split_args = Args::default();
         split_args
             .device_bindings
-            .insert("board_b".to_string(), "vulkan:3".to_string());
+            .insert("device_b".to_string(), "vulkan:3".to_string());
         let split = runtime_physical_device_bindings_in(
             &split_args,
             &logical_device_ids,
             &available_devices,
         )
         .unwrap();
-        assert_eq!(split.get("board_a"), Some(&2));
-        assert_eq!(split.get("board_b"), Some(&3));
+        assert_eq!(split.get("device_a"), Some(&2));
+        assert_eq!(split.get("device_b"), Some(&3));
         assert_eq!(split.values().collect::<BTreeSet<_>>().len(), 2);
     }
 
     #[test]
     fn fully_explicit_device_binding_report_does_not_request_an_unused_default_gpu() {
-        let logical_device_ids = vec!["board_a".to_string(), "board_b".to_string()];
+        let logical_device_ids = vec!["device_a".to_string(), "device_b".to_string()];
         let mut args = Args::default();
         args.device_bindings
-            .insert("board_a".to_string(), "vulkan:2".to_string());
+            .insert("device_a".to_string(), "vulkan:2".to_string());
         args.device_bindings
-            .insert("board_b".to_string(), "vulkan:3".to_string());
+            .insert("device_b".to_string(), "vulkan:3".to_string());
 
         let report = runtime_device_bindings_report(&args, &logical_device_ids);
 

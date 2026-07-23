@@ -4,9 +4,9 @@ impl App {
             return;
         };
         let available = editor
-            .source_pedals()
+            .source_components()
             .iter()
-            .filter_map(|pedal| pedal.layer_index)
+            .filter_map(|component| component.layer_index)
             .collect::<BTreeSet<_>>();
         match parse_layer_sequence(self.sequence.text(), &available) {
             Ok(sequence) => match editor.replace_layer_sequence(&sequence) {
@@ -14,7 +14,7 @@ impl App {
                     self.last_valid_sequence = sequence;
                     self.sequence_error = None;
                     self.ensure_selection_exists();
-                    self.status = "Board draft updated · not mounted".to_string();
+                    self.status = "Graph draft updated · not mounted".to_string();
                 }
                 Err(error) => {
                     self.sequence_error = Some(SequenceParseError {
@@ -62,7 +62,7 @@ impl App {
             .any(|instance| instance.instance_id == instance_id)
         {
             self.selected_instance_id = Some(instance_id.to_string());
-            self.focus = FocusRegion::Board;
+            self.focus = FocusRegion::Graph;
         }
     }
 

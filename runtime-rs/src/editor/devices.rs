@@ -63,9 +63,9 @@ pub fn discover_runtime_devices(
                         } else {
                             "inventory_only".to_string()
                         }),
-                        can_host_runtime_pedals_on_physical_device: Some(true),
+                        can_host_runtime_components_on_physical_device: Some(true),
                         notes: if selected_by_runtime {
-                            vec!["default target for unbound pedal instances".to_string()]
+                            vec!["default target for unbound node instances".to_string()]
                         } else if let Some(cpu_runtime_device_id) = cpu_runtime_device_id {
                             vec![format!(
                                 "CPU runtime target {cpu_runtime_device_id} backed by {}",
@@ -110,7 +110,7 @@ fn unavailable_device(
         selected_by_default: None,
         selected_by_runtime: None,
         runtime_binding: None,
-        can_host_runtime_pedals_on_physical_device: None,
+        can_host_runtime_components_on_physical_device: None,
         notes: vec![note.to_string()],
         error,
     }

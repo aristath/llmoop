@@ -48,7 +48,7 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
                     .all(|transaction| transaction.cycle_width >= transaction_width)
             });
         let batch_execution_is_sufficient = self
-            .pedal_batch_execution
+            .component_batch_execution
             .borrow()
             .as_ref()
             .is_some_and(|runner| runner.lane_capacity >= transaction_width);
@@ -82,25 +82,25 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
             // Recorded batch sequences contain copies into the transaction's snapshot buffers.
             *self.verification_input_embedding.borrow_mut() = None;
             *self.batched_output_projection.borrow_mut() = None;
-            *self.pedal_batch_execution.borrow_mut() = None;
+            *self.component_batch_execution.borrow_mut() = None;
         }
         if self
-            .pedal_batch_execution
+            .component_batch_execution
             .borrow()
             .as_ref()
             .is_none_or(|runner| runner.lane_capacity < transaction_width)
         {
             *self.verification_input_embedding.borrow_mut() = None;
             *self.batched_output_projection.borrow_mut() = None;
-            let runner = VulkanResidentPlacedPedalBatchRunner::new(
+            let runner = VulkanResidentPlacedComponentBatchRunner::new(
                 devices,
                 &self.device_slices,
                 transaction_width,
-                VulkanPedalBatchExecutionMode::IndependentCandidates,
+                VulkanComponentBatchExecutionMode::IndependentCandidates,
                 &self.model.distributed_execution_plan,
                 &self.model.distributed_parameter_buffers,
             )?;
-            *self.pedal_batch_execution.borrow_mut() = Some(runner);
+            *self.component_batch_execution.borrow_mut() = Some(runner);
         }
         if self
             .verification_input_embedding
@@ -133,12 +133,12 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
                         },
                     )
                 })?;
-            let batch_execution = self.pedal_batch_execution.borrow();
+            let batch_execution = self.component_batch_execution.borrow();
             let input_signal = batch_execution
                 .as_ref()
-                .expect("verification pedal batch was initialized")
+                .expect("verification component batch was initialized")
                 .slice(first_device_index)?
-                .signal_buffer(&VulkanPedalBatchSignalKey::ModelInput(
+                .signal_buffer(&VulkanComponentBatchSignalKey::ModelInput(
                     self.model.input_transducer_spec.output_signal_id.clone(),
                 ))?;
             let input_embedding = VulkanResidentBatchedInputEmbeddingRunner::new(

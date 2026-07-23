@@ -1,5 +1,5 @@
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RuntimeCableRouteTarget {
+pub struct RuntimeEdgeRouteTarget {
     pub target: Option<String>,
     pub physical_device_index: Option<usize>,
     pub binding_source: String,
@@ -7,7 +7,7 @@ pub struct RuntimeCableRouteTarget {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum RuntimeCableRouteKind {
+pub enum RuntimeEdgeRouteKind {
     LogicalLocal,
     SamePhysicalTarget,
     CrossPhysicalTarget,
@@ -15,84 +15,84 @@ pub enum RuntimeCableRouteKind {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RuntimeCableRoute {
-    pub cable_index: usize,
+pub struct RuntimeEdgeRoute {
+    pub edge_index: usize,
     pub signal: String,
     pub shape: Vec<usize>,
-    pub source_pedal_id: String,
+    pub source_component_id: String,
     pub source_device_id: String,
     pub source_target: Option<String>,
     pub source_physical_device_index: Option<usize>,
     pub source_binding: String,
-    pub destination_pedal_id: String,
+    pub destination_component_id: String,
     pub destination_device_id: String,
     pub destination_target: Option<String>,
     pub destination_physical_device_index: Option<usize>,
     pub destination_binding: String,
-    pub route_kind: RuntimeCableRouteKind,
+    pub route_kind: RuntimeEdgeRouteKind,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RuntimeCableRoutes {
+pub struct RuntimeEdgeRoutes {
     pub schema: String,
-    pub cable_count: usize,
-    pub logical_local_cable_count: usize,
-    pub logical_cross_device_cable_count: usize,
-    pub same_physical_target_cable_count: usize,
-    pub cross_physical_target_cable_count: usize,
-    pub unresolved_target_cable_count: usize,
-    pub routes: Vec<RuntimeCableRoute>,
+    pub edge_count: usize,
+    pub logical_local_edge_count: usize,
+    pub logical_cross_device_edge_count: usize,
+    pub same_physical_target_edge_count: usize,
+    pub cross_physical_target_edge_count: usize,
+    pub unresolved_target_edge_count: usize,
+    pub routes: Vec<RuntimeEdgeRoute>,
 }
 
-impl RuntimeCableRoutes {
-    pub fn from_cables<F>(cables: &[PedalCablePlacement], mut target_for: F) -> Self
+impl RuntimeEdgeRoutes {
+    pub fn from_edges<F>(edges: &[ComponentEdgePlacement], mut target_for: F) -> Self
     where
-        F: FnMut(&str) -> RuntimeCableRouteTarget,
+        F: FnMut(&str) -> RuntimeEdgeRouteTarget,
     {
-        let mut logical_local_cable_count = 0usize;
-        let mut logical_cross_device_cable_count = 0usize;
-        let mut same_physical_target_cable_count = 0usize;
-        let mut cross_physical_target_cable_count = 0usize;
-        let mut unresolved_target_cable_count = 0usize;
+        let mut logical_local_edge_count = 0usize;
+        let mut logical_cross_device_edge_count = 0usize;
+        let mut same_physical_target_edge_count = 0usize;
+        let mut cross_physical_target_edge_count = 0usize;
+        let mut unresolved_target_edge_count = 0usize;
 
-        let routes = cables
+        let routes = edges
             .iter()
-            .map(|cable| {
-                let source_target = target_for(&cable.source_device_id);
-                let destination_target = target_for(&cable.destination_device_id);
-                let is_logical_local = cable.source_device_id == cable.destination_device_id;
+            .map(|edge| {
+                let source_target = target_for(&edge.source_device_id);
+                let destination_target = target_for(&edge.destination_device_id);
+                let is_logical_local = edge.source_device_id == edge.destination_device_id;
                 let route_kind = if is_logical_local {
-                    logical_local_cable_count += 1;
-                    RuntimeCableRouteKind::LogicalLocal
+                    logical_local_edge_count += 1;
+                    RuntimeEdgeRouteKind::LogicalLocal
                 } else {
-                    logical_cross_device_cable_count += 1;
+                    logical_cross_device_edge_count += 1;
                     match (&source_target.target, &destination_target.target) {
                         (Some(source), Some(destination)) if source == destination => {
-                            same_physical_target_cable_count += 1;
-                            RuntimeCableRouteKind::SamePhysicalTarget
+                            same_physical_target_edge_count += 1;
+                            RuntimeEdgeRouteKind::SamePhysicalTarget
                         }
                         (Some(_), Some(_)) => {
-                            cross_physical_target_cable_count += 1;
-                            RuntimeCableRouteKind::CrossPhysicalTarget
+                            cross_physical_target_edge_count += 1;
+                            RuntimeEdgeRouteKind::CrossPhysicalTarget
                         }
                         _ => {
-                            unresolved_target_cable_count += 1;
-                            RuntimeCableRouteKind::UnresolvedRuntimeTarget
+                            unresolved_target_edge_count += 1;
+                            RuntimeEdgeRouteKind::UnresolvedRuntimeTarget
                         }
                     }
                 };
 
-                RuntimeCableRoute {
-                    cable_index: cable.cable_index,
-                    signal: cable.signal.clone(),
-                    shape: cable.shape.clone(),
-                    source_pedal_id: cable.source_pedal_id.clone(),
-                    source_device_id: cable.source_device_id.clone(),
+                RuntimeEdgeRoute {
+                    edge_index: edge.edge_index,
+                    signal: edge.signal.clone(),
+                    shape: edge.shape.clone(),
+                    source_component_id: edge.source_component_id.clone(),
+                    source_device_id: edge.source_device_id.clone(),
                     source_target: source_target.target,
                     source_physical_device_index: source_target.physical_device_index,
                     source_binding: source_target.binding_source,
-                    destination_pedal_id: cable.destination_pedal_id.clone(),
-                    destination_device_id: cable.destination_device_id.clone(),
+                    destination_component_id: edge.destination_component_id.clone(),
+                    destination_device_id: edge.destination_device_id.clone(),
                     destination_target: destination_target.target,
                     destination_physical_device_index: destination_target.physical_device_index,
                     destination_binding: destination_target.binding_source,
@@ -102,13 +102,13 @@ impl RuntimeCableRoutes {
             .collect::<Vec<_>>();
 
         Self {
-            schema: RUNTIME_CABLE_ROUTES_SCHEMA.to_string(),
-            cable_count: cables.len(),
-            logical_local_cable_count,
-            logical_cross_device_cable_count,
-            same_physical_target_cable_count,
-            cross_physical_target_cable_count,
-            unresolved_target_cable_count,
+            schema: RUNTIME_EDGE_ROUTES_SCHEMA.to_string(),
+            edge_count: edges.len(),
+            logical_local_edge_count,
+            logical_cross_device_edge_count,
+            same_physical_target_edge_count,
+            cross_physical_target_edge_count,
+            unresolved_target_edge_count,
             routes,
         }
     }

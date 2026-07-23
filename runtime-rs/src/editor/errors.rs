@@ -7,10 +7,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    CircuitPlacementError, CircuitRuntimeRole, PedalPlacement, RUNTIME_DEFAULT_LOGICAL_DEVICE_ID,
-    ResolvedLoweredPedalboard, RuntimeAvailableDevice, RuntimeAvailableMemoryHeap,
-    StreamCircuitPedalInstance, StreamCircuitPedalInstanceStatePolicy, StreamCircuitPlacementPlan,
-    StreamCircuitRuntimePatch, VulkanComputeDevice, VulkanResidentModelPackageManifest,
+    CircuitPlacementError, CircuitRuntimeRole, ComponentPlacement, RUNTIME_DEFAULT_LOGICAL_DEVICE_ID,
+    ResolvedLoweredExecutionGraph, RuntimeAvailableDevice, RuntimeAvailableMemoryHeap,
+    StreamCircuitNodeInstance, StreamCircuitNodeInstanceStatePolicy, StreamCircuitPlacementPlan,
+    StreamCircuitRuntimeGraph, VulkanComputeDevice, VulkanResidentModelPackageManifest,
 };
 
 pub const RUNTIME_PACKAGE_MANIFEST_FILE: &str = "vulkan_resident_package.json";

@@ -1,5 +1,5 @@
 fn infer_node_output_shapes(
-    pedal_id: &str,
+    component_id: &str,
     node: &CircuitNode,
     signals: &BTreeMap<String, PlannedSignal>,
     params: &BTreeMap<String, ParameterRef>,
@@ -26,7 +26,7 @@ fn infer_node_output_shapes(
         | "scaled_residual_add"
         | "silu_multiply"
         | "sigmoid_multiply" => Ok(repeat_shape(
-            compatible_input_shape(pedal_id, node, signals)?,
+            compatible_input_shape(component_id, node, signals)?,
             outputs,
         )),
         "sigmoid_scalar_multiply" => Ok(repeat_shape(first_input_shape(node, signals), outputs)),
@@ -34,7 +34,7 @@ fn infer_node_output_shapes(
             if node.inputs.len() != 2 || node.outputs.len() != 2 || node.params.len() != 2 {
                 return Err(CircuitPlanError(format!(
                     "{} node {} requires two head-norm/rope inputs, outputs, and parameters",
-                    pedal_id, node.id
+                    component_id, node.id
                 )));
             }
             Ok(node
@@ -44,10 +44,10 @@ fn infer_node_output_shapes(
                 .collect())
         }
         "parallel_linear_2way" | "parallel_linear_3way" => {
-            infer_parallel_linear_output_shapes(pedal_id, node, signals, params, tensor_index)
+            infer_parallel_linear_output_shapes(component_id, node, signals, params, tensor_index)
         }
         "linear" | "linear_residual" | "linear_projection" | "parallel_linear_silu_multiply" => {
-            infer_linear_output_shapes(pedal_id, node, signals, params, tensor_index)
+            infer_linear_output_shapes(component_id, node, signals, params, tensor_index)
         }
         "concatenate" => {
             let mut width = 0usize;
@@ -58,28 +58,28 @@ fn infer_node_output_shapes(
                     .ok_or_else(|| {
                         CircuitPlanError(format!(
                             "{} node {} concatenate input {} has no known shape",
-                            pedal_id, node.id, input
+                            component_id, node.id, input
                         ))
                     })?;
                 let [input_width] = shape.as_slice() else {
                     return Err(CircuitPlanError(format!(
                         "{} node {} concatenate input {} must be one-dimensional",
-                        pedal_id, node.id, input
+                        component_id, node.id, input
                     )));
                 };
                 width = width.checked_add(*input_width).ok_or_else(|| {
                     CircuitPlanError(format!(
                         "{} node {} concatenate width overflowed",
-                        pedal_id, node.id
+                        component_id, node.id
                     ))
                 })?;
             }
             Ok(repeat_shape(Some(vec![width]), outputs))
         }
         "linear_split_3way" => {
-            infer_linear_split_output_shapes(pedal_id, node, signals, params, tensor_index)
+            infer_linear_split_output_shapes(component_id, node, signals, params, tensor_index)
         }
-        "split" => infer_split_output_shapes(pedal_id, node, signals),
+        "split" => infer_split_output_shapes(component_id, node, signals),
         "rolling_state_update" => {
             let state_shape = node
                 .inputs
@@ -158,7 +158,7 @@ fn infer_node_output_shapes(
 }
 
 fn infer_linear_output_shapes(
-    pedal_id: &str,
+    component_id: &str,
     node: &CircuitNode,
     signals: &BTreeMap<String, PlannedSignal>,
     params: &BTreeMap<String, ParameterRef>,
@@ -193,7 +193,7 @@ fn infer_linear_output_shapes(
             if *last_dim != input_width {
                 return Err(CircuitPlanError(format!(
                     "{} node {} linear input width {} does not match parameter {:?} width {}",
-                    pedal_id, node.id, *last_dim, param_id, input_width
+                    component_id, node.id, *last_dim, param_id, input_width
                 )));
             }
             *last_dim = output_width;
@@ -206,7 +206,7 @@ fn infer_linear_output_shapes(
 }
 
 fn infer_parallel_linear_output_shapes(
-    pedal_id: &str,
+    component_id: &str,
     node: &CircuitNode,
     signals: &BTreeMap<String, PlannedSignal>,
     params: &BTreeMap<String, ParameterRef>,
@@ -225,7 +225,7 @@ fn infer_parallel_linear_output_shapes(
     {
         return Err(CircuitPlanError(format!(
             "{} node {} declares {:?} parallel-linear branches for {} parameters and {} outputs; expected {}",
-            pedal_id,
+            component_id,
             node.id,
             declared_branch_count,
             node.params.len(),
@@ -236,7 +236,7 @@ fn infer_parallel_linear_output_shapes(
     if branch_parameter_counts.iter().sum::<usize>() != node.params.len() {
         return Err(CircuitPlanError(format!(
             "{} node {} parallel-linear branch parameter counts {:?} do not cover {} parameters",
-            pedal_id,
+            component_id,
             node.id,
             branch_parameter_counts,
             node.params.len()
@@ -259,19 +259,19 @@ fn infer_parallel_linear_output_shapes(
             let parameter = params.get(param_id).ok_or_else(|| {
                 CircuitPlanError(format!(
                     "{} node {} cannot resolve parallel-linear parameter {:?}",
-                    pedal_id, node.id, param_id
+                    component_id, node.id, param_id
                 ))
             })?;
             let tensor = parameter.tensor.as_deref().ok_or_else(|| {
                 CircuitPlanError(format!(
                     "{} node {} parallel-linear parameter {:?} has no tensor",
-                    pedal_id, node.id, param_id
+                    component_id, node.id, param_id
                 ))
             })?;
             let weight_shape = tensor_index.tensor_shape(tensor).ok_or_else(|| {
                 CircuitPlanError(format!(
                     "{} node {} parallel-linear tensor {:?} has no shape",
-                    pedal_id, node.id, tensor
+                    component_id, node.id, tensor
                 ))
             })?;
             if weight_shape.len() != 2 {
@@ -280,7 +280,7 @@ fn infer_parallel_linear_output_shapes(
             if input_width.is_some_and(|width| width != weight_shape[1]) {
                 return Err(CircuitPlanError(format!(
                     "{} node {} parallel-linear input width {:?} does not match parameter {:?} width {}",
-                    pedal_id, node.id, input_width, param_id, weight_shape[1]
+                    component_id, node.id, input_width, param_id, weight_shape[1]
                 )));
             }
             let mut output_shape = input_shape
@@ -333,7 +333,7 @@ fn parallel_linear_branch_parameter_counts(
 }
 
 fn infer_split_output_shapes(
-    pedal_id: &str,
+    component_id: &str,
     node: &CircuitNode,
     signals: &BTreeMap<String, PlannedSignal>,
 ) -> Result<Vec<Option<Vec<usize>>>, CircuitPlanError> {
@@ -355,13 +355,13 @@ fn infer_split_output_shapes(
             .ok_or_else(|| {
                 CircuitPlanError(format!(
                     "{} node {} has non-integer split part widths",
-                    pedal_id, node.id
+                    component_id, node.id
                 ))
             })?;
         if widths.len() != node.outputs.len() || widths.iter().sum::<usize>() != *channel_dim {
             return Err(CircuitPlanError(format!(
                 "{} node {} cannot split shape {:?} into widths {:?}",
-                pedal_id,
+                component_id,
                 node.id,
                 first_input_shape(node, signals),
                 widths
@@ -379,7 +379,7 @@ fn infer_split_output_shapes(
     if node.outputs.is_empty() || *channel_dim % node.outputs.len() != 0 {
         return Err(CircuitPlanError(format!(
             "{} node {} cannot split shape {:?} across {} outputs",
-            pedal_id,
+            component_id,
             node.id,
             first_input_shape(node, signals),
             node.outputs.len()
@@ -390,14 +390,14 @@ fn infer_split_output_shapes(
 }
 
 fn infer_linear_split_output_shapes(
-    pedal_id: &str,
+    component_id: &str,
     node: &CircuitNode,
     signals: &BTreeMap<String, PlannedSignal>,
     params: &BTreeMap<String, ParameterRef>,
     tensor_index: Option<&TensorIndex>,
 ) -> Result<Vec<Option<Vec<usize>>>, CircuitPlanError> {
     let combined_shapes =
-        infer_linear_output_shapes(pedal_id, node, signals, params, tensor_index)?;
+        infer_linear_output_shapes(component_id, node, signals, params, tensor_index)?;
     let Some(Some(combined_shape)) = combined_shapes.first() else {
         return Ok(vec![None; node.outputs.len()]);
     };
@@ -417,7 +417,7 @@ fn infer_linear_split_output_shapes(
         .ok_or_else(|| {
             CircuitPlanError(format!(
                 "{} node {} requires integer linear-split part widths",
-                pedal_id, node.id
+                component_id, node.id
             ))
         })?;
     if part_widths.len() != node.outputs.len()
@@ -425,7 +425,7 @@ fn infer_linear_split_output_shapes(
     {
         return Err(CircuitPlanError(format!(
             "{} node {} cannot split linear output shape {:?} into widths {:?}",
-            pedal_id, node.id, combined_shape, part_widths
+            component_id, node.id, combined_shape, part_widths
         )));
     }
     Ok(part_widths
@@ -439,7 +439,7 @@ fn infer_linear_split_output_shapes(
 }
 
 fn compatible_input_shape(
-    pedal_id: &str,
+    component_id: &str,
     node: &CircuitNode,
     signals: &BTreeMap<String, PlannedSignal>,
 ) -> Result<Option<Vec<usize>>, CircuitPlanError> {
@@ -451,7 +451,7 @@ fn compatible_input_shape(
                 if existing != &shape {
                     return Err(CircuitPlanError(format!(
                         "{} node {} input {:?} shape {:?} does not match {:?}",
-                        pedal_id, node.id, input, shape, existing
+                        component_id, node.id, input, shape, existing
                     )));
                 }
             } else {

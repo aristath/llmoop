@@ -3,7 +3,7 @@ impl App {
         match self.overlay.as_ref() {
             Some(Overlay::ModelSelector(_)) => self.dispatch_model_selector(action),
             Some(Overlay::Compiler(_)) => self.dispatch_compiler(action),
-            Some(Overlay::Pedal(_)) => self.dispatch_pedal_modal(action),
+            Some(Overlay::Node(_)) => self.dispatch_node_modal(action),
             Some(Overlay::Help) => match action {
                 AppAction::Quit => self.should_quit = true,
                 AppAction::CloseOverlay => self.overlay = self.help_return_overlay.take(),
@@ -121,8 +121,8 @@ impl App {
         }
     }
 
-    fn dispatch_pedal_modal(&mut self, action: AppAction) {
-        let Some(Overlay::Pedal(modal)) = &mut self.overlay else {
+    fn dispatch_node_modal(&mut self, action: AppAction) {
+        let Some(Overlay::Node(modal)) = &mut self.overlay else {
             return;
         };
         match action {
@@ -137,13 +137,13 @@ impl App {
                     .checked_sub(1)
                     .unwrap_or_else(|| modal.row_count() - 1)
             }
-            AppAction::ModalChange(delta) => change_pedal_modal(modal, delta),
+            AppAction::ModalChange(delta) => change_node_modal(modal, delta),
             AppAction::ModalClickRow(row) => {
                 modal.focus_row = row.min(modal.row_count().saturating_sub(1));
                 if row <= 3 {
-                    change_pedal_modal(modal, 1);
+                    change_node_modal(modal, 1);
                 } else if row == modal.apply_row() {
-                    self.apply_pedal_modal();
+                    self.apply_node_modal();
                 } else if row == modal.cancel_row() {
                     self.overlay = None;
                 } else if modal
@@ -151,16 +151,16 @@ impl App {
                     .and_then(|index| modal.properties.get(index))
                     .is_some_and(|property| !property.accepts_text())
                 {
-                    change_pedal_modal(modal, 1);
+                    change_node_modal(modal, 1);
                 }
             }
             AppAction::ActivateModal => {
                 if modal.focus_row == 1 {
                     modal.enabled = !modal.enabled;
                 } else if matches!(modal.focus_row, 0 | 2 | 3) {
-                    change_pedal_modal(modal, 1);
+                    change_node_modal(modal, 1);
                 } else if modal.focus_row == modal.apply_row() {
-                    self.apply_pedal_modal();
+                    self.apply_node_modal();
                 } else if modal.focus_row == modal.cancel_row() {
                     self.overlay = None;
                 } else if modal
@@ -168,11 +168,11 @@ impl App {
                     .and_then(|index| modal.properties.get(index))
                     .is_some_and(|property| !property.accepts_text())
                 {
-                    change_pedal_modal(modal, 1);
+                    change_node_modal(modal, 1);
                 }
             }
             AppAction::InsertText(value) => {
-                if let Some(property) = focused_property_mut(modal)
+                if let Some(property) = focused_node_property_mut(modal)
                     && property.accepts_text()
                 {
                     property.buffer.insert(&value);
@@ -180,7 +180,7 @@ impl App {
                 }
             }
             AppAction::Backspace => {
-                if let Some(property) = focused_property_mut(modal)
+                if let Some(property) = focused_node_property_mut(modal)
                     && property.accepts_text()
                 {
                     property.buffer.backspace();
@@ -188,7 +188,7 @@ impl App {
                 }
             }
             AppAction::DeleteForward => {
-                if let Some(property) = focused_property_mut(modal)
+                if let Some(property) = focused_node_property_mut(modal)
                     && property.accepts_text()
                 {
                     property.buffer.delete();
@@ -196,20 +196,20 @@ impl App {
                 }
             }
             AppAction::MoveTextCursor { motion, selecting } => {
-                if let Some(property) = focused_property_mut(modal)
+                if let Some(property) = focused_node_property_mut(modal)
                     && property.accepts_text()
                 {
                     move_text_cursor(&mut property.buffer, motion, selecting);
                 }
             }
             AppAction::SelectAllText => {
-                if let Some(property) = focused_property_mut(modal)
+                if let Some(property) = focused_node_property_mut(modal)
                     && property.accepts_text()
                 {
                     property.buffer.select_all();
                 }
             }
-            AppAction::ApplyPedal => self.apply_pedal_modal(),
+            AppAction::ApplyNode => self.apply_node_modal(),
             _ => {}
         }
     }
@@ -458,15 +458,15 @@ impl App {
         self.last_valid_sequence = sequence;
         self.sequence_error = None;
         self.selected_instance_id = selected_instance_id;
-        self.board_scroll = 0;
+        self.graph_scroll = 0;
         self.status = format!(
-            "Loaded {} · {} pedals · draft not mounted",
+            "Loaded {} · {} source components · graph draft not mounted",
             editor.package_id(),
             editor.instances().len()
         );
         self.editor = Some(editor);
         self.overlay = None;
-        self.focus = FocusRegion::Board;
+        self.focus = FocusRegion::Graph;
     }
 
 }

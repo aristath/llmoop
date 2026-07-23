@@ -23,17 +23,17 @@ impl VulkanKernelInterfacePlan {
             .sum()
     }
 
-    pub fn kernel(&self, pedal_id: &str, node_id: &str) -> Option<&VulkanKernelInterface> {
+    pub fn kernel(&self, component_id: &str, node_id: &str) -> Option<&VulkanKernelInterface> {
         self.circuits
             .iter()
-            .find(|circuit| circuit.pedal_id == pedal_id)
+            .find(|circuit| circuit.component_id == component_id)
             .and_then(|circuit| circuit.kernel(node_id))
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VulkanCircuitKernelInterface {
-    pub pedal_id: String,
+    pub component_id: String,
     pub circuit_id: String,
     pub kernels: Vec<VulkanKernelInterface>,
 }
@@ -41,12 +41,12 @@ pub struct VulkanCircuitKernelInterface {
 impl VulkanCircuitKernelInterface {
     fn from_binding_plan(circuit: &VulkanCircuitBindingPlan) -> Self {
         Self {
-            pedal_id: circuit.pedal_id.clone(),
+            component_id: circuit.component_id.clone(),
             circuit_id: circuit.circuit_id.clone(),
             kernels: circuit
                 .nodes
                 .iter()
-                .map(|node| VulkanKernelInterface::from_node_binding(&circuit.pedal_id, node))
+                .map(|node| VulkanKernelInterface::from_node_binding(&circuit.component_id, node))
                 .collect(),
         }
     }
@@ -59,7 +59,7 @@ impl VulkanCircuitKernelInterface {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VulkanKernelInterface {
     pub kernel_id: String,
-    pub pedal_id: String,
+    pub component_id: String,
     pub node_index: usize,
     pub node_id: String,
     pub op: String,
@@ -74,7 +74,7 @@ pub struct VulkanKernelInterface {
 }
 
 impl VulkanKernelInterface {
-    fn from_node_binding(pedal_id: &str, node: &VulkanNodeBinding) -> Self {
+    fn from_node_binding(component_id: &str, node: &VulkanNodeBinding) -> Self {
         let state_views = node
             .inputs
             .iter()
@@ -84,8 +84,8 @@ impl VulkanKernelInterface {
             .collect();
 
         Self {
-            kernel_id: format!("{}.{}", pedal_id, node.node_id),
-            pedal_id: pedal_id.to_string(),
+            kernel_id: format!("{}.{}", component_id, node.node_id),
+            component_id: component_id.to_string(),
             node_index: node.node_index,
             node_id: node.node_id.clone(),
             op: node.op.clone(),
@@ -193,10 +193,10 @@ impl VulkanKernelDispatchPlan {
         self.commands.len()
     }
 
-    pub fn command(&self, pedal_id: &str, node_id: &str) -> Option<&VulkanKernelDispatchCommand> {
+    pub fn command(&self, component_id: &str, node_id: &str) -> Option<&VulkanKernelDispatchCommand> {
         self.commands
             .iter()
-            .find(|command| command.pedal_id == pedal_id && command.node_id == node_id)
+            .find(|command| command.component_id == component_id && command.node_id == node_id)
     }
 
     pub fn op_counts(&self) -> BTreeMap<String, usize> {
@@ -213,7 +213,7 @@ pub struct VulkanKernelDispatchCommand {
     pub dispatch_index: usize,
     pub circuit_index: usize,
     pub kernel_id: String,
-    pub pedal_id: String,
+    pub component_id: String,
     pub circuit_id: String,
     pub node_index: usize,
     pub node_id: String,
@@ -235,7 +235,7 @@ impl VulkanKernelDispatchCommand {
             dispatch_index,
             circuit_index,
             kernel_id: kernel.kernel_id.clone(),
-            pedal_id: kernel.pedal_id.clone(),
+            component_id: kernel.component_id.clone(),
             circuit_id: circuit_id.to_string(),
             node_index: kernel.node_index,
             node_id: kernel.node_id.clone(),

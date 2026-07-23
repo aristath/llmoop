@@ -99,7 +99,7 @@ impl VulkanMountedStreamCircuit {
 pub enum VulkanStreamCircuitMountError {
     Binding(VulkanBindingPlanError),
     BoundaryIo(VulkanModelBoundaryBufferPlanError),
-    CableIo(VulkanPlacedCableIoPlanError),
+    EdgeIo(VulkanPlacedEdgeIoPlanError),
     PermanentParameters(VulkanPermanentParameterBufferPlanError),
     Vulkan(VulkanError),
 }
@@ -109,7 +109,7 @@ impl Display for VulkanStreamCircuitMountError {
         match self {
             Self::Binding(error) => Display::fmt(error, f),
             Self::BoundaryIo(error) => Display::fmt(error, f),
-            Self::CableIo(error) => Display::fmt(error, f),
+            Self::EdgeIo(error) => Display::fmt(error, f),
             Self::PermanentParameters(error) => Display::fmt(error, f),
             Self::Vulkan(error) => Display::fmt(error, f),
         }
@@ -130,9 +130,9 @@ impl From<VulkanModelBoundaryBufferPlanError> for VulkanStreamCircuitMountError 
     }
 }
 
-impl From<VulkanPlacedCableIoPlanError> for VulkanStreamCircuitMountError {
-    fn from(error: VulkanPlacedCableIoPlanError) -> Self {
-        Self::CableIo(error)
+impl From<VulkanPlacedEdgeIoPlanError> for VulkanStreamCircuitMountError {
+    fn from(error: VulkanPlacedEdgeIoPlanError) -> Self {
+        Self::EdgeIo(error)
     }
 }
 
@@ -153,7 +153,7 @@ pub struct VulkanMountedPlacedStreamCircuit {
     pub parameter_buffers: Arc<VulkanPermanentParameterBuffers>,
     pub buffers: VulkanStreamCircuitStreamBuffers,
     pub boundary_io: VulkanModelBoundaryBuffers,
-    pub cable_io: VulkanPlacedCableIoBuffers,
+    pub edge_io: VulkanPlacedEdgeIoBuffers,
     pub stream_control_buffer: Arc<VulkanResidentBuffer>,
 }
 
@@ -214,7 +214,7 @@ impl VulkanMountedPlacedStreamCircuit {
         dynamic_state_capacity_activations: usize,
         parameter_buffers: Arc<VulkanPermanentParameterBuffers>,
         activation_overrides: &[VulkanActivationSlotBufferOverride],
-        cable_endpoint_overrides: &[VulkanPlacedCableEndpointBufferOverride],
+        edge_endpoint_overrides: &[VulkanPlacedEdgeEndpointBufferOverride],
         stream_control_override: Option<Arc<VulkanResidentBuffer>>,
     ) -> Result<Self, VulkanStreamCircuitMountError> {
         let buffers = placed_plan
@@ -227,10 +227,10 @@ impl VulkanMountedPlacedStreamCircuit {
             )?;
         let boundary_io_plan = VulkanModelBoundaryBufferPlan::from_placed_plan(&placed_plan)?;
         let boundary_io = boundary_io_plan.allocate_buffers(device)?;
-        let cable_io_plan =
-            VulkanPlacedCableIoPlan::from_placed_resident_plan(&placed_plan.placed_resident_plan)?;
-        let cable_io = cable_io_plan
-            .allocate_buffers_with_endpoint_overrides(device, cable_endpoint_overrides)?;
+        let edge_io_plan =
+            VulkanPlacedEdgeIoPlan::from_placed_resident_plan(&placed_plan.placed_resident_plan)?;
+        let edge_io = edge_io_plan
+            .allocate_buffers_with_endpoint_overrides(device, edge_endpoint_overrides)?;
         let stream_control_buffer = if let Some(stream_control_buffer) = stream_control_override {
             if !device.owns_resident_buffer(&stream_control_buffer) {
                 return Err(VulkanStreamCircuitMountError::Vulkan(VulkanError(
@@ -262,7 +262,7 @@ impl VulkanMountedPlacedStreamCircuit {
             parameter_buffers,
             buffers,
             boundary_io,
-            cable_io,
+            edge_io,
             stream_control_buffer,
         })
     }
@@ -328,7 +328,7 @@ impl VulkanMountedPlacedStreamCircuit {
         let placed_bound_plan = self.placed_bound_dispatch_plan(manifest)?;
         VulkanMountedPlacedBoundDispatchPlan::from_placed_bound_plan(
             &placed_bound_plan,
-            &self.cable_io,
+            &self.edge_io,
         )
     }
 
@@ -461,44 +461,44 @@ impl VulkanMountedPlacedStreamCircuit {
             .map_err(VulkanMountedPlacedResidentKernelDispatchError::Vulkan)
     }
 
-    pub fn create_resident_pedal_runner(
+    pub fn create_resident_component_runner(
         &self,
         device: &VulkanComputeDevice,
         mounted_bound_plan: &VulkanMountedPlacedBoundDispatchPlan,
-        pedal_id: &str,
+        component_id: &str,
         loaded_manifest: &VulkanLoadedReusableKernelArtifactManifest,
     ) -> Result<
-        VulkanMountedPlacedResidentPedalRunner,
+        VulkanMountedPlacedResidentComponentRunner,
         VulkanMountedPlacedResidentKernelDispatchError,
     > {
-        VulkanMountedPlacedResidentPedalRunner::from_mounted_bound_plan(
+        VulkanMountedPlacedResidentComponentRunner::from_mounted_bound_plan(
             device,
             self,
             mounted_bound_plan,
-            pedal_id,
+            component_id,
             loaded_manifest,
         )
     }
 
-    pub fn create_resident_pedalboard_runner<I, S>(
+    pub fn create_resident_execution_graph_runner<I, S>(
         &self,
         device: &VulkanComputeDevice,
         mounted_bound_plan: &VulkanMountedPlacedBoundDispatchPlan,
-        pedal_ids: I,
+        component_ids: I,
         loaded_manifest: &VulkanLoadedReusableKernelArtifactManifest,
     ) -> Result<
-        VulkanMountedPlacedResidentPedalboardRunner,
+        VulkanMountedPlacedResidentExecutionGraphRunner,
         VulkanMountedPlacedResidentKernelDispatchError,
     >
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
-        VulkanMountedPlacedResidentPedalboardRunner::from_mounted_bound_plan(
+        VulkanMountedPlacedResidentExecutionGraphRunner::from_mounted_bound_plan(
             device,
             self,
             mounted_bound_plan,
-            pedal_ids,
+            component_ids,
             loaded_manifest,
         )
     }
@@ -541,47 +541,47 @@ impl VulkanMountedPlacedStreamCircuit {
                 })?;
                 (&allocation.buffer, allocation.byte_capacity)
             }
-            VulkanMountedPlacedBoundDescriptorTarget::LocalCableInputBuffer { cable }
-            | VulkanMountedPlacedBoundDescriptorTarget::LocalCableOutputBuffer { cable } => {
+            VulkanMountedPlacedBoundDescriptorTarget::LocalEdgeInputBuffer { edge }
+            | VulkanMountedPlacedBoundDescriptorTarget::LocalEdgeOutputBuffer { edge } => {
                 let allocation = self
-                    .cable_io
+                    .edge_io
                     .local_buffers
-                    .get(cable.buffer_index)
+                    .get(edge.buffer_index)
                     .ok_or_else(|| {
                         VulkanMountedPlacedResidentKernelDispatchError::MissingMountedBuffer {
                             dispatch_index: dispatch.dispatch_index,
                             binding: descriptor.binding,
-                            buffer_kind: "local_cable".to_string(),
-                            buffer_index: cable.buffer_index,
+                            buffer_kind: "local_edge".to_string(),
+                            buffer_index: edge.buffer_index,
                         }
                     })?;
-                (&allocation.buffer, cable.byte_capacity)
+                (&allocation.buffer, edge.byte_capacity)
             }
-            VulkanMountedPlacedBoundDescriptorTarget::IncomingCableBuffer { endpoint } => {
+            VulkanMountedPlacedBoundDescriptorTarget::IncomingEdgeBuffer { endpoint } => {
                 let allocation = self
-                    .cable_io
+                    .edge_io
                     .incoming_buffers
                     .get(endpoint.buffer_index)
                     .ok_or_else(|| {
                         VulkanMountedPlacedResidentKernelDispatchError::MissingMountedBuffer {
                             dispatch_index: dispatch.dispatch_index,
                             binding: descriptor.binding,
-                            buffer_kind: "incoming_cable".to_string(),
+                            buffer_kind: "incoming_edge".to_string(),
                             buffer_index: endpoint.buffer_index,
                         }
                     })?;
                 (allocation.buffer.as_ref(), endpoint.byte_capacity)
             }
-            VulkanMountedPlacedBoundDescriptorTarget::OutgoingCableBuffer { endpoint } => {
+            VulkanMountedPlacedBoundDescriptorTarget::OutgoingEdgeBuffer { endpoint } => {
                 let allocation = self
-                    .cable_io
+                    .edge_io
                     .outgoing_buffers
                     .get(endpoint.buffer_index)
                     .ok_or_else(|| {
                         VulkanMountedPlacedResidentKernelDispatchError::MissingMountedBuffer {
                             dispatch_index: dispatch.dispatch_index,
                             binding: descriptor.binding,
-                            buffer_kind: "outgoing_cable".to_string(),
+                            buffer_kind: "outgoing_edge".to_string(),
                             buffer_index: endpoint.buffer_index,
                         }
                     })?;

@@ -170,11 +170,11 @@ fn load_layer_00_parameters(
 }
 
 #[test]
-fn package_pedal_executions_must_match_mounted_dispatch_order() {
+fn package_component_executions_must_match_mounted_dispatch_order() {
     let device = match VulkanComputeDevice::new() {
         Ok(device) => device,
         Err(error) => {
-            eprintln!("skipping package pedal execution validation: {error}");
+            eprintln!("skipping package component execution validation: {error}");
             return;
         }
     };
@@ -201,30 +201,30 @@ fn package_pedal_executions_must_match_mounted_dispatch_order() {
         .mounted_placed_bound_dispatch_plan(&kernel_manifest)
         .unwrap();
 
-    validate_pedal_executions_against_mounted_dispatches(
+    validate_component_executions_against_mounted_dispatches(
         &runtime_model.package.package_id,
-        &runtime_model.pedal_executions,
+        &runtime_model.component_executions,
         &mounted_bound,
     )
     .unwrap();
 
-    runtime_model.pedal_executions[0].kernels.swap(0, 1);
-    let error = validate_pedal_executions_against_mounted_dispatches(
+    runtime_model.component_executions[0].kernels.swap(0, 1);
+    let error = validate_component_executions_against_mounted_dispatches(
         &runtime_model.package.package_id,
-        &runtime_model.pedal_executions,
+        &runtime_model.component_executions,
         &mounted_bound,
     )
     .unwrap_err();
     assert!(error.to_string().contains(
-        "declares pedal layer_00 kernel conv_in_projection with execution_index 1, expected 0"
+        "declares component layer_00 kernel conv_in_projection with execution_index 1, expected 0"
     ));
 }
 
 #[test]
-fn single_device_package_rejects_remote_pedal_placement() {
+fn single_device_package_rejects_remote_component_placement() {
     let manifest = fixture_model_package_manifest();
     let placement = StreamCircuitPlacementSpec::new(RUNTIME_DEFAULT_LOGICAL_DEVICE_ID)
-        .with_pedal_device("layer_00", "gpu1");
+        .with_component_device("layer_00", "gpu1");
     let manifest_path = fixture_model_package_manifest_path();
     let manifest_dir = manifest_path.parent().unwrap();
     let tensor_index_path =
@@ -241,7 +241,7 @@ fn single_device_package_rejects_remote_pedal_placement() {
     )
     .unwrap_err();
     assert!(error.to_string().contains(
-            "single-device resident package for \"runtime_default\" cannot host remote pedals: layer_00@gpu1"
+            "single-device resident package for \"runtime_default\" cannot host remote components: layer_00@gpu1"
         ));
 }
 
@@ -249,22 +249,22 @@ fn single_device_package_rejects_remote_pedal_placement() {
 fn placed_package_planning_reuses_one_tensor_index_across_device_slices() {
     let graph = fixture_model_execution_graph();
     let package_graph = VulkanResidentPackageCircuitGraph {
-        wiring: graph.index.graph.wiring.clone(),
-        cables: graph.index.graph.cables.clone(),
+        topology: graph.index.graph.topology.clone(),
+        edges: graph.index.graph.edges.clone(),
         boundary: graph.index.graph.boundary.clone(),
         architecture: graph.index.architecture.clone(),
         dimensions: graph.index.dimensions.clone(),
         input_transducer: graph.index.graph.input_transducer.clone(),
         output_transducer: graph.index.graph.output_transducer.clone(),
-        pedals: graph
+        components: graph
             .circuits
             .iter()
-            .map(|artifact| VulkanResidentPackagePedalCircuit {
-                pedal_id: artifact.pedal.id.clone(),
-                operator_type: artifact.pedal.operator_type.clone(),
-                runtime_role: artifact.pedal.runtime_role,
-                implementation: artifact.pedal.implementation.clone(),
-                behavioral_role: artifact.pedal.behavioral_role.clone(),
+            .map(|artifact| VulkanResidentPackageComponentCircuit {
+                component_id: artifact.component.id.clone(),
+                operator_type: artifact.component.operator_type.clone(),
+                runtime_role: artifact.component.runtime_role,
+                implementation: artifact.component.implementation.clone(),
+                behavioral_role: artifact.component.behavioral_role.clone(),
                 circuit: artifact.circuit.clone(),
                 params: artifact.params.clone(),
                 state: artifact.state.clone(),
@@ -272,8 +272,8 @@ fn placed_package_planning_reuses_one_tensor_index_across_device_slices() {
             .collect(),
     };
     let placement = StreamCircuitPlacementSpec::new("gpu0")
-        .with_pedal_device("layer_02", "gpu1")
-        .with_pedal_device("layer_05", "gpu1");
+        .with_component_device("layer_02", "gpu1")
+        .with_component_device("layer_05", "gpu1");
     let tensor_index = TensorIndex::from_json_file(fixture_model_tensor_index_path()).unwrap();
 
     let (_, _, gpu0) = plan_resident_package_placed_stream_circuit_with_tensor_index(
@@ -295,25 +295,25 @@ fn placed_package_planning_reuses_one_tensor_index_across_device_slices() {
     )
     .unwrap();
 
-    let gpu0_pedals = gpu0
+    let gpu0_components = gpu0
         .binding_plan
         .circuits
         .iter()
-        .map(|circuit| circuit.pedal_id.as_str())
+        .map(|circuit| circuit.component_id.as_str())
         .collect::<BTreeSet<_>>();
-    let gpu1_pedals = gpu1
+    let gpu1_components = gpu1
         .binding_plan
         .circuits
         .iter()
-        .map(|circuit| circuit.pedal_id.as_str())
+        .map(|circuit| circuit.component_id.as_str())
         .collect::<BTreeSet<_>>();
-    assert!(gpu0_pedals.is_disjoint(&gpu1_pedals));
-    assert_eq!(gpu1_pedals, BTreeSet::from(["layer_02", "layer_05"]));
-    assert_eq!(gpu0_pedals.len() + gpu1_pedals.len(), graph.circuits.len());
+    assert!(gpu0_components.is_disjoint(&gpu1_components));
+    assert_eq!(gpu1_components, BTreeSet::from(["layer_02", "layer_05"]));
+    assert_eq!(gpu0_components.len() + gpu1_components.len(), graph.circuits.len());
 }
 
 #[test]
-fn package_device_slice_mounts_only_pedals_assigned_to_device() {
+fn package_device_slice_mounts_only_components_assigned_to_device() {
     let device = match VulkanComputeDevice::new() {
         Ok(device) => device,
         Err(error) => {
@@ -323,9 +323,9 @@ fn package_device_slice_mounts_only_pedals_assigned_to_device() {
     };
     let runtime_model = fixture_model_runtime_model_with_placement(
         StreamCircuitPlacementSpec::new("gpu0")
-            .with_pedal_device("layer_01", "cpu0")
-            .with_pedal_device("layer_02", "gpu1")
-            .with_pedal_device("layer_03", "lan:worker-a"),
+            .with_component_device("layer_01", "cpu0")
+            .with_component_device("layer_02", "gpu1")
+            .with_component_device("layer_03", "lan:worker-a"),
     );
     let manifest_path = fixture_model_package_manifest_path();
     let manifest_dir = manifest_path.parent().unwrap();
@@ -340,9 +340,9 @@ fn package_device_slice_mounts_only_pedals_assigned_to_device() {
     .unwrap();
 
     assert_eq!(slice.device_id, "gpu1");
-    assert_eq!(slice.hosted_pedal_count, 1);
-    assert_eq!(slice.incoming_cable_count, 1);
-    assert_eq!(slice.outgoing_cable_count, 1);
+    assert_eq!(slice.hosted_component_count, 1);
+    assert_eq!(slice.incoming_edge_count, 1);
+    assert_eq!(slice.outgoing_edge_count, 1);
     assert_eq!(slice.permanent_parameter_count, 11);
     assert!(slice.permanent_parameter_bytes > 0);
     assert!(slice.reusable_kernel_word_count > 0);
@@ -368,8 +368,8 @@ fn package_device_slice_mounts_only_pedals_assigned_to_device() {
             .is_none()
     );
     assert_eq!(mounted_bound.model_boundary_descriptor_count, 0);
-    assert_eq!(mounted_bound.incoming_cable_descriptor_count, 2);
-    assert_eq!(mounted_bound.outgoing_cable_descriptor_count, 1);
+    assert_eq!(mounted_bound.incoming_edge_descriptor_count, 2);
+    assert_eq!(mounted_bound.outgoing_edge_descriptor_count, 1);
 
     let tick_plan = mounted.stream_tick_plan(&reusable_manifest).unwrap();
     assert_eq!(tick_plan.device_id, "gpu1");
@@ -382,7 +382,7 @@ fn package_device_slice_mounts_only_pedals_assigned_to_device() {
         tick_run.status,
         VulkanMountedPlacedStreamTickRunStatus::Blocked {
             stage_index: 0,
-            reason: VulkanMountedPlacedStreamTickBlockReason::CableReceiveTransportUnavailable,
+            reason: VulkanMountedPlacedStreamTickBlockReason::EdgeReceiveTransportUnavailable,
         }
     );
 }

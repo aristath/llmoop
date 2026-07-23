@@ -4,7 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::*;
 use crate::stream_circuit::{
-    ResolvedLoweredPedalboard, StreamCircuitPlacementSpec, StreamCircuitRuntimePatch,
+    ResolvedLoweredExecutionGraph, StreamCircuitPlacementSpec, StreamCircuitRuntimeGraph,
 };
 use crate::stream_plan::{StreamCircuitExecutionPlan, StreamCircuitResourcePlan};
 use crate::test_support::compiled_artifact_dir;
@@ -13,7 +13,7 @@ const FIXTURE_MODEL_TOKEN_EMBEDDING_TRANSDUCER_ID: &str = "input_transducer.toke
 const FIXTURE_MODEL_OUTPUT_EMBEDDING_NORM_TRANSDUCER_ID: &str = "output_transducer.embedding_norm";
 const FIXTURE_MODEL_TIED_OUTPUT_PROJECTION_TRANSDUCER_ID: &str =
     "output_transducer.tied_output_projection";
-const FIXTURE_MODEL_GREEDY_SAMPLER_PEDAL_ID: &str = "greedy_sampler";
+const FIXTURE_MODEL_GREEDY_SAMPLER_COMPONENT_ID: &str = "greedy_sampler";
 const FIXTURE_MODEL_EMBED_TOKENS_TENSOR: &str = "model.embed_tokens.weight";
 const FIXTURE_MODEL_INPUT_FRAME_SIGNAL: &str = "input_frame";
 const FIXTURE_MODEL_OUTPUT_FRAME_SIGNAL: &str = "output_frame";
@@ -92,42 +92,42 @@ fn loaded_artifact_manifest_preserves_compiled_launch_geometry() {
 }
 
 #[test]
-fn pedal_batch_signal_liveness_reuses_only_compatible_dead_buffers() {
-    let key = |signal_id: &str| VulkanPedalBatchSignalKey::Activation {
-        pedal_id: "pedal".to_string(),
+fn component_batch_signal_liveness_reuses_only_compatible_dead_buffers() {
+    let key = |signal_id: &str| VulkanComponentBatchSignalKey::Activation {
+        component_id: "component".to_string(),
         signal_id: signal_id.to_string(),
     };
     let lifetimes = vec![
-        VulkanPedalBatchSignalLifetime {
+        VulkanComponentBatchSignalLifetime {
             key: key("first"),
             frame_byte_capacity: 4_096,
             host_visible: false,
             first_dispatch: 0,
             last_dispatch: 2,
         },
-        VulkanPedalBatchSignalLifetime {
+        VulkanComponentBatchSignalLifetime {
             key: key("overlapping"),
             frame_byte_capacity: 4_096,
             host_visible: false,
             first_dispatch: 2,
             last_dispatch: 3,
         },
-        VulkanPedalBatchSignalLifetime {
+        VulkanComponentBatchSignalLifetime {
             key: key("reusable"),
             frame_byte_capacity: 4_096,
             host_visible: false,
             first_dispatch: 3,
             last_dispatch: 4,
         },
-        VulkanPedalBatchSignalLifetime {
+        VulkanComponentBatchSignalLifetime {
             key: key("different_size"),
             frame_byte_capacity: 8_192,
             host_visible: false,
             first_dispatch: 5,
             last_dispatch: 6,
         },
-        VulkanPedalBatchSignalLifetime {
-            key: VulkanPedalBatchSignalKey::IncomingCable(7),
+        VulkanComponentBatchSignalLifetime {
+            key: VulkanComponentBatchSignalKey::IncomingEdge(7),
             frame_byte_capacity: 4_096,
             host_visible: true,
             first_dispatch: 5,
@@ -135,7 +135,7 @@ fn pedal_batch_signal_liveness_reuses_only_compatible_dead_buffers() {
         },
     ];
 
-    let (indices, buffers) = allocate_pedal_batch_signal_lifetimes(lifetimes);
+    let (indices, buffers) = allocate_component_batch_signal_lifetimes(lifetimes);
 
     assert_eq!(buffers.len(), 4);
     assert_ne!(indices[&key("first")], indices[&key("overlapping")]);
@@ -143,18 +143,18 @@ fn pedal_batch_signal_liveness_reuses_only_compatible_dead_buffers() {
     assert_ne!(indices[&key("first")], indices[&key("different_size")]);
     assert_ne!(
         indices[&key("first")],
-        indices[&VulkanPedalBatchSignalKey::IncomingCable(7)]
+        indices[&VulkanComponentBatchSignalKey::IncomingEdge(7)]
     );
 }
 
 #[test]
-fn pedal_batch_execution_uses_standalone_pedal_submissions() {
-    let span = |pedal_id: &str,
+fn component_batch_execution_uses_standalone_component_submissions() {
+    let span = |component_id: &str,
                 dispatch_index: usize,
                 step_start: usize,
                 step_end: usize,
-                distributed: bool| VulkanPedalBatchDispatchSpan {
-        pedal_id: pedal_id.to_string(),
+                distributed: bool| VulkanComponentBatchDispatchSpan {
+        component_id: component_id.to_string(),
         dispatch_index,
         step_start,
         step_end,
@@ -170,26 +170,26 @@ fn pedal_batch_execution_uses_standalone_pedal_submissions() {
     ];
 
     assert_eq!(
-        pedal_batch_execution_units(&spans).unwrap(),
+        component_batch_execution_units(&spans).unwrap(),
         vec![
-            VulkanPedalBatchExecutionUnit::LocalPedal {
-                pedal_id: "layer_00".to_string(),
+            VulkanComponentBatchExecutionUnit::LocalComponent {
+                component_id: "layer_00".to_string(),
                 step_start: 0,
                 step_end: 5,
             },
-            VulkanPedalBatchExecutionUnit::LocalPedal {
-                pedal_id: "layer_01".to_string(),
+            VulkanComponentBatchExecutionUnit::LocalComponent {
+                component_id: "layer_01".to_string(),
                 step_start: 5,
                 step_end: 7,
             },
-            VulkanPedalBatchExecutionUnit::DistributedDispatch { dispatch_index: 3 },
-            VulkanPedalBatchExecutionUnit::LocalPedal {
-                pedal_id: "layer_01".to_string(),
+            VulkanComponentBatchExecutionUnit::DistributedDispatch { dispatch_index: 3 },
+            VulkanComponentBatchExecutionUnit::LocalComponent {
+                component_id: "layer_01".to_string(),
                 step_start: 7,
                 step_end: 10,
             },
-            VulkanPedalBatchExecutionUnit::LocalPedal {
-                pedal_id: "layer_02".to_string(),
+            VulkanComponentBatchExecutionUnit::LocalComponent {
+                component_id: "layer_02".to_string(),
                 step_start: 10,
                 step_end: 12,
             },
@@ -198,17 +198,17 @@ fn pedal_batch_execution_uses_standalone_pedal_submissions() {
 }
 
 #[test]
-fn pedal_batch_execution_does_not_create_empty_local_submissions() {
+fn component_batch_execution_does_not_create_empty_local_submissions() {
     let spans = vec![
-        VulkanPedalBatchDispatchSpan {
-            pedal_id: "layer_00".to_string(),
+        VulkanComponentBatchDispatchSpan {
+            component_id: "layer_00".to_string(),
             dispatch_index: 0,
             step_start: 0,
             step_end: 0,
             distributed: true,
         },
-        VulkanPedalBatchDispatchSpan {
-            pedal_id: "layer_01".to_string(),
+        VulkanComponentBatchDispatchSpan {
+            component_id: "layer_01".to_string(),
             dispatch_index: 1,
             step_start: 0,
             step_end: 0,
@@ -217,19 +217,19 @@ fn pedal_batch_execution_does_not_create_empty_local_submissions() {
     ];
 
     assert_eq!(
-        pedal_batch_execution_units(&spans).unwrap(),
+        component_batch_execution_units(&spans).unwrap(),
         vec![
-            VulkanPedalBatchExecutionUnit::DistributedDispatch { dispatch_index: 0 },
-            VulkanPedalBatchExecutionUnit::DistributedDispatch { dispatch_index: 1 },
+            VulkanComponentBatchExecutionUnit::DistributedDispatch { dispatch_index: 0 },
+            VulkanComponentBatchExecutionUnit::DistributedDispatch { dispatch_index: 1 },
         ]
     );
 }
 
 #[test]
-fn pedal_batch_execution_submits_only_distributed_group_leaders() {
+fn component_batch_execution_submits_only_distributed_group_leaders() {
     let spans = (0..3)
-        .map(|dispatch_index| VulkanPedalBatchDispatchSpan {
-            pedal_id: "layer_00".to_string(),
+        .map(|dispatch_index| VulkanComponentBatchDispatchSpan {
+            component_id: "layer_00".to_string(),
             dispatch_index,
             step_start: 0,
             step_end: 0,
@@ -238,27 +238,27 @@ fn pedal_batch_execution_submits_only_distributed_group_leaders() {
         .collect::<Vec<_>>();
 
     assert_eq!(
-        pedal_batch_execution_units_for_distributed_groups(&spans, &BTreeSet::from([0, 2]),)
+        component_batch_execution_units_for_distributed_groups(&spans, &BTreeSet::from([0, 2]),)
             .unwrap(),
         vec![
-            VulkanPedalBatchExecutionUnit::DistributedDispatch { dispatch_index: 0 },
-            VulkanPedalBatchExecutionUnit::DistributedDispatch { dispatch_index: 2 },
+            VulkanComponentBatchExecutionUnit::DistributedDispatch { dispatch_index: 0 },
+            VulkanComponentBatchExecutionUnit::DistributedDispatch { dispatch_index: 2 },
         ]
     );
 }
 
 #[test]
-fn pedal_batch_execution_rejects_noncontiguous_dispatch_steps() {
+fn component_batch_execution_rejects_noncontiguous_dispatch_steps() {
     let spans = vec![
-        VulkanPedalBatchDispatchSpan {
-            pedal_id: "layer_00".to_string(),
+        VulkanComponentBatchDispatchSpan {
+            component_id: "layer_00".to_string(),
             dispatch_index: 0,
             step_start: 0,
             step_end: 2,
             distributed: false,
         },
-        VulkanPedalBatchDispatchSpan {
-            pedal_id: "layer_00".to_string(),
+        VulkanComponentBatchDispatchSpan {
+            component_id: "layer_00".to_string(),
             dispatch_index: 1,
             step_start: 3,
             step_end: 4,
@@ -266,7 +266,7 @@ fn pedal_batch_execution_rejects_noncontiguous_dispatch_steps() {
         },
     ];
 
-    let error = pedal_batch_execution_units(&spans).unwrap_err();
+    let error = component_batch_execution_units(&spans).unwrap_err();
     assert!(error.to_string().contains("starts at step 3, expected 2"));
 }
 
@@ -316,13 +316,13 @@ fn speculative_verification_stops_at_the_first_emitted_stop_token() {
 }
 
 #[test]
-fn pedal_batches_never_select_a_numerically_unproven_kernel() {
+fn component_batches_never_select_a_numerically_unproven_kernel() {
     let artifact =
-        |lane_tile_width, exact_primary_equivalence| VulkanResidentPedalBatchKernelArtifact {
-            pedal_id: "processor".to_string(),
+        |lane_tile_width, exact_primary_equivalence| VulkanResidentComponentBatchKernelArtifact {
+            component_id: "processor".to_string(),
             node_id: "project".to_string(),
-            execution_domain: VulkanResidentPedalKernelExecutionDomain::DecodeAndPrefill,
-            batch_mode: VulkanResidentPedalKernelBatchMode::WeightShared,
+            execution_domain: VulkanResidentComponentKernelExecutionDomain::DecodeAndPrefill,
+            batch_mode: VulkanResidentComponentKernelBatchMode::WeightShared,
             lane_tile_width,
             exact_primary_equivalence,
             exact_causal_sequence_equivalence: exact_primary_equivalence,
@@ -337,33 +337,33 @@ fn pedal_batches_never_select_a_numerically_unproven_kernel() {
         artifact(16, true),
     ];
 
-    let verification = select_pedal_batch_kernel_artifact(
+    let verification = select_component_batch_kernel_artifact(
         &artifacts,
         "processor",
         "project",
-        VulkanPedalBatchExecutionMode::IndependentCandidates,
+        VulkanComponentBatchExecutionMode::IndependentCandidates,
         6,
     )
     .unwrap();
     assert_eq!(verification.lane_tile_width, 8);
     assert!(verification.exact_primary_equivalence);
 
-    let causal = select_pedal_batch_kernel_artifact(
+    let causal = select_component_batch_kernel_artifact(
         &artifacts,
         "processor",
         "project",
-        VulkanPedalBatchExecutionMode::CausalSequence,
+        VulkanComponentBatchExecutionMode::CausalSequence,
         6,
     )
     .unwrap();
     assert_eq!(causal.lane_tile_width, 16);
     assert!(causal.exact_primary_equivalence);
 
-    let heterogeneous = select_pedal_batch_kernel_artifact_where(
+    let heterogeneous = select_component_batch_kernel_artifact_where(
         &artifacts,
         "processor",
         "project",
-        VulkanPedalBatchExecutionMode::CausalSequence,
+        VulkanComponentBatchExecutionMode::CausalSequence,
         6,
         |artifact| artifact.lane_tile_width != 64,
     )
@@ -372,12 +372,12 @@ fn pedal_batches_never_select_a_numerically_unproven_kernel() {
 }
 
 #[test]
-fn pedal_batches_select_only_artifacts_for_the_requested_execution_domain() {
-    let artifact = |execution_domain, lane_tile_width| VulkanResidentPedalBatchKernelArtifact {
-        pedal_id: "processor".to_string(),
+fn component_batches_select_only_artifacts_for_the_requested_execution_domain() {
+    let artifact = |execution_domain, lane_tile_width| VulkanResidentComponentBatchKernelArtifact {
+        component_id: "processor".to_string(),
         node_id: "project".to_string(),
         execution_domain,
-        batch_mode: VulkanResidentPedalKernelBatchMode::WeightShared,
+        batch_mode: VulkanResidentComponentKernelBatchMode::WeightShared,
         lane_tile_width,
         exact_primary_equivalence: true,
         exact_causal_sequence_equivalence: true,
@@ -385,50 +385,50 @@ fn pedal_batches_select_only_artifacts_for_the_requested_execution_domain() {
         stages: Vec::new(),
     };
     let artifacts = vec![
-        artifact(VulkanResidentPedalKernelExecutionDomain::Prefill, 4),
-        artifact(VulkanResidentPedalKernelExecutionDomain::Decode, 8),
+        artifact(VulkanResidentComponentKernelExecutionDomain::Prefill, 4),
+        artifact(VulkanResidentComponentKernelExecutionDomain::Decode, 8),
         artifact(
-            VulkanResidentPedalKernelExecutionDomain::DecodeAndPrefill,
+            VulkanResidentComponentKernelExecutionDomain::DecodeAndPrefill,
             16,
         ),
     ];
 
-    let decode = select_pedal_batch_kernel_artifact(
+    let decode = select_component_batch_kernel_artifact(
         &artifacts,
         "processor",
         "project",
-        VulkanPedalBatchExecutionMode::IndependentCandidates,
+        VulkanComponentBatchExecutionMode::IndependentCandidates,
         4,
     )
     .unwrap();
     assert_eq!(
         decode.execution_domain,
-        VulkanResidentPedalKernelExecutionDomain::Decode
+        VulkanResidentComponentKernelExecutionDomain::Decode
     );
     assert_eq!(decode.lane_tile_width, 8);
 
-    let prefill = select_pedal_batch_kernel_artifact(
+    let prefill = select_component_batch_kernel_artifact(
         &artifacts,
         "processor",
         "project",
-        VulkanPedalBatchExecutionMode::CausalSequence,
+        VulkanComponentBatchExecutionMode::CausalSequence,
         4,
     )
     .unwrap();
     assert_eq!(
         prefill.execution_domain,
-        VulkanResidentPedalKernelExecutionDomain::DecodeAndPrefill
+        VulkanResidentComponentKernelExecutionDomain::DecodeAndPrefill
     );
     assert_eq!(prefill.lane_tile_width, 16);
 }
 
 #[test]
-fn pedal_batches_use_causal_exactness_for_temporal_prefill_kernels() {
-    let artifacts = vec![VulkanResidentPedalBatchKernelArtifact {
-        pedal_id: "processor".to_string(),
+fn component_batches_use_causal_exactness_for_temporal_prefill_kernels() {
+    let artifacts = vec![VulkanResidentComponentBatchKernelArtifact {
+        component_id: "processor".to_string(),
         node_id: "attention".to_string(),
-        execution_domain: VulkanResidentPedalKernelExecutionDomain::Prefill,
-        batch_mode: VulkanResidentPedalKernelBatchMode::CausalScan,
+        execution_domain: VulkanResidentComponentKernelExecutionDomain::Prefill,
+        batch_mode: VulkanResidentComponentKernelBatchMode::CausalScan,
         lane_tile_width: 64,
         exact_primary_equivalence: false,
         exact_causal_sequence_equivalence: true,
@@ -437,20 +437,20 @@ fn pedal_batches_use_causal_exactness_for_temporal_prefill_kernels() {
     }];
 
     assert!(
-        select_pedal_batch_kernel_artifact(
+        select_component_batch_kernel_artifact(
             &artifacts,
             "processor",
             "attention",
-            VulkanPedalBatchExecutionMode::IndependentCandidates,
+            VulkanComponentBatchExecutionMode::IndependentCandidates,
             4,
         )
         .is_none()
     );
-    let causal = select_pedal_batch_kernel_artifact(
+    let causal = select_component_batch_kernel_artifact(
         &artifacts,
         "processor",
         "attention",
-        VulkanPedalBatchExecutionMode::CausalSequence,
+        VulkanComponentBatchExecutionMode::CausalSequence,
         4,
     )
     .unwrap();
@@ -459,32 +459,32 @@ fn pedal_batches_use_causal_exactness_for_temporal_prefill_kernels() {
 }
 
 #[test]
-fn pedal_batch_execution_contract_requires_matching_shader_mode() {
+fn component_batch_execution_contract_requires_matching_shader_mode() {
     let execution = |batch_mode, batch_shader_path: Option<String>| {
         let batch_implementations = batch_shader_path
             .into_iter()
-            .map(|shader_path| VulkanResidentPedalBatchImplementationSpec {
-                execution_domain: VulkanResidentPedalKernelExecutionDomain::DecodeAndPrefill,
+            .map(|shader_path| VulkanResidentComponentBatchImplementationSpec {
+                execution_domain: VulkanResidentComponentKernelExecutionDomain::DecodeAndPrefill,
                 lane_tile_width: 16,
                 exact_primary_equivalence: true,
                 exact_causal_sequence_equivalence: true,
                 device_requirements: VulkanResidentVulkanDeviceRequirements::default(),
-                stages: vec![VulkanResidentPedalBatchStageSpec {
+                stages: vec![VulkanResidentComponentBatchStageSpec {
                     shader_path,
                     local_size_x: 64,
                     workgroup_count_x: 1,
                 }],
             })
             .collect();
-        vec![VulkanResidentPedalExecutionSpec {
-            pedal_id: "processor".to_string(),
+        vec![VulkanResidentComponentExecutionSpec {
+            component_id: "processor".to_string(),
             operator_type: "fixture".to_string(),
             implementation: "exact_reference".to_string(),
-            kernels: vec![VulkanResidentPedalKernelSpec {
+            kernels: vec![VulkanResidentComponentKernelSpec {
                 execution_index: 0,
                 node_id: "project".to_string(),
                 op: "linear".to_string(),
-                execution_domain: VulkanResidentPedalKernelExecutionDomain::Decode,
+                execution_domain: VulkanResidentComponentKernelExecutionDomain::Decode,
                 shader_path: "shaders/project.spv".to_string(),
                 local_size_x: 64,
                 workgroup_count_x: 1,
@@ -494,49 +494,49 @@ fn pedal_batch_execution_contract_requires_matching_shader_mode() {
         }]
     };
 
-    validate_pedal_executions(
+    validate_component_executions(
         "fixture",
-        &execution(VulkanResidentPedalKernelBatchMode::SerialLanes, None),
+        &execution(VulkanResidentComponentKernelBatchMode::SerialLanes, None),
     )
     .unwrap();
-    validate_pedal_executions(
+    validate_component_executions(
         "fixture",
         &execution(
-            VulkanResidentPedalKernelBatchMode::WeightShared,
+            VulkanResidentComponentKernelBatchMode::WeightShared,
             Some("shaders/project_batch.spv".to_string()),
         ),
     )
     .unwrap();
-    validate_pedal_executions(
+    validate_component_executions(
         "fixture",
         &execution(
-            VulkanResidentPedalKernelBatchMode::CausalScan,
+            VulkanResidentComponentKernelBatchMode::CausalScan,
             Some("shaders/project_scan.spv".to_string()),
         ),
     )
     .unwrap();
 
-    let serial_error = validate_pedal_executions(
+    let serial_error = validate_component_executions(
         "fixture",
         &execution(
-            VulkanResidentPedalKernelBatchMode::SerialLanes,
+            VulkanResidentComponentKernelBatchMode::SerialLanes,
             Some("shaders/project_batch.spv".to_string()),
         ),
     )
     .unwrap_err();
     assert!(serial_error.to_string().contains("invalid SerialLanes"));
 
-    let batch_error = validate_pedal_executions(
+    let batch_error = validate_component_executions(
         "fixture",
-        &execution(VulkanResidentPedalKernelBatchMode::WeightShared, None),
+        &execution(VulkanResidentComponentKernelBatchMode::WeightShared, None),
     )
     .unwrap_err();
     assert!(batch_error.to_string().contains("invalid WeightShared"));
 }
 
 #[test]
-fn pedal_batch_control_preserves_temporal_position_and_capacity() {
-    let bytes = pedal_batch_control_bytes(64, 0x1122_3344_5566_7788, 65_536);
+fn component_batch_control_preserves_temporal_position_and_capacity() {
+    let bytes = component_batch_control_bytes(64, 0x1122_3344_5566_7788, 65_536);
 
     assert_eq!(&bytes[0..4], &64u32.to_le_bytes());
     assert_eq!(&bytes[4..12], &0x1122_3344_5566_7788u64.to_le_bytes());

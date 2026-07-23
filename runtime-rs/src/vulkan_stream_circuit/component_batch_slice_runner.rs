@@ -1,17 +1,17 @@
-struct VulkanResidentPedalBatchSliceRunner {
+struct VulkanResidentComponentBatchSliceRunner {
     lane_capacity: usize,
-    signal_buffers: Vec<VulkanPedalBatchSignalBuffer>,
-    signal_buffer_indices: BTreeMap<VulkanPedalBatchSignalKey, usize>,
+    signal_buffers: Vec<VulkanComponentBatchSignalBuffer>,
+    signal_buffer_indices: BTreeMap<VulkanComponentBatchSignalKey, usize>,
     stream_control_buffers: Vec<VulkanResidentBuffer>,
-    steps: Vec<VulkanPedalBatchDispatchStep>,
-    execution_units: Vec<VulkanPedalBatchExecutionUnit>,
+    steps: Vec<VulkanComponentBatchDispatchStep>,
+    execution_units: Vec<VulkanComponentBatchExecutionUnit>,
     sequences: Vec<VulkanResidentKernelSequence>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum VulkanPedalBatchExecutionUnit {
-    LocalPedal {
-        pedal_id: String,
+enum VulkanComponentBatchExecutionUnit {
+    LocalComponent {
+        component_id: String,
         step_start: usize,
         step_end: usize,
     },
@@ -21,95 +21,95 @@ enum VulkanPedalBatchExecutionUnit {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct VulkanPedalBatchDispatchSpan {
-    pedal_id: String,
+struct VulkanComponentBatchDispatchSpan {
+    component_id: String,
     dispatch_index: usize,
     step_start: usize,
     step_end: usize,
     distributed: bool,
 }
 
-fn finish_pedal_batch_local_execution_unit(
-    execution_units: &mut Vec<VulkanPedalBatchExecutionUnit>,
-    pedal_id: &str,
+fn finish_component_batch_local_execution_unit(
+    execution_units: &mut Vec<VulkanComponentBatchExecutionUnit>,
+    component_id: &str,
     step_start: usize,
     step_end: usize,
 ) {
     if step_start < step_end {
-        execution_units.push(VulkanPedalBatchExecutionUnit::LocalPedal {
-            pedal_id: pedal_id.to_string(),
+        execution_units.push(VulkanComponentBatchExecutionUnit::LocalComponent {
+            component_id: component_id.to_string(),
             step_start,
             step_end,
         });
     }
 }
 
-fn pedal_batch_execution_units(
-    dispatch_spans: &[VulkanPedalBatchDispatchSpan],
-) -> Result<Vec<VulkanPedalBatchExecutionUnit>, VulkanError> {
+fn component_batch_execution_units(
+    dispatch_spans: &[VulkanComponentBatchDispatchSpan],
+) -> Result<Vec<VulkanComponentBatchExecutionUnit>, VulkanError> {
     let mut execution_units = Vec::new();
-    let mut current_pedal_id = None::<&str>;
+    let mut current_component_id = None::<&str>;
     let mut local_step_start = 0usize;
     let mut expected_step_start = 0usize;
     let mut previous_dispatch_index = None;
     for span in dispatch_spans {
         if span.step_start != expected_step_start {
             return Err(VulkanError(format!(
-                "pedal batch dispatch {} starts at step {}, expected {expected_step_start}",
+                "component batch dispatch {} starts at step {}, expected {expected_step_start}",
                 span.dispatch_index, span.step_start
             )));
         }
         if previous_dispatch_index.is_some_and(|previous| previous >= span.dispatch_index) {
             return Err(VulkanError(format!(
-                "pedal batch dispatch indices are not strictly increasing at {}",
+                "component batch dispatch indices are not strictly increasing at {}",
                 span.dispatch_index
             )));
         }
         if span.distributed && span.step_end != span.step_start {
             return Err(VulkanError(format!(
-                "distributed pedal batch dispatch {} owns local steps {}..{}",
+                "distributed component batch dispatch {} owns local steps {}..{}",
                 span.dispatch_index, span.step_start, span.step_end
             )));
         }
         if !span.distributed && span.step_end <= span.step_start {
             return Err(VulkanError(format!(
-                "local pedal batch dispatch {} has no executable steps",
+                "local component batch dispatch {} has no executable steps",
                 span.dispatch_index
             )));
         }
         previous_dispatch_index = Some(span.dispatch_index);
         expected_step_start = span.step_end;
         if span.distributed {
-            if let Some(pedal_id) = current_pedal_id.take() {
-                finish_pedal_batch_local_execution_unit(
+            if let Some(component_id) = current_component_id.take() {
+                finish_component_batch_local_execution_unit(
                     &mut execution_units,
-                    pedal_id,
+                    component_id,
                     local_step_start,
                     span.step_start,
                 );
             }
-            execution_units.push(VulkanPedalBatchExecutionUnit::DistributedDispatch {
+            execution_units.push(VulkanComponentBatchExecutionUnit::DistributedDispatch {
                 dispatch_index: span.dispatch_index,
             });
             continue;
         }
-        if current_pedal_id != Some(span.pedal_id.as_str()) {
-            if let Some(pedal_id) = current_pedal_id {
-                finish_pedal_batch_local_execution_unit(
+        if current_component_id != Some(span.component_id.as_str()) {
+            if let Some(component_id) = current_component_id {
+                finish_component_batch_local_execution_unit(
                     &mut execution_units,
-                    pedal_id,
+                    component_id,
                     local_step_start,
                     span.step_start,
                 );
             }
-            current_pedal_id = Some(&span.pedal_id);
+            current_component_id = Some(&span.component_id);
             local_step_start = span.step_start;
         }
     }
-    if let (Some(pedal_id), Some(last_span)) = (current_pedal_id, dispatch_spans.last()) {
-        finish_pedal_batch_local_execution_unit(
+    if let (Some(component_id), Some(last_span)) = (current_component_id, dispatch_spans.last()) {
+        finish_component_batch_local_execution_unit(
             &mut execution_units,
-            pedal_id,
+            component_id,
             local_step_start,
             last_span.step_end,
         );
@@ -117,36 +117,36 @@ fn pedal_batch_execution_units(
     Ok(execution_units)
 }
 
-fn pedal_batch_execution_units_for_distributed_groups(
-    dispatch_spans: &[VulkanPedalBatchDispatchSpan],
+fn component_batch_execution_units_for_distributed_groups(
+    dispatch_spans: &[VulkanComponentBatchDispatchSpan],
     distributed_group_leaders: &BTreeSet<usize>,
-) -> Result<Vec<VulkanPedalBatchExecutionUnit>, VulkanError> {
-    let mut execution_units = pedal_batch_execution_units(dispatch_spans)?;
+) -> Result<Vec<VulkanComponentBatchExecutionUnit>, VulkanError> {
+    let mut execution_units = component_batch_execution_units(dispatch_spans)?;
     execution_units.retain(|unit| match unit {
-        VulkanPedalBatchExecutionUnit::DistributedDispatch { dispatch_index } => {
+        VulkanComponentBatchExecutionUnit::DistributedDispatch { dispatch_index } => {
             distributed_group_leaders.contains(dispatch_index)
         }
-        VulkanPedalBatchExecutionUnit::LocalPedal { .. } => true,
+        VulkanComponentBatchExecutionUnit::LocalComponent { .. } => true,
     });
     Ok(execution_units)
 }
 
-impl VulkanResidentPedalBatchSliceRunner {
+impl VulkanResidentComponentBatchSliceRunner {
     fn new(
         devices: &BTreeMap<String, Rc<VulkanComputeDevice>>,
         device: &VulkanComputeDevice,
         slice: &VulkanResidentInProcessPlacedStreamProcessorDevice,
         lane_capacity: usize,
-        execution_mode: VulkanPedalBatchExecutionMode,
+        execution_mode: VulkanComponentBatchExecutionMode,
         distributed_execution_plan: &VulkanDistributedExecutionPlan,
     ) -> Result<Self, VulkanResidentInProcessPlacedRuntimeError> {
         if lane_capacity == 0 {
             return Err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop(
-                VulkanError("pedal batch lane capacity is zero".to_string()),
+                VulkanError("component batch lane capacity is zero".to_string()),
             ));
         }
         let (signal_buffer_indices, signal_buffer_plan) =
-            pedal_batch_signal_buffer_plan(&slice.mounted, &slice.mounted_bound.dispatches)?;
+            component_batch_signal_buffer_plan(&slice.mounted, &slice.mounted_bound.dispatches)?;
         let mut shared_device_ids_by_buffer = BTreeMap::<usize, BTreeSet<String>>::new();
         for dispatch in distributed_execution_plan
             .dispatches
@@ -157,13 +157,13 @@ impl VulkanResidentPedalBatchSliceRunner {
                 .chain(&dispatch.auxiliary_input_activations)
                 .chain(std::iter::once(&dispatch.output_activation))
             {
-                let key = VulkanPedalBatchSignalKey::Activation {
-                    pedal_id: activation.pedal_id.clone(),
+                let key = VulkanComponentBatchSignalKey::Activation {
+                    component_id: activation.component_id.clone(),
                     signal_id: activation.signal_id.clone(),
                 };
                 let buffer_index = *signal_buffer_indices.get(&key).ok_or_else(|| {
                     VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(format!(
-                        "distributed pedal batch has no signal buffer for {key:?}"
+                        "distributed component batch has no signal buffer for {key:?}"
                     )))
                 })?;
                 shared_device_ids_by_buffer
@@ -172,14 +172,14 @@ impl VulkanResidentPedalBatchSliceRunner {
                     .extend(dispatch.shards.iter().map(|shard| shard.device_id.clone()));
             }
         }
-        let mut signal_buffers = Vec::<VulkanPedalBatchSignalBuffer>::new();
+        let mut signal_buffers = Vec::<VulkanComponentBatchSignalBuffer>::new();
         for (buffer_index, allocation) in signal_buffer_plan.into_iter().enumerate() {
             let byte_capacity = allocation
                 .frame_byte_capacity
                 .checked_mul(lane_capacity)
                 .ok_or_else(|| {
                     VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(
-                        "pedal batch signal capacity overflowed".to_string(),
+                        "component batch signal capacity overflowed".to_string(),
                     ))
                 })?;
             let shared_device_ids = shared_device_ids_by_buffer.get(&buffer_index);
@@ -188,7 +188,7 @@ impl VulkanResidentPedalBatchSliceRunner {
                     if !shared_device_ids.contains(&slice.device_id) {
                         return Err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop(
                             VulkanError(format!(
-                                "distributed pedal batch buffer {buffer_index} omits owner {:?}",
+                                "distributed component batch buffer {buffer_index} omits owner {:?}",
                                 slice.device_id
                             )),
                         ));
@@ -232,8 +232,8 @@ impl VulkanResidentPedalBatchSliceRunner {
                     (owner_buffer, shared_device_buffers)
                 } else {
                     let buffer = if allocation.host_visible {
-                        // Cross-device cables are the one place where the batch must be
-                        // host-addressable. The cable still moves once per device boundary,
+                        // Cross-device edges are the one place where the batch must be
+                        // host-addressable. The edge still moves once per device boundary,
                         // as one contiguous frame batch.
                         device.create_host_visible_resident_buffer(byte_capacity)
                     } else {
@@ -246,14 +246,14 @@ impl VulkanResidentPedalBatchSliceRunner {
                 Arc::get_mut(&mut buffer)
                     .ok_or_else(|| {
                         VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(
-                            "host-visible pedal batch cable buffer is unexpectedly shared"
+                            "host-visible component batch edge buffer is unexpectedly shared"
                                 .to_string(),
                         ))
                     })?
                     .persistently_map()
                     .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
             }
-            signal_buffers.push(VulkanPedalBatchSignalBuffer {
+            signal_buffers.push(VulkanComponentBatchSignalBuffer {
                 frame_byte_capacity: allocation.frame_byte_capacity,
                 buffer,
                 shared_device_buffers,
@@ -283,8 +283,8 @@ impl VulkanResidentPedalBatchSliceRunner {
                         && distributed.dispatch_index == dispatch.dispatch_index
                 })
             {
-                dispatch_spans.push(VulkanPedalBatchDispatchSpan {
-                    pedal_id: dispatch.pedal_id.clone(),
+                dispatch_spans.push(VulkanComponentBatchDispatchSpan {
+                    component_id: dispatch.component_id.clone(),
                     dispatch_index: dispatch.dispatch_index,
                     step_start: dispatch_step_start,
                     step_end: dispatch_step_start,
@@ -292,33 +292,33 @@ impl VulkanResidentPedalBatchSliceRunner {
                 });
                 continue;
             }
-            let batch_artifact = select_pedal_batch_kernel_artifact(
+            let batch_artifact = select_component_batch_kernel_artifact(
                 &slice.package_slice.batch_kernels,
-                &dispatch.pedal_id,
+                &dispatch.component_id,
                 &dispatch.node_id,
                 execution_mode,
                 lane_capacity,
             );
             if let Some(batch_artifact) = batch_artifact {
-                if batch_artifact.batch_mode == VulkanResidentPedalKernelBatchMode::CausalScan
+                if batch_artifact.batch_mode == VulkanResidentComponentKernelBatchMode::CausalScan
                     && lane_capacity > batch_artifact.lane_tile_width
                 {
                     return Err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop(
                         VulkanError(format!(
                             "causal scan kernel {}.{} cannot execute {lane_capacity} lanes with tile width {}",
-                            dispatch.pedal_id, dispatch.node_id, batch_artifact.lane_tile_width
+                            dispatch.component_id, dispatch.node_id, batch_artifact.lane_tile_width
                         )),
                     ));
                 }
                 if !dispatch.push_constants.is_empty() {
                     return Err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop(
                         VulkanError(format!(
-                            "pedal batch kernel {}.{} requires model-specific scalar values",
-                            dispatch.pedal_id, dispatch.node_id
+                            "component batch kernel {}.{} requires model-specific scalar values",
+                            dispatch.component_id, dispatch.node_id
                         )),
                     ));
                 }
-                if batch_artifact.batch_mode == VulkanResidentPedalKernelBatchMode::WeightShared
+                if batch_artifact.batch_mode == VulkanResidentComponentKernelBatchMode::WeightShared
                     && dispatch.descriptors.iter().any(|descriptor| {
                         matches!(
                             descriptor.usage,
@@ -330,12 +330,12 @@ impl VulkanResidentPedalBatchSliceRunner {
                 {
                     return Err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop(
                         VulkanError(format!(
-                            "weight-shared pedal batch kernel {}.{} is not stateless",
-                            dispatch.pedal_id, dispatch.node_id
+                            "weight-shared component batch kernel {}.{} is not stateless",
+                            dispatch.component_id, dispatch.node_id
                         )),
                     ));
                 }
-                let bindings = pedal_batch_bindings(
+                let bindings = component_batch_bindings(
                     &slice.mounted,
                     dispatch,
                     &signal_buffers,
@@ -344,24 +344,24 @@ impl VulkanResidentPedalBatchSliceRunner {
                     None,
                 )?;
                 let workgroup_count_y = match batch_artifact.batch_mode {
-                    VulkanResidentPedalKernelBatchMode::WeightShared => u32::try_from(
+                    VulkanResidentComponentKernelBatchMode::WeightShared => u32::try_from(
                         lane_capacity
                             .checked_add(batch_artifact.lane_tile_width - 1)
                             .ok_or_else(|| {
                                 VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(
-                                    "pedal batch workgroup count overflowed".to_string(),
+                                    "component batch workgroup count overflowed".to_string(),
                                 ))
                             })?
                             / batch_artifact.lane_tile_width,
                     )
                     .map_err(|_| {
                         VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(
-                            "pedal batch workgroup count exceeds u32".to_string(),
+                            "component batch workgroup count exceeds u32".to_string(),
                         ))
                     })?,
-                    VulkanResidentPedalKernelBatchMode::CausalScan => 1,
-                    VulkanResidentPedalKernelBatchMode::SerialLanes => {
-                        unreachable!("serial-lane kernels do not have pedal batch artifacts")
+                    VulkanResidentComponentKernelBatchMode::CausalScan => 1,
+                    VulkanResidentComponentKernelBatchMode::SerialLanes => {
+                        unreachable!("serial-lane kernels do not have component batch artifacts")
                     }
                 };
                 for stage in &batch_artifact.stages {
@@ -372,19 +372,19 @@ impl VulkanResidentPedalBatchSliceRunner {
                             stage.workgroup_count_x,
                             workgroup_count_y,
                             stage.local_size_x,
-                            VULKAN_PEDAL_BATCH_CONTROL_BYTE_CAPACITY,
+                            VULKAN_COMPONENT_BATCH_CONTROL_BYTE_CAPACITY,
                             Some(vulkan_dispatch_semantic_label(dispatch, Some("batch"))),
                         )
                         .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
-                    steps.push(VulkanPedalBatchDispatchStep {
+                    steps.push(VulkanComponentBatchDispatchStep {
                         dispatch: resident,
                         push_constants: Vec::new(),
                         lane_index: None,
                         snapshot_state_buffer_indices: BTreeSet::new(),
                     });
                 }
-                dispatch_spans.push(VulkanPedalBatchDispatchSpan {
-                    pedal_id: dispatch.pedal_id.clone(),
+                dispatch_spans.push(VulkanComponentBatchDispatchSpan {
+                    component_id: dispatch.component_id.clone(),
                     dispatch_index: dispatch.dispatch_index,
                     step_start: dispatch_step_start,
                     step_end: steps.len(),
@@ -399,8 +399,8 @@ impl VulkanResidentPedalBatchSliceRunner {
                 .artifact(&dispatch.reusable_family_id)
                 .ok_or_else(|| {
                     VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(format!(
-                        "pedal batch scalar kernel {}.{} has no loaded artifact",
-                        dispatch.pedal_id, dispatch.node_id
+                        "component batch scalar kernel {}.{} has no loaded artifact",
+                        dispatch.component_id, dispatch.node_id
                     )))
                 })?;
             let snapshot_state_buffer_indices = dispatch
@@ -431,7 +431,7 @@ impl VulkanResidentPedalBatchSliceRunner {
                 })
                 .collect::<BTreeSet<_>>();
             for (lane_index, stream_control_buffer) in stream_control_buffers.iter().enumerate() {
-                let bindings = pedal_batch_bindings(
+                let bindings = component_batch_bindings(
                     &slice.mounted,
                     dispatch,
                     &signal_buffers,
@@ -447,7 +447,7 @@ impl VulkanResidentPedalBatchSliceRunner {
                         artifact.artifact.local_size_x,
                         push_constant_byte_count(&dispatch.push_constants).map_err(|error| {
                             VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(
-                                format!("invalid pedal batch push constants: {error}"),
+                                format!("invalid component batch push constants: {error}"),
                             ))
                         })?,
                         Some(vulkan_dispatch_semantic_label(
@@ -456,15 +456,15 @@ impl VulkanResidentPedalBatchSliceRunner {
                         )),
                     )
                     .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
-                steps.push(VulkanPedalBatchDispatchStep {
+                steps.push(VulkanComponentBatchDispatchStep {
                     dispatch: resident,
                     push_constants: dispatch.push_constants.clone(),
                     lane_index: Some(lane_index),
                     snapshot_state_buffer_indices: snapshot_state_buffer_indices.clone(),
                 });
             }
-            dispatch_spans.push(VulkanPedalBatchDispatchSpan {
-                pedal_id: dispatch.pedal_id.clone(),
+            dispatch_spans.push(VulkanComponentBatchDispatchSpan {
+                component_id: dispatch.component_id.clone(),
                 dispatch_index: dispatch.dispatch_index,
                 step_start: dispatch_step_start,
                 step_end: steps.len(),
@@ -477,7 +477,7 @@ impl VulkanResidentPedalBatchSliceRunner {
             .filter(|group| group.owner_device_id == slice.device_id)
             .map(|group| group.leader().dispatch_index)
             .collect::<BTreeSet<_>>();
-        let execution_units = pedal_batch_execution_units_for_distributed_groups(
+        let execution_units = component_batch_execution_units_for_distributed_groups(
             &dispatch_spans,
             &distributed_group_leaders,
         )
@@ -485,7 +485,7 @@ impl VulkanResidentPedalBatchSliceRunner {
 
         let sequences = (0..execution_units
             .iter()
-            .filter(|unit| matches!(unit, VulkanPedalBatchExecutionUnit::LocalPedal { .. }))
+            .filter(|unit| matches!(unit, VulkanComponentBatchExecutionUnit::LocalComponent { .. }))
             .count())
             .map(|_| {
                 device
@@ -521,7 +521,7 @@ impl VulkanResidentPedalBatchSliceRunner {
         self.run(
             device,
             mounted,
-            VulkanPedalBatchStateSemantics::IndependentCandidates(transaction),
+            VulkanComponentBatchStateSemantics::IndependentCandidates(transaction),
             input_token_ids,
             start_stream_tick,
             dynamic_state_capacity_activations,
@@ -544,7 +544,7 @@ impl VulkanResidentPedalBatchSliceRunner {
         self.run(
             device,
             mounted,
-            VulkanPedalBatchStateSemantics::CausalSequence,
+            VulkanComponentBatchStateSemantics::CausalSequence,
             input_token_ids,
             start_stream_tick,
             dynamic_state_capacity_activations,
@@ -557,7 +557,7 @@ impl VulkanResidentPedalBatchSliceRunner {
         &self,
         device: &VulkanComputeDevice,
         mounted: &VulkanMountedPlacedStreamCircuit,
-        state_semantics: VulkanPedalBatchStateSemantics<'_>,
+        state_semantics: VulkanComponentBatchStateSemantics<'_>,
         input_token_ids: &[u32],
         start_stream_tick: u64,
         dynamic_state_capacity_activations: u32,
@@ -571,12 +571,12 @@ impl VulkanResidentPedalBatchSliceRunner {
         if batch_width == 0 || batch_width > self.lane_capacity {
             return Err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop(
                 VulkanError(format!(
-                    "pedal batch tile width {} cannot execute {batch_width} lanes",
+                    "component batch tile width {} cannot execute {batch_width} lanes",
                     self.lane_capacity
                 )),
             ));
         }
-        let lane_controls = pedal_batch_lane_stream_control_bytes(
+        let lane_controls = component_batch_lane_stream_control_bytes(
             input_token_ids,
             start_stream_tick,
             dynamic_state_capacity_activations,
@@ -591,10 +591,10 @@ impl VulkanResidentPedalBatchSliceRunner {
 
         let batch_width_u32 = u32::try_from(batch_width).map_err(|_| {
             VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(
-                "pedal batch width exceeds u32".to_string(),
+                "component batch width exceeds u32".to_string(),
             ))
         })?;
-        let batch_control = pedal_batch_control_bytes(
+        let batch_control = component_batch_control_bytes(
             batch_width_u32,
             start_stream_tick,
             dynamic_state_capacity_activations,
@@ -602,7 +602,7 @@ impl VulkanResidentPedalBatchSliceRunner {
         let mut sequence_index = 0usize;
         for unit in &self.execution_units {
             match unit {
-                VulkanPedalBatchExecutionUnit::LocalPedal {
+                VulkanComponentBatchExecutionUnit::LocalComponent {
                     step_start,
                     step_end,
                     ..
@@ -621,7 +621,7 @@ impl VulkanResidentPedalBatchSliceRunner {
                     )?;
                     sequence_index += 1;
                 }
-                VulkanPedalBatchExecutionUnit::DistributedDispatch { dispatch_index } => {
+                VulkanComponentBatchExecutionUnit::DistributedDispatch { dispatch_index } => {
                     run_distributed(*dispatch_index, &batch_control)?;
                 }
             }
@@ -635,7 +635,7 @@ impl VulkanResidentPedalBatchSliceRunner {
         &self,
         device: &VulkanComputeDevice,
         mounted: &VulkanMountedPlacedStreamCircuit,
-        state_semantics: VulkanPedalBatchStateSemantics<'_>,
+        state_semantics: VulkanComponentBatchStateSemantics<'_>,
         batch_width: usize,
         start_stream_tick: u64,
         dynamic_state_capacity_activations: u32,
@@ -645,7 +645,7 @@ impl VulkanResidentPedalBatchSliceRunner {
         step_end: usize,
     ) -> Result<(), VulkanResidentInProcessPlacedRuntimeError> {
         let mut push_constant_storage = Vec::<Vec<u8>>::new();
-        let mut active_steps = Vec::<&VulkanPedalBatchDispatchStep>::new();
+        let mut active_steps = Vec::<&VulkanComponentBatchDispatchStep>::new();
         for step in &self.steps[step_start..step_end] {
             if step.lane_index.is_some_and(|lane| lane >= batch_width) {
                 continue;
@@ -666,7 +666,7 @@ impl VulkanResidentPedalBatchSliceRunner {
                 )
                 .map_err(|error| {
                     VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(format!(
-                        "invalid pedal batch stream control: {error}"
+                        "invalid component batch stream control: {error}"
                     )))
                 })?
             } else {
@@ -686,7 +686,7 @@ impl VulkanResidentPedalBatchSliceRunner {
             })
             .collect::<Vec<_>>();
         let mut snapshot_copies = Vec::new();
-        if let VulkanPedalBatchStateSemantics::IndependentCandidates(transaction) = state_semantics
+        if let VulkanComponentBatchStateSemantics::IndependentCandidates(transaction) = state_semantics
         {
             for (step_index, step) in active_steps.iter().enumerate() {
                 let Some(lane_index) = step.lane_index else {
@@ -718,21 +718,21 @@ impl VulkanResidentPedalBatchSliceRunner {
 
     fn signal_buffer(
         &self,
-        key: &VulkanPedalBatchSignalKey,
-    ) -> Result<&VulkanPedalBatchSignalBuffer, VulkanResidentInProcessPlacedRuntimeError> {
+        key: &VulkanComponentBatchSignalKey,
+    ) -> Result<&VulkanComponentBatchSignalBuffer, VulkanResidentInProcessPlacedRuntimeError> {
         self.signal_buffer_indices
             .get(key)
             .and_then(|index| self.signal_buffers.get(*index))
             .ok_or_else(|| {
                 VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(format!(
-                    "pedal batch has no signal buffer {key:?}"
+                    "component batch has no signal buffer {key:?}"
                 )))
             })
     }
 
     fn distributed_signal_buffer(
         &self,
-        key: &VulkanPedalBatchSignalKey,
+        key: &VulkanComponentBatchSignalKey,
         device_id: &str,
     ) -> Result<&Arc<VulkanResidentBuffer>, VulkanResidentInProcessPlacedRuntimeError> {
         let allocation = self.signal_buffer_indices.get(key).and_then(|index| {
@@ -742,7 +742,7 @@ impl VulkanResidentPedalBatchSliceRunner {
         });
         allocation.ok_or_else(|| {
             VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(format!(
-                "distributed pedal batch signal {key:?} is not imported on {device_id:?}"
+                "distributed component batch signal {key:?} is not imported on {device_id:?}"
             )))
         })
     }

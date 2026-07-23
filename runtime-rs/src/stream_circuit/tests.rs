@@ -29,13 +29,13 @@ mod tests {
         compiled_artifact_dir(
             "NERVE_TEST_LOWERED_DIR",
             "lowered",
-            "pedalboard.circuits.json",
+            "execution_graph.circuits.json",
         )
-        .join("pedalboard.circuits.json")
+        .join("execution_graph.circuits.json")
     }
 
     include!("tests/circuit_contracts.rs");
     include!("tests/placement_routes.rs");
     include!("tests/runtime_reports.rs");
-    include!("tests/runtime_patch.rs");
+    include!("tests/runtime_graph.rs");
 }

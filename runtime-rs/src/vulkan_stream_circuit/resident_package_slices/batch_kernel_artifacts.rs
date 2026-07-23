@@ -1,25 +1,25 @@
-struct VulkanResidentPedalBatchKernelArtifact {
-    pedal_id: String,
+struct VulkanResidentComponentBatchKernelArtifact {
+    component_id: String,
     node_id: String,
-    execution_domain: VulkanResidentPedalKernelExecutionDomain,
-    batch_mode: VulkanResidentPedalKernelBatchMode,
+    execution_domain: VulkanResidentComponentKernelExecutionDomain,
+    batch_mode: VulkanResidentComponentKernelBatchMode,
     lane_tile_width: usize,
     exact_primary_equivalence: bool,
     exact_causal_sequence_equivalence: bool,
     device_requirements: VulkanResidentVulkanDeviceRequirements,
-    stages: Vec<VulkanResidentPedalBatchStageArtifact>,
+    stages: Vec<VulkanResidentComponentBatchStageArtifact>,
 }
 
-impl VulkanResidentPedalBatchKernelArtifact {
-    fn is_exact_for(&self, mode: VulkanPedalBatchExecutionMode) -> bool {
+impl VulkanResidentComponentBatchKernelArtifact {
+    fn is_exact_for(&self, mode: VulkanComponentBatchExecutionMode) -> bool {
         match mode {
-            VulkanPedalBatchExecutionMode::IndependentCandidates => self.exact_primary_equivalence,
-            VulkanPedalBatchExecutionMode::CausalSequence => self.exact_causal_sequence_equivalence,
+            VulkanComponentBatchExecutionMode::IndependentCandidates => self.exact_primary_equivalence,
+            VulkanComponentBatchExecutionMode::CausalSequence => self.exact_causal_sequence_equivalence,
         }
     }
 }
 
-struct VulkanResidentPedalBatchStageArtifact {
+struct VulkanResidentComponentBatchStageArtifact {
     spirv_words: Vec<u32>,
     local_size_x: u32,
     workgroup_count_x: u32,

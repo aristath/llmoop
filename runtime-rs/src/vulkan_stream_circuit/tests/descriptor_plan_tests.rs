@@ -39,7 +39,7 @@ fn descriptor_resource_plan_resolves_fixture_model_dispatch_patch_bay() {
     assert_eq!(
         first.descriptors[1].resource,
         VulkanDescriptorResourceAddress::ActivationSlot {
-            pedal_id: "layer_00".to_string(),
+            component_id: "layer_00".to_string(),
             signal_id: "operator_norm_out".to_string(),
             slot: 0,
             byte_capacity: 5120,
@@ -62,7 +62,7 @@ fn descriptor_resource_plan_resolves_fixture_model_dispatch_patch_bay() {
     assert_eq!(
         kv_append.descriptors[2].resource,
         VulkanDescriptorResourceAddress::StateBuffer {
-            pedal_id: "layer_02".to_string(),
+            component_id: "layer_02".to_string(),
             state_id: "kv_memory".to_string(),
             state_type: "append_only_attention_memory".to_string(),
             byte_capacity: 8192,
@@ -73,7 +73,7 @@ fn descriptor_resource_plan_resolves_fixture_model_dispatch_patch_bay() {
     assert_eq!(
         kv_append.descriptors[6].resource,
         VulkanDescriptorResourceAddress::StateBuffer {
-            pedal_id: "layer_02".to_string(),
+            component_id: "layer_02".to_string(),
             state_id: "kv_memory".to_string(),
             state_type: "append_only_attention_memory".to_string(),
             byte_capacity: 8192,
@@ -84,7 +84,7 @@ fn descriptor_resource_plan_resolves_fixture_model_dispatch_patch_bay() {
     assert_eq!(
         kv_append.descriptors[7].resource,
         VulkanDescriptorResourceAddress::StateView {
-            pedal_id: "layer_02".to_string(),
+            component_id: "layer_02".to_string(),
             state_id: "kv_memory".to_string(),
             state_type: "append_only_attention_memory".to_string(),
             byte_capacity: 8192,

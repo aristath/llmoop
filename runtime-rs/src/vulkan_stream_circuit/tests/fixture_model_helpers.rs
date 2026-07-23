@@ -30,7 +30,7 @@ fn backend_loop_window_is_device_owned_and_snapshot_memory_bounded() {
 }
 
 #[test]
-fn placed_feedback_window_accepts_bridged_multi_device_pedalboards() {
+fn placed_feedback_window_accepts_bridged_multi_device_execution_graphs() {
     let eligible = VulkanResidentInProcessPlacedFeedbackLoopEligibility {
         device_slice_count: 3,
         every_slice_has_terminal_segment: true,
@@ -104,7 +104,7 @@ fn fixture_tick_dispatch_stage(stage_index: usize) -> VulkanMountedPlacedStreamT
         dispatch: VulkanMountedPlacedStreamTickDispatch {
             dispatch_index: stage_index,
             kernel_id: format!("kernel_{stage_index}"),
-            pedal_id: format!("pedal_{stage_index}"),
+            component_id: format!("component_{stage_index}"),
             node_id: format!("node_{stage_index}"),
             op: "fixture".to_string(),
             descriptor_count: 0,
@@ -120,23 +120,23 @@ fn resident_dispatch_segments_stop_at_transport_boundaries() {
     let stages = vec![
         fixture_tick_dispatch_stage(0),
         fixture_tick_dispatch_stage(1),
-        VulkanMountedPlacedStreamTickStage::PublishCable {
+        VulkanMountedPlacedStreamTickStage::PublishEdge {
             stage_index: 2,
-            cable_index: 0,
+            edge_index: 0,
             endpoint_id: "out".to_string(),
             buffer_index: 0,
             byte_capacity: 16,
             remote_device_id: "gpu1".to_string(),
-            remote_pedal_id: "remote".to_string(),
+            remote_component_id: "remote".to_string(),
         },
-        VulkanMountedPlacedStreamTickStage::ReceiveCable {
+        VulkanMountedPlacedStreamTickStage::ReceiveEdge {
             stage_index: 3,
-            cable_index: 1,
+            edge_index: 1,
             endpoint_id: "in".to_string(),
             buffer_index: 0,
             byte_capacity: 16,
             remote_device_id: "gpu1".to_string(),
-            remote_pedal_id: "remote".to_string(),
+            remote_component_id: "remote".to_string(),
         },
         fixture_tick_dispatch_stage(4),
         fixture_tick_dispatch_stage(5),
@@ -173,10 +173,10 @@ fn distributed_dependency_topology_covers_edges_and_adjacent_dispatches() {
             receive_stage_count: 0,
             dispatch_stage_count: stages.len(),
             publish_stage_count: 0,
-            local_cable_read_count: 0,
-            local_cable_write_count: 0,
-            incoming_cable_read_count: 0,
-            outgoing_cable_write_count: 0,
+            local_edge_read_count: 0,
+            local_edge_write_count: 0,
+            incoming_edge_read_count: 0,
+            outgoing_edge_write_count: 0,
             model_input_read_count: 0,
             model_output_write_count: 0,
             can_execute: false,
@@ -244,10 +244,10 @@ fn distributed_dependency_topology_uses_composed_group_boundaries() {
         receive_stage_count: 0,
         dispatch_stage_count: stages.len(),
         publish_stage_count: 0,
-        local_cable_read_count: 0,
-        local_cable_write_count: 0,
-        incoming_cable_read_count: 0,
-        outgoing_cable_write_count: 0,
+        local_edge_read_count: 0,
+        local_edge_write_count: 0,
+        incoming_edge_read_count: 0,
+        outgoing_edge_write_count: 0,
         model_input_read_count: 0,
         model_output_write_count: 0,
         can_execute: false,
@@ -300,10 +300,10 @@ fn cursor_completes_an_entire_matching_distributed_group() {
         receive_stage_count: 0,
         dispatch_stage_count: 2,
         publish_stage_count: 0,
-        local_cable_read_count: 0,
-        local_cable_write_count: 0,
-        incoming_cable_read_count: 0,
-        outgoing_cable_write_count: 0,
+        local_edge_read_count: 0,
+        local_edge_write_count: 0,
+        incoming_edge_read_count: 0,
+        outgoing_edge_write_count: 0,
         model_input_read_count: 0,
         model_output_write_count: 0,
         can_execute: false,
@@ -652,9 +652,9 @@ fn fixture_model_index_path() -> PathBuf {
     compiled_artifact_dir(
         "NERVE_TEST_LOWERED_DIR",
         "lowered",
-        "pedalboard.circuits.json",
+        "execution_graph.circuits.json",
     )
-    .join("pedalboard.circuits.json")
+    .join("execution_graph.circuits.json")
 }
 
 fn fixture_model_tensor_index_path() -> PathBuf {
@@ -678,7 +678,7 @@ fn fixture_model_package_manifest() -> VulkanResidentModelPackageManifest {
 
 fn fixture_model_runtime_model() -> VulkanResidentRuntimeModel {
     fixture_model_package_manifest()
-        .mount_runtime_patch_controls(None, &BTreeMap::new(), &[], None)
+        .mount_runtime_graph_controls(None, &BTreeMap::new(), &[], None)
         .unwrap()
 }
 
@@ -688,42 +688,42 @@ fn fixture_model_runtime_model_with_placement(
     let manifest = fixture_model_package_manifest();
     let source_graph = manifest
         .circuit_graph
-        .to_resolved_lowered_pedalboard(PathBuf::from("."))
+        .to_resolved_lowered_execution_graph(PathBuf::from("."))
         .unwrap();
-    let patch = source_graph
-        .runtime_patch_from_placement(&placement)
+    let runtime_graph = source_graph
+        .runtime_graph_from_placement(&placement)
         .unwrap();
-    manifest.mount_runtime_patch(&patch).unwrap()
+    manifest.mount_runtime_graph(&runtime_graph).unwrap()
 }
 
-fn fixture_model_execution_graph() -> ResolvedLoweredPedalboard {
-    let full = ResolvedLoweredPedalboard::from_index_file(fixture_model_index_path()).unwrap();
+fn fixture_model_execution_graph() -> ResolvedLoweredExecutionGraph {
+    let full = ResolvedLoweredExecutionGraph::from_index_file(fixture_model_index_path()).unwrap();
     let processor_ids = full
         .circuits
         .iter()
         .filter(|artifact| artifact.circuit.runtime_role.is_signal_processor())
-        .map(|artifact| artifact.pedal.id.as_str())
+        .map(|artifact| artifact.component.id.as_str())
         .collect::<BTreeSet<_>>();
     let circuits = full
         .circuits
         .iter()
-        .filter(|artifact| processor_ids.contains(artifact.pedal.id.as_str()))
+        .filter(|artifact| processor_ids.contains(artifact.component.id.as_str()))
         .cloned()
         .collect::<Vec<_>>();
     let mut index = full.index.clone();
     index.graph.circuits = circuits
         .iter()
-        .map(|artifact| artifact.pedal.clone())
+        .map(|artifact| artifact.component.clone())
         .collect();
-    index.graph.cables = full
+    index.graph.edges = full
         .index
         .graph
-        .cables
+        .edges
         .iter()
-        .filter(|cable| {
-            cable.connection.is_forward()
-                && processor_ids.contains(cable.source.pedal_id.as_str())
-                && processor_ids.contains(cable.destination.pedal_id.as_str())
+        .filter(|edge| {
+            edge.connection.is_forward()
+                && processor_ids.contains(edge.source.component_id.as_str())
+                && processor_ids.contains(edge.destination.component_id.as_str())
         })
         .cloned()
         .collect();
@@ -734,14 +734,14 @@ fn fixture_model_execution_graph() -> ResolvedLoweredPedalboard {
     let mut operator_counts = BTreeMap::new();
     for artifact in &circuits {
         *operator_counts
-            .entry(artifact.pedal.operator_type.clone())
+            .entry(artifact.component.operator_type.clone())
             .or_insert(0) += 1;
     }
-    index.summary = LoweredPedalboardSummary {
+    index.summary = LoweredExecutionGraphSummary {
         circuit_count: circuits.len(),
         operator_counts,
     };
-    ResolvedLoweredPedalboard {
+    ResolvedLoweredExecutionGraph {
         artifact_root: full.artifact_root,
         index,
         circuits,

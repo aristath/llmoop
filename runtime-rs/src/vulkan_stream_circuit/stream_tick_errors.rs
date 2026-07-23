@@ -11,7 +11,7 @@ pub enum VulkanMountedPlacedResidentStreamTickError {
     DynamicStateCapacityOverflow {
         capacity: usize,
     },
-    Transport(VulkanPlacedCableTransportError),
+    Transport(VulkanPlacedEdgeTransportError),
     Dispatch(VulkanMountedPlacedResidentKernelDispatchError),
 }
 
@@ -86,11 +86,11 @@ pub enum VulkanMountedPlacedResidentKernelDispatchError {
     MissingExecutionDispatchSegments {
         device_id: String,
     },
-    MissingPedalboardPedals {
+    MissingExecutionGraphComponents {
         device_id: String,
     },
-    MissingPedalDispatches {
-        pedal_id: String,
+    MissingComponentDispatches {
+        component_id: String,
     },
     MissingLoadedArtifact {
         dispatch_index: usize,
@@ -139,16 +139,16 @@ pub enum VulkanMountedPlacedResidentKernelDispatchError {
         scalar_type: String,
     },
     PushConstantByteCountOverflow,
-    PedalRunnerDescriptorCountOverflow {
-        pedal_id: String,
+    ComponentRunnerDescriptorCountOverflow {
+        component_id: String,
     },
-    PedalRunnerPushConstantByteCountOverflow {
-        pedal_id: String,
+    ComponentRunnerPushConstantByteCountOverflow {
+        component_id: String,
     },
-    PedalboardRunnerDescriptorCountOverflow {
+    ExecutionGraphRunnerDescriptorCountOverflow {
         device_id: String,
     },
-    PedalboardRunnerPushConstantByteCountOverflow {
+    ExecutionGraphRunnerPushConstantByteCountOverflow {
         device_id: String,
     },
     Vulkan(VulkanError),
@@ -221,14 +221,14 @@ impl Display for VulkanMountedPlacedResidentKernelDispatchError {
                 f,
                 "resident execution plan for device {device_id:?} has no dispatch segments"
             ),
-            Self::MissingPedalboardPedals { device_id } => {
+            Self::MissingExecutionGraphComponents { device_id } => {
                 write!(
                     f,
-                    "resident pedalboard runner for device {device_id:?} has no pedals"
+                    "resident execution_graph runner for device {device_id:?} has no components"
                 )
             }
-            Self::MissingPedalDispatches { pedal_id } => {
-                write!(f, "pedal {pedal_id:?} has no mounted dispatches")
+            Self::MissingComponentDispatches { component_id } => {
+                write!(f, "component {component_id:?} has no mounted dispatches")
             }
             Self::MissingLoadedArtifact {
                 dispatch_index,
@@ -300,21 +300,21 @@ impl Display for VulkanMountedPlacedResidentKernelDispatchError {
             Self::PushConstantByteCountOverflow => {
                 f.write_str("push-constant byte count overflowed")
             }
-            Self::PedalRunnerDescriptorCountOverflow { pedal_id } => write!(
+            Self::ComponentRunnerDescriptorCountOverflow { component_id } => write!(
                 f,
-                "resident pedal runner {pedal_id:?} descriptor count overflowed"
+                "resident component runner {component_id:?} descriptor count overflowed"
             ),
-            Self::PedalRunnerPushConstantByteCountOverflow { pedal_id } => write!(
+            Self::ComponentRunnerPushConstantByteCountOverflow { component_id } => write!(
                 f,
-                "resident pedal runner {pedal_id:?} push-constant byte count overflowed"
+                "resident component runner {component_id:?} push-constant byte count overflowed"
             ),
-            Self::PedalboardRunnerDescriptorCountOverflow { device_id } => write!(
+            Self::ExecutionGraphRunnerDescriptorCountOverflow { device_id } => write!(
                 f,
-                "resident pedalboard runner for device {device_id:?} descriptor count overflowed"
+                "resident execution_graph runner for device {device_id:?} descriptor count overflowed"
             ),
-            Self::PedalboardRunnerPushConstantByteCountOverflow { device_id } => write!(
+            Self::ExecutionGraphRunnerPushConstantByteCountOverflow { device_id } => write!(
                 f,
-                "resident pedalboard runner for device {device_id:?} push-constant byte count overflowed"
+                "resident execution_graph runner for device {device_id:?} push-constant byte count overflowed"
             ),
             Self::Vulkan(error) => Display::fmt(error, f),
         }

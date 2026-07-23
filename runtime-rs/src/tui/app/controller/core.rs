@@ -6,9 +6,9 @@ impl App {
             sequence: TextBuffer::new("[]"),
             sequence_error: None,
             last_valid_sequence: Vec::new(),
-            focus: FocusRegion::Board,
+            focus: FocusRegion::Graph,
             selected_instance_id: None,
-            board_scroll: 0,
+            graph_scroll: 0,
             overlay: Some(Overlay::ModelSelector(ModelSelectorState::new(
                 initial_path,
             ))),
@@ -52,23 +52,23 @@ impl App {
     }
 
     pub fn modal_text_entry_active(&self) -> bool {
-        let Some(Overlay::Pedal(modal)) = &self.overlay else {
+        let Some(Overlay::Node(modal)) = &self.overlay else {
             return false;
         };
         modal
             .property_index()
             .and_then(|index| modal.properties.get(index))
-            .is_some_and(PedalPropertyDraft::accepts_text)
+            .is_some_and(NodePropertyDraft::accepts_text)
     }
 
     pub fn action_at(&self, column: u16, row: u16) -> Option<AppAction> {
         match self.hit_map.resolve(column, row)? {
             HitTarget::OpenModel => Some(AppAction::OpenModelSelector),
             HitTarget::Sequence => Some(AppAction::FocusSequence),
-            HitTarget::Pedal(instance_id) => Some(AppAction::OpenPedal(instance_id.clone())),
-            HitTarget::PanLeft => Some(AppAction::PanBoard(-1)),
-            HitTarget::PanRight => Some(AppAction::PanBoard(1)),
-            HitTarget::ModalApply => Some(AppAction::ApplyPedal),
+            HitTarget::Node(instance_id) => Some(AppAction::OpenNode(instance_id.clone())),
+            HitTarget::PanLeft => Some(AppAction::PanGraph(-1)),
+            HitTarget::PanRight => Some(AppAction::PanGraph(1)),
+            HitTarget::ModalApply => Some(AppAction::ApplyNode),
             HitTarget::ModalCancel => Some(AppAction::CloseOverlay),
             HitTarget::ModalRow(row) => Some(AppAction::ModalClickRow(*row)),
             HitTarget::BrowserEntry(index) => Some(AppAction::ModelBrowserOpen(*index)),
@@ -111,8 +111,8 @@ impl App {
             }
             AppAction::FocusNext | AppAction::FocusPrevious => {
                 self.focus = match self.focus {
-                    FocusRegion::Sequence => FocusRegion::Board,
-                    FocusRegion::Board => FocusRegion::Sequence,
+                    FocusRegion::Sequence => FocusRegion::Graph,
+                    FocusRegion::Graph => FocusRegion::Sequence,
                 };
             }
             AppAction::FocusSequence => self.focus = FocusRegion::Sequence,
@@ -136,21 +136,21 @@ impl App {
             AppAction::SelectAllText if self.focus == FocusRegion::Sequence => {
                 self.sequence.select_all();
             }
-            AppAction::SelectPreviousPedal => self.select_relative(-1),
-            AppAction::SelectNextPedal => self.select_relative(1),
-            AppAction::SelectFirstPedal => self.select_index(0),
-            AppAction::SelectLastPedal => {
+            AppAction::SelectPreviousNode => self.select_relative(-1),
+            AppAction::SelectNextNode => self.select_relative(1),
+            AppAction::SelectFirstNode => self.select_index(0),
+            AppAction::SelectLastNode => {
                 let last = self.instance_count().saturating_sub(1);
                 self.select_index(last);
             }
-            AppAction::OpenSelectedPedal => self.open_selected_pedal(),
-            AppAction::SelectPedal(instance_id) => self.select_instance(&instance_id),
-            AppAction::OpenPedal(instance_id) => {
+            AppAction::OpenSelectedNode => self.open_selected_node(),
+            AppAction::SelectNode(instance_id) => self.select_instance(&instance_id),
+            AppAction::OpenNode(instance_id) => {
                 self.select_instance(&instance_id);
-                self.open_selected_pedal();
+                self.open_selected_node();
             }
-            AppAction::PanBoard(delta) => {
-                self.board_scroll = self.board_scroll.saturating_add_signed(delta as isize)
+            AppAction::PanGraph(delta) => {
+                self.graph_scroll = self.graph_scroll.saturating_add_signed(delta as isize)
             }
             AppAction::DuplicateSelected => self.duplicate_selected(),
             AppAction::RemoveSelected => self.remove_selected(),

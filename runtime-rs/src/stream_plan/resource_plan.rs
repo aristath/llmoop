@@ -6,7 +6,7 @@ pub struct PlannedParameterResource {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlannedParameterUse {
-    pub pedal_id: String,
+    pub component_id: String,
     pub circuit_id: String,
     pub param_id: String,
     pub role: Option<String>,
@@ -16,7 +16,7 @@ pub struct PlannedParameterUse {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlannedStateResource {
-    pub pedal_id: String,
+    pub component_id: String,
     pub circuit_id: String,
     pub state_id: String,
     pub state_type: String,
@@ -44,7 +44,7 @@ fn state_dtype_bytes(dtype: &str) -> Result<usize, CircuitPlanError> {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlannedActivationSlotBank {
-    pub pedal_id: String,
+    pub component_id: String,
     pub circuit_id: String,
     pub temporary_signal_count: usize,
     pub state_view_signal_count: usize,
@@ -62,7 +62,7 @@ pub struct PlannedActivationSlot {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CircuitActivationPlan {
-    pub pedal_id: String,
+    pub component_id: String,
     pub circuit_id: String,
     pub input_ports: Vec<PlannedPort>,
     pub output_ports: Vec<PlannedPort>,
@@ -76,37 +76,37 @@ pub struct CircuitActivationPlan {
 
 impl CircuitActivationPlan {
     pub fn from_artifact(artifact: &ResolvedCircuitArtifact) -> Result<Self, CircuitPlanError> {
-        Self::from_circuit(&artifact.pedal.id, &artifact.circuit)
+        Self::from_circuit(&artifact.component.id, &artifact.circuit)
     }
 
     pub fn from_artifact_with_tensor_index(
         artifact: &ResolvedCircuitArtifact,
         tensor_index: &TensorIndex,
     ) -> Result<Self, CircuitPlanError> {
-        Self::from_circuit_with_tensor_index(&artifact.pedal.id, &artifact.circuit, tensor_index)
+        Self::from_circuit_with_tensor_index(&artifact.component.id, &artifact.circuit, tensor_index)
     }
 
     pub fn from_circuit(
-        pedal_id: impl Into<String>,
+        component_id: impl Into<String>,
         circuit: &StreamCircuit,
     ) -> Result<Self, CircuitPlanError> {
-        Self::from_circuit_with_optional_tensor_index(pedal_id, circuit, None)
+        Self::from_circuit_with_optional_tensor_index(component_id, circuit, None)
     }
 
     pub fn from_circuit_with_tensor_index(
-        pedal_id: impl Into<String>,
+        component_id: impl Into<String>,
         circuit: &StreamCircuit,
         tensor_index: &TensorIndex,
     ) -> Result<Self, CircuitPlanError> {
-        Self::from_circuit_with_optional_tensor_index(pedal_id, circuit, Some(tensor_index))
+        Self::from_circuit_with_optional_tensor_index(component_id, circuit, Some(tensor_index))
     }
 
     fn from_circuit_with_optional_tensor_index(
-        pedal_id: impl Into<String>,
+        component_id: impl Into<String>,
         circuit: &StreamCircuit,
         tensor_index: Option<&TensorIndex>,
     ) -> Result<Self, CircuitPlanError> {
-        let pedal_id = pedal_id.into();
+        let component_id = component_id.into();
         let state_ids: BTreeSet<_> = circuit.state_ports.iter().map(|state| &state.id).collect();
         let param_ids: BTreeSet<_> = circuit.parameters.refs.keys().collect();
         let boundary_output_sources: BTreeSet<_> = circuit
@@ -149,9 +149,9 @@ impl CircuitActivationPlan {
 
         let mut planned_nodes = Vec::with_capacity(circuit.nodes.len());
         for (index, node) in circuit.nodes.iter().enumerate() {
-            validate_node_dependencies(&pedal_id, node, &available, &state_ids, &param_ids)?;
+            validate_node_dependencies(&component_id, node, &available, &state_ids, &param_ids)?;
             let output_shapes = infer_node_output_shapes(
-                &pedal_id,
+                &component_id,
                 node,
                 &signals,
                 &circuit.parameters.refs,
@@ -162,7 +162,7 @@ impl CircuitActivationPlan {
                 let signal = signals.get_mut(input).ok_or_else(|| {
                     CircuitPlanError(format!(
                         "{} node {} input {:?} is not in the planned signal table",
-                        pedal_id, node.id, input
+                        component_id, node.id, input
                     ))
                 })?;
                 signal.consumers.push(node.id.clone());
@@ -172,7 +172,7 @@ impl CircuitActivationPlan {
                 if available.contains(output) {
                     return Err(CircuitPlanError(format!(
                         "{} node {} output {:?} is already available",
-                        pedal_id, node.id, output
+                        component_id, node.id, output
                     )));
                 }
                 available.insert(output.clone());
@@ -199,7 +199,7 @@ impl CircuitActivationPlan {
             let signal = signals.get_mut(source).ok_or_else(|| {
                 CircuitPlanError(format!(
                     "{} boundary output {} source {:?} is not planned",
-                    pedal_id, output.id, source
+                    component_id, output.id, source
                 ))
             })?;
             signal.is_boundary_output = true;
@@ -227,7 +227,7 @@ impl CircuitActivationPlan {
             .collect();
 
         Ok(Self {
-            pedal_id,
+            component_id,
             circuit_id: circuit.id.clone(),
             input_ports: circuit
                 .boundary

@@ -3,7 +3,7 @@ pub enum VulkanKernelDescriptorResource {
     Signal(VulkanSignalBinding),
     Parameter(VulkanParameterBinding),
     State {
-        pedal_id: String,
+        component_id: String,
         binding: VulkanStateBinding,
     },
 }
@@ -30,7 +30,7 @@ impl VulkanDescriptorResourcePlan {
         let state_index: BTreeMap<_, _> = resident_plan
             .stream_state_buffers
             .iter()
-            .map(|state| ((state.pedal_id.as_str(), state.state_id.as_str()), state))
+            .map(|state| ((state.component_id.as_str(), state.state_id.as_str()), state))
             .collect();
         let activation_index: BTreeMap<_, _> = resident_plan
             .activation_banks
@@ -38,7 +38,7 @@ impl VulkanDescriptorResourcePlan {
             .flat_map(|bank| {
                 bank.slots
                     .iter()
-                    .map(move |slot| ((bank.pedal_id.as_str(), slot.slot), slot))
+                    .map(move |slot| ((bank.component_id.as_str(), slot.slot), slot))
             })
             .collect();
 
@@ -70,12 +70,12 @@ impl VulkanDescriptorResourcePlan {
 
     pub fn dispatch(
         &self,
-        pedal_id: &str,
+        component_id: &str,
         node_id: &str,
     ) -> Option<&VulkanDispatchDescriptorResourcePlan> {
         self.dispatches
             .iter()
-            .find(|dispatch| dispatch.pedal_id == pedal_id && dispatch.node_id == node_id)
+            .find(|dispatch| dispatch.component_id == component_id && dispatch.node_id == node_id)
     }
 }
 
@@ -83,7 +83,7 @@ impl VulkanDescriptorResourcePlan {
 pub struct VulkanDispatchDescriptorResourcePlan {
     pub dispatch_index: usize,
     pub kernel_id: String,
-    pub pedal_id: String,
+    pub component_id: String,
     pub node_id: String,
     pub op: String,
     pub descriptors: Vec<VulkanResolvedDescriptorBinding>,
@@ -115,7 +115,7 @@ impl VulkanDispatchDescriptorResourcePlan {
         Ok(Self {
             dispatch_index: command.dispatch_index,
             kernel_id: command.kernel_id.clone(),
-            pedal_id: command.pedal_id.clone(),
+            component_id: command.component_id.clone(),
             node_id: command.node_id.clone(),
             op: command.op.clone(),
             descriptors,
@@ -170,14 +170,14 @@ pub enum VulkanDescriptorResourceAddress {
         byte_count: Option<usize>,
     },
     ActivationSlot {
-        pedal_id: String,
+        component_id: String,
         signal_id: String,
         slot: usize,
         byte_capacity: usize,
         signal_byte_capacity: usize,
     },
     StateBuffer {
-        pedal_id: String,
+        component_id: String,
         state_id: String,
         state_type: String,
         byte_capacity: usize,
@@ -185,7 +185,7 @@ pub enum VulkanDescriptorResourceAddress {
         bytes_per_activation: Option<usize>,
     },
     StateView {
-        pedal_id: String,
+        component_id: String,
         state_id: String,
         state_type: String,
         byte_capacity: usize,
@@ -247,11 +247,11 @@ fn resolve_descriptor_resource(
                 byte_count: resident.byte_count,
             })
         }
-        VulkanKernelDescriptorResource::State { pedal_id, binding } => {
+        VulkanKernelDescriptorResource::State { component_id, binding } => {
             resolve_state_descriptor_resource(
                 command,
                 descriptor,
-                pedal_id,
+                component_id,
                 binding,
                 state_index,
                 dynamic_state_capacity_activations,
@@ -279,29 +279,29 @@ fn resolve_signal_descriptor_resource(
             })
         }
         VulkanSignalResource::ActivationSlot {
-            pedal_id,
+            component_id,
             slot,
             bytes,
             signal_bytes,
         } => {
             let resident = activation_index
-                .get(&(pedal_id.as_str(), *slot))
+                .get(&(component_id.as_str(), *slot))
                 .ok_or_else(|| {
                     VulkanDescriptorResourcePlanError(format!(
                         "{} descriptor {} activation slot {}.{} is not resident",
-                        command.kernel_id, descriptor.binding, pedal_id, slot
+                        command.kernel_id, descriptor.binding, component_id, slot
                     ))
                 })?;
             let byte_capacity = resident.bytes.ok_or_else(|| {
                 VulkanDescriptorResourcePlanError(format!(
                     "{} descriptor {} activation slot {}.{} has unknown byte capacity",
-                    command.kernel_id, descriptor.binding, pedal_id, slot
+                    command.kernel_id, descriptor.binding, component_id, slot
                 ))
             })?;
             if *bytes != Some(byte_capacity) {
                 return Err(VulkanDescriptorResourcePlanError(format!(
                     "{} descriptor {} activation slot {}.{} byte count {:?} does not match resident {}",
-                    command.kernel_id, descriptor.binding, pedal_id, slot, bytes, byte_capacity
+                    command.kernel_id, descriptor.binding, component_id, slot, bytes, byte_capacity
                 )));
             }
             let signal_byte_capacity = signal_bytes.ok_or_else(|| {
@@ -321,7 +321,7 @@ fn resolve_signal_descriptor_resource(
                 )));
             }
             Ok(VulkanDescriptorResourceAddress::ActivationSlot {
-                pedal_id: pedal_id.clone(),
+                component_id: component_id.clone(),
                 signal_id: signal.signal_id.clone(),
                 slot: *slot,
                 byte_capacity,
@@ -347,33 +347,33 @@ fn resolve_signal_state_descriptor_resource(
     state_index: &BTreeMap<(&str, &str), &VulkanResidentStateBuffer>,
     dynamic_state_capacity_activations: usize,
 ) -> Result<VulkanDescriptorResourceAddress, VulkanDescriptorResourcePlanError> {
-    let (pedal_id, state_id, static_bytes, bytes_per_activation, state_view) = match resource {
+    let (component_id, state_id, static_bytes, bytes_per_activation, state_view) = match resource {
         VulkanSignalResource::StateBuffer {
-            pedal_id,
+            component_id,
             state_id,
             static_bytes,
             bytes_per_activation,
         } => (
-            pedal_id,
+            component_id,
             state_id,
             static_bytes,
             bytes_per_activation,
             false,
         ),
         VulkanSignalResource::StateView {
-            pedal_id,
+            component_id,
             state_id,
             static_bytes,
             bytes_per_activation,
-        } => (pedal_id, state_id, static_bytes, bytes_per_activation, true),
+        } => (component_id, state_id, static_bytes, bytes_per_activation, true),
         _ => unreachable!("caller only routes state resources"),
     };
     let resident = state_index
-        .get(&(pedal_id.as_str(), state_id.as_str()))
+        .get(&(component_id.as_str(), state_id.as_str()))
         .ok_or_else(|| {
             VulkanDescriptorResourcePlanError(format!(
                 "{} descriptor {} state {}.{} is not resident",
-                command.kernel_id, descriptor.binding, pedal_id, state_id
+                command.kernel_id, descriptor.binding, component_id, state_id
             ))
         })?;
     if *static_bytes != resident.static_bytes
@@ -383,7 +383,7 @@ fn resolve_signal_state_descriptor_resource(
             "{} descriptor {} state {}.{} byte shape {:?}/{:?} does not match resident {:?}/{:?}",
             command.kernel_id,
             descriptor.binding,
-            pedal_id,
+            component_id,
             state_id,
             static_bytes,
             bytes_per_activation,
@@ -395,7 +395,7 @@ fn resolve_signal_state_descriptor_resource(
         descriptor_state_byte_capacity(resident, dynamic_state_capacity_activations)?;
     if state_view {
         Ok(VulkanDescriptorResourceAddress::StateView {
-            pedal_id: pedal_id.to_string(),
+            component_id: component_id.to_string(),
             state_id: state_id.to_string(),
             state_type: resident.state_type.clone(),
             byte_capacity,
@@ -404,7 +404,7 @@ fn resolve_signal_state_descriptor_resource(
         })
     } else {
         Ok(VulkanDescriptorResourceAddress::StateBuffer {
-            pedal_id: pedal_id.to_string(),
+            component_id: component_id.to_string(),
             state_id: state_id.to_string(),
             state_type: resident.state_type.clone(),
             byte_capacity,
@@ -417,18 +417,18 @@ fn resolve_signal_state_descriptor_resource(
 fn resolve_state_descriptor_resource(
     command: &VulkanKernelDispatchCommand,
     descriptor: &VulkanKernelDescriptorBinding,
-    pedal_id: &str,
+    component_id: &str,
     binding: &VulkanStateBinding,
     state_index: &BTreeMap<(&str, &str), &VulkanResidentStateBuffer>,
     dynamic_state_capacity_activations: usize,
     state_view: bool,
 ) -> Result<VulkanDescriptorResourceAddress, VulkanDescriptorResourcePlanError> {
     let resident = state_index
-        .get(&(pedal_id, binding.state_id.as_str()))
+        .get(&(component_id, binding.state_id.as_str()))
         .ok_or_else(|| {
             VulkanDescriptorResourcePlanError(format!(
                 "{} descriptor {} state {}.{} is not resident",
-                command.kernel_id, descriptor.binding, pedal_id, binding.state_id
+                command.kernel_id, descriptor.binding, component_id, binding.state_id
             ))
         })?;
     if binding.state_type != resident.state_type
@@ -437,14 +437,14 @@ fn resolve_state_descriptor_resource(
     {
         return Err(VulkanDescriptorResourcePlanError(format!(
             "{} descriptor {} state {}.{} binding does not match resident allocation",
-            command.kernel_id, descriptor.binding, pedal_id, binding.state_id
+            command.kernel_id, descriptor.binding, component_id, binding.state_id
         )));
     }
     let byte_capacity =
         descriptor_state_byte_capacity(resident, dynamic_state_capacity_activations)?;
     if state_view {
         Ok(VulkanDescriptorResourceAddress::StateView {
-            pedal_id: pedal_id.to_string(),
+            component_id: component_id.to_string(),
             state_id: binding.state_id.clone(),
             state_type: binding.state_type.clone(),
             byte_capacity,
@@ -453,7 +453,7 @@ fn resolve_state_descriptor_resource(
         })
     } else {
         Ok(VulkanDescriptorResourceAddress::StateBuffer {
-            pedal_id: pedal_id.to_string(),
+            component_id: component_id.to_string(),
             state_id: binding.state_id.clone(),
             state_type: binding.state_type.clone(),
             byte_capacity,
@@ -473,7 +473,7 @@ fn descriptor_state_byte_capacity(
             if dynamic_state_capacity_activations == 0 {
                 return Err(VulkanDescriptorResourcePlanError(format!(
                     "{}.{} requires non-zero dynamic state capacity",
-                    state.pedal_id, state.state_id
+                    state.component_id, state.state_id
                 )));
             }
             let state_capacity = state
@@ -485,7 +485,7 @@ fn descriptor_state_byte_capacity(
                 .ok_or_else(|| {
                     VulkanDescriptorResourcePlanError(format!(
                         "{}.{} dynamic state byte capacity overflowed",
-                        state.pedal_id, state.state_id
+                        state.component_id, state.state_id
                     ))
                 })?
         }
@@ -494,13 +494,13 @@ fn descriptor_state_byte_capacity(
     let total = static_bytes.checked_add(dynamic_bytes).ok_or_else(|| {
         VulkanDescriptorResourcePlanError(format!(
             "{}.{} state byte capacity overflowed",
-            state.pedal_id, state.state_id
+            state.component_id, state.state_id
         ))
     })?;
     if total == 0 {
         return Err(VulkanDescriptorResourcePlanError(format!(
             "{}.{} has unknown or zero byte capacity",
-            state.pedal_id, state.state_id
+            state.component_id, state.state_id
         )));
     }
     Ok(total)

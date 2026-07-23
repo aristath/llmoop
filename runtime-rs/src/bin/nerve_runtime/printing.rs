@@ -66,19 +66,19 @@ fn print_runtime_execution_counters(counters: &VulkanResidentExecutionCounters) 
     println!("  resident_copy_waits={}", counters.resident_copy_waits);
 }
 
-fn print_placed_pedal_timing_profile(
-    summaries: &[RuntimePlacedPedalTimingSummaryReport],
+fn print_placed_component_timing_profile(
+    summaries: &[RuntimePlacedComponentTimingSummaryReport],
     max_rows: usize,
 ) {
     if summaries.is_empty() || max_rows == 0 {
         return;
     }
-    println!("top_pedals:");
+    println!("top_nodes:");
     for summary in summaries.iter().take(max_rows) {
         println!(
             "  {}:{} total_ms={:.3} ticks={} dispatches={} avg_tick_ms={} avg_dispatch_ms={}",
             summary.device_id,
-            summary.pedal_id,
+            summary.component_id,
             nanos_to_millis(summary.total_run_time_ns),
             summary.tick_count,
             summary.dispatch_count,
@@ -112,18 +112,18 @@ Options:
   --chat                     Start an interactive resident text session.
   --chat-template-var <NAME=JSON>
                              Set a model-owned chat template variable; may be repeated.
-  --device <DEVICE_ID>       Default logical device for unplaced pedals. May be supplied once.
-  --place-pedal <PEDAL=DEV>  Assign one runtime pedal instance to a logical device.
+  --device <DEVICE_ID>       Default logical device for unplaced nodes. May be supplied once.
+  --place-node <NODE=DEV>    Assign one runtime node instance to a logical device.
   --bind-device <DEV=TARGET> Bind a logical device to a discovered Vulkan device ID.
   --chain <ITEM[,ITEM...]>    Runtime source chain. ITEM is SOURCE or INSTANCE=SOURCE.
   --duplicate-after <AFTER=NEW>
-                             Duplicate runtime pedal instance AFTER with id NEW.
-  --inspect-runtime          Preview UI-ready package, patch, placement, device, and route facts.
-  --inspect-package          Summarize the compiled source pedal kit and available devices.
-  --inspect-patch            Preview the effective runtime patch without mounting devices.
-  --inspect-placement        Mount and summarize every logical device slice in the runtime patch.
+                             Duplicate runtime node instance AFTER with id NEW.
+  --inspect-runtime          Preview UI-ready package, runtime graph, placement, device, and route facts.
+  --inspect-package          Summarize the compiled component catalog and available devices.
+  --inspect-graph            Preview the effective runtime graph without mounting devices.
+  --inspect-placement        Mount and summarize every logical device slice in the runtime graph.
   --inspect-device-slice <DEVICE_ID>
-                             Mount and summarize only the runtime patch pedals assigned to DEVICE_ID.
+                             Mount and summarize only the runtime graph nodes assigned to DEVICE_ID.
   --max-new-tokens <N>       Generation stop condition, independent of context size. Default: 65536
   --speculative-draft-tokens <N>
                              MTP draft tokens proposed per verification cycle. Default: 0 (disabled).
@@ -147,4 +147,3 @@ Example:
   python -m nerve --compile-model <MODEL_DIR>
   cargo run --manifest-path runtime-rs/Cargo.toml --features 'vulkan tokenizers' --bin nerve-runtime -- --package compiled_models/model_xxx/vulkan_resident_package.json --chat"
 }
-

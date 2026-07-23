@@ -2,11 +2,11 @@
 pub struct VulkanPlacedStreamCircuitResidentPlan {
     pub backend_id: String,
     pub device_id: String,
-    pub hosted_pedal_ids: Vec<String>,
+    pub hosted_component_ids: Vec<String>,
     pub signal_element_bytes: Option<usize>,
-    pub local_cables: Vec<PedalCablePlacement>,
-    pub incoming_cables: Vec<PedalCablePlacement>,
-    pub outgoing_cables: Vec<PedalCablePlacement>,
+    pub local_edges: Vec<ComponentEdgePlacement>,
+    pub incoming_edges: Vec<ComponentEdgePlacement>,
+    pub outgoing_edges: Vec<ComponentEdgePlacement>,
     pub resident_plan: VulkanStreamCircuitResidentPlan,
 }
 
@@ -24,46 +24,46 @@ impl VulkanPlacedStreamCircuitResidentPlan {
                 "Vulkan placed resident plan device_id must not be empty".to_string(),
             ));
         }
-        let hosted_pedal_ids = placement_plan
-            .pedals
+        let hosted_component_ids = placement_plan
+            .components
             .iter()
-            .filter(|pedal| pedal.device_id == device_id)
-            .map(|pedal| pedal.pedal_id.clone())
+            .filter(|component| component.device_id == device_id)
+            .map(|component| component.component_id.clone())
             .collect::<Vec<_>>();
-        let hosted_pedal_set = hosted_pedal_ids.iter().cloned().collect::<BTreeSet<_>>();
-        let resident_plan = VulkanStreamCircuitResidentPlan::from_resource_plan_with_hosted_pedals(
+        let hosted_component_set = hosted_component_ids.iter().cloned().collect::<BTreeSet<_>>();
+        let resident_plan = VulkanStreamCircuitResidentPlan::from_resource_plan_with_hosted_components(
             resource_plan,
-            Some(&hosted_pedal_set),
+            Some(&hosted_component_set),
             tensor_index,
             activation_element_bytes,
         )?;
-        let local_cables = placement_plan
-            .cables
+        let local_edges = placement_plan
+            .edges
             .iter()
-            .filter(|cable| {
-                cable.connection.is_forward()
-                    && cable.source_device_id == device_id
-                    && cable.destination_device_id == device_id
+            .filter(|edge| {
+                edge.connection.is_forward()
+                    && edge.source_device_id == device_id
+                    && edge.destination_device_id == device_id
             })
             .cloned()
             .collect();
-        let incoming_cables = placement_plan
-            .cables
+        let incoming_edges = placement_plan
+            .edges
             .iter()
-            .filter(|cable| {
-                cable.connection.is_forward()
-                    && cable.source_device_id != device_id
-                    && cable.destination_device_id == device_id
+            .filter(|edge| {
+                edge.connection.is_forward()
+                    && edge.source_device_id != device_id
+                    && edge.destination_device_id == device_id
             })
             .cloned()
             .collect();
-        let outgoing_cables = placement_plan
-            .cables
+        let outgoing_edges = placement_plan
+            .edges
             .iter()
-            .filter(|cable| {
-                cable.connection.is_forward()
-                    && cable.source_device_id == device_id
-                    && cable.destination_device_id != device_id
+            .filter(|edge| {
+                edge.connection.is_forward()
+                    && edge.source_device_id == device_id
+                    && edge.destination_device_id != device_id
             })
             .cloned()
             .collect();
@@ -71,18 +71,18 @@ impl VulkanPlacedStreamCircuitResidentPlan {
         Ok(Self {
             backend_id: VULKAN_STREAM_CIRCUIT_BACKEND_ID.to_string(),
             device_id,
-            hosted_pedal_ids,
+            hosted_component_ids,
             signal_element_bytes: activation_element_bytes,
-            local_cables,
-            incoming_cables,
-            outgoing_cables,
+            local_edges,
+            incoming_edges,
+            outgoing_edges,
             resident_plan,
         })
     }
 
-    pub fn hosts_pedal(&self, pedal_id: &str) -> bool {
-        self.hosted_pedal_ids
+    pub fn hosts_component(&self, component_id: &str) -> bool {
+        self.hosted_component_ids
             .iter()
-            .any(|hosted| hosted == pedal_id)
+            .any(|hosted| hosted == component_id)
     }
 }

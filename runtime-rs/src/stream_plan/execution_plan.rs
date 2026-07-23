@@ -1,23 +1,23 @@
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StreamCircuitExecutionPlan {
-    pub wiring: String,
+    pub topology: String,
     pub circuits: Vec<CircuitActivationPlan>,
 }
 
 impl StreamCircuitExecutionPlan {
-    pub fn from_graph(graph: &ResolvedLoweredPedalboard) -> Result<Self, CircuitPlanError> {
+    pub fn from_graph(graph: &ResolvedLoweredExecutionGraph) -> Result<Self, CircuitPlanError> {
         let mut circuits = Vec::with_capacity(graph.circuits.len());
         for artifact in &graph.circuits {
             circuits.push(CircuitActivationPlan::from_artifact(artifact)?);
         }
         Ok(Self {
-            wiring: graph.index.graph.wiring.clone(),
+            topology: graph.index.graph.topology.clone(),
             circuits,
         })
     }
 
     pub fn from_graph_with_tensor_index(
-        graph: &ResolvedLoweredPedalboard,
+        graph: &ResolvedLoweredExecutionGraph,
         tensor_index: &TensorIndex,
     ) -> Result<Self, CircuitPlanError> {
         let mut circuits = Vec::with_capacity(graph.circuits.len());
@@ -28,7 +28,7 @@ impl StreamCircuitExecutionPlan {
             )?);
         }
         Ok(Self {
-            wiring: graph.index.graph.wiring.clone(),
+            topology: graph.index.graph.topology.clone(),
             circuits,
         })
     }
@@ -107,13 +107,13 @@ pub struct StreamCircuitResourcePlan {
 }
 
 impl StreamCircuitResourcePlan {
-    pub fn from_graph(graph: &ResolvedLoweredPedalboard) -> Result<Self, CircuitPlanError> {
+    pub fn from_graph(graph: &ResolvedLoweredExecutionGraph) -> Result<Self, CircuitPlanError> {
         let execution_plan = StreamCircuitExecutionPlan::from_graph(graph)?;
         Self::from_graph_and_plan(graph, &execution_plan)
     }
 
     pub fn from_graph_with_tensor_index(
-        graph: &ResolvedLoweredPedalboard,
+        graph: &ResolvedLoweredExecutionGraph,
         tensor_index: &TensorIndex,
     ) -> Result<Self, CircuitPlanError> {
         let execution_plan =
@@ -122,7 +122,7 @@ impl StreamCircuitResourcePlan {
     }
 
     pub fn from_graph_and_plan(
-        graph: &ResolvedLoweredPedalboard,
+        graph: &ResolvedLoweredExecutionGraph,
         execution_plan: &StreamCircuitExecutionPlan,
     ) -> Result<Self, CircuitPlanError> {
         if graph.circuits.len() != execution_plan.circuits.len() {
@@ -144,10 +144,10 @@ impl StreamCircuitResourcePlan {
         let mut unknown_state_view_shape_count = 0;
 
         for (artifact, activation_plan) in graph.circuits.iter().zip(&execution_plan.circuits) {
-            if artifact.pedal.id != activation_plan.pedal_id {
+            if artifact.component.id != activation_plan.component_id {
                 return Err(CircuitPlanError(format!(
-                    "graph pedal {:?} does not match activation plan pedal {:?}",
-                    artifact.pedal.id, activation_plan.pedal_id
+                    "graph component {:?} does not match activation plan component {:?}",
+                    artifact.component.id, activation_plan.component_id
                 )));
             }
             if artifact.circuit.id != activation_plan.circuit_id {
@@ -162,14 +162,14 @@ impl StreamCircuitResourcePlan {
                 let tensor = parameter.tensor.clone().ok_or_else(|| {
                     CircuitPlanError(format!(
                         "{} parameter {:?} has no source tensor",
-                        artifact.pedal.id, param_id
+                        artifact.component.id, param_id
                     ))
                 })?;
                 parameters_by_tensor
                     .entry(tensor)
                     .or_default()
                     .push(PlannedParameterUse {
-                        pedal_id: artifact.pedal.id.clone(),
+                        component_id: artifact.component.id.clone(),
                         circuit_id: artifact.circuit.id.clone(),
                         param_id: param_id.clone(),
                         role: parameter.role.clone(),
@@ -180,7 +180,7 @@ impl StreamCircuitResourcePlan {
 
             for state in &artifact.state.state_ports {
                 state_allocations.push(PlannedStateResource {
-                    pedal_id: artifact.pedal.id.clone(),
+                    component_id: artifact.component.id.clone(),
                     circuit_id: artifact.circuit.id.clone(),
                     state_id: state.id.clone(),
                     state_type: state.state_type.clone(),
@@ -225,7 +225,7 @@ impl StreamCircuitResourcePlan {
 
             let activation_frame = activation_plan.activation_frame_plan();
             activation_banks.push(PlannedActivationSlotBank {
-                pedal_id: artifact.pedal.id.clone(),
+                component_id: artifact.component.id.clone(),
                 circuit_id: artifact.circuit.id.clone(),
                 temporary_signal_count: activation_plan.temporary_signals.len(),
                 state_view_signal_count: activation_plan.state_view_signals.len(),
@@ -357,7 +357,7 @@ fn collect_transducer_component_parameters(
             .entry(tensor.to_string())
             .or_default()
             .push(PlannedParameterUse {
-                pedal_id: format!("{transducer_id}.{component_id}"),
+                component_id: format!("{transducer_id}.{component_id}"),
                 circuit_id: transducer_id.to_string(),
                 param_id: param_id.clone(),
                 role: component_type.clone(),

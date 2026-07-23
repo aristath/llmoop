@@ -16,7 +16,7 @@ pub struct VulkanResidentKernelDispatch {
 
 /// Owns the Vulkan recording/submission resources for a composed sequence of
 /// resident kernel dispatches. Kernel bindings remain independently reusable;
-/// this object defines an execution boundary, not a model or pedal boundary.
+/// this object defines an execution boundary, not a model or component boundary.
 pub struct VulkanResidentKernelSequence {
     device: ash::Device,
     command_pool: vk::CommandPool,
@@ -227,7 +227,7 @@ fn print_resident_kernel_timestamp_summary(
 
     let mut shape_groups = HashMap::<(u32, u32, usize, u32), (usize, f64)>::new();
     let mut semantic_groups = HashMap::<String, (usize, f64)>::new();
-    let mut pedal_groups = HashMap::<String, (usize, f64)>::new();
+    let mut component_groups = HashMap::<String, (usize, f64)>::new();
     let mut op_groups = HashMap::<String, (usize, f64)>::new();
     let mut intervals = Vec::with_capacity(steps.len());
     let mut semantic_intervals = Vec::with_capacity(steps.len());
@@ -248,8 +248,8 @@ fn print_resident_kernel_timestamp_summary(
             let group = semantic_groups.entry(label.to_string()).or_insert((0, 0.0));
             group.0 += 1;
             group.1 += elapsed_ns;
-            if let Some(pedal_id) = semantic_label_field(label, "pedal") {
-                let group = pedal_groups.entry(pedal_id.to_string()).or_insert((0, 0.0));
+            if let Some(component_id) = semantic_label_field(label, "component") {
+                let group = component_groups.entry(component_id.to_string()).or_insert((0, 0.0));
                 group.0 += 1;
                 group.1 += elapsed_ns;
             }
@@ -276,7 +276,7 @@ fn print_resident_kernel_timestamp_summary(
         (host_elapsed_ns as f64 - total_ns).max(0.0) / 1_000_000.0,
     );
 
-    print_resident_kernel_named_timestamp_groups("grouped pedal intervals", pedal_groups);
+    print_resident_kernel_named_timestamp_groups("grouped component intervals", component_groups);
     print_resident_kernel_named_timestamp_groups("grouped op intervals", op_groups);
 
     if !semantic_groups.is_empty() {

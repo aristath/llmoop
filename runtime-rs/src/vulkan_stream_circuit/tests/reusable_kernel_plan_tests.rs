@@ -1,12 +1,12 @@
 #[test]
 fn reusable_kernel_plan_keeps_compile_time_specializations_distinct() {
     let command =
-        |dispatch_index: usize, pedal_id: &str, specialization: &str| VulkanKernelDispatchCommand {
+        |dispatch_index: usize, component_id: &str, specialization: &str| VulkanKernelDispatchCommand {
             dispatch_index,
             circuit_index: dispatch_index,
-            kernel_id: format!("{pedal_id}.per_layer_embedding"),
-            pedal_id: pedal_id.to_string(),
-            circuit_id: format!("{pedal_id}_circuit"),
+            kernel_id: format!("{component_id}.per_layer_embedding"),
+            component_id: component_id.to_string(),
+            circuit_id: format!("{component_id}_circuit"),
             node_index: 0,
             node_id: "per_layer_embedding".to_string(),
             op: "per_layer_embedding".to_string(),
@@ -225,7 +225,7 @@ fn reusable_kernel_plan_collapses_fixture_model_dispatches_into_op_families() {
 }
 
 #[test]
-fn reusable_kernel_coverage_reports_missing_gpu_pedal_circuits() {
+fn reusable_kernel_coverage_reports_missing_gpu_component_circuits() {
     let graph = fixture_model_execution_graph();
     let tensor_index = TensorIndex::from_json_file(fixture_model_tensor_index_path()).unwrap();
     let execution_plan =

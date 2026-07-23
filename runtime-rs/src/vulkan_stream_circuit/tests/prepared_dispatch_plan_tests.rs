@@ -77,20 +77,20 @@ fn prepared_dispatch_plan_links_artifacts_to_descriptor_resources() {
     assert!(matches!(
         kv_append.descriptors[2].resource,
         VulkanDescriptorResourceAddress::StateBuffer {
-            ref pedal_id,
+            ref component_id,
             ref state_id,
             byte_capacity: 8192,
             ..
-        } if pedal_id == "layer_02" && state_id == "kv_memory"
+        } if component_id == "layer_02" && state_id == "kv_memory"
     ));
     assert!(matches!(
         kv_append.descriptors[6].resource,
         VulkanDescriptorResourceAddress::StateBuffer {
-            ref pedal_id,
+            ref component_id,
             ref state_id,
             byte_capacity: 8192,
             ..
-        } if pedal_id == "layer_02" && state_id == "kv_memory"
+        } if component_id == "layer_02" && state_id == "kv_memory"
     ));
 }
 
@@ -221,7 +221,7 @@ fn bound_dispatch_plan_maps_prepared_descriptors_to_mounted_stream_buffers() {
         first.descriptors[1].target,
         VulkanBoundDescriptorTarget::ActivationSlot {
             buffer_index: buffers.activation_slot_buffer_index("layer_00", 0).unwrap(),
-            pedal_id: "layer_00".to_string(),
+            component_id: "layer_00".to_string(),
             signal_id: "operator_norm_out".to_string(),
             circuit_id: "layer_00_shortconv_circuit_v1".to_string(),
             slot: 0,
@@ -242,29 +242,29 @@ fn bound_dispatch_plan_maps_prepared_descriptors_to_mounted_stream_buffers() {
     assert!(matches!(
         kv_append.descriptors[2].target,
         VulkanBoundDescriptorTarget::StreamStateBuffer {
-            ref pedal_id,
+            ref component_id,
             ref state_id,
             byte_capacity: 8192,
             ..
-        } if pedal_id == "layer_02" && state_id == "kv_memory"
+        } if component_id == "layer_02" && state_id == "kv_memory"
     ));
     assert!(matches!(
         kv_append.descriptors[6].target,
         VulkanBoundDescriptorTarget::StreamStateBuffer {
-            ref pedal_id,
+            ref component_id,
             ref state_id,
             byte_capacity: 8192,
             ..
-        } if pedal_id == "layer_02" && state_id == "kv_memory"
+        } if component_id == "layer_02" && state_id == "kv_memory"
     ));
     assert!(matches!(
         kv_append.descriptors[7].target,
         VulkanBoundDescriptorTarget::StreamStateView {
-            ref pedal_id,
+            ref component_id,
             ref state_id,
             byte_capacity: 8192,
             ..
-        } if pedal_id == "layer_02" && state_id == "kv_memory"
+        } if component_id == "layer_02" && state_id == "kv_memory"
     ));
 }
 

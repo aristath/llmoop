@@ -1,4 +1,4 @@
-fn resident_single_token_tick_runs_input_board_and_output_to_logits() {
+fn resident_single_token_tick_runs_input_graph_and_output_to_logits() {
     let device = match VulkanComputeDevice::new() {
         Ok(device) => device,
         Err(error) => {
@@ -42,7 +42,7 @@ fn resident_single_token_tick_runs_input_board_and_output_to_logits() {
 
     let transducer_parameter_buffers =
         load_fixture_model_transducer_parameter_buffers(&device, &tensor_index);
-    let pedal_ids = prepare_fixture_model_resident_prefix(&mounted, &tensor_index, 13);
+    let component_ids = prepare_fixture_model_resident_prefix(&mounted, &tensor_index, 13);
     let input_transducer =
         VulkanResidentInputEmbeddingTransducerRunner::from_mounted_token_embedding(
             &device,
@@ -52,12 +52,12 @@ fn resident_single_token_tick_runs_input_board_and_output_to_logits() {
             &fixture_model_input_embedding_transducer_spec(),
         )
         .unwrap();
-    let pedalboard = create_fixture_model_resident_prefix_runner(
+    let execution_graph = create_fixture_model_resident_prefix_runner(
         &device,
         &mounted,
         &mounted_bound,
         &loaded_manifest,
-        &pedal_ids,
+        &component_ids,
     );
     let output_transducer = VulkanResidentOutputTransducerRunner::from_mounted_output_transducer(
         &device,
@@ -71,12 +71,12 @@ fn resident_single_token_tick_runs_input_board_and_output_to_logits() {
     let runner = VulkanResidentSingleTokenTickRunner::new(
         &device,
         input_transducer,
-        pedalboard,
+        execution_graph,
         output_transducer,
     )
     .unwrap();
     assert_eq!(runner.device_id, "gpu0");
-    assert_eq!(runner.pedal_count, 14);
+    assert_eq!(runner.component_count, 14);
     assert_eq!(runner.dispatch_count, 245);
     assert_eq!(runner.total_descriptor_count, 827);
     assert_eq!(runner.total_push_constant_byte_count, 0);
@@ -99,7 +99,7 @@ fn resident_single_token_tick_runs_input_board_and_output_to_logits() {
         run.input_run.output_signal_id,
         FIXTURE_MODEL_INPUT_FRAME_SIGNAL
     );
-    assert_fixture_model_resident_prefix_run(&run.pedalboard_run, &pedal_ids, 242);
+    assert_fixture_model_resident_prefix_run(&run.execution_graph_run, &component_ids, 242);
     assert_eq!(run.output_run.as_ref().unwrap().dispatch_count, 2);
     assert_eq!(
         run.output_run.as_ref().unwrap().logits_byte_capacity,
@@ -202,7 +202,7 @@ fn create_fixture_model_resident_greedy_stream_processor_with_capacity(
         device,
         &tensor_index,
     ));
-    let pedal_ids = prepare_fixture_model_resident_prefix(&mounted, &tensor_index, 13);
+    let component_ids = prepare_fixture_model_resident_prefix(&mounted, &tensor_index, 13);
     let input_transducer =
         VulkanResidentInputEmbeddingTransducerRunner::from_mounted_token_embedding(
             device,
@@ -212,12 +212,12 @@ fn create_fixture_model_resident_greedy_stream_processor_with_capacity(
             &fixture_model_input_embedding_transducer_spec(),
         )
         .unwrap();
-    let pedalboard = create_fixture_model_resident_prefix_runner(
+    let execution_graph = create_fixture_model_resident_prefix_runner(
         device,
         &mounted,
         &mounted_bound,
         &loaded_manifest,
-        &pedal_ids,
+        &component_ids,
     );
     let output_transducer = VulkanResidentOutputTransducerRunner::from_mounted_output_transducer(
         device,
@@ -240,7 +240,7 @@ fn create_fixture_model_resident_greedy_stream_processor_with_capacity(
     let tick_runner = VulkanResidentSingleTokenTickRunner::new(
         device,
         input_transducer,
-        pedalboard,
+        execution_graph,
         output_transducer,
     )
     .unwrap();
@@ -271,7 +271,7 @@ fn resident_greedy_feedback_loop_runs_two_ticks() {
         return;
     };
     assert_eq!(processor.device_id, "gpu0");
-    assert_eq!(processor.pedal_count, 14);
+    assert_eq!(processor.component_count, 14);
     assert_eq!(processor.per_tick_dispatch_count, 246);
     assert_eq!(processor.per_tick_descriptor_count, 830);
     assert_eq!(processor.per_tick_push_constant_byte_count, 0);
@@ -849,7 +849,7 @@ fn resident_feedback_cycle_restores_recurrent_state_when_eos_arrives_mid_cycle()
         .filter(|state| state.static_byte_capacity.is_some())
         .map(|state| {
             (
-                state.pedal_id.clone(),
+                state.component_id.clone(),
                 state.state_id.clone(),
                 state.buffer.read_bytes(state.byte_capacity).unwrap(),
             )
@@ -878,7 +878,7 @@ fn resident_feedback_cycle_restores_recurrent_state_when_eos_arrives_mid_cycle()
         .filter(|state| state.static_byte_capacity.is_some())
         .map(|state| {
             (
-                state.pedal_id.clone(),
+                state.component_id.clone(),
                 state.state_id.clone(),
                 state.buffer.read_bytes(state.byte_capacity).unwrap(),
             )

@@ -43,7 +43,7 @@ pub struct VulkanResidentInProcessPlacedPromptEventRun {
     pub tick_count: usize,
     pub scheduler_turn_count: usize,
     pub completed_stage_count: usize,
-    pub transport_stats: VulkanPlacedCableTransportStats,
+    pub transport_stats: VulkanPlacedEdgeTransportStats,
     pub output_source_stream_ticks: Vec<u64>,
     pub speculative_decode: VulkanSpeculativeDecodeStats,
 }
@@ -60,7 +60,7 @@ struct VulkanResidentInProcessPlacedActivePromptEvent {
     tick_count: usize,
     scheduler_turn_count: usize,
     completed_stage_count: usize,
-    transport_stats: VulkanPlacedCableTransportStats,
+    transport_stats: VulkanPlacedEdgeTransportStats,
     generated_token_ids: Vec<u32>,
     output_source_stream_ticks: Vec<u64>,
     output_events: Vec<VulkanResidentTokenOutputEvent>,
@@ -91,7 +91,7 @@ impl VulkanResidentInProcessPlacedActivePromptEvent {
             tick_count: 0,
             scheduler_turn_count: 0,
             completed_stage_count: 0,
-            transport_stats: VulkanPlacedCableTransportStats::default(),
+            transport_stats: VulkanPlacedEdgeTransportStats::default(),
             speculative_decode: VulkanSpeculativeDecodeStats::default(),
         })
     }
@@ -156,7 +156,7 @@ impl VulkanResidentInProcessPlacedActivePromptEvent {
         stream_tick: u64,
         scheduler_turn_count: usize,
         completed_stage_count: usize,
-        transport_stats: &VulkanPlacedCableTransportStats,
+        transport_stats: &VulkanPlacedEdgeTransportStats,
         sampled_token_id: Option<u32>,
     ) -> Result<Option<VulkanResidentTokenOutputEvent>, VulkanResidentInProcessPlacedRuntimeError>
     {
