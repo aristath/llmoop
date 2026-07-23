@@ -65,6 +65,8 @@ def compile_model_package(
         cancel_requested=cancel_requested,
     )
     check_compile_cancelled(cancel_requested)
+    derive_internal_q8_linear_tensors(lowered["index"], lowered_dir, tensor_index)
+    write_json(transpiled_dir / "tensors.json", tensor_index)
     tensor_index = referenced_tensor_index(
         tensor_index,
         model_graph=model_graph,

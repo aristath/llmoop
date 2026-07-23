@@ -1,5 +1,8 @@
 from model_package_layout_common import *
-from nerve.model_package_derived_tensors import derive_output_projection_tensors
+from nerve.model_package_derived_tensors import (
+    derive_internal_q8_linear_tensors,
+    derive_output_projection_tensors,
+)
 from nerve.model_package_tensors import (
     e4m3fn_to_f32,
     f32_to_bf16_bytes,
@@ -222,6 +225,86 @@ def test_compiler_writes_internal_q8_0_blocks_from_block_scaled_fp8(
         quantized = np.frombuffer(block[4:], dtype=np.int8).astype(np.float32)
         reconstructed[row, :] = quantized * scale_value
     assert np.max(np.abs(reconstructed - expected)) < 0.04
+
+
+def test_compiler_rewrites_eligible_fp8_linears_to_internal_q8(
+    tmp_path: Path,
+) -> None:
+    lowered_dir = tmp_path / "lowered"
+    circuit_dir = lowered_dir / "layer_00"
+    circuit_dir.mkdir(parents=True)
+    circuit = {
+        "parameters": {
+            "refs": {
+                "projection": {
+                    "tensor": "layer.proj.weight",
+                    "role": "projection",
+                },
+                "projection_scale_inv": {
+                    "tensor": "layer.proj.weight_scale_inv",
+                    "role": "projection_scale",
+                },
+            }
+        },
+        "nodes": [
+            {
+                "id": "projection",
+                "op": "linear",
+                "inputs": ["hidden"],
+                "outputs": ["projected"],
+                "params": ["projection", "projection_scale_inv"],
+            }
+        ],
+    }
+    (circuit_dir / "circuit.json").write_text(json.dumps(circuit))
+    lowered_index = {
+        "graph": {
+            "circuits": [
+                {
+                    "id": "layer_00",
+                    "circuit": "layer_00/circuit.json",
+                }
+            ]
+        }
+    }
+    tensor_index = {
+        "tensors": {
+            "layer.proj.weight": {
+                "dtype": "F8_E4M3",
+                "shape": [64, 128],
+                "parameter_count": 64 * 128,
+                "byte_count": 64 * 128,
+                "source_file": "/models/source.safetensors",
+                "source_header_bytes": 128,
+                "data_offsets": [0, 64 * 128],
+            },
+            "layer.proj.weight_scale_inv": {
+                "dtype": "BF16",
+                "shape": [1, 1],
+                "parameter_count": 1,
+                "byte_count": 2,
+                "source_file": "/models/source.safetensors",
+                "source_header_bytes": 128,
+                "data_offsets": [64 * 128, 64 * 128 + 2],
+            },
+        }
+    }
+
+    derive_internal_q8_linear_tensors(lowered_index, lowered_dir, tensor_index)
+
+    rewritten = json.loads((circuit_dir / "circuit.json").read_text())
+    q8_tensor = "layer.proj.weight.__nerve_q8_0"
+    assert rewritten["nodes"][0]["params"] == ["projection"]
+    assert rewritten["parameters"]["refs"] == {
+        "projection": {"tensor": q8_tensor, "role": "projection"}
+    }
+    assert tensor_index["tensors"][q8_tensor]["dtype"] == "Q8_0"
+    assert tensor_index["tensors"][q8_tensor]["shape"] == [64, 4, 9]
+    assert tensor_index["tensors"][q8_tensor]["logical_shape"] == [64, 128]
+    assert tensor_index["tensors"][q8_tensor]["byte_count"] == 64 * 4 * 36
+    assert tensor_index["tensors"][q8_tensor]["derived"]["kind"] == (
+        "fp8_e4m3_to_q8_0"
+    )
 
 
 def test_compiler_renders_row_major_matrix_and_transducer_shaders(
