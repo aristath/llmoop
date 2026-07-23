@@ -933,7 +933,7 @@ def local_size_x_for_shader_file(shader_file: str, node: Json) -> int:
         r"parallel_linear_silu_multiply_fp8_e4m3_b\d+x\d+_\d+x\d+\.comp",
         shader_file,
     ):
-        return 512
+        return 1024
     return local_size_x_for_node(node)
 
 

@@ -14,7 +14,7 @@ spirv_instruction(
 )
 float fp8_dot4_acc32(fe4m3vec4 a, fe4m3vec4 b, float accumulator);
 
-layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
+layout(local_size_x = 1024, local_size_y = 1, local_size_z = 1) in;
 
 layout(set = 0, binding = 0) readonly buffer InputFrame { uint words[]; } input_frame;
 layout(set = 0, binding = 1) readonly buffer ResidualFrame { uint words[]; } residual_frame;
@@ -80,7 +80,7 @@ void main() {
     uint lane = gl_LocalInvocationID.x;
     uint cluster = lane >> 5u;
     uint cluster_lane = lane & 31u;
-    for (uint block = cluster; block < INPUT_BLOCKS; block += 16u) {
+    for (uint block = cluster; block < INPUT_BLOCKS; block += 32u) {
         uint word = block * BLOCK_FP8_WORDS + cluster_lane;
         vec4 input_value = read_inputx4(word * 4u);
         float lane_max = max(
