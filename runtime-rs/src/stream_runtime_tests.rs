@@ -1,4 +1,5 @@
 use super::*;
+use crate::stream_prefix_cache::RuntimePrefixStateCacheKey;
 
 fn budget(max_activations: usize) -> RuntimeStreamSchedulerBudget {
     RuntimeStreamSchedulerBudget::new(max_activations, 2, 16)
@@ -409,6 +410,151 @@ fn scheduler_shares_single_component_state_between_streams() {
         .ref_count;
     assert_eq!(kv_ref_count, 2);
     assert_eq!(conv_ref_count, 1);
+}
+
+#[test]
+fn scheduler_prefix_cache_restores_state_after_source_reset() {
+    let prefix_key = RuntimePrefixStateCacheKey::from_token_prefix(
+        "package_a",
+        "graph_a",
+        &[1, 2],
+        b"reasoning=true",
+        [state_key()],
+    )
+    .unwrap();
+    let mut scheduler = RuntimeStreamScheduler::with_prefix_state_cache_capacity(2);
+    scheduler
+        .add_stream_with_state_declarations_and_execution_class(
+            "source",
+            "package_a",
+            [(state_key(), state_shape())],
+        )
+        .unwrap();
+    scheduler
+        .enqueue_input_event("source", RuntimeStreamInputEvent::new("event_0", [1, 2], 8))
+        .unwrap();
+    let prefill = scheduler.schedule_step(budget(1)).unwrap().activations[0].clone();
+    scheduler
+        .complete_activation(
+            prefill.id,
+            RuntimeStreamActivationOutcome::prefill_complete(),
+        )
+        .unwrap();
+
+    scheduler
+        .cache_stream_prefix_state("source", prefix_key.clone())
+        .unwrap();
+    let cached_block = scheduler
+        .stream_transient_state_snapshot("source")
+        .unwrap()
+        .entries[0]
+        .block_ids[0];
+    assert_eq!(
+        scheduler
+            .transient_state_arena_snapshot()
+            .unwrap()
+            .blocks
+            .iter()
+            .find(|block| block.block_id == cached_block)
+            .unwrap()
+            .ref_count,
+        2
+    );
+
+    scheduler.interrupt_stream("source", "drop source").unwrap();
+    scheduler
+        .add_stream_with_state_declarations_and_execution_class(
+            "target",
+            "package_a",
+            [(state_key(), state_shape())],
+        )
+        .unwrap();
+    let restored = scheduler
+        .restore_stream_prefix_state("target", &prefix_key)
+        .unwrap();
+
+    assert!(restored);
+    assert_eq!(
+        scheduler
+            .stream_transient_state_snapshot("target")
+            .unwrap()
+            .entries[0]
+            .block_ids,
+        vec![cached_block]
+    );
+    let cache_snapshot = scheduler.prefix_state_cache_snapshot();
+    assert_eq!(cache_snapshot.entry_count, 1);
+    assert_eq!(cache_snapshot.entries[0].use_count, 1);
+    assert_eq!(
+        scheduler
+            .transient_state_arena_snapshot()
+            .unwrap()
+            .blocks
+            .iter()
+            .find(|block| block.block_id == cached_block)
+            .unwrap()
+            .ref_count,
+        2
+    );
+}
+
+#[test]
+fn scheduler_prefix_cache_rejects_execution_class_mismatch_without_mutation() {
+    let prefix_key = RuntimePrefixStateCacheKey::from_token_prefix(
+        "package_a",
+        "graph_a",
+        &[1, 2],
+        b"reasoning=true",
+        [state_key()],
+    )
+    .unwrap();
+    let mut scheduler = RuntimeStreamScheduler::with_prefix_state_cache_capacity(2);
+    scheduler
+        .add_stream_with_state_declarations_and_execution_class(
+            "source",
+            "package_a",
+            [(state_key(), state_shape())],
+        )
+        .unwrap();
+    scheduler
+        .add_stream_with_state_declarations_and_execution_class(
+            "target",
+            "package_b",
+            [(state_key(), state_shape())],
+        )
+        .unwrap();
+    scheduler
+        .enqueue_input_event("source", RuntimeStreamInputEvent::new("event_0", [1, 2], 8))
+        .unwrap();
+    let prefill = scheduler.schedule_step(budget(1)).unwrap().activations[0].clone();
+    scheduler
+        .complete_activation(
+            prefill.id,
+            RuntimeStreamActivationOutcome::prefill_complete(),
+        )
+        .unwrap();
+    scheduler
+        .cache_stream_prefix_state("source", prefix_key.clone())
+        .unwrap();
+    let before_target = scheduler.stream_transient_state_snapshot("target").unwrap();
+
+    let error = scheduler
+        .restore_stream_prefix_state("target", &prefix_key)
+        .unwrap_err();
+
+    assert!(
+        error
+            .0
+            .contains("cannot restore prefix key execution class")
+    );
+    assert_eq!(
+        scheduler.stream_transient_state_snapshot("target").unwrap(),
+        before_target
+    );
+    assert_eq!(
+        scheduler.prefix_state_cache_snapshot().entries[0].use_count,
+        0
+    );
 }
 
 #[test]

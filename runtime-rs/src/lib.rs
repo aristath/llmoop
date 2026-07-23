@@ -2,6 +2,7 @@
 pub mod editor;
 pub mod stream_circuit;
 pub mod stream_plan;
+pub mod stream_prefix_cache;
 pub mod stream_runtime;
 pub mod stream_state;
 pub mod tensor_storage;
@@ -21,6 +22,7 @@ pub mod vulkan_stream_circuit;
 pub use editor::*;
 pub use stream_circuit::*;
 pub use stream_plan::*;
+pub use stream_prefix_cache::*;
 pub use stream_runtime::*;
 pub use stream_state::*;
 pub use tensor_storage::*;

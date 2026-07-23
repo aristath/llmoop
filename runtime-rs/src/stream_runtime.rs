@@ -2,6 +2,10 @@ use std::collections::{BTreeMap, VecDeque};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 
+use crate::stream_prefix_cache::{
+    RuntimePrefixStateCache, RuntimePrefixStateCacheError, RuntimePrefixStateCacheKey,
+    RuntimePrefixStateCacheSnapshot,
+};
 use crate::stream_state::{
     TransientStateArena, TransientStateArenaSnapshot, TransientStateBlockShape,
     TransientStateError, TransientStateKey, TransientStateSlot, TransientStateTable,
@@ -251,6 +255,12 @@ impl From<TransientStateError> for RuntimeStreamSchedulerError {
     }
 }
 
+impl From<RuntimePrefixStateCacheError> for RuntimeStreamSchedulerError {
+    fn from(error: RuntimePrefixStateCacheError) -> Self {
+        Self(error.to_string())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct RuntimeStreamCurrentEvent {
     event: RuntimeStreamInputEvent,
@@ -409,12 +419,20 @@ pub struct RuntimeStreamScheduler {
     active_queue: VecDeque<String>,
     in_flight: BTreeMap<u64, RuntimeStreamActivation>,
     transient_state_arena: TransientStateArena,
+    prefix_state_cache: RuntimePrefixStateCache,
     next_activation_id: u64,
 }
 
 impl RuntimeStreamScheduler {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn with_prefix_state_cache_capacity(capacity_entries: usize) -> Self {
+        Self {
+            prefix_state_cache: RuntimePrefixStateCache::new(capacity_entries),
+            ..Self::default()
+        }
     }
 
     pub fn add_stream_with_execution_class(
@@ -510,6 +528,10 @@ impl RuntimeStreamScheduler {
         Ok(self.stream(stream_id)?.transient_state_table.snapshot())
     }
 
+    pub fn prefix_state_cache_snapshot(&self) -> RuntimePrefixStateCacheSnapshot {
+        self.prefix_state_cache.snapshot()
+    }
+
     pub fn fork_stream_transient_state(
         &mut self,
         source_stream_id: &str,
@@ -561,6 +583,48 @@ impl RuntimeStreamScheduler {
             .transient_state_table
             .share_state_from(arena, &source_table, key)?;
         Ok(target.snapshot())
+    }
+
+    pub fn cache_stream_prefix_state(
+        &mut self,
+        stream_id: &str,
+        key: RuntimePrefixStateCacheKey,
+    ) -> Result<(), RuntimeStreamSchedulerError> {
+        let source = self.stream(stream_id)?;
+        if source.execution_class_id != key.execution_class_id {
+            return Err(RuntimeStreamSchedulerError(format!(
+                "cannot cache stream {stream_id:?} with execution class {:?} under prefix key execution class {:?}",
+                source.execution_class_id, key.execution_class_id
+            )));
+        }
+        let source_table = source.transient_state_table.clone();
+        self.prefix_state_cache
+            .insert(&mut self.transient_state_arena, key, &source_table)?;
+        Ok(())
+    }
+
+    pub fn restore_stream_prefix_state(
+        &mut self,
+        target_stream_id: &str,
+        key: &RuntimePrefixStateCacheKey,
+    ) -> Result<bool, RuntimeStreamSchedulerError> {
+        let target_execution_class_id = self.stream(target_stream_id)?.execution_class_id.clone();
+        if target_execution_class_id != key.execution_class_id {
+            return Err(RuntimeStreamSchedulerError(format!(
+                "cannot restore prefix key execution class {:?} into stream {target_stream_id:?} with execution class {:?}",
+                key.execution_class_id, target_execution_class_id
+            )));
+        }
+        let target = self.streams.get_mut(target_stream_id).ok_or_else(|| {
+            RuntimeStreamSchedulerError(format!("unknown stream {target_stream_id:?}"))
+        })?;
+        self.prefix_state_cache
+            .restore_into(
+                &mut self.transient_state_arena,
+                key,
+                &mut target.transient_state_table,
+            )
+            .map_err(RuntimeStreamSchedulerError::from)
     }
 
     pub fn enqueue_input_event(

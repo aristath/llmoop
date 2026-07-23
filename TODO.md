@@ -324,13 +324,19 @@ Current status:
   top of the ref-counted transient state arena. A stream can branch into a new
   idle stream with the same resident transient blocks, and individual component
   state can be shared into another stream without copying unrelated state.
-- Tests guard that shared blocks are retained by ref count, that source reset
-  does not destroy forked child state, and that per-component sharing does not
-  accidentally merge every state entry.
-- This is not finished prefix caching yet: prompt/state hash keys, cache
-  admission, block-aligned lookup, eviction policy, runtime graph identity in
-  keys, and backend page-backed bindings still need to be wired into normal
-  prompt admission.
+- Prefix-cache keys now include execution class, runtime graph identity, token
+  prefix hash, runtime modifier hash, token count, and normalized component
+  state keys.
+- A backend-neutral retained prefix-state cache can keep state tables alive
+  independently from the source stream, restore them into compatible streams,
+  and evict older entries while releasing retained blocks.
+- Tests guard shared block ref counts, source-reset survival, per-component
+  sharing, key normalization, eviction release, and execution-class mismatch
+  rejection.
+- This is not finished prompt prefix caching yet: block-aligned prompt
+  admission, longest-prefix lookup, automatic cache insert/restore around
+  normal prompt events, runtime modifier serialization, and backend page-backed
+  bindings still need to be wired into normal prompt admission.
 
 ### 12. Make graph/kernel reuse explicit
 

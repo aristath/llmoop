@@ -377,25 +377,49 @@ impl TransientStateTable {
         source: &Self,
         key: &TransientStateKey,
     ) -> Result<(), TransientStateError> {
-        let source_entry = source.entry(key)?;
-        if let Some(existing) = self.entries.get(key) {
-            if existing.shape != source_entry.shape {
-                return Err(TransientStateError(format!(
-                    "cannot share transient state {:?}.{} into a table with a different shape",
-                    key.node_instance_id, key.state_id
-                )));
-            }
-            if !existing.block_ids.is_empty() || existing.logical_activation_count != 0 {
-                return Err(TransientStateError(format!(
-                    "cannot replace non-empty transient state {:?}.{} with shared blocks",
-                    key.node_instance_id, key.state_id
-                )));
-            }
-        }
-        for block_id in unique_block_ids(source_entry.block_ids.iter().copied()) {
+        self.share_states_from(arena, source, [key])
+    }
+
+    pub fn share_states_from<'a, I>(
+        &mut self,
+        arena: &mut TransientStateArena,
+        source: &Self,
+        keys: I,
+    ) -> Result<(), TransientStateError>
+    where
+        I: IntoIterator<Item = &'a TransientStateKey>,
+    {
+        let shares = keys
+            .into_iter()
+            .map(|key| {
+                let source_entry = source.entry(key)?;
+                if let Some(existing) = self.entries.get(key) {
+                    if existing.shape != source_entry.shape {
+                        return Err(TransientStateError(format!(
+                            "cannot share transient state {:?}.{} into a table with a different shape",
+                            key.node_instance_id, key.state_id
+                        )));
+                    }
+                    if !existing.block_ids.is_empty() || existing.logical_activation_count != 0 {
+                        return Err(TransientStateError(format!(
+                            "cannot replace non-empty transient state {:?}.{} with shared blocks",
+                            key.node_instance_id, key.state_id
+                        )));
+                    }
+                }
+                Ok((key.clone(), source_entry.clone()))
+            })
+            .collect::<Result<Vec<_>, TransientStateError>>()?;
+        for block_id in unique_block_ids(
+            shares
+                .iter()
+                .flat_map(|(_, entry)| entry.block_ids.iter().copied()),
+        ) {
             arena.retain_block(block_id)?;
         }
-        self.entries.insert(key.clone(), source_entry.clone());
+        for (key, source_entry) in shares {
+            self.entries.insert(key, source_entry);
+        }
         Ok(())
     }
 
