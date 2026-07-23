@@ -925,6 +925,18 @@ def local_size_x_for_node(node: Json) -> int:
     return 64
 
 
+def local_size_x_for_shader_file(shader_file: str, node: Json) -> int:
+    if re.fullmatch(
+        r"(linear|linear_residual)_fp8_e4m3_b\d+x\d+_\d+x\d+\.comp",
+        shader_file,
+    ) or re.fullmatch(
+        r"parallel_linear_silu_multiply_fp8_e4m3_b\d+x\d+_\d+x\d+\.comp",
+        shader_file,
+    ):
+        return 256
+    return local_size_x_for_node(node)
+
+
 def fp8_linear_tile_rows(output_size: int) -> int:
     if output_size <= 0:
         raise ModelCompileError("FP8 linear output width must be positive")

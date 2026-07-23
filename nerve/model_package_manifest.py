@@ -589,7 +589,7 @@ def component_execution_specs(
                     execution_index=index,
                     node=node,
                     shader_file=shader_file,
-                    local_size_x=local_size_x_for_node(node),
+                    local_size_x=local_size_x_for_shader_file(shader_file, node),
                     workgroup_count_x=workgroup_count_x_for_node(
                         circuit, node, tensor_index
                     ),
@@ -730,7 +730,7 @@ def component_execution_spec(
                 execution_index=index,
                 node=node,
                 shader_file=shader_file,
-                local_size_x=local_size_x_for_node(node),
+                local_size_x=local_size_x_for_shader_file(shader_file, node),
                 workgroup_count_x=workgroup_count_x_for_node(
                     circuit, node, tensor_index
                 ),
