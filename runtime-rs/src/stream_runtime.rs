@@ -138,6 +138,41 @@ pub struct RuntimeStreamSchedulerStep {
     pub idle: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RuntimeStreamActivationBatchKind {
+    PrefillChunk { token_count: usize },
+    DecodeFeedback { max_tokens: usize },
+}
+
+impl RuntimeStreamActivationBatchKind {
+    pub fn for_activation(activation: &RuntimeStreamActivation) -> Self {
+        match &activation.kind {
+            RuntimeStreamActivationKind::PrefillChunk { token_ids, .. } => Self::PrefillChunk {
+                token_count: token_ids.len(),
+            },
+            RuntimeStreamActivationKind::DecodeFeedback { max_tokens, .. } => {
+                Self::DecodeFeedback {
+                    max_tokens: *max_tokens,
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuntimeStreamActivationBatch {
+    pub kind: RuntimeStreamActivationBatchKind,
+    pub activations: Vec<RuntimeStreamActivation>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuntimeStreamSchedulerBatchStep {
+    pub batches: Vec<RuntimeStreamActivationBatch>,
+    pub exhausted_activation_budget: bool,
+    pub exhausted_work_budget: bool,
+    pub idle: bool,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RuntimeStreamSchedulerRunStopCondition {
     Idle,
@@ -147,6 +182,12 @@ pub enum RuntimeStreamSchedulerRunStopCondition {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuntimeStreamCompletedActivation {
     pub activation: RuntimeStreamActivation,
+    pub outcome: RuntimeStreamActivationOutcome,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuntimeStreamBatchActivationOutcome {
+    pub activation_id: u64,
     pub outcome: RuntimeStreamActivationOutcome,
 }
 
@@ -513,6 +554,19 @@ impl RuntimeStreamScheduler {
         })
     }
 
+    pub fn schedule_batch_step(
+        &mut self,
+        budget: RuntimeStreamSchedulerBudget,
+    ) -> Result<RuntimeStreamSchedulerBatchStep, RuntimeStreamSchedulerError> {
+        let step = self.schedule_step(budget)?;
+        Ok(RuntimeStreamSchedulerBatchStep {
+            batches: group_compatible_stream_activations(step.activations),
+            exhausted_activation_budget: step.exhausted_activation_budget,
+            exhausted_work_budget: step.exhausted_work_budget,
+            idle: step.idle,
+        })
+    }
+
     pub fn run_until_idle_with<F>(
         &mut self,
         budget: RuntimeStreamSchedulerBudget,
@@ -565,6 +619,79 @@ impl RuntimeStreamScheduler {
             scheduled_steps,
             completed_activations,
             final_snapshot: self.snapshot(),
+        })
+    }
+
+    pub fn run_batches_until_idle_with<F>(
+        &mut self,
+        budget: RuntimeStreamSchedulerBudget,
+        max_steps: usize,
+        mut execute_batch: F,
+    ) -> Result<RuntimeStreamSchedulerRun, RuntimeStreamSchedulerError>
+    where
+        F: FnMut(
+            &RuntimeStreamActivationBatch,
+        )
+            -> Result<Vec<RuntimeStreamBatchActivationOutcome>, RuntimeStreamSchedulerError>,
+    {
+        let mut completed_activations = Vec::new();
+        let mut scheduled_steps = 0usize;
+
+        while scheduled_steps < max_steps {
+            let step = self.schedule_batch_step(budget.clone())?;
+            if step.batches.is_empty() && step.idle {
+                return Ok(RuntimeStreamSchedulerRun {
+                    stop_condition: RuntimeStreamSchedulerRunStopCondition::Idle,
+                    max_steps,
+                    scheduled_steps,
+                    completed_activations,
+                    final_snapshot: self.snapshot(),
+                });
+            }
+            if step.batches.is_empty() {
+                break;
+            }
+            scheduled_steps = scheduled_steps.saturating_add(1);
+            for batch in step.batches {
+                let mut outcomes = execute_batch(&batch)?;
+                for activation in batch.activations {
+                    let outcome_index = outcomes
+                        .iter()
+                        .position(|outcome| outcome.activation_id == activation.id)
+                        .ok_or_else(|| {
+                            RuntimeStreamSchedulerError(format!(
+                                "batch executor did not return an outcome for activation {}",
+                                activation.id
+                            ))
+                        })?;
+                    let outcome = outcomes.remove(outcome_index).outcome;
+                    self.complete_activation(activation.id, outcome.clone())?;
+                    completed_activations.push(RuntimeStreamCompletedActivation {
+                        activation,
+                        outcome,
+                    });
+                }
+                if !outcomes.is_empty() {
+                    return Err(RuntimeStreamSchedulerError(
+                        "batch executor returned outcomes for unknown activations".to_string(),
+                    ));
+                }
+            }
+        }
+
+        let snapshot = self.snapshot();
+        let stop_condition =
+            if snapshot.active_stream_count == 0 && snapshot.in_flight_activation_count == 0 {
+                RuntimeStreamSchedulerRunStopCondition::Idle
+            } else {
+                RuntimeStreamSchedulerRunStopCondition::StepBudget
+            };
+        Ok(RuntimeStreamSchedulerRun {
+            stop_condition,
+            max_steps,
+            scheduled_steps,
+            completed_activations,
+            final_snapshot: snapshot,
         })
     }
 
@@ -888,6 +1015,24 @@ impl RuntimeStreamScheduler {
     }
 }
 
+fn group_compatible_stream_activations(
+    activations: Vec<RuntimeStreamActivation>,
+) -> Vec<RuntimeStreamActivationBatch> {
+    let mut batches: Vec<RuntimeStreamActivationBatch> = Vec::new();
+    for activation in activations {
+        let kind = RuntimeStreamActivationBatchKind::for_activation(&activation);
+        if let Some(batch) = batches.iter_mut().find(|batch| batch.kind == kind) {
+            batch.activations.push(activation);
+        } else {
+            batches.push(RuntimeStreamActivationBatch {
+                kind,
+                activations: vec![activation],
+            });
+        }
+    }
+    batches
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1173,6 +1318,183 @@ mod tests {
                 ))
                 .count(),
             2
+        );
+    }
+
+    #[test]
+    fn scheduler_batch_step_groups_compatible_decode_windows_across_streams() {
+        let mut scheduler = RuntimeStreamScheduler::new();
+        scheduler.add_stream("stream_a").unwrap();
+        scheduler.add_stream("stream_b").unwrap();
+        scheduler
+            .declare_stream_state("stream_a", state_key(), state_shape())
+            .unwrap();
+        scheduler
+            .declare_stream_state("stream_b", state_key(), state_shape())
+            .unwrap();
+        scheduler
+            .enqueue_input_event("stream_a", RuntimeStreamInputEvent::new("event_a", [10], 4))
+            .unwrap();
+        scheduler
+            .enqueue_input_event("stream_b", RuntimeStreamInputEvent::new("event_b", [20], 4))
+            .unwrap();
+
+        let prefill = scheduler.schedule_batch_step(budget(2)).unwrap();
+        assert_eq!(prefill.batches.len(), 1);
+        assert_eq!(
+            prefill.batches[0].kind,
+            RuntimeStreamActivationBatchKind::PrefillChunk { token_count: 1 }
+        );
+        for activation in &prefill.batches[0].activations {
+            scheduler
+                .complete_activation(
+                    activation.id,
+                    RuntimeStreamActivationOutcome::prefill_complete(),
+                )
+                .unwrap();
+        }
+
+        let decode_budget =
+            RuntimeStreamSchedulerBudget::new(2, 2, 16).with_max_decode_tokens_per_activation(4);
+        let decode = scheduler.schedule_batch_step(decode_budget).unwrap();
+
+        assert_eq!(decode.batches.len(), 1);
+        assert_eq!(
+            decode.batches[0].kind,
+            RuntimeStreamActivationBatchKind::DecodeFeedback { max_tokens: 4 }
+        );
+        let stream_ids = decode.batches[0]
+            .activations
+            .iter()
+            .map(|activation| activation.stream_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(stream_ids, vec!["stream_a", "stream_b"]);
+        assert_ne!(
+            decode.batches[0].activations[0].state_reservations[0].slots[0].block_id,
+            decode.batches[0].activations[1].state_reservations[0].slots[0].block_id
+        );
+    }
+
+    #[test]
+    fn scheduler_batch_step_keeps_incompatible_prefill_shapes_separate() {
+        let mut scheduler = RuntimeStreamScheduler::new();
+        scheduler.add_stream("stream_a").unwrap();
+        scheduler.add_stream("stream_b").unwrap();
+        scheduler
+            .enqueue_input_event(
+                "stream_a",
+                RuntimeStreamInputEvent::new("event_a", [1, 2], 1),
+            )
+            .unwrap();
+        scheduler
+            .enqueue_input_event("stream_b", RuntimeStreamInputEvent::new("event_b", [3], 1))
+            .unwrap();
+
+        let step = scheduler.schedule_batch_step(budget(2)).unwrap();
+
+        assert_eq!(step.batches.len(), 2);
+        assert_eq!(
+            step.batches[0].kind,
+            RuntimeStreamActivationBatchKind::PrefillChunk { token_count: 2 }
+        );
+        assert_eq!(
+            step.batches[1].kind,
+            RuntimeStreamActivationBatchKind::PrefillChunk { token_count: 1 }
+        );
+        assert_eq!(step.batches[0].activations.len(), 1);
+        assert_eq!(step.batches[1].activations.len(), 1);
+    }
+
+    #[test]
+    fn scheduler_batch_run_requires_exact_outcomes_for_every_activation() {
+        let mut scheduler = RuntimeStreamScheduler::new();
+        scheduler.add_stream("stream_a").unwrap();
+        scheduler.add_stream("stream_b").unwrap();
+        scheduler
+            .enqueue_input_event("stream_a", RuntimeStreamInputEvent::new("event_a", [1], 1))
+            .unwrap();
+        scheduler
+            .enqueue_input_event("stream_b", RuntimeStreamInputEvent::new("event_b", [2], 1))
+            .unwrap();
+
+        let error = scheduler
+            .run_batches_until_idle_with(budget(2), 1, |batch| {
+                Ok(vec![RuntimeStreamBatchActivationOutcome {
+                    activation_id: batch.activations[0].id,
+                    outcome: RuntimeStreamActivationOutcome::prefill_complete(),
+                }])
+            })
+            .unwrap_err();
+
+        assert!(
+            error
+                .0
+                .contains("batch executor did not return an outcome for activation")
+        );
+    }
+
+    #[test]
+    fn scheduler_batch_run_drives_multiple_streams_until_idle() {
+        let mut scheduler = RuntimeStreamScheduler::new();
+        scheduler.add_stream("stream_a").unwrap();
+        scheduler.add_stream("stream_b").unwrap();
+        scheduler
+            .enqueue_input_event("stream_a", RuntimeStreamInputEvent::new("event_a", [1], 2))
+            .unwrap();
+        scheduler
+            .enqueue_input_event("stream_b", RuntimeStreamInputEvent::new("event_b", [2], 2))
+            .unwrap();
+
+        let run = scheduler
+            .run_batches_until_idle_with(
+                RuntimeStreamSchedulerBudget::new(2, 2, 16)
+                    .with_max_decode_tokens_per_activation(2),
+                8,
+                |batch| {
+                    Ok(batch
+                        .activations
+                        .iter()
+                        .map(|activation| {
+                            let outcome = match activation.kind {
+                                RuntimeStreamActivationKind::PrefillChunk { .. } => {
+                                    RuntimeStreamActivationOutcome::prefill_complete()
+                                }
+                                RuntimeStreamActivationKind::DecodeFeedback { .. } => {
+                                    RuntimeStreamActivationOutcome::generated_tokens(
+                                        [activation.id as u32, activation.id as u32 + 100],
+                                        false,
+                                    )
+                                }
+                            };
+                            RuntimeStreamBatchActivationOutcome {
+                                activation_id: activation.id,
+                                outcome,
+                            }
+                        })
+                        .collect())
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            run.stop_condition,
+            RuntimeStreamSchedulerRunStopCondition::Idle
+        );
+        assert_eq!(run.final_snapshot.active_stream_count, 0);
+        assert_eq!(run.completed_activations.len(), 4);
+        assert!(
+            run.final_snapshot
+                .streams
+                .iter()
+                .all(|stream| stream.completed_input_event_count == 1)
+        );
+        assert_eq!(
+            run.final_snapshot
+                .streams
+                .iter()
+                .map(|stream| stream.generated_token_count)
+                .sum::<usize>(),
+            4
         );
     }
 

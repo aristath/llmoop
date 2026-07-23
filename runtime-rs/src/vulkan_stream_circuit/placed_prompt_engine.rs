@@ -218,55 +218,58 @@ impl VulkanResidentInProcessPlacedPromptEngine {
         let start_snapshot = self.snapshot();
         let mut input_runs = Vec::new();
         let mut output_events = Vec::new();
+        let scheduler_activation_capacity = self.streams.len().max(1);
         let scheduler_budget = RuntimeStreamSchedulerBudget::new(
-            1,
+            scheduler_activation_capacity,
             VULKAN_BACKEND_LOOP_MAX_WINDOW,
-            VULKAN_BACKEND_LOOP_MAX_WINDOW,
+            scheduler_activation_capacity.saturating_mul(VULKAN_BACKEND_LOOP_MAX_WINDOW),
         )
         .with_max_decode_tokens_per_activation(VULKAN_BACKEND_LOOP_MAX_WINDOW);
 
         while input_runs.len() < max_input_events {
             let scheduler_step = self
                 .runtime_scheduler
-                .schedule_step(scheduler_budget.clone())?;
-            if scheduler_step.activations.is_empty() {
+                .schedule_batch_step(scheduler_budget.clone())?;
+            if scheduler_step.batches.is_empty() {
                 break;
             }
 
-            for activation in scheduler_step.activations {
-                if input_runs.len() >= max_input_events {
-                    break;
-                }
-                let stream_id = activation.stream_id.clone();
-                let stream = self.streams.get_mut(&stream_id).ok_or_else(|| {
-                    VulkanResidentInProcessPlacedPromptEngineError::UnknownStream {
-                        stream_id: stream_id.clone(),
+            for batch in scheduler_step.batches {
+                for activation in batch.activations {
+                    if input_runs.len() >= max_input_events {
+                        break;
                     }
-                })?;
-                let callback_stream_id = stream_id.clone();
-                let scheduled_run =
-                    stream.run_runtime_scheduler_activation_with_output(&activation, |output_event| {
-                        on_output_event(VulkanResidentTokenRuntimeSchedulerOutputEvent {
-                            stream_id: callback_stream_id.clone(),
-                            output_event,
-                        });
+                    let stream_id = activation.stream_id.clone();
+                    let stream = self.streams.get_mut(&stream_id).ok_or_else(|| {
+                        VulkanResidentInProcessPlacedPromptEngineError::UnknownStream {
+                            stream_id: stream_id.clone(),
+                        }
                     })?;
-                self.runtime_scheduler
-                    .complete_activation(activation.id, scheduled_run.outcome.clone())?;
+                    let callback_stream_id = stream_id.clone();
+                    let scheduled_run = stream
+                        .run_runtime_scheduler_activation_with_output(&activation, |output_event| {
+                            on_output_event(VulkanResidentTokenRuntimeSchedulerOutputEvent {
+                                stream_id: callback_stream_id.clone(),
+                                output_event,
+                            });
+                        })?;
+                    self.runtime_scheduler
+                        .complete_activation(activation.id, scheduled_run.outcome.clone())?;
 
-                let stream_output_events = placed_prompt_engine_output_events_for(
-                    &stream_id,
-                    &scheduled_run.output_events,
-                );
-                output_events.extend(stream_output_events.iter().cloned());
-                if let Some(submitted_run) = scheduled_run.completed_input_run {
-                    let stream_generated_token_ids = submitted_run.generated_token_ids.clone();
-                    input_runs.push(VulkanResidentInProcessPlacedPromptEngineInputRun {
-                        stream_id,
-                        submitted_run,
-                        output_events: stream_output_events,
-                        generated_token_ids: stream_generated_token_ids,
-                    });
+                    let stream_output_events = placed_prompt_engine_output_events_for(
+                        &stream_id,
+                        &scheduled_run.output_events,
+                    );
+                    output_events.extend(stream_output_events.iter().cloned());
+                    if let Some(submitted_run) = scheduled_run.completed_input_run {
+                        let stream_generated_token_ids = submitted_run.generated_token_ids.clone();
+                        input_runs.push(VulkanResidentInProcessPlacedPromptEngineInputRun {
+                            stream_id,
+                            submitted_run,
+                            output_events: stream_output_events,
+                            generated_token_ids: stream_generated_token_ids,
+                        });
+                    }
                 }
             }
         }
