@@ -460,7 +460,10 @@ impl VulkanResidentInProcessPlacedPromptStream {
             if ran_temporal_block {
                 continue;
             }
-            if self.run_speculative_feedback_window_with_output(&mut on_output_event)? {
+            if self.run_speculative_feedback_window_limited_with_output(
+                usize::MAX,
+                &mut on_output_event,
+            )? {
                 if self
                     .active_input_event
                     .as_ref()
@@ -492,8 +495,9 @@ impl VulkanResidentInProcessPlacedPromptStream {
         }
     }
 
-    fn run_speculative_feedback_window_with_output<F>(
+    fn run_speculative_feedback_window_limited_with_output<F>(
         &mut self,
+        max_public_outputs: usize,
         on_output_event: &mut F,
     ) -> Result<bool, VulkanResidentInProcessPlacedRuntimeError>
     where
@@ -512,12 +516,14 @@ impl VulkanResidentInProcessPlacedPromptStream {
             || activation.input_closes_loop_after_processing
             || !activation.should_emit_public_output
             || active.remaining_public_outputs < 2
+            || max_public_outputs < 2
         {
             return Ok(false);
         }
         let draft_token_count = self
             .speculative_draft_tokens
-            .min(active.remaining_public_outputs - 1);
+            .min(active.remaining_public_outputs - 1)
+            .min(max_public_outputs - 1);
         let stop_token_ids = active
             .input_event
             .stop_token_ids

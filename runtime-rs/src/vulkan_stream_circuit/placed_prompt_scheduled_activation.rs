@@ -149,27 +149,37 @@ impl VulkanResidentInProcessPlacedPromptStream {
         let mut generated = 0usize;
         while generated < max_tokens {
             let remaining = max_tokens - generated;
-            let generated_before = self
-                .active_input_event
-                .as_ref()
-                .map(|event| event.generated_token_ids.len())
-                .unwrap_or(0);
-            if self.run_resident_feedback_window_limited_with_output(remaining, on_output_event)? {
-                let generated_after = self
-                    .active_input_event
-                    .as_ref()
-                    .map(|event| event.generated_token_ids.len())
-                    .unwrap_or(generated_before);
-                let generated_delta = generated_after.saturating_sub(generated_before);
+            let generated_before = self.active_generated_token_count();
+            if self.run_speculative_feedback_window_limited_with_output(
+                remaining,
+                on_output_event,
+            )? {
+                let generated_delta = self.scheduled_feedback_generated_delta(
+                    generated_before,
+                    remaining,
+                    "speculative feedback window emitted more tokens than scheduled",
+                )?;
                 if generated_delta == 0 {
                     break;
                 }
                 generated += generated_delta;
-                if generated_delta > remaining {
-                    return Err(placed_scheduler_divergence(
-                        "resident feedback window emitted more tokens than scheduled",
-                    ));
+                if let Some(completed_run) = self.complete_active_input_event_if_complete()? {
+                    completed_input_run = Some(completed_run);
+                    break;
                 }
+                continue;
+            }
+
+            if self.run_resident_feedback_window_limited_with_output(remaining, on_output_event)? {
+                let generated_delta = self.scheduled_feedback_generated_delta(
+                    generated_before,
+                    remaining,
+                    "resident feedback window emitted more tokens than scheduled",
+                )?;
+                if generated_delta == 0 {
+                    break;
+                }
+                generated += generated_delta;
                 if let Some(completed_run) = self.complete_active_input_event_if_complete()? {
                     completed_input_run = Some(completed_run);
                     break;
@@ -206,6 +216,27 @@ impl VulkanResidentInProcessPlacedPromptStream {
             completed_input_run = self.close_scheduled_loop_if_exhausted()?;
         }
         Ok(completed_input_run)
+    }
+
+    fn active_generated_token_count(&self) -> usize {
+        self.active_input_event
+            .as_ref()
+            .map(|event| event.generated_token_ids.len())
+            .unwrap_or(0)
+    }
+
+    fn scheduled_feedback_generated_delta(
+        &self,
+        generated_before: usize,
+        remaining: usize,
+        overflow_message: &'static str,
+    ) -> Result<usize, VulkanResidentInProcessPlacedRuntimeError> {
+        let generated_after = self.active_generated_token_count();
+        let generated_delta = generated_after.saturating_sub(generated_before);
+        if generated_delta > remaining {
+            return Err(placed_scheduler_divergence(overflow_message));
+        }
+        Ok(generated_delta)
     }
 
     fn complete_active_input_event_if_complete(
