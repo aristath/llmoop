@@ -123,6 +123,27 @@ pub struct RuntimeStreamSchedulerStep {
     pub idle: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuntimeStreamSchedulerRunStopCondition {
+    Idle,
+    StepBudget,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuntimeStreamCompletedActivation {
+    pub activation: RuntimeStreamActivation,
+    pub outcome: RuntimeStreamActivationOutcome,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuntimeStreamSchedulerRun {
+    pub stop_condition: RuntimeStreamSchedulerRunStopCondition,
+    pub max_steps: usize,
+    pub scheduled_steps: usize,
+    pub completed_activations: Vec<RuntimeStreamCompletedActivation>,
+    pub final_snapshot: RuntimeStreamSchedulerSnapshot,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuntimeStreamSnapshot {
     pub stream_id: String,
@@ -466,6 +487,61 @@ impl RuntimeStreamScheduler {
             exhausted_work_budget: consumed_work_units == budget.max_work_units,
             idle: self.active_stream_count() == 0 && activations.is_empty(),
             activations,
+        })
+    }
+
+    pub fn run_until_idle_with<F>(
+        &mut self,
+        budget: RuntimeStreamSchedulerBudget,
+        max_steps: usize,
+        mut execute_activation: F,
+    ) -> Result<RuntimeStreamSchedulerRun, RuntimeStreamSchedulerError>
+    where
+        F: FnMut(
+            &RuntimeStreamActivation,
+        ) -> Result<RuntimeStreamActivationOutcome, RuntimeStreamSchedulerError>,
+    {
+        let mut completed_activations = Vec::new();
+        let mut scheduled_steps = 0usize;
+
+        while scheduled_steps < max_steps {
+            let step = self.schedule_step(budget.clone())?;
+            if step.activations.is_empty() && step.idle {
+                return Ok(RuntimeStreamSchedulerRun {
+                    stop_condition: RuntimeStreamSchedulerRunStopCondition::Idle,
+                    max_steps,
+                    scheduled_steps,
+                    completed_activations,
+                    final_snapshot: self.snapshot(),
+                });
+            }
+            if step.activations.is_empty() {
+                break;
+            }
+            scheduled_steps = scheduled_steps.saturating_add(1);
+            for activation in step.activations {
+                let outcome = execute_activation(&activation)?;
+                self.complete_activation(activation.id, outcome.clone())?;
+                completed_activations.push(RuntimeStreamCompletedActivation {
+                    activation,
+                    outcome,
+                });
+            }
+        }
+
+        let stop_condition = if self.snapshot().active_stream_count == 0
+            && self.snapshot().in_flight_activation_count == 0
+        {
+            RuntimeStreamSchedulerRunStopCondition::Idle
+        } else {
+            RuntimeStreamSchedulerRunStopCondition::StepBudget
+        };
+        Ok(RuntimeStreamSchedulerRun {
+            stop_condition,
+            max_steps,
+            scheduled_steps,
+            completed_activations,
+            final_snapshot: self.snapshot(),
         })
     }
 
@@ -945,5 +1021,76 @@ mod tests {
             scheduler.snapshot().transient_state_arena.free_block_count,
             1
         );
+    }
+
+    #[test]
+    fn scheduler_run_drives_executor_until_stream_is_idle() {
+        let mut scheduler = RuntimeStreamScheduler::new();
+        scheduler.add_stream("stream_a").unwrap();
+        scheduler
+            .enqueue_input_event(
+                "stream_a",
+                RuntimeStreamInputEvent::new("event_0", [1, 2, 3], 2),
+            )
+            .unwrap();
+
+        let mut decode_tokens = vec![200, 201].into_iter();
+        let run = scheduler
+            .run_until_idle_with(budget(1), 16, |activation| match activation.kind {
+                RuntimeStreamActivationKind::PrefillChunk { .. } => {
+                    Ok(RuntimeStreamActivationOutcome::prefill_complete())
+                }
+                RuntimeStreamActivationKind::DecodeFeedback { .. } => Ok(
+                    RuntimeStreamActivationOutcome::generated(decode_tokens.next().unwrap(), true),
+                ),
+            })
+            .unwrap();
+
+        assert_eq!(
+            run.stop_condition,
+            RuntimeStreamSchedulerRunStopCondition::Idle
+        );
+        assert_eq!(run.completed_activations.len(), 4);
+        assert_eq!(run.final_snapshot.active_stream_count, 0);
+        assert_eq!(run.final_snapshot.streams[0].completed_input_event_count, 1);
+        assert_eq!(run.final_snapshot.streams[0].generated_token_count, 2);
+        assert_eq!(
+            run.completed_activations
+                .iter()
+                .filter(|completed| matches!(
+                    completed.activation.kind,
+                    RuntimeStreamActivationKind::PrefillChunk { .. }
+                ))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn scheduler_run_preserves_in_flight_work_when_step_budget_expires() {
+        let mut scheduler = RuntimeStreamScheduler::new();
+        scheduler.add_stream("stream_a").unwrap();
+        scheduler
+            .enqueue_input_event("stream_a", RuntimeStreamInputEvent::new("event_0", [1], 1))
+            .unwrap();
+
+        let run = scheduler
+            .run_until_idle_with(budget(1), 1, |activation| match activation.kind {
+                RuntimeStreamActivationKind::PrefillChunk { .. } => {
+                    Ok(RuntimeStreamActivationOutcome::prefill_complete())
+                }
+                RuntimeStreamActivationKind::DecodeFeedback { .. } => {
+                    Ok(RuntimeStreamActivationOutcome::generated(42, true))
+                }
+            })
+            .unwrap();
+
+        assert_eq!(
+            run.stop_condition,
+            RuntimeStreamSchedulerRunStopCondition::StepBudget
+        );
+        assert_eq!(run.completed_activations.len(), 1);
+        assert_eq!(run.final_snapshot.active_stream_count, 1);
+        assert_eq!(run.final_snapshot.streams[0].completed_input_event_count, 0);
     }
 }
