@@ -10,6 +10,7 @@ from uuid import uuid4
 from nerve.compilation import (
     CancelCheck,
     CompiledModelReport,
+    DEFAULT_COMPILED_MODELS_DIR,
     CompileEventSink,
     Json,
     ModelCompileCancelled,
@@ -47,9 +48,7 @@ class SourceModelDiscovery:
 def compile_model(
     model_dir: Path,
     *,
-    transpiled_dir: Path | None = None,
-    lowered_dir: Path | None = None,
-    package_dir: Path | None = None,
+    compiled_model_dir: Path | None = None,
     shader_source_dir: Path = Path("runtime-rs/shaders"),
     event_sink: CompileEventSink | None = None,
     cancel_requested: CancelCheck | None = None,
@@ -63,16 +62,16 @@ def compile_model(
         emit_compile_event(event_sink, "ValidationStarted", model_dir=str(model_dir))
 
         slug = compiled_model_slug(model_dir)
-        final_transpiled = transpiled_dir or Path("transpiled") / slug
-        final_lowered = lowered_dir or Path("lowered") / slug
-        final_package = package_dir or Path("packages") / slug
+        final_compiled_model = compiled_model_dir or DEFAULT_COMPILED_MODELS_DIR / slug
+        final_transpiled = final_compiled_model / "transpiled"
+        final_lowered = final_compiled_model / "lowered"
+        final_package = final_compiled_model
         token = uuid4().hex
-        staged_transpiled = staging_path(final_transpiled, token)
-        staged_lowered = staging_path(final_lowered, token)
-        staged_package = staging_path(final_package, token)
-        staged = (staged_transpiled, staged_lowered, staged_package)
-        for path in staged:
-            remove_path(path)
+        staged_compiled_model = staging_path(final_compiled_model, token)
+        staged_transpiled = staged_compiled_model / "transpiled"
+        staged_lowered = staged_compiled_model / "lowered"
+        staged_package = staged_compiled_model
+        remove_path(staged_compiled_model)
 
         try:
             staged_report = compile_model_package(
@@ -86,20 +85,16 @@ def compile_model(
             )
             check_compile_cancelled(cancel_requested)
             publish_staged_directories(
-                (
-                    (staged_transpiled, final_transpiled),
-                    (staged_lowered, final_lowered),
-                    (staged_package, final_package),
-                ),
+                ((staged_compiled_model, final_compiled_model),),
                 token,
             )
         except BaseException:
-            for path in staged:
-                remove_path(path)
+            remove_path(staged_compiled_model)
             raise
 
         report = CompiledModelReport(
             model_dir=model_dir,
+            compiled_model_dir=final_compiled_model,
             transpiled_dir=final_transpiled,
             lowered_dir=final_lowered,
             package_dir=final_package,

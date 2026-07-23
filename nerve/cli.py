@@ -84,19 +84,9 @@ def main() -> None:
         help="path to a built nerve-runtime binary; defaults to cargo run --release from a source checkout",
     )
     parser.add_argument(
-        "--transpiled-dir",
+        "--compiled-model-dir",
         type=Path,
-        help="directory for model graph/tensor transpilation artifacts",
-    )
-    parser.add_argument(
-        "--lowered-dir",
-        type=Path,
-        help="directory for lowered circuit artifacts",
-    )
-    parser.add_argument(
-        "--package-dir",
-        type=Path,
-        help="directory for runtime package artifacts",
+        help="directory for the complete compiled model artifact",
     )
     parser.add_argument(
         "--device",
@@ -323,9 +313,7 @@ def main() -> None:
     try:
         report = compile_model(
             args.compile_model,
-            transpiled_dir=args.transpiled_dir,
-            lowered_dir=args.lowered_dir,
-            package_dir=args.package_dir,
+            compiled_model_dir=args.compiled_model_dir,
             shader_source_dir=args.shader_source_dir,
             event_sink=reporter,
             cancel_requested=lambda: cancel_requested,
@@ -346,12 +334,12 @@ def main() -> None:
     else:
         print(f"compiled {report.model_dir}")
         print(f"  model_type: {report.model_type}")
-        print(f"  transpiled: {report.transpiled_dir}")
-        print(f"  lowered:    {report.lowered_dir}")
-        print(f"  package_dir: {report.package_dir}")
-        print(f"  package:    {report.package_manifest}")
-        print(f"  circuits:   {report.circuit_count}")
-        print(f"  shaders:    {report.shader_count}")
+        print(f"  compiled_model: {report.compiled_model_dir}")
+        print(f"  manifest:       {report.package_manifest}")
+        print(f"  transpiled:     {report.transpiled_dir}")
+        print(f"  lowered:        {report.lowered_dir}")
+        print(f"  circuits:       {report.circuit_count}")
+        print(f"  shaders:        {report.shader_count}")
 
 
 def validate_action_options(
@@ -393,9 +381,7 @@ def validate_action_options(
                 parser.error(f"{option} is only supported with --run")
 
     compiler_options = (
-        ("--transpiled-dir", args.transpiled_dir is not None),
-        ("--lowered-dir", args.lowered_dir is not None),
-        ("--package-dir", args.package_dir is not None),
+        ("--compiled-model-dir", args.compiled_model_dir is not None),
         ("--shader-source-dir", args.shader_source_dir is not None),
     )
     if args.compile_model is None:

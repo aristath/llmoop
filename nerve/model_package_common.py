@@ -19,6 +19,7 @@ from nerve.circuit_ir import validate_circuit
 from nerve.circuit_lowering import lower_pedalboard
 from nerve.circuit_optimizer import optimize_circuit_for_vulkan
 from nerve.compilation import (
+    DEFAULT_COMPILED_MODELS_DIR,
     PACKAGE_SCHEMA,
     CompiledModelReport,
     Json,
@@ -135,4 +136,3 @@ def package_artifact_path(package_dir: Path, value: Any, label: str) -> Path:
             f"compiled package {label} path must stay inside the package: {value!r}"
         )
     return package_dir / relative
-

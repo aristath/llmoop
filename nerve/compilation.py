@@ -10,6 +10,7 @@ from typing import Any, Callable
 Json = dict[str, Any]
 
 PACKAGE_SCHEMA = "nerve.vulkan_resident_model_package.v3"
+DEFAULT_COMPILED_MODELS_DIR = Path("compiled_models")
 
 
 class ModelCompileError(RuntimeError):
@@ -27,6 +28,7 @@ CancelCheck = Callable[[], bool]
 @dataclass(frozen=True)
 class CompiledModelReport:
     model_dir: Path
+    compiled_model_dir: Path
     transpiled_dir: Path
     lowered_dir: Path
     package_dir: Path
@@ -40,6 +42,7 @@ class CompiledModelReport:
             "ok": True,
             "model_dir": str(self.model_dir),
             "model_type": self.model_type,
+            "compiled_model_dir": str(self.compiled_model_dir),
             "transpiled_dir": str(self.transpiled_dir),
             "lowered_dir": str(self.lowered_dir),
             "package_dir": str(self.package_dir),

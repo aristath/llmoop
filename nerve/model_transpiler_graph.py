@@ -225,7 +225,7 @@ def make_model_graph(
             "rms_norm": "stateless normalization operator",
             "residual_add": "stateless signal mixer",
         },
-        "output_dir": str(output_dir),
+        "output_dir": ".",
     }
 
 
@@ -848,5 +848,4 @@ def make_pedal_class(structure: ModelStructure, layer: LayerStructure) -> str:
         )
 
     raise ModelTranspileError(f"unsupported pedal class for operator {operator_type!r}")
-
 

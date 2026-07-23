@@ -145,6 +145,6 @@ Options:
 
 Example:
   python -m nerve --compile-model <MODEL_DIR>
-  cargo run --manifest-path runtime-rs/Cargo.toml --features 'vulkan tokenizers' --bin nerve-runtime -- --package packages/model_xxx/vulkan_resident_package.json --chat"
+  cargo run --manifest-path runtime-rs/Cargo.toml --features 'vulkan tokenizers' --bin nerve-runtime -- --package compiled_models/model_xxx/vulkan_resident_package.json --chat"
 }
 

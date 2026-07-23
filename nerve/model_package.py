@@ -14,17 +14,21 @@ from nerve.model_package_tensors import *
 def compile_model_package(
     model_dir: Path,
     *,
-    transpiled_dir: Path | None,
-    lowered_dir: Path | None,
-    package_dir: Path | None,
-    shader_source_dir: Path,
+    transpiled_dir: Path | None = None,
+    lowered_dir: Path | None = None,
+    package_dir: Path | None = None,
+    shader_source_dir: Path = Path("runtime-rs/shaders"),
     event_sink: Callable[[Json], None] | None = None,
     cancel_requested: Callable[[], bool] | None = None,
 ) -> CompiledModelReport:
     slug = compiled_model_slug(model_dir)
-    transpiled_dir = transpiled_dir or Path("transpiled") / slug
-    lowered_dir = lowered_dir or Path("lowered") / slug
-    package_dir = package_dir or Path("packages") / slug
+    package_dir = package_dir or DEFAULT_COMPILED_MODELS_DIR / slug
+    transpiled_dir = transpiled_dir or package_dir / "transpiled"
+    lowered_dir = lowered_dir or package_dir / "lowered"
+
+    if package_dir.exists():
+        shutil.rmtree(package_dir)
+    package_dir.mkdir(parents=True, exist_ok=True)
 
     structure = transpile_model(
         model_dir,
@@ -63,9 +67,6 @@ def compile_model_package(
         lowered_dir=lowered_dir,
     )
 
-    if package_dir.exists():
-        shutil.rmtree(package_dir)
-    package_dir.mkdir(parents=True, exist_ok=True)
     emit_compile_event(
         event_sink, "ArtifactWritingStarted", package_dir=str(package_dir)
     )
@@ -85,6 +86,7 @@ def compile_model_package(
         ),
         cancel_requested=cancel_requested,
     )
+    write_json(transpiled_dir / "tensors.json", packaged_tensor_index)
     package_manifest = build_vulkan_resident_package_manifest(
         model_graph=model_graph,
         tensor_index=packaged_tensor_index,
@@ -110,6 +112,7 @@ def compile_model_package(
 
     return CompiledModelReport(
         model_dir=model_dir,
+        compiled_model_dir=package_dir,
         transpiled_dir=transpiled_dir,
         lowered_dir=lowered_dir,
         package_dir=package_dir,
@@ -118,5 +121,3 @@ def compile_model_package(
         circuit_count=lowered["index"]["summary"]["circuit_count"],
         shader_count=len(list((package_dir / "shaders").glob("*.spv"))),
     )
-
-

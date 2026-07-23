@@ -29,10 +29,10 @@ def discoverable_source(root: Path) -> None:
                 "{source}/missing-package",
                 "--prompt",
                 "hello",
-                "--transpiled-dir",
+                "--compiled-model-dir",
                 "{source}/ignored",
             ],
-            "--transpiled-dir is only supported with --compile-model",
+            "--compiled-model-dir is only supported with --compile-model",
         ),
     ],
 )

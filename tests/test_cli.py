@@ -52,7 +52,7 @@ def runtime_args(**overrides: object) -> Namespace:
 
 class RuntimeCliCommandTest(unittest.TestCase):
     def test_build_runtime_command_forwards_model_chat_template_variables(self) -> None:
-        package = Path("packages/model_x/vulkan_resident_package.json")
+        package = Path("compiled_models/model_x/vulkan_resident_package.json")
         args = runtime_args(
             chat=True,
             chat_template_var=[
@@ -73,7 +73,7 @@ class RuntimeCliCommandTest(unittest.TestCase):
         )
 
     def test_build_runtime_command_forwards_non_default_random_seed(self) -> None:
-        package = Path("packages/model_x/vulkan_resident_package.json")
+        package = Path("compiled_models/model_x/vulkan_resident_package.json")
         args = runtime_args(prompt="Hello", seed=42)
 
         self.assertIn(
@@ -85,7 +85,7 @@ class RuntimeCliCommandTest(unittest.TestCase):
         )
 
     def test_build_runtime_command_forwards_sampler_overrides(self) -> None:
-        package = Path("packages/model_x/vulkan_resident_package.json")
+        package = Path("compiled_models/model_x/vulkan_resident_package.json")
         args = runtime_args(
             prompt="Hello",
             temperature=1.0,
@@ -139,7 +139,7 @@ class RuntimeCliCommandTest(unittest.TestCase):
             self.assertEqual(manifest, resolve_runtime_package_manifest(manifest))
 
     def test_build_runtime_command_prefers_explicit_runtime_binary(self) -> None:
-        package = Path("packages/model_x/vulkan_resident_package.json")
+        package = Path("compiled_models/model_x/vulkan_resident_package.json")
         args = runtime_args(
             prompt="Hello",
             inspect_runtime=False,
@@ -182,7 +182,7 @@ class RuntimeCliCommandTest(unittest.TestCase):
         )
 
     def test_build_runtime_command_forwards_chat_mode_without_prompt(self) -> None:
-        package = Path("packages/model_x/vulkan_resident_package.json")
+        package = Path("compiled_models/model_x/vulkan_resident_package.json")
         args = runtime_args(
             prompt=None,
             chat=True,
@@ -219,7 +219,7 @@ class RuntimeCliCommandTest(unittest.TestCase):
         )
 
     def test_build_runtime_command_forwards_explicit_mtp_window(self) -> None:
-        package = Path("packages/model_x/vulkan_resident_package.json")
+        package = Path("compiled_models/model_x/vulkan_resident_package.json")
         args = runtime_args(prompt="Hello", speculative_draft_tokens=5)
 
         self.assertEqual(
@@ -240,7 +240,7 @@ class RuntimeCliCommandTest(unittest.TestCase):
     def test_build_runtime_command_can_inspect_device_slice_without_prompt(
         self,
     ) -> None:
-        package = Path("packages/model_x/vulkan_resident_package.json")
+        package = Path("compiled_models/model_x/vulkan_resident_package.json")
         args = runtime_args(
             prompt=None,
             inspect_runtime=False,
@@ -278,7 +278,7 @@ class RuntimeCliCommandTest(unittest.TestCase):
         )
 
     def test_build_runtime_command_can_inspect_placement_without_prompt(self) -> None:
-        package = Path("packages/model_x/vulkan_resident_package.json")
+        package = Path("compiled_models/model_x/vulkan_resident_package.json")
         args = runtime_args(
             prompt=None,
             inspect_runtime=False,
@@ -315,7 +315,7 @@ class RuntimeCliCommandTest(unittest.TestCase):
         )
 
     def test_build_runtime_command_can_inspect_package_without_prompt(self) -> None:
-        package = Path("packages/model_x/vulkan_resident_package.json")
+        package = Path("compiled_models/model_x/vulkan_resident_package.json")
         args = runtime_args(
             prompt=None,
             inspect_runtime=False,
@@ -352,7 +352,7 @@ class RuntimeCliCommandTest(unittest.TestCase):
         )
 
     def test_build_runtime_command_can_inspect_patch_without_prompt(self) -> None:
-        package = Path("packages/model_x/vulkan_resident_package.json")
+        package = Path("compiled_models/model_x/vulkan_resident_package.json")
         args = runtime_args(
             prompt=None,
             inspect_runtime=False,
@@ -393,7 +393,7 @@ class RuntimeCliCommandTest(unittest.TestCase):
         )
 
     def test_build_runtime_command_preserves_cpu_logical_placement(self) -> None:
-        package = Path("packages/model_x/vulkan_resident_package.json")
+        package = Path("compiled_models/model_x/vulkan_resident_package.json")
         args = runtime_args(
             prompt=None,
             inspect_runtime=False,
@@ -436,7 +436,7 @@ class RuntimeCliCommandTest(unittest.TestCase):
     def test_build_runtime_command_can_inspect_runtime_topology_without_prompt(
         self,
     ) -> None:
-        package = Path("packages/model_x/vulkan_resident_package.json")
+        package = Path("compiled_models/model_x/vulkan_resident_package.json")
         args = runtime_args(
             prompt=None,
             inspect_runtime=True,
@@ -481,7 +481,7 @@ class RuntimeCliCommandTest(unittest.TestCase):
         )
 
     def test_build_runtime_command_forwards_runtime_patch_overrides(self) -> None:
-        package = Path("packages/model_x/vulkan_resident_package.json")
+        package = Path("compiled_models/model_x/vulkan_resident_package.json")
         args = runtime_args(
             prompt="Hello",
             inspect_runtime=False,
@@ -741,33 +741,31 @@ class CompiledPackageTest(unittest.TestCase):
         self.assertEqual("exact_reference", behavioral["candidate_kind"])
         self.assertEqual(len(circuit_graph["pedals"]), len(behavioral["circuits"]))
 
-    def test_compiled_package_does_not_reference_source_or_transpiled_paths(
+    def test_compiled_model_does_not_reference_source_paths(
         self,
     ) -> None:
         fixture = compiled_model_or_skip()
 
-        for root in (fixture.lowered_dir, fixture.package_dir):
-            for artifact in root.rglob("*.json"):
-                payload = artifact.read_text()
-                self.assertNotIn(str(fixture.source_model_dir), payload, artifact)
-                self.assertNotIn("transpiled/", payload, artifact)
-                self.assertNotIn("source_model_dir", payload, artifact)
+        for artifact in fixture.compiled_model_dir.rglob("*.json"):
+            payload = artifact.read_text()
+            self.assertNotIn(str(fixture.source_model_dir), payload, artifact)
+            self.assertNotIn("source_model_dir", payload, artifact)
 
-    def test_runtime_package_is_separate_from_lowered_workspace(self) -> None:
+    def test_compiled_model_contains_runtime_and_intermediate_artifacts(self) -> None:
         fixture = compiled_model_or_skip()
 
+        self.assertEqual(fixture.compiled_model_dir, fixture.package_dir)
         self.assertEqual(fixture.package_dir, fixture.package_manifest.parent)
-        self.assertNotEqual(fixture.lowered_dir, fixture.package_dir)
-        self.assertFalse(
-            (fixture.lowered_dir / "vulkan_resident_package.json").exists()
+        self.assertEqual(
+            fixture.transpiled_dir, fixture.compiled_model_dir / "transpiled"
         )
-        self.assertFalse(
-            any(
-                artifact.name == "vulkan_resident_package.json"
-                for artifact in fixture.lowered_dir.rglob("*.json")
-            )
-        )
+        self.assertEqual(fixture.lowered_dir, fixture.compiled_model_dir / "lowered")
+        self.assertTrue((fixture.transpiled_dir / "model.json").is_file())
+        self.assertTrue((fixture.transpiled_dir / "tensors.json").is_file())
         self.assertTrue((fixture.lowered_dir / "pedalboard.circuits.json").is_file())
+        self.assertTrue((fixture.package_dir / "weights").is_dir())
+        self.assertTrue((fixture.package_dir / "shaders").is_dir())
+        self.assertTrue((fixture.package_dir / "tokenizer").is_dir())
         self.assertTrue(fixture.package_manifest.is_file())
 
 

@@ -8,7 +8,11 @@ import pytest
 
 import nerve.model_compiler as compiler_module
 from nerve.cli import main
-from nerve.compilation import ModelCompileCancelled, ModelCompileError
+from nerve.compilation import (
+    CompiledModelReport,
+    ModelCompileCancelled,
+    ModelCompileError,
+)
 from nerve.model_compiler import (
     compile_model,
     discover_source_model,
@@ -80,9 +84,7 @@ def test_cancelled_job_emits_terminal_event_before_writing_artifacts(
     with pytest.raises(ModelCompileCancelled):
         compile_model(
             source,
-            transpiled_dir=tmp_path / "transpiled",
-            lowered_dir=tmp_path / "lowered",
-            package_dir=tmp_path / "package",
+            compiled_model_dir=tmp_path / "compiled_model",
             event_sink=events.append,
             cancel_requested=lambda: True,
         )
@@ -92,9 +94,7 @@ def test_cancelled_job_emits_terminal_event_before_writing_artifacts(
         "SourceDiscovered",
         "Cancelled",
     ]
-    assert not (tmp_path / "transpiled").exists()
-    assert not (tmp_path / "lowered").exists()
-    assert not (tmp_path / "package").exists()
+    assert not (tmp_path / "compiled_model").exists()
 
 
 def test_staged_directories_replace_existing_outputs_as_one_publication(
@@ -158,20 +158,20 @@ def test_failed_compile_preserves_public_outputs_and_removes_staging(
     source = tmp_path / "source"
     source.mkdir()
     write_discoverable_source(source)
-    destinations = tuple(tmp_path / name for name in ("transpiled", "lowered", "package"))
-    for destination in destinations:
-        destination.mkdir()
-        (destination / "identity").write_text("published")
+    destination = tmp_path / "compiled_model"
+    destination.mkdir()
+    (destination / "identity").write_text("published")
     events: list[dict[str, object]] = []
 
     def fail_after_writing_staged_artifacts(
         _model_dir: Path, **arguments: object
     ) -> None:
-        for name in ("transpiled_dir", "lowered_dir", "package_dir"):
-            staged = arguments[name]
-            assert isinstance(staged, Path)
-            staged.mkdir(parents=True)
-            (staged / "partial").write_text("incomplete")
+        staged = arguments["package_dir"]
+        assert isinstance(staged, Path)
+        staged.mkdir(parents=True)
+        (staged / "partial").write_text("incomplete")
+        (staged / "transpiled").mkdir()
+        (staged / "lowered").mkdir()
         raise RuntimeError("injected compiler failure")
 
     monkeypatch.setattr(
@@ -181,14 +181,11 @@ def test_failed_compile_preserves_public_outputs_and_removes_staging(
     with pytest.raises(RuntimeError, match="injected compiler failure"):
         compile_model(
             source,
-            transpiled_dir=destinations[0],
-            lowered_dir=destinations[1],
-            package_dir=destinations[2],
+            compiled_model_dir=destination,
             event_sink=events.append,
         )
 
-    for destination in destinations:
-        assert (destination / "identity").read_text() == "published"
+    assert (destination / "identity").read_text() == "published"
     assert not list(tmp_path.glob(".*.nerve-stage-*"))
     assert events[-1] == {
         "type": "Failed",
@@ -196,6 +193,58 @@ def test_failed_compile_preserves_public_outputs_and_removes_staging(
             {"kind": "RuntimeError", "message": "injected compiler failure"}
         ],
     }
+
+
+def test_cli_compile_forwards_one_compiled_model_destination(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    write_discoverable_source(source)
+    compiled_model_dir = tmp_path / "compiled_model"
+    captured: dict[str, object] = {}
+
+    def fake_compile_model(model_dir: Path, **kwargs: object) -> CompiledModelReport:
+        captured["model_dir"] = model_dir
+        captured["kwargs"] = kwargs
+        return CompiledModelReport(
+            model_dir=model_dir,
+            compiled_model_dir=compiled_model_dir,
+            transpiled_dir=compiled_model_dir / "transpiled",
+            lowered_dir=compiled_model_dir / "lowered",
+            package_dir=compiled_model_dir,
+            package_manifest=compiled_model_dir / "vulkan_resident_package.json",
+            model_type="synthetic_decoder",
+            circuit_count=2,
+            shader_count=3,
+        )
+
+    monkeypatch.setattr("nerve.cli.compile_model", fake_compile_model)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "nerve",
+            "--compile-model",
+            str(source),
+            "--compiled-model-dir",
+            str(compiled_model_dir),
+            "--json",
+        ],
+    )
+
+    main()
+
+    kwargs = captured["kwargs"]
+    assert captured["model_dir"] == source
+    assert isinstance(kwargs, dict)
+    assert kwargs["compiled_model_dir"] == compiled_model_dir
+    assert "transpiled_dir" not in kwargs
+    assert "lowered_dir" not in kwargs
+    assert "package_dir" not in kwargs
+    report = json.loads(capsys.readouterr().out)
+    assert report["compiled_model_dir"] == str(compiled_model_dir)
+    assert report["package_dir"] == str(compiled_model_dir)
 
 
 def test_cli_discovery_streams_machine_readable_json_lines(
