@@ -373,6 +373,17 @@ impl RuntimeStreamScheduler {
         &mut self,
         stream_id: impl Into<String>,
     ) -> Result<RuntimeStreamSnapshot, RuntimeStreamSchedulerError> {
+        self.add_stream_with_state_declarations(stream_id, [])
+    }
+
+    pub fn add_stream_with_state_declarations<I>(
+        &mut self,
+        stream_id: impl Into<String>,
+        state_declarations: I,
+    ) -> Result<RuntimeStreamSnapshot, RuntimeStreamSchedulerError>
+    where
+        I: IntoIterator<Item = (TransientStateKey, TransientStateBlockShape)>,
+    {
         let stream_id = stream_id.into();
         if stream_id.is_empty() {
             return Err(RuntimeStreamSchedulerError(
@@ -384,7 +395,10 @@ impl RuntimeStreamScheduler {
                 "stream {stream_id:?} already exists"
             )));
         }
-        let stream = RuntimeStreamState::new(stream_id.clone())?;
+        let mut stream = RuntimeStreamState::new(stream_id.clone())?;
+        for (key, shape) in state_declarations {
+            stream.transient_state_table.declare_state(key, shape)?;
+        }
         let snapshot = stream.snapshot();
         self.streams.insert(stream_id, stream);
         Ok(snapshot)
@@ -1047,6 +1061,25 @@ mod tests {
 
     fn state_shape() -> TransientStateBlockShape {
         TransientStateBlockShape::new(16, 2).unwrap()
+    }
+
+    #[test]
+    fn scheduler_adds_stream_with_declared_transient_state_atomically() {
+        let mut scheduler = RuntimeStreamScheduler::new();
+
+        let snapshot = scheduler
+            .add_stream_with_state_declarations("stream_a", [(state_key(), state_shape())])
+            .unwrap();
+
+        assert_eq!(snapshot.transient_state_entry_count, 1);
+        assert_eq!(
+            scheduler
+                .stream_transient_state_snapshot("stream_a")
+                .unwrap()
+                .entries[0]
+                .key,
+            state_key()
+        );
     }
 
     #[test]

@@ -24,7 +24,14 @@ impl VulkanResidentInProcessPlacedPromptEngine {
         if self.streams.contains_key(&stream_id) {
             return Err(VulkanResidentInProcessPlacedPromptEngineError::DuplicateStream(stream_id));
         }
-        self.runtime_scheduler.add_stream(stream_id.clone())?;
+        let state_declarations = stream
+            .package()
+            .transient_state_declarations()
+            .map_err(VulkanResidentInProcessPlacedRuntimeError::Package)?
+            .into_iter()
+            .map(|declaration| (declaration.key, declaration.block_shape));
+        self.runtime_scheduler
+            .add_stream_with_state_declarations(stream_id.clone(), state_declarations)?;
         let snapshot = placed_prompt_engine_stream_snapshot(&stream_id, &stream);
         self.streams.insert(stream_id, stream);
         Ok(snapshot)

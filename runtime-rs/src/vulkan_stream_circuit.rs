@@ -31,6 +31,7 @@ use crate::stream_runtime::{
     RuntimeStreamInputEvent, RuntimeStreamScheduler, RuntimeStreamSchedulerBudget,
     RuntimeStreamSchedulerError,
 };
+use crate::stream_state::{TransientStateBlockShape, TransientStateKey};
 use crate::tensor_storage::TensorStorage;
 use crate::vulkan::{DEFAULT_COMPUTE_LOCAL_SIZE_X, DEFAULT_SPIRV_ENTRY_POINT, read_spirv_words};
 use crate::vulkan_compute::{
