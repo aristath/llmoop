@@ -1,3 +1,4 @@
+    #[test]
     fn runtime_device_bindings_treat_cpu_targets_as_direct_runtime_devices() {
         let logical_device_ids = vec!["cpu0".to_string(), "gpu0".to_string()];
         let bindings = RuntimeDeviceBindings::from_vulkan_targets(

@@ -1,3 +1,5 @@
+    #[test]
+    #[ignore = "requires a valid NERVE_TEST_LOWERED_DIR structural fixture"]
     fn placement_plan_keeps_every_stream_entity_as_a_deployable_component() {
         let resolved =
             ResolvedLoweredExecutionGraph::from_index_file(fixture_model_index_path()).unwrap();
@@ -242,4 +244,3 @@
         );
         assert_eq!(payload["unsupported_targets"][0], "remote0=lan:worker-a");
     }
-
