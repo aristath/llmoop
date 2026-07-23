@@ -459,6 +459,27 @@ fn component_batches_use_causal_exactness_for_temporal_prefill_kernels() {
 }
 
 #[test]
+fn component_batch_execution_mode_follows_runtime_activation_shape() {
+    let prefill = RuntimeStreamActivationBatchKind::PrefillChunk {
+        execution_class_id: "package".to_string(),
+        token_count: 8,
+    };
+    let decode = RuntimeStreamActivationBatchKind::DecodeFeedback {
+        execution_class_id: "package".to_string(),
+        max_tokens: 4,
+    };
+
+    assert_eq!(
+        VulkanComponentBatchExecutionMode::from_runtime_activation_batch_kind(&prefill),
+        VulkanComponentBatchExecutionMode::CausalSequence
+    );
+    assert_eq!(
+        VulkanComponentBatchExecutionMode::from_runtime_activation_batch_kind(&decode),
+        VulkanComponentBatchExecutionMode::IndependentCandidates
+    );
+}
+
+#[test]
 fn component_batch_execution_contract_requires_matching_shader_mode() {
     let execution = |batch_mode, batch_shader_path: Option<String>| {
         let batch_implementations = batch_shader_path
@@ -575,4 +596,3 @@ fn distributed_batch_workgroups_preserve_the_compiled_row_granularity() {
             .contains("cannot partition 32769 rows across 512 workgroups")
     );
 }
-

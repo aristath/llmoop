@@ -261,12 +261,12 @@ impl VulkanResidentInProcessPlacedPromptEngine {
             for batch in scheduler_step.batches {
                 let batch_run =
                     self.run_scheduler_activation_batch_with_output(batch, &mut on_output_event)?;
-                match &batch_run.kind {
-                    RuntimeStreamActivationBatchKind::PrefillChunk { .. } => {
+                match batch_run.execution_mode {
+                    VulkanComponentBatchExecutionMode::CausalSequence => {
                         prefill_activation_batch_count =
                             prefill_activation_batch_count.saturating_add(1);
                     }
-                    RuntimeStreamActivationBatchKind::DecodeFeedback { .. } => {
+                    VulkanComponentBatchExecutionMode::IndependentCandidates => {
                         decode_activation_batch_count =
                             decode_activation_batch_count.saturating_add(1);
                     }
@@ -328,6 +328,9 @@ impl VulkanResidentInProcessPlacedPromptEngine {
         F: FnMut(VulkanResidentTokenRuntimeSchedulerOutputEvent),
     {
         let kind = batch.kind;
+        let execution_mode = VulkanComponentBatchExecutionMode::from_runtime_activation_batch_kind(
+            &kind,
+        );
         let batch_width = batch.activations.len();
         let mut input_runs = Vec::new();
         let mut output_events = Vec::new();
@@ -381,7 +384,7 @@ impl VulkanResidentInProcessPlacedPromptEngine {
         }
 
         Ok(VulkanResidentInProcessPlacedPromptEngineScheduledBatchRun {
-            kind,
+            execution_mode,
             batch_width,
             input_runs,
             output_events,
@@ -470,7 +473,7 @@ pub struct VulkanResidentInProcessPlacedPromptEngineInputRun {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct VulkanResidentInProcessPlacedPromptEngineScheduledBatchRun {
-    kind: RuntimeStreamActivationBatchKind,
+    execution_mode: VulkanComponentBatchExecutionMode,
     batch_width: usize,
     input_runs: Vec<VulkanResidentInProcessPlacedPromptEngineInputRun>,
     output_events: Vec<VulkanResidentTokenRuntimeSchedulerOutputEvent>,

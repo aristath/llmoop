@@ -17,6 +17,15 @@ enum VulkanComponentBatchExecutionMode {
     CausalSequence,
 }
 
+impl VulkanComponentBatchExecutionMode {
+    fn from_runtime_activation_batch_kind(kind: &RuntimeStreamActivationBatchKind) -> Self {
+        match kind {
+            RuntimeStreamActivationBatchKind::PrefillChunk { .. } => Self::CausalSequence,
+            RuntimeStreamActivationBatchKind::DecodeFeedback { .. } => Self::IndependentCandidates,
+        }
+    }
+}
+
 fn select_component_batch_kernel_artifact<'a>(
     artifacts: &'a [VulkanResidentComponentBatchKernelArtifact],
     component_id: &str,
@@ -65,4 +74,3 @@ fn select_component_batch_kernel_artifact_where<'a>(
             }
         })
 }
-
