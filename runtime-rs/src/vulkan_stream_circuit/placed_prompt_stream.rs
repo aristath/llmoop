@@ -388,6 +388,7 @@ impl VulkanResidentInProcessPlacedPromptStream {
         let mut output_events = Vec::new();
         let mut generated_token_ids = Vec::new();
         let start_stream_tick = self.next_stream_tick();
+        let state_bindings = self.scheduler_activation_state_bindings(activation)?;
         let mut capture_output_event = |event: VulkanResidentTokenOutputEvent| {
             generated_token_ids.push(event.token_id);
             output_events.push(event.clone());
@@ -428,6 +429,7 @@ impl VulkanResidentInProcessPlacedPromptStream {
                 input_event_id: activation.input_event_id.clone(),
                 start_stream_tick,
                 next_stream_tick: self.next_stream_tick(),
+                state_bindings,
                 output_events,
                 generated_token_ids,
                 outcome,
@@ -612,6 +614,96 @@ impl VulkanResidentInProcessPlacedPromptStream {
         }
         let _ = self.run_next_activation()?;
         self.complete_active_input_event_if_complete()
+    }
+
+    fn scheduler_activation_state_bindings(
+        &self,
+        activation: &RuntimeStreamActivation,
+    ) -> Result<
+        Vec<VulkanResidentScheduledActivationStateBinding>,
+        VulkanResidentInProcessPlacedRuntimeError,
+    > {
+        activation
+            .state_reservations
+            .iter()
+            .flat_map(|reservation| self.scheduler_state_reservation_bindings(reservation))
+            .collect()
+    }
+
+    fn scheduler_state_reservation_bindings(
+        &self,
+        reservation: &RuntimeStreamStateReservation,
+    ) -> Vec<
+        Result<VulkanResidentScheduledActivationStateBinding, VulkanResidentInProcessPlacedRuntimeError>,
+    > {
+        reservation
+            .slots
+            .iter()
+            .map(|slot| {
+                let state = self.package.resident_state_buffer(&slot.key).ok_or_else(|| {
+                    VulkanResidentInProcessPlacedRuntimeError::Package(
+                        VulkanResidentTokenModelPackageError::new(format!(
+                            "scheduled transient state {}.{} is not resident in package {:?}",
+                            slot.key.node_instance_id, slot.key.state_id, self.package.package_id
+                        )),
+                    )
+                })?;
+                let bytes_per_activation = state.bytes_per_activation.ok_or_else(|| {
+                    VulkanResidentInProcessPlacedRuntimeError::Package(
+                        VulkanResidentTokenModelPackageError::new(format!(
+                            "scheduled transient state {}.{} has no dynamic bytes per activation",
+                            state.component_id, state.state_id
+                        )),
+                    )
+                })?;
+                let state_capacity = state
+                    .max_dynamic_activations
+                    .map(|limit| limit.min(self.package.dynamic_state_capacity_activations))
+                    .unwrap_or(self.package.dynamic_state_capacity_activations);
+                if state_capacity == 0 {
+                    return Err(VulkanResidentInProcessPlacedRuntimeError::Package(
+                        VulkanResidentTokenModelPackageError::new(format!(
+                            "scheduled transient state {}.{} has zero resident activation capacity",
+                            state.component_id, state.state_id
+                        )),
+                    ));
+                }
+                let resident_activation_offset = slot.logical_activation_index % state_capacity;
+                let resident_byte_offset = state
+                    .static_bytes
+                    .unwrap_or(0)
+                    .checked_add(
+                        bytes_per_activation
+                            .checked_mul(resident_activation_offset)
+                            .ok_or_else(|| {
+                                VulkanResidentInProcessPlacedRuntimeError::Package(
+                                    VulkanResidentTokenModelPackageError::new(format!(
+                                        "scheduled transient state {}.{} byte offset overflowed",
+                                        state.component_id, state.state_id
+                                    )),
+                                )
+                            })?,
+                    )
+                    .ok_or_else(|| {
+                        VulkanResidentInProcessPlacedRuntimeError::Package(
+                            VulkanResidentTokenModelPackageError::new(format!(
+                                "scheduled transient state {}.{} byte offset overflowed",
+                                state.component_id, state.state_id
+                            )),
+                        )
+                    })?;
+
+                Ok(VulkanResidentScheduledActivationStateBinding {
+                    key: slot.key.clone(),
+                    logical_activation_index: slot.logical_activation_index,
+                    transient_block_id: slot.block_id,
+                    transient_block_activation_offset: slot.block_activation_offset,
+                    resident_activation_offset,
+                    resident_byte_offset,
+                    bytes_per_activation,
+                })
+            })
+            .collect()
     }
 
     pub fn interrupt(
@@ -1049,10 +1141,22 @@ pub struct VulkanResidentInProcessPlacedPromptStreamScheduledActivationRun {
     pub input_event_id: String,
     pub start_stream_tick: u64,
     pub next_stream_tick: u64,
+    pub state_bindings: Vec<VulkanResidentScheduledActivationStateBinding>,
     pub output_events: Vec<VulkanResidentTokenOutputEvent>,
     pub generated_token_ids: Vec<u32>,
     pub outcome: RuntimeStreamActivationOutcome,
     pub completed_input_run: Option<VulkanResidentInProcessPlacedSubmittedInputRun>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanResidentScheduledActivationStateBinding {
+    pub key: TransientStateKey,
+    pub logical_activation_index: usize,
+    pub transient_block_id: TransientStateBlockId,
+    pub transient_block_activation_offset: usize,
+    pub resident_activation_offset: usize,
+    pub resident_byte_offset: usize,
+    pub bytes_per_activation: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -48,6 +48,25 @@ impl VulkanResidentInProcessPlacedModelPackage {
         )
     }
 
+    pub fn resident_state_buffer(
+        &self,
+        key: &TransientStateKey,
+    ) -> Option<&VulkanResidentStateBuffer> {
+        self.device_slices
+            .iter()
+            .flat_map(|device_slice| {
+                device_slice
+                    .placed_plan
+                    .placed_resident_plan
+                    .resident_plan
+                    .stream_state_buffers
+                    .iter()
+            })
+            .find(|state| {
+                state.component_id == key.node_instance_id && state.state_id == key.state_id
+            })
+    }
+
     pub fn transient_state_declarations(
         &self,
     ) -> Result<Vec<VulkanResidentStreamStateDeclaration>, VulkanResidentTokenModelPackageError>
