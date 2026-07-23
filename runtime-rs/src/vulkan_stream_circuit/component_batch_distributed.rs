@@ -16,8 +16,13 @@ struct VulkanDistributedComponentBatchDispatchRunner {
 
 struct VulkanDistributedComponentBatchShardRunner {
     device_id: String,
-    dispatches: Vec<VulkanResidentKernelDispatch>,
+    dispatches: Vec<VulkanDistributedComponentBatchShardDispatch>,
     sequence: VulkanResidentKernelSequence,
+}
+
+struct VulkanDistributedComponentBatchShardDispatch {
+    dispatch: VulkanResidentKernelDispatch,
+    batch_control_byte_count: u32,
 }
 
 impl VulkanDistributedComponentBatchRunners {
@@ -272,6 +277,7 @@ impl VulkanDistributedComponentBatchRunners {
                 }
                 let mut resident_dispatches = Vec::with_capacity(artifact.stages.len());
                 for stage in &artifact.stages {
+                    let batch_control_byte_count = batch_stage_control_byte_count(stage);
                     let workgroup_count_x = match planned.distribution {
                         VulkanDistributedDispatchDistribution::ExpertRange => {
                             stage.workgroup_count_x
@@ -306,29 +312,31 @@ impl VulkanDistributedComponentBatchRunners {
                             })?
                         }
                     };
-                    resident_dispatches.push(
-                        device
-                            .create_resident_kernel_dispatch_2d_with_base_z(
-                                &stage.spirv_words,
-                                &bindings,
-                                workgroup_count_x,
-                                workgroup_count_y,
+                    let dispatch = device
+                        .create_resident_kernel_dispatch_2d_with_base_z(
+                            &stage.spirv_words,
+                            &bindings,
+                            workgroup_count_x,
+                            workgroup_count_y,
+                            shard.base_workgroup_z,
+                            stage.local_size_x,
+                            batch_control_byte_count,
+                            Some(format!(
+                                "component={} node={} distributed_batch=device:{} rows={}..{} base_z={} distribution={:?}",
+                                planned.component_id,
+                                planned.node_id,
+                                shard.device_id,
+                                shard.row_start,
+                                shard.row_start + shard.row_count,
                                 shard.base_workgroup_z,
-                                stage.local_size_x,
-                                VULKAN_COMPONENT_BATCH_CONTROL_BYTE_CAPACITY,
-                                Some(format!(
-                                    "component={} node={} distributed_batch=device:{} rows={}..{} base_z={} distribution={:?}",
-                                    planned.component_id,
-                                    planned.node_id,
-                                    shard.device_id,
-                                    shard.row_start,
-                                    shard.row_start + shard.row_count,
-                                    shard.base_workgroup_z,
-                                    planned.distribution,
-                                )),
-                            )
-                            .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?,
-                    );
+                                planned.distribution,
+                            )),
+                        )
+                        .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
+                    resident_dispatches.push(VulkanDistributedComponentBatchShardDispatch {
+                        dispatch,
+                        batch_control_byte_count,
+                    });
                 }
                 let sequence = device
                     .create_resident_kernel_sequence()
@@ -436,17 +444,37 @@ impl VulkanDistributedComponentBatchRunners {
                 VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(format!(
                     "distributed component batch has no dispatch {dispatch_index} owned by {owner_device_id:?}"
                 )))
-            })?;
+        })?;
         for shard in &dispatch.shards {
             let device = devices.get(&shard.device_id).ok_or_else(|| {
                 VulkanResidentInProcessPlacedRuntimeError::MissingBoundDevice {
                     device_id: shard.device_id.clone(),
                 }
             })?;
+            let batch_control: &[u8; VULKAN_COMPONENT_BATCH_CONTROL_BYTE_CAPACITY as usize] =
+                batch_control.try_into().map_err(|_| {
+                    VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(format!(
+                        "distributed component batch control has {} bytes",
+                        batch_control.len()
+                    )))
+                })?;
+            let push_constant_storage = shard
+                .dispatches
+                .iter()
+                .map(|resident| {
+                    component_batch_push_constant_bytes(
+                        resident.batch_control_byte_count,
+                        batch_control,
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?;
             let steps = shard
                 .dispatches
                 .iter()
-                .map(|resident| VulkanResidentKernelSequenceStep::new(resident, batch_control))
+                .zip(&push_constant_storage)
+                .map(|(resident, push_constants)| {
+                    VulkanResidentKernelSequenceStep::new(&resident.dispatch, push_constants)
+                })
                 .collect::<Vec<_>>();
             device
                 .record_resident_kernel_sequence(&shard.sequence, &steps)
@@ -552,4 +580,3 @@ fn distributed_batch_rows_per_workgroup(
     }
     Ok(output_rows / full_workgroup_count_x)
 }
-

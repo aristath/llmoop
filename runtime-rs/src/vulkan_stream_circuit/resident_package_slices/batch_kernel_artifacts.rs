@@ -20,6 +20,7 @@ impl VulkanResidentComponentBatchKernelArtifact {
 }
 
 struct VulkanResidentComponentBatchStageArtifact {
+    shader_path: String,
     spirv_words: Vec<u32>,
     local_size_x: u32,
     workgroup_count_x: u32,

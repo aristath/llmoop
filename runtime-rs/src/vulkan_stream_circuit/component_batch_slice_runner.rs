@@ -365,6 +365,7 @@ impl VulkanResidentComponentBatchSliceRunner {
                     }
                 };
                 for stage in &batch_artifact.stages {
+                    let batch_control_byte_count = batch_stage_control_byte_count(stage);
                     let resident = device
                         .create_resident_kernel_dispatch_2d_labeled(
                             &stage.spirv_words,
@@ -372,12 +373,13 @@ impl VulkanResidentComponentBatchSliceRunner {
                             stage.workgroup_count_x,
                             workgroup_count_y,
                             stage.local_size_x,
-                            VULKAN_COMPONENT_BATCH_CONTROL_BYTE_CAPACITY,
+                            batch_control_byte_count,
                             Some(vulkan_dispatch_semantic_label(dispatch, Some("batch"))),
                         )
                         .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
                     steps.push(VulkanComponentBatchDispatchStep {
                         dispatch: resident,
+                        batch_control_byte_count,
                         push_constants: Vec::new(),
                         lane_index: None,
                         snapshot_state_buffer_indices: BTreeSet::new(),
@@ -458,6 +460,7 @@ impl VulkanResidentComponentBatchSliceRunner {
                     .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
                 steps.push(VulkanComponentBatchDispatchStep {
                     dispatch: resident,
+                    batch_control_byte_count: 0,
                     push_constants: dispatch.push_constants.clone(),
                     lane_index: Some(lane_index),
                     snapshot_state_buffer_indices: snapshot_state_buffer_indices.clone(),
@@ -666,7 +669,7 @@ impl VulkanResidentComponentBatchSliceRunner {
         batch_width: usize,
         start_stream_tick: u64,
         dynamic_state_capacity_activations: u32,
-        batch_control: &[u8],
+        batch_control: &[u8; VULKAN_COMPONENT_BATCH_CONTROL_BYTE_CAPACITY as usize],
         segment_index: usize,
         step_start: usize,
         step_end: usize,
@@ -699,7 +702,7 @@ impl VulkanResidentComponentBatchSliceRunner {
                     )))
                 })?
             } else {
-                batch_control.to_vec()
+                component_batch_push_constant_bytes(step.batch_control_byte_count, batch_control)?
             };
             push_constant_storage.push(push_constants);
             active_steps.push(step);

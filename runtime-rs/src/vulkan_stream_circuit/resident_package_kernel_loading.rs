@@ -214,6 +214,7 @@ fn load_resident_component_batch_kernels(
                         .iter()
                         .map(|stage| {
                             Ok(VulkanResidentComponentBatchStageArtifact {
+                                shader_path: stage.shader_path.clone(),
                                 spirv_words: load_required_resident_model_package_shader(
                                     manifest_dir,
                                     &stage.shader_path,

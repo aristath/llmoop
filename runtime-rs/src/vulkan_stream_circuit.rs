@@ -69,6 +69,7 @@ const CONTRACT_DIGEST_ALGORITHM: &str = "nerve.json_tree_sha256.v1";
 const VULKAN_STREAM_CONTROL_BYTE_CAPACITY: usize = 5 * std::mem::size_of::<u32>();
 const VULKAN_STREAM_CONTROL_TOKEN_BYTE_CAPACITY: usize = std::mem::size_of::<u32>();
 const VULKAN_STREAM_CONTROL_METADATA_OFFSET: usize = VULKAN_STREAM_CONTROL_TOKEN_BYTE_CAPACITY;
+const VULKAN_COMPONENT_BATCH_WIDTH_CONTROL_BYTE_CAPACITY: u32 = std::mem::size_of::<u32>() as u32;
 const VULKAN_COMPONENT_BATCH_CONTROL_BYTE_CAPACITY: u32 = 4 * std::mem::size_of::<u32>() as u32;
 const VULKAN_SAMPLER_HISTORY_RECORD_BYTE_CAPACITY: usize = 4 * std::mem::size_of::<u32>();
 pub const VULKAN_BACKEND_LOOP_MAX_WINDOW: usize = 64;

@@ -565,6 +565,31 @@ fn component_batch_control_preserves_temporal_position_and_capacity() {
 }
 
 #[test]
+fn component_batch_control_uses_width_only_payload_unless_stage_reads_time() {
+    let width_only = VulkanResidentComponentBatchStageArtifact {
+        shader_path: "shaders/linear_batch2_fp8_e4m3_b128x128_5120x5120.spv".to_string(),
+        spirv_words: Vec::new(),
+        local_size_x: 64,
+        workgroup_count_x: 1,
+    };
+    let temporal = VulkanResidentComponentBatchStageArtifact {
+        shader_path: "shaders/append_kv_temporal_commit_bf16_kv8_d128_w0.spv".to_string(),
+        spirv_words: Vec::new(),
+        local_size_x: 64,
+        workgroup_count_x: 1,
+    };
+
+    assert_eq!(
+        batch_stage_control_byte_count(&width_only),
+        VULKAN_COMPONENT_BATCH_WIDTH_CONTROL_BYTE_CAPACITY
+    );
+    assert_eq!(
+        batch_stage_control_byte_count(&temporal),
+        VULKAN_COMPONENT_BATCH_CONTROL_BYTE_CAPACITY
+    );
+}
+
+#[test]
 fn distributed_batch_output_binding_repeats_the_full_lane_stride() {
     let (offset, byte_capacity) =
         distributed_batch_shard_output_binding_range(8_192, 4, 2_048, 2_048).unwrap();

@@ -1,5 +1,6 @@
 struct VulkanComponentBatchDispatchStep {
     dispatch: VulkanResidentKernelDispatch,
+    batch_control_byte_count: u32,
     push_constants: Vec<VulkanKernelScalarBinding>,
     lane_index: Option<usize>,
     snapshot_state_buffer_indices: BTreeSet<usize>,
@@ -9,6 +10,19 @@ struct VulkanComponentBatchDispatchStep {
 enum VulkanComponentBatchStateSemantics<'a> {
     IndependentCandidates(&'a VulkanResidentStateTransactionBank),
     CausalSequence,
+}
+
+fn batch_stage_control_byte_count(stage: &VulkanResidentComponentBatchStageArtifact) -> u32 {
+    if stage.shader_path.contains("append_gqa_attention_temporal_read")
+        || stage.shader_path.contains("append_kv_temporal_commit")
+        || stage
+            .shader_path
+            .contains("parallel_head_norm_rope_2way_temporal")
+    {
+        VULKAN_COMPONENT_BATCH_CONTROL_BYTE_CAPACITY
+    } else {
+        VULKAN_COMPONENT_BATCH_WIDTH_CONTROL_BYTE_CAPACITY
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
