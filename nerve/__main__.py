@@ -1,4 +1,4 @@
-from llmoop.cli import main
+from nerve.cli import main
 
 
 if __name__ == "__main__":

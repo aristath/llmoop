@@ -8,13 +8,13 @@ from pathlib import Path
 
 import pytest
 
-from llmoop.behavioral_compiler import (
+from nerve.behavioral_compiler import (
     CONTRACT_DIGEST_ALGORITHM,
     json_contract_digest,
 )
-from llmoop.compilation import PACKAGE_SCHEMA, ModelCompileError
-from llmoop.compiler_fingerprint import package_compiler_fingerprint
-from llmoop.model_package import (
+from nerve.compilation import PACKAGE_SCHEMA, ModelCompileError
+from nerve.compiler_fingerprint import package_compiler_fingerprint
+from nerve.model_package import (
     build_package_artifact_integrity,
     compile_shader_artifacts,
     copy_exact_bytes,
@@ -49,7 +49,7 @@ def minimal_package(root: Path) -> dict[str, object]:
     (root / "tensors.json").write_text(
         json.dumps(
             {
-                "schema": "llmoop.tensor_index.v1",
+                "schema": "nerve.tensor_index.v1",
                 "tensors": {
                     "weight": {
                         "source_file": "weights/model.safetensors",
@@ -60,7 +60,7 @@ def minimal_package(root: Path) -> dict[str, object]:
         )
     )
     circuit = {
-        "schema": "llmoop.stream_circuit.v1",
+        "schema": "nerve.stream_circuit.v1",
         "id": "fixture_circuit",
         "source": {
             "pedal_id": "fixture_pedal",
@@ -100,7 +100,7 @@ def minimal_package(root: Path) -> dict[str, object]:
         "behavioral_error_contract": {"mode": "source_reference_circuit"},
     }
     input_circuit = {
-        "schema": "llmoop.stream_circuit.v1",
+        "schema": "nerve.stream_circuit.v1",
         "id": "input_circuit",
         "source": {
             "pedal_id": "input",
@@ -140,7 +140,7 @@ def minimal_package(root: Path) -> dict[str, object]:
         "behavioral_error_contract": {"mode": "source_reference_circuit"},
     }
     output_circuit = {
-        "schema": "llmoop.stream_circuit.v1",
+        "schema": "nerve.stream_circuit.v1",
         "id": "output_circuit",
         "source": {
             "pedal_id": "output",
@@ -190,7 +190,7 @@ def minimal_package(root: Path) -> dict[str, object]:
         "behavioral_error_contract": {"mode": "source_reference_circuit"},
     }
     sampler_circuit = {
-        "schema": "llmoop.stream_circuit.v1",
+        "schema": "nerve.stream_circuit.v1",
         "id": "sampler_circuit",
         "source": {
             "pedal_id": "sampler",
@@ -248,7 +248,7 @@ def minimal_package(root: Path) -> dict[str, object]:
     (root / "behavioral_validation.json").write_text(
         json.dumps(
             {
-                "schema": "llmoop.behavioral_validation.v1",
+                "schema": "nerve.behavioral_validation.v1",
                 "status": "passed",
                 "candidate_kind": "exact_reference",
                 "candidate_contract_digest_algorithm": CONTRACT_DIGEST_ALGORITHM,
@@ -360,14 +360,14 @@ def minimal_package(root: Path) -> dict[str, object]:
                     "behavioral_role": candidate["behavioral_role"],
                     "circuit": candidate,
                     "params": {
-                        "schema": "llmoop.circuit_params.v1",
+                        "schema": "nerve.circuit_params.v1",
                         "circuit": candidate["id"],
                         "layout": candidate["parameters"]["layout"],
                         "storage": candidate["parameters"]["storage"],
                         "refs": candidate["parameters"]["refs"],
                     },
                     "state": {
-                        "schema": "llmoop.circuit_state.v1",
+                        "schema": "nerve.circuit_state.v1",
                         "circuit": candidate["id"],
                         "state_ports": [],
                     },
@@ -497,7 +497,7 @@ def test_package_integrity_rejects_corrupt_or_incomplete_artifacts(
         (tmp_path / "behavioral_validation.json").write_text(
             json.dumps(
                 {
-                    "schema": "llmoop.behavioral_validation.v1",
+                    "schema": "nerve.behavioral_validation.v1",
                     "status": "passed",
                     "candidate_kind": "exact_reference",
                     "candidate_contract_digest_algorithm": CONTRACT_DIGEST_ALGORITHM,
@@ -536,7 +536,7 @@ def test_package_integrity_rejects_corrupt_or_incomplete_artifacts(
         }
     elif corruption == "compiler_placement":
         manifest["placement"] = {
-            "schema": "llmoop.stream_circuit_placement.v1",
+            "schema": "nerve.stream_circuit_placement.v1",
             "default_device_id": "gpu0",
             "pedal_devices": {"fixture_pedal": "gpu0"},
         }

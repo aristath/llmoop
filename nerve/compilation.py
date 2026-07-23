@@ -9,7 +9,7 @@ from typing import Any, Callable
 
 Json = dict[str, Any]
 
-PACKAGE_SCHEMA = "llmoop.vulkan_resident_model_package.v3"
+PACKAGE_SCHEMA = "nerve.vulkan_resident_model_package.v3"
 
 
 class ModelCompileError(RuntimeError):

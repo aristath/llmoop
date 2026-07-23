@@ -64,10 +64,10 @@ def validate_circuit(circuit: Json) -> CircuitValidationReport:
     issues: list[CircuitIssue] = []
 
     _check(
-        circuit.get("schema") == "llmoop.stream_circuit.v1",
+        circuit.get("schema") == "nerve.stream_circuit.v1",
         checks,
         issues,
-        "schema is llmoop.stream_circuit.v1",
+        "schema is nerve.stream_circuit.v1",
         f"unsupported circuit schema {circuit.get('schema')!r}",
         "schema",
     )

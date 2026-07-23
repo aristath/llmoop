@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from llmoop.cli import main
+from nerve.cli import main
 
 
 def discoverable_source(root: Path) -> None:
@@ -45,7 +45,7 @@ def test_cli_rejects_options_owned_by_a_different_action_before_running_it(
 ) -> None:
     discoverable_source(tmp_path)
     rendered = [argument.replace("{source}", str(tmp_path)) for argument in arguments]
-    monkeypatch.setattr(sys, "argv", ["llmoop", *rendered])
+    monkeypatch.setattr(sys, "argv", ["nerve", *rendered])
 
     with pytest.raises(SystemExit) as exit_info:
         main()

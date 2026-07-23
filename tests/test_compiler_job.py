@@ -6,10 +6,10 @@ from pathlib import Path
 
 import pytest
 
-import llmoop.model_compiler as compiler_module
-from llmoop.cli import main
-from llmoop.compilation import ModelCompileCancelled, ModelCompileError
-from llmoop.model_compiler import (
+import nerve.model_compiler as compiler_module
+from nerve.cli import main
+from nerve.compilation import ModelCompileCancelled, ModelCompileError
+from nerve.model_compiler import (
     compile_model,
     discover_source_model,
     publish_staged_directories,
@@ -115,7 +115,7 @@ def test_staged_directories_replace_existing_outputs_as_one_publication(
     for staged, destination in publications:
         assert not staged.exists()
         assert (destination / "identity").read_text() == "new"
-    assert not list(tmp_path.glob(".*.llmoop-backup-*"))
+    assert not list(tmp_path.glob(".*.nerve-backup-*"))
 
 
 def test_publication_failure_restores_every_previous_output(
@@ -149,7 +149,7 @@ def test_publication_failure_restores_every_previous_output(
     assert failed
     for _staged, destination in publications:
         assert (destination / "identity").read_text() == "old"
-    assert not list(tmp_path.glob(".*.llmoop-backup-*"))
+    assert not list(tmp_path.glob(".*.nerve-backup-*"))
 
 
 def test_failed_compile_preserves_public_outputs_and_removes_staging(
@@ -189,7 +189,7 @@ def test_failed_compile_preserves_public_outputs_and_removes_staging(
 
     for destination in destinations:
         assert (destination / "identity").read_text() == "published"
-    assert not list(tmp_path.glob(".*.llmoop-stage-*"))
+    assert not list(tmp_path.glob(".*.nerve-stage-*"))
     assert events[-1] == {
         "type": "Failed",
         "diagnostics": [
@@ -206,7 +206,7 @@ def test_cli_discovery_streams_machine_readable_json_lines(
         sys,
         "argv",
         [
-            "llmoop",
+            "nerve",
             "--discover-model",
             str(tmp_path),
             "--compiler-events-jsonl",
@@ -222,4 +222,4 @@ def test_cli_discovery_streams_machine_readable_json_lines(
         "Completed",
     ]
     assert [event["sequence"] for event in events] == [0, 1, 2]
-    assert all(event["schema"] == "llmoop.compiler_event.v1" for event in events)
+    assert all(event["schema"] == "nerve.compiler_event.v1" for event in events)

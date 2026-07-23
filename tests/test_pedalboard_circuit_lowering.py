@@ -4,9 +4,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from llmoop.circuit_ir import load_circuit, validate_circuit
-from llmoop.circuit_lowering import lower_pedalboard
-from llmoop.compilation import read_json
+from nerve.circuit_ir import load_circuit, validate_circuit
+from nerve.circuit_lowering import lower_pedalboard
+from nerve.compilation import read_json
 from tests.fixtures import compiled_model_or_skip
 
 
@@ -18,7 +18,7 @@ class PedalboardCircuitLoweringTest(unittest.TestCase):
             result = lower_pedalboard(fixture.transpiled_dir, out_dir)
             index = result["index"]
 
-            self.assertEqual("llmoop.lowered_pedalboard.v1", index["schema"])
+            self.assertEqual("nerve.lowered_pedalboard.v1", index["schema"])
             self.assertEqual(17, index["summary"]["circuit_count"])
             self.assertEqual(
                 {
@@ -61,7 +61,7 @@ class PedalboardCircuitLoweringTest(unittest.TestCase):
                     for port in index["graph"]["boundary"]["external_inputs"]
                 ],
             )
-            self.assertEqual("llmoop.compiled_pedalboard_artifact.v1", index["source"]["format"])
+            self.assertEqual("nerve.compiled_pedalboard_artifact.v1", index["source"]["format"])
             self.assertEqual(".", index["source"]["artifact_root"])
             self.assertTrue(result["index_path"].exists())
 

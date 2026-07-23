@@ -10,20 +10,20 @@ import subprocess
 import sys
 from pathlib import Path
 
-from llmoop.compilation import ModelCompileCancelled, ModelCompileError
-from llmoop.model_compiler import compile_model, discover_source_model
+from nerve.compilation import ModelCompileCancelled, ModelCompileError
+from nerve.model_compiler import compile_model, discover_source_model
 
 
 RUNTIME_PACKAGE_MANIFEST = "vulkan_resident_package.json"
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(prog="llmoop")
+    parser = argparse.ArgumentParser(prog="nerve")
     parser.add_argument(
         "--compile-model",
         type=Path,
         metavar="MODEL_DIR",
-        help="compile a source model directory into llmoop engine artifacts",
+        help="compile a source model directory into NERVE engine artifacts",
     )
     parser.add_argument(
         "--discover-model",
@@ -81,7 +81,7 @@ def main() -> None:
     parser.add_argument(
         "--runtime-bin",
         type=Path,
-        help="path to a built llmoop-runtime binary; defaults to cargo run from a source checkout",
+        help="path to a built nerve-runtime binary; defaults to cargo run --release from a source checkout",
     )
     parser.add_argument(
         "--transpiled-dir",
@@ -210,7 +210,7 @@ def main() -> None:
         if len(sys.argv) == 1:
             run_tui()
             return
-        parser.error("choose an action, or run llmoop without arguments to open the TUI")
+        parser.error("choose an action, or run nerve without arguments to open the TUI")
     validate_action_options(parser, args)
     if args.shader_source_dir is None:
         args.shader_source_dir = Path("runtime-rs/shaders")
@@ -422,7 +422,7 @@ def run_tui() -> None:
 
 def build_tui_command() -> tuple[list[str], Path]:
     workspace = Path(__file__).resolve().parent.parent
-    configured = os.environ.get("LLMOOP_TUI_BIN")
+    configured = os.environ.get("NERVE_TUI_BIN")
     if configured:
         return [configured], workspace
     manifest = workspace / "runtime-rs" / "Cargo.toml"
@@ -436,13 +436,13 @@ def build_tui_command() -> tuple[list[str], Path]:
             "--features",
             "vulkan,tokenizers,tui",
             "--bin",
-            "llmoop-tui",
+            "nerve-tui",
         ], workspace
-    installed = shutil.which("llmoop-tui")
+    installed = shutil.which("nerve-tui")
     if installed:
         return [installed], workspace
     raise SystemExit(
-        "llmoop-tui is not installed; set LLMOOP_TUI_BIN to the executable path"
+        "nerve-tui is not installed; set NERVE_TUI_BIN to the executable path"
     )
 
 
@@ -450,7 +450,7 @@ def emit_jsonl_event(sequence: int, event: dict[str, object]) -> None:
     print(
         json.dumps(
             {
-                "schema": "llmoop.compiler_event.v1",
+                "schema": "nerve.compiler_event.v1",
                 "sequence": sequence,
                 **event,
             },
@@ -554,31 +554,32 @@ def build_runtime_command(args: argparse.Namespace, package_manifest: Path) -> l
         return [
             "cargo",
             "run",
+            "--release",
             "--quiet",
             "--manifest-path",
             str(cargo_manifest),
             "--features",
             "vulkan tokenizers",
             "--bin",
-            "llmoop-runtime",
+            "nerve-runtime",
             "--",
             *runtime_args,
         ]
 
     for candidate in (
-        repo_root / "runtime-rs" / "target" / "debug" / "llmoop-runtime",
-        repo_root / "runtime-rs" / "target" / "release" / "llmoop-runtime",
+        repo_root / "runtime-rs" / "target" / "debug" / "nerve-runtime",
+        repo_root / "runtime-rs" / "target" / "release" / "nerve-runtime",
     ):
         if candidate.is_file():
             return [str(candidate), *runtime_args]
 
     raise SystemExit(
-        "could not find llmoop-runtime; pass --runtime-bin or run from a source checkout with runtime-rs"
+        "could not find nerve-runtime; pass --runtime-bin or run from a source checkout with runtime-rs"
     )
 
 
 def runtime_bin_from_env() -> Path | None:
-    raw = os.environ.get("LLMOOP_RUNTIME_BIN")
+    raw = os.environ.get("NERVE_RUNTIME_BIN")
     return Path(raw).expanduser() if raw else None
 
 

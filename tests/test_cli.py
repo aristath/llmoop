@@ -6,11 +6,11 @@ import unittest
 from argparse import Namespace
 from pathlib import Path
 
-from llmoop.cli import (
+from nerve.cli import (
     build_runtime_command,
     resolve_runtime_package_manifest,
 )
-from llmoop.model_package import copy_shader_templates
+from nerve.model_package import copy_shader_templates
 from tests.fixtures import compiled_model_or_skip
 
 
@@ -44,7 +44,7 @@ def runtime_args(**overrides: object) -> Namespace:
         "keep_special_tokens": False,
         "generated_only": False,
         "json": False,
-        "runtime_bin": Path("/tmp/llmoop-runtime"),
+        "runtime_bin": Path("/tmp/nerve-runtime"),
     }
     values.update(overrides)
     return Namespace(**values)
@@ -159,12 +159,12 @@ class RuntimeCliCommandTest(unittest.TestCase):
             keep_special_tokens=True,
             generated_only=True,
             json=True,
-            runtime_bin=Path("/tmp/llmoop-runtime"),
+            runtime_bin=Path("/tmp/nerve-runtime"),
         )
 
         self.assertEqual(
             [
-                "/tmp/llmoop-runtime",
+                "/tmp/nerve-runtime",
                 "--package",
                 str(package),
                 "--prompt",
@@ -203,12 +203,12 @@ class RuntimeCliCommandTest(unittest.TestCase):
             keep_special_tokens=False,
             generated_only=False,
             json=False,
-            runtime_bin=Path("/tmp/llmoop-runtime"),
+            runtime_bin=Path("/tmp/nerve-runtime"),
         )
 
         self.assertEqual(
             [
-                "/tmp/llmoop-runtime",
+                "/tmp/nerve-runtime",
                 "--package",
                 str(package),
                 "--chat",
@@ -224,7 +224,7 @@ class RuntimeCliCommandTest(unittest.TestCase):
 
         self.assertEqual(
             [
-                "/tmp/llmoop-runtime",
+                "/tmp/nerve-runtime",
                 "--package",
                 str(package),
                 "--prompt",
@@ -260,12 +260,12 @@ class RuntimeCliCommandTest(unittest.TestCase):
             keep_special_tokens=False,
             generated_only=False,
             json=True,
-            runtime_bin=Path("/tmp/llmoop-runtime"),
+            runtime_bin=Path("/tmp/nerve-runtime"),
         )
 
         self.assertEqual(
             [
-                "/tmp/llmoop-runtime",
+                "/tmp/nerve-runtime",
                 "--package",
                 str(package),
                 "--inspect-device-slice",
@@ -298,12 +298,12 @@ class RuntimeCliCommandTest(unittest.TestCase):
             keep_special_tokens=False,
             generated_only=False,
             json=True,
-            runtime_bin=Path("/tmp/llmoop-runtime"),
+            runtime_bin=Path("/tmp/nerve-runtime"),
         )
 
         self.assertEqual(
             [
-                "/tmp/llmoop-runtime",
+                "/tmp/nerve-runtime",
                 "--package",
                 str(package),
                 "--inspect-placement",
@@ -335,12 +335,12 @@ class RuntimeCliCommandTest(unittest.TestCase):
             keep_special_tokens=False,
             generated_only=False,
             json=True,
-            runtime_bin=Path("/tmp/llmoop-runtime"),
+            runtime_bin=Path("/tmp/nerve-runtime"),
         )
 
         self.assertEqual(
             [
-                "/tmp/llmoop-runtime",
+                "/tmp/nerve-runtime",
                 "--package",
                 str(package),
                 "--inspect-package",
@@ -372,12 +372,12 @@ class RuntimeCliCommandTest(unittest.TestCase):
             keep_special_tokens=False,
             generated_only=False,
             json=True,
-            runtime_bin=Path("/tmp/llmoop-runtime"),
+            runtime_bin=Path("/tmp/nerve-runtime"),
         )
 
         self.assertEqual(
             [
-                "/tmp/llmoop-runtime",
+                "/tmp/nerve-runtime",
                 "--package",
                 str(package),
                 "--inspect-patch",
@@ -413,12 +413,12 @@ class RuntimeCliCommandTest(unittest.TestCase):
             keep_special_tokens=False,
             generated_only=False,
             json=True,
-            runtime_bin=Path("/tmp/llmoop-runtime"),
+            runtime_bin=Path("/tmp/nerve-runtime"),
         )
 
         self.assertEqual(
             [
-                "/tmp/llmoop-runtime",
+                "/tmp/nerve-runtime",
                 "--package",
                 str(package),
                 "--inspect-patch",
@@ -456,12 +456,12 @@ class RuntimeCliCommandTest(unittest.TestCase):
             keep_special_tokens=False,
             generated_only=False,
             json=True,
-            runtime_bin=Path("/tmp/llmoop-runtime"),
+            runtime_bin=Path("/tmp/nerve-runtime"),
         )
 
         self.assertEqual(
             [
-                "/tmp/llmoop-runtime",
+                "/tmp/nerve-runtime",
                 "--package",
                 str(package),
                 "--inspect-runtime",
@@ -501,12 +501,12 @@ class RuntimeCliCommandTest(unittest.TestCase):
             keep_special_tokens=False,
             generated_only=False,
             json=True,
-            runtime_bin=Path("/tmp/llmoop-runtime"),
+            runtime_bin=Path("/tmp/nerve-runtime"),
         )
 
         self.assertEqual(
             [
-                "/tmp/llmoop-runtime",
+                "/tmp/nerve-runtime",
                 "--package",
                 str(package),
                 "--prompt",
@@ -732,8 +732,8 @@ class CompiledPackageTest(unittest.TestCase):
             ),
         )
         for pedal in circuit_graph["pedals"]:
-            self.assertEqual("llmoop.circuit_params.v1", pedal["params"]["schema"])
-            self.assertEqual("llmoop.circuit_state.v1", pedal["state"]["schema"])
+            self.assertEqual("nerve.circuit_params.v1", pedal["params"]["schema"])
+            self.assertEqual("nerve.circuit_state.v1", pedal["state"]["schema"])
         behavioral = json.loads(
             (fixture.package_dir / manifest["behavioral_validation_path"]).read_text()
         )

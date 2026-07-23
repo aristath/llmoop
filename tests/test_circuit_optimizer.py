@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from llmoop.circuit_optimizer import optimize_circuit_for_vulkan
+from nerve.circuit_optimizer import optimize_circuit_for_vulkan
 
 
 class VulkanCircuitOptimizerTest(unittest.TestCase):

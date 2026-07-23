@@ -4,18 +4,18 @@ from copy import deepcopy
 
 import pytest
 
-from llmoop.behavioral_compiler import (
+from nerve.behavioral_compiler import (
     build_behavioral_validation,
     model_contract_digest,
     prove_exact_circuit_candidate,
     validate_behavioral_validation_artifact,
 )
-from llmoop.compilation import ModelCompileError
+from nerve.compilation import ModelCompileError
 
 
 def source_circuit() -> dict:
     return {
-        "schema": "llmoop.stream_circuit.v1",
+        "schema": "nerve.stream_circuit.v1",
         "source": {"pedal_id": "layer_00"},
         "boundary": {
             "inputs": [{"id": "input_frame", "source": "x"}],
@@ -44,7 +44,7 @@ def source_circuit() -> dict:
 
 def empirical_evidence(*, free_running_status: str = "passed") -> dict:
     return {
-        "schema": "llmoop.behavioral_empirical_evidence.v1",
+        "schema": "nerve.behavioral_empirical_evidence.v1",
         "model_contract_digest": "a" * 64,
         "teacher_forced": {
             "status": "passed",
@@ -93,7 +93,7 @@ def test_exact_candidate_gate_proves_complete_fusion_coverage() -> None:
 
 def test_exact_candidate_gate_proves_fused_parallel_ffn_projection() -> None:
     source = {
-        "schema": "llmoop.stream_circuit.v1",
+        "schema": "nerve.stream_circuit.v1",
         "source": {"pedal_id": "layer_00"},
         "boundary": {
             "inputs": [{"id": "input", "source": "x"}],
@@ -168,7 +168,7 @@ def test_exact_candidate_gate_proves_fused_parallel_ffn_projection() -> None:
 
 def test_exact_candidate_gate_proves_fp8_parallel_linear_parameter_pairs() -> None:
     source = {
-        "schema": "llmoop.stream_circuit.v1",
+        "schema": "nerve.stream_circuit.v1",
         "source": {"pedal_id": "layer_00"},
         "boundary": {
             "inputs": [{"id": "input", "source": "x"}],

@@ -5,12 +5,12 @@ from typing import Callable
 
 import pytest
 
-from llmoop.circuit_ir import validate_circuit, validate_circuit_against_pedal
+from nerve.circuit_ir import validate_circuit, validate_circuit_against_pedal
 
 
 def valid_circuit() -> dict[str, object]:
     return {
-        "schema": "llmoop.stream_circuit.v1",
+        "schema": "nerve.stream_circuit.v1",
         "id": "test_circuit",
         "runtime_role": "signal_processor",
         "boundary": {

@@ -7,10 +7,10 @@ from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
-from llmoop.model_compiler import compile_model
+from nerve.model_compiler import compile_model
 
 
-TEST_MODEL_ENV = "LLMOOP_TEST_MODEL_DIR"
+TEST_MODEL_ENV = "NERVE_TEST_MODEL_DIR"
 
 
 @dataclass(frozen=True)
@@ -35,7 +35,7 @@ def source_model_dir_or_skip() -> Path:
 @lru_cache(maxsize=1)
 def compiled_model_or_skip() -> CompiledModelFixture:
     model_dir = source_model_dir_or_skip()
-    root = Path(tempfile.mkdtemp(prefix="llmoop_compiled_model_"))
+    root = Path(tempfile.mkdtemp(prefix="nerve_compiled_model_"))
     report = compile_model(
         model_dir,
         transpiled_dir=root / "transpiled",

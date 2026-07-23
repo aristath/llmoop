@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
 
-from llmoop.compilation import (
+from nerve.compilation import (
     CancelCheck,
     CompiledModelReport,
     CompileEventSink,
@@ -18,7 +18,7 @@ from llmoop.compilation import (
     emit_compile_event,
     read_json,
 )
-from llmoop.model_package import compiled_model_slug, compile_model_package
+from nerve.model_package import compiled_model_slug, compile_model_package
 
 @dataclass(frozen=True)
 class SourceModelDiscovery:
@@ -170,11 +170,11 @@ def discover_source_model(model_dir: Path) -> SourceModelDiscovery:
 
 
 def staging_path(destination: Path, token: str) -> Path:
-    return destination.with_name(f".{destination.name}.llmoop-stage-{token}")
+    return destination.with_name(f".{destination.name}.nerve-stage-{token}")
 
 
 def backup_path(destination: Path, token: str) -> Path:
-    return destination.with_name(f".{destination.name}.llmoop-backup-{token}")
+    return destination.with_name(f".{destination.name}.nerve-backup-{token}")
 
 
 def remove_path(path: Path) -> None:

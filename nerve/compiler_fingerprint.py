@@ -4,13 +4,13 @@ from hashlib import sha256
 from pathlib import Path
 
 
-COMPILER_FINGERPRINT_SCHEMA = "llmoop.package_compiler_sha256.v1"
+COMPILER_FINGERPRINT_SCHEMA = "nerve.package_compiler_sha256.v1"
 
 
 def package_compiler_fingerprint(shader_source_dir: Path) -> str:
     compiler_dir = Path(__file__).resolve().parent
     inputs = [
-        *((f"llmoop/{path.name}", path) for path in compiler_dir.glob("*.py")),
+        *((f"nerve/{path.name}", path) for path in compiler_dir.glob("*.py")),
         *(
             (f"runtime-rs/shaders/{path.name}", path)
             for path in shader_source_dir.iterdir()

@@ -4,15 +4,15 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
-from llmoop import cli
+from nerve import cli
 
 
 def test_no_argument_cli_launches_tui(
     monkeypatch,
 ) -> None:
     calls: list[tuple[list[str], Path | None]] = []
-    monkeypatch.setattr(sys, "argv", ["llmoop"])
-    monkeypatch.setenv("LLMOOP_TUI_BIN", "/tmp/llmoop-tui")
+    monkeypatch.setattr(sys, "argv", ["nerve"])
+    monkeypatch.setenv("NERVE_TUI_BIN", "/tmp/nerve-tui")
     monkeypatch.setattr(
         cli.subprocess,
         "run",
@@ -23,21 +23,21 @@ def test_no_argument_cli_launches_tui(
     cli.main()
 
     assert calls == [
-        (["/tmp/llmoop-tui"], Path(cli.__file__).resolve().parent.parent)
+        (["/tmp/nerve-tui"], Path(cli.__file__).resolve().parent.parent)
     ]
 
 
 def test_tui_launcher_prefers_explicit_binary(monkeypatch) -> None:
-    monkeypatch.setenv("LLMOOP_TUI_BIN", "/opt/llmoop/bin/tui")
+    monkeypatch.setenv("NERVE_TUI_BIN", "/opt/nerve/bin/tui")
 
     command, workspace = cli.build_tui_command()
 
-    assert command == ["/opt/llmoop/bin/tui"]
+    assert command == ["/opt/nerve/bin/tui"]
     assert workspace == Path(cli.__file__).resolve().parent.parent
 
 
 def test_tui_launcher_uses_current_source_tree_without_shell(monkeypatch) -> None:
-    monkeypatch.delenv("LLMOOP_TUI_BIN", raising=False)
+    monkeypatch.delenv("NERVE_TUI_BIN", raising=False)
     monkeypatch.setattr(cli.shutil, "which", lambda _name: None)
     workspace = Path(cli.__file__).resolve().parent.parent
 
@@ -52,6 +52,6 @@ def test_tui_launcher_uses_current_source_tree_without_shell(monkeypatch) -> Non
         "--features",
         "vulkan,tokenizers,tui",
         "--bin",
-        "llmoop-tui",
+        "nerve-tui",
     ]
     assert command_workspace == workspace

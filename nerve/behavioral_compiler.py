@@ -8,12 +8,12 @@ from collections import Counter
 from copy import deepcopy
 from typing import Any
 
-from llmoop.compilation import Json, ModelCompileError
+from nerve.compilation import Json, ModelCompileError
 
 
-BEHAVIORAL_VALIDATION_SCHEMA = "llmoop.behavioral_validation.v1"
-BEHAVIORAL_EMPIRICAL_EVIDENCE_SCHEMA = "llmoop.behavioral_empirical_evidence.v1"
-CONTRACT_DIGEST_ALGORITHM = "llmoop.json_tree_sha256.v1"
+BEHAVIORAL_VALIDATION_SCHEMA = "nerve.behavioral_validation.v1"
+BEHAVIORAL_EMPIRICAL_EVIDENCE_SCHEMA = "nerve.behavioral_empirical_evidence.v1"
+CONTRACT_DIGEST_ALGORITHM = "nerve.json_tree_sha256.v1"
 EXACT_REWRITE_CONTRACTS = {
     "append_scaled_dot_product_attention": "append_attention_exact_bf16.v1",
     "linear_residual": "linear_residual_exact_bf16.v1",
