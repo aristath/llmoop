@@ -27,9 +27,10 @@ use crate::stream_plan::{
     SignalStorage, StreamCircuitExecutionPlan, StreamCircuitResourcePlan, TensorIndex,
 };
 use crate::stream_runtime::{
-    RuntimeStreamActivation, RuntimeStreamActivationKind, RuntimeStreamActivationOutcome,
-    RuntimeStreamInputEvent, RuntimeStreamScheduler, RuntimeStreamSchedulerBudget,
-    RuntimeStreamSchedulerError, RuntimeStreamStateReservation,
+    RuntimeStreamActivation, RuntimeStreamActivationBatch, RuntimeStreamActivationBatchKind,
+    RuntimeStreamActivationKind, RuntimeStreamActivationOutcome, RuntimeStreamInputEvent,
+    RuntimeStreamScheduler, RuntimeStreamSchedulerBudget, RuntimeStreamSchedulerError,
+    RuntimeStreamStateReservation,
 };
 use crate::stream_state::{TransientStateBlockId, TransientStateBlockShape, TransientStateKey};
 use crate::tensor_storage::TensorStorage;

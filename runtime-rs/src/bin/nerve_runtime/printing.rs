@@ -33,6 +33,14 @@ fn print_runtime_timing_stats(label: &str, timing: &RuntimePromptTimingReport) {
     println!("  scheduler_steps={}", timing.scheduler_step_count);
     println!("  activation_batches={}", timing.activation_batch_count);
     println!(
+        "  prefill_activation_batches={}",
+        timing.prefill_activation_batch_count
+    );
+    println!(
+        "  decode_activation_batches={}",
+        timing.decode_activation_batch_count
+    );
+    println!(
         "  max_activation_batch_width={}",
         timing.max_activation_batch_width
     );

@@ -306,6 +306,8 @@ pub struct RuntimePromptTimingReport {
     pub generated_token_count: usize,
     pub scheduler_step_count: usize,
     pub activation_batch_count: usize,
+    pub prefill_activation_batch_count: usize,
+    pub decode_activation_batch_count: usize,
     pub max_activation_batch_width: usize,
     pub prefill_activation_count: usize,
     pub decode_activation_count: usize,

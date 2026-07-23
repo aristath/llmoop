@@ -634,6 +634,8 @@
             generated_token_count: 1,
             scheduler_step_count: 2,
             activation_batch_count: 2,
+            prefill_activation_batch_count: 1,
+            decode_activation_batch_count: 1,
             max_activation_batch_width: 1,
             prefill_activation_count: 1,
             decode_activation_count: 1,
