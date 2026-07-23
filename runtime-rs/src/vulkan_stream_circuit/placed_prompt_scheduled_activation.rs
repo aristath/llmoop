@@ -240,93 +240,58 @@ impl VulkanResidentInProcessPlacedPromptStream {
     }
 
     fn scheduler_activation_state_bindings(
-        &self,
+        &mut self,
         activation: &RuntimeStreamActivation,
     ) -> Result<
         Vec<VulkanResidentScheduledActivationStateBinding>,
         VulkanResidentInProcessPlacedRuntimeError,
     > {
-        activation
-            .state_reservations
-            .iter()
-            .flat_map(|reservation| self.scheduler_state_reservation_bindings(reservation))
-            .collect()
+        let mut bindings = Vec::new();
+        for reservation in &activation.state_reservations {
+            bindings.extend(self.scheduler_state_reservation_bindings(reservation)?);
+        }
+        Ok(bindings)
     }
 
     fn scheduler_state_reservation_bindings(
-        &self,
+        &mut self,
         reservation: &RuntimeStreamStateReservation,
-    ) -> Vec<
-        Result<VulkanResidentScheduledActivationStateBinding, VulkanResidentInProcessPlacedRuntimeError>,
+    ) -> Result<
+        Vec<VulkanResidentScheduledActivationStateBinding>,
+        VulkanResidentInProcessPlacedRuntimeError,
     > {
-        reservation
-            .slots
-            .iter()
-            .map(|slot| {
-                let state = self.package.resident_state_buffer(&slot.key).ok_or_else(|| {
-                    VulkanResidentInProcessPlacedRuntimeError::Package(
-                        VulkanResidentTokenModelPackageError::new(format!(
-                            "scheduled transient state {}.{} is not resident in package {:?}",
-                            slot.key.node_instance_id, slot.key.state_id, self.package.package_id
-                        )),
-                    )
-                })?;
-                let bytes_per_activation = state.bytes_per_activation.ok_or_else(|| {
-                    VulkanResidentInProcessPlacedRuntimeError::Package(
-                        VulkanResidentTokenModelPackageError::new(format!(
-                            "scheduled transient state {}.{} has no dynamic bytes per activation",
-                            state.component_id, state.state_id
-                        )),
-                    )
-                })?;
-                let state_capacity = state
-                    .max_dynamic_activations
-                    .map(|limit| limit.min(self.package.dynamic_state_capacity_activations))
-                    .unwrap_or(self.package.dynamic_state_capacity_activations);
-                if state_capacity == 0 {
-                    return Err(VulkanResidentInProcessPlacedRuntimeError::Package(
-                        VulkanResidentTokenModelPackageError::new(format!(
-                            "scheduled transient state {}.{} has zero resident activation capacity",
-                            state.component_id, state.state_id
-                        )),
-                    ));
-                }
-                let resident_activation_offset = slot.logical_activation_index % state_capacity;
-                let resident_byte_offset = state
-                    .static_bytes
-                    .unwrap_or(0)
-                    .checked_add(
-                        bytes_per_activation
-                            .checked_mul(resident_activation_offset)
-                            .ok_or_else(|| {
-                                VulkanResidentInProcessPlacedRuntimeError::Package(
-                                    VulkanResidentTokenModelPackageError::new(format!(
-                                        "scheduled transient state {}.{} byte offset overflowed",
-                                        state.component_id, state.state_id
-                                    )),
-                                )
-                            })?,
-                    )
-                    .ok_or_else(|| {
-                        VulkanResidentInProcessPlacedRuntimeError::Package(
-                            VulkanResidentTokenModelPackageError::new(format!(
-                                "scheduled transient state {}.{} byte offset overflowed",
-                                state.component_id, state.state_id
-                            )),
-                        )
-                    })?;
-
-                Ok(VulkanResidentScheduledActivationStateBinding {
-                    key: slot.key.clone(),
-                    logical_activation_index: slot.logical_activation_index,
-                    transient_block_id: slot.block_id,
-                    transient_block_activation_offset: slot.block_activation_offset,
-                    resident_activation_offset,
-                    resident_byte_offset,
-                    bytes_per_activation,
-                })
-            })
-            .collect()
+        let mut bindings = Vec::with_capacity(reservation.slots.len());
+        for slot in &reservation.slots {
+            let state = self.package.resident_state_buffer(&slot.key).ok_or_else(|| {
+                VulkanResidentInProcessPlacedRuntimeError::Package(
+                    VulkanResidentTokenModelPackageError::new(format!(
+                        "scheduled transient state {}.{} is not resident in package {:?}",
+                        slot.key.node_instance_id, slot.key.state_id, self.package.package_id
+                    )),
+                )
+            })?;
+            let page_binding = self
+                .transient_state_pages
+                .bind_slot(
+                    state,
+                    self.package.dynamic_state_capacity_activations,
+                    slot,
+                )
+                .map_err(VulkanResidentInProcessPlacedRuntimeError::Package)?;
+            bindings.push(VulkanResidentScheduledActivationStateBinding {
+                key: page_binding.key,
+                logical_activation_index: page_binding.logical_activation_index,
+                transient_block_id: page_binding.transient_block_id,
+                transient_block_activation_offset: page_binding.transient_block_activation_offset,
+                transient_block_activation_capacity: page_binding
+                    .transient_block_activation_capacity,
+                resident_page_index: page_binding.resident_page_index,
+                resident_activation_offset: page_binding.resident_activation_offset,
+                resident_byte_offset: page_binding.resident_byte_offset,
+                bytes_per_activation: page_binding.bytes_per_activation,
+            });
+        }
+        Ok(bindings)
     }
 }
 
@@ -349,6 +314,8 @@ pub struct VulkanResidentScheduledActivationStateBinding {
     pub logical_activation_index: usize,
     pub transient_block_id: TransientStateBlockId,
     pub transient_block_activation_offset: usize,
+    pub transient_block_activation_capacity: usize,
+    pub resident_page_index: usize,
     pub resident_activation_offset: usize,
     pub resident_byte_offset: usize,
     pub bytes_per_activation: usize,

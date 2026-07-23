@@ -62,6 +62,7 @@ pub struct TransientStateSlot {
     pub logical_activation_index: usize,
     pub block_id: TransientStateBlockId,
     pub block_activation_offset: usize,
+    pub block_activation_capacity: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -312,6 +313,7 @@ impl TransientStateTable {
                 logical_activation_index,
                 block_id,
                 block_activation_offset,
+                block_activation_capacity: entry.shape.activation_capacity,
             });
             entry.logical_activation_count = entry.logical_activation_count.saturating_add(1);
         }

@@ -78,7 +78,8 @@ Current status:
 - State blocks are page-like, reusable, ref-counted, resettable, forkable, and snapshot-able.
 - The stream scheduler reserves transient state slots per scheduled activation for declared stream-owned state.
 - Placed Vulkan packages now expose dynamic per-activation state declarations from resident package metadata, and placed streams register those declarations with the scheduler at stream admission.
-- Scheduled placed activations expose a transitional binding plan from scheduler transient slots to the current resident state-buffer offsets; the backend still needs to use real page-backed bindings instead of fixed circular state buffers.
+- Scheduled placed activations bind scheduler transient block ids to explicit resident page indexes before computing state-buffer byte offsets. This removes the old fixed circular/modulo aliasing path and fails loudly when resident page capacity is exhausted.
+- This is not finished: resident state buffers are still allocated as flat buffers, and the runtime still needs page free/eviction, block-to-buffer rebinding metadata, and device-side page-table bindings instead of host-side offset calculation.
 
 ### 3. Preserve layer components as runtime/editing/placement boundaries
 
@@ -299,9 +300,9 @@ Current status:
   are reported separately in normal prompt/chat output.
 - The runtime default generation budget is 65,536 new tokens rather than a tiny
   benchmark-oriented cap.
-- This is not finished: true page-backed resident state bindings, prefill/decode
-  interleaving under memory pressure, and real long-context validation are still
-  required.
+- This is not finished: device-visible page-table bindings, prefill/decode
+  interleaving under memory pressure, page reclamation, and real long-context
+  validation are still required.
 
 ### 11. Add prefix/state reuse after block-managed state exists
 
@@ -341,10 +342,10 @@ Current status:
   sharing, key normalization, eviction release, block-alignment rejection,
   state-depth mismatch rejection, longest-prefix lookup, and execution-class
   mismatch rejection.
-- This is not finished prompt prefix caching yet: block-aligned prompt
-  admission, automatic cache insert/restore around normal prompt events,
-  runtime modifier serialization, and backend page-backed bindings still need
-  to be wired into normal prompt admission.
+- This is not finished prompt prefix caching yet: automatic cache
+  insert/restore around normal prompt events, runtime modifier serialization,
+  page reclamation, and device-visible page-table bindings still need to be
+  wired into normal prompt admission.
 
 ### 12. Make graph/kernel reuse explicit
 
@@ -370,8 +371,8 @@ Current status:
 - Normal chat output includes resident sequence record/reuse/submit counters, so
   graph/kernel reuse is visible without a special profiling mode.
 - This is not finished: stable runtime graph identity, reusable prefill/decode
-  template catalogs, and hot-path metadata updates for page-backed state still
-  need to be made explicit.
+  template catalogs, and hot-path page-table metadata updates still need to be
+  made explicit.
 
 ## Validation expectations
 

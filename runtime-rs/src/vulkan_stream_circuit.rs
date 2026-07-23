@@ -32,7 +32,9 @@ use crate::stream_runtime::{
     RuntimeStreamScheduler, RuntimeStreamSchedulerBudget, RuntimeStreamSchedulerError,
     RuntimeStreamStateReservation,
 };
-use crate::stream_state::{TransientStateBlockId, TransientStateBlockShape, TransientStateKey};
+use crate::stream_state::{
+    TransientStateBlockId, TransientStateBlockShape, TransientStateKey, TransientStateSlot,
+};
 use crate::tensor_storage::TensorStorage;
 use crate::vulkan::{DEFAULT_COMPUTE_LOCAL_SIZE_X, DEFAULT_SPIRV_ENTRY_POINT, read_spirv_words};
 use crate::vulkan_compute::{
@@ -73,6 +75,7 @@ pub const VULKAN_BACKEND_LOOP_MAX_WINDOW: usize = 64;
 const VULKAN_BACKEND_LOOP_SNAPSHOT_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 
 include!("vulkan_stream_circuit/resident_plan_buffers.rs");
+include!("vulkan_stream_circuit/transient_state_pages.rs");
 include!("vulkan_stream_circuit/edge_plan.rs");
 include!("vulkan_stream_circuit/edge_buffers.rs");
 include!("vulkan_stream_circuit/edge_transport.rs");
