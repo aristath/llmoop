@@ -1,27 +1,43 @@
-# NERVE: Neural Execution & Rewiring Virtual Engine
+# NERVE: Neural Execution & Retopology Virtual Engine
 
 ## Continuous Stream Inference Engine
 
 ## Summary
 
-This inference engine treats a language model as a continuously available, event-driven signal processor rather than a request/response service.
+This inference engine treats a language model as a continuously available, event-driven stream processor rather than a request/response service.
 
-The engine is modeled after an audio signal chain consisting of a guitar, a pedalboard, an amplifier, and a feedback loop. The complete model is the pedalboard; its layers and other processing entities are individual pedals connected in series, in parallel, through mixers, and through delayed feedback paths. A user request is not a self-contained job that creates a temporary generation process. It is a signal injected into an existing stream. The board processes that signal, produces output, and feeds state back into itself so that the stream can continue.
+The original design metaphor was an audio signal chain: a guitar, a pedalboard, an amplifier, and a feedback loop. That metaphor remains useful for intuition, but it is not the project’s formal nomenclature. Public architecture, APIs, manifests, UI text, and runtime discussions should use graph/compiler terminology:
+
+- **stream**: a long-lived stateful inference process;
+- **compiled model**: the self-contained artifact produced by the compiler;
+- **component**: a reusable compiled processing unit definition;
+- **node instance**: a runtime-mounted occurrence of a component;
+- **port**: a typed input, output, state, or control boundary;
+- **edge**: a typed connection between ports;
+- **execution graph**: the editable graph of node instances and edges;
+- **runtime graph**: the concrete execution graph selected for a mounted stream;
+- **placement**: the assignment of node instances to execution devices;
+- **transport**: the mechanism used by an edge, especially across device boundaries; and
+- **transient state**: stream-owned mutable state.
+
+A user request is not a self-contained job that creates a temporary generation process. It is an event injected into an existing stream. The runtime graph processes that event, produces output, and feeds state back into itself so that the stream can continue.
 
 The stream is logically always on. When it has no input and no internally scheduled continuation, it consumes no compute; its state simply remains suspended until the next event.
 
-An existing model provides the behavioral reference, but its transformer implementation is not the required runtime structure. A behavioral compiler produces a neutral pedal kit: reusable pedals, parameter artifacts, port contracts, transducers, kernels, state declarations, and canonical/default wiring. Runtime then assembles an actual pedalboard patch from that kit. Placement, custom wiring, duplication, bypasses, and cable transport are runtime decisions rather than compiler decisions. While a stream is active, the selected devices own sampling and feedback loops as much as possible; the host or UI injects external events, receives public output, and supplies control.
+An existing model provides the behavioral reference, but its transformer implementation is not the required runtime structure. A behavioral compiler produces a neutral component catalog: reusable components, parameter artifacts, port contracts, transducers, kernels, state declarations, and canonical/default topology. Runtime then assembles an actual runtime graph from that catalog. Placement, custom topology, duplication, bypasses, and edge transport are runtime decisions rather than compiler decisions. While a stream is active, the selected devices own sampling and feedback loops as much as possible; the host or UI injects external events, receives public output, and supplies control.
 
-## Audio Model
+## Origin Analogy: Audio Signal Chain
+
+This section is an analogy only. It explains where the architecture came from, not the names that should be used in the implementation.
 
 The physical system is:
 
 ```text
-                                      +--> pedal B --+
+                                      +--> component B --+
                                       |              v
-guitar --> input mixer --> pedal A ---+-----------> mixer --> pedal D ---+--> amplifier
+guitar --> input mixer --> component A ---+-----------> mixer --> component D ---+--> amplifier
            ^                          |              ^                   |
-           |                          +--> pedal C --+                   |
+           |                          +--> component C --+                   |
            |                                                             |
            +---------------- delayed insert/feedback <-------------------+
 ```
@@ -32,9 +48,9 @@ Its inference counterpart is:
 | --- | --- |
 | Guitar | User or another external input source |
 | Sound | Tokens, embeddings, or another stream representation |
-| Pedalboard | The complete model circuit graph |
-| Pedal | A layer or another processing entity |
-| Patch cable | A typed signal, state, or control connection |
+| Pedalboard | Execution graph |
+| Pedal | Component or node instance |
+| Cable | Edge or transport link |
 | Splitter and mixer | Parallel paths, residual paths, and combination functions |
 | Delayed feedback | State carried into a later activation |
 | Input | New external information entering the stream |
@@ -43,7 +59,7 @@ Its inference counterpart is:
 | Output | Observable generated stream |
 | Amplifier | The user or another consumer of the output |
 
-The user injects a signal. The runtime-mounted board processes it and produces output. The insert loop carries the process forward, producing subsequent output until the circuit decides to stop. At that point the engine becomes idle without destroying the stream.
+The user injects a signal. The runtime-mounted graph processes it and produces output. The insert loop carries the process forward, producing subsequent output until the circuit decides to stop. At that point the engine becomes idle without destroying the stream.
 
 ## The Stream Is the Primary Runtime Object
 
@@ -58,7 +74,7 @@ This engine elevates the stream itself into the primary runtime object:
 ```text
                     +-------------------+----> public output
 external input ---->| mounted           |
-                    | pedalboard        |
+                    | execution graph   |
 feedback state ---->|                   |----> next feedback state
                     +-------------------+
 ```
@@ -115,38 +131,38 @@ Logical persistence is separate from physical execution strategy. A backend may 
 
 The source model defines a behavior that is compiled into a runtime-loadable DSP representation. Its transformer architecture and weights are a reference implementation of that behavior, not a required description of the resulting circuit.
 
-The compiler should not decide where pedals run or how a user edits the board. Its job is to produce the reusable parts from which boards can be mounted:
+The compiler should not decide where components run or how a user edits the graph. Its job is to produce the reusable parts from which graphs can be mounted:
 
-- pedal definitions;
+- component definitions;
 - immutable parameters;
 - state and activation layouts;
 - input and output port contracts;
 - transducers and sampler definitions;
 - executable kernels or kernel sources;
 - compatibility metadata; and
-- canonical/default wiring for the unmodified source model.
+- canonical/default topology for the unmodified source model.
 
-The runtime turns those parts into a concrete mounted board.
+The runtime turns those parts into a concrete mounted graph.
 
 The compiled circuit does not need to reproduce the source model's attention heads, matrix multiplications, MLPs, layer topology, KV layout, or numerical path. It may use any internal representation and any sequence of calculations that produces sufficiently equivalent outputs for the same inputs and stream state.
 
-The result is not treated as a function reconstructed around each prompt, but as a runtime-loadable package whose pedals expose stable input, output, and state ports.
+The result is not treated as a function reconstructed around each prompt, but as a runtime-loadable package whose components expose stable input, output, and state ports.
 
 A mounted running stream consists of three parts:
 
 ```text
 mounted stream
-|-- runtime patch
-|   `-- pedal instances, cables, devices, and routing
+|-- runtime graph
+|   `-- node instances, edges, devices, and routing
 |
 |-- permanent circuits
 |   `-- immutable synthesized programs and parameters
 |
 `-- transient circuit
-    `-- mutable state belonging to this stream and its pedal instances
+    `-- mutable state belonging to this stream and its node instances
 ```
 
-The permanent circuits can be shared by many mounted streams and by multiple instances of the same source pedal. Each stream has its own transient circuit and therefore its own continuity and identity. Each duplicated stateful pedal instance receives its own state unless the runtime patch explicitly asks for a different state-sharing policy.
+The permanent circuits can be shared by many mounted streams and by multiple instances of the same source component. Each stream has its own transient circuit and therefore its own continuity and identity. Each duplicated stateful node instance receives its own state unless the runtime graph explicitly asks for a different state-sharing policy.
 
 The compiled form can define:
 
@@ -169,24 +185,24 @@ source checkpoint and architecture
       behavioral compiler
                |
                v
-       pedal kit and stream-circuit IR
+       component catalog and stream-circuit IR
                |
                v
        Vulkan/SPIR-V backend
                |
                v
-     runtime-loadable pedal package
+     runtime-loadable compiled model package
 ```
 
 Runtime mounting is a separate step:
 
 ```text
-pedal package
+compiled model
       +
-runtime patch-bay choices
+runtime graph choices
       |
       v
-mounted pedalboard across one or more devices
+mounted execution graph across one or more devices
       |
       v
 running stream
@@ -230,23 +246,23 @@ Randomness is explicit because individual reference layers may be deterministic 
 
 Entity boundaries are logical. The backend may fuse entities, split them, or lower a connected region as one executable unit without changing its circuit-level contract.
 
-## The Model as a Pedalboard Graph
+## The Model as an Execution Graph
 
-The complete model is an editable graph of circuit entities. A transformer layer is one useful pedal-sized entity, but it is not the only possible granularity and is not an indivisible runtime primitive.
+The complete model is an editable graph of circuit entities. A transformer layer is one useful component-sized entity, but it is not the only possible granularity and is not an indivisible runtime primitive.
 
 ```text
 input transducer
        |
        v
-   layer pedal 0 <----> transient state 0
+   layer component 0 <----> transient state 0
        |
        v
-   layer pedal 1 <----> transient state 1
+   layer component 1 <----> transient state 1
        |
        +-------------------+
        |                   |
        v                   v
-   layer pedal 2       other entity
+   layer component 2       other entity
        |                   |
        +--------> mixer <--+
                     |
@@ -256,10 +272,10 @@ input transducer
                     +----> delayed feedback
 ```
 
-Each pedal instance declares:
+Each node instance declares:
 
 ```text
-pedal instance
+node instance
 |-- typed input ports
 |-- typed output ports
 |-- immutable circuit and parameter references
@@ -270,13 +286,13 @@ pedal instance
 
 The circuit graph makes topology first-class. Its basic editing operations include:
 
-- insert, remove, replace, reorder, or bypass a compatible pedal;
-- duplicate a pedal in series or in parallel;
+- insert, remove, replace, reorder, or bypass a compatible component;
+- duplicate a component in series or in parallel;
 - split and mix signals;
 - add a delayed feedback connection;
 - tap a signal for inspection;
-- group several pedals into a rack entity; and
-- expand a rack into its internal entities.
+- group several components into a composite component; and
+- expand a composite into its internal entities.
 
 Because transformer layers commonly preserve the residual signal width, bypassing or removing one from a serial chain is often structurally simple:
 
@@ -288,109 +304,109 @@ A --------> C
 
 Port types and dimensions remain part of the contract. Where two entities are incompatible, the graph must contain an explicit adapter rather than silently reinterpret the signal.
 
-## Compiler Artifact Versus Runtime Patch Bay
+## Compiler Artifact Versus Runtime Graph
 
-The compiled model package is not the pedalboard placement. It is the box of parts from which a pedalboard can be mounted.
+The compiled model package is not the execution graph placement. It is the self-contained catalog from which an execution graph can be mounted.
 
-The compiler produces a neutral kit:
+The compiler produces a neutral component catalog:
 
 ```text
 compiled package
-|-- source pedal definitions
+|-- source component definitions
 |-- parameter artifacts
 |-- executable kernels
 |-- port and state contracts
 |-- transducers
 |-- sampler
-`-- canonical source wiring
+`-- canonical source topology
 ```
 
-The runtime owns the patch bay:
+The runtime owns the concrete graph:
 
 ```text
-runtime patch
-|-- pedal instances
-|-- instance-to-source-pedal references
+runtime graph
+|-- node instances
+|-- instance-to-source-component references
 |-- device assignment per instance
-|-- cables between instances
+|-- edges between instances
 |-- bypasses and removals
 |-- duplicated instances
 |-- mixers, splitters, and adapters
-`-- transport policy for each cable
+`-- transport policy for each edge
 ```
 
-This distinction is foundational. The same compiled package should support many mounted boards without recompiling the model:
+This distinction is foundational. The same compiled package should support many mounted graphs without recompiling the model:
 
 ```text
-source wiring:
+source topology:
 layer_00 -> layer_01 -> layer_02 -> layer_03
 
-runtime patch A:
+runtime graph A:
 layer_00@gpu0 -> layer_01@gpu0 -> layer_02@gpu0 -> layer_03@gpu0
 
-runtime patch B:
+runtime graph B:
 layer_00@gpu0 -> layer_01@cpu0 -> layer_02@gpu1 -> layer_03@gpu0
 
-runtime patch C:
+runtime graph C:
 layer_00 -> layer_01 -> layer_02a -> layer_02b -> layer_03
                          ^          ^
                          |          |
                both reference source layer_02
 ```
 
-Placement should therefore be a runtime parameter, not a compiler option and not a required manifest rewrite. A file can be a convenient way to save or share a patch, but the architecture must not require placement to be compiled into the package or supplied through a separate JSON artifact. A UI, TUI, CLI, or API call should all be able to construct the same runtime patch object directly.
+Placement should therefore be a runtime parameter, not a compiler option and not a required manifest rewrite. A file can be a convenient way to save or share a runtime graph, but the architecture must not require placement to be compiled into the package or supplied through a separate JSON artifact. A UI, TUI, CLI, or API call should all be able to construct the same runtime graph object directly.
 
 The intended product shape follows naturally:
 
 1. Load a compiled model package.
 2. Discover available execution devices.
-3. Display source pedals, current pedal instances, and cables.
+3. Display source components, current node instances, and edges.
 4. Let the user assign instances to devices.
-5. Let the user bypass, duplicate, remove, reorder, or reconnect compatible pedals.
-6. Mount the selected patch as a running stream.
+5. Let the user bypass, duplicate, remove, reorder, or reconnect compatible components.
+6. Mount the selected runtime graph as a running stream.
 
-The UI is not merely a configuration editor. It is the visible patch bay for the inference engine.
+The UI is not merely a configuration editor. It is the visible graph editor for the inference engine.
 
-### Layer pedals as device-placement boundaries
+### Layer components as device-placement boundaries
 
-For the first practical architecture, each source model layer should be represented as a standalone source pedal in the compiled package. Smaller internal components may exist inside that pedal, and later compiler passes may fuse, split, or specialize implementation details, but the layer-level pedal boundary is important enough to preserve as a logical placement and routing boundary.
+For the first practical architecture, each source model layer should be represented as a standalone source component in the compiled package. Smaller internal components may exist inside that component, and later compiler passes may fuse, split, or specialize implementation details, but the layer-level component boundary is important enough to preserve as a logical placement and routing boundary.
 
-At runtime, the mounted pedalboard contains pedal instances. A simple default board has one instance per source layer. Edited boards may have fewer, more, or differently wired instances. One reason this matters is multi-device inference. If each layer is a self-contained pedal with typed input ports, output ports, permanent parameters, and stream-owned transient state, then different instances can live on different execution devices:
+At runtime, the mounted execution graph contains node instances. A simple default graph has one instance per source layer. Edited graphs may have fewer, more, or differently wired instances. One reason this matters is multi-device inference. If each layer is a self-contained component with typed input ports, output ports, permanent parameters, and stream-owned transient state, then different instances can live on different execution devices:
 
 ```text
 input
   |
   v
-layer_00 pedal  @ GPU 0
+layer_00 component  @ GPU 0
   |
   v
-layer_01 pedal  @ CPU
+layer_01 component  @ CPU
   |
   v
-layer_02 pedal  @ GPU 1
+layer_02 component  @ GPU 1
   |
   v
-layer_03 pedal  @ LAN device
+layer_03 component  @ LAN device
   |
   v
 output
 ```
 
-The compiled package does not need to change when placement changes. For pure placement changes, the runtime board remains the same logical graph and only the cables become different kinds of transport. A short cable may be an in-device buffer reference. A longer cable may be a device-to-device copy, shared memory handoff, PCIe transfer, IPC channel, or LAN stream. In audio terms, the pedalboard still has the same pedals in the same order; the only thing that changes is cable length and cable type.
+The compiled package does not need to change when placement changes. For pure placement changes, the runtime graph remains the same logical graph and only the edges become different kinds of transport. A short edge may be an in-device buffer reference. A longer edge may be a device-to-device copy, shared memory handoff, PCIe transfer, IPC channel, or LAN stream. In audio terms, the execution graph still has the same components in the same order; the only thing that changes is edge length and edge type.
 
-For graph edits, the runtime board itself changes, but the source package still does not. Duplicating a layer, bypassing a layer, or inserting an adapter creates a different runtime patch from the same compiled kit.
+For graph edits, the runtime graph itself changes, but the source package still does not. Duplicating a layer, bypassing a layer, or inserting an adapter creates a different runtime graph from the same compiled kit.
 
 This makes placement a routing problem rather than a model-architecture problem:
 
-- a pedal declares what it consumes and produces;
-- a device backend declares what pedals it can host;
-- a cable declares how signals move between hosted pedals;
+- a component declares what it consumes and produces;
+- a device backend declares what components it can host;
+- an edge declares how signals move between hosted components;
 - the scheduler decides when cross-device boundaries must synchronize; and
-- the behavioral contract stays attached to the pedal, not to the device.
+- the behavioral contract stays attached to the component, not to the device.
 
-This is also why a layer should not be treated merely as a compile-time convenience. A layer pedal is a deployable unit. It can be hosted locally, remotely, duplicated, bypassed, inspected, replaced, or migrated, provided its port and state contracts remain compatible.
+This is also why a layer should not be treated merely as a compile-time convenience. A layer component is a deployable unit. It can be hosted locally, remotely, duplicated, bypassed, inspected, replaced, or migrated, provided its port and state contracts remain compatible.
 
-### Pedal duplication
+### Node duplication
 
 Duplicating an entity does not necessarily duplicate its permanent parameters. Multiple instances can reference one immutable circuit while retaining independent stream state:
 
@@ -419,7 +435,7 @@ A ----+         +--> mixer --> C
 
 The mixer may sum, gate, select, concatenate, or otherwise combine compatible signals. Deterministic copies with identical parameters, input, and state produce identical output, so useful parallel copies require a meaningful difference in state, routing, control, representation, or parameters.
 
-Duplicating a stateful pedal also requires an explicit state policy:
+Duplicating a stateful component also requires an explicit state policy:
 
 - **Fresh:** create empty state for the new instance.
 - **Clone:** snapshot the original instance's current state.
@@ -448,11 +464,11 @@ After delayed feedback edges are separated at activation boundaries, the work wi
 
 ### Hierarchical circuits
 
-Circuit entities are hierarchical. A layer can appear as one opaque pedal while internally containing a smaller board:
+Circuit entities are hierarchical. A layer can appear as one opaque component while internally containing a smaller graph:
 
 ```text
-model board
-`-- layer pedal
+model graph
+`-- layer component
     |-- normalization
     |-- attention circuit
     |-- residual mixer
@@ -464,18 +480,18 @@ The same circuit can therefore be viewed as a whole model, groups of layers, ind
 
 ### Editing behavior versus compiling structure
 
-Removing a pedal and compiling it away are different operations:
+Removing a component and compiling it away are different operations:
 
 ```text
-remove pedal
-    -> intentionally change the board's behavior
+remove component
+    -> intentionally change the graph's behavior
 
-compile pedal away
+compile component away
     -> remove its executable boundary while synthesizing surrounding
-       circuitry that preserves the board's behavior
+       circuitry that preserves the graph's behavior
 ```
 
-Graph editing supports deliberate model surgery. Behavioral compilation may independently alter, fuse, or eliminate topology while remaining subject to the source board's behavioral contract.
+Graph editing supports deliberate model surgery. Behavioral compilation may independently alter, fuse, or eliminate topology while remaining subject to the source graph's behavioral contract.
 
 ## Vulkan/SPIR-V Baseline
 
@@ -749,21 +765,21 @@ The engine's central abstraction is:
 
 ```text
 running stream =
-    runtime patch
-  + compiled permanent pedal circuits
+    runtime graph
+  + compiled permanent component circuits
   + mutable transient circuit
 ```
 
-The compiled permanent circuits supply learned processing capability. They implement the behavior of the source model but need not preserve the source model's calculations or structure. The runtime patch decides which pedal instances exist, how they are wired, and where they run. The transient circuit is created and reshaped by the stream's experience and need not preserve the source model's state representation.
+The compiled permanent circuits supply learned processing capability. They implement the behavior of the source model but need not preserve the source model's calculations or structure. The runtime graph decides which node instances exist, how they are wired, and where they run. The transient circuit is created and reshaped by the stream's experience and need not preserve the source model's state representation.
 
 Together they form a persistent, interruptible, continuously addressable inference process.
 
 ```text
 compiled package != fixed placement of the original calculations
 
-compiled package = reusable pedal kit implementing source behavior
+compiled package = reusable component catalog implementing source behavior
 
-mounted model = runtime patch over that compiled kit
+mounted model = runtime graph over that compiled kit
 ```
 
 The complete system has five defining objects:
@@ -771,23 +787,23 @@ The complete system has five defining objects:
 ```text
 source oracle
     + behavioral compiler
-    + stream-circuit IR / pedal package
-    + runtime patch bay
+    + stream-circuit IR / compiled model package
+    + runtime graph editor
     + Vulkan runtime
 ```
 
-The source oracle defines the behavior. The compiler discovers another realization and packages reusable pedals. The runtime patch bay chooses the mounted graph, placement, duplication, and cable routing. The Vulkan runtime installs and executes the closed loop on broadly available GPU hardware.
+The source oracle defines the behavior. The compiler discovers another realization and packages reusable components. The runtime graph editor chooses the mounted graph, placement, duplication, and edge routing. The Vulkan runtime installs and executes the closed loop on broadly available GPU hardware.
 
 At the graph level:
 
 ```text
-LLM = editable pedalboard graph
+LLM = editable execution graph
 
-source layer = reusable stateful pedal definition
+source layer = reusable stateful component definition
 
-pedal instance = runtime-mounted use of a source pedal
+node instance = runtime-mounted use of a source component
 
-compiled package = behaviorally equivalent pedal kit
+compiled package = behaviorally equivalent component catalog
 
-mounted model = concrete runtime patch over the compiled package
+mounted model = concrete runtime graph over the compiled package
 ```

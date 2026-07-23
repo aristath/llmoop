@@ -8,14 +8,14 @@ NERVE remains a continuous stream inference engine:
 
 ```text
 running stream =
-    runtime patch
-  + compiled permanent pedal circuits
+    runtime graph
+  + compiled permanent component circuits
   + mutable transient circuit
 ```
 
 llama.cpp and vLLM should be used as engineering references for the hard practical parts that mature inference engines already solve: scheduling, memory/state management, batching, graph reuse, kernel selection, quantization, MoE routing, and speculative decoding.
 
-The product shape remains the pedalboard model described in `CONCEPT.md`.
+The product shape remains the execution graph model described in `CONCEPT.md`.
 
 ## Core architectural work
 
@@ -43,7 +43,7 @@ KV is not conceptually a disposable cache in NERVE. It is stream-owned transient
 Use vLLM-style block management as a practical implementation clue, but expose it in NERVE terms:
 
 ```text
-pedal instance state
+node instance state
   -> allocated in blocks/pages
   -> owned by a stream
   -> referenced through state tables
@@ -54,22 +54,22 @@ Required pieces:
 
 - A block/page allocator for transient state.
 - Per-stream state tables.
-- Per-pedal or per-state block tables.
+- Per-component or per-state block tables.
 - Slot mappings for writing new state.
 - Ref counts for shared or reused state blocks.
 - Free lists and safe reclamation.
 - State reset, snapshot, fork, and eventual merge semantics.
-- Support for attention KV, recurrent state, Mamba state, conv state, and other pedal-owned transient state.
+- Support for attention KV, recurrent state, Mamba state, conv state, and other component-owned transient state.
 
 This should remove the architectural need for arbitrary tiny capacity limits while preserving bounded, explicit resource management.
 
-### 3. Preserve layer pedals as runtime/editing/placement boundaries
+### 3. Preserve layer components as runtime/editing/placement boundaries
 
-For the first practical architecture, each source model layer remains a standalone source pedal in the compiled package.
+For the first practical architecture, each source model layer remains a standalone source component in the compiled package.
 
-The backend may fuse, split, tile, or lower internals however it wants, but the logical layer-pedal boundary remains available to the runtime patch bay.
+The backend may fuse, split, tile, or lower internals however it wants, but the logical layer-component boundary remains available to the runtime graph editor.
 
-The layer pedal is the unit that can be:
+The layer component is the unit that can be:
 
 - placed on a device;
 - bypassed;
@@ -77,13 +77,13 @@ The layer pedal is the unit that can be:
 - inspected;
 - migrated;
 - replaced;
-- connected over a short in-device cable or a longer cross-device cable.
+- connected over a short in-device edge or a longer cross-device edge.
 
-Optimization must not erase the user-facing pedalboard contract.
+Optimization must not erase the user-facing execution graph contract.
 
-### 4. Put the scheduler below the runtime patch bay
+### 4. Put the scheduler below the runtime graph editor
 
-The runtime patch decides what exists and how it is wired.
+The runtime graph decides what exists and how it is wired.
 
 The scheduler decides when activations happen.
 
@@ -96,16 +96,16 @@ UI/API event
 stream scheduler
    |
    v
-runtime patch
+runtime graph
    |
    v
-pedal instances + transient state pages
+node instances + transient state pages
    |
    v
 backend execution plan
 ```
 
-Placement remains a runtime concern. The compiler should produce a neutral pedal kit and canonical wiring, not a hardcoded execution placement.
+Placement remains a runtime concern. The compiler should produce a neutral component catalog and canonical topology, not a hardcoded execution placement.
 
 ### 5. Make batch execution mean multi-stream signal processing
 
@@ -117,7 +117,7 @@ Instead:
 many active streams
         |
         v
-same mounted pedalboard execution window
+same mounted execution graph window
         |
         v
 many stream outputs and state updates
@@ -131,7 +131,7 @@ Implement batch execution over active streams:
 - Keep public output and private feedback signals separate.
 - Avoid rebuilding or remounting the model for each prompt.
 
-This is the stream/pedalboard equivalent of vLLM continuous batching.
+This is the stream/execution graph equivalent of vLLM continuous batching.
 
 ### 6. Keep the device-owned feedback loop as the long-term target
 
@@ -153,14 +153,14 @@ Long-term target:
 
 ### 7. Make kernel dispatch shape-aware
 
-Do not treat every compiled linear/pedal operation as the same kind of shader problem.
+Do not treat every compiled linear/component operation as the same kind of shader problem.
 
 Use llama.cpp as inspiration:
 
 - Decode often wants matvec-style kernels.
 - Prefill often wants matmul-style kernels.
 - Quantized formats need native paths, not wide-scalar expansion unless proven faster.
-- Backend dispatch should pick kernels based on runtime shape, dtype, device features, and pedal contract.
+- Backend dispatch should pick kernels based on runtime shape, dtype, device features, and component contract.
 - Graph/kernel reuse should avoid hot-path allocation and recompilation.
 
 Initial required dispatch families:
@@ -175,17 +175,17 @@ Initial required dispatch families:
 
 ### 8. Make MoE route-native
 
-MoE pedals must not behave like dense FFNs with a mask.
+MoE components must not behave like dense FFNs with a mask.
 
 Routing is a first-class signal:
 
 ```text
-hidden signal -> router -> selected expert routes -> active expert pedals -> reducer
+hidden signal -> router -> selected expert routes -> active expert components -> reducer
 ```
 
 Required pieces:
 
-- Router/top-k pedal output as explicit route signal.
+- Router/top-k component output as explicit route signal.
 - Expert execution that only processes selected experts/routes.
 - Route grouping or route batching to reduce wasted work.
 - Expert-shard placement across devices.
@@ -198,19 +198,19 @@ For MoE models with a small active parameter count, performance should reflect a
 
 Speculative decoding should not be treated as benchmark garnish.
 
-For models that ship MTP/draft components, the compiled package should expose them as pedals or pedalboards with explicit wiring:
+For models that ship MTP/draft components, the compiled package should expose them as components or execution graphs with explicit topology:
 
 ```text
-main stream state -> draft pedal(s) -> proposed feedback tokens
+main stream state -> draft component(s) -> proposed feedback tokens
                                 |
                                 v
-main pedalboard verifies/accepts/rejects
+main execution graph verifies/accepts/rejects
 ```
 
 Required pieces:
 
-- Compile MTP/draft components as reusable source pedals.
-- Runtime patch support for draft pedals.
+- Compile MTP/draft components as reusable source components.
+- Runtime graph support for draft components.
 - Scheduler support for lookahead slots.
 - Transient state rollback on rejected draft tokens.
 - Acceptance-rate and accepted-token stats in normal runtime output.
@@ -241,7 +241,7 @@ Once block-managed transient state exists:
 - Reuse block-aligned prefix state across streams.
 - Keep ref counts for shared blocks.
 - Evict with LRU or better policy.
-- Keep model/pedal identity and patch identity in cache keys.
+- Keep model/component identity and runtime graph identity in cache keys.
 - Support future external or remote state connectors.
 
 This maps to vLLM prefix caching while preserving NERVE's transient-circuit semantics.
@@ -253,11 +253,11 @@ Avoid rebuilding execution shape on every prompt or token.
 Required pieces:
 
 - Separate prefill and decode execution plans.
-- Reusable mounted pedalboard plans.
+- Reusable mounted execution graph plans.
 - Reusable batch-size/token-count execution templates.
 - Persistent descriptor/buffer layouts.
 - Hot-path metadata updates without allocation.
-- Stable graph identity based on patch, placement, shape class, and state layout.
+- Stable graph identity based on runtime graph, placement, shape class, and state layout.
 
 This is the Vulkan/SPIR-V analogue of graph reservation/reuse in llama.cpp and CUDA graph capture/replay in vLLM.
 
@@ -297,7 +297,8 @@ Validation should include:
 9. Make MoE route execution truly active-route based.
 10. Wire MTP/speculative decoding as real runtime flow.
 11. Add prefix/state reuse.
-12. Re-benchmark all available models and compare against llama.cpp using warmed runs.
+12. Finish the internal terminology/schema migration before package-format stabilization.
+13. Re-benchmark all available models and compare against llama.cpp using warmed runs.
 
 ## Non-goals
 
@@ -307,15 +308,15 @@ Validation should include:
 - Do not hardcode model-specific behavior into core runtime files.
 - Do not solve performance by adding arbitrary low limits.
 - Do not optimize only benchmark prompts at the expense of real chat usability.
-- Do not erase pedal boundaries to gain short-term speed.
+- Do not erase component boundaries to gain short-term speed.
 - Do not add compatibility layers for old package formats unless there is a concrete current need.
 
 ## Success criteria
 
 The engine is moving in the right direction when:
 
-- A compiled package remains a reusable pedal kit.
-- Runtime patching controls placement, wiring, duplication, and bypass.
+- A compiled package remains a reusable component catalog.
+- Runtime graph editing controls placement, topology, duplication, and bypass.
 - A stream survives across multiple input events without remounting the model.
 - Transient state is explicit, stream-owned, and block-managed.
 - Multiple active streams can share mounted permanent circuits.
@@ -324,4 +325,4 @@ The engine is moving in the right direction when:
 - MTP/speculative decoding works as part of normal generation.
 - Normal chat output includes useful performance stats.
 - Benchmarks discard warmup and report realistic multi-request averages.
-- The implementation still feels like the continuous stream/pedalboard architecture in `CONCEPT.md`.
+- The implementation still feels like the continuous stream/execution graph architecture in `CONCEPT.md`.

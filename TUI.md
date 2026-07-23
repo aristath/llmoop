@@ -2,9 +2,9 @@
 
 ## Purpose
 
-The model editor is the main feature and primary workspace of the NERVE TUI. It is not an auxiliary configuration page attached to a chat client. The TUI is the visible patch bay for the inference engine: it loads an existing compiled pedal kit or transpiles a source model into one, constructs a runtime pedalboard, places pedal instances on available devices, and lets the user inspect and edit that board.
+The model editor is the main feature and primary workspace of the NERVE TUI. It is not an auxiliary configuration page attached to a chat client. The TUI is the visible graph editor for the inference engine: it loads an existing compiled component catalog or transpiles a source model into one, constructs a runtime execution graph, places node instances on available devices, and lets the user inspect and edit that graph.
 
-Chat, runtime statistics, logs, and device information support this workspace. They must not displace the pedalboard editor as the application's central surface.
+Chat, runtime statistics, logs, and device information support this workspace. They must not displace the execution graph editor as the application's central surface.
 
 The TUI will be implemented in Rust and must be fully operable with either the keyboard or the mouse.
 
@@ -15,14 +15,14 @@ Use [Ratatui](https://ratatui.rs/) for layout and rendering, with [Crossterm](ht
 This combination fits the editor because:
 
 - Ratatui permits custom and stateful widgets instead of restricting the application to conventional forms and lists.
-- The pedalboard can render each pedal and cable directly into the terminal buffer.
+- The execution graph can render each component and edge directly into the terminal buffer.
 - Crossterm reports keyboard, mouse, paste, focus, and terminal-resize events.
 - Crossterm supports explicit mouse capture.
-- The application can record the terminal rectangle occupied by every rendered pedal and use those rectangles for precise mouse hit testing.
+- The application can record the terminal rectangle occupied by every rendered component and use those rectangles for precise mouse hit testing.
 
 Ratatui has an [official interactive custom-widget example](https://ratatui.rs/examples/widgets/custom_widget/) that includes mouse handling, as well as documentation for its [custom widget model](https://ratatui.rs/recipes/widgets/custom/).
 
-Ratatui is an immediate-mode rendering library rather than a complete retained GUI toolkit. NERVE will therefore own application state, focus, semantic actions, modal behavior, scrolling, and hit testing. This is appropriate for a specialized pedalboard editor because those behaviors are part of the product rather than generic form behavior.
+Ratatui is an immediate-mode rendering library rather than a complete retained GUI toolkit. NERVE will therefore own application state, focus, semantic actions, modal behavior, scrolling, and hit testing. This is appropriate for a specialized execution graph editor because those behaviors are part of the product rather than generic form behavior.
 
 ## Launching the editor
 
@@ -39,14 +39,14 @@ cargo run --manifest-path runtime-rs/Cargo.toml \
 
 The TUI must preserve the distinctions defined in `CONCEPT.md`:
 
-- A **source pedal** is a reusable definition supplied by the compiled model package.
-- A **pedal instance** is one mounted occurrence of a source pedal on the runtime board.
-- The **pedalboard** is the editable runtime patch containing instances and cables.
-- **Placement** assigns a pedal instance to a runtime-discovered physical device.
-- A **cable** transports a signal between pedal instances. Device placement may change the cable's transport without changing the logical connection.
-- The **transient state** belongs to a running stream and, by default, to an individual stateful pedal instance.
+- A **source component** is a reusable definition supplied by the compiled model package.
+- A **node instance** is one mounted occurrence of a source component on the runtime graph.
+- The **execution graph** is the editable runtime graph containing instances and edges.
+- **Placement** assigns a node instance to a runtime-discovered physical device.
+- An **edge** transports a signal between node instances. Device placement may change the edge's transport without changing the logical connection.
+- The **transient state** belongs to a running stream and, by default, to an individual stateful node instance.
 
-The compiled package provides the source pedal kit and canonical wiring. The TUI edits a runtime patch. It does not modify or recompile the source model merely to reorder, duplicate, bypass, or place pedals.
+The compiled package provides the source component catalog and canonical topology. The TUI edits a runtime graph. It does not modify or recompile the source model merely to reorder, duplicate, bypass, or place components.
 
 ## Model loading and transpilation
 
@@ -87,7 +87,7 @@ The interface should not depend on scraping human-oriented compiler log text. Th
 DiscoveryStarted
 SourceDiscovered
 ValidationStarted
-PedalLoweringStarted { current, total, pedal_id }
+ComponentLoweringStarted { current, total, component_id }
 ArtifactWritingStarted
 PackageValidationStarted
 Completed { package }
@@ -107,7 +107,7 @@ Transpilation may take long enough that it cannot block the terminal event loop.
 │                                                                         │
 │ Discovering structure                         complete                  │
 │ Validating source artifacts                   complete                  │
-│ Lowering pedals                               17 / 32                   │
+│ Lowering components                               17 / 32                   │
 │ ███████████████████████░░░░░░░░░░░░░░░░░░░░                            │
 │ Current: layer_16                                                      │
 │                                                                         │
@@ -119,7 +119,7 @@ Progress must report real compiler stages and completed work. The TUI must not f
 
 Cancellation must leave no package that can be mistaken for a valid completed model. Package publication should be atomic: the result becomes loadable only after compiler validation succeeds.
 
-On successful transpilation, the TUI immediately loads the completed package and opens its canonical pedalboard in the main editor. The user should not have to locate and reopen the generated package manually.
+On successful transpilation, the TUI immediately loads the completed package and opens its canonical execution graph in the main editor. The user should not have to locate and reopen the generated package manually.
 
 ### Loading failures
 
@@ -128,19 +128,19 @@ Failure returns the user to the model-selection surface with the chosen path int
 ```text
 Cannot transpile this source: tokenizer_config.json is missing.
 Unsupported circuit operation in layer_12: selective_scan_v3.
-Compiled package validation failed: pedal layer_07 has no output contract.
+Compiled package validation failed: component layer_07 has no output contract.
 ```
 
 The TUI must not silently fall back to a different model, substitute a different architecture, or load a partially generated package.
 
 ## Primary workspace
 
-The application opens into the model editor and gives the pedalboard most of the terminal area.
+The application opens into the model editor and gives the execution graph most of the terminal area.
 
 ```text
 ┌ Model: LFM2.5-230M ───────────────────────────────────────────────────────┐
 │ Layer order: [0,1,2,3,4,5,5,6,7,7,8,9,10,11,12,13]                     │
-├ Pedalboard ───────────────────────────────────────────────────────────────┤
+├ Execution graph ───────────────────────────────────────────────────────────────┤
 │                                                                          │
 │  [0]──[1]──[2]──[3]──[4]──[5]──[5²]──[6]──[7]──[7²]──[8]──[9] ...     │
 │  GPU0 GPU0 GPU0 GPU0 GPU0 GPU0 CPU  CPU  GPU1 GPU1 GPU1 GPU1             │
@@ -152,16 +152,16 @@ The application opens into the model editor and gives the pedalboard most of the
 
 The exact layout must adapt to the terminal dimensions, but the priority remains stable:
 
-1. Model and board identity.
+1. Model and graph identity.
 2. The layer-order editor.
-3. The live pedalboard visualization.
+3. The live execution graph visualization.
 4. Contextual actions, validation, and status.
 
-The editor must remain useful in a small terminal. A small viewport may scroll, collapse secondary metadata, or show a more compact pedal shape, but it must not remove the ability to edit the sequence, select a pedal, open its modal, or identify its device.
+The editor must remain useful in a small terminal. A small viewport may scroll, collapse secondary metadata, or show a more compact component shape, but it must not remove the ability to edit the sequence, select a component, open its modal, or identify its device.
 
 ## Layer-order field
 
-The layer-order field provides a direct, simple way to define the serial order of layer pedals:
+The layer-order field provides a direct, simple way to define the serial order of layer components:
 
 ```text
 [0,1,2,3,4,5,5,6,7,7,8,9,10,11,12,13]
@@ -169,35 +169,35 @@ The layer-order field provides a direct, simple way to define the serial order o
 
 The field is a real text editor, not a sequence of single-character shortcuts. It must support normal cursor movement, insertion, deletion, selection where the terminal permits it, and bracketed paste.
 
-The field and the visual pedalboard are two interfaces to the same board state:
+The field and the visual execution graph are two interfaces to the same graph state:
 
-- Editing a valid sequence immediately updates the visual board.
+- Editing a valid sequence immediately updates the visual graph.
 - A visual reorder, insertion, removal, or duplication updates the sequence field.
-- Neither surface owns a second, divergent representation of the board.
+- Neither surface owns a second, divergent representation of the graph.
 
-The parser should accept insignificant whitespace around brackets, commas, and identifiers. More expressive syntax can be introduced when it has a concrete editing purpose; the literal list remains the clearest canonical form for a serial board.
+The parser should accept insignificant whitespace around brackets, commas, and identifiers. More expressive syntax can be introduced when it has a concrete editing purpose; the literal list remains the clearest canonical form for a serial graph.
 
 ### Editing and validation
 
-Text is often temporarily invalid while a user is typing. The editor must therefore distinguish the text buffer from the last valid parsed board:
+Text is often temporarily invalid while a user is typing. The editor must therefore distinguish the text buffer from the last valid parsed graph:
 
 ```text
 text buffer
     |
-    +-- valid ----> replace board draft ----> rerender visualization
+    +-- valid ----> replace graph draft ----> rerender visualization
     |
-    `-- invalid --> retain last valid board -> show precise inline error
+    `-- invalid --> retain last valid graph -> show precise inline error
 ```
 
-An incomplete bracket, missing comma, or unknown layer must not make the pedalboard disappear or partially mutate. The error must identify the problematic position and explain the correction, for example:
+An incomplete bracket, missing comma, or unknown layer must not make the execution graph disappear or partially mutate. The error must identify the problematic position and explain the correction, for example:
 
 ```text
 Unknown layer `14` at column 14. Available layers: 0-13.
 ```
 
-## Pedal instances and duplication
+## Node instances and duplication
 
-Every occurrence in the sequence creates a distinct pedal instance, even when several occurrences reference the same source pedal.
+Every occurrence in the sequence creates a distinct node instance, even when several occurrences reference the same source component.
 
 For example:
 
@@ -205,7 +205,7 @@ For example:
 [0,1,2,1,3]
 ```
 
-contains two instances of source pedal `1`. Internally they require stable and distinct identities, such as:
+contains two instances of source component `1`. Internally they require stable and distinct identities, such as:
 
 ```text
 layer_01@1
@@ -221,52 +221,52 @@ Duplicated instances may reference the same immutable compiled circuit and param
 - its own runtime-editable properties; and
 - its own declared transient-state policy.
 
-State sharing or cloning must always be explicit. Duplicating a pedal must not accidentally duplicate or share state as an incidental UI side effect.
+State sharing or cloning must always be explicit. Duplicating a component must not accidentally duplicate or share state as an incidental UI side effect.
 
-## Live pedalboard visualization
+## Live execution graph visualization
 
-The visual area displays the instantiated signal path, one pedal at a time, in execution order. The default serial board uses a clear cable between adjacent pedals. Long boards are scrollable and may wrap only when continuity between rows remains unambiguous.
+The visual area displays the instantiated signal path, one component at a time, in execution order. The default serial graph uses a clear edge between adjacent components. Long graphs are scrollable and may wrap only when continuity between rows remains unambiguous.
 
-Each pedal should communicate, within the available space:
+Each component should communicate, within the available space:
 
-- source layer or pedal identifier;
-- occurrence when the source pedal is duplicated;
-- pedal kind when useful;
+- source layer or component identifier;
+- occurrence when the source component is duplicated;
+- component kind when useful;
 - assigned physical device;
 - selected and focused state;
 - enabled, bypassed, invalid, or unavailable state; and
 - validation or compatibility warnings.
 
-The board should spend its visual emphasis on the signal chain itself. Boxes, cables, and instance identity encode real topology; decoration that does not communicate state or structure should be avoided.
+The graph should spend its visual emphasis on the signal chain itself. Boxes, edges, and instance identity encode real topology; decoration that does not communicate state or structure should be avoided.
 
-The signature visual element is the live cable path. It should make the execution order immediately legible and make placement boundaries visible without turning the screen into a generic dashboard. A cable crossing between devices may change its line treatment or include a transport marker, but color must never be its only distinguishing property.
+The signature visual element is the live edge path. It should make the execution order immediately legible and make placement boundaries visible without turning the screen into a generic dashboard. An edge crossing between devices may change its line treatment or include a transport marker, but color must never be its only distinguishing property.
 
 ### Navigation
 
-There is exactly one logical board selection, regardless of input method.
+There is exactly one logical graph selection, regardless of input method.
 
-- Left and right select the previous or next pedal in a serial chain.
-- Directional navigation follows visible topology when the board contains branches.
-- Enter opens the selected pedal's editor.
-- Clicking a pedal selects it and opens its editor.
-- Scrolling pans through a board larger than its viewport.
+- Left and right select the previous or next component in a serial chain.
+- Directional navigation follows visible topology when the graph contains branches.
+- Enter opens the selected component's editor.
+- Clicking a component selects it and opens its editor.
+- Scrolling pans through a graph larger than its viewport.
 - Tab and Shift-Tab move between major focus regions.
-- Escape closes the current modal or returns focus to the board.
-- Home and End move to the first and last pedal where that meaning is unambiguous.
+- Escape closes the current modal or returns focus to the graph.
+- Home and End move to the first and last component where that meaning is unambiguous.
 
 Keyboard selection and mouse selection must update the same selected-instance identifier. They must not have separate behavioral paths.
 
 ### Hit testing
 
-During every render, the board widget records the `Rect` occupied by each visible pedal and interactive cable or control. Mouse events resolve their coordinates against this render map. The render map is regenerated after scrolling, resizing, topology changes, or density changes, so it cannot retain stale terminal coordinates.
+During every render, the graph widget records the `Rect` occupied by each visible component and interactive edge or control. Mouse events resolve their coordinates against this render map. The render map is regenerated after scrolling, resizing, topology changes, or density changes, so it cannot retain stale terminal coordinates.
 
-## Pedal modal
+## Node modal
 
-Opening a pedal presents a modal for the selected pedal instance, not merely its shared source definition.
+Opening a component presents a modal for the selected node instance, not merely its shared source definition.
 
 ```text
 ┌ Layer 1 · occurrence 2 ──────────────────────┐
-│ Source pedal: layer_01                       │
+│ Source component: layer_01                       │
 │ Type: transformer                            │
 │                                              │
 │ Device:       [ Vulkan GPU 1             ▼ ] │
@@ -283,23 +283,23 @@ Opening a pedal presents a modal for the selected pedal instance, not merely its
 
 The modal may expose:
 
-- source-pedal identity and instance occurrence;
+- source-component identity and instance occurrence;
 - physical-device assignment;
 - enabled or bypassed state;
 - transient-state policy where applicable;
 - an optional instance label;
-- runtime-editable controls declared by the pedal; and
+- runtime-editable controls declared by the component; and
 - compatibility, capacity, or remount warnings.
 
-`Apply` changes the board draft and immediately updates the visualization. `Cancel` discards the modal's uncommitted changes. The interaction for applying a changed draft to an already mounted running stream remains a separate runtime-lifecycle decision; it must not be silently conflated with editing the draft.
+`Apply` changes the graph draft and immediately updates the visualization. `Cancel` discards the modal's uncommitted changes. The interaction for applying a changed draft to an already mounted running stream remains a separate runtime-lifecycle decision; it must not be silently conflated with editing the draft.
 
-When a source pedal has several instances, the modal edits only the selected instance by default. Any later operation that applies a change to every occurrence must say so explicitly.
+When a source component has several instances, the modal edits only the selected instance by default. Any later operation that applies a change to every occurrence must say so explicitly.
 
 ## Schema-driven properties
 
 The TUI must not hardcode controls for LFM, Qwen, Gemma, transformers, Mamba, or any other model family or circuit implementation.
 
-The compiled pedal package declares the editable control schema for each source pedal. A property definition should provide enough metadata for a generic TUI to render and validate it, including:
+The compiled model package declares the editable control schema for each source component. A property definition should provide enough metadata for a generic TUI to render and validate it, including:
 
 - stable property identifier;
 - user-facing name and description;
@@ -309,7 +309,7 @@ The compiled pedal package declares the editable control schema for each source 
 - units where applicable;
 - whether it is editable at runtime;
 - whether changing it requires transient-state reset;
-- whether changing it requires remounting or recompiling the pedal; and
+- whether changing it requires remounting or recompiling the component; and
 - whether the property applies to an instance or to the shared source definition.
 
 The TUI selects an appropriate generic editor from that schema: toggle, numeric input, slider, enumeration list, text input, or read-only value. Unknown property types must be displayed safely as unsupported metadata rather than ignored or guessed.
@@ -323,15 +323,15 @@ The device selector shows the devices currently reported by the runtime together
 - stable runtime identifier;
 - human-readable device name;
 - backend and device kind;
-- supported pedal or kernel capabilities;
+- supported component or kernel capabilities;
 - relevant memory capacity and current availability; and
 - availability or connection state.
 
 CPU support and Vulkan devices participate through the same runtime device abstraction. Other device transports, including LAN devices, can be presented through the same selector when their runtime backends exist.
 
-Changing an instance's placement must not change its source pedal or logical position. It changes where the instance is hosted and may change the transport used by its incoming and outgoing cables.
+Changing an instance's placement must not change its source component or logical position. It changes where the instance is hosted and may change the transport used by its incoming and outgoing edges.
 
-If a device cannot host the selected pedal, the TUI must explain the concrete incompatibility. It must not silently move the pedal elsewhere or present unavailable devices as valid choices.
+If a device cannot host the selected component, the TUI must explain the concrete incompatibility. It must not silently move the component elsewhere or present unavailable devices as valid choices.
 
 ## Unified interaction model
 
@@ -350,15 +350,15 @@ Representative actions include:
 - `StartModelTranspilation`
 - `CancelModelTranspilation`
 - `FocusNextRegion`
-- `SelectPreviousPedal`
-- `SelectNextPedal`
-- `OpenSelectedPedal`
+- `SelectPreviousNode`
+- `SelectNextNode`
+- `OpenSelectedNode`
 - `SetInstanceDevice`
 - `SetInstanceProperty`
 - `ApplyModalChanges`
 - `CancelModalChanges`
-- `ReplaceBoardSequence`
-- `PanBoard`
+- `ReplaceGraphSequence`
+- `PanGraph`
 
 This command layer prevents mouse and keyboard support from becoming two implementations of the editor. It also makes actions testable without a physical terminal.
 
@@ -373,12 +373,12 @@ Keyboard support is a first-class interaction method, not a fallback.
 - Selection and focus remain distinguishable.
 - Meaning is never conveyed by color alone.
 - Device placement includes a textual label even when devices also have colors.
-- Duplicated pedals have textual occurrence labels.
+- Duplicated components have textual occurrence labels.
 - Modal focus is trapped inside the modal until it closes.
 - Escape behavior is consistent and never discards committed edits.
 - Help text reflects the currently focused region instead of displaying irrelevant global shortcuts.
 - Mouse capture can be disabled so users and terminals that do not support it remain fully functional.
-- Terminal resize preserves the selected pedal and scrolls it back into view where possible.
+- Terminal resize preserves the selected component and scrolls it back into view where possible.
 
 ## State model
 
@@ -390,12 +390,12 @@ application
 |-- compiler job and structured progress, if active
 |-- loaded compiled package
 |-- runtime-discovered devices
-|-- board draft
-|   |-- pedal instances with stable IDs
-|   |-- cables
+|-- graph draft
+|   |-- node instances with stable IDs
+|   |-- edges
 |   |-- per-instance placement
 |   `-- per-instance control values
-|-- mounted board identity and status, if any
+|-- mounted graph identity and status, if any
 |-- layer-order text buffer
 |-- last valid parsed sequence
 |-- focus and selected instance
@@ -405,13 +405,13 @@ application
 `-- current render hit map
 ```
 
-The board draft is the authoritative editable runtime patch. The order field and visual chain are projections and editing surfaces over that state. Stable instance IDs must survive rerenders and should survive sequence edits where an occurrence can be matched unambiguously, so that placement and property edits are not needlessly lost.
+The graph draft is the authoritative editable runtime graph. The order field and visual chain are projections and editing surfaces over that state. Stable instance IDs must survive rerenders and should survive sequence edits where an occurrence can be matched unambiguously, so that placement and property edits are not needlessly lost.
 
 ## Validation and failure behavior
 
 Validation occurs at the level where the problem exists:
 
-- The sequence parser validates syntax and source-pedal references.
+- The sequence parser validates syntax and source-component references.
 - The graph validator validates ports, dimensions, cycles, delays, and required adapters.
 - The placement validator checks device capability and availability.
 - The property validator checks schema constraints.
@@ -422,7 +422,7 @@ Errors should say what failed and how to correct it. Examples:
 ```text
 Layer 12 cannot run on GPU 1: the device lacks the required shader feature.
 Connection layer_05@1 -> layer_08@1 is incompatible: expected width 2048, got 1024.
-Layer 2 occurrence 2 needs a state policy before the duplicated board can be mounted.
+Layer 2 occurrence 2 needs a state policy before the duplicated graph can be mounted.
 ```
 
 The editor must not silently insert adapters, change placement, discard instance state, or repair topology unless the user invokes a clearly named operation that performs that change.
@@ -432,25 +432,25 @@ The editor must not silently insert adapters, change placement, discard instance
 The interface should feel like a technical signal-chain instrument rather than a generic administrative dashboard.
 
 - Use the terminal's normal background as the quiet field.
-- Give the live cable and current signal path the strongest contrast.
+- Give the live edge and current signal path the strongest contrast.
 - Use restrained device accents, always paired with labels or line patterns.
-- Use borders to express real boundaries: pedals, modal scope, focus region, and device transitions.
+- Use borders to express real boundaries: components, modal scope, focus region, and device transitions.
 - Prefer compact engineering labels over decorative headings.
 - Keep status and help text quiet until it is relevant.
-- Avoid dense collections of unrelated panels around the board.
+- Avoid dense collections of unrelated panels around the graph.
 
-The distinctive element is not a decorative color scheme. It is the live, editable signal path whose pedals visibly carry identity, placement, and state.
+The distinctive element is not a decorative color scheme. It is the live, editable signal path whose components visibly carry identity, placement, and state.
 
 ## Settled public convention
 
-The layer-order field uses zero-based numeric indices, for example `[0,1,2,1,3]`. The field does not repeat a ceremonial `layer_` prefix. Internal source-pedal and instance IDs remain stable model-package identities such as `layer_01` and `layer_01@2`; they are shown as metadata where that identity matters, but are not mixed into the numeric order field.
+The layer-order field uses zero-based numeric indices, for example `[0,1,2,1,3]`. The field does not repeat a ceremonial `layer_` prefix. Internal source-component and instance IDs remain stable model-package identities such as `layer_01` and `layer_01@2`; they are shown as metadata where that identity matters, but are not mixed into the numeric order field.
 
 ## Remaining runtime decisions
 
-### Running-board edits
+### Running-graph edits
 
-The runtime contract must define whether a board draft can be applied while a stream is active, which edits require a remount, and what happens to transient state. Until that contract exists, the TUI must distinguish editing a draft from changing an already mounted board.
+The runtime contract must define whether a graph draft can be applied while a stream is active, which edits require a remount, and what happens to transient state. Until that contract exists, the TUI must distinguish editing a draft from changing an already mounted graph.
 
 ### General graph editing
 
-The serial layer-order field is the clearest editor for the common chain. The underlying board state must still support the graph operations defined in `CONCEPT.md`, including parallel paths, mixers, adapters, and delayed feedback. The visual interaction for creating and editing those connections requires its own deliberate design; it must extend the same board state rather than introduce a second graph representation.
+The serial layer-order field is the clearest editor for the common chain. The underlying graph state must still support the graph operations defined in `CONCEPT.md`, including parallel paths, mixers, adapters, and delayed feedback. The visual interaction for creating and editing those connections requires its own deliberate design; it must extend the same graph state rather than introduce a second graph representation.
