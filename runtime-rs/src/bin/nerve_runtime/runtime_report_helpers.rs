@@ -13,7 +13,12 @@ fn average_nanos(total_ns: u64, count: usize) -> Option<u64> {
 fn runtime_prompt_timing_report(
     setup_time_ns: u64,
     run_time_ns: u64,
+    prefill_token_count: usize,
     generated_token_count: usize,
+    prefill_activation_count: usize,
+    decode_activation_count: usize,
+    prefill_time_ns: u64,
+    decode_time_ns: u64,
     tick_count: usize,
     scheduler_turn_count: usize,
 ) -> RuntimePromptTimingReport {
@@ -21,10 +26,21 @@ fn runtime_prompt_timing_report(
         setup_time_ns,
         run_time_ns,
         total_time_ns: setup_time_ns.saturating_add(run_time_ns),
+        prefill_token_count,
+        decode_token_count: generated_token_count,
         generated_token_count,
+        prefill_activation_count,
+        decode_activation_count,
+        prefill_time_ns,
+        decode_time_ns,
         tick_count,
         scheduler_turn_count,
         average_generated_token_time_ns: average_nanos(run_time_ns, generated_token_count),
+        average_prefill_activation_time_ns: average_nanos(
+            prefill_time_ns,
+            prefill_activation_count,
+        ),
+        average_decode_activation_time_ns: average_nanos(decode_time_ns, decode_activation_count),
         average_tick_time_ns: average_nanos(run_time_ns, tick_count),
         average_scheduler_turn_time_ns: average_nanos(run_time_ns, scheduler_turn_count),
     }
@@ -141,4 +157,3 @@ fn choose_chat_runtime_context_size(
 ) -> Result<usize, Box<dyn Error>> {
     choose_runtime_context_size(package_manifest, requested_context_size, 0)
 }
-

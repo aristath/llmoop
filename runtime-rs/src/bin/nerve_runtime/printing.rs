@@ -16,10 +16,41 @@ fn print_runtime_timing_stats(label: &str, timing: &RuntimePromptTimingReport) {
     {
         println!("  generated_tokens_per_second={tokens_per_second:.3}");
     }
+    println!("  prefill_tokens={}", timing.prefill_token_count);
+    if let Some(tokens_per_second) =
+        generated_tokens_per_second(timing.prefill_token_count, timing.prefill_time_ns)
+    {
+        println!("  prefill_tokens_per_second={tokens_per_second:.3}");
+    }
+    println!("  decode_tokens={}", timing.decode_token_count);
+    if let Some(tokens_per_second) =
+        generated_tokens_per_second(timing.decode_token_count, timing.decode_time_ns)
+    {
+        println!("  decode_tokens_per_second={tokens_per_second:.3}");
+    }
+    println!("  prefill_activations={}", timing.prefill_activation_count);
+    println!("  decode_activations={}", timing.decode_activation_count);
+    println!(
+        "  prefill_ms={:.3}",
+        nanos_to_millis(timing.prefill_time_ns)
+    );
+    println!("  decode_ms={:.3}", nanos_to_millis(timing.decode_time_ns));
     println!("  ticks={}", timing.tick_count);
     println!("  scheduler_turns={}", timing.scheduler_turn_count);
     if let Some(average) = timing.average_generated_token_time_ns {
         println!("  avg_generated_token_ms={:.3}", nanos_to_millis(average));
+    }
+    if let Some(average) = timing.average_prefill_activation_time_ns {
+        println!(
+            "  avg_prefill_activation_ms={:.3}",
+            nanos_to_millis(average)
+        );
+    }
+    if let Some(average) = timing.average_decode_activation_time_ns {
+        println!(
+            "  avg_decode_activation_ms={:.3}",
+            nanos_to_millis(average)
+        );
     }
     if let Some(average) = timing.average_tick_time_ns {
         println!("  avg_tick_ms={:.3}", nanos_to_millis(average));

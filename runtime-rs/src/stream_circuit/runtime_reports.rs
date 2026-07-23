@@ -301,10 +301,18 @@ pub struct RuntimePromptTimingReport {
     pub setup_time_ns: u64,
     pub run_time_ns: u64,
     pub total_time_ns: u64,
+    pub prefill_token_count: usize,
+    pub decode_token_count: usize,
     pub generated_token_count: usize,
+    pub prefill_activation_count: usize,
+    pub decode_activation_count: usize,
+    pub prefill_time_ns: u64,
+    pub decode_time_ns: u64,
     pub tick_count: usize,
     pub scheduler_turn_count: usize,
     pub average_generated_token_time_ns: Option<u64>,
+    pub average_prefill_activation_time_ns: Option<u64>,
+    pub average_decode_activation_time_ns: Option<u64>,
     pub average_tick_time_ns: Option<u64>,
     pub average_scheduler_turn_time_ns: Option<u64>,
 }
@@ -451,4 +459,3 @@ pub struct RuntimePlacedPromptRunReport {
     pub speculative_target_verification_time_ns: u64,
     pub speculative_draft_catch_up_time_ns: u64,
 }
-

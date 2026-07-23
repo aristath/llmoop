@@ -230,6 +230,10 @@ impl VulkanResidentInProcessPlacedPromptEngine {
         let start_snapshot = self.snapshot();
         let mut input_runs = Vec::new();
         let mut output_events = Vec::new();
+        let mut prefill_activation_count = 0usize;
+        let mut decode_activation_count = 0usize;
+        let mut prefill_time_ns = 0u64;
+        let mut decode_time_ns = 0u64;
         let scheduler_activation_capacity = self.streams.len().max(1);
         let scheduler_budget = RuntimeStreamSchedulerBudget::new(
             scheduler_activation_capacity,
@@ -248,6 +252,8 @@ impl VulkanResidentInProcessPlacedPromptEngine {
 
             for batch in scheduler_step.batches {
                 for activation in batch.activations {
+                    let activation_is_prefill =
+                        matches!(activation.kind, RuntimeStreamActivationKind::PrefillChunk { .. });
                     let stream_id = activation.stream_id.clone();
                     let stream = self.streams.get_mut(&stream_id).ok_or_else(|| {
                         VulkanResidentInProcessPlacedPromptEngineError::UnknownStream {
@@ -255,6 +261,7 @@ impl VulkanResidentInProcessPlacedPromptEngine {
                         }
                     })?;
                     let callback_stream_id = stream_id.clone();
+                    let activation_start = Instant::now();
                     let scheduled_run = stream
                         .run_runtime_scheduler_activation_with_output(&activation, |output_event| {
                             on_output_event(VulkanResidentTokenRuntimeSchedulerOutputEvent {
@@ -262,6 +269,15 @@ impl VulkanResidentInProcessPlacedPromptEngine {
                                 output_event,
                             });
                         })?;
+                    let activation_time_ns = u64::try_from(activation_start.elapsed().as_nanos())
+                        .unwrap_or(u64::MAX);
+                    if activation_is_prefill {
+                        prefill_activation_count = prefill_activation_count.saturating_add(1);
+                        prefill_time_ns = prefill_time_ns.saturating_add(activation_time_ns);
+                    } else {
+                        decode_activation_count = decode_activation_count.saturating_add(1);
+                        decode_time_ns = decode_time_ns.saturating_add(activation_time_ns);
+                    }
                     self.runtime_scheduler
                         .complete_activation(activation.id, scheduled_run.outcome.clone())?;
 
@@ -301,6 +317,10 @@ impl VulkanResidentInProcessPlacedPromptEngine {
             input_runs,
             output_events,
             generated_token_ids,
+            prefill_activation_count,
+            decode_activation_count,
+            prefill_time_ns,
+            decode_time_ns,
             start_snapshot,
             end_snapshot,
         })
@@ -396,6 +416,10 @@ pub struct VulkanResidentInProcessPlacedPromptEngineRun {
     pub input_runs: Vec<VulkanResidentInProcessPlacedPromptEngineInputRun>,
     pub output_events: Vec<VulkanResidentTokenRuntimeSchedulerOutputEvent>,
     pub generated_token_ids: Vec<u32>,
+    pub prefill_activation_count: usize,
+    pub decode_activation_count: usize,
+    pub prefill_time_ns: u64,
+    pub decode_time_ns: u64,
     pub start_snapshot: VulkanResidentInProcessPlacedPromptEngineSnapshot,
     pub end_snapshot: VulkanResidentInProcessPlacedPromptEngineSnapshot,
 }

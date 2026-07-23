@@ -98,7 +98,12 @@ fn run_placed_chat(
             let timing = runtime_prompt_timing_report(
                 0,
                 run_time_ns,
+                token_ids.len(),
                 run.generated_token_ids.len(),
+                run.engine_run.prefill_activation_count,
+                run.engine_run.decode_activation_count,
+                run.engine_run.prefill_time_ns,
+                run.engine_run.decode_time_ns,
                 submitted_run.submitted_run.session_run.tick_count,
                 submitted_run
                     .submitted_run
@@ -166,8 +171,12 @@ fn execute_placed_prompt_run(
     reset_vulkan_resident_execution_counters();
     let submitted_run = engine.submit_input_event_until_idle("main", input_event)?;
     let run_time_ns = elapsed_nanos_u64(run_start);
-    let run = submitted_run
-        .engine_run
+    let engine_run = submitted_run.engine_run;
+    let prefill_activation_count = engine_run.prefill_activation_count;
+    let decode_activation_count = engine_run.decode_activation_count;
+    let prefill_time_ns = engine_run.prefill_time_ns;
+    let decode_time_ns = engine_run.decode_time_ns;
+    let run = engine_run
         .input_runs
         .into_iter()
         .find(|run| run.stream_id == "main" && run.submitted_run.input_event.id == input_event_id)
@@ -189,7 +198,12 @@ fn execute_placed_prompt_run(
     let timing = runtime_prompt_timing_report(
         setup_time_ns,
         run_time_ns,
+        prompt_ids.len(),
         generated_token_count,
+        prefill_activation_count,
+        decode_activation_count,
+        prefill_time_ns,
+        decode_time_ns,
         tick_count,
         total_scheduler_turns,
     );
@@ -313,4 +327,3 @@ fn generated_tokens_per_second(generated_token_count: usize, run_time_ns: u64) -
         Some(generated_token_count as f64 / (run_time_ns as f64 / 1_000_000_000.0))
     }
 }
-
