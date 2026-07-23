@@ -26,6 +26,9 @@ use crate::stream_plan::{
     CircuitActivationPlan, PlannedNode, PlannedParameterResource, PlannedPort, SignalProducer,
     SignalStorage, StreamCircuitExecutionPlan, StreamCircuitResourcePlan, TensorIndex,
 };
+use crate::stream_runtime::{
+    RuntimeStreamActivation, RuntimeStreamActivationKind, RuntimeStreamActivationOutcome,
+};
 use crate::tensor_storage::TensorStorage;
 use crate::vulkan::{DEFAULT_COMPUTE_LOCAL_SIZE_X, DEFAULT_SPIRV_ENTRY_POINT, read_spirv_words};
 use crate::vulkan_compute::{
