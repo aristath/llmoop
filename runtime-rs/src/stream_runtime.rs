@@ -45,6 +45,7 @@ pub enum RuntimeStreamActivationKind {
     },
     DecodeFeedback {
         feedback_depth: usize,
+        max_tokens: usize,
     },
 }
 
@@ -52,7 +53,7 @@ impl RuntimeStreamActivationKind {
     pub fn work_units(&self) -> usize {
         match self {
             Self::PrefillChunk { token_ids, .. } => token_ids.len(),
-            Self::DecodeFeedback { .. } => 1,
+            Self::DecodeFeedback { max_tokens, .. } => *max_tokens,
         }
     }
 }
@@ -74,21 +75,28 @@ pub struct RuntimeStreamActivation {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuntimeStreamActivationOutcome {
-    pub generated_token_id: Option<u32>,
+    pub generated_token_ids: Vec<u32>,
     pub continue_generation: bool,
 }
 
 impl RuntimeStreamActivationOutcome {
     pub fn prefill_complete() -> Self {
         Self {
-            generated_token_id: None,
+            generated_token_ids: Vec::new(),
             continue_generation: true,
         }
     }
 
     pub fn generated(token_id: u32, continue_generation: bool) -> Self {
+        Self::generated_tokens([token_id], continue_generation)
+    }
+
+    pub fn generated_tokens(
+        token_ids: impl IntoIterator<Item = u32>,
+        continue_generation: bool,
+    ) -> Self {
         Self {
-            generated_token_id: Some(token_id),
+            generated_token_ids: token_ids.into_iter().collect(),
             continue_generation,
         }
     }
@@ -98,6 +106,7 @@ impl RuntimeStreamActivationOutcome {
 pub struct RuntimeStreamSchedulerBudget {
     pub max_activations: usize,
     pub max_prefill_tokens_per_activation: usize,
+    pub max_decode_tokens_per_activation: usize,
     pub max_work_units: usize,
 }
 
@@ -110,8 +119,14 @@ impl RuntimeStreamSchedulerBudget {
         Self {
             max_activations,
             max_prefill_tokens_per_activation,
+            max_decode_tokens_per_activation: 1,
             max_work_units,
         }
+    }
+
+    pub fn with_max_decode_tokens_per_activation(mut self, max_tokens: usize) -> Self {
+        self.max_decode_tokens_per_activation = max_tokens;
+        self
     }
 }
 
@@ -457,6 +472,11 @@ impl RuntimeStreamScheduler {
                 "max_prefill_tokens_per_activation must be positive".to_string(),
             ));
         }
+        if budget.max_decode_tokens_per_activation == 0 {
+            return Err(RuntimeStreamSchedulerError(
+                "max_decode_tokens_per_activation must be positive".to_string(),
+            ));
+        }
 
         self.refresh_active_queue();
         let mut activations = Vec::new();
@@ -473,6 +493,9 @@ impl RuntimeStreamScheduler {
                 &stream_id,
                 budget
                     .max_prefill_tokens_per_activation
+                    .min(remaining_work_units),
+                budget
+                    .max_decode_tokens_per_activation
                     .min(remaining_work_units),
             )?
             else {
@@ -570,16 +593,50 @@ impl RuntimeStreamScheduler {
                     .next_prompt_token_index
                     .saturating_add(token_ids.len());
             }
-            RuntimeStreamActivationKind::DecodeFeedback { .. } => {
-                let token_id = outcome.generated_token_id.ok_or_else(|| {
-                    RuntimeStreamSchedulerError(format!(
-                        "decode activation {activation_id} completed without a token"
-                    ))
-                })?;
-                let _ = token_id;
-                current.generated_token_count = current.generated_token_count.saturating_add(1);
-                current.next_feedback_depth = current.next_feedback_depth.saturating_add(1);
-                stream.generated_token_count = stream.generated_token_count.saturating_add(1);
+            RuntimeStreamActivationKind::DecodeFeedback { max_tokens, .. } => {
+                if outcome.generated_token_ids.is_empty() {
+                    return Err(RuntimeStreamSchedulerError(format!(
+                        "decode activation {activation_id} completed without generated tokens"
+                    )));
+                }
+                if outcome.generated_token_ids.len() > max_tokens {
+                    return Err(RuntimeStreamSchedulerError(format!(
+                        "decode activation {activation_id} generated {} tokens, exceeding its window of {max_tokens}",
+                        outcome.generated_token_ids.len()
+                    )));
+                }
+                let generated_token_count = outcome.generated_token_ids.len();
+                let new_generated_token_count = current
+                    .generated_token_count
+                    .checked_add(generated_token_count)
+                    .ok_or_else(|| {
+                        RuntimeStreamSchedulerError(format!(
+                            "stream {stream_id:?} generated token count overflowed"
+                        ))
+                    })?;
+                if new_generated_token_count > current.event.max_public_tokens {
+                    return Err(RuntimeStreamSchedulerError(format!(
+                        "decode activation {activation_id} exceeded input event public output budget"
+                    )));
+                }
+                let new_feedback_depth = current
+                    .next_feedback_depth
+                    .checked_add(generated_token_count)
+                    .ok_or_else(|| {
+                        RuntimeStreamSchedulerError(format!(
+                            "stream {stream_id:?} feedback depth overflowed"
+                        ))
+                    })?;
+                stream.generated_token_count = stream
+                    .generated_token_count
+                    .checked_add(generated_token_count)
+                    .ok_or_else(|| {
+                        RuntimeStreamSchedulerError(format!(
+                            "stream {stream_id:?} total generated token count overflowed"
+                        ))
+                    })?;
+                current.generated_token_count = new_generated_token_count;
+                current.next_feedback_depth = new_feedback_depth;
                 if !outcome.continue_generation {
                     current.generated_token_count = current.event.max_public_tokens;
                 }
@@ -624,6 +681,7 @@ impl RuntimeStreamScheduler {
         &mut self,
         stream_id: &str,
         max_prefill_tokens: usize,
+        max_decode_tokens: usize,
     ) -> Result<Option<RuntimeStreamActivation>, RuntimeStreamSchedulerError> {
         let activation_id = self.next_activation_id;
         self.next_activation_id = self
@@ -657,8 +715,15 @@ impl RuntimeStreamScheduler {
                     token_ids: current.event.token_ids[token_offset..token_limit].to_vec(),
                 }
             } else if !current.generation_done() {
+                let max_tokens = max_decode_tokens.min(
+                    current
+                        .event
+                        .max_public_tokens
+                        .saturating_sub(current.generated_token_count),
+                );
                 RuntimeStreamActivationKind::DecodeFeedback {
                     feedback_depth: current.next_feedback_depth,
+                    max_tokens,
                 }
             } else {
                 return Ok(None);
@@ -841,7 +906,10 @@ mod tests {
         let third = scheduler.schedule_step(budget(1)).unwrap();
         assert_eq!(
             third.activations[0].kind,
-            RuntimeStreamActivationKind::DecodeFeedback { feedback_depth: 0 }
+            RuntimeStreamActivationKind::DecodeFeedback {
+                feedback_depth: 0,
+                max_tokens: 1,
+            }
         );
     }
 
@@ -1063,6 +1131,67 @@ mod tests {
                 ))
                 .count(),
             2
+        );
+    }
+
+    #[test]
+    fn scheduler_decode_activation_can_cover_a_feedback_window() {
+        let mut scheduler = RuntimeStreamScheduler::new();
+        scheduler.add_stream("stream_a").unwrap();
+        scheduler
+            .enqueue_input_event("stream_a", RuntimeStreamInputEvent::new("event_0", [1], 5))
+            .unwrap();
+        let windowed_budget =
+            RuntimeStreamSchedulerBudget::new(1, 2, 16).with_max_decode_tokens_per_activation(4);
+
+        let prefill = scheduler
+            .schedule_step(windowed_budget.clone())
+            .unwrap()
+            .activations[0]
+            .clone();
+        scheduler
+            .complete_activation(
+                prefill.id,
+                RuntimeStreamActivationOutcome::prefill_complete(),
+            )
+            .unwrap();
+
+        let decode = scheduler
+            .schedule_step(windowed_budget)
+            .unwrap()
+            .activations[0]
+            .clone();
+
+        assert_eq!(
+            decode.kind,
+            RuntimeStreamActivationKind::DecodeFeedback {
+                feedback_depth: 0,
+                max_tokens: 4,
+            }
+        );
+        let done = scheduler
+            .complete_activation(
+                decode.id,
+                RuntimeStreamActivationOutcome::generated_tokens([10, 11, 12, 13], true),
+            )
+            .unwrap();
+        assert_eq!(done.generated_token_count, 4);
+        assert_eq!(done.status, RuntimeStreamStatus::Active);
+
+        let final_decode = scheduler
+            .schedule_step(
+                RuntimeStreamSchedulerBudget::new(1, 2, 16)
+                    .with_max_decode_tokens_per_activation(4),
+            )
+            .unwrap()
+            .activations[0]
+            .clone();
+        assert_eq!(
+            final_decode.kind,
+            RuntimeStreamActivationKind::DecodeFeedback {
+                feedback_depth: 4,
+                max_tokens: 1,
+            }
         );
     }
 
