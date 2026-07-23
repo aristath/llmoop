@@ -103,6 +103,7 @@ include!("vulkan_stream_circuit/placed_stream_processor.rs");
 include!("vulkan_stream_circuit/placed_prompt_event.rs");
 include!("vulkan_stream_circuit/placed_prompt_session.rs");
 include!("vulkan_stream_circuit/placed_prompt_stream.rs");
+include!("vulkan_stream_circuit/placed_prompt_scheduled_activation.rs");
 include!("vulkan_stream_circuit/placed_prompt_engine.rs");
 include!("vulkan_stream_circuit/placed_prompt_device.rs");
 include!("vulkan_stream_circuit/placed_runtime_error.rs");
