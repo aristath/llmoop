@@ -39,6 +39,7 @@ The scheduler should schedule stream events, not convert NERVE into a stateless 
 Current status:
 
 - Core stream scheduler exists and tracks persistent streams, queued input events, prefill chunks, decode feedback windows, active/idle/interrupted/closing state, and normal executor-driven runs.
+- Streams can be admitted atomically with package-derived transient state declarations and an execution class identity.
 - Decode activations can represent bounded feedback windows instead of forcing one-token host stepping.
 - Prefill completion can account for the first emitted feedback token when the backend samples from the final prompt activation.
 - The placed Vulkan prompt engine now routes normal prompt/chat execution through the core stream scheduler while keeping the model mounted.
@@ -75,6 +76,8 @@ Current status:
 - A backend-neutral transient state arena and per-stream state tables exist.
 - State blocks are page-like, reusable, ref-counted, resettable, forkable, and snapshot-able.
 - The stream scheduler reserves transient state slots per scheduled activation for declared stream-owned state.
+- Placed Vulkan packages now expose dynamic per-activation state declarations from resident package metadata, and placed streams register those declarations with the scheduler at stream admission.
+- Scheduled placed activations expose a transitional binding plan from scheduler transient slots to the current resident state-buffer offsets; the backend still needs to use real page-backed bindings instead of fixed circular state buffers.
 
 ### 3. Preserve layer components as runtime/editing/placement boundaries
 
@@ -145,6 +148,13 @@ Implement batch execution over active streams:
 - Avoid rebuilding or remounting the model for each prompt.
 
 This is the stream/execution graph equivalent of vLLM continuous batching.
+
+Current status:
+
+- The scheduler can emit backend-neutral activation batches.
+- Batch compatibility includes execution class identity, so streams from different packages, placements, or context capacities are not grouped together accidentally.
+- The placed Vulkan prompt engine consumes scheduler batch steps and sizes scheduler budgets by current stream count.
+- Current placed execution still runs each activation inside a batch sequentially; actual batched Vulkan kernels need to consume the batch plan next.
 
 ### 6. Keep the device-owned feedback loop as the long-term target
 
