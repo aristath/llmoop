@@ -147,13 +147,6 @@ impl VulkanResidentSpeculativeDecoderProcessor {
             random_seed,
         )
         .map_err(VulkanResidentInProcessPlacedRuntimeError::Sampler)?;
-        let target_hidden_copy = device
-            .create_resident_buffer_copy(
-                target_hidden,
-                &hidden_input.buffer,
-                adapter.target_hidden_byte_capacity,
-            )
-            .map_err(VulkanResidentInProcessPlacedRuntimeError::FeedbackEdge)?;
         let recursive_hidden_copy = device
             .create_resident_buffer_copy(
                 output_transducer.normalized_frame_buffer(),
@@ -181,13 +174,6 @@ impl VulkanResidentSpeculativeDecoderProcessor {
                 adapter.target_hidden_byte_capacity,
             )
             .map_err(VulkanResidentInProcessPlacedRuntimeError::FeedbackEdge)?;
-        let restore_target_hidden_copy = device
-            .create_resident_buffer_copy(
-                &pending_target_hidden,
-                target_hidden,
-                adapter.target_hidden_byte_capacity,
-            )
-            .map_err(VulkanResidentInProcessPlacedRuntimeError::FeedbackEdge)?;
         let state_transaction =
             VulkanResidentStateTransactionBank::new_transactional(device, &mounted.buffers, 1)
                 .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
@@ -209,11 +195,9 @@ impl VulkanResidentSpeculativeDecoderProcessor {
             draft_sequence,
             state_sequence,
             hidden_input_signal_id: adapter.target_hidden_signal_id.clone(),
-            target_hidden_copy,
             recursive_hidden_copy,
             pending_hidden_input_copy,
             update_pending_hidden_copy,
-            restore_target_hidden_copy,
             pending_target_hidden,
             state_transaction,
         })
@@ -229,9 +213,6 @@ impl VulkanResidentSpeculativeDecoderProcessor {
     }
 
     fn restore_baseline(&self) -> Result<(), VulkanResidentInProcessPlacedRuntimeError> {
-        self.restore_target_hidden_copy
-            .run(self.restore_target_hidden_copy.byte_len())
-            .map_err(VulkanResidentInProcessPlacedRuntimeError::FeedbackEdge)?;
         self.state_transaction
             .restore_baseline(&self.mounted.buffers)
             .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
@@ -248,7 +229,7 @@ impl VulkanResidentSpeculativeDecoderProcessor {
         draft_index: usize,
     ) -> Result<u32, VulkanResidentInProcessPlacedRuntimeError> {
         let hidden_source = if draft_index == 0 {
-            VulkanDraftHiddenSource::Target
+            VulkanDraftHiddenSource::PendingTarget
         } else {
             VulkanDraftHiddenSource::Recursive
         };
@@ -293,9 +274,8 @@ impl VulkanResidentSpeculativeDecoderProcessor {
         include_output: bool,
     ) -> Result<Option<VulkanResidentSamplerRun>, VulkanResidentInProcessPlacedRuntimeError> {
         let hidden_copy = match hidden_source {
-            VulkanDraftHiddenSource::Target => &self.target_hidden_copy,
-            VulkanDraftHiddenSource::Recursive => &self.recursive_hidden_copy,
             VulkanDraftHiddenSource::PendingTarget => &self.pending_hidden_input_copy,
+            VulkanDraftHiddenSource::Recursive => &self.recursive_hidden_copy,
         };
         self.run_composed_step_with_input_copies(
             device,

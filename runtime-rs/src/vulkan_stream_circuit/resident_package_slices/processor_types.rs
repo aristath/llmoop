@@ -50,18 +50,15 @@ struct VulkanResidentSpeculativeDecoderProcessor {
     draft_sequence: VulkanResidentKernelSequence,
     state_sequence: VulkanResidentKernelSequence,
     hidden_input_signal_id: String,
-    target_hidden_copy: VulkanResidentBufferCopy,
     recursive_hidden_copy: VulkanResidentBufferCopy,
     pending_hidden_input_copy: VulkanResidentBufferCopy,
     update_pending_hidden_copy: VulkanResidentBufferCopy,
-    restore_target_hidden_copy: VulkanResidentBufferCopy,
     pending_target_hidden: VulkanResidentBuffer,
     state_transaction: VulkanResidentStateTransactionBank,
 }
 
 #[derive(Clone, Copy)]
 enum VulkanDraftHiddenSource {
-    Target,
-    Recursive,
     PendingTarget,
+    Recursive,
 }
