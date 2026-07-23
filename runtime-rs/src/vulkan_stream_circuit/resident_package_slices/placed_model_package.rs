@@ -39,6 +39,15 @@ pub struct VulkanResidentStreamStateDeclaration {
 }
 
 impl VulkanResidentInProcessPlacedModelPackage {
+    pub fn stream_execution_class_id(&self) -> String {
+        format!(
+            "{}|devices={}|context={}",
+            self.package_id,
+            self.device_ids.join(","),
+            self.dynamic_state_capacity_activations
+        )
+    }
+
     pub fn transient_state_declarations(
         &self,
     ) -> Result<Vec<VulkanResidentStreamStateDeclaration>, VulkanResidentTokenModelPackageError>

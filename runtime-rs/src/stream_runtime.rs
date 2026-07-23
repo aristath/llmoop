@@ -68,6 +68,7 @@ pub struct RuntimeStreamStateReservation {
 pub struct RuntimeStreamActivation {
     pub id: u64,
     pub stream_id: String,
+    pub execution_class_id: String,
     pub input_event_id: String,
     pub kind: RuntimeStreamActivationKind,
     pub state_reservations: Vec<RuntimeStreamStateReservation>,
@@ -140,18 +141,26 @@ pub struct RuntimeStreamSchedulerStep {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RuntimeStreamActivationBatchKind {
-    PrefillChunk { token_count: usize },
-    DecodeFeedback { max_tokens: usize },
+    PrefillChunk {
+        execution_class_id: String,
+        token_count: usize,
+    },
+    DecodeFeedback {
+        execution_class_id: String,
+        max_tokens: usize,
+    },
 }
 
 impl RuntimeStreamActivationBatchKind {
     pub fn for_activation(activation: &RuntimeStreamActivation) -> Self {
         match &activation.kind {
             RuntimeStreamActivationKind::PrefillChunk { token_ids, .. } => Self::PrefillChunk {
+                execution_class_id: activation.execution_class_id.clone(),
                 token_count: token_ids.len(),
             },
             RuntimeStreamActivationKind::DecodeFeedback { max_tokens, .. } => {
                 Self::DecodeFeedback {
+                    execution_class_id: activation.execution_class_id.clone(),
                     max_tokens: *max_tokens,
                 }
             }
@@ -203,6 +212,7 @@ pub struct RuntimeStreamSchedulerRun {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuntimeStreamSnapshot {
     pub stream_id: String,
+    pub execution_class_id: String,
     pub status: RuntimeStreamStatus,
     pub queued_input_event_count: usize,
     pub current_input_event_id: Option<String>,
@@ -271,6 +281,7 @@ impl RuntimeStreamCurrentEvent {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct RuntimeStreamState {
     stream_id: String,
+    execution_class_id: String,
     status: RuntimeStreamStatus,
     closing_after_current: bool,
     queued_input_events: VecDeque<RuntimeStreamInputEvent>,
@@ -283,11 +294,16 @@ struct RuntimeStreamState {
 }
 
 impl RuntimeStreamState {
-    fn new(stream_id: impl Into<String>) -> Result<Self, RuntimeStreamSchedulerError> {
+    fn new(
+        stream_id: impl Into<String>,
+        execution_class_id: impl Into<String>,
+    ) -> Result<Self, RuntimeStreamSchedulerError> {
         let stream_id = stream_id.into();
+        let execution_class_id = execution_class_id.into();
         Ok(Self {
             transient_state_table: TransientStateTable::new(stream_id.clone())?,
             stream_id,
+            execution_class_id,
             status: RuntimeStreamStatus::Idle,
             closing_after_current: false,
             queued_input_events: VecDeque::new(),
@@ -338,6 +354,7 @@ impl RuntimeStreamState {
         let transient_state = self.transient_state_table.snapshot();
         RuntimeStreamSnapshot {
             stream_id: self.stream_id.clone(),
+            execution_class_id: self.execution_class_id.clone(),
             status: self.status,
             queued_input_event_count: self.queued_input_events.len(),
             current_input_event_id: self
@@ -369,11 +386,23 @@ impl RuntimeStreamScheduler {
         Self::default()
     }
 
+    pub fn add_stream_with_execution_class(
+        &mut self,
+        stream_id: impl Into<String>,
+        execution_class_id: impl Into<String>,
+    ) -> Result<RuntimeStreamSnapshot, RuntimeStreamSchedulerError> {
+        self.add_stream_with_state_declarations_and_execution_class(
+            stream_id,
+            execution_class_id,
+            [],
+        )
+    }
+
     pub fn add_stream(
         &mut self,
         stream_id: impl Into<String>,
     ) -> Result<RuntimeStreamSnapshot, RuntimeStreamSchedulerError> {
-        self.add_stream_with_state_declarations(stream_id, [])
+        self.add_stream_with_execution_class(stream_id, "default")
     }
 
     pub fn add_stream_with_state_declarations<I>(
@@ -384,10 +413,32 @@ impl RuntimeStreamScheduler {
     where
         I: IntoIterator<Item = (TransientStateKey, TransientStateBlockShape)>,
     {
+        self.add_stream_with_state_declarations_and_execution_class(
+            stream_id,
+            "default",
+            state_declarations,
+        )
+    }
+
+    pub fn add_stream_with_state_declarations_and_execution_class<I>(
+        &mut self,
+        stream_id: impl Into<String>,
+        execution_class_id: impl Into<String>,
+        state_declarations: I,
+    ) -> Result<RuntimeStreamSnapshot, RuntimeStreamSchedulerError>
+    where
+        I: IntoIterator<Item = (TransientStateKey, TransientStateBlockShape)>,
+    {
         let stream_id = stream_id.into();
+        let execution_class_id = execution_class_id.into();
         if stream_id.is_empty() {
             return Err(RuntimeStreamSchedulerError(
                 "stream id must not be empty".to_string(),
+            ));
+        }
+        if execution_class_id.is_empty() {
+            return Err(RuntimeStreamSchedulerError(
+                "stream execution class id must not be empty".to_string(),
             ));
         }
         if self.streams.contains_key(&stream_id) {
@@ -395,7 +446,7 @@ impl RuntimeStreamScheduler {
                 "stream {stream_id:?} already exists"
             )));
         }
-        let mut stream = RuntimeStreamState::new(stream_id.clone())?;
+        let mut stream = RuntimeStreamState::new(stream_id.clone(), execution_class_id)?;
         for (key, shape) in state_declarations {
             stream.transient_state_table.declare_state(key, shape)?;
         }
@@ -872,7 +923,7 @@ impl RuntimeStreamScheduler {
             .checked_add(1)
             .ok_or_else(|| RuntimeStreamSchedulerError("activation id overflow".to_string()))?;
 
-        let (input_event_id, kind, state_keys) = {
+        let (execution_class_id, input_event_id, kind, state_keys) = {
             let stream = self.stream_mut(stream_id)?;
             if stream.has_in_flight_work() {
                 return Ok(None);
@@ -912,6 +963,7 @@ impl RuntimeStreamScheduler {
                 return Ok(None);
             };
             (
+                stream.execution_class_id.clone(),
                 input_event_id,
                 kind,
                 stream.transient_state_table.state_keys(),
@@ -922,6 +974,7 @@ impl RuntimeStreamScheduler {
         let activation = RuntimeStreamActivation {
             id: activation_id,
             stream_id: stream_id.to_string(),
+            execution_class_id,
             input_event_id,
             kind,
             state_reservations,
@@ -1376,7 +1429,10 @@ mod tests {
         assert_eq!(prefill.batches.len(), 1);
         assert_eq!(
             prefill.batches[0].kind,
-            RuntimeStreamActivationBatchKind::PrefillChunk { token_count: 1 }
+            RuntimeStreamActivationBatchKind::PrefillChunk {
+                execution_class_id: "default".to_string(),
+                token_count: 1
+            }
         );
         for activation in &prefill.batches[0].activations {
             scheduler
@@ -1394,7 +1450,10 @@ mod tests {
         assert_eq!(decode.batches.len(), 1);
         assert_eq!(
             decode.batches[0].kind,
-            RuntimeStreamActivationBatchKind::DecodeFeedback { max_tokens: 4 }
+            RuntimeStreamActivationBatchKind::DecodeFeedback {
+                execution_class_id: "default".to_string(),
+                max_tokens: 4
+            }
         );
         let stream_ids = decode.batches[0]
             .activations
@@ -1428,14 +1487,55 @@ mod tests {
         assert_eq!(step.batches.len(), 2);
         assert_eq!(
             step.batches[0].kind,
-            RuntimeStreamActivationBatchKind::PrefillChunk { token_count: 2 }
+            RuntimeStreamActivationBatchKind::PrefillChunk {
+                execution_class_id: "default".to_string(),
+                token_count: 2
+            }
         );
         assert_eq!(
             step.batches[1].kind,
-            RuntimeStreamActivationBatchKind::PrefillChunk { token_count: 1 }
+            RuntimeStreamActivationBatchKind::PrefillChunk {
+                execution_class_id: "default".to_string(),
+                token_count: 1
+            }
         );
         assert_eq!(step.batches[0].activations.len(), 1);
         assert_eq!(step.batches[1].activations.len(), 1);
+    }
+
+    #[test]
+    fn scheduler_batch_step_keeps_different_execution_classes_separate() {
+        let mut scheduler = RuntimeStreamScheduler::new();
+        scheduler
+            .add_stream_with_execution_class("stream_a", "package_a")
+            .unwrap();
+        scheduler
+            .add_stream_with_execution_class("stream_b", "package_b")
+            .unwrap();
+        scheduler
+            .enqueue_input_event("stream_a", RuntimeStreamInputEvent::new("event_a", [1], 1))
+            .unwrap();
+        scheduler
+            .enqueue_input_event("stream_b", RuntimeStreamInputEvent::new("event_b", [2], 1))
+            .unwrap();
+
+        let step = scheduler.schedule_batch_step(budget(2)).unwrap();
+
+        assert_eq!(step.batches.len(), 2);
+        assert_eq!(
+            step.batches[0].kind,
+            RuntimeStreamActivationBatchKind::PrefillChunk {
+                execution_class_id: "package_a".to_string(),
+                token_count: 1,
+            }
+        );
+        assert_eq!(
+            step.batches[1].kind,
+            RuntimeStreamActivationBatchKind::PrefillChunk {
+                execution_class_id: "package_b".to_string(),
+                token_count: 1,
+            }
+        );
     }
 
     #[test]

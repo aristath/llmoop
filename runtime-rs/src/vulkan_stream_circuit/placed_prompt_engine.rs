@@ -30,8 +30,13 @@ impl VulkanResidentInProcessPlacedPromptEngine {
             .map_err(VulkanResidentInProcessPlacedRuntimeError::Package)?
             .into_iter()
             .map(|declaration| (declaration.key, declaration.block_shape));
+        let execution_class_id = stream.package().stream_execution_class_id();
         self.runtime_scheduler
-            .add_stream_with_state_declarations(stream_id.clone(), state_declarations)?;
+            .add_stream_with_state_declarations_and_execution_class(
+                stream_id.clone(),
+                execution_class_id,
+                state_declarations,
+            )?;
         let snapshot = placed_prompt_engine_stream_snapshot(&stream_id, &stream);
         self.streams.insert(stream_id, stream);
         Ok(snapshot)
