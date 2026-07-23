@@ -43,6 +43,7 @@ Current status:
 - Decode activations can represent bounded feedback windows instead of forcing one-token host stepping.
 - Prefill completion can account for the first emitted feedback token when the backend samples from the final prompt activation.
 - The placed Vulkan prompt engine now routes normal prompt/chat execution through the core stream scheduler while keeping the model mounted.
+- Normal prompt/chat reports include prefill/decode token counts, activation counts, scheduler batch counts, maximum batch width, and prefill/decode timing without a special profiling mode.
 
 ### 2. Replace flat transient context with block-managed transient circuit state
 
@@ -154,6 +155,7 @@ Current status:
 - The scheduler can emit backend-neutral activation batches.
 - Batch compatibility includes execution class identity, so streams from different packages, placements, or context capacities are not grouped together accidentally.
 - The placed Vulkan prompt engine consumes scheduler batch steps and sizes scheduler budgets by current stream count.
+- Placed scheduler batches execute through a dedicated batch executor seam, so real multi-stream Vulkan execution can replace the current sequential internals without rewriting the outer scheduler loop.
 - Current placed execution still runs each activation inside a batch sequentially; actual batched Vulkan kernels need to consume the batch plan next.
 
 ### 6. Keep the device-owned feedback loop as the long-term target
