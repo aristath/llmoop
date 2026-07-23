@@ -130,7 +130,7 @@ def shader_file_for_node(
             len(shapes) != branch_count
             or any(len(shape) != 2 for shape in shapes)
             or len(input_widths) != 1
-            or dtypes not in ({"BF16"}, {"F8_E4M3"})
+            or dtypes not in ({"BF16"}, {"F8_E4M3"}, {"Q8_0"})
         ):
             raise ModelCompileError(
                 f"parallel-linear node {node['id']!r} has incompatible shapes {shapes}"
@@ -173,6 +173,25 @@ def shader_file_for_node(
                 f"parallel_linear_{branch_count}way_fp8_e4m3_"
                 f"b{block_rows}x{block_columns}_{input_width}x{output_widths[0]}.comp"
             )
+        if dtypes == {"Q8_0"}:
+            for parameter_ids in branch_params:
+                q8_0_linear_shape_for_node(
+                    circuit,
+                    {
+                        "id": f"{node['id']}__branch_q8",
+                        "params": [parameter_ids[0]],
+                    },
+                    tensor_index,
+                )
+            if len(set(output_widths)) != 1:
+                raise ModelCompileError(
+                    f"parallel-linear Q8_0 node {node['id']!r} requires equal output widths"
+                )
+            input_width = input_widths.pop()
+            return (
+                f"parallel_linear_{branch_count}way_q8_0_"
+                f"{input_width}x{output_widths[0]}.comp"
+            )
         input_width = input_widths.pop()
         return (
             f"parallel_linear_{branch_count}way_bf16_{input_width}x"
@@ -207,14 +226,25 @@ def shader_file_for_node(
                 len(shapes) != 2
                 or shapes[0] != shapes[1]
                 or len(shapes[0]) != 2
-                or dtypes != {"BF16"}
+                or dtypes not in ({"BF16"}, {"Q8_0"})
                 or layouts != {ROW_MAJOR_LAYOUT}
             ):
                 raise ModelCompileError(
                     f"fused FFN projection node {node['id']!r} has incompatible "
                     f"parameters {shapes}"
-                )
+            )
             block_shape = None
+            q8_shape = dtypes == {"Q8_0"}
+            if q8_shape:
+                for parameter_id in weight_ids:
+                    q8_0_linear_shape_for_node(
+                        circuit,
+                        {
+                            "id": f"{node['id']}__q8",
+                            "params": [parameter_id],
+                        },
+                        tensor_index,
+                    )
         elif len(params) == 4:
             weight_ids = [params[0], params[2]]
             shapes = [
@@ -251,6 +281,7 @@ def shader_file_for_node(
                     f"parameters {shapes}"
                 )
             block_shape = block_shapes.pop()
+            q8_shape = False
         else:
             raise ModelCompileError(
                 f"fused FFN projection node {node['id']!r} has invalid parameter count "
@@ -273,6 +304,11 @@ def shader_file_for_node(
             return (
                 "parallel_linear_silu_multiply_fp8_e4m3_"
                 f"b{block_rows}x{block_columns}_{input_width}x{output_width}.comp"
+            )
+        if q8_shape:
+            return (
+                "parallel_linear_silu_multiply_q8_0_"
+                f"{input_width}x{output_width}.comp"
             )
         return f"parallel_linear_silu_multiply_bf16_{input_width}x{output_width}.comp"
     if op == "linear_split_3way":
@@ -822,6 +858,18 @@ def workgroup_count_x_for_node(circuit: Json, node: Json, tensor_index: Json) ->
                 // fp8_linear_tile_rows(output_size)
                 for output_size in output_sizes
             )
+        if {
+            parameter_dtype_for_id(circuit, parameter_id, tensor_index)
+            for parameter_id in branch_weight_ids
+        } == {"Q8_0"}:
+            output_sizes = [
+                int(parameter_shape_for_id(circuit, parameter_id, tensor_index)[0])
+                for parameter_id in branch_weight_ids
+            ]
+            return max(
+                (output_size + Q8_0_OUTPUT_TILE_ROWS - 1) // Q8_0_OUTPUT_TILE_ROWS
+                for output_size in output_sizes
+            )
         return sum(
             (int(parameter_shape_for_id(circuit, parameter_id, tensor_index)[0]) + 1)
             // 2
@@ -838,6 +886,11 @@ def workgroup_count_x_for_node(circuit: Json, node: Json, tensor_index: Json) ->
             return (
                 int(out_features) + FP8_FUSED_FFN_TILE_ROWS - 1
             ) // FP8_FUSED_FFN_TILE_ROWS
+        if (
+            parameter_dtype_for_id(circuit, node["params"][0], tensor_index)
+            == "Q8_0"
+        ):
+            return (int(out_features) + Q8_0_OUTPUT_TILE_ROWS - 1) // Q8_0_OUTPUT_TILE_ROWS
         return (int(out_features) + 1) // 2
     if node["op"] in {"linear", "linear_residual", "linear_split_3way"}:
         out_features, _ = parameter_shape_for_node(circuit, node, tensor_index)

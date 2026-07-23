@@ -126,12 +126,88 @@ def test_linear_shader_selector_supports_internal_q8_0_weights() -> None:
     )
 
 
+def test_parallel_and_fused_shader_selectors_support_internal_q8_0_weights() -> None:
+    circuit = {
+        "parameters": {
+            "refs": {
+                parameter_id: {"tensor": parameter_id}
+                for parameter_id in ("gate", "up", "q", "k")
+            }
+        }
+    }
+    tensor_index = {
+        "tensors": {
+            parameter_id: {
+                "dtype": "Q8_0",
+                "shape": [768, 16, 9],
+                "logical_shape": [768, 512],
+                "byte_count": 768 * 16 * 36,
+                "layout": ROW_MAJOR_LAYOUT,
+            }
+            for parameter_id in ("gate", "up", "q", "k")
+        }
+    }
+    dimensions = {"hidden_size": 512, "intermediate_size": 768}
+    parallel = {
+        "id": "qk",
+        "op": "parallel_linear_2way",
+        "inputs": ["hidden"],
+        "outputs": ["q", "k"],
+        "params": ["q", "k"],
+        "attrs": {"branch_count": 2, "branch_parameter_counts": [1, 1]},
+    }
+    fused = {
+        "id": "ffn_gate_up",
+        "op": "parallel_linear_silu_multiply",
+        "inputs": ["hidden"],
+        "outputs": ["ffn"],
+        "params": ["gate", "up"],
+        "attrs": {
+            "branch_count": 2,
+            "element_count": 768,
+            "intermediate_rounding": "BF16",
+        },
+    }
+
+    assert shader_file_for_node(circuit, parallel, tensor_index, dimensions) == (
+        "parallel_linear_2way_q8_0_512x768.comp"
+    )
+    assert workgroup_count_x_for_node(circuit, parallel, tensor_index) == 24
+    assert shader_file_for_node(circuit, fused, tensor_index, dimensions) == (
+        "parallel_linear_silu_multiply_q8_0_512x768.comp"
+    )
+    assert workgroup_count_x_for_node(circuit, fused, tensor_index) == 24
+
+
+def test_compiler_batches_internal_q8_0_dense_kernels() -> None:
+    for shader_file in (
+        "linear_q8_0_512x768.comp",
+        "parallel_linear_2way_q8_0_512x768.comp",
+        "parallel_linear_silu_multiply_q8_0_512x768.comp",
+    ):
+        spec = component_kernel_spec(
+            execution_index=0,
+            node={"id": "project", "op": "linear"},
+            shader_file=shader_file,
+            local_size_x=64,
+            workgroup_count_x=24,
+        )
+        assert spec["batch_mode"] == "weight_shared"
+        assert [
+            implementation["lane_tile_width"]
+            for implementation in spec["batch_implementations"]
+        ] == [2, 4, 8, 16]
+
+
 def test_compiler_renders_internal_q8_0_linear_shaders(tmp_path: Path) -> None:
     shader_source_dir = Path(__file__).parents[1] / "runtime-rs" / "shaders"
     shader_files = {
         "linear_q8_0_512x768.comp",
+        "linear_batch16_q8_0_512x768.comp",
         "linear_bias_q8_0_512x768.comp",
+        "linear_bias_batch16_q8_0_512x768.comp",
         "linear_residual_q8_0_512x768.comp",
+        "linear_residual_batch16_q8_0_512x768.comp",
     }
 
     copy_shader_templates(shader_source_dir, tmp_path, shader_files)
@@ -139,6 +215,7 @@ def test_compiler_renders_internal_q8_0_linear_shaders(tmp_path: Path) -> None:
     linear = (tmp_path / "linear_q8_0_512x768.comp").read_text()
     bias = (tmp_path / "linear_bias_q8_0_512x768.comp").read_text()
     residual = (tmp_path / "linear_residual_q8_0_512x768.comp").read_text()
+    batch = (tmp_path / "linear_batch16_q8_0_512x768.comp").read_text()
     assert "const uint INPUT_SIZE = 512u;" in linear
     assert "const uint OUTPUT_SIZE = 768u;" in linear
     assert "const uint OUTPUT_TILE_ROWS = 32u;" in linear
@@ -150,7 +227,57 @@ def test_compiler_renders_internal_q8_0_linear_shaders(tmp_path: Path) -> None:
     assert "subgroupShuffle(quantized" in linear
     assert "binding = 3) readonly buffer Bias" in bias
     assert "binding = 1) readonly buffer ResidualFrames" in residual
-    assert all("{{" not in source for source in (linear, bias, residual))
+    assert "const uint BATCH_TILE_WIDTH = 16u;" in batch
+    assert "layout(push_constant) uniform BatchControl" in batch
+    assert "batch_control.batch_width" in batch
+    assert all("{{" not in source for source in (linear, bias, residual, batch))
+
+
+def test_compiler_renders_internal_q8_0_parallel_and_fused_shaders(
+    tmp_path: Path,
+) -> None:
+    shader_source_dir = Path(__file__).parents[1] / "runtime-rs" / "shaders"
+    shader_files = {
+        "parallel_linear_2way_q8_0_512x768.comp",
+        "parallel_linear_batch16_2way_q8_0_512x768.comp",
+        "parallel_linear_silu_multiply_q8_0_512x768.comp",
+        "parallel_linear_silu_multiply_batch16_q8_0_512x768.comp",
+    }
+
+    copy_shader_templates(shader_source_dir, tmp_path, shader_files)
+
+    parallel = (tmp_path / "parallel_linear_2way_q8_0_512x768.comp").read_text()
+    fused = (
+        tmp_path / "parallel_linear_silu_multiply_q8_0_512x768.comp"
+    ).read_text()
+    parallel_batch = (
+        tmp_path / "parallel_linear_batch16_2way_q8_0_512x768.comp"
+    ).read_text()
+    fused_batch = (
+        tmp_path / "parallel_linear_silu_multiply_batch16_q8_0_512x768.comp"
+    ).read_text()
+    for source in (parallel, fused, parallel_batch, fused_batch):
+        assert "const uint INPUT_SIZE = 512u;" in source
+        assert "const uint OUTPUT_SIZE = 768u;" in source
+        assert "const uint OUTPUT_TILE_ROWS = 32u;" in source
+        assert "#extension GL_EXT_integer_dot_product : require" in source
+        assert "dotPacked4x8EXT" in source
+        assert "subgroupClusteredMax" in source
+        assert "shared uint quantized_input" in source
+        assert "{{" not in source
+    assert "const uint BRANCH_COUNT = 2u;" in parallel
+    assert "buffer OutputA" in parallel
+    assert "buffer OutputB" in parallel
+    assert "readonly buffer WeightA" in parallel
+    assert "readonly buffer WeightB" in parallel
+    assert "write_branch_output" in parallel
+    assert "rounded_silu(round_bf16(gate)) * round_bf16(up)" in fused
+    assert "readonly buffer GateWeight" in fused
+    assert "readonly buffer UpWeight" in fused
+    assert "const uint BATCH_TILE_WIDTH = 16u;" in parallel_batch
+    assert "const uint BATCH_TILE_WIDTH = 16u;" in fused_batch
+    assert "batch_control.batch_width" in parallel_batch
+    assert "batch_control.batch_width" in fused_batch
 
 
 def test_compiler_renders_native_block_scaled_fp8_linear_shaders(

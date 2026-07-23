@@ -253,6 +253,18 @@ def weight_shared_batch_shader_file(
                 f"{operation}_batch{tile}_fp8_e4m3_",
                 1,
             )
+    q8 = re.fullmatch(
+        r"(linear|linear_bias|linear_residual)_q8_0_(\d+)x(\d+)\.comp",
+        shader_file,
+    )
+    if q8 is not None:
+        operation, input_size, output_size = q8.groups()
+        if int(input_size) % Q8_0_GROUP_SIZE == 0 and int(output_size) % 2 == 0:
+            return shader_file.replace(
+                f"{operation}_q8_0_",
+                f"{operation}_batch{tile}_q8_0_",
+                1,
+            )
     int4 = re.fullmatch(
         r"(linear|linear_bias|linear_residual)_int4_(gptq|ct)_s(?:f16|bf16)_"
         r"g(\d+)_(\d+)x(\d+)\.comp",
@@ -321,6 +333,30 @@ def weight_shared_batch_shader_file(
             f"parallel_linear_batch{tile}_",
             1,
         )
+    parallel_q8 = re.fullmatch(
+        r"parallel_linear_([23])way_q8_0_(\d+)x(\d+)\.comp",
+        shader_file,
+    )
+    if parallel_q8 is not None:
+        _branch_count, input_size, output_size = map(int, parallel_q8.groups())
+        if input_size % Q8_0_GROUP_SIZE == 0 and output_size % 2 == 0:
+            return shader_file.replace(
+                "parallel_linear_",
+                f"parallel_linear_batch{tile}_",
+                1,
+            )
+    fused_q8_ffn = re.fullmatch(
+        r"parallel_linear_silu_multiply_q8_0_(\d+)x(\d+)\.comp",
+        shader_file,
+    )
+    if fused_q8_ffn is not None:
+        input_size, output_size = map(int, fused_q8_ffn.groups())
+        if input_size % Q8_0_GROUP_SIZE == 0 and output_size % 2 == 0:
+            return shader_file.replace(
+                "parallel_linear_silu_multiply_",
+                f"parallel_linear_silu_multiply_batch{tile}_",
+                1,
+            )
     fused_bf16_ffn = re.fullmatch(
         r"parallel_linear_silu_multiply_bf16_"
         r"(\d+)x(\d+)\.comp",
@@ -334,5 +370,4 @@ def weight_shared_batch_shader_file(
                 f"{input_size}x{output_size}.comp"
             )
     return None
-
 

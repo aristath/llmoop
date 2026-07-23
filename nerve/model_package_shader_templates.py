@@ -502,6 +502,79 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
             },
         )
 
+    parallel_q8 = re.fullmatch(
+        r"parallel_linear_(?:batch(\d+)_)?([23])way_q8_0_(\d+)x(\d+)\.comp",
+        shader_file,
+    )
+    if parallel_q8 is not None:
+        batch_tile_width = (
+            int(parallel_q8.group(1)) if parallel_q8.group(1) is not None else None
+        )
+        branch_count = int(parallel_q8.group(2))
+        input_size = int(parallel_q8.group(3))
+        output_size = int(parallel_q8.group(4))
+        if (
+            branch_count not in {2, 3}
+            or (batch_tile_width is not None and batch_tile_width <= 0)
+            or input_size <= 0
+            or input_size % Q8_0_GROUP_SIZE
+            or output_size <= 0
+            or output_size % 2
+        ):
+            raise ModelCompileError(
+                f"invalid Q8_0 parallel-linear shader shape {shader_file!r}"
+            )
+        labels = [chr(ord("A") + index) for index in range(branch_count)]
+        output_bindings = "\n\n".join(
+            f"layout(set = 0, binding = {index + 1}) buffer Output{label} {{\n"
+            "    uint words[];\n"
+            f"}} output_{label.lower()};"
+            for index, label in enumerate(labels)
+        )
+        weight_bindings = "\n\n".join(
+            f"layout(set = 0, binding = {branch_count + index + 1}) "
+            f"readonly buffer Weight{label} {{\n"
+            "    uint words[];\n"
+            f"}} weight_{label.lower()};"
+            for index, label in enumerate(labels)
+        )
+        weight_reads = "\n".join(
+            f"    if (branch == {index}u) return weight_{label.lower()}.words[index];"
+            for index, label in enumerate(labels[:-1])
+        )
+        weight_reads += "\n    return weight_" + labels[-1].lower() + ".words[index];"
+        output_writes = "\n".join(
+            f"    if (branch == {index}u) {{ output_{label.lower()}.words[__OUTPUT_INDEX__] = value; return; }}"
+            for index, label in enumerate(labels[:-1])
+        )
+        output_writes += (
+            "\n    output_" + labels[-1].lower() + ".words[__OUTPUT_INDEX__] = value;"
+        )
+        output_index = (
+            "batch_index * OUTPUT_WORDS + index"
+            if batch_tile_width is not None
+            else "index"
+        )
+        return render_shader_template(
+            source_dir,
+            (
+                "parallel_linear_batch_q8_0.comp.template"
+                if batch_tile_width is not None
+                else "parallel_linear_q8_0.comp.template"
+            ),
+            {
+                "BATCH_TILE_WIDTH": str(batch_tile_width or 1),
+                "BRANCH_COUNT": str(branch_count),
+                "INPUT_SIZE": str(input_size),
+                "OUTPUT_SIZE": str(output_size),
+                "OUTPUT_TILE_ROWS": str(Q8_0_OUTPUT_TILE_ROWS),
+                "OUTPUT_BINDINGS": output_bindings,
+                "WEIGHT_BINDINGS": weight_bindings,
+                "WEIGHT_READS": weight_reads,
+                "OUTPUT_WRITES": output_writes.replace("__OUTPUT_INDEX__", output_index),
+            },
+        )
+
     tied_output_projection_fp8 = re.fullmatch(
         r"tied_output_projection(?:_batch(\d+))?_fp8_e4m3_b(\d+)x(\d+)_"
         r"(\d+)x(\d+)_scale([A-Za-z0-9_]+)_to_f32\.comp",
@@ -662,6 +735,110 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
                 "INPUT_SIZE": str(input_size),
                 "OUTPUT_SIZE": str(output_size),
                 "OUTPUT_TILE_ROWS": str(FP8_FUSED_FFN_TILE_ROWS),
+            },
+        )
+
+    fused_q8_ffn_projection = re.fullmatch(
+        r"parallel_linear_silu_multiply_(?:batch(\d+)_)?q8_0_(\d+)x(\d+)\.comp",
+        shader_file,
+    )
+    if fused_q8_ffn_projection is not None:
+        batch_tile_width = (
+            int(fused_q8_ffn_projection.group(1))
+            if fused_q8_ffn_projection.group(1) is not None
+            else None
+        )
+        input_size = int(fused_q8_ffn_projection.group(2))
+        output_size = int(fused_q8_ffn_projection.group(3))
+        if (
+            (batch_tile_width is not None and batch_tile_width <= 0)
+            or
+            input_size <= 0
+            or input_size % Q8_0_GROUP_SIZE
+            or output_size <= 0
+            or output_size % 2
+        ):
+            raise ModelCompileError(
+                f"invalid fused Q8_0 FFN projection shader shape {shader_file!r}"
+            )
+        return render_shader_template(
+            source_dir,
+            (
+                "parallel_linear_silu_multiply_batch_q8_0.comp.template"
+                if batch_tile_width is not None
+                else "parallel_linear_silu_multiply_q8_0.comp.template"
+            ),
+            {
+                "BATCH_TILE_WIDTH": str(batch_tile_width or 1),
+                "INPUT_SIZE": str(input_size),
+                "OUTPUT_SIZE": str(output_size),
+                "OUTPUT_TILE_ROWS": str(Q8_0_OUTPUT_TILE_ROWS),
+            },
+        )
+
+    native_q8_batch_linear = re.fullmatch(
+        r"(linear|linear_bias|linear_residual)_batch(\d+)_q8_0_(\d+)x(\d+)\.comp",
+        shader_file,
+    )
+    if native_q8_batch_linear is not None:
+        operation = native_q8_batch_linear.group(1)
+        batch_tile_width = int(native_q8_batch_linear.group(2))
+        input_size, output_size = map(int, native_q8_batch_linear.groups()[2:])
+        if (
+            batch_tile_width <= 0
+            or input_size <= 0
+            or input_size % Q8_0_GROUP_SIZE
+            or output_size <= 0
+            or output_size % 2
+        ):
+            raise ModelCompileError(
+                f"invalid native batched Q8_0 linear shader shape {shader_file!r}"
+            )
+        has_residual = operation == "linear_residual"
+        has_bias = operation == "linear_bias"
+        output_binding = 2 if has_residual else 1
+        weight_binding = 3 if has_residual else 2
+        auxiliary_buffer = (
+            "layout(set = 0, binding = 3) readonly buffer Bias { "
+            "uint words[]; } bias;"
+            if has_bias
+            else (
+                "layout(set = 0, binding = 1) readonly buffer ResidualFrames { "
+                "uint words[]; } residual_frames;"
+                if has_residual
+                else ""
+            )
+        )
+        finalize_output = (
+            "float finalize_output(uint batch_index, uint row, float value) {\n"
+            "    uint index = batch_index * OUTPUT_WORDS + (row >> 1u);\n"
+            "    return read_bf16_word(residual_frames.words[index], row) + value;\n"
+            "}"
+            if has_residual
+            else (
+                "float finalize_output(uint batch_index, uint row, float value) {\n"
+                "    return read_bf16_word(bias.words[row >> 1u], row) + value;\n"
+                "}"
+                if has_bias
+                else (
+                    "float finalize_output(uint batch_index, uint row, float value) {\n"
+                    "    return value;\n"
+                    "}"
+                )
+            )
+        )
+        return render_shader_template(
+            source_dir,
+            "linear_batch_q8_0.comp.template",
+            {
+                "BATCH_TILE_WIDTH": str(batch_tile_width),
+                "OUTPUT_BINDING": str(output_binding),
+                "WEIGHT_BINDING": str(weight_binding),
+                "AUXILIARY_BUFFER": auxiliary_buffer,
+                "FINALIZE_OUTPUT_FUNCTION": finalize_output,
+                "INPUT_SIZE": str(input_size),
+                "OUTPUT_SIZE": str(output_size),
+                "OUTPUT_TILE_ROWS": str(Q8_0_OUTPUT_TILE_ROWS),
             },
         )
 

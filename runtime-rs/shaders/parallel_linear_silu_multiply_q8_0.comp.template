@@ -10,9 +10,9 @@
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
 layout(set = 0, binding = 0) readonly buffer InputFrame { uint words[]; } input_frame;
-layout(set = 0, binding = {{OUTPUT_BINDING}}) buffer OutputFrame { uint words[]; } output_frame;
-layout(set = 0, binding = {{WEIGHT_BINDING}}) readonly buffer Weight { uint words[]; } weight;
-{{AUXILIARY_BUFFER}}
+layout(set = 0, binding = 1) buffer OutputFrame { uint words[]; } output_frame;
+layout(set = 0, binding = 2) readonly buffer GateWeight { uint words[]; } gate_weight;
+layout(set = 0, binding = 3) readonly buffer UpWeight { uint words[]; } up_weight;
 
 const uint INPUT_SIZE = {{INPUT_SIZE}}u;
 const uint OUTPUT_SIZE = {{OUTPUT_SIZE}}u;
@@ -23,8 +23,9 @@ const uint Q8_BLOCK_WORDS = 9u;
 
 shared uint quantized_input[INPUT_Q8_WORDS];
 shared float input_scales[INPUT_BLOCKS];
-shared float subgroup_sum[OUTPUT_TILE_ROWS][64];
-shared float output_rows[OUTPUT_TILE_ROWS];
+shared float gate_subgroup_sum[OUTPUT_TILE_ROWS][64];
+shared float up_subgroup_sum[OUTPUT_TILE_ROWS][64];
+shared float activated_rows[OUTPUT_TILE_ROWS];
 
 float bf16_to_f32(uint value) { return uintBitsToFloat((value & 0xffffu) << 16u); }
 
@@ -32,6 +33,12 @@ uint f32_to_bf16(float value) {
     uint bits = floatBitsToUint(value);
     uint lsb = (bits >> 16u) & 1u;
     return (bits + 0x7fffu + lsb) >> 16u;
+}
+
+float round_bf16(float value) { return bf16_to_f32(f32_to_bf16(value)); }
+
+float rounded_silu(float value) {
+    return round_bf16(value / (1.0 + exp(-value)));
 }
 
 float read_bf16_word(uint packed, uint index) {
@@ -53,18 +60,27 @@ uint pack_i8x4(int a, int b, int c, int d) {
         | ((uint(d) & 255u) << 24u);
 }
 
-float read_weight_scale(uint row, uint block) {
-    uint scale_word = weight.words[(row * INPUT_BLOCKS + block) * Q8_BLOCK_WORDS];
-    return bf16_to_f32(scale_word);
+float read_gate_scale(uint row, uint block) {
+    uint index = (row * INPUT_BLOCKS + block) * Q8_BLOCK_WORDS;
+    return bf16_to_f32(gate_weight.words[index]);
 }
 
-uint read_weight_q8_word(uint row, uint q8_word) {
+float read_up_scale(uint row, uint block) {
+    uint index = (row * INPUT_BLOCKS + block) * Q8_BLOCK_WORDS;
+    return bf16_to_f32(up_weight.words[index]);
+}
+
+uint read_gate_q8_word(uint row, uint q8_word) {
     uint block = q8_word >> 3u;
     uint word = q8_word & 7u;
-    return weight.words[(row * INPUT_BLOCKS + block) * Q8_BLOCK_WORDS + 1u + word];
+    return gate_weight.words[(row * INPUT_BLOCKS + block) * Q8_BLOCK_WORDS + 1u + word];
 }
 
-{{FINALIZE_OUTPUT_FUNCTION}}
+uint read_up_q8_word(uint row, uint q8_word) {
+    uint block = q8_word >> 3u;
+    uint word = q8_word & 7u;
+    return up_weight.words[(row * INPUT_BLOCKS + block) * Q8_BLOCK_WORDS + 1u + word];
+}
 
 void quantize_input(uint lane) {
     uint cluster = lane >> 5u;
@@ -96,45 +112,62 @@ void main() {
 
     for (uint local_row = 0u; local_row < OUTPUT_TILE_ROWS; local_row++) {
         uint row = first_row + local_row;
-        float sum = 0.0;
+        float gate = 0.0;
+        float up = 0.0;
         if (row < OUTPUT_SIZE) {
             for (uint q8_word = lane; q8_word < INPUT_Q8_WORDS; q8_word += 64u) {
                 uint block = q8_word >> 3u;
                 uint activation = quantized_input[q8_word];
-                uint qweight = read_weight_q8_word(row, q8_word);
-                int dot = dotPacked4x8EXT(int32_t(activation), int32_t(qweight));
-                sum = fma(
-                    float(dot),
-                    input_scales[block] * read_weight_scale(row, block),
-                    sum
+                int gate_dot = dotPacked4x8EXT(
+                    int32_t(activation),
+                    int32_t(read_gate_q8_word(row, q8_word))
+                );
+                int up_dot = dotPacked4x8EXT(
+                    int32_t(activation),
+                    int32_t(read_up_q8_word(row, q8_word))
+                );
+                float activation_scale = input_scales[block];
+                gate = fma(
+                    float(gate_dot),
+                    activation_scale * read_gate_scale(row, block),
+                    gate
+                );
+                up = fma(
+                    float(up_dot),
+                    activation_scale * read_up_scale(row, block),
+                    up
                 );
             }
         }
-        sum = subgroupAdd(sum);
+        gate = subgroupAdd(gate);
+        up = subgroupAdd(up);
         if (gl_SubgroupInvocationID == 0u) {
-            subgroup_sum[local_row][gl_SubgroupID] = sum;
+            gate_subgroup_sum[local_row][gl_SubgroupID] = gate;
+            up_subgroup_sum[local_row][gl_SubgroupID] = up;
         }
     }
     barrier();
 
     if (lane < OUTPUT_TILE_ROWS) {
         uint row = first_row + lane;
-        float sum = 0.0;
+        float gate = 0.0;
+        float up = 0.0;
         if (row < OUTPUT_SIZE) {
             for (uint subgroup = 0u; subgroup < gl_NumSubgroups; subgroup++) {
-                sum += subgroup_sum[lane][subgroup];
+                gate += gate_subgroup_sum[lane][subgroup];
+                up += up_subgroup_sum[lane][subgroup];
             }
         }
-        output_rows[lane] = sum;
+        activated_rows[lane] = rounded_silu(round_bf16(gate)) * round_bf16(up);
     }
     barrier();
 
     if (lane < OUTPUT_TILE_ROWS / 2u) {
         uint row = first_row + lane * 2u;
         if (row < OUTPUT_SIZE) {
-            uint lo = f32_to_bf16(finalize_output(row, output_rows[lane * 2u]));
+            uint lo = f32_to_bf16(activated_rows[lane * 2u]);
             uint hi = row + 1u < OUTPUT_SIZE
-                ? f32_to_bf16(finalize_output(row + 1u, output_rows[lane * 2u + 1u]))
+                ? f32_to_bf16(activated_rows[lane * 2u + 1u])
                 : 0u;
             output_frame.words[row >> 1u] = (hi << 16u) | lo;
         }
