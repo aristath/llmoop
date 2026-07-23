@@ -198,6 +198,17 @@ Initial required dispatch families:
 - MoE route-native paths.
 - Sampler and speculative decode paths.
 
+Current status:
+
+- Scheduler activation batches now map explicitly onto backend execution modes:
+  prefill chunks are causal sequences, while decode feedback batches are
+  independent candidates.
+- Vulkan component-batch kernel selection already uses execution-domain metadata
+  to choose decode, prefill, or shared decode/prefill implementations by shape.
+- This is still only the dispatch vocabulary and selection seam; dense FP8/INT4,
+  attention/state, MoE route-native, and speculative decode optimized kernel
+  families still need real implementations.
+
 ### 8. Make MoE route-native
 
 MoE components must not behave like dense FFNs with a mask.
