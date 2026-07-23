@@ -234,6 +234,48 @@ fn package_loader_accepts_mixed_exact_and_approximate_component_proofs() {
 }
 
 #[test]
+fn package_loader_accepts_extra_self_contained_integrity_artifacts() {
+    let source_manifest_path = fixture_model_package_manifest_path();
+    let source_manifest = fixture_model_package_manifest();
+    let source_root = source_manifest_path.parent().unwrap();
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "nerve-extra-integrity-artifact-{}-{unique}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    copy_package_integrity_artifacts(source_root, &root, &source_manifest);
+
+    let extra_path = root.join("lowered/extra_self_contained_artifact.json");
+    std::fs::create_dir_all(extra_path.parent().unwrap()).unwrap();
+    let payload = br#"{"schema":"nerve.test.extra_artifact.v1"}"#;
+    std::fs::write(&extra_path, payload).unwrap();
+
+    let mut raw_manifest: Value =
+        serde_json::from_slice(&std::fs::read(&source_manifest_path).unwrap()).unwrap();
+    raw_manifest["artifact_integrity"]["files"]["lowered/extra_self_contained_artifact.json"] =
+        serde_json::json!({
+            "byte_count": payload.len(),
+            "sha256": Sha256::digest(payload)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        });
+    let manifest_path = root.join("vulkan_resident_package.json");
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&raw_manifest).unwrap(),
+    )
+    .unwrap();
+
+    VulkanResidentModelPackageManifest::from_json_file(&manifest_path).unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn runtime_graph_duplicates_package_components_in_memory() {
     let manifest = fixture_model_package_manifest();
     let source_graph = manifest
@@ -493,4 +535,3 @@ fn generation_contract_rejects_execution_and_graph_drift() {
             .to_string();
     assert!(boundary_error.contains("sampler public output"));
 }
-

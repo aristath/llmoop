@@ -609,7 +609,8 @@ fn validate_resident_package_artifact_integrity(
     .chain(kernel_shaders)
     .chain(draft_shaders)
     .collect::<BTreeSet<_>>();
-    if integrity.files.keys().cloned().collect::<BTreeSet<_>>() != required {
+    let covered = integrity.files.keys().cloned().collect::<BTreeSet<_>>();
+    if !required.is_subset(&covered) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "resident model package artifact integrity contract does not cover its declared non-weight artifacts",
@@ -789,4 +790,3 @@ fn validate_resident_package_spirv_requirements(
     }
     Ok(())
 }
-
