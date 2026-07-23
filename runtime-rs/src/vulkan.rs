@@ -33,7 +33,7 @@ mod tests {
     fn spirv_words_round_trip_through_file() {
         let words = vec![0x0723_0203, 0x0001_0000, 0x0008_000b, 42];
         let path = std::env::temp_dir().join(format!(
-            "llmoop-spirv-round-trip-{}.spv",
+            "nerve-spirv-round-trip-{}.spv",
             std::process::id()
         ));
 
@@ -46,7 +46,7 @@ mod tests {
     #[test]
     fn rejects_spirv_files_with_partial_words() {
         let path =
-            std::env::temp_dir().join(format!("llmoop-invalid-spirv-{}.spv", std::process::id()));
+            std::env::temp_dir().join(format!("nerve-invalid-spirv-{}.spv", std::process::id()));
         fs::write(&path, [1_u8, 2, 3]).unwrap();
 
         let error = read_spirv_words(&path).unwrap_err();

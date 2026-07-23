@@ -35,7 +35,7 @@ fn discover_fixture_artifact_id() -> String {
     let mut candidates = std::fs::read_dir(&root)
         .unwrap_or_else(|_| {
             panic!(
-                "set LLMOOP_TEST_LOWERED_DIR or compile the structural test model into {}",
+                "set NERVE_TEST_LOWERED_DIR or compile the structural test model into {}",
                 root.display()
             )
         })
@@ -52,10 +52,10 @@ fn discover_fixture_artifact_id() -> String {
             .expect("compiled fixture directory must have a UTF-8 name")
             .to_string(),
         [] => panic!(
-            "set LLMOOP_TEST_LOWERED_DIR or compile exactly one compatible structural test model"
+            "set NERVE_TEST_LOWERED_DIR or compile exactly one compatible structural test model"
         ),
         _ => panic!(
-            "multiple compatible structural test models were found ({}); set LLMOOP_TEST_LOWERED_DIR, LLMOOP_TEST_TRANSPILED_DIR, and LLMOOP_TEST_PACKAGE_DIR explicitly",
+            "multiple compatible structural test models were found ({}); set NERVE_TEST_LOWERED_DIR, NERVE_TEST_TRANSPILED_DIR, and NERVE_TEST_PACKAGE_DIR explicitly",
             candidates
                 .iter()
                 .map(|path| path.display().to_string())

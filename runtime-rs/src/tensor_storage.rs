@@ -307,7 +307,7 @@ mod tests {
                 .unwrap()
                 .as_nanos();
             let root = std::env::temp_dir().join(format!(
-                "llmoop-tensor-storage-{}-{unique}",
+                "nerve-tensor-storage-{}-{unique}",
                 std::process::id()
             ));
             fs::create_dir_all(&root).unwrap();
@@ -325,7 +325,7 @@ mod tests {
                 .map(|byte| format!("{byte:02x}"))
                 .collect();
             let index = TensorIndex {
-                schema: "llmoop.tensor_index.v1".to_string(),
+                schema: "nerve.tensor_index.v1".to_string(),
                 tensors: BTreeMap::from([(
                     "weight".to_string(),
                     TensorMetadata {

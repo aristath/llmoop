@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
-const COMPILER_FINGERPRINT_SCHEMA: &str = "llmoop.package_compiler_sha256.v1";
+const COMPILER_FINGERPRINT_SCHEMA: &str = "nerve.package_compiler_sha256.v1";
 
 fn directory_files(path: &Path, prefix: &str) -> Vec<(String, PathBuf)> {
     fs::read_dir(path)
@@ -24,13 +24,13 @@ fn main() {
         .expect("runtime crate must live inside the repository");
     println!(
         "cargo:rerun-if-changed={}",
-        repository_root.join("llmoop").display()
+        repository_root.join("nerve").display()
     );
     println!(
         "cargo:rerun-if-changed={}",
         manifest_dir.join("shaders").display()
     );
-    let mut inputs = directory_files(&repository_root.join("llmoop"), "llmoop")
+    let mut inputs = directory_files(&repository_root.join("nerve"), "nerve")
         .into_iter()
         .filter(|(relative, _)| relative.ends_with(".py"))
         .chain(directory_files(
@@ -52,7 +52,7 @@ fn main() {
         digest.update(source_bytes);
     }
     println!(
-        "cargo:rustc-env=LLMOOP_PACKAGE_COMPILER_FINGERPRINT={COMPILER_FINGERPRINT_SCHEMA}:{:x}",
+        "cargo:rustc-env=NERVE_PACKAGE_COMPILER_FINGERPRINT={COMPILER_FINGERPRINT_SCHEMA}:{:x}",
         digest.finalize()
     );
 }

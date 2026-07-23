@@ -1,21 +1,21 @@
 [package]
-name = "llmoop-runtime"
+name = "nerve-runtime"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
 
 [lib]
-name = "llmoop_runtime"
+name = "nerve_runtime"
 path = "src/lib.rs"
 
 [[bin]]
-name = "llmoop-runtime"
-path = "src/bin/llmoop_runtime.rs"
+name = "nerve-runtime"
+path = "src/bin/nerve_runtime.rs"
 required-features = ["vulkan", "tokenizers"]
 
 [[bin]]
-name = "llmoop-tui"
-path = "src/bin/llmoop_tui.rs"
+name = "nerve-tui"
+path = "src/bin/nerve_tui.rs"
 required-features = ["vulkan", "tokenizers", "tui"]
 
 [features]

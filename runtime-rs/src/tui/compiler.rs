@@ -10,7 +10,7 @@ use std::thread;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-const COMPILER_EVENT_SCHEMA: &str = "llmoop.compiler_event.v1";
+const COMPILER_EVENT_SCHEMA: &str = "nerve.compiler_event.v1";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CompilerJobKind {
@@ -75,14 +75,14 @@ pub struct CompilerLaunch {
 impl CompilerLaunch {
     pub fn from_environment() -> Result<Self, String> {
         let working_directory = compiler_workspace()?;
-        if let Some(program) = env::var_os("LLMOOP_COMPILER_BIN") {
+        if let Some(program) = env::var_os("NERVE_COMPILER_BIN") {
             return Ok(Self {
                 program,
                 prefix_args: Vec::new(),
                 working_directory,
             });
         }
-        let python = env::var_os("LLMOOP_PYTHON").unwrap_or_else(|| {
+        let python = env::var_os("NERVE_PYTHON").unwrap_or_else(|| {
             let local = working_directory.join(".venv/bin/python");
             if local.is_file() {
                 local.into_os_string()
@@ -92,7 +92,7 @@ impl CompilerLaunch {
         });
         Ok(Self {
             program: python,
-            prefix_args: vec![OsString::from("-m"), OsString::from("llmoop")],
+            prefix_args: vec![OsString::from("-m"), OsString::from("nerve")],
             working_directory,
         })
     }
@@ -306,13 +306,13 @@ fn send_terminate(_pid: u32) -> Result<(), String> {
 }
 
 fn compiler_workspace() -> Result<PathBuf, String> {
-    if let Some(path) = env::var_os("LLMOOP_WORKSPACE") {
+    if let Some(path) = env::var_os("NERVE_WORKSPACE") {
         let path = PathBuf::from(path);
         if is_compiler_workspace(&path) {
             return Ok(path);
         }
         return Err(format!(
-            "LLMOOP_WORKSPACE does not contain the llmoop compiler: {}",
+            "NERVE_WORKSPACE does not contain the NERVE compiler: {}",
             path.display()
         ));
     }
@@ -329,11 +329,11 @@ fn compiler_workspace() -> Result<PathBuf, String> {
     if let Some(path) = source_workspace.filter(|path| is_compiler_workspace(path)) {
         return Ok(path);
     }
-    Err("could not locate the llmoop compiler workspace; set LLMOOP_WORKSPACE".to_string())
+    Err("could not locate the NERVE compiler workspace; set NERVE_WORKSPACE".to_string())
 }
 
 fn is_compiler_workspace(path: &Path) -> bool {
-    path.join("llmoop/__main__.py").is_file() && path.join("llmoop/cli.py").is_file()
+    path.join("nerve/__main__.py").is_file() && path.join("nerve/cli.py").is_file()
 }
 
 #[cfg(test)]
@@ -345,14 +345,14 @@ mod tests {
     #[test]
     fn compiler_event_exposes_progress_and_nested_package_path() {
         let event: CompilerEvent = serde_json::from_str(
-            r#"{"schema":"llmoop.compiler_event.v1","sequence":7,"type":"PedalLoweringStarted","current":3,"total":12,"pedal_id":"layer_02"}"#,
+            r#"{"schema":"nerve.compiler_event.v1","sequence":7,"type":"PedalLoweringStarted","current":3,"total":12,"pedal_id":"layer_02"}"#,
         )
         .unwrap();
         assert_eq!(event.progress(), Some((3, 12)));
         assert_eq!(event.current_item(), Some("layer_02"));
 
         let completed: CompilerEvent = serde_json::from_str(
-            r#"{"schema":"llmoop.compiler_event.v1","sequence":8,"type":"Completed","package":{"package_manifest":"/tmp/package/vulkan_resident_package.json"}}"#,
+            r#"{"schema":"nerve.compiler_event.v1","sequence":8,"type":"Completed","package":{"package_manifest":"/tmp/package/vulkan_resident_package.json"}}"#,
         )
         .unwrap();
         assert_eq!(
@@ -370,7 +370,7 @@ mod tests {
     #[test]
     fn rust_client_consumes_real_python_discovery_protocol() {
         let source = env::temp_dir().join(format!(
-            "llmoop-tui-discovery-{}-{}",
+            "nerve-tui-discovery-{}-{}",
             std::process::id(),
             Instant::now().elapsed().as_nanos()
         ));
