@@ -26,7 +26,7 @@ def synthesize_packed_expert_tensors(
 
     The compiler package owns the physical packing.  The model graph only sees
     the common [expert, row, column] circuit parameters used by every sparse
-    MoE pedal, regardless of how the source checkpoint sharded its experts.
+    MoE component, regardless of how the source checkpoint sharded its experts.
     """
     packed_input = f"{layer_prefix}.mlp.experts.gate_up_proj"
     packed_output = f"{layer_prefix}.mlp.experts.down_proj"

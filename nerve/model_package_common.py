@@ -16,7 +16,7 @@ from nerve.behavioral_compiler import (
     validate_behavioral_validation_artifact,
 )
 from nerve.circuit_ir import validate_circuit
-from nerve.circuit_lowering import lower_pedalboard
+from nerve.circuit_lowering import lower_execution_graph
 from nerve.circuit_optimizer import optimize_circuit_for_vulkan
 from nerve.compilation import (
     DEFAULT_COMPILED_MODELS_DIR,
@@ -101,7 +101,7 @@ SPIRV_CAPABILITY_VULKAN_SUBGROUP_OPERATION_REQUIREMENTS = {
 KNOWN_VULKAN_SUBGROUP_OPERATIONS = frozenset(
     SPIRV_CAPABILITY_VULKAN_SUBGROUP_OPERATION_REQUIREMENTS.values()
 )
-KNOWN_PEDAL_KERNEL_EXECUTION_DOMAINS = frozenset(
+KNOWN_COMPONENT_KERNEL_EXECUTION_DOMAINS = frozenset(
     {"decode", "prefill", "decode_and_prefill"}
 )
 SUPPORTED_SPIRV_CAPABILITIES = frozenset(

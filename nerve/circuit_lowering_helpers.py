@@ -35,10 +35,10 @@ def _linear_params(weight_id: str, parameters: Json) -> list[str]:
     return result
 
 
-def _attention_heads_from_state(pedal: Json) -> Json:
-    state = pedal["state_ports"][0]
+def _attention_heads_from_state(component: Json) -> Json:
+    state = component["state_ports"][0]
     kv_heads, head_width = state["key_shape_per_token"]
-    hidden_size = pedal["ports"]["inputs"][0]["shape"][0]
+    hidden_size = component["ports"]["inputs"][0]["shape"][0]
     query_heads = int(state.get("query_heads") or hidden_size // head_width)
     return {
         "query_heads": query_heads,

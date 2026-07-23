@@ -1,1 +1,1 @@
-"""Compiler and launcher for NERVE, the Neural Execution & Rewiring Virtual Engine."""
+"""Compiler and launcher for NERVE, the Neural Execution & Retopology Virtual Engine."""

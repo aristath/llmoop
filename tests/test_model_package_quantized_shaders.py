@@ -286,7 +286,7 @@ def test_compiler_parallelizes_only_selected_sparse_expert_routes() -> None:
     assert workgroup_count_x_for_node(circuit, gate_up, bf16_tensor_index) == 2048
     assert workgroup_count_x_for_node(circuit, down, bf16_tensor_index) == 8192
 
-    spec = pedal_kernel_spec(
+    spec = component_kernel_spec(
         execution_index=0,
         node={"id": "sparse_moe_gate_up", "op": "sparse_moe_gate_up"},
         shader_file=("sparse_moe_gate_up_fp8_e4m3_b128x128_h2048_i512_e256_k8.comp"),

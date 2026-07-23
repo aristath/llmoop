@@ -5,20 +5,20 @@ import unittest
 from pathlib import Path
 
 from nerve.circuit_ir import load_circuit, validate_circuit
-from nerve.circuit_lowering import lower_pedalboard
+from nerve.circuit_lowering import lower_execution_graph
 from nerve.compilation import read_json
 from tests.fixtures import compiled_model_or_skip
 
 
-class PedalboardCircuitLoweringTest(unittest.TestCase):
-    def test_lower_pedalboard_writes_one_circuit_per_pedal(self) -> None:
+class ExecutionGraphCircuitLoweringTest(unittest.TestCase):
+    def test_lower_execution_graph_writes_one_circuit_per_component(self) -> None:
         fixture = compiled_model_or_skip()
         with tempfile.TemporaryDirectory() as tempdir:
             out_dir = Path(tempdir)
-            result = lower_pedalboard(fixture.transpiled_dir, out_dir)
+            result = lower_execution_graph(fixture.transpiled_dir, out_dir)
             index = result["index"]
 
-            self.assertEqual("nerve.lowered_pedalboard.v1", index["schema"])
+            self.assertEqual("nerve.lowered_execution_graph.v1", index["schema"])
             self.assertEqual(17, index["summary"]["circuit_count"])
             self.assertEqual(
                 {
@@ -30,29 +30,29 @@ class PedalboardCircuitLoweringTest(unittest.TestCase):
                 },
                 index["summary"]["operator_counts"],
             )
-            self.assertEqual("explicit_graph", index["graph"]["wiring"])
-            self.assertEqual(17, len(index["graph"]["cables"]))
+            self.assertEqual("explicit_graph", index["graph"]["topology"])
+            self.assertEqual(17, len(index["graph"]["edges"]))
             self.assertEqual(
                 {
-                    "id": "cable_0000",
+                    "id": "edge_0000",
                     "connection": {"kind": "forward"},
                     "source": {
-                        "pedal_id": "input_transducer",
+                        "component_id": "input_transducer",
                         "port_id": "output_frame",
                     },
                     "destination": {
-                        "pedal_id": "layer_00",
+                        "component_id": "layer_00",
                         "port_id": "input_frame",
                     },
                 },
-                index["graph"]["cables"][0],
+                index["graph"]["edges"][0],
             )
             self.assertEqual(
                 {
                     "kind": "temporal_feedback",
                     "delay_activations": 1,
                 },
-                index["graph"]["cables"][-1]["connection"],
+                index["graph"]["edges"][-1]["connection"],
             )
             self.assertEqual(
                 ["user_input", "random_seed"],
@@ -61,12 +61,12 @@ class PedalboardCircuitLoweringTest(unittest.TestCase):
                     for port in index["graph"]["boundary"]["external_inputs"]
                 ],
             )
-            self.assertEqual("nerve.compiled_pedalboard_artifact.v1", index["source"]["format"])
+            self.assertEqual("nerve.compiled_execution_graph_artifact.v1", index["source"]["format"])
             self.assertEqual(".", index["source"]["artifact_root"])
             self.assertTrue(result["index_path"].exists())
 
             for circuit_entry in index["graph"]["circuits"]:
-                self.assertNotIn("pedal_file", circuit_entry)
+                self.assertNotIn("component_file", circuit_entry)
                 circuit_path = out_dir / circuit_entry["circuit"]
                 params_path = out_dir / circuit_entry["params"]
                 state_path = out_dir / circuit_entry["state"]
@@ -77,8 +77,8 @@ class PedalboardCircuitLoweringTest(unittest.TestCase):
                 circuit = load_circuit(circuit_path)
                 report = validate_circuit(circuit)
                 self.assertTrue(report.ok, [issue.to_json() for issue in report.errors])
-                self.assertEqual(circuit_entry["id"], circuit["source"]["pedal_id"])
-                self.assertNotIn("pedal_file", circuit["source"])
+                self.assertEqual(circuit_entry["id"], circuit["source"]["component_id"])
+                self.assertNotIn("component_file", circuit["source"])
 
                 params = read_json(params_path)
                 state = read_json(state_path)
@@ -88,7 +88,7 @@ class PedalboardCircuitLoweringTest(unittest.TestCase):
     def test_attention_circuit_declares_kv_as_stream_owned_transient_state(self) -> None:
         fixture = compiled_model_or_skip()
         with tempfile.TemporaryDirectory() as tempdir:
-            result = lower_pedalboard(fixture.transpiled_dir, Path(tempdir))
+            result = lower_execution_graph(fixture.transpiled_dir, Path(tempdir))
             attention = next(circuit for circuit in result["index"]["graph"]["circuits"] if circuit["operator_type"] == "full_attention")
             circuit = load_circuit(Path(tempdir) / attention["circuit"])
 

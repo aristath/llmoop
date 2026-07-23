@@ -106,7 +106,7 @@ def test_compiler_selects_only_compatible_weight_shared_batch_kernels() -> None:
 
 
 def test_compiler_orders_frame_parallel_before_portable_batch_implementation() -> None:
-    spec = pedal_kernel_spec(
+    spec = component_kernel_spec(
         execution_index=0,
         node={"id": "norm", "op": "rms_norm"},
         shader_file="rms_norm_bf16_h4096_eps1e-06_offset1.comp",
@@ -199,7 +199,7 @@ def test_compiler_selects_stateful_causal_scan_kernels() -> None:
             "workgroup_count_x": 4,
         },
     ]
-    attention_spec = pedal_kernel_spec(
+    attention_spec = component_kernel_spec(
         execution_index=0,
         node={"id": "attention", "op": "append_scaled_dot_product_attention"},
         shader_file="append_gqa_attention_bf16_q16_kv4_d256_scale0.0625__sc7.comp",
@@ -283,10 +283,10 @@ def test_compiler_selects_cooperative_bfloat16_projection_kernels() -> None:
     )
 
 
-def test_projection_pedal_compiles_ordered_target_native_and_scalar_implementations() -> (
+def test_projection_component_compiles_ordered_target_native_and_scalar_implementations() -> (
     None
 ):
-    spec = pedal_kernel_spec(
+    spec = component_kernel_spec(
         execution_index=0,
         node={"id": "project", "op": "linear"},
         shader_file="linear_bf16_1024x4096.comp",
@@ -350,7 +350,7 @@ def test_projection_pedal_compiles_ordered_target_native_and_scalar_implementati
         }
 
 
-def test_compiler_renders_weight_shared_pedal_batch_shaders(tmp_path: Path) -> None:
+def test_compiler_renders_weight_shared_component_batch_shaders(tmp_path: Path) -> None:
     shader_source_dir = Path(__file__).parents[1] / "runtime-rs" / "shaders"
     shader_files = {
         "rms_norm_batch16_bf16_h5120_eps1e-06_offset1.comp",

@@ -53,7 +53,7 @@ class LayerStructure:
 
 
 @dataclass(frozen=True)
-class DraftPedalboardStructure:
+class DraftExecutionGraphStructure:
     id: str
     prefix: str
     tensors: dict[str, str]
@@ -96,7 +96,7 @@ class ModelStructure:
     token_ids: Json
     tensors: dict[str, str]
     layers: tuple[LayerStructure, ...]
-    draft_pedalboards: tuple[DraftPedalboardStructure, ...]
+    draft_execution_graphs: tuple[DraftExecutionGraphStructure, ...]
 
 
 TOKEN_EMBEDDING_CANDIDATES = (

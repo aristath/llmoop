@@ -6,29 +6,29 @@ from nerve.model_package_tensors import *
 
 def validate_compiled_circuit_graph(manifest: Json) -> dict[str, Json]:
     graph = manifest.get("circuit_graph")
-    if not isinstance(graph, dict) or graph.get("wiring") != "explicit_graph":
+    if not isinstance(graph, dict) or graph.get("topology") != "explicit_graph":
         raise ModelCompileError(
             "compiled package must contain an explicit circuit graph"
         )
-    pedals = graph.get("pedals")
-    if not isinstance(pedals, list) or not pedals:
-        raise ModelCompileError("compiled package circuit graph contains no pedals")
+    components = graph.get("components")
+    if not isinstance(components, list) or not components:
+        raise ModelCompileError("compiled package circuit graph contains no components")
 
     candidates: dict[str, Json] = {}
-    for pedal in pedals:
-        pedal_id = pedal.get("pedal_id") if isinstance(pedal, dict) else None
-        if not isinstance(pedal_id, str) or not pedal_id:
+    for component in components:
+        component_id = component.get("component_id") if isinstance(component, dict) else None
+        if not isinstance(component_id, str) or not component_id:
             raise ModelCompileError(
-                "compiled package circuit graph contains a pedal without an id"
+                "compiled package circuit graph contains a component without an id"
             )
-        if pedal_id in candidates:
+        if component_id in candidates:
             raise ModelCompileError(
-                f"compiled package circuit graph repeats pedal {pedal_id!r}"
+                f"compiled package circuit graph repeats component {component_id!r}"
             )
-        circuit = pedal.get("circuit")
+        circuit = component.get("circuit")
         if not isinstance(circuit, dict):
             raise ModelCompileError(
-                f"compiled package pedal {pedal_id!r} has no circuit"
+                f"compiled package component {component_id!r} has no circuit"
             )
         report = validate_circuit(circuit)
         if not report.ok:
@@ -37,28 +37,28 @@ def validate_compiled_circuit_graph(manifest: Json) -> dict[str, Json]:
             except ValueError as error:
                 raise ModelCompileError(str(error)) from error
         source = circuit.get("source")
-        if not isinstance(source, dict) or source.get("pedal_id") != pedal_id:
+        if not isinstance(source, dict) or source.get("component_id") != component_id:
             raise ModelCompileError(
-                f"compiled package pedal {pedal_id!r} circuit identity does not match"
+                f"compiled package component {component_id!r} circuit identity does not match"
             )
-        if pedal.get("operator_type") != source.get("source_operator_type"):
+        if component.get("operator_type") != source.get("source_operator_type"):
             raise ModelCompileError(
-                f"compiled package pedal {pedal_id!r} operator identity does not match"
+                f"compiled package component {component_id!r} operator identity does not match"
             )
-        if pedal.get("runtime_role") != circuit.get("runtime_role"):
+        if component.get("runtime_role") != circuit.get("runtime_role"):
             raise ModelCompileError(
-                f"compiled package pedal {pedal_id!r} runtime role does not match"
+                f"compiled package component {component_id!r} runtime role does not match"
             )
-        if pedal.get("implementation") != circuit.get("implementation"):
+        if component.get("implementation") != circuit.get("implementation"):
             raise ModelCompileError(
-                f"compiled package pedal {pedal_id!r} implementation does not match"
+                f"compiled package component {component_id!r} implementation does not match"
             )
-        if pedal.get("behavioral_role") != circuit.get("behavioral_role"):
+        if component.get("behavioral_role") != circuit.get("behavioral_role"):
             raise ModelCompileError(
-                f"compiled package pedal {pedal_id!r} behavioral role does not match"
+                f"compiled package component {component_id!r} behavioral role does not match"
             )
-        params = pedal.get("params")
-        state = pedal.get("state")
+        params = component.get("params")
+        state = component.get("state")
         if (
             not isinstance(params, dict)
             or params.get("schema") != "nerve.circuit_params.v1"
@@ -68,7 +68,7 @@ def validate_compiled_circuit_graph(manifest: Json) -> dict[str, Json]:
             or params.get("refs") != circuit.get("parameters", {}).get("refs")
         ):
             raise ModelCompileError(
-                f"compiled package pedal {pedal_id!r} parameter artifact does not match its circuit"
+                f"compiled package component {component_id!r} parameter artifact does not match its circuit"
             )
         if (
             not isinstance(state, dict)
@@ -77,9 +77,9 @@ def validate_compiled_circuit_graph(manifest: Json) -> dict[str, Json]:
             or state.get("state_ports", []) != circuit.get("state_ports", [])
         ):
             raise ModelCompileError(
-                f"compiled package pedal {pedal_id!r} state artifact does not match its circuit"
+                f"compiled package component {component_id!r} state artifact does not match its circuit"
             )
-        candidates[pedal_id] = circuit
+        candidates[component_id] = circuit
 
     compiler_owned_placement = {"device_id", "placement"}.intersection(manifest)
     if compiler_owned_placement:
@@ -88,56 +88,56 @@ def validate_compiled_circuit_graph(manifest: Json) -> dict[str, Json]:
             f"{sorted(compiler_owned_placement)}"
         )
 
-    cables = graph.get("cables")
-    if not isinstance(cables, list):
-        raise ModelCompileError("compiled package circuit graph cables must be a list")
-    cable_ids: set[str] = set()
+    edges = graph.get("edges")
+    if not isinstance(edges, list):
+        raise ModelCompileError("compiled package circuit graph edges must be a list")
+    edge_ids: set[str] = set()
     connected_outputs: set[tuple[str, str]] = set()
     connected_inputs: set[tuple[str, str]] = set()
     forward_inputs: set[tuple[str, str]] = set()
     feedback_inputs: set[tuple[str, str]] = set()
-    forward_indegree = {pedal_id: 0 for pedal_id in candidates}
+    forward_indegree = {component_id: 0 for component_id in candidates}
     forward_destinations: dict[str, list[str]] = {
-        pedal_id: [] for pedal_id in candidates
+        component_id: [] for component_id in candidates
     }
-    for cable in cables:
-        cable_id = cable.get("id") if isinstance(cable, dict) else None
-        source = cable.get("source") if isinstance(cable, dict) else None
-        destination = cable.get("destination") if isinstance(cable, dict) else None
-        if not isinstance(cable_id, str) or not cable_id or cable_id in cable_ids:
+    for edge in edges:
+        edge_id = edge.get("id") if isinstance(edge, dict) else None
+        source = edge.get("source") if isinstance(edge, dict) else None
+        destination = edge.get("destination") if isinstance(edge, dict) else None
+        if not isinstance(edge_id, str) or not edge_id or edge_id in edge_ids:
             raise ModelCompileError(
-                f"compiled package circuit graph contains invalid cable id {cable_id!r}"
+                f"compiled package circuit graph contains invalid edge id {edge_id!r}"
             )
-        cable_ids.add(cable_id)
+        edge_ids.add(edge_id)
         if not isinstance(source, dict) or not isinstance(destination, dict):
             raise ModelCompileError(
-                f"compiled package cable {cable_id!r} has invalid endpoints"
+                f"compiled package edge {edge_id!r} has invalid endpoints"
             )
-        source_id = source.get("pedal_id")
-        destination_id = destination.get("pedal_id")
+        source_id = source.get("component_id")
+        destination_id = destination.get("component_id")
         if source_id not in candidates or destination_id not in candidates:
             raise ModelCompileError(
-                f"compiled package cable {cable_id!r} references an unknown pedal"
+                f"compiled package edge {edge_id!r} references an unknown component"
             )
-        connection = cable.get("connection")
+        connection = edge.get("connection")
         if not isinstance(connection, dict):
             raise ModelCompileError(
-                f"compiled package cable {cable_id!r} has no connection contract"
+                f"compiled package edge {edge_id!r} has no connection contract"
             )
         connection_kind = connection.get("kind")
         if connection_kind not in {"forward", "temporal_feedback"}:
             raise ModelCompileError(
-                f"compiled package cable {cable_id!r} has unsupported connection kind {connection_kind!r}"
+                f"compiled package edge {edge_id!r} has unsupported connection kind {connection_kind!r}"
             )
         if connection_kind == "temporal_feedback":
             delay = connection.get("delay_activations")
             if not isinstance(delay, int) or isinstance(delay, bool) or delay < 1:
                 raise ModelCompileError(
-                    f"compiled package temporal feedback cable {cable_id!r} must delay at least one activation"
+                    f"compiled package temporal feedback edge {edge_id!r} must delay at least one activation"
                 )
         if source_id == destination_id and connection_kind == "forward":
             raise ModelCompileError(
-                f"compiled package cable {cable_id!r} creates an instantaneous self-loop"
+                f"compiled package edge {edge_id!r} creates an instantaneous self-loop"
             )
         output = _port_by_id(
             candidates[source_id]["boundary"]["outputs"], source.get("port_id")
@@ -148,13 +148,13 @@ def validate_compiled_circuit_graph(manifest: Json) -> dict[str, Json]:
         )
         if output is None or input_port is None:
             raise ModelCompileError(
-                f"compiled package cable {cable_id!r} references an unknown port"
+                f"compiled package edge {edge_id!r} references an unknown port"
             )
         if output.get("signal") != input_port.get("signal") or output.get(
             "shape"
         ) != input_port.get("shape"):
             raise ModelCompileError(
-                f"compiled package cable {cable_id!r} connects incompatible ports"
+                f"compiled package edge {edge_id!r} connects incompatible ports"
             )
         source_endpoint = (source_id, source["port_id"])
         destination_endpoint = (destination_id, destination["port_id"])
@@ -163,7 +163,7 @@ def validate_compiled_circuit_graph(manifest: Json) -> dict[str, Json]:
         )
         if destination_endpoint in destination_set:
             raise ModelCompileError(
-                f"compiled package input {destination_id}.{destination['port_id']} has multiple {connection_kind} cables"
+                f"compiled package input {destination_id}.{destination['port_id']} has multiple {connection_kind} edges"
             )
         destination_set.add(destination_endpoint)
         connected_outputs.add(source_endpoint)
@@ -176,9 +176,9 @@ def validate_compiled_circuit_graph(manifest: Json) -> dict[str, Json]:
     while remaining:
         ready = next(
             (
-                pedal_id
-                for pedal_id in candidates
-                if pedal_id in remaining and forward_indegree[pedal_id] == 0
+                component_id
+                for component_id in candidates
+                if component_id in remaining and forward_indegree[component_id] == 0
             ),
             None,
         )
@@ -208,18 +208,18 @@ def validate_compiled_circuit_graph(manifest: Json) -> dict[str, Json]:
 
     unrouted_inputs = []
     unrouted_outputs = []
-    for pedal_id, circuit in candidates.items():
+    for component_id, circuit in candidates.items():
         unrouted_inputs.extend(
-            (pedal_id, port["id"])
+            (component_id, port["id"])
             for port in circuit["boundary"]["inputs"]
-            if (pedal_id, port["id"]) not in connected_inputs
-            and (pedal_id, port["id"]) not in external_inputs
+            if (component_id, port["id"]) not in connected_inputs
+            and (component_id, port["id"]) not in external_inputs
         )
         unrouted_outputs.extend(
-            (pedal_id, port["id"])
+            (component_id, port["id"])
             for port in circuit["boundary"]["outputs"]
-            if (pedal_id, port["id"]) not in connected_outputs
-            and (pedal_id, port["id"]) not in public_outputs
+            if (component_id, port["id"]) not in connected_outputs
+            and (component_id, port["id"]) not in public_outputs
         )
     if unrouted_inputs or unrouted_outputs:
         raise ModelCompileError(
@@ -254,9 +254,9 @@ def _validate_package_graph_boundary_ports(
             raise ModelCompileError(
                 f"compiled package circuit graph {kind} {port_id!r} has no endpoint"
             )
-        pedal_id = endpoint.get("pedal_id")
+        component_id = endpoint.get("component_id")
         endpoint_port_id = endpoint.get("port_id")
-        circuit = candidates.get(pedal_id)
+        circuit = candidates.get(component_id)
         if (
             circuit is None
             or _port_by_id(circuit["boundary"][direction], endpoint_port_id) is None
@@ -264,10 +264,10 @@ def _validate_package_graph_boundary_ports(
             raise ModelCompileError(
                 f"compiled package circuit graph {kind} {port_id!r} references an unknown {direction[:-1]}"
             )
-        key = (pedal_id, endpoint_port_id)
+        key = (component_id, endpoint_port_id)
         if key in endpoints:
             raise ModelCompileError(
-                f"compiled package circuit graph repeats {kind} endpoint {pedal_id}.{endpoint_port_id}"
+                f"compiled package circuit graph repeats {kind} endpoint {component_id}.{endpoint_port_id}"
             )
         endpoints.add(key)
     return endpoints
@@ -303,11 +303,11 @@ def validate_compiled_speculative_decoders(manifest: Json) -> dict[str, Json]:
         duplicate = set(candidates).intersection(graph_candidates)
         if duplicate:
             raise ModelCompileError(
-                f"speculative decoder {decoder_id!r} repeats pedal ids {sorted(duplicate)}"
+                f"speculative decoder {decoder_id!r} repeats component ids {sorted(duplicate)}"
             )
         roles: dict[str, list[str]] = {}
-        for pedal_id, circuit in graph_candidates.items():
-            roles.setdefault(str(circuit.get("runtime_role")), []).append(pedal_id)
+        for component_id, circuit in graph_candidates.items():
+            roles.setdefault(str(circuit.get("runtime_role")), []).append(component_id)
         if (
             len(roles.get("draft_input_adapter", [])) != 1
             or not roles.get("draft_processor")
@@ -323,25 +323,25 @@ def validate_compiled_speculative_decoders(manifest: Json) -> dict[str, Json]:
                 f"speculative decoder {decoder_id!r} must contain one input adapter, "
                 "at least one draft processor, and one output transducer"
             )
-        execution_by_pedal = {
-            execution.get("pedal_id"): execution
-            for execution in decoder.get("pedal_executions", [])
+        execution_by_component = {
+            execution.get("component_id"): execution
+            for execution in decoder.get("component_executions", [])
             if isinstance(execution, dict)
         }
         executable_ids = set(roles["draft_input_adapter"]) | set(
             roles["draft_processor"]
         )
-        if set(execution_by_pedal) != executable_ids:
+        if set(execution_by_component) != executable_ids:
             raise ModelCompileError(
-                f"speculative decoder {decoder_id!r} executions do not cover its executable pedals"
+                f"speculative decoder {decoder_id!r} executions do not cover its executable components"
             )
-        for pedal_id in executable_ids:
-            circuit = graph_candidates[pedal_id]
-            execution = execution_by_pedal[pedal_id]
+        for component_id in executable_ids:
+            circuit = graph_candidates[component_id]
+            execution = execution_by_component[component_id]
             kernels = execution.get("kernels")
             if not isinstance(kernels, list) or len(kernels) != len(circuit["nodes"]):
                 raise ModelCompileError(
-                    f"speculative decoder {decoder_id!r} execution for {pedal_id!r} "
+                    f"speculative decoder {decoder_id!r} execution for {component_id!r} "
                     "does not cover every circuit node"
                 )
             for index, (kernel, node) in enumerate(
@@ -355,7 +355,7 @@ def validate_compiled_speculative_decoders(manifest: Json) -> dict[str, Json]:
                     or not kernel["shader_path"]
                 ):
                     raise ModelCompileError(
-                        f"speculative decoder {decoder_id!r} kernel {pedal_id}.{index} "
+                        f"speculative decoder {decoder_id!r} kernel {component_id}.{index} "
                         "does not match its circuit node"
                     )
         output_id = roles["draft_output_transducer"][0]
@@ -363,7 +363,7 @@ def validate_compiled_speculative_decoders(manifest: Json) -> dict[str, Json]:
         output_refs = graph_candidates[output_id]["parameters"]["refs"]
         if (
             not isinstance(output_spec, dict)
-            or output_spec.get("pedal_id") != output_id
+            or output_spec.get("component_id") != output_id
             or output_spec.get("norm_parameter_tensor")
             != output_refs.get("norm", {}).get("tensor")
             or output_spec.get("projection_parameter_tensor")
@@ -377,7 +377,7 @@ def validate_compiled_speculative_decoders(manifest: Json) -> dict[str, Json]:
                 f"speculative decoder {decoder_id!r} output execution does not match its circuit"
             )
         expected_state_contract = {
-            "ownership": "per_stream_per_pedal_instance",
+            "ownership": "per_stream_per_node_instance",
             "draft_updates": "tentative",
             "acceptance": "commit_accepted_prefix",
             "rejection": "restore_last_committed_state",
@@ -390,48 +390,48 @@ def validate_compiled_speculative_decoders(manifest: Json) -> dict[str, Json]:
     return candidates
 
 
-def validate_compiled_pedal_executions(
+def validate_compiled_component_executions(
     manifest: Json,
     candidate_circuits: dict[str, Json],
 ) -> None:
-    executions = manifest.get("pedal_executions")
+    executions = manifest.get("component_executions")
     if not isinstance(executions, list):
-        raise ModelCompileError("compiled package has no pedal execution list")
-    execution_by_pedal: dict[str, Json] = {}
+        raise ModelCompileError("compiled package has no component execution list")
+    execution_by_component: dict[str, Json] = {}
     for execution in executions:
-        pedal_id = execution.get("pedal_id") if isinstance(execution, dict) else None
+        component_id = execution.get("component_id") if isinstance(execution, dict) else None
         if (
-            not isinstance(pedal_id, str)
-            or not pedal_id
-            or pedal_id in execution_by_pedal
+            not isinstance(component_id, str)
+            or not component_id
+            or component_id in execution_by_component
         ):
             raise ModelCompileError(
-                f"compiled package contains invalid or duplicate pedal execution {pedal_id!r}"
+                f"compiled package contains invalid or duplicate component execution {component_id!r}"
             )
-        execution_by_pedal[pedal_id] = execution
+        execution_by_component[component_id] = execution
     executable_circuits = {
-        pedal_id: circuit
-        for pedal_id, circuit in candidate_circuits.items()
+        component_id: circuit
+        for component_id, circuit in candidate_circuits.items()
         if circuit.get("runtime_role") == "signal_processor"
     }
-    if set(execution_by_pedal) != set(executable_circuits):
+    if set(execution_by_component) != set(executable_circuits):
         raise ModelCompileError(
-            "compiled package pedal executions do not match its signal-processing circuits"
+            "compiled package component executions do not match its signal-processing circuits"
         )
-    for pedal_id, circuit in executable_circuits.items():
-        execution = execution_by_pedal[pedal_id]
+    for component_id, circuit in executable_circuits.items():
+        execution = execution_by_component[component_id]
         source = circuit.get("source", {})
         if execution.get("operator_type") != source.get(
             "source_operator_type"
         ) or execution.get("implementation") != circuit.get("implementation"):
             raise ModelCompileError(
-                f"compiled package pedal {pedal_id!r} execution identity does not match its circuit"
+                f"compiled package component {component_id!r} execution identity does not match its circuit"
             )
         kernels = execution.get("kernels")
         nodes = circuit.get("nodes", [])
         if not isinstance(kernels, list) or len(kernels) != len(nodes):
             raise ModelCompileError(
-                f"compiled package pedal {pedal_id!r} execution does not cover every circuit node"
+                f"compiled package component {component_id!r} execution does not cover every circuit node"
             )
         for index, (kernel, node) in enumerate(zip(kernels, nodes, strict=True)):
             if (
@@ -447,7 +447,7 @@ def validate_compiled_pedal_executions(
                 or not kernel["shader_path"]
             ):
                 raise ModelCompileError(
-                    f"compiled package pedal {pedal_id!r} kernel {index} does not match its circuit node"
+                    f"compiled package component {component_id!r} kernel {index} does not match its circuit node"
                 )
             batch_mode = kernel.get("batch_mode")
             batch_implementations = kernel.get("batch_implementations")
@@ -473,7 +473,7 @@ def validate_compiled_pedal_executions(
             ):
                 continue
             raise ModelCompileError(
-                f"compiled package pedal {pedal_id!r} kernel {index} has an invalid batch execution contract"
+                f"compiled package component {component_id!r} kernel {index} has an invalid batch execution contract"
             )
 
 
@@ -495,7 +495,7 @@ def valid_batch_implementation(implementation: Any) -> bool:
     subgroup_size = requirements.get("subgroup_size") if requirements else None
     stages = implementation.get("stages")
     return (
-        execution_domain in KNOWN_PEDAL_KERNEL_EXECUTION_DOMAINS
+        execution_domain in KNOWN_COMPONENT_KERNEL_EXECUTION_DOMAINS
         and
         isinstance(implementation.get("lane_tile_width"), int)
         and not isinstance(implementation.get("lane_tile_width"), bool)
@@ -560,12 +560,12 @@ def validate_compiled_generation_contract(
     candidate_circuits: dict[str, Json],
 ) -> None:
     role_ids: dict[str, list[str]] = {}
-    for pedal_id, circuit in candidate_circuits.items():
-        role_ids.setdefault(str(circuit.get("runtime_role")), []).append(pedal_id)
+    for component_id, circuit in candidate_circuits.items():
+        role_ids.setdefault(str(circuit.get("runtime_role")), []).append(component_id)
     for role in ("input_transducer", "output_transducer", "sampler"):
         if len(role_ids.get(role, [])) != 1:
             raise ModelCompileError(
-                f"compiled generation graph must contain exactly one {role} pedal"
+                f"compiled generation graph must contain exactly one {role} component"
             )
     if not role_ids.get("signal_processor"):
         raise ModelCompileError(
@@ -578,36 +578,36 @@ def validate_compiled_generation_contract(
     processor_ids = set(role_ids["signal_processor"])
     graph = manifest["circuit_graph"]
     forward = [
-        cable for cable in graph["cables"] if cable["connection"]["kind"] == "forward"
+        edge for edge in graph["edges"] if edge["connection"]["kind"] == "forward"
     ]
     feedback = [
-        cable
-        for cable in graph["cables"]
-        if cable["connection"]["kind"] == "temporal_feedback"
+        edge
+        for edge in graph["edges"]
+        if edge["connection"]["kind"] == "temporal_feedback"
     ]
     input_edges = [
-        cable
-        for cable in forward
-        if cable["source"]["pedal_id"] == input_id
-        and cable["destination"]["pedal_id"] in processor_ids
+        edge
+        for edge in forward
+        if edge["source"]["component_id"] == input_id
+        and edge["destination"]["component_id"] in processor_ids
     ]
     output_edges = [
-        cable
-        for cable in forward
-        if cable["source"]["pedal_id"] in processor_ids
-        and cable["destination"]["pedal_id"] == output_id
+        edge
+        for edge in forward
+        if edge["source"]["component_id"] in processor_ids
+        and edge["destination"]["component_id"] == output_id
     ]
     sampler_edges = [
-        cable
-        for cable in forward
-        if cable["source"]["pedal_id"] == output_id
-        and cable["destination"]["pedal_id"] == sampler_id
+        edge
+        for edge in forward
+        if edge["source"]["component_id"] == output_id
+        and edge["destination"]["component_id"] == sampler_id
     ]
     generation_feedback = [
-        cable
-        for cable in feedback
-        if cable["source"]["pedal_id"] == sampler_id
-        and cable["destination"]["pedal_id"] == input_id
+        edge
+        for edge in feedback
+        if edge["source"]["component_id"] == sampler_id
+        and edge["destination"]["component_id"] == input_id
     ]
     if any(
         len(edges) != 1
@@ -641,7 +641,7 @@ def validate_compiled_generation_contract(
         or len(sampler_nodes[0].get("outputs", [])) != 1
     ):
         raise ModelCompileError(
-            "compiled generation system pedals have invalid node boundaries"
+            "compiled generation system components have invalid node boundaries"
         )
     input_token_port = input_nodes[0]["inputs"][0]
     input_frame_port = input_nodes[0]["outputs"][0]
@@ -658,16 +658,16 @@ def validate_compiled_generation_contract(
         or generation_feedback[0]["destination"]["port_id"] != input_token_port
     ):
         raise ModelCompileError(
-            "compiled generation graph cables do not match system-pedal ports"
+            "compiled generation graph edges do not match system-component ports"
         )
 
     boundary = graph["boundary"]
     external_endpoints = {
-        (port["endpoint"]["pedal_id"], port["endpoint"]["port_id"])
+        (port["endpoint"]["component_id"], port["endpoint"]["port_id"])
         for port in boundary["external_inputs"]
     }
     public_endpoints = {
-        (port["endpoint"]["pedal_id"], port["endpoint"]["port_id"])
+        (port["endpoint"]["component_id"], port["endpoint"]["port_id"])
         for port in boundary["public_outputs"]
     }
     if (
@@ -690,7 +690,7 @@ def validate_compiled_generation_contract(
         for value in (input_package, output_package, sampler_package)
     ):
         raise ModelCompileError(
-            "compiled generation package is missing a system-pedal execution spec"
+            "compiled generation package is missing a system-component execution spec"
         )
 
     input_spec = input_package.get("spec")
@@ -709,7 +709,7 @@ def validate_compiled_generation_contract(
         or not input_package["batch_shader_path"]
     ):
         raise ModelCompileError(
-            "compiled input-transducer execution does not match its circuit pedal"
+            "compiled input-transducer execution does not match its circuit component"
         )
 
     output_spec = output_package.get("spec")
@@ -743,7 +743,7 @@ def validate_compiled_generation_contract(
         or output_package["projection_batch_lane_tile_width"] <= 0
     ):
         raise ModelCompileError(
-            "compiled output-transducer execution does not match its circuit pedal"
+            "compiled output-transducer execution does not match its circuit component"
         )
 
     sampler_spec = sampler_package.get("spec")
@@ -769,7 +769,7 @@ def validate_compiled_generation_contract(
         or not sampler_package["kernels"]
     ):
         raise ModelCompileError(
-            "compiled sampler execution does not match its circuit pedal"
+            "compiled sampler execution does not match its circuit component"
         )
 
 
@@ -868,7 +868,7 @@ def validate_compiled_package(package_dir: Path, manifest: Json) -> None:
     all_candidate_circuits = {**candidate_circuits, **auxiliary_circuits}
     validate_compiled_generation_contract(manifest, candidate_circuits)
     validate_behavioral_validation_artifact(behavioral, all_candidate_circuits)
-    validate_compiled_pedal_executions(manifest, candidate_circuits)
+    validate_compiled_component_executions(manifest, candidate_circuits)
 
     tokenizer = manifest.get("tokenizer")
     if not isinstance(tokenizer, dict) or not tokenizer.get("path"):
@@ -964,11 +964,11 @@ def validate_compiled_package(package_dir: Path, manifest: Json) -> None:
 
 def validate_compiled_spirv_requirements(package_dir: Path, manifest: Json) -> None:
     speculative_decoders = manifest.get("speculative_decoders", [])
-    executions = list(manifest["pedal_executions"])
+    executions = list(manifest["component_executions"])
     executions.extend(
         execution
         for decoder in speculative_decoders
-        for execution in decoder["pedal_executions"]
+        for execution in decoder["component_executions"]
     )
     mandatory_shader_paths = {
         manifest["input_transducer"]["shader_path"],
@@ -1002,7 +1002,7 @@ def validate_compiled_spirv_requirements(package_dir: Path, manifest: Json) -> N
                 ):
                     raise ModelCompileError(
                         "compiled batch implementation "
-                        f"{execution['pedal_id']}.{kernel['node_id']} does not declare "
+                        f"{execution['component_id']}.{kernel['node_id']} does not declare "
                         "the Vulkan requirements of its SPIR-V artifacts"
                     )
 

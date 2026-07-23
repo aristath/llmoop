@@ -16,7 +16,7 @@ from nerve.compilation import ModelCompileError
 def source_circuit() -> dict:
     return {
         "schema": "nerve.stream_circuit.v1",
-        "source": {"pedal_id": "layer_00"},
+        "source": {"component_id": "layer_00"},
         "boundary": {
             "inputs": [{"id": "input_frame", "source": "x"}],
             "outputs": [{"id": "output_frame", "source": "y"}],
@@ -82,7 +82,7 @@ def test_exact_candidate_gate_proves_complete_fusion_coverage() -> None:
     candidate = fused_candidate(source)
 
     evidence = prove_exact_circuit_candidate(
-        pedal_id="layer_00", source=source, candidate=candidate
+        component_id="layer_00", source=source, candidate=candidate
     )
 
     assert evidence["status"] == "passed"
@@ -94,7 +94,7 @@ def test_exact_candidate_gate_proves_complete_fusion_coverage() -> None:
 def test_exact_candidate_gate_proves_fused_parallel_ffn_projection() -> None:
     source = {
         "schema": "nerve.stream_circuit.v1",
-        "source": {"pedal_id": "layer_00"},
+        "source": {"component_id": "layer_00"},
         "boundary": {
             "inputs": [{"id": "input", "source": "x"}],
             "outputs": [{"id": "output", "source": "y"}],
@@ -155,7 +155,7 @@ def test_exact_candidate_gate_proves_fused_parallel_ffn_projection() -> None:
     ]
 
     evidence = prove_exact_circuit_candidate(
-        pedal_id="layer_00", source=source, candidate=candidate
+        component_id="layer_00", source=source, candidate=candidate
     )
 
     assert evidence["status"] == "passed"
@@ -169,7 +169,7 @@ def test_exact_candidate_gate_proves_fused_parallel_ffn_projection() -> None:
 def test_exact_candidate_gate_proves_fp8_parallel_linear_parameter_pairs() -> None:
     source = {
         "schema": "nerve.stream_circuit.v1",
-        "source": {"pedal_id": "layer_00"},
+        "source": {"component_id": "layer_00"},
         "boundary": {
             "inputs": [{"id": "input", "source": "x"}],
             "outputs": [
@@ -226,7 +226,7 @@ def test_exact_candidate_gate_proves_fp8_parallel_linear_parameter_pairs() -> No
     ]
 
     evidence = prove_exact_circuit_candidate(
-        pedal_id="layer_00", source=source, candidate=candidate
+        component_id="layer_00", source=source, candidate=candidate
     )
 
     assert evidence["status"] == "passed"
@@ -241,7 +241,7 @@ def test_exact_candidate_gate_rejects_dropped_source_behavior() -> None:
 
     with pytest.raises(ModelCompileError, match="does not exactly cover"):
         prove_exact_circuit_candidate(
-            pedal_id="layer_00", source=source, candidate=candidate
+            component_id="layer_00", source=source, candidate=candidate
         )
 
 
@@ -263,14 +263,14 @@ def test_exact_candidate_gate_rejects_reordered_interface_and_specialization() -
     ]
     with pytest.raises(ModelCompileError, match="observable region interface"):
         prove_exact_circuit_candidate(
-            pedal_id="layer_00", source=source, candidate=candidate
+            component_id="layer_00", source=source, candidate=candidate
         )
 
     candidate["nodes"][0]["inputs"] = ["x", "gate"]
     candidate["nodes"][0]["attrs"]["intermediate_rounding"] = "F32"
     with pytest.raises(ModelCompileError, match="exact rewrite attributes"):
         prove_exact_circuit_candidate(
-            pedal_id="layer_00", source=source, candidate=candidate
+            component_id="layer_00", source=source, candidate=candidate
         )
 
 
@@ -281,11 +281,11 @@ def test_approximate_candidate_requires_both_closed_loop_evidence_modes() -> Non
 
     with pytest.raises(ModelCompileError, match="without source-oracle evidence"):
         prove_exact_circuit_candidate(
-            pedal_id="layer_00", source=source, candidate=candidate
+            component_id="layer_00", source=source, candidate=candidate
         )
     with pytest.raises(ModelCompileError, match="versioned source-oracle"):
         prove_exact_circuit_candidate(
-            pedal_id="layer_00",
+            component_id="layer_00",
             source=source,
             candidate=candidate,
             empirical_evidence={
@@ -296,14 +296,14 @@ def test_approximate_candidate_requires_both_closed_loop_evidence_modes() -> Non
 
     with pytest.raises(ModelCompileError, match="free-running"):
         prove_exact_circuit_candidate(
-            pedal_id="layer_00",
+            component_id="layer_00",
             source=source,
             candidate=candidate,
             empirical_evidence=empirical_evidence(free_running_status="failed"),
         )
 
     evidence = prove_exact_circuit_candidate(
-        pedal_id="layer_00",
+        component_id="layer_00",
         source=source,
         candidate=candidate,
         empirical_evidence=empirical_evidence(),
@@ -312,12 +312,12 @@ def test_approximate_candidate_requires_both_closed_loop_evidence_modes() -> Non
     assert len(evidence["candidate_contract_digest"]) == 64
 
 
-def test_behavioral_validation_accepts_mixed_exact_and_approximate_pedals() -> None:
+def test_behavioral_validation_accepts_mixed_exact_and_approximate_components() -> None:
     model_graph = {
         "architecture": {"family": "fixture"},
         "dimensions": {"hidden_size": 4},
         "numerics": {"activation_dtype": "BF16"},
-        "graph": {"wiring": "series"},
+        "graph": {"topology": "series"},
     }
     tensor_index = {
         "tensors": {},
@@ -325,7 +325,7 @@ def test_behavioral_validation_accepts_mixed_exact_and_approximate_pedals() -> N
     }
     source_exact = source_circuit()
     source_approximate = deepcopy(source_exact)
-    source_approximate["source"]["pedal_id"] = "layer_01"
+    source_approximate["source"]["component_id"] = "layer_01"
     candidate_exact = fused_candidate(source_exact)
     candidate_approximate = deepcopy(source_approximate)
     candidate_approximate["boundary"]["outputs"][0]["source"] = "approximate_y"
@@ -374,7 +374,7 @@ def test_behavioral_validation_accepts_mixed_exact_and_approximate_pedals() -> N
             "covered_source_node_count": 2,
         }
     )
-    with pytest.raises(ModelCompileError, match="no approximate pedal proof"):
+    with pytest.raises(ModelCompileError, match="no approximate component proof"):
         validate_behavioral_validation_artifact(
             mislabeled,
             {"layer_00": candidate_exact, "layer_01": candidate_approximate},

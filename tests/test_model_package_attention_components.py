@@ -1,6 +1,6 @@
 from model_package_layout_common import *
 
-def test_compiler_renders_attention_pedals_from_discovered_dimensions(
+def test_compiler_renders_attention_components_from_discovered_dimensions(
     tmp_path: Path,
 ) -> None:
     shader_source_dir = Path(__file__).parents[1] / "runtime-rs" / "shaders"

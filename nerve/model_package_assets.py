@@ -113,7 +113,7 @@ def all_lowered_circuit_refs(lowered_index: Json) -> list[Json]:
     refs = list(lowered_index["graph"]["circuits"])
     refs.extend(
         circuit_ref
-        for draft in lowered_index.get("draft_pedalboards", [])
+        for draft in lowered_index.get("draft_execution_graphs", [])
         for circuit_ref in draft["circuits"]
     )
     return refs

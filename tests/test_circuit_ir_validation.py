@@ -5,7 +5,7 @@ from typing import Callable
 
 import pytest
 
-from nerve.circuit_ir import validate_circuit, validate_circuit_against_pedal
+from nerve.circuit_ir import validate_circuit, validate_circuit_against_component
 
 
 def valid_circuit() -> dict[str, object]:
@@ -19,7 +19,7 @@ def valid_circuit() -> dict[str, object]:
                     "id": "input_frame",
                     "signal": "frame",
                     "shape": [8],
-                    "pedal_port": "input",
+                    "component_port": "input",
                 }
             ],
             "outputs": [
@@ -28,7 +28,7 @@ def valid_circuit() -> dict[str, object]:
                     "signal": "frame",
                     "shape": [8],
                     "source": "output_frame",
-                    "pedal_port": "output",
+                    "component_port": "output",
                 }
             ],
         },
@@ -64,7 +64,7 @@ def valid_circuit() -> dict[str, object]:
     }
 
 
-def matching_pedal() -> dict[str, object]:
+def matching_component() -> dict[str, object]:
     return {
         "ports": {
             "inputs": [{"id": "input", "signal": "frame", "shape": [8]}],
@@ -133,20 +133,20 @@ def test_circuit_validation_rejects_broken_dataflow_contracts(
         report.raise_for_errors()
 
 
-def test_valid_circuit_and_pedal_contract_has_no_false_positive_errors() -> None:
-    report = validate_circuit_against_pedal(valid_circuit(), matching_pedal())
+def test_valid_circuit_and_component_contract_has_no_false_positive_errors() -> None:
+    report = validate_circuit_against_component(valid_circuit(), matching_component())
 
     assert report.ok, report.to_json()
     assert not report.errors
 
 
-def test_pedal_contract_validation_catches_interface_state_and_tensor_drift() -> None:
-    pedal = matching_pedal()
-    pedal["ports"]["outputs"][0]["shape"] = [16]  # type: ignore[index]
-    pedal["state_ports"][0]["update"] = "append"  # type: ignore[index]
-    pedal["parameter_block"]["params"]["weight"]["tensor"] = "other.weight"  # type: ignore[index]
+def test_component_contract_validation_catches_interface_state_and_tensor_drift() -> None:
+    component = matching_component()
+    component["ports"]["outputs"][0]["shape"] = [16]  # type: ignore[index]
+    component["state_ports"][0]["update"] = "append"  # type: ignore[index]
+    component["parameter_block"]["params"]["weight"]["tensor"] = "other.weight"  # type: ignore[index]
 
-    report = validate_circuit_against_pedal(deepcopy(valid_circuit()), pedal)
+    report = validate_circuit_against_component(deepcopy(valid_circuit()), component)
     errors = {(issue.path, issue.message) for issue in report.errors}
 
     assert any(path == "boundary.outputs[0].shape" for path, _message in errors)
@@ -195,40 +195,40 @@ def test_circuit_validation_rejects_duplicate_boundary_port_ids(
     )
 
 
-def test_pedal_contract_validation_checks_every_boundary_port() -> None:
+def test_component_contract_validation_checks_every_boundary_port() -> None:
     circuit = valid_circuit()
-    pedal = matching_pedal()
+    component = matching_component()
     circuit["boundary"]["inputs"].append(  # type: ignore[index]
         {
             "id": "sidechain_frame",
             "signal": "frame",
             "shape": [4],
-            "pedal_port": "sidechain",
+            "component_port": "sidechain",
         }
     )
-    pedal["ports"]["inputs"].append(  # type: ignore[index]
+    component["ports"]["inputs"].append(  # type: ignore[index]
         {"id": "sidechain", "signal": "frame", "shape": [8]}
     )
 
-    report = validate_circuit_against_pedal(circuit, pedal)
+    report = validate_circuit_against_component(circuit, component)
 
     assert not report.ok
     assert any(issue.path == "boundary.inputs[1].shape" for issue in report.errors)
 
 
-def test_pedal_contract_validation_rejects_missing_and_wrong_port_mappings() -> None:
+def test_component_contract_validation_rejects_missing_and_wrong_port_mappings() -> None:
     circuit = valid_circuit()
-    del circuit["boundary"]["inputs"][0]["pedal_port"]  # type: ignore[index]
-    circuit["boundary"]["outputs"][0]["pedal_port"] = "input"  # type: ignore[index]
+    del circuit["boundary"]["inputs"][0]["component_port"]  # type: ignore[index]
+    circuit["boundary"]["outputs"][0]["component_port"] = "input"  # type: ignore[index]
 
-    report = validate_circuit_against_pedal(circuit, matching_pedal())
+    report = validate_circuit_against_component(circuit, matching_component())
 
     assert not report.ok
     assert {
         issue.path
         for issue in report.errors
-        if issue.path and issue.path.endswith(".pedal_port")
+        if issue.path and issue.path.endswith(".component_port")
     } == {
-        "boundary.inputs[0].pedal_port",
-        "boundary.outputs[0].pedal_port",
+        "boundary.inputs[0].component_port",
+        "boundary.outputs[0].component_port",
     }

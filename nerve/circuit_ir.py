@@ -200,7 +200,7 @@ def validate_circuit(circuit: Json) -> CircuitValidationReport:
     return CircuitValidationReport(checks=tuple(checks), issues=tuple(issues))
 
 
-def validate_circuit_against_pedal(circuit: Json, pedal: Json) -> CircuitValidationReport:
+def validate_circuit_against_component(circuit: Json, component: Json) -> CircuitValidationReport:
     base = validate_circuit(circuit)
     checks = list(base.checks)
     issues = list(base.issues)
@@ -208,43 +208,43 @@ def validate_circuit_against_pedal(circuit: Json, pedal: Json) -> CircuitValidat
     boundary = circuit.get("boundary", {})
     circuit_inputs = boundary.get("inputs", []) if isinstance(boundary, dict) else []
     circuit_outputs = boundary.get("outputs", []) if isinstance(boundary, dict) else []
-    pedal_inputs = pedal.get("ports", {}).get("inputs", [])
-    pedal_outputs = pedal.get("ports", {}).get("outputs", [])
+    component_inputs = component.get("ports", {}).get("inputs", [])
+    component_outputs = component.get("ports", {}).get("outputs", [])
 
-    _compare_ports(circuit_inputs, pedal_inputs, checks, issues, "inputs")
-    _compare_ports(circuit_outputs, pedal_outputs, checks, issues, "outputs")
+    _compare_ports(circuit_inputs, component_inputs, checks, issues, "inputs")
+    _compare_ports(circuit_outputs, component_outputs, checks, issues, "outputs")
 
     circuit_state = {port.get("id"): port for port in circuit.get("state_ports", []) if isinstance(port, dict)}
-    pedal_state = {port.get("id"): port for port in pedal.get("state_ports", []) if isinstance(port, dict)}
+    component_state = {port.get("id"): port for port in component.get("state_ports", []) if isinstance(port, dict)}
     _check(
-        set(circuit_state) == set(pedal_state),
+        set(circuit_state) == set(component_state),
         checks,
         issues,
-        "state port ids match pedal contract",
-        f"expected state ports {sorted(pedal_state)}, found {sorted(circuit_state)}",
+        "state port ids match component contract",
+        f"expected state ports {sorted(component_state)}, found {sorted(circuit_state)}",
         "state_ports",
     )
-    for state_id in sorted(set(circuit_state) & set(pedal_state)):
+    for state_id in sorted(set(circuit_state) & set(component_state)):
         c_state = circuit_state[state_id]
-        p_state = pedal_state[state_id]
-        _check(c_state.get("type") == p_state.get("type"), checks, issues, f"{state_id} state type matches pedal", f"expected {p_state.get('type')!r}, found {c_state.get('type')!r}", f"state_ports.{state_id}.type")
-        _check(c_state.get("shape") == p_state.get("shape"), checks, issues, f"{state_id} state shape matches pedal", f"expected {p_state.get('shape')!r}, found {c_state.get('shape')!r}", f"state_ports.{state_id}.shape")
-        _check(c_state.get("update") == p_state.get("update"), checks, issues, f"{state_id} state update matches pedal", f"expected {p_state.get('update')!r}, found {c_state.get('update')!r}", f"state_ports.{state_id}.update")
+        p_state = component_state[state_id]
+        _check(c_state.get("type") == p_state.get("type"), checks, issues, f"{state_id} state type matches component", f"expected {p_state.get('type')!r}, found {c_state.get('type')!r}", f"state_ports.{state_id}.type")
+        _check(c_state.get("shape") == p_state.get("shape"), checks, issues, f"{state_id} state shape matches component", f"expected {p_state.get('shape')!r}, found {c_state.get('shape')!r}", f"state_ports.{state_id}.shape")
+        _check(c_state.get("update") == p_state.get("update"), checks, issues, f"{state_id} state update matches component", f"expected {p_state.get('update')!r}, found {c_state.get('update')!r}", f"state_ports.{state_id}.update")
 
     circuit_params = circuit.get("parameters", {}).get("refs", {}) if isinstance(circuit.get("parameters"), dict) else {}
-    pedal_params = pedal.get("parameter_block", {}).get("params", {})
+    component_params = component.get("parameter_block", {}).get("params", {})
     _check(
-        set(circuit_params) == set(pedal_params),
+        set(circuit_params) == set(component_params),
         checks,
         issues,
-        "parameter ids match pedal contract",
-        f"expected parameter refs {sorted(pedal_params)}, found {sorted(circuit_params)}",
+        "parameter ids match component contract",
+        f"expected parameter refs {sorted(component_params)}, found {sorted(circuit_params)}",
         "parameters.refs",
     )
-    for param_id in sorted(set(circuit_params) & set(pedal_params)):
+    for param_id in sorted(set(circuit_params) & set(component_params)):
         c_tensor = circuit_params[param_id].get("tensor") if isinstance(circuit_params[param_id], dict) else None
-        p_tensor = pedal_params[param_id].get("tensor") if isinstance(pedal_params[param_id], dict) else None
-        _check(c_tensor == p_tensor, checks, issues, f"{param_id} tensor ref matches pedal", f"expected tensor {p_tensor!r}, found {c_tensor!r}", f"parameters.refs.{param_id}.tensor")
+        p_tensor = component_params[param_id].get("tensor") if isinstance(component_params[param_id], dict) else None
+        _check(c_tensor == p_tensor, checks, issues, f"{param_id} tensor ref matches component", f"expected tensor {p_tensor!r}, found {c_tensor!r}", f"parameters.refs.{param_id}.tensor")
 
     return CircuitValidationReport(checks=tuple(checks), issues=tuple(issues))
 
@@ -284,45 +284,45 @@ def _port_has_id_signal_shape(port: Any, checks: list[str], issues: list[Circuit
 
 def _compare_port(
     circuit_port: Json,
-    pedal_port: Json,
+    component_port: Json,
     checks: list[str],
     issues: list[CircuitIssue],
     circuit_path: str,
-    pedal_path: str,
+    component_path: str,
 ) -> None:
-    _check(circuit_port.get("pedal_port") == pedal_port.get("id"), checks, issues, f"{circuit_path} maps to {pedal_path}", f"expected pedal port {pedal_port.get('id')!r}, found {circuit_port.get('pedal_port')!r}", f"{circuit_path}.pedal_port")
-    _check(circuit_port.get("signal") == pedal_port.get("signal"), checks, issues, f"{circuit_path} signal matches {pedal_path}", f"expected signal {pedal_port.get('signal')!r}, found {circuit_port.get('signal')!r}", f"{circuit_path}.signal")
-    _check(circuit_port.get("shape") == pedal_port.get("shape"), checks, issues, f"{circuit_path} shape matches {pedal_path}", f"expected shape {pedal_port.get('shape')!r}, found {circuit_port.get('shape')!r}", f"{circuit_path}.shape")
+    _check(circuit_port.get("component_port") == component_port.get("id"), checks, issues, f"{circuit_path} maps to {component_path}", f"expected component port {component_port.get('id')!r}, found {circuit_port.get('component_port')!r}", f"{circuit_path}.component_port")
+    _check(circuit_port.get("signal") == component_port.get("signal"), checks, issues, f"{circuit_path} signal matches {component_path}", f"expected signal {component_port.get('signal')!r}, found {circuit_port.get('signal')!r}", f"{circuit_path}.signal")
+    _check(circuit_port.get("shape") == component_port.get("shape"), checks, issues, f"{circuit_path} shape matches {component_path}", f"expected shape {component_port.get('shape')!r}, found {circuit_port.get('shape')!r}", f"{circuit_path}.shape")
 
 
 def _compare_ports(
     circuit_ports: Any,
-    pedal_ports: Any,
+    component_ports: Any,
     checks: list[str],
     issues: list[CircuitIssue],
     direction: str,
 ) -> None:
-    if not isinstance(circuit_ports, list) or not isinstance(pedal_ports, list):
-        issues.append(CircuitIssue("error", f"circuit and pedal {direction} must be lists", f"boundary.{direction}"))
+    if not isinstance(circuit_ports, list) or not isinstance(component_ports, list):
+        issues.append(CircuitIssue("error", f"circuit and component {direction} must be lists", f"boundary.{direction}"))
         return
     _check(
-        len(circuit_ports) == len(pedal_ports),
+        len(circuit_ports) == len(component_ports),
         checks,
         issues,
-        f"boundary {direction} count matches pedal contract",
-        f"expected {len(pedal_ports)} {direction}, found {len(circuit_ports)}",
+        f"boundary {direction} count matches component contract",
+        f"expected {len(component_ports)} {direction}, found {len(circuit_ports)}",
         f"boundary.{direction}",
     )
-    for index, (circuit_port, pedal_port) in enumerate(zip(circuit_ports, pedal_ports)):
-        if not isinstance(circuit_port, dict) or not isinstance(pedal_port, dict):
+    for index, (circuit_port, component_port) in enumerate(zip(circuit_ports, component_ports)):
+        if not isinstance(circuit_port, dict) or not isinstance(component_port, dict):
             continue
         _compare_port(
             circuit_port,
-            pedal_port,
+            component_port,
             checks,
             issues,
             f"boundary.{direction}[{index}]",
-            f"pedal.ports.{direction}[{index}]",
+            f"component.ports.{direction}[{index}]",
         )
 
 

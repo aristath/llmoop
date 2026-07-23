@@ -6,11 +6,11 @@ def make_layer(
     structure: ModelStructure,
     layer: LayerStructure,
     *,
-    pedal_id: str | None = None,
+    component_id: str | None = None,
     runtime_role: str = "signal_processor",
 ) -> Json:
     hidden_size = structure.hidden_size
-    pedal_id = pedal_id or f"layer_{layer.index:02d}"
+    component_id = component_id or f"layer_{layer.index:02d}"
     tensor_refs = list(layer.tensors.values())
     operator = (
         make_conv_operator(structure, layer)
@@ -23,12 +23,12 @@ def make_layer(
     )
 
     return {
-        "schema": "nerve.pedal_instance.v1",
-        "id": pedal_id,
+        "schema": "nerve.node_instance.v1",
+        "id": component_id,
         "source_layer_index": layer.index,
-        "type": "pedal_instance",
+        "type": "node_instance",
         "runtime_role": runtime_role,
-        "pedal_class": make_pedal_class(structure, layer),
+        "component_class": make_component_class(structure, layer),
         "operator_type": layer.operator_type,
         "feed_forward": make_feed_forward_descriptor(structure, layer),
         "numerics": {
@@ -84,12 +84,12 @@ def make_layer(
         ),
         "transition_contract": {
             "type": "stateful_frame_transform",
-            "equation": "(output_frame, next_state, events) = pedal(input_frame, state, params, control)",
+            "equation": "(output_frame, next_state, events) = component(input_frame, state, params, control)",
             "reference_behavior": f"source_checkpoint_entity:{layer.prefix}",
             "behavioral_error_contract": "not_defined_yet",
         },
         "runtime_boundary": {
-            "opaque_to_pedalboard": True,
+            "opaque_to_execution_graph": True,
             "compiler_may_fuse_internal_operations": True,
             "compiler_may_replace_reference_decomposition": True,
         },
@@ -103,11 +103,11 @@ def make_layer(
 def make_model_graph(
     structure: ModelStructure, output_dir: Path, tensor_index: Json
 ) -> Json:
-    pedals = [
+    components = [
         {
             "id": f"layer_{layer.index:02d}",
-            "type": "pedal_instance",
-            "pedal_class": make_pedal_class(structure, layer),
+            "type": "node_instance",
+            "component_class": make_component_class(structure, layer),
             "operator_type": layer.operator_type,
             "file": f"layers/layer_{layer.index:02d}.json",
         }
@@ -182,7 +182,7 @@ def make_model_graph(
         "token_ids": structure.token_ids,
         "files": {
             "tensor_index": "tensors.json",
-            "pedals_dir": "layers/",
+            "components_dir": "layers/",
         },
         "graph": {
             "input_transducer": {
@@ -192,9 +192,9 @@ def make_model_graph(
                 "attrs": {"scale": structure.embedding_scale},
                 "params": {"weight": tensor_ref(structure.tensors["token_embedding"])},
             },
-            "pedalboard": {
-                "wiring": "series",
-                "pedals": pedals,
+            "execution_graph": {
+                "topology": "series",
+                "components": components,
             },
             "output_transducer": {
                 "components": [
@@ -212,15 +212,15 @@ def make_model_graph(
                     output_projection,
                 ]
             },
-            "draft_pedalboards": [
-                make_draft_pedalboard_descriptor(structure, draft)
-                for draft in structure.draft_pedalboards
+            "draft_execution_graphs": [
+                make_draft_execution_graph_descriptor(structure, draft)
+                for draft in structure.draft_execution_graphs
             ],
         },
         "component_templates": {
-            "shortconv_layer": "opaque layer pedal with fixed rolling temporal state",
-            "rg_lru_layer": "opaque recurrent layer pedal with fixed convolution and recurrent state",
-            "gqa_attention_layer": "opaque layer pedal with append-only KV state",
+            "shortconv_layer": "opaque layer component with fixed rolling temporal state",
+            "rg_lru_layer": "opaque recurrent layer component with fixed convolution and recurrent state",
+            "gqa_attention_layer": "opaque layer component with append-only KV state",
             "swiglu_feed_forward": "dense gated feed-forward operator",
             "rms_norm": "stateless normalization operator",
             "residual_add": "stateless signal mixer",
@@ -229,9 +229,9 @@ def make_model_graph(
     }
 
 
-def make_draft_pedalboard_descriptor(
+def make_draft_execution_graph_descriptor(
     structure: ModelStructure,
-    draft: DraftPedalboardStructure,
+    draft: DraftExecutionGraphStructure,
 ) -> Json:
     hidden_size = structure.hidden_size
     adapter_params = {
@@ -257,13 +257,13 @@ def make_draft_pedalboard_descriptor(
             },
             "params": adapter_params,
         },
-        "pedalboard": {
-            "wiring": "series",
-            "pedals": [
+        "execution_graph": {
+            "topology": "series",
+            "components": [
                 {
                     "id": f"{draft.id}_layer_{layer.index:02d}",
-                    "type": "pedal_instance",
-                    "pedal_class": make_pedal_class(structure, layer),
+                    "type": "node_instance",
+                    "component_class": make_component_class(structure, layer),
                     "operator_type": layer.operator_type,
                     "file": (
                         f"drafts/{draft.id}/layers/"
@@ -298,7 +298,7 @@ def make_draft_pedalboard_descriptor(
             },
         },
         "state_contract": {
-            "ownership": "per_stream_per_pedal_instance",
+            "ownership": "per_stream_per_node_instance",
             "draft_updates": "tentative",
             "acceptance": "commit_accepted_prefix",
             "rejection": "restore_last_committed_state",
@@ -335,7 +335,7 @@ def make_reference_decomposition(
     hidden_size = structure.hidden_size
     return {
         "source": "source_transformers_layer",
-        "wiring": [
+        "topology": [
             {
                 "id": "operator_norm",
                 "type": "rms_norm",
@@ -446,7 +446,7 @@ def make_conv_operator(structure: ModelStructure, layer: LayerStructure) -> Json
             "depthwise_kernel": tensor_ref(layer.tensors["conv_depthwise_kernel"]),
             "out_projection": tensor_ref(layer.tensors["conv_out_projection"]),
         },
-        "internal_pedals": [
+        "internal_components": [
             {"id": "in_projection", "type": "linear"},
             {"id": "split_b_c_x", "type": "split", "parts": ["b", "c", "x"]},
             {"id": "input_gate", "type": "multiply", "expression": "b * x"},
@@ -494,7 +494,7 @@ def make_attention_operator(structure: ModelStructure, layer: LayerStructure) ->
     ):
         if source_id in layer.tensors:
             params[target_id] = tensor_ref(layer.tensors[source_id])
-    internal_pedals = (
+    internal_components = (
         [
             {"id": "qkv_projection", "type": "linear"},
             {"id": "qkv_split", "type": "split"},
@@ -517,21 +517,21 @@ def make_attention_operator(structure: ModelStructure, layer: LayerStructure) ->
         ]
     )
     if structure.attention_output_gate:
-        internal_pedals.append({"id": "q_gate_split", "type": "split"})
+        internal_components.append({"id": "q_gate_split", "type": "split"})
     if "attention_gate_projection" in layer.tensors:
         params["attention_gate_projection"] = tensor_ref(
             layer.tensors["attention_gate_projection"]
         )
-        internal_pedals.append({"id": "attention_gate_projection", "type": "linear"})
+        internal_components.append({"id": "attention_gate_projection", "type": "linear"})
     if "q_norm" in layer.tensors:
         params["q_norm"] = tensor_ref(layer.tensors["q_norm"])
-        internal_pedals.append({"id": "q_norm", "type": "rms_norm_per_head"})
+        internal_components.append({"id": "q_norm", "type": "rms_norm_per_head"})
     if "k_norm" in layer.tensors:
         params["k_norm"] = tensor_ref(layer.tensors["k_norm"])
-        internal_pedals.append({"id": "k_norm", "type": "rms_norm_per_head"})
+        internal_components.append({"id": "k_norm", "type": "rms_norm_per_head"})
     if "attention_sinks" in layer.tensors:
         params["attention_sinks"] = tensor_ref(layer.tensors["attention_sinks"])
-    internal_pedals.extend(
+    internal_components.extend(
         [
             {"id": "rope", "type": "rotary_position_embedding"},
             {
@@ -587,7 +587,7 @@ def make_attention_operator(structure: ModelStructure, layer: LayerStructure) ->
         "shared_kv_source_layer": layer.shared_kv_source_layer,
         "state_ports": make_state_ports(structure, layer),
         "params": params,
-        "internal_pedals": internal_pedals,
+        "internal_components": internal_components,
     }
 
 
@@ -617,7 +617,7 @@ def make_gated_delta_operator(structure: ModelStructure, layer: LayerStructure) 
             "norm": tensor_ref(layer.tensors["delta_norm"]),
             "out_projection": tensor_ref(layer.tensors["delta_out_projection"]),
         },
-        "internal_pedals": [
+        "internal_components": [
             {"id": "qkv_projection", "type": "linear"},
             {"id": "z_projection", "type": "linear"},
             {"id": "b_projection", "type": "linear"},
@@ -668,7 +668,7 @@ def make_rg_lru_operator(structure: ModelStructure, layer: LayerStructure) -> Js
         "activation": structure.activation,
         "state_ports": make_state_ports(structure, layer),
         "params": params,
-        "internal_pedals": [
+        "internal_components": [
             {"id": "x_projection", "type": "linear"},
             {"id": "y_projection", "type": "linear"},
             {"id": "y_activation", "type": structure.activation},
@@ -716,7 +716,7 @@ def make_state_ports(
                 "shape": [structure.conv_l_cache, structure.hidden_size],
                 "dtype": "BF16",
                 "update": "shift_append",
-                "sharing": "per_stream_per_pedal_instance",
+                "sharing": "per_stream_per_node_instance",
             }
         ]
 
@@ -725,7 +725,7 @@ def make_state_ports(
         sharing = (
             f"shared_from:layer_{layer.shared_kv_source_layer:02d}.kv_memory"
             if layer.shared_kv_source_layer is not None
-            else "per_stream_per_pedal_instance"
+            else "per_stream_per_node_instance"
         )
         return [
             {
@@ -757,7 +757,7 @@ def make_state_ports(
                 "shape": [conv_width, int(mixer["conv_kernel_width"])],
                 "dtype": "BF16",
                 "update": "shift_append",
-                "sharing": "per_stream_per_pedal_instance",
+                "sharing": "per_stream_per_node_instance",
             },
             {
                 "id": "recurrent_state",
@@ -769,7 +769,7 @@ def make_state_ports(
                 ],
                 "dtype": mixer["state_dtype"],
                 "update": "decay_delta_outer_product",
-                "sharing": "per_stream_per_pedal_instance",
+                "sharing": "per_stream_per_node_instance",
             },
         ]
 
@@ -787,7 +787,7 @@ def make_state_ports(
                 ],
                 "dtype": "BF16",
                 "update": "shift_append",
-                "sharing": "per_stream_per_pedal_instance",
+                "sharing": "per_stream_per_node_instance",
             },
             {
                 "id": "recurrent_state",
@@ -795,14 +795,14 @@ def make_state_ports(
                 "shape": [int(mixer["width"])],
                 "dtype": str(mixer["state_dtype"]),
                 "update": "real_gated_linear_recurrence",
-                "sharing": "per_stream_per_pedal_instance",
+                "sharing": "per_stream_per_node_instance",
             },
         ]
 
     raise ModelTranspileError(f"unsupported state ports for operator {operator_type!r}")
 
 
-def make_pedal_class(structure: ModelStructure, layer: LayerStructure) -> str:
+def make_component_class(structure: ModelStructure, layer: LayerStructure) -> str:
     operator_type = layer.operator_type
     feed_forward = (
         f"moe{structure.num_experts}x{structure.experts_per_token}i{layer.intermediate_size}"
@@ -847,5 +847,5 @@ def make_pedal_class(structure: ModelStructure, layer: LayerStructure) -> str:
             f"{feed_forward}_v1"
         )
 
-    raise ModelTranspileError(f"unsupported pedal class for operator {operator_type!r}")
+    raise ModelTranspileError(f"unsupported component class for operator {operator_type!r}")
 

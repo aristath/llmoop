@@ -33,27 +33,27 @@ def compile_model_package(
     structure = transpile_model(
         model_dir,
         transpiled_dir,
-        progress=lambda current, total, pedal_id: emit_compile_event(
+        progress=lambda current, total, component_id: emit_compile_event(
             event_sink,
-            "PedalTranspiled",
+            "ComponentTranspiled",
             current=current,
             total=total,
-            pedal_id=pedal_id,
+            component_id=component_id,
         ),
         cancel_requested=cancel_requested,
     )
     check_compile_cancelled(cancel_requested)
     if lowered_dir.exists():
         shutil.rmtree(lowered_dir)
-    lowered = lower_pedalboard(
+    lowered = lower_execution_graph(
         transpiled_dir,
         lowered_dir,
-        progress=lambda current, total, pedal_id: emit_compile_event(
+        progress=lambda current, total, component_id: emit_compile_event(
             event_sink,
-            "PedalLoweringStarted",
+            "ComponentLoweringStarted",
             current=current,
             total=total,
-            pedal_id=pedal_id,
+            component_id=component_id,
         ),
         cancel_requested=cancel_requested,
     )

@@ -27,7 +27,7 @@ def optimize_circuit_for_vulkan(
     can_fuse_linear_split_recurrent: Callable[[Json, Json], bool] | None = None,
     can_fuse_append_attention: Callable[[Json, Json], bool] | None = None,
 ) -> Json:
-    """Compile discoverable node regions without changing the pedal boundary."""
+    """Compile discoverable node regions without changing the component boundary."""
     optimized = deepcopy(circuit)
     nodes = _fuse_parallel_head_norm_rope_regions(
         optimized["nodes"], can_fuse_parallel_head_norm_rope

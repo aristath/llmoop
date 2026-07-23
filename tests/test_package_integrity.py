@@ -63,7 +63,7 @@ def minimal_package(root: Path) -> dict[str, object]:
         "schema": "nerve.stream_circuit.v1",
         "id": "fixture_circuit",
         "source": {
-            "pedal_id": "fixture_pedal",
+            "component_id": "fixture_component",
             "source_layer_index": 0,
             "source_operator_type": "fixture",
         },
@@ -103,7 +103,7 @@ def minimal_package(root: Path) -> dict[str, object]:
         "schema": "nerve.stream_circuit.v1",
         "id": "input_circuit",
         "source": {
-            "pedal_id": "input",
+            "component_id": "input",
             "source_layer_index": None,
             "source_operator_type": "input_transducer",
         },
@@ -143,7 +143,7 @@ def minimal_package(root: Path) -> dict[str, object]:
         "schema": "nerve.stream_circuit.v1",
         "id": "output_circuit",
         "source": {
-            "pedal_id": "output",
+            "component_id": "output",
             "source_layer_index": None,
             "source_operator_type": "output_transducer",
         },
@@ -193,7 +193,7 @@ def minimal_package(root: Path) -> dict[str, object]:
         "schema": "nerve.stream_circuit.v1",
         "id": "sampler_circuit",
         "source": {
-            "pedal_id": "sampler",
+            "component_id": "sampler",
             "source_layer_index": None,
             "source_operator_type": "sampler",
         },
@@ -241,7 +241,7 @@ def minimal_package(root: Path) -> dict[str, object]:
     }
     circuits = {
         "input": input_circuit,
-        "fixture_pedal": circuit,
+        "fixture_component": circuit,
         "output": output_circuit,
         "sampler": sampler_circuit,
     }
@@ -262,7 +262,7 @@ def minimal_package(root: Path) -> dict[str, object]:
                 "free_running": {"status": "not_required"},
                 "circuits": [
                     {
-                        "pedal_id": pedal_id,
+                        "component_id": component_id,
                         "candidate_kind": "exact_reference",
                         "status": "passed",
                         "source_node_count": len(candidate["nodes"]),
@@ -272,7 +272,7 @@ def minimal_package(root: Path) -> dict[str, object]:
                         "rewrite_count": 0,
                         "rewrites": [],
                     }
-                    for pedal_id, candidate in circuits.items()
+                    for component_id, candidate in circuits.items()
                 ],
             }
         )
@@ -288,14 +288,14 @@ def minimal_package(root: Path) -> dict[str, object]:
         "required_vulkan_features": [],
         "required_vulkan_subgroup_operations": [],
         "circuit_graph": {
-            "wiring": "explicit_graph",
-            "cables": [
+            "topology": "explicit_graph",
+            "edges": [
                 {
                     "id": "input_to_processor",
                     "connection": {"kind": "forward"},
-                    "source": {"pedal_id": "input", "port_id": "frame"},
+                    "source": {"component_id": "input", "port_id": "frame"},
                     "destination": {
-                        "pedal_id": "fixture_pedal",
+                        "component_id": "fixture_component",
                         "port_id": "input_frame",
                     },
                 },
@@ -303,16 +303,16 @@ def minimal_package(root: Path) -> dict[str, object]:
                     "id": "processor_to_output",
                     "connection": {"kind": "forward"},
                     "source": {
-                        "pedal_id": "fixture_pedal",
+                        "component_id": "fixture_component",
                         "port_id": "output_frame",
                     },
-                    "destination": {"pedal_id": "output", "port_id": "frame"},
+                    "destination": {"component_id": "output", "port_id": "frame"},
                 },
                 {
                     "id": "output_to_sampler",
                     "connection": {"kind": "forward"},
-                    "source": {"pedal_id": "output", "port_id": "logits"},
-                    "destination": {"pedal_id": "sampler", "port_id": "logits"},
+                    "source": {"component_id": "output", "port_id": "logits"},
+                    "destination": {"component_id": "sampler", "port_id": "logits"},
                 },
                 {
                     "id": "feedback",
@@ -320,8 +320,8 @@ def minimal_package(root: Path) -> dict[str, object]:
                         "kind": "temporal_feedback",
                         "delay_activations": 1,
                     },
-                    "source": {"pedal_id": "sampler", "port_id": "token"},
-                    "destination": {"pedal_id": "input", "port_id": "token"},
+                    "source": {"component_id": "sampler", "port_id": "token"},
+                    "destination": {"component_id": "input", "port_id": "token"},
                 },
             ],
             "boundary": {
@@ -329,14 +329,14 @@ def minimal_package(root: Path) -> dict[str, object]:
                     {
                         "id": "model_input",
                         "endpoint": {
-                            "pedal_id": "input",
+                            "component_id": "input",
                             "port_id": "token",
                         },
                     },
                     {
                         "id": "random_seed",
                         "endpoint": {
-                            "pedal_id": "sampler",
+                            "component_id": "sampler",
                             "port_id": "random_seed",
                         },
                     },
@@ -345,15 +345,15 @@ def minimal_package(root: Path) -> dict[str, object]:
                     {
                         "id": "model_output",
                         "endpoint": {
-                            "pedal_id": "sampler",
+                            "component_id": "sampler",
                             "port_id": "token",
                         },
                     }
                 ],
             },
-            "pedals": [
+            "components": [
                 {
-                    "pedal_id": pedal_id,
+                    "component_id": component_id,
                     "operator_type": candidate["source"]["source_operator_type"],
                     "runtime_role": candidate["runtime_role"],
                     "implementation": candidate["implementation"],
@@ -372,7 +372,7 @@ def minimal_package(root: Path) -> dict[str, object]:
                         "state_ports": [],
                     },
                 }
-                for pedal_id, candidate in circuits.items()
+                for component_id, candidate in circuits.items()
             ],
         },
         "config_path": "config.json",
@@ -410,9 +410,9 @@ def minimal_package(root: Path) -> dict[str, object]:
             },
             "kernels": [{"shader_path": "shaders/kernel.spv"}],
         },
-        "pedal_executions": [
+        "component_executions": [
             {
-                "pedal_id": "fixture_pedal",
+                "component_id": "fixture_component",
                 "operator_type": "fixture",
                 "implementation": "exact_reference",
                 "kernels": [
@@ -509,13 +509,13 @@ def test_package_integrity_rejects_corrupt_or_incomplete_artifacts(
         evidence["circuits"][0]["candidate_node_count"] = 2
         (tmp_path / "behavioral_validation.json").write_text(json.dumps(evidence))
     elif corruption == "kernel":
-        manifest["pedal_executions"][0]["kernels"][0]["op"] = "multiply"
+        manifest["component_executions"][0]["kernels"][0]["op"] = "multiply"
     elif corruption == "execution_identity":
-        manifest["pedal_executions"][0]["implementation"] = "wrong"
+        manifest["component_executions"][0]["implementation"] = "wrong"
     elif corruption == "sampler_contract":
         manifest["sampler"]["spec"]["top_k"] = 2
     elif corruption == "batch_contract":
-        manifest["pedal_executions"][0]["kernels"][0]["batch_mode"] = "weight_shared"
+        manifest["component_executions"][0]["kernels"][0]["batch_mode"] = "weight_shared"
     elif corruption == "device_extensions":
         manifest["required_vulkan_device_extensions"] = [
             "VK_EXT_shader_float8",
@@ -531,14 +531,14 @@ def test_package_integrity_rejects_corrupt_or_incomplete_artifacts(
         manifest["required_vulkan_subgroup_operations"] = ["basic"]
     elif corruption == "generation_boundary":
         manifest["circuit_graph"]["boundary"]["public_outputs"][0]["endpoint"] = {
-            "pedal_id": "output",
+            "component_id": "output",
             "port_id": "logits",
         }
     elif corruption == "compiler_placement":
         manifest["placement"] = {
             "schema": "nerve.stream_circuit_placement.v1",
             "default_device_id": "gpu0",
-            "pedal_devices": {"fixture_pedal": "gpu0"},
+            "node_devices": {"fixture_component": "gpu0"},
         }
     elif corruption == "path_escape":
         manifest["config_path"] = "../config.json"
@@ -551,7 +551,7 @@ def test_package_integrity_rejects_batch_requirements_that_do_not_match_spirv(
     tmp_path: Path,
 ) -> None:
     manifest = minimal_package(tmp_path)
-    kernel = manifest["pedal_executions"][0]["kernels"][0]
+    kernel = manifest["component_executions"][0]["kernels"][0]
     kernel["batch_mode"] = "weight_shared"
     kernel["batch_implementations"] = [
         {

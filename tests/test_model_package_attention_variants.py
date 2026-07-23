@@ -1,6 +1,6 @@
 from model_package_layout_common import *
 
-def test_compiler_renders_biased_recurrent_and_windowed_attention_pedals(
+def test_compiler_renders_biased_recurrent_and_windowed_attention_components(
     tmp_path: Path,
 ) -> None:
     shader_source_dir = Path(__file__).parents[1] / "runtime-rs" / "shaders"
@@ -102,7 +102,7 @@ def test_compiler_renders_subgroup_padded_attention_and_unequal_qkv_split(
     assert "{{" not in split
 
 
-def test_compiler_renders_hybrid_recurrent_and_gated_attention_pedals(
+def test_compiler_renders_hybrid_recurrent_and_gated_attention_components(
     tmp_path: Path,
 ) -> None:
     shader_source_dir = Path(__file__).parents[1] / "runtime-rs" / "shaders"

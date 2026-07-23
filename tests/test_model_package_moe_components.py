@@ -30,7 +30,7 @@ def test_compiler_renders_per_head_softplus_attention_gate(tmp_path: Path) -> No
     assert "{{" not in batch_source
 
 
-def test_compiler_renders_sparse_moe_and_scaled_residual_pedals(tmp_path: Path) -> None:
+def test_compiler_renders_sparse_moe_and_scaled_residual_components(tmp_path: Path) -> None:
     shader_source_dir = Path(__file__).parents[1] / "runtime-rs" / "shaders"
     shader_files = {
         "scaled_add_bf16_1024_scale0.22.comp",

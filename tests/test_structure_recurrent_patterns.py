@@ -92,13 +92,13 @@ def test_discovers_recurrent_block_pattern_biases_and_numerics_by_structure() ->
     recurrent = make_layer(structure, structure.layers[0])
     assert [state["shape"] for state in recurrent["state_ports"]] == [[16, 4], [16]]
     assert [state["dtype"] for state in recurrent["state_ports"]] == ["BF16", "F32"]
-    circuit = build_pedal_circuit(recurrent, Path("layer_00.json"))
+    circuit = build_component_circuit(recurrent, Path("layer_00.json"))
     nodes = {node["id"]: node for node in circuit["nodes"]}
     assert nodes["rg_lru_step"]["attrs"]["block_width"] == 8
     assert nodes["ffn_gate_projection"]["params"] == ["ffn_gate", "ffn_gate_bias"]
     assert nodes["ffn_gate_activation"]["op"] == "gelu_tanh"
 
-    attention = build_pedal_circuit(
+    attention = build_component_circuit(
         make_layer(structure, structure.layers[2]), Path("layer_02.json")
     )
     attention_nodes = {node["id"]: node for node in attention["nodes"]}

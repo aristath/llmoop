@@ -96,7 +96,7 @@ def discover_model_structure(
         )
         for index in range(layer_count)
     )
-    draft_pedalboards = discover_draft_pedalboards(
+    draft_execution_graphs = discover_draft_execution_graphs(
         tensors=tensors,
         decoder_config=decoder_config,
         primary_layer_root=layer_root,
@@ -232,7 +232,7 @@ def discover_model_structure(
             "output_projection": output_projection,
         },
         layers=layers,
-        draft_pedalboards=draft_pedalboards,
+        draft_execution_graphs=draft_execution_graphs,
     )
 
 
@@ -871,7 +871,7 @@ def discover_layer_root(
     return root, tuple(sorted(root_indices[root]))
 
 
-def discover_draft_pedalboards(
+def discover_draft_execution_graphs(
     *,
     tensors: dict[str, Json],
     decoder_config: Json,
@@ -883,7 +883,7 @@ def discover_draft_pedalboards(
     configured_num_key_value_heads: int,
     configured_head_width: int,
     configured_attention_window_size: int | None,
-) -> tuple[DraftPedalboardStructure, ...]:
+) -> tuple[DraftExecutionGraphStructure, ...]:
     """Discover auxiliary next-token predictors from their tensor topology.
 
     The checkpoint family name is deliberately irrelevant. A candidate is an
@@ -901,7 +901,7 @@ def discover_draft_pedalboards(
                 )
                 break
 
-    discovered: list[DraftPedalboardStructure] = []
+    discovered: list[DraftExecutionGraphStructure] = []
     for root in sorted(roots):
         if root == primary_layer_root:
             continue
@@ -970,7 +970,7 @@ def discover_draft_pedalboards(
         attach_block_quantization_scales(tensors, adapter_tensors)
         attach_packed_linear_quantization(tensors, adapter_tensors)
         discovered.append(
-            DraftPedalboardStructure(
+            DraftExecutionGraphStructure(
                 id=f"draft_{len(discovered):02d}",
                 prefix=prefix,
                 tensors=adapter_tensors,
@@ -1106,7 +1106,7 @@ def discover_shared_kv_sources(
         )
     if configured_layer_types is None:
         raise ModelTranspileError(
-            "shared KV layers require structural layer_types to identify their source pedals"
+            "shared KV layers require structural layer_types to identify their source components"
         )
     first_shared = layer_count - shared_count
     source_by_type: dict[str, int] = {}

@@ -56,22 +56,23 @@ def main() -> None:
     parser.add_argument(
         "--inspect-runtime",
         action="store_true",
-        help="preview UI-ready package, patch, placement, device, and route facts for --run",
+        help="preview UI-ready package, runtime graph, placement, device, and route facts for --run",
     )
     parser.add_argument(
         "--inspect-device-slice",
         metavar="DEVICE_ID",
-        help="mount and summarize only the compiled package pedals assigned to DEVICE_ID for --run",
+        help="mount and summarize only the compiled model nodes assigned to DEVICE_ID for --run",
     )
     parser.add_argument(
         "--inspect-package",
         action="store_true",
-        help="summarize the compiled source pedal kit and available runtime devices for --run",
+        help="summarize the compiled component catalog and available runtime devices for --run",
     )
     parser.add_argument(
-        "--inspect-patch",
+        "--inspect-graph",
+        dest="inspect_graph",
         action="store_true",
-        help="preview the effective runtime patch for --run without mounting devices",
+        help="preview the effective runtime graph for --run without mounting devices",
     )
     parser.add_argument(
         "--inspect-placement",
@@ -91,14 +92,14 @@ def main() -> None:
     parser.add_argument(
         "--device",
         default=None,
-        help="default logical device for the runtime pedalboard patch",
+        help="default logical device for the runtime graph",
     )
     parser.add_argument(
-        "--place-pedal",
+        "--place-node",
         action="append",
         default=[],
-        metavar="PEDAL=DEVICE",
-        help="assign one runtime pedal instance to a logical device in the runtime patch; may be repeated",
+        metavar="NODE=DEVICE",
+        help="assign one runtime node instance to a logical device in the runtime graph; may be repeated",
     )
     parser.add_argument(
         "--bind-device",
@@ -112,13 +113,13 @@ def main() -> None:
         action="append",
         default=[],
         metavar="AFTER=NEW",
-        help="duplicate runtime pedal instance AFTER with id NEW; may be repeated",
+        help="duplicate runtime node instance AFTER with id NEW; may be repeated",
     )
     parser.add_argument(
         "--chain",
         default=None,
         metavar="ITEM[,ITEM...]",
-        help="runtime source chain for --run; ITEM is SOURCE or INSTANCE=SOURCE",
+        help="runtime component chain for --run; ITEM is SOURCE or INSTANCE=SOURCE",
     )
     parser.add_argument(
         "--shader-source-dir",
@@ -254,13 +255,13 @@ def main() -> None:
                 args.inspect_device_slice is not None,
                 args.inspect_runtime,
                 args.inspect_package,
-                args.inspect_patch,
+                args.inspect_graph,
                 args.inspect_placement,
             ]
         )
         if inspect_mode_count > 1:
             parser.error(
-                "--inspect-runtime, --inspect-package, --inspect-patch, --inspect-device-slice, and --inspect-placement are mutually exclusive"
+                "--inspect-runtime, --inspect-package, --inspect-graph, --inspect-device-slice, and --inspect-placement are mutually exclusive"
             )
         if args.chat and inspect_mode_count > 0:
             parser.error("--chat cannot be combined with inspect modes")
@@ -351,12 +352,12 @@ def validate_action_options(
         ("--chat-template-var", bool(args.chat_template_var)),
         ("--inspect-runtime", args.inspect_runtime),
         ("--inspect-package", args.inspect_package),
-        ("--inspect-patch", args.inspect_patch),
+        ("--inspect-graph", args.inspect_graph),
         ("--inspect-placement", args.inspect_placement),
         ("--inspect-device-slice", args.inspect_device_slice is not None),
         ("--runtime-bin", args.runtime_bin is not None),
         ("--device", args.device is not None),
-        ("--place-pedal", bool(args.place_pedal)),
+        ("--place-node", bool(args.place_node)),
         ("--bind-device", bool(args.bind_device)),
         ("--duplicate-after", bool(args.duplicate_after)),
         ("--chain", args.chain is not None),
@@ -476,8 +477,8 @@ def build_runtime_command(args: argparse.Namespace, package_manifest: Path) -> l
         runtime_args.append("--inspect-placement")
     elif args.inspect_package:
         runtime_args.append("--inspect-package")
-    elif args.inspect_patch:
-        runtime_args.append("--inspect-patch")
+    elif args.inspect_graph:
+        runtime_args.append("--inspect-graph")
     elif args.inspect_device_slice is not None:
         runtime_args.extend(["--inspect-device-slice", args.inspect_device_slice])
     else:
@@ -494,8 +495,8 @@ def build_runtime_command(args: argparse.Namespace, package_manifest: Path) -> l
         )
     if args.device is not None:
         runtime_args.extend(["--device", args.device])
-    for raw_placement in args.place_pedal:
-        runtime_args.extend(["--place-pedal", raw_placement])
+    for raw_placement in args.place_node:
+        runtime_args.extend(["--place-node", raw_placement])
     for raw_binding in args.bind_device:
         runtime_args.extend(["--bind-device", raw_binding])
     for raw_duplicate in args.duplicate_after:

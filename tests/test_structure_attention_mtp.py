@@ -44,7 +44,7 @@ def test_discovers_attention_with_values_derived_from_keys() -> None:
 
     structure = discover_model_structure(Path("synthetic"), config, tensors)
     layer = structure.layers[0]
-    circuit = build_pedal_circuit(make_layer(structure, layer), Path("layer_00.json"))
+    circuit = build_component_circuit(make_layer(structure, layer), Path("layer_00.json"))
     nodes = {node["id"]: node for node in circuit["nodes"]}
 
     assert layer.attention_key_equals_value
@@ -66,7 +66,7 @@ def test_discovers_attention_with_values_derived_from_keys() -> None:
     assert nodes["layer_scale"]["outputs"] == ["output_frame"]
 
 
-def test_discovers_structural_mtp_as_auxiliary_pedalboard() -> None:
+def test_discovers_structural_mtp_as_auxiliary_execution_graph() -> None:
     tensors = {
         "model.embed_tokens.weight": _tensor([1024, 512]),
         "model.norm.weight": _tensor([512]),
@@ -108,8 +108,8 @@ def test_discovers_structural_mtp_as_auxiliary_pedalboard() -> None:
 
     structure = discover_model_structure(Path("synthetic"), config, tensors)
     assert len(structure.layers) == 1
-    assert len(structure.draft_pedalboards) == 1
-    draft = structure.draft_pedalboards[0]
+    assert len(structure.draft_execution_graphs) == 1
+    draft = structure.draft_execution_graphs[0]
     assert draft.id == "draft_00"
     assert draft.prefix == "mtp"
     assert draft.tensors == {
@@ -123,19 +123,19 @@ def test_discovers_structural_mtp_as_auxiliary_pedalboard() -> None:
     assert draft.layers[0].prefix == "mtp.layers.0"
 
     graph = make_model_graph(structure, Path("transpiled"), {"source": {}})
-    [draft_graph] = graph["graph"]["draft_pedalboards"]
+    [draft_graph] = graph["graph"]["draft_execution_graphs"]
     assert draft_graph["type"] == "multi_token_prediction"
     assert draft_graph["input_adapter"]["attrs"]["concatenation_order"] == [
         "token_embedding",
         "target_hidden",
     ]
-    assert draft_graph["pedalboard"]["pedals"][0]["id"] == "draft_00_layer_00"
+    assert draft_graph["execution_graph"]["components"][0]["id"] == "draft_00_layer_00"
     assert draft_graph["state_contract"]["draft_updates"] == "tentative"
 
     draft_layer = make_layer(
         structure,
         draft.layers[0],
-        pedal_id="draft_00_layer_00",
+        component_id="draft_00_layer_00",
         runtime_role="draft_processor",
     )
     assert draft_layer["runtime_role"] == "draft_processor"

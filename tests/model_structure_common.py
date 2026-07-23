@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from math import prod
 
-from nerve.circuit_lowering import build_pedal_circuit
+from nerve.circuit_lowering import build_component_circuit
 from nerve.model_transpiler import (
     attach_block_quantization_scales,
     attach_packed_linear_quantization,

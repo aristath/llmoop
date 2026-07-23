@@ -907,7 +907,7 @@ def workgroup_count_x_for_node(circuit: Json, node: Json, tensor_index: Json) ->
 
 def local_size_x_for_node(node: Json) -> int:
     # The tiled attention kernel maps sixteen 64-wide head reductions onto one
-    # workgroup. This execution geometry belongs to the compiled pedal package.
+    # workgroup. This execution geometry belongs to the compiled model package.
     if node["op"] in {
         "scaled_dot_product_attention",
         "append_scaled_dot_product_attention",
@@ -1097,4 +1097,3 @@ def rope_shader_suffix(attrs: Json) -> str:
             f"RoPE type {rope_type!r} unexpectedly declares a scaling profile"
         )
     return f"theta{shader_float_token(theta)}_{layout}"
-

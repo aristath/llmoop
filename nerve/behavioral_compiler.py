@@ -78,21 +78,21 @@ def build_behavioral_validation(
     circuit_refs = list(lowered_index["graph"]["circuits"])
     circuit_refs.extend(
         circuit_ref
-        for draft in lowered_index.get("draft_pedalboards", [])
+        for draft in lowered_index.get("draft_execution_graphs", [])
         for circuit_ref in draft["circuits"]
     )
     for circuit_ref in circuit_refs:
-        pedal_id = circuit_ref["id"]
+        component_id = circuit_ref["id"]
         try:
-            source = source_circuits[pedal_id]
-            candidate = candidate_circuits[pedal_id]
+            source = source_circuits[component_id]
+            candidate = candidate_circuits[component_id]
         except KeyError as error:
             raise ModelCompileError(
-                f"behavioral compiler is missing circuit candidate {pedal_id!r}"
+                f"behavioral compiler is missing circuit candidate {component_id!r}"
             ) from error
         circuit_evidence.append(
             prove_exact_circuit_candidate(
-                pedal_id=pedal_id,
+                component_id=component_id,
                 source=source,
                 candidate=candidate,
                 empirical_evidence=empirical_evidence,
@@ -138,7 +138,7 @@ def build_behavioral_validation(
 
 def prove_exact_circuit_candidate(
     *,
-    pedal_id: str,
+    component_id: str,
     source: Json,
     candidate: Json,
     empirical_evidence: Json | None = None,
@@ -160,14 +160,14 @@ def prove_exact_circuit_candidate(
             empirical_evidence, expected_model_contract_digest
         )
         return _approximate_candidate_evidence(
-            pedal_id, drift, candidate_digest, len(candidate.get("nodes", []))
+            component_id, drift, candidate_digest, len(candidate.get("nodes", []))
         )
 
     source_nodes = source.get("nodes", [])
     candidate_nodes = candidate.get("nodes", [])
     source_by_id = {node["id"]: node for node in source_nodes}
     if len(source_by_id) != len(source_nodes):
-        raise ModelCompileError(f"source circuit {pedal_id!r} contains duplicate node ids")
+        raise ModelCompileError(f"source circuit {component_id!r} contains duplicate node ids")
     source_positions = {node["id"]: index for index, node in enumerate(source_nodes)}
     consumers = _signal_consumers(source_nodes)
     boundary_outputs = {
@@ -185,7 +185,7 @@ def prove_exact_circuit_candidate(
                     empirical_evidence, expected_model_contract_digest
                 )
                 return _approximate_candidate_evidence(
-                    pedal_id,
+                    component_id,
                     [f"node:{node['id']}"],
                     candidate_digest,
                     len(candidate_nodes),
@@ -198,20 +198,20 @@ def prove_exact_circuit_candidate(
                 empirical_evidence, expected_model_contract_digest
             )
             return _approximate_candidate_evidence(
-                pedal_id,
+                component_id,
                 [f"unproven_node:{node.get('id', '<missing>')}"],
                 candidate_digest,
                 len(candidate_nodes),
             )
         if len(set(compiled_from)) != len(compiled_from):
             raise ModelCompileError(
-                f"candidate circuit {pedal_id!r} rewrite {node['id']!r} repeats "
+                f"candidate circuit {component_id!r} rewrite {node['id']!r} repeats "
                 "a source node in compiled_from"
             )
         if any(source_id not in source_by_id for source_id in compiled_from):
             unknown = [source_id for source_id in compiled_from if source_id not in source_by_id]
             raise ModelCompileError(
-                f"candidate circuit {pedal_id!r} rewrite {node['id']!r} references "
+                f"candidate circuit {component_id!r} rewrite {node['id']!r} references "
                 f"unknown source nodes {unknown}"
             )
         proof_contract = EXACT_REWRITE_CONTRACTS.get(node.get("op"))
@@ -220,7 +220,7 @@ def prove_exact_circuit_candidate(
                 empirical_evidence, expected_model_contract_digest
             )
             return _approximate_candidate_evidence(
-                pedal_id,
+                component_id,
                 [f"unproven_rewrite:{node.get('op', '<missing>')}"],
                 candidate_digest,
                 len(candidate_nodes),
@@ -229,16 +229,16 @@ def prove_exact_circuit_candidate(
         source_ops = tuple(node["op"] for node in region)
         if source_ops not in EXACT_REWRITE_SOURCE_OPS[node["op"]]:
             raise ModelCompileError(
-                f"candidate circuit {pedal_id!r} rewrite {node['id']!r} cannot use "
+                f"candidate circuit {component_id!r} rewrite {node['id']!r} cannot use "
                 f"proof contract {proof_contract} for source ops {source_ops}"
             )
         _validate_exact_rewrite_semantics(
-            pedal_id=pedal_id,
+            component_id=component_id,
             candidate_node=node,
             region=region,
         )
         _validate_rewrite_interface(
-            pedal_id=pedal_id,
+            component_id=component_id,
             candidate_node=node,
             region=region,
             region_ids=set(compiled_from),
@@ -260,11 +260,11 @@ def prove_exact_circuit_candidate(
     missing = sorted(set(source_by_id) - set(covered))
     if duplicates or missing:
         raise ModelCompileError(
-            f"candidate circuit {pedal_id!r} does not exactly cover its source graph; "
+            f"candidate circuit {component_id!r} does not exactly cover its source graph; "
             f"missing={missing}, duplicate={duplicates}"
         )
     return {
-        "pedal_id": pedal_id,
+        "component_id": component_id,
         "candidate_kind": "exact_reference",
         "status": "passed",
         "source_node_count": len(source_nodes),
@@ -405,25 +405,25 @@ def validate_behavioral_validation_artifact(
     circuits = evidence.get("circuits")
     if not isinstance(circuits, list):
         raise ModelCompileError("behavioral validation artifact has no circuit proofs")
-    proof_by_pedal: dict[str, Json] = {}
+    proof_by_component: dict[str, Json] = {}
     for proof in circuits:
-        pedal_id = proof.get("pedal_id") if isinstance(proof, dict) else None
-        if not isinstance(pedal_id, str) or not pedal_id:
+        component_id = proof.get("component_id") if isinstance(proof, dict) else None
+        if not isinstance(component_id, str) or not component_id:
             raise ModelCompileError(
-                "behavioral validation artifact contains a proof without a pedal id"
+                "behavioral validation artifact contains a proof without a component id"
             )
-        if pedal_id in proof_by_pedal:
+        if component_id in proof_by_component:
             raise ModelCompileError(
-                f"behavioral validation artifact repeats pedal {pedal_id!r}"
+                f"behavioral validation artifact repeats component {component_id!r}"
             )
-        proof_by_pedal[pedal_id] = proof
-    if set(proof_by_pedal) != set(candidate_circuits):
+        proof_by_component[component_id] = proof
+    if set(proof_by_component) != set(candidate_circuits):
         raise ModelCompileError(
-            "behavioral validation artifact does not prove every packaged pedal"
+            "behavioral validation artifact does not prove every packaged component"
         )
     approximate_proof_count = 0
-    for pedal_id, candidate in candidate_circuits.items():
-        proof = proof_by_pedal[pedal_id]
+    for component_id, candidate in candidate_circuits.items():
+        proof = proof_by_component[component_id]
         proof_kind = proof.get("candidate_kind")
         if (
             proof.get("status") != "passed"
@@ -434,7 +434,7 @@ def validate_behavioral_validation_artifact(
             != json_contract_digest(candidate)
         ):
             raise ModelCompileError(
-                f"behavioral validation artifact has an incomplete or stale proof for pedal {pedal_id!r}"
+                f"behavioral validation artifact has an incomplete or stale proof for component {component_id!r}"
             )
         if proof_kind == "approximate":
             approximate_proof_count += 1
@@ -443,17 +443,17 @@ def validate_behavioral_validation_artifact(
             != proof.get("covered_source_node_count")
         ):
             raise ModelCompileError(
-                f"behavioral validation artifact does not completely cover pedal {pedal_id!r}"
+                f"behavioral validation artifact does not completely cover component {component_id!r}"
             )
     if candidate_kind == "approximate" and approximate_proof_count == 0:
         raise ModelCompileError(
-            "approximate behavioral validation artifact contains no approximate pedal proof"
+            "approximate behavioral validation artifact contains no approximate component proof"
         )
 
 
 def _validate_exact_rewrite_semantics(
     *,
-    pedal_id: str,
+    component_id: str,
     candidate_node: Json,
     region: list[Json],
 ) -> None:
@@ -463,7 +463,7 @@ def _validate_exact_rewrite_semantics(
     expected_attrs: Json
 
     if op in {"parallel_linear_2way", "parallel_linear_3way"}:
-        _require_empty_attrs(pedal_id, op, region)
+        _require_empty_attrs(component_id, op, region)
         expected_attrs = {
             "compiled_from": source_ids,
             "branch_count": len(region),
@@ -472,7 +472,7 @@ def _validate_exact_rewrite_semantics(
         if any(parameter_count != 1 for parameter_count in branch_parameter_counts):
             expected_attrs["branch_parameter_counts"] = branch_parameter_counts
     elif op == "linear_residual":
-        _require_empty_attrs(pedal_id, op, region)
+        _require_empty_attrs(component_id, op, region)
         expected_attrs = {
             "compiled_from": source_ids,
             "intermediate_rounding": "BF16",
@@ -487,7 +487,7 @@ def _validate_exact_rewrite_semantics(
             or region[1].get("attrs", {})
         ):
             raise ModelCompileError(
-                f"candidate circuit {pedal_id!r} rewrite {candidate_node['id']!r} "
+                f"candidate circuit {component_id!r} rewrite {candidate_node['id']!r} "
                 "cannot prove the SiLU/multiply source attributes"
             )
         expected_attrs = {
@@ -496,7 +496,7 @@ def _validate_exact_rewrite_semantics(
             "element_count": element_count,
         }
     elif op == "parallel_linear_silu_multiply":
-        _require_empty_attrs(pedal_id, op, region[:2])
+        _require_empty_attrs(component_id, op, region[:2])
         activation_attrs = region[2].get("attrs", {})
         element_count = activation_attrs.get("element_count")
         if (
@@ -506,7 +506,7 @@ def _validate_exact_rewrite_semantics(
             or region[3].get("attrs", {})
         ):
             raise ModelCompileError(
-                f"candidate circuit {pedal_id!r} rewrite {candidate_node['id']!r} "
+                f"candidate circuit {component_id!r} rewrite {candidate_node['id']!r} "
                 "cannot prove the fused FFN source attributes"
             )
         expected_attrs = {
@@ -516,14 +516,14 @@ def _validate_exact_rewrite_semantics(
             "element_count": element_count,
         }
     elif op == "linear_split_3way":
-        _require_empty_attrs(pedal_id, op, region[:1])
+        _require_empty_attrs(component_id, op, region[:1])
         split_attrs = deepcopy(region[1].get("attrs", {}))
         part_widths = split_attrs.get("part_widths")
         if part_widths is None:
             part_width = split_attrs.get("part_width")
             if not isinstance(part_width, int):
                 raise ModelCompileError(
-                    f"candidate circuit {pedal_id!r} rewrite {candidate_node['id']!r} "
+                    f"candidate circuit {component_id!r} rewrite {candidate_node['id']!r} "
                     "does not preserve a provable split width"
                 )
             part_widths = [part_width] * 3
@@ -533,7 +533,7 @@ def _validate_exact_rewrite_semantics(
             or any(not isinstance(width, int) or width <= 0 for width in part_widths)
         ):
             raise ModelCompileError(
-                f"candidate circuit {pedal_id!r} rewrite {candidate_node['id']!r} "
+                f"candidate circuit {component_id!r} rewrite {candidate_node['id']!r} "
                 "does not preserve provable split widths"
             )
         split_attrs["part_widths"] = part_widths
@@ -554,7 +554,7 @@ def _validate_exact_rewrite_semantics(
         if op == "multiply_rolling_depthwise_gate":
             if region[3].get("attrs", {}):
                 raise ModelCompileError(
-                    f"candidate circuit {pedal_id!r} rewrite {candidate_node['id']!r} "
+                    f"candidate circuit {component_id!r} rewrite {candidate_node['id']!r} "
                     "drops output-gate attributes"
                 )
             expected_attrs["output_gate_rounding"] = "BF16"
@@ -582,14 +582,14 @@ def _validate_exact_rewrite_semantics(
         }
     elif op == "linear_split_recurrent_depthwise_gate":
         linear, split, multiply, rolling, depthwise, output_gate = region
-        _require_empty_attrs(pedal_id, op, [linear, output_gate])
+        _require_empty_attrs(component_id, op, [linear, output_gate])
         split_attrs = deepcopy(split.get("attrs", {}))
         part_widths = split_attrs.get("part_widths")
         if part_widths is None:
             part_width = split_attrs.get("part_width")
             if not isinstance(part_width, int):
                 raise ModelCompileError(
-                    f"candidate circuit {pedal_id!r} rewrite {candidate_node['id']!r} "
+                    f"candidate circuit {component_id!r} rewrite {candidate_node['id']!r} "
                     "does not preserve a provable projection split width"
                 )
             part_widths = [part_width] * 3
@@ -626,7 +626,7 @@ def _validate_exact_rewrite_semantics(
             output_gate_index = projection_outputs.index(output_gate_signal)
         except (IndexError, KeyError, StopIteration, ValueError) as error:
             raise ModelCompileError(
-                f"candidate circuit {pedal_id!r} rewrite {candidate_node['id']!r} "
+                f"candidate circuit {component_id!r} rewrite {candidate_node['id']!r} "
                 f"has an unprovable recurrent branch mapping: {recurrent_inputs}"
             ) from error
         expected_attrs = {
@@ -639,29 +639,29 @@ def _validate_exact_rewrite_semantics(
         }
     else:
         raise ModelCompileError(
-            f"candidate circuit {pedal_id!r} rewrite {candidate_node['id']!r} "
+            f"candidate circuit {component_id!r} rewrite {candidate_node['id']!r} "
             f"has no semantic proof implementation for {op!r}"
         )
 
     if attrs != expected_attrs:
         raise ModelCompileError(
-            f"candidate circuit {pedal_id!r} rewrite {candidate_node['id']!r} "
+            f"candidate circuit {component_id!r} rewrite {candidate_node['id']!r} "
             f"changes exact rewrite attributes: expected={expected_attrs!r}, candidate={attrs!r}"
         )
 
 
-def _require_empty_attrs(pedal_id: str, op: str, nodes: list[Json]) -> None:
+def _require_empty_attrs(component_id: str, op: str, nodes: list[Json]) -> None:
     with_attrs = [node["id"] for node in nodes if node.get("attrs", {})]
     if with_attrs:
         raise ModelCompileError(
-            f"candidate circuit {pedal_id!r} rewrite {op!r} drops source attributes "
+            f"candidate circuit {component_id!r} rewrite {op!r} drops source attributes "
             f"from {with_attrs}"
         )
 
 
 def _validate_rewrite_interface(
     *,
-    pedal_id: str,
+    component_id: str,
     candidate_node: Json,
     region: list[Json],
     region_ids: set[str],
@@ -705,7 +705,7 @@ def _validate_rewrite_interface(
     }
     if drift:
         raise ModelCompileError(
-            f"candidate circuit {pedal_id!r} rewrite {candidate_node['id']!r} "
+            f"candidate circuit {component_id!r} rewrite {candidate_node['id']!r} "
             f"changes its observable region interface: {drift}"
         )
 
@@ -785,13 +785,13 @@ def _is_sha256_digest(value: Any) -> bool:
 
 
 def _approximate_candidate_evidence(
-    pedal_id: str,
+    component_id: str,
     drift: list[str],
     candidate_digest: str,
     candidate_node_count: int,
 ) -> Json:
     return {
-        "pedal_id": pedal_id,
+        "component_id": component_id,
         "candidate_kind": "approximate",
         "status": "passed",
         "drift": drift,

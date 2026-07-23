@@ -20,7 +20,7 @@ from nerve.model_package import (
     copy_shader_templates,
     frame_parallel_batch_shader_file,
     fp8_moe_block_shape_for_stage,
-    pedal_kernel_spec,
+    component_kernel_spec,
     required_vulkan_device_extensions,
     required_vulkan_features,
     required_vulkan_subgroup_operations,

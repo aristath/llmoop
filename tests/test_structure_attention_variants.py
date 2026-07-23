@@ -38,8 +38,8 @@ def test_discovers_attention_without_optional_query_key_norms() -> None:
     assert structure.norm_eps == 1e-5
     assert structure.rope_theta == 100000.0
 
-    pedal = make_layer(structure, layer)
-    circuit = build_pedal_circuit(pedal, Path("layer_00.json"))
+    component = make_layer(structure, layer)
+    circuit = build_component_circuit(component, Path("layer_00.json"))
     nodes = {node["id"]: node for node in circuit["nodes"]}
 
     assert "q_head_norm" not in nodes
@@ -87,8 +87,8 @@ def test_discovers_source_defined_per_head_attention_gate(tmp_path: Path) -> Non
     assert layer.attention_gate_activation == "softplus"
     assert layer.attention_gate_per_head is True
 
-    pedal = make_layer(structure, layer)
-    circuit = build_pedal_circuit(pedal, Path("layer_00.json"))
+    component = make_layer(structure, layer)
+    circuit = build_component_circuit(component, Path("layer_00.json"))
     nodes = {node["id"]: node for node in circuit["nodes"]}
     assert nodes["attention_gate_projection"]["params"] == ["attention_gate_projection"]
     assert nodes["attention_output_gate"] == {
@@ -187,7 +187,7 @@ def test_discovers_nested_hybrid_decoder_by_tensor_structure() -> None:
     gated = make_layer(structure, structure.layers[0])
     assert gated["state_ports"][0]["dtype"] == "BF16"
     assert gated["state_ports"][1]["dtype"] == "F32"
-    attention_circuit = build_pedal_circuit(
+    attention_circuit = build_component_circuit(
         make_layer(structure, structure.layers[1]), Path("layer_01.json")
     )
     split = next(
@@ -252,8 +252,8 @@ def test_discovers_sparse_moe_and_model_specific_numerics_by_structure(
     assert structure.attention_scale == 0.015625
     assert structure.logits_scale == 6.0
 
-    pedal = make_layer(structure, layer)
-    circuit = build_pedal_circuit(pedal, Path("layer_00.json"))
+    component = make_layer(structure, layer)
+    circuit = build_component_circuit(component, Path("layer_00.json"))
     nodes = {node["id"]: node for node in circuit["nodes"]}
     assert nodes["attention_read"]["attrs"]["scale"] == 0.015625
     assert nodes["operator_residual"]["op"] == "scaled_residual_add"
@@ -326,7 +326,7 @@ def test_discovers_mixed_window_attention_sinks_and_shared_sparse_experts() -> N
     assert full["state_ports"][0]["max_dynamic_activations"] is None
     assert sliding["state_ports"][0]["max_dynamic_activations"] == 128
 
-    circuit = build_pedal_circuit(sliding, Path("layer_01.json"))
+    circuit = build_component_circuit(sliding, Path("layer_01.json"))
     nodes = {node["id"]: node for node in circuit["nodes"]}
     assert nodes["attention_read"]["params"] == ["attention_sinks"]
     assert nodes["attention_read"]["attrs"]["attention_sinks"] is True
@@ -373,7 +373,7 @@ def test_discovers_fused_qkv_and_gate_up_projections_by_shape() -> None:
     assert layer.tensors["qkv_projection"].endswith("qkv_proj.weight")
     assert layer.tensors["ffn_gate_up"].endswith("gate_up_proj.weight")
 
-    circuit = build_pedal_circuit(make_layer(structure, layer), Path("layer_00.json"))
+    circuit = build_component_circuit(make_layer(structure, layer), Path("layer_00.json"))
     nodes = {node["id"]: node for node in circuit["nodes"]}
     assert nodes["qkv_projection"]["params"] == ["qkv_projection"]
     assert nodes["qkv_split"]["attrs"] == {"part_widths": [16, 8, 8]}

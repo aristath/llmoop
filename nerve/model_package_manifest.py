@@ -295,7 +295,7 @@ def build_vulkan_resident_package_manifest(
         candidate_circuits=compiled_circuits,
     )
     write_json(package_dir / "behavioral_validation.json", behavioral_validation)
-    pedal_executions = pedal_execution_specs(
+    component_executions = component_execution_specs(
         lowered_index=lowered_index,
         compiled_circuits=compiled_circuits,
         tensor_index=tensor_index,
@@ -314,16 +314,16 @@ def build_vulkan_resident_package_manifest(
         vocab_size=vocab_size,
         hidden_size=hidden_size,
     )
-    all_pedal_executions = [
-        *pedal_executions,
+    all_component_executions = [
+        *component_executions,
         *(
             execution
             for decoder in speculative_decoders
-            for execution in decoder["pedal_executions"]
+            for execution in decoder["component_executions"]
         ),
     ]
     shader_files = required_shader_files(
-        all_pedal_executions,
+        all_component_executions,
         embedding_shader_file=embedding_shader_file,
         embedding_batch_shader_file=embedding_batch_shader_file,
         projection_shader_file=projection_shader_file,
@@ -355,7 +355,7 @@ def build_vulkan_resident_package_manifest(
         package_dir / "shaders",
         shader_files,
     )
-    for execution in all_pedal_executions:
+    for execution in all_component_executions:
         for kernel in execution["kernels"]:
             for implementation in kernel["batch_implementations"]:
                 implementation["device_requirements"]["vulkan_device_extensions"] = (
@@ -369,7 +369,7 @@ def build_vulkan_resident_package_manifest(
                 )
     optional_device_shader_files = {
         stage["shader_path"].removeprefix("shaders/")
-        for execution in all_pedal_executions
+        for execution in all_component_executions
         for kernel in execution["kernels"]
         for implementation in kernel["batch_implementations"]
         for stage in implementation["stages"]
@@ -403,7 +403,7 @@ def build_vulkan_resident_package_manifest(
         package_dir / "shaders",
         mandatory_spirv_files,
     )
-    for execution in all_pedal_executions:
+    for execution in all_component_executions:
         for kernel in execution["kernels"]:
             kernel["shader_path"] = compiled_shader_path(kernel["shader_path"])
             for implementation in kernel["batch_implementations"]:
@@ -487,7 +487,7 @@ def build_vulkan_resident_package_manifest(
                 "logits_byte_capacity": logits_bytes,
                 # The projection shader collaboratively computes two vocabulary
                 # rows per workgroup. Dispatch geometry is part of the compiled
-                # pedal, not something the runtime should infer from a model.
+                # component, not something the runtime should infer from a model.
                 "projection_workgroup_count_x": (vocab_size + 1) // 2,
                 "norm_local_size_x": 64,
                 "projection_local_size_x": 64,
@@ -525,7 +525,7 @@ def build_vulkan_resident_package_manifest(
             },
             "kernels": sampler_kernels,
         },
-        "pedal_executions": pedal_executions,
+        "component_executions": component_executions,
         "speculative_decoders": speculative_decoders,
     }
 
@@ -536,11 +536,11 @@ def package_circuit_graph(
     compiled_circuits: dict[str, Json],
 ) -> Json:
     graph = lowered_index["graph"]
-    pedals = []
+    components = []
     for circuit_ref in graph["circuits"]:
-        pedals.append(
+        components.append(
             {
-                "pedal_id": circuit_ref["id"],
+                "component_id": circuit_ref["id"],
                 "operator_type": circuit_ref["operator_type"],
                 "runtime_role": circuit_ref["runtime_role"],
                 "implementation": circuit_ref["implementation"],
@@ -552,18 +552,18 @@ def package_circuit_graph(
         )
 
     return {
-        "wiring": graph["wiring"],
-        "cables": deepcopy(graph["cables"]),
+        "topology": graph["topology"],
+        "edges": deepcopy(graph["edges"]),
         "boundary": deepcopy(graph["boundary"]),
         "architecture": deepcopy(lowered_index.get("architecture", {})),
         "dimensions": deepcopy(lowered_index.get("dimensions", {})),
         "input_transducer": deepcopy(graph.get("input_transducer", {})),
         "output_transducer": deepcopy(graph.get("output_transducer", {})),
-        "pedals": pedals,
+        "components": components,
     }
 
 
-def pedal_execution_specs(
+def component_execution_specs(
     *,
     lowered_index: Json,
     compiled_circuits: dict[str, Json],
@@ -585,7 +585,7 @@ def pedal_execution_specs(
                 dimensions,
             )
             kernels.append(
-                pedal_kernel_spec(
+                component_kernel_spec(
                     execution_index=index,
                     node=node,
                     shader_file=shader_file,
@@ -597,7 +597,7 @@ def pedal_execution_specs(
             )
         executions.append(
             {
-                "pedal_id": circuit_ref["id"],
+                "component_id": circuit_ref["id"],
                 "operator_type": circuit_ref["operator_type"],
                 "implementation": circuit_ref["implementation"],
                 "kernels": kernels,
@@ -622,7 +622,7 @@ def speculative_decoder_specs(
     hidden_size: int,
 ) -> list[Json]:
     decoders = []
-    for draft in lowered_index.get("draft_pedalboards", []):
+    for draft in lowered_index.get("draft_execution_graphs", []):
         circuit_refs = draft["circuits"]
         input_ref = next(
             ref for ref in circuit_refs if ref["runtime_role"] == "draft_input_adapter"
@@ -638,7 +638,7 @@ def speculative_decoder_specs(
             if ref["runtime_role"] in {"draft_input_adapter", "draft_processor"}
         ]
         executions = [
-            pedal_execution_spec(
+            component_execution_spec(
                 circuit_ref=ref,
                 circuit=compiled_circuits[ref["id"]],
                 tensor_index=tensor_index,
@@ -659,7 +659,7 @@ def speculative_decoder_specs(
                     draft, lowered_dir, compiled_circuits
                 ),
                 "input_adapter": {
-                    "pedal_id": input_ref["id"],
+                    "component_id": input_ref["id"],
                     "token_embedding_signal_id": "token_embedding",
                     "target_hidden_signal_id": "target_hidden",
                     "output_signal_id": "output_frame",
@@ -668,7 +668,7 @@ def speculative_decoder_specs(
                     "output_frame_byte_capacity": frame_bytes,
                 },
                 "output_transducer": {
-                    "pedal_id": output_ref["id"],
+                    "component_id": output_ref["id"],
                     "input_signal_id": "output_frame",
                     "hidden_signal_id": "output_hidden",
                     "logits_signal_id": "output_logits",
@@ -703,7 +703,7 @@ def speculative_decoder_specs(
                         f"shaders/{projection_shader_file}"
                     ),
                 },
-                "pedal_executions": executions,
+                "component_executions": executions,
                 "state_contract": deepcopy(draft["state_contract"]),
                 "verification_contract": {
                     "target_execution": "multi_token",
@@ -715,7 +715,7 @@ def speculative_decoder_specs(
     return decoders
 
 
-def pedal_execution_spec(
+def component_execution_spec(
     *,
     circuit_ref: Json,
     circuit: Json,
@@ -726,7 +726,7 @@ def pedal_execution_spec(
     for index, node in enumerate(circuit["nodes"]):
         shader_file = shader_file_for_node(circuit, node, tensor_index, dimensions)
         kernels.append(
-            pedal_kernel_spec(
+            component_kernel_spec(
                 execution_index=index,
                 node=node,
                 shader_file=shader_file,
@@ -737,14 +737,14 @@ def pedal_execution_spec(
             )
         )
     return {
-        "pedal_id": circuit_ref["id"],
+        "component_id": circuit_ref["id"],
         "operator_type": circuit_ref["operator_type"],
         "implementation": circuit_ref["implementation"],
         "kernels": kernels,
     }
 
 
-def pedal_kernel_spec(
+def component_kernel_spec(
     *,
     execution_index: int,
     node: Json,
@@ -892,11 +892,11 @@ def package_auxiliary_circuit_graph(
     lowered_dir: Path,
     compiled_circuits: dict[str, Json],
 ) -> Json:
-    pedals = []
+    components = []
     for circuit_ref in draft["circuits"]:
-        pedals.append(
+        components.append(
             {
-                "pedal_id": circuit_ref["id"],
+                "component_id": circuit_ref["id"],
                 "operator_type": circuit_ref["operator_type"],
                 "runtime_role": circuit_ref["runtime_role"],
                 "implementation": circuit_ref["implementation"],
@@ -907,8 +907,8 @@ def package_auxiliary_circuit_graph(
             }
         )
     return {
-        "wiring": draft["wiring"],
-        "cables": deepcopy(draft["cables"]),
+        "topology": draft["topology"],
+        "edges": deepcopy(draft["edges"]),
         "boundary": deepcopy(draft["boundary"]),
-        "pedals": pedals,
+        "components": components,
     }

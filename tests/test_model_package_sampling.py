@@ -28,7 +28,7 @@ def test_compiler_renders_model_owned_sampling_shader(tmp_path: Path) -> None:
     assert "{{" not in sampler
 
 
-def test_compiler_renders_repetition_state_as_sampler_pedal_artifacts(
+def test_compiler_renders_repetition_state_as_sampler_component_artifacts(
     tmp_path: Path,
 ) -> None:
     shader_source_dir = Path(__file__).parents[1] / "runtime-rs" / "shaders"

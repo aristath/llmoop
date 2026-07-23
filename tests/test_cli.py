@@ -21,11 +21,11 @@ def runtime_args(**overrides: object) -> Namespace:
         "chat_template_var": [],
         "inspect_runtime": False,
         "inspect_package": False,
-        "inspect_patch": False,
+        "inspect_graph": False,
         "inspect_placement": False,
         "inspect_device_slice": None,
         "device": None,
-        "place_pedal": [],
+        "place_node": [],
         "bind_device": [],
         "duplicate_after": [],
         "chain": None,
@@ -144,11 +144,11 @@ class RuntimeCliCommandTest(unittest.TestCase):
             prompt="Hello",
             inspect_runtime=False,
             inspect_package=False,
-            inspect_patch=False,
+            inspect_graph=False,
             inspect_placement=False,
             inspect_device_slice=None,
             device=None,
-            place_pedal=[],
+            place_node=[],
             bind_device=[],
             duplicate_after=[],
             chain=None,
@@ -188,11 +188,11 @@ class RuntimeCliCommandTest(unittest.TestCase):
             chat=True,
             inspect_runtime=False,
             inspect_package=False,
-            inspect_patch=False,
+            inspect_graph=False,
             inspect_placement=False,
             inspect_device_slice=None,
             device=None,
-            place_pedal=[],
+            place_node=[],
             bind_device=[],
             duplicate_after=[],
             chain=None,
@@ -245,11 +245,11 @@ class RuntimeCliCommandTest(unittest.TestCase):
             prompt=None,
             inspect_runtime=False,
             inspect_package=False,
-            inspect_patch=False,
+            inspect_graph=False,
             inspect_placement=False,
             inspect_device_slice="gpu1",
             device=None,
-            place_pedal=[],
+            place_node=[],
             bind_device=[],
             duplicate_after=[],
             chain=None,
@@ -283,11 +283,11 @@ class RuntimeCliCommandTest(unittest.TestCase):
             prompt=None,
             inspect_runtime=False,
             inspect_package=False,
-            inspect_patch=False,
+            inspect_graph=False,
             inspect_placement=True,
             inspect_device_slice=None,
             device=None,
-            place_pedal=[],
+            place_node=[],
             bind_device=[],
             duplicate_after=[],
             chain=None,
@@ -320,11 +320,11 @@ class RuntimeCliCommandTest(unittest.TestCase):
             prompt=None,
             inspect_runtime=False,
             inspect_package=True,
-            inspect_patch=False,
+            inspect_graph=False,
             inspect_placement=False,
             inspect_device_slice=None,
             device=None,
-            place_pedal=[],
+            place_node=[],
             bind_device=[],
             duplicate_after=[],
             chain=None,
@@ -351,17 +351,17 @@ class RuntimeCliCommandTest(unittest.TestCase):
             build_runtime_command(args, package),
         )
 
-    def test_build_runtime_command_can_inspect_patch_without_prompt(self) -> None:
+    def test_build_runtime_command_can_inspect_graph_without_prompt(self) -> None:
         package = Path("compiled_models/model_x/vulkan_resident_package.json")
         args = runtime_args(
             prompt=None,
             inspect_runtime=False,
             inspect_package=False,
-            inspect_patch=True,
+            inspect_graph=True,
             inspect_placement=False,
             inspect_device_slice=None,
             device=None,
-            place_pedal=["layer_05_repeat=gpu1"],
+            place_node=["layer_05_repeat=gpu1"],
             bind_device=["gpu1=vulkan:5"],
             duplicate_after=[],
             chain="layer_00,layer_05_repeat=layer_05,layer_13",
@@ -380,8 +380,8 @@ class RuntimeCliCommandTest(unittest.TestCase):
                 "/tmp/nerve-runtime",
                 "--package",
                 str(package),
-                "--inspect-patch",
-                "--place-pedal",
+                "--inspect-graph",
+                "--place-node",
                 "layer_05_repeat=gpu1",
                 "--bind-device",
                 "gpu1=vulkan:5",
@@ -398,11 +398,11 @@ class RuntimeCliCommandTest(unittest.TestCase):
             prompt=None,
             inspect_runtime=False,
             inspect_package=False,
-            inspect_patch=True,
+            inspect_graph=True,
             inspect_placement=False,
             inspect_device_slice=None,
             device="gpu0",
-            place_pedal=["layer_01=cpu0"],
+            place_node=["layer_01=cpu0"],
             bind_device=[],
             duplicate_after=[],
             chain="layer_00,layer_01,layer_02",
@@ -421,10 +421,10 @@ class RuntimeCliCommandTest(unittest.TestCase):
                 "/tmp/nerve-runtime",
                 "--package",
                 str(package),
-                "--inspect-patch",
+                "--inspect-graph",
                 "--device",
                 "gpu0",
-                "--place-pedal",
+                "--place-node",
                 "layer_01=cpu0",
                 "--chain",
                 "layer_00,layer_01,layer_02",
@@ -441,11 +441,11 @@ class RuntimeCliCommandTest(unittest.TestCase):
             prompt=None,
             inspect_runtime=True,
             inspect_package=False,
-            inspect_patch=False,
+            inspect_graph=False,
             inspect_placement=False,
             inspect_device_slice=None,
             device="gpu0",
-            place_pedal=["layer_05_repeat=gpu1"],
+            place_node=["layer_05_repeat=gpu1"],
             bind_device=["gpu0=vulkan:5", "gpu1=vulkan:5"],
             duplicate_after=[],
             chain="layer_00,layer_05_repeat=layer_05,layer_13",
@@ -467,7 +467,7 @@ class RuntimeCliCommandTest(unittest.TestCase):
                 "--inspect-runtime",
                 "--device",
                 "gpu0",
-                "--place-pedal",
+                "--place-node",
                 "layer_05_repeat=gpu1",
                 "--bind-device",
                 "gpu0=vulkan:5",
@@ -480,17 +480,17 @@ class RuntimeCliCommandTest(unittest.TestCase):
             build_runtime_command(args, package),
         )
 
-    def test_build_runtime_command_forwards_runtime_patch_overrides(self) -> None:
+    def test_build_runtime_command_forwards_runtime_graph_overrides(self) -> None:
         package = Path("compiled_models/model_x/vulkan_resident_package.json")
         args = runtime_args(
             prompt="Hello",
             inspect_runtime=False,
             inspect_package=False,
-            inspect_patch=False,
+            inspect_graph=False,
             inspect_placement=False,
             inspect_device_slice=None,
             device="gpu0",
-            place_pedal=["layer_02=gpu1", "layer_07=lan:worker-a"],
+            place_node=["layer_02=gpu1", "layer_07=lan:worker-a"],
             bind_device=["gpu0=vulkan:0", "gpu1=vulkan:5"],
             duplicate_after=["layer_05=layer_05_repeat"],
             chain="layer_00,layer_01,layer_05,layer_05_repeat=layer_05,layer_06",
@@ -515,9 +515,9 @@ class RuntimeCliCommandTest(unittest.TestCase):
                 "4",
                 "--device",
                 "gpu0",
-                "--place-pedal",
+                "--place-node",
                 "layer_02=gpu1",
-                "--place-pedal",
+                "--place-node",
                 "layer_07=lan:worker-a",
                 "--bind-device",
                 "gpu0=vulkan:0",
@@ -590,29 +590,29 @@ class CompiledPackageTest(unittest.TestCase):
             self.assertTrue((fixture.package_dir / source_file).is_file())
             self.assertEqual("row_major", info["layout"])
 
-    def test_compiled_package_declares_pedal_executions(self) -> None:
+    def test_compiled_package_declares_component_executions(self) -> None:
         fixture = compiled_model_or_skip()
         manifest = json.loads(fixture.package_manifest.read_text())
 
         self.assertNotIn("reusable_kernel_shaders", manifest)
-        executions = manifest["pedal_executions"]
-        processor_pedals = [
-            pedal
-            for pedal in manifest["circuit_graph"]["pedals"]
-            if pedal["runtime_role"] == "signal_processor"
+        executions = manifest["component_executions"]
+        processor_components = [
+            component
+            for component in manifest["circuit_graph"]["components"]
+            if component["runtime_role"] == "signal_processor"
         ]
         self.assertTrue(executions)
-        self.assertEqual(len(processor_pedals), len(executions))
-        execution_by_pedal = {
-            execution["pedal_id"]: execution for execution in executions
+        self.assertEqual(len(processor_components), len(executions))
+        execution_by_component = {
+            execution["component_id"]: execution for execution in executions
         }
         self.assertEqual(
-            {pedal["pedal_id"] for pedal in processor_pedals},
-            set(execution_by_pedal),
+            {component["component_id"] for component in processor_components},
+            set(execution_by_component),
         )
-        for pedal in processor_pedals:
-            execution = execution_by_pedal[pedal["pedal_id"]]
-            nodes = pedal["circuit"]["nodes"]
+        for component in processor_components:
+            execution = execution_by_component[component["component_id"]]
+            nodes = component["circuit"]["nodes"]
             self.assertEqual(
                 [node["id"] for node in nodes],
                 [kernel["node_id"] for kernel in execution["kernels"]],
@@ -691,12 +691,12 @@ class CompiledPackageTest(unittest.TestCase):
             *(kernel["shader_path"] for kernel in manifest["sampler"]["kernels"]),
             *(
                 kernel["shader_path"]
-                for execution in manifest["pedal_executions"]
+                for execution in manifest["component_executions"]
                 for kernel in execution["kernels"]
             ),
             *(
                 stage["shader_path"]
-                for execution in manifest["pedal_executions"]
+                for execution in manifest["component_executions"]
                 for kernel in execution["kernels"]
                 for implementation in kernel["batch_implementations"]
                 for stage in implementation["stages"]
@@ -717,29 +717,29 @@ class CompiledPackageTest(unittest.TestCase):
         self.assertNotIn("placement", manifest)
         self.assertNotIn("device_id", manifest)
         circuit_graph = manifest["circuit_graph"]
-        self.assertEqual("explicit_graph", circuit_graph["wiring"])
-        roles = [pedal["runtime_role"] for pedal in circuit_graph["pedals"]]
+        self.assertEqual("explicit_graph", circuit_graph["topology"])
+        roles = [component["runtime_role"] for component in circuit_graph["components"]]
         self.assertEqual(1, roles.count("input_transducer"))
         self.assertEqual(1, roles.count("output_transducer"))
         self.assertEqual(1, roles.count("sampler"))
         self.assertGreaterEqual(roles.count("signal_processor"), 1)
-        self.assertEqual(len(circuit_graph["pedals"]), len(circuit_graph["cables"]))
+        self.assertEqual(len(circuit_graph["components"]), len(circuit_graph["edges"]))
         self.assertEqual(
             1,
             sum(
-                cable["connection"]["kind"] == "temporal_feedback"
-                for cable in circuit_graph["cables"]
+                edge["connection"]["kind"] == "temporal_feedback"
+                for edge in circuit_graph["edges"]
             ),
         )
-        for pedal in circuit_graph["pedals"]:
-            self.assertEqual("nerve.circuit_params.v1", pedal["params"]["schema"])
-            self.assertEqual("nerve.circuit_state.v1", pedal["state"]["schema"])
+        for component in circuit_graph["components"]:
+            self.assertEqual("nerve.circuit_params.v1", component["params"]["schema"])
+            self.assertEqual("nerve.circuit_state.v1", component["state"]["schema"])
         behavioral = json.loads(
             (fixture.package_dir / manifest["behavioral_validation_path"]).read_text()
         )
         self.assertEqual("passed", behavioral["status"])
         self.assertEqual("exact_reference", behavioral["candidate_kind"])
-        self.assertEqual(len(circuit_graph["pedals"]), len(behavioral["circuits"]))
+        self.assertEqual(len(circuit_graph["components"]), len(behavioral["circuits"]))
 
     def test_compiled_model_does_not_reference_source_paths(
         self,
@@ -762,7 +762,7 @@ class CompiledPackageTest(unittest.TestCase):
         self.assertEqual(fixture.lowered_dir, fixture.compiled_model_dir / "lowered")
         self.assertTrue((fixture.transpiled_dir / "model.json").is_file())
         self.assertTrue((fixture.transpiled_dir / "tensors.json").is_file())
-        self.assertTrue((fixture.lowered_dir / "pedalboard.circuits.json").is_file())
+        self.assertTrue((fixture.lowered_dir / "execution_graph.circuits.json").is_file())
         self.assertTrue((fixture.package_dir / "weights").is_dir())
         self.assertTrue((fixture.package_dir / "shaders").is_dir())
         self.assertTrue((fixture.package_dir / "tokenizer").is_dir())

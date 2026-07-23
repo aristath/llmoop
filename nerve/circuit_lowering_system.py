@@ -15,7 +15,7 @@ def build_system_circuits(model: Json) -> list[Json]:
         for name, ref in input_component.get("params", {}).items()
     }
     input_circuit = _system_circuit(
-        pedal_id="input_transducer",
+        component_id="input_transducer",
         operator_type="input_transducer",
         runtime_role="input_transducer",
         implementation="compiled_input_transducer_v1",
@@ -75,7 +75,7 @@ def build_system_circuits(model: Json) -> list[Json]:
         )
         signal = output_signal
     output_circuit = _system_circuit(
-        pedal_id="output_transducer",
+        component_id="output_transducer",
         operator_type="output_transducer",
         runtime_role="output_transducer",
         implementation="compiled_output_transducer_v1",
@@ -108,7 +108,7 @@ def build_system_circuits(model: Json) -> list[Json]:
         sampler_top_p = sampling["top_p"]
         sampler_min_p = sampling["min_p"]
     sampler_circuit = _system_circuit(
-        pedal_id="sampler",
+        component_id="sampler",
         operator_type="sampler",
         runtime_role="sampler",
         implementation="compiled_sampler_v1",
@@ -165,7 +165,7 @@ def build_draft_system_circuits(model: Json, draft: Json) -> list[Json]:
         "weight_offset": float(adapter["attrs"]["weight_offset"]),
     }
     input_circuit = _system_circuit(
-        pedal_id=adapter_id,
+        component_id=adapter_id,
         operator_type="draft_input_adapter",
         runtime_role="draft_input_adapter",
         implementation="compiled_normalized_embedding_hidden_projection_v1",
@@ -237,7 +237,7 @@ def build_draft_system_circuits(model: Json, draft: Json) -> list[Json]:
         for name, ref in output["params"].items()
     }
     output_circuit = _system_circuit(
-        pedal_id=output_id,
+        component_id=output_id,
         operator_type="draft_output_transducer",
         runtime_role="draft_output_transducer",
         implementation="compiled_draft_output_transducer_v1",
@@ -295,7 +295,7 @@ def _system_port(
     port_id: str,
     signal: str,
     shape: list[int],
-    pedal_port: str,
+    component_port: str,
     *,
     source: str | None = None,
 ) -> Json:
@@ -303,7 +303,7 @@ def _system_port(
         "id": port_id,
         "signal": signal,
         "shape": shape,
-        "pedal_port": pedal_port,
+        "component_port": component_port,
     }
     if source is not None:
         port["source"] = source
@@ -316,7 +316,7 @@ def _system_param_ref(reference: Json, role: str) -> Json:
 
 def _system_circuit(
     *,
-    pedal_id: str,
+    component_id: str,
     operator_type: str,
     runtime_role: str,
     implementation: str,
@@ -327,9 +327,9 @@ def _system_circuit(
 ) -> Json:
     return {
         "schema": "nerve.stream_circuit.v1",
-        "id": f"{pedal_id}_circuit_v1",
+        "id": f"{component_id}_circuit_v1",
         "source": {
-            "pedal_id": pedal_id,
+            "component_id": component_id,
             "source_layer_index": None,
             "source_operator_type": operator_type,
         },
@@ -349,7 +349,7 @@ def _system_circuit(
             "reference": operator_type,
         },
         "lowering_notes": [
-            "This stream entity is part of the editable pedalboard contract.",
+            "This stream entity is part of the editable execution graph contract.",
             "Its optimized Vulkan implementation is a backend lowering, not a host-side exception.",
         ],
     }

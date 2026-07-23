@@ -43,18 +43,18 @@ def transpile_model(
     ]
     emitted_layers.extend(
         (layer, f"{draft.id}_layer_{layer.index:02d}", f"drafts/{draft.id}/layers")
-        for draft in structure.draft_pedalboards
+        for draft in structure.draft_execution_graphs
         for layer in draft.layers
     )
     total = len(emitted_layers)
-    for current, (layer, pedal_id, relative_dir) in enumerate(emitted_layers, start=1):
+    for current, (layer, component_id, relative_dir) in enumerate(emitted_layers, start=1):
         check_compile_cancelled(cancel_requested)
         write_json(
-            output_dir / relative_dir / f"{pedal_id}.json",
+            output_dir / relative_dir / f"{component_id}.json",
             make_layer(
                 structure,
                 layer,
-                pedal_id=pedal_id,
+                component_id=component_id,
                 runtime_role=(
                     "signal_processor"
                     if relative_dir == "layers"
@@ -63,6 +63,6 @@ def transpile_model(
             ),
         )
         if progress is not None:
-            progress(current, total, pedal_id)
+            progress(current, total, component_id)
 
     return structure

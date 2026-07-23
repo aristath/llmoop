@@ -2,7 +2,7 @@ from nerve.model_package_common import *
 from nerve.model_package_shader_selection import *
 
 def required_shader_files(
-    pedal_executions: list[Json],
+    component_executions: list[Json],
     *,
     embedding_shader_file: str,
     embedding_batch_shader_file: str,
@@ -22,13 +22,13 @@ def required_shader_files(
         projection_batch_shader_file,
         *(
             kernel["shader_path"].removeprefix("shaders/")
-            for pedal in pedal_executions
-            for kernel in pedal["kernels"]
+            for component in component_executions
+            for kernel in component["kernels"]
         ),
         *(
             stage["shader_path"].removeprefix("shaders/")
-            for pedal in pedal_executions
-            for kernel in pedal["kernels"]
+            for component in component_executions
+            for kernel in component["kernels"]
             for implementation in kernel["batch_implementations"]
             for stage in implementation["stages"]
         ),

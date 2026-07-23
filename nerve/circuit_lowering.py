@@ -6,10 +6,10 @@ from nerve.circuit_lowering_nodes import *
 from nerve.circuit_lowering_operators import *
 from nerve.circuit_lowering_system import *
 
-def lower_pedal(pedal_path: Path, out_dir: Path) -> Json:
-    pedal = read_json(pedal_path)
-    circuit = build_pedal_circuit(pedal, pedal_path)
-    validation = validate_circuit_against_pedal(circuit, pedal)
+def lower_component(component_path: Path, out_dir: Path) -> Json:
+    component = read_json(component_path)
+    circuit = build_component_circuit(component, component_path)
+    validation = validate_circuit_against_component(circuit, component)
     validation.raise_for_errors()
 
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -21,7 +21,7 @@ def lower_pedal(pedal_path: Path, out_dir: Path) -> Json:
     write_json(state_path, build_state_artifact(circuit))
 
     return {
-        "pedal": pedal,
+        "component": component,
         "circuit": circuit,
         "validation": validation.to_json(),
         "circuit_path": circuit_path,
@@ -30,51 +30,51 @@ def lower_pedal(pedal_path: Path, out_dir: Path) -> Json:
     }
 
 
-def build_pedal_circuit(pedal: Json, pedal_path: Path) -> Json:
-    operator_type = pedal.get("operator_type")
+def build_component_circuit(component: Json, component_path: Path) -> Json:
+    operator_type = component.get("operator_type")
     if operator_type == "conv":
-        return build_conv_circuit(pedal, pedal_path)
+        return build_conv_circuit(component, component_path)
     if operator_type == "full_attention":
-        return build_attention_circuit(pedal, pedal_path)
+        return build_attention_circuit(component, component_path)
     if operator_type == "gated_delta":
-        return build_gated_delta_circuit(pedal, pedal_path)
+        return build_gated_delta_circuit(component, component_path)
     if operator_type == "rg_lru":
-        return build_rg_lru_circuit(pedal, pedal_path)
-    raise ValueError(f"unsupported pedal operator type {operator_type!r}")
+        return build_rg_lru_circuit(component, component_path)
+    raise ValueError(f"unsupported component operator type {operator_type!r}")
 
 
-def lower_pedalboard(
-    pedalboard_dir: Path,
+def lower_execution_graph(
+    execution_graph_dir: Path,
     out_dir: Path,
     *,
     progress: Callable[[int, int, str], None] | None = None,
     cancel_requested: Callable[[], bool] | None = None,
 ) -> Json:
-    model = read_json(pedalboard_dir / "model.json")
-    source_pedals = model["graph"]["pedalboard"]["pedals"]
-    source_drafts = model["graph"].get("draft_pedalboards", [])
-    draft_source_pedals = [
-        pedal for draft in source_drafts for pedal in draft["pedalboard"]["pedals"]
+    model = read_json(execution_graph_dir / "model.json")
+    source_components = model["graph"]["execution_graph"]["components"]
+    source_drafts = model["graph"].get("draft_execution_graphs", [])
+    draft_source_components = [
+        component for draft in source_drafts for component in draft["execution_graph"]["components"]
     ]
 
     lowered: list[Json] = []
     operator_counts: Counter[str] = Counter()
-    total = len(source_pedals) + len(draft_source_pedals)
-    for current, source_pedal in enumerate(source_pedals, start=1):
+    total = len(source_components) + len(draft_source_components)
+    for current, source_component in enumerate(source_components, start=1):
         check_compile_cancelled(cancel_requested)
         if progress is not None:
-            progress(current, total, source_pedal["id"])
-        pedal_path = pedalboard_dir / source_pedal["file"]
-        pedal_out_dir = out_dir / source_pedal["id"]
-        result = lower_pedal(pedal_path, pedal_out_dir)
+            progress(current, total, source_component["id"])
+        component_path = execution_graph_dir / source_component["file"]
+        component_out_dir = out_dir / source_component["id"]
+        result = lower_component(component_path, component_out_dir)
         circuit_rel = result["circuit_path"].relative_to(out_dir)
         params_rel = result["params_path"].relative_to(out_dir)
         state_rel = result["state_path"].relative_to(out_dir)
-        operator_counts[source_pedal["operator_type"]] += 1
+        operator_counts[source_component["operator_type"]] += 1
         lowered.append(
             {
-                "id": source_pedal["id"],
-                "operator_type": source_pedal["operator_type"],
+                "id": source_component["id"],
+                "operator_type": source_component["operator_type"],
                 "runtime_role": result["circuit"]["runtime_role"],
                 "circuit": str(circuit_rel),
                 "params": str(params_rel),
@@ -84,23 +84,23 @@ def lower_pedalboard(
             }
         )
 
-    draft_pedalboards: list[Json] = []
-    lowered_count = len(source_pedals)
+    draft_execution_graphs: list[Json] = []
+    lowered_count = len(source_components)
     for draft in source_drafts:
         draft_refs: list[Json] = []
-        for source_pedal in draft["pedalboard"]["pedals"]:
+        for source_component in draft["execution_graph"]["components"]:
             check_compile_cancelled(cancel_requested)
             lowered_count += 1
             if progress is not None:
-                progress(lowered_count, total, source_pedal["id"])
-            pedal_path = pedalboard_dir / source_pedal["file"]
-            pedal_out_dir = out_dir / "drafts" / draft["id"] / source_pedal["id"]
-            result = lower_pedal(pedal_path, pedal_out_dir)
-            operator_counts[source_pedal["operator_type"]] += 1
+                progress(lowered_count, total, source_component["id"])
+            component_path = execution_graph_dir / source_component["file"]
+            component_out_dir = out_dir / "drafts" / draft["id"] / source_component["id"]
+            result = lower_component(component_path, component_out_dir)
+            operator_counts[source_component["operator_type"]] += 1
             draft_refs.append(
                 {
-                    "id": source_pedal["id"],
-                    "operator_type": source_pedal["operator_type"],
+                    "id": source_component["id"],
+                    "operator_type": source_component["operator_type"],
                     "runtime_role": result["circuit"]["runtime_role"],
                     "circuit": str(result["circuit_path"].relative_to(out_dir)),
                     "params": str(result["params_path"].relative_to(out_dir)),
@@ -109,18 +109,18 @@ def lower_pedalboard(
                     "behavioral_role": result["circuit"]["behavioral_role"],
                 }
             )
-        lowered_draft = lower_draft_pedalboard(model, draft, draft_refs, out_dir)
+        lowered_draft = lower_draft_execution_graph(model, draft, draft_refs, out_dir)
         operator_counts["draft_input_adapter"] += 1
         operator_counts["draft_output_transducer"] += 1
-        draft_pedalboards.append(lowered_draft)
+        draft_execution_graphs.append(lowered_draft)
 
     if not lowered:
-        raise ValueError("cannot lower an empty pedalboard")
+        raise ValueError("cannot lower an empty execution graph")
 
     system_circuits = build_system_circuits(model)
     system_refs: dict[str, Json] = {}
     for circuit in system_circuits:
-        circuit_id = circuit["source"]["pedal_id"]
+        circuit_id = circuit["source"]["component_id"]
         circuit_out_dir = out_dir / circuit_id
         circuit_out_dir.mkdir(parents=True, exist_ok=True)
         validation = validate_circuit(circuit)
@@ -150,9 +150,9 @@ def lower_pedalboard(
     forward_chain = [input_ref, *lowered, output_ref, sampler_ref]
 
     index = {
-        "schema": "nerve.lowered_pedalboard.v1",
+        "schema": "nerve.lowered_execution_graph.v1",
         "source": {
-            "format": "nerve.compiled_pedalboard_artifact.v1",
+            "format": "nerve.compiled_execution_graph_artifact.v1",
             "artifact_root": ".",
         },
         "architecture": model["architecture"],
@@ -160,18 +160,18 @@ def lower_pedalboard(
         "numerics": model["numerics"],
         "token_ids": model["token_ids"],
         "graph": {
-            "wiring": "explicit_graph",
+            "topology": "explicit_graph",
             "circuits": all_circuits,
-            "cables": [
+            "edges": [
                 {
-                    "id": f"cable_{index:04d}",
+                    "id": f"edge_{index:04d}",
                     "connection": {"kind": "forward"},
                     "source": {
-                        "pedal_id": source["id"],
+                        "component_id": source["id"],
                         "port_id": _canonical_output_port(source["runtime_role"]),
                     },
                     "destination": {
-                        "pedal_id": destination["id"],
+                        "component_id": destination["id"],
                         "port_id": _canonical_input_port(destination["runtime_role"]),
                     },
                 }
@@ -187,11 +187,11 @@ def lower_pedalboard(
                         "delay_activations": 1,
                     },
                     "source": {
-                        "pedal_id": sampler_ref["id"],
+                        "component_id": sampler_ref["id"],
                         "port_id": "sampled_token",
                     },
                     "destination": {
-                        "pedal_id": input_ref["id"],
+                        "component_id": input_ref["id"],
                         "port_id": "input_token",
                     },
                 }
@@ -201,14 +201,14 @@ def lower_pedalboard(
                     {
                         "id": "user_input",
                         "endpoint": {
-                            "pedal_id": input_ref["id"],
+                            "component_id": input_ref["id"],
                             "port_id": "input_token",
                         },
                     },
                     {
                         "id": "random_seed",
                         "endpoint": {
-                            "pedal_id": sampler_ref["id"],
+                            "component_id": sampler_ref["id"],
                             "port_id": "random_seed",
                         },
                     },
@@ -217,7 +217,7 @@ def lower_pedalboard(
                     {
                         "id": "model_output",
                         "endpoint": {
-                            "pedal_id": sampler_ref["id"],
+                            "component_id": sampler_ref["id"],
                             "port_id": "sampled_token",
                         },
                     }
@@ -226,29 +226,29 @@ def lower_pedalboard(
             "input_transducer": model["graph"]["input_transducer"],
             "output_transducer": model["graph"]["output_transducer"],
         },
-        "draft_pedalboards": draft_pedalboards,
+        "draft_execution_graphs": draft_execution_graphs,
         "summary": {
             "circuit_count": len(all_circuits)
-            + sum(len(draft["circuits"]) for draft in draft_pedalboards),
+            + sum(len(draft["circuits"]) for draft in draft_execution_graphs),
             "generation_circuit_count": len(all_circuits),
-            "draft_pedalboard_count": len(draft_pedalboards),
+            "draft_execution_graph_count": len(draft_execution_graphs),
             "operator_counts": dict(sorted(operator_counts.items())),
         },
         "notes": [
-            "This index maps the source pedalboard to stream-circuit artifacts.",
-            "The artifacts preserve pedal boundaries for now; a backend may later fuse or replace connected regions.",
-            "No layer receives privileged treatment; every pedal is addressed through the same boundary contract.",
+            "This index maps the source execution graph to stream-circuit artifacts.",
+            "The artifacts preserve component boundaries for now; a backend may later fuse or replace connected regions.",
+            "No layer receives privileged treatment; every component is addressed through the same boundary contract.",
         ],
     }
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    index_path = out_dir / "pedalboard.circuits.json"
+    index_path = out_dir / "execution_graph.circuits.json"
     write_json(index_path, index)
     return {
         "index": index,
         "index_path": index_path,
         "circuits": lowered,
-        "draft_pedalboards": draft_pedalboards,
+        "draft_execution_graphs": draft_execution_graphs,
     }
 
 
@@ -270,18 +270,18 @@ def _canonical_output_port(runtime_role: str) -> str:
     }[runtime_role]
 
 
-def lower_draft_pedalboard(
+def lower_draft_execution_graph(
     model: Json,
     draft: Json,
     layer_refs: list[Json],
     out_dir: Path,
 ) -> Json:
     if not layer_refs:
-        raise ValueError(f"draft pedalboard {draft['id']!r} contains no layer pedals")
+        raise ValueError(f"draft execution graph {draft['id']!r} contains no layer components")
     system_circuits = build_draft_system_circuits(model, draft)
     system_refs = []
     for circuit in system_circuits:
-        circuit_id = circuit["source"]["pedal_id"]
+        circuit_id = circuit["source"]["component_id"]
         circuit_out_dir = out_dir / "drafts" / draft["id"] / circuit_id
         circuit_out_dir.mkdir(parents=True, exist_ok=True)
         validate_circuit(circuit).raise_for_errors()
@@ -310,14 +310,14 @@ def lower_draft_pedalboard(
         "id": draft["id"],
         "type": draft["type"],
         "source_prefix": draft["source_prefix"],
-        "wiring": "explicit_graph",
+        "topology": "explicit_graph",
         "circuits": forward_chain,
-        "cables": [
+        "edges": [
             {
-                "id": f"{draft['id']}_cable_{index:04d}",
+                "id": f"{draft['id']}_edge_{index:04d}",
                 "connection": {"kind": "forward"},
                 "source": {
-                    "pedal_id": source["id"],
+                    "component_id": source["id"],
                     "port_id": (
                         "output_frame"
                         if source["runtime_role"] != "draft_output_transducer"
@@ -325,7 +325,7 @@ def lower_draft_pedalboard(
                     ),
                 },
                 "destination": {
-                    "pedal_id": destination["id"],
+                    "component_id": destination["id"],
                     "port_id": "input_frame",
                 },
             }
@@ -338,14 +338,14 @@ def lower_draft_pedalboard(
                 {
                     "id": "token_embedding",
                     "endpoint": {
-                        "pedal_id": input_ref["id"],
+                        "component_id": input_ref["id"],
                         "port_id": "token_embedding",
                     },
                 },
                 {
                     "id": "target_hidden",
                     "endpoint": {
-                        "pedal_id": input_ref["id"],
+                        "component_id": input_ref["id"],
                         "port_id": "target_hidden",
                     },
                 },
@@ -354,14 +354,14 @@ def lower_draft_pedalboard(
                 {
                     "id": "draft_hidden",
                     "endpoint": {
-                        "pedal_id": output_ref["id"],
+                        "component_id": output_ref["id"],
                         "port_id": "output_hidden",
                     },
                 },
                 {
                     "id": "draft_logits",
                     "endpoint": {
-                        "pedal_id": output_ref["id"],
+                        "component_id": output_ref["id"],
                         "port_id": "output_logits",
                     },
                 },
@@ -369,5 +369,3 @@ def lower_draft_pedalboard(
         },
         "state_contract": dict(draft["state_contract"]),
     }
-
-
