@@ -27,30 +27,11 @@ context/output limits, or benchmark-only shortcuts.
 
 ## Remaining work, in priority order
 
-### 1. Wire prefix/state reuse into normal stream admission
-
-Prefix-state primitives exist, but normal chat does not automatically use them.
-
-- Restore the longest compatible cached prefix when admitting prompt input.
-- Insert reusable block-aligned state after normal prefill.
-- Serialize every runtime modifier that can affect state into the cache key.
-- Key reuse by canonical graph identity, exact placement, component/state layout,
-  model/package identity, and token prefix.
-- Connect cache references to physical page refcounts, copy-on-write, eviction,
-  and reclamation.
-- Report hits, misses, reused tokens, saved prefill work, and eviction behavior.
-- Validate reuse with real multi-turn and branched conversations.
-
-### 2. Define canonical runtime graph identity and reusable execution templates
+### 1. Use canonical runtime graph identity for reusable execution templates
 
 Execution-class compatibility, prefix reuse, and command/template reuse need one
 precise graph identity.
 
-- Canonicalize source component references, node instances, topology, edge kinds,
-  duplication/bypass edits, exact component placement, state layout, shape class,
-  and selected kernel variants.
-- Include runtime modifiers when they change execution or transient-state
-  semantics.
 - Use the identity consistently for scheduler compatibility, prefix-state keys,
   resident execution plans, and feedback templates.
 - Maintain reusable prefill, decode, and batch template catalogs.
@@ -68,7 +49,7 @@ precise graph identity.
   rebased without giving independently recorded templates stale relative
   offsets.
 
-### 3. Make cross-device execution efficient without making it mandatory
+### 2. Make cross-device execution efficient without making it mandatory
 
 Everything may run on one device. Multi-device execution should become useful
 when requested by placement or required by model size.
@@ -95,7 +76,7 @@ when requested by placement or required by model size.
   the prior single-device run; repeat under matched context and conversation
   conditions before attributing the entire difference to transport.
 
-### 4. Complete route-native MoE execution
+### 3. Complete route-native MoE execution
 
 Sparse components and selected-route kernels exist, but routing is not yet a
 fully optimized runtime signal path.
@@ -110,7 +91,7 @@ fully optimized runtime signal path.
 - Make the 35B MoE model's performance reflect its active parameter count rather
   than its full declared size.
 
-### 5. Integrate MTP into the steady-state scheduler and device loop
+### 4. Integrate MTP into the steady-state scheduler and device loop
 
 MTP compilation and transactional verification work, but speculative execution
 is not yet part of the optimized steady-state path.
@@ -126,7 +107,7 @@ is not yet part of the optimized steady-state path.
 - Enable MTP by default only where warmed, realistic workloads show a net
   improvement.
 
-### 6. Finish long-context prefill and mixed-workload scheduling
+### 5. Finish long-context prefill and mixed-workload scheduling
 
 - Interleave prefill and decode fairly under memory pressure.
 - Derive prefill chunk size from available memory, device execution limits, and
@@ -143,13 +124,17 @@ is not yet part of the optimized steady-state path.
   tokens/second, below the pre-paging 15.862-token/second observation, although
   the different generated lengths and accumulated context make this a lead to
   isolate rather than a causal attribution.
+- Make resident prefix checkpoint capture asynchronous or incrementally
+  copy-on-write instead of synchronously copying the complete retained state. In
+  the first post-prefix-admission 27B-FP8 run, one checkpoint retained
+  167,510,016 device bytes and introduced two blocking resident copy waits.
 - Preallocate, reclaim, and compact physical state pages safely around long
   prompts.
 - Validate 64K/128K context and long agentic outputs without arbitrary low token
   limits.
 - Report prefill and decode throughput separately by default.
 
-### 7. Maintain adversarial correctness and performance gates
+### 6. Maintain adversarial correctness and performance gates
 
 Every meaningful compiler, runtime, state, graph, or kernel change must be tested
 against the supported model set rather than optimized around one model.
@@ -208,6 +193,14 @@ Performance runs must:
   answering Greece. The four completed measured turns decoded at 13.735, 13.158,
   11.908, and 11.178 tokens/second (12.495 average). Treat that run as a failed
   correctness gate, not a five-turn performance result.
+- The first post-prefix-admission seed-1 run entered the repeated Corinth city
+  list on measured turn three. The two completed measured turns decoded at
+  13.667 and 16.667 tokens/second (15.167 average); the full benchmark is invalid,
+  and the implementation remains below the 20-token/second floor.
+- An explicitly selected Vulkan test device must make a test run or fail; it must
+  never silently turn a device-open error into a passing skip. The prefix,
+  cancellation, and physical-page tests now enforce this, and the remaining
+  Vulkan tests need the same contract.
 - Finish migrating structural Rust tests to the checked-in deterministic tiny
   compiled package. Prompt-engine batching, wait-set, fairness, and cancellation
   tests now use it; remaining tests must stop depending on the deleted external
