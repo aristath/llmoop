@@ -63,6 +63,12 @@ def test_compiler_target_preserves_dtype_supported_by_any_gpu() -> None:
     assert target.supports_native_dtype("F16")
     assert target.supports_native_dtype("F32")
     assert not target.supports_native_dtype("Q8_0")
+    assert target.devices[0].max_compute_work_group_invocations == 1024
+    assert target.devices[0].max_compute_work_group_size_x == 1024
+    assert (
+        target.to_json()["devices"][0]["max_compute_work_group_invocations"]
+        == 1024
+    )
 
 
 def test_compiler_target_ignores_cpu_vulkan_devices_and_requires_a_gpu() -> None:

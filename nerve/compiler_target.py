@@ -23,6 +23,8 @@ class CompilerTargetDevice:
     vendor_id: int
     device_id: int
     shader_features: frozenset[str]
+    max_compute_work_group_invocations: int
+    max_compute_work_group_size_x: int
 
     @classmethod
     def from_json(cls, payload: Json) -> CompilerTargetDevice:
@@ -35,6 +37,12 @@ class CompilerTargetDevice:
                 vendor_id=int(payload["vendor_id"]),
                 device_id=int(payload["device_id"]),
                 shader_features=frozenset(map(str, payload["shader_features"])),
+                max_compute_work_group_invocations=int(
+                    payload["max_compute_work_group_invocations"]
+                ),
+                max_compute_work_group_size_x=int(
+                    payload["max_compute_work_group_size_x"]
+                ),
             )
         except (KeyError, TypeError, ValueError) as error:
             raise ModelCompileError(
@@ -54,6 +62,10 @@ class CompilerTargetDevice:
             "vendor_id": self.vendor_id,
             "device_id": self.device_id,
             "shader_features": sorted(self.shader_features),
+            "max_compute_work_group_invocations": (
+                self.max_compute_work_group_invocations
+            ),
+            "max_compute_work_group_size_x": self.max_compute_work_group_size_x,
         }
 
 
@@ -101,6 +113,8 @@ class CompilerTarget:
                 vendor_id=0,
                 device_id=index,
                 shader_features=frozenset(features),
+                max_compute_work_group_invocations=1024,
+                max_compute_work_group_size_x=1024,
             )
             for index, features in enumerate(feature_sets)
         )
