@@ -129,6 +129,34 @@ def test_compiler_renders_rms_norm_with_reusable_fp8_output(
     assert "layout(push_constant) uniform BatchControl" in batch
 
 
+def test_compiler_renders_sigmoid_gate_with_reusable_fp8_output(
+    tmp_path: Path,
+) -> None:
+    shader_source_dir = Path(__file__).parents[1] / "runtime-rs" / "shaders"
+    shader_files = {
+        "sigmoid_multiply_quantize_fp8_e4m3_b128_h6144.comp",
+        "sigmoid_multiply_quantize_batch4_fp8_e4m3_b128_h6144.comp",
+    }
+
+    copy_shader_templates(shader_source_dir, tmp_path, shader_files)
+
+    decode = (
+        tmp_path / "sigmoid_multiply_quantize_fp8_e4m3_b128_h6144.comp"
+    ).read_text()
+    batch = (
+        tmp_path
+        / "sigmoid_multiply_quantize_batch4_fp8_e4m3_b128_h6144.comp"
+    ).read_text()
+    for source in (decode, batch):
+        assert "layout(local_size_x = 1024" in source
+        assert "const uint ELEMENT_COUNT = 6144u;" in source
+        assert "const uint BLOCK_COLUMNS = 128u;" in source
+        assert "subgroupMax" in source
+        assert "{{" not in source
+    assert "layout(push_constant) uniform BatchControl" not in decode
+    assert "layout(push_constant) uniform BatchControl" in batch
+
+
 def test_compiler_renders_reusable_fp8_activation_kernel_family(
     tmp_path: Path,
 ) -> None:

@@ -13,6 +13,33 @@ from nerve.model_package_shader_compiler import (
 from nerve.model_package_shader_templates import copy_shader_templates
 from nerve.model_package_tensors import *
 
+
+def can_emit_fp8_representation_from_producer(
+    producer: Json,
+    scope: Json,
+    *,
+    hidden_size: int,
+    compiler_target: Json,
+) -> bool:
+    operation = producer.get("op")
+    operation_shape_supported = (
+        operation == "rms_norm" and int(scope["input_size"]) == hidden_size
+    ) or operation == "sigmoid_multiply"
+    return (
+        operation_shape_supported
+        and producer.get("outputs") == [scope["logical_signal"]]
+        and int(scope["block_columns"]) == 128
+        and bool(compiler_target.get("devices"))
+        and all(
+            int(device.get("max_compute_work_group_invocations", 0)) >= 1024
+            and int(device.get("max_compute_work_group_size_x", 0)) >= 1024
+            and {"shader_float8", "shader_int8"}
+            <= set(device.get("shader_features", []))
+            for device in compiler_target["devices"]
+        )
+    )
+
+
 def build_vulkan_resident_package_manifest(
     *,
     model_graph: Json,
@@ -397,22 +424,11 @@ def build_vulkan_resident_package_manifest(
                 fp8_prequantization_spec(circuit, node, tensor_index)
             ),
             can_emit_fp8_representation=lambda producer, scope: (
-                producer.get("op") == "rms_norm"
-                and producer.get("outputs") == [scope["logical_signal"]]
-                and int(scope["input_size"]) == hidden_size
-                and int(scope["block_columns"]) == 128
-                and bool(compiler_target.get("devices"))
-                and all(
-                    int(device.get("max_compute_work_group_invocations", 0))
-                    >= 1024
-                    and int(device.get("max_compute_work_group_size_x", 0))
-                    >= 1024
-                    and {
-                        "shader_float8",
-                        "shader_int8",
-                    }
-                    <= set(device.get("shader_features", []))
-                    for device in compiler_target.get("devices", [])
+                can_emit_fp8_representation_from_producer(
+                    producer,
+                    scope,
+                    hidden_size=hidden_size,
+                    compiler_target=compiler_target,
                 )
             ),
         )

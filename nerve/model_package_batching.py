@@ -234,6 +234,15 @@ def weight_shared_batch_shader_file(
             f"rms_norm_quantize_batch{tile}_fp8_e4m3_",
             1,
         )
+    if re.fullmatch(
+        r"sigmoid_multiply_quantize_fp8_e4m3_b128_h\d+\.comp",
+        shader_file,
+    ):
+        return shader_file.replace(
+            "sigmoid_multiply_quantize_fp8_e4m3_",
+            f"sigmoid_multiply_quantize_batch{tile}_fp8_e4m3_",
+            1,
+        )
     prequant_fp8 = re.fullmatch(
         r"(linear|linear_bias|linear_residual)_prequant_fp8_e4m3_"
         r"b(\d+)x(\d+)_(\d+)x(\d+)\.comp",

@@ -1473,6 +1473,16 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
 
     shaped_templates = (
         (
+            r"sigmoid_multiply_quantize_fp8_e4m3_b(\d+)_h(\d+)\.comp",
+            "sigmoid_multiply_quantize_fp8_e4m3.comp.template",
+            ("BLOCK_COLUMNS", "ELEMENT_COUNT"),
+        ),
+        (
+            r"sigmoid_multiply_quantize_batch(\d+)_fp8_e4m3_b(\d+)_h(\d+)\.comp",
+            "sigmoid_multiply_quantize_batch_fp8_e4m3.comp.template",
+            ("BATCH_TILE_WIDTH", "BLOCK_COLUMNS", "ELEMENT_COUNT"),
+        ),
+        (
             r"sigmoid_multiply_batch(\d+)_bf16\.comp",
             "sigmoid_multiply_batch_bf16.comp.template",
             ("BATCH_TILE_WIDTH",),

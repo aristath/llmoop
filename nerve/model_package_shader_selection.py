@@ -583,6 +583,27 @@ def shader_file_for_node(
     if op == "silu_multiply":
         return f"silu_multiply_bf16_{int(node['attrs']['element_count'])}.comp"
     if op == "sigmoid_multiply":
+        representations = node.get("attrs", {}).get(
+            "physical_output_representations"
+        )
+        if representations:
+            if (
+                len(representations) != 1
+                or representations[0].get("contract")
+                != "bf16_blockwise_fp8_e4m3_f32_scale.v1"
+                or representations[0].get("logical_signal")
+                != node.get("outputs", [None])[0]
+                or int(representations[0].get("element_count", 0)) <= 0
+                or int(representations[0].get("block_columns", 0)) != 128
+            ):
+                raise ModelCompileError(
+                    f"sigmoid-multiply node {node['id']!r} has an invalid "
+                    "physical FP8 output representation"
+                )
+            return (
+                "sigmoid_multiply_quantize_fp8_e4m3_b128_"
+                f"h{int(representations[0]['element_count'])}.comp"
+            )
         return "sigmoid_multiply_bf16.comp"
     if op == "softplus_multiply":
         attrs = node.get("attrs", {})
@@ -1059,7 +1080,9 @@ def local_size_x_for_node(node: Json) -> int:
 
 
 def local_size_x_for_shader_file(shader_file: str, node: Json) -> int:
-    if shader_file.startswith("rms_norm_quantize_"):
+    if shader_file.startswith(
+        ("rms_norm_quantize_", "sigmoid_multiply_quantize_")
+    ):
         return 1024
     if shader_file.startswith("quantize_fp8_e4m3_"):
         return 32
