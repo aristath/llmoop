@@ -28,33 +28,74 @@ fn stream_control_metadata_bytes(
     bytes
 }
 
+#[cfg(test)]
 fn component_batch_lane_stream_control_bytes(
     input_token_ids: &[u32],
     start_stream_tick: u64,
     dynamic_state_capacity_activations: u32,
 ) -> Result<Vec<[u8; VULKAN_STREAM_CONTROL_BYTE_CAPACITY]>, VulkanResidentInProcessPlacedRuntimeError>
 {
-    input_token_ids
+    let stream_ticks = (0..input_token_ids.len())
+        .map(|lane_index| {
+            start_stream_tick
+                .checked_add(u64::try_from(lane_index).map_err(|_| {
+                    VulkanResidentInProcessPlacedRuntimeError::StreamTickOverflow
+                })?)
+                .ok_or(VulkanResidentInProcessPlacedRuntimeError::StreamTickOverflow)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    component_batch_lane_stream_control_bytes_for_ticks(
+        input_token_ids,
+        &stream_ticks,
+        dynamic_state_capacity_activations,
+    )
+}
+
+fn consecutive_component_batch_stream_ticks(
+    start_stream_tick: u64,
+    lane_count: usize,
+) -> Result<Vec<u64>, VulkanResidentInProcessPlacedRuntimeError> {
+    (0..lane_count)
+        .map(|lane_index| {
+            start_stream_tick
+                .checked_add(u64::try_from(lane_index).map_err(|_| {
+                    VulkanResidentInProcessPlacedRuntimeError::StreamTickOverflow
+                })?)
+                .ok_or(VulkanResidentInProcessPlacedRuntimeError::StreamTickOverflow)
+        })
+        .collect()
+}
+
+fn component_batch_lane_stream_control_bytes_for_ticks(
+    input_token_ids: &[u32],
+    stream_ticks: &[u64],
+    dynamic_state_capacity_activations: u32,
+) -> Result<Vec<[u8; VULKAN_STREAM_CONTROL_BYTE_CAPACITY]>, VulkanResidentInProcessPlacedRuntimeError>
+{
+    if input_token_ids.len() != stream_ticks.len() {
+        return Err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop(
+            VulkanError(format!(
+                "component batch has {} input tokens but {} stream ticks",
+                input_token_ids.len(),
+                stream_ticks.len()
+            )),
+        ));
+    }
+    Ok(input_token_ids
         .iter()
         .copied()
-        .enumerate()
-        .map(|(lane_index, token_id)| {
-            let stream_tick =
-                start_stream_tick
-                    .checked_add(u64::try_from(lane_index).map_err(|_| {
-                        VulkanResidentInProcessPlacedRuntimeError::StreamTickOverflow
-                    })?)
-                    .ok_or(VulkanResidentInProcessPlacedRuntimeError::StreamTickOverflow)?;
-            Ok(stream_control_bytes(
+        .zip(stream_ticks.iter().copied())
+        .map(|(token_id, stream_tick)| {
+            stream_control_bytes(
                 token_id,
                 VulkanMountedPlacedStreamControl {
                     stream_tick,
                     control_flags: 0,
                     dynamic_state_capacity_activations,
                 },
-            ))
+            )
         })
-        .collect()
+        .collect())
 }
 
 fn component_batch_control_bytes(

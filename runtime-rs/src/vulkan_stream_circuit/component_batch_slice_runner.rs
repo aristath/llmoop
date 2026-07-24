@@ -137,6 +137,7 @@ impl VulkanResidentComponentBatchSliceRunner {
         devices: &BTreeMap<String, Rc<VulkanComputeDevice>>,
         device: &VulkanComputeDevice,
         slice: &VulkanResidentInProcessPlacedStreamProcessorDevice,
+        lane_mounteds: &[&VulkanMountedPlacedStreamCircuit],
         lane_capacity: usize,
         execution_mode: VulkanComponentBatchExecutionMode,
         distributed_execution_plan: &VulkanDistributedExecutionPlan,
@@ -145,6 +146,14 @@ impl VulkanResidentComponentBatchSliceRunner {
         if lane_capacity == 0 {
             return Err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop(
                 VulkanError("component batch lane capacity is zero".to_string()),
+            ));
+        }
+        if lane_mounteds.len() != lane_capacity {
+            return Err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop(
+                VulkanError(format!(
+                    "component batch has {lane_capacity} lanes but {} mounted stream states",
+                    lane_mounteds.len()
+                )),
             ));
         }
         let (signal_buffer_indices, signal_buffer_plan) =
@@ -306,7 +315,20 @@ impl VulkanResidentComponentBatchSliceRunner {
                 &dispatch.node_id,
                 execution_mode,
                 lane_capacity,
-            );
+            )
+            .filter(|artifact| {
+                execution_mode == VulkanComponentBatchExecutionMode::CausalSequence
+                    || artifact.batch_mode != VulkanResidentComponentKernelBatchMode::WeightShared
+                    || (!dispatch.uses_stream_tick
+                        && !dispatch.descriptors.iter().any(|descriptor| {
+                            matches!(
+                                descriptor.usage,
+                                VulkanKernelDescriptorUsage::StateRead
+                                    | VulkanKernelDescriptorUsage::StateWrite
+                                    | VulkanKernelDescriptorUsage::StateView
+                            )
+                        }))
+            });
             if let Some(batch_artifact) = batch_artifact {
                 if batch_artifact.batch_mode == VulkanResidentComponentKernelBatchMode::CausalScan
                     && lane_capacity > batch_artifact.lane_tile_width
@@ -322,23 +344,6 @@ impl VulkanResidentComponentBatchSliceRunner {
                     return Err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop(
                         VulkanError(format!(
                             "component batch kernel {}.{} requires model-specific scalar values",
-                            dispatch.component_id, dispatch.node_id
-                        )),
-                    ));
-                }
-                if batch_artifact.batch_mode == VulkanResidentComponentKernelBatchMode::WeightShared
-                    && dispatch.descriptors.iter().any(|descriptor| {
-                        matches!(
-                            descriptor.usage,
-                            VulkanKernelDescriptorUsage::StateRead
-                                | VulkanKernelDescriptorUsage::StateWrite
-                                | VulkanKernelDescriptorUsage::StateView
-                        )
-                    })
-                {
-                    return Err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop(
-                        VulkanError(format!(
-                            "weight-shared component batch kernel {}.{} is not stateless",
                             dispatch.component_id, dispatch.node_id
                         )),
                     ));
@@ -443,7 +448,7 @@ impl VulkanResidentComponentBatchSliceRunner {
                 .collect::<BTreeSet<_>>();
             for (lane_index, stream_control_buffer) in stream_control_buffers.iter().enumerate() {
                 let bindings = component_batch_bindings(
-                    &slice.mounted,
+                    lane_mounteds[lane_index],
                     dispatch,
                     &signal_buffers,
                     &signal_buffer_indices,
@@ -532,11 +537,16 @@ impl VulkanResidentComponentBatchSliceRunner {
             &[u8],
         ) -> Result<(), VulkanResidentInProcessPlacedRuntimeError>,
     ) -> Result<(), VulkanResidentInProcessPlacedRuntimeError> {
+        let stream_ticks = consecutive_component_batch_stream_ticks(
+            start_stream_tick,
+            input_token_ids.len(),
+        )?;
         self.run(
             device,
             mounted,
             VulkanComponentBatchStateSemantics::IndependentCandidates(transaction),
             input_token_ids,
+            &stream_ticks,
             start_stream_tick,
             dynamic_state_capacity_activations,
             run_distributed,
@@ -555,11 +565,44 @@ impl VulkanResidentComponentBatchSliceRunner {
             &[u8],
         ) -> Result<(), VulkanResidentInProcessPlacedRuntimeError>,
     ) -> Result<(), VulkanResidentInProcessPlacedRuntimeError> {
+        let stream_ticks = consecutive_component_batch_stream_ticks(
+            start_stream_tick,
+            input_token_ids.len(),
+        )?;
         self.run(
             device,
             mounted,
             VulkanComponentBatchStateSemantics::CausalSequence,
             input_token_ids,
+            &stream_ticks,
+            start_stream_tick,
+            dynamic_state_capacity_activations,
+            run_distributed,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_independent_streams(
+        &self,
+        device: &VulkanComputeDevice,
+        mounted: &VulkanMountedPlacedStreamCircuit,
+        input_token_ids: &[u32],
+        stream_ticks: &[u64],
+        dynamic_state_capacity_activations: u32,
+        run_distributed: impl FnMut(
+            usize,
+            &[u8],
+        ) -> Result<(), VulkanResidentInProcessPlacedRuntimeError>,
+    ) -> Result<(), VulkanResidentInProcessPlacedRuntimeError> {
+        let start_stream_tick = stream_ticks.first().copied().ok_or(
+            VulkanResidentInProcessPlacedRuntimeError::ZeroTickBudget,
+        )?;
+        self.run(
+            device,
+            mounted,
+            VulkanComponentBatchStateSemantics::IndependentStreams,
+            input_token_ids,
+            stream_ticks,
             start_stream_tick,
             dynamic_state_capacity_activations,
             run_distributed,
@@ -573,6 +616,7 @@ impl VulkanResidentComponentBatchSliceRunner {
         mounted: &VulkanMountedPlacedStreamCircuit,
         state_semantics: VulkanComponentBatchStateSemantics<'_>,
         input_token_ids: &[u32],
+        stream_ticks: &[u64],
         start_stream_tick: u64,
         dynamic_state_capacity_activations: u32,
         mut run_distributed: impl FnMut(
@@ -590,9 +634,17 @@ impl VulkanResidentComponentBatchSliceRunner {
                 )),
             ));
         }
-        let lane_controls = component_batch_lane_stream_control_bytes(
+        if stream_ticks.len() != batch_width {
+            return Err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop(
+                VulkanError(format!(
+                    "component batch has {batch_width} lanes but {} stream ticks",
+                    stream_ticks.len()
+                )),
+            ));
+        }
+        let lane_controls = component_batch_lane_stream_control_bytes_for_ticks(
             input_token_ids,
-            start_stream_tick,
+            stream_ticks,
             dynamic_state_capacity_activations,
         )?;
         for (stream_control_buffer, control_bytes) in
@@ -636,7 +688,7 @@ impl VulkanResidentComponentBatchSliceRunner {
                         mounted,
                         state_semantics,
                         batch_width,
-                        start_stream_tick,
+                        stream_ticks,
                         dynamic_state_capacity_activations,
                         &batch_control,
                         component_id,
@@ -675,7 +727,7 @@ impl VulkanResidentComponentBatchSliceRunner {
         mounted: &VulkanMountedPlacedStreamCircuit,
         state_semantics: VulkanComponentBatchStateSemantics<'_>,
         batch_width: usize,
-        start_stream_tick: u64,
+        stream_ticks: &[u64],
         dynamic_state_capacity_activations: u32,
         batch_control: &[u8; VULKAN_COMPONENT_BATCH_CONTROL_BYTE_CAPACITY as usize],
         component_id: &str,
@@ -692,11 +744,11 @@ impl VulkanResidentComponentBatchSliceRunner {
                 continue;
             }
             let push_constants = if let Some(lane_index) = step.lane_index {
-                let stream_tick = start_stream_tick
-                    .checked_add(u64::try_from(lane_index).map_err(|_| {
-                        VulkanResidentInProcessPlacedRuntimeError::StreamTickOverflow
-                    })?)
-                    .ok_or(VulkanResidentInProcessPlacedRuntimeError::StreamTickOverflow)?;
+                let stream_tick = *stream_ticks.get(lane_index).ok_or_else(|| {
+                    VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(format!(
+                        "component batch has no stream tick for lane {lane_index}"
+                    )))
+                })?;
                 stream_control_push_constant_bytes(
                     &step.push_constants,
                     VulkanMountedPlacedStreamControl {

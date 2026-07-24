@@ -1151,10 +1151,13 @@ impl VulkanResidentSamplerLogitsView {
         if let Some(copy) = &self.seen_token_copy {
             copy.run(copy.byte_len())?;
         }
+        if prefix_token_ids.is_empty() {
+            return Ok(());
+        }
         let Some(dispatch) = &self.seen_token_batch_dispatch else {
             return Ok(());
         };
-        if prefix_token_ids.is_empty() || prefix_token_ids.len() > VULKAN_BACKEND_LOOP_MAX_WINDOW {
+        if prefix_token_ids.len() > VULKAN_BACKEND_LOOP_MAX_WINDOW {
             return Err(
                 VulkanResidentSamplerRunnerError::TokenBatchCapacityExceeded {
                     requested: prefix_token_ids.len(),

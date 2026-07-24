@@ -141,6 +141,19 @@ fn component_batch_lane_controls_preserve_each_token_identity() {
 }
 
 #[test]
+fn independent_stream_batch_controls_preserve_nonconsecutive_stream_ticks() {
+    let controls =
+        component_batch_lane_stream_control_bytes_for_ticks(&[9259, 1902], &[41, 907], 65_536)
+            .unwrap();
+
+    assert_eq!(controls.len(), 2);
+    assert_eq!(&controls[0][0..4], &9259u32.to_le_bytes());
+    assert_eq!(&controls[0][4..12], &41u64.to_le_bytes());
+    assert_eq!(&controls[1][0..4], &1902u32.to_le_bytes());
+    assert_eq!(&controls[1][4..12], &907u64.to_le_bytes());
+}
+
+#[test]
 fn recurrent_gate_kernel_receives_stream_control_metadata() {
     let metadata = VulkanKernelStreamMetadata::for_op("rg_lru_step");
 

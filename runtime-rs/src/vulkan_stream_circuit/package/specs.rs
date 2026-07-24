@@ -184,7 +184,8 @@ impl VulkanResidentComponentKernelExecutionDomain {
 
     pub(super) fn supports_batch_mode(self, mode: VulkanComponentBatchExecutionMode) -> bool {
         match mode {
-            VulkanComponentBatchExecutionMode::IndependentCandidates => self.supports_decode(),
+            VulkanComponentBatchExecutionMode::IndependentCandidates
+            | VulkanComponentBatchExecutionMode::IndependentStreams => self.supports_decode(),
             VulkanComponentBatchExecutionMode::CausalSequence => self.supports_prefill(),
         }
     }

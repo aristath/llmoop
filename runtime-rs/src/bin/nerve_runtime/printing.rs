@@ -45,6 +45,14 @@ fn print_runtime_timing_stats(label: &str, timing: &RuntimePromptTimingReport) {
         timing.max_activation_batch_width
     );
     println!(
+        "  physical_multi_stream_batches={}",
+        timing.physical_multi_stream_batch_count
+    );
+    println!(
+        "  max_physical_multi_stream_batch_width={}",
+        timing.max_physical_multi_stream_batch_width
+    );
+    println!(
         "  max_pending_activations={}",
         timing.max_pending_activation_count
     );

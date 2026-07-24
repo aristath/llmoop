@@ -7,21 +7,18 @@ fn placed_prompt_engine_owns_streams_and_submits_input_events() {
             return;
         }
     };
-    let runtime_model = fixture_model_runtime_model_with_placement(
-        StreamCircuitPlacementSpec::new("gpu0").with_component_device("layer_02", "gpu1"),
+    let runtime_model = tiny_fixture_model_runtime_model_with_placement(
+        StreamCircuitPlacementSpec::new("gpu0"),
     );
-    let manifest_path = fixture_model_package_manifest_path();
+    let manifest_path = tiny_fixture_model_package_manifest_path();
     let manifest_dir = manifest_path.parent().unwrap();
     let device = Rc::new(device);
-    let devices = BTreeMap::from([
-        ("gpu0".to_string(), device.clone()),
-        ("gpu1".to_string(), device.clone()),
-    ]);
+    let devices = BTreeMap::from([("gpu0".to_string(), device.clone())]);
     let stream = VulkanResidentInProcessPlacedPromptStream::from_runtime_model_for_bound_devices(
         devices,
         manifest_dir,
         runtime_model,
-        Some(8),
+        Some(64),
         0,
         0,
     )
@@ -109,7 +106,7 @@ fn placed_prompt_engine_returns_completion_from_a_boundary_closing_drain() {
             devices,
             manifest_path.parent().unwrap(),
             fixture_model_runtime_model(),
-            Some(8),
+            Some(64),
             0,
             0,
         )
@@ -147,22 +144,19 @@ fn placed_prompt_engine_single_submit_runs_the_engine_queue() {
             return;
         }
     };
-    let runtime_model = fixture_model_runtime_model_with_placement(
-        StreamCircuitPlacementSpec::new("gpu0").with_component_device("layer_02", "gpu1"),
+    let runtime_model = tiny_fixture_model_runtime_model_with_placement(
+        StreamCircuitPlacementSpec::new("gpu0"),
     );
-    let manifest_path = fixture_model_package_manifest_path();
+    let manifest_path = tiny_fixture_model_package_manifest_path();
     let manifest_dir = manifest_path.parent().unwrap();
     let device = Rc::new(device);
-    let devices = BTreeMap::from([
-        ("gpu0".to_string(), device.clone()),
-        ("gpu1".to_string(), device.clone()),
-    ]);
+    let devices = BTreeMap::from([("gpu0".to_string(), device.clone())]);
     let model = Arc::new(
         VulkanResidentInProcessPlacedModelPackage::from_runtime_model_for_bound_devices(
             &devices,
             manifest_dir,
             runtime_model,
-            Some(8),
+            Some(64),
             false,
         )
         .unwrap(),
@@ -199,14 +193,14 @@ fn placed_prompt_engine_single_submit_runs_the_engine_queue() {
     engine
         .enqueue_input_event(
             "stream_b",
-            VulkanResidentTokenInputEvent::new("event_b", vec![36_309], 1),
+            VulkanResidentTokenInputEvent::new("event_b", vec![4], 1),
         )
         .unwrap();
 
     let submitted = engine
         .submit_input_event_until_idle(
             "stream_a",
-            VulkanResidentTokenInputEvent::new("event_a", vec![1], 1),
+            VulkanResidentTokenInputEvent::new("event_a", vec![5], 1),
         )
         .unwrap();
 
@@ -214,6 +208,14 @@ fn placed_prompt_engine_single_submit_runs_the_engine_queue() {
     assert_eq!(submitted.output_events[0].stream_id, "stream_a");
     assert_eq!(submitted.engine_run.processed_input_event_count, 2);
     assert_eq!(submitted.engine_run.input_runs.len(), 2);
+    assert!(
+        submitted.engine_run.physical_multi_stream_batch_count > 0,
+        "shared-package streams must execute as physical Vulkan batches"
+    );
+    assert_eq!(
+        submitted.engine_run.max_physical_multi_stream_batch_width,
+        2
+    );
     assert_eq!(submitted.engine_run.input_runs[0].stream_id, "stream_b");
     assert_eq!(
         submitted.engine_run.input_runs[0]
@@ -231,6 +233,81 @@ fn placed_prompt_engine_single_submit_runs_the_engine_queue() {
         "event_a"
     );
     assert!(submitted.engine_run.end_snapshot.idle);
+}
+
+#[test]
+fn placed_prompt_engine_batches_fairly_and_cancels_between_physical_batches() {
+    let device = match selected_test_vulkan_device() {
+        Ok(device) => device,
+        Err(error) => {
+            eprintln!("skipping placed prompt engine batch cancellation test: {error}");
+            return;
+        }
+    };
+    let runtime_model = tiny_fixture_model_runtime_model_with_placement(
+        StreamCircuitPlacementSpec::new("gpu0"),
+    );
+    let manifest_path = tiny_fixture_model_package_manifest_path();
+    let manifest_dir = manifest_path.parent().unwrap();
+    let device = Rc::new(device);
+    let devices = BTreeMap::from([("gpu0".to_string(), device)]);
+    let model = Arc::new(
+        VulkanResidentInProcessPlacedModelPackage::from_runtime_model_for_bound_devices(
+            &devices,
+            manifest_dir,
+            runtime_model,
+            Some(64),
+            false,
+        )
+        .unwrap(),
+    );
+    let short =
+        VulkanResidentInProcessPlacedPromptStream::new(model.clone(), devices.clone(), 0).unwrap();
+    let long = VulkanResidentInProcessPlacedPromptStream::new(model, devices, 1).unwrap();
+
+    let mut engine = VulkanResidentInProcessPlacedPromptEngine::new();
+    engine.add_stream("short", short).unwrap();
+    engine.add_stream("long", long).unwrap();
+    engine
+        .enqueue_input_event(
+            "short",
+            VulkanResidentTokenInputEvent::new("short_event", vec![4], 1),
+        )
+        .unwrap();
+    engine
+        .enqueue_input_event(
+            "long",
+            VulkanResidentTokenInputEvent::new("long_event", vec![5], 5),
+        )
+        .unwrap();
+
+    let first_completion = engine.run_until_idle_bounded(1).unwrap();
+
+    assert_eq!(first_completion.processed_input_event_count, 1);
+    assert_eq!(first_completion.input_runs[0].stream_id, "short");
+    assert!(first_completion.physical_multi_stream_batch_count > 0);
+    assert_eq!(first_completion.max_physical_multi_stream_batch_width, 2);
+    assert_eq!(
+        first_completion
+            .output_events
+            .iter()
+            .filter(|event| event.stream_id == "short")
+            .count(),
+        1
+    );
+    assert_eq!(
+        first_completion
+            .output_events
+            .iter()
+            .filter(|event| event.stream_id == "long")
+            .count(),
+        1
+    );
+    assert_eq!(first_completion.end_snapshot.active_stream_ids, ["long"]);
+
+    let cancellation = engine.interrupt_stream("long", "test cancellation").unwrap();
+    assert!(cancellation.stream_control_run.completed_input_run.is_some());
+    assert!(engine.snapshot().idle);
 }
 
 #[test]
@@ -421,7 +498,6 @@ fn placed_prompt_engine_batches_input_events_across_streams() {
 }
 
 #[test]
-#[ignore = "requires the deterministic structural Vulkan fixture tracked in TODO.md"]
 fn placed_prompt_engine_overlaps_resident_feedback_windows_across_streams() {
     let device = match selected_test_vulkan_device() {
         Ok(device) => device,
@@ -430,21 +506,18 @@ fn placed_prompt_engine_overlaps_resident_feedback_windows_across_streams() {
             return;
         }
     };
-    let runtime_model = fixture_model_runtime_model_with_placement(
-        StreamCircuitPlacementSpec::new("gpu0").with_component_device("layer_02", "gpu1"),
+    let runtime_model = tiny_fixture_model_runtime_model_with_placement(
+        StreamCircuitPlacementSpec::new("gpu0"),
     );
-    let manifest_path = fixture_model_package_manifest_path();
+    let manifest_path = tiny_fixture_model_package_manifest_path();
     let manifest_dir = manifest_path.parent().unwrap();
     let device = Rc::new(device);
-    let devices = BTreeMap::from([
-        ("gpu0".to_string(), device.clone()),
-        ("gpu1".to_string(), device.clone()),
-    ]);
+    let devices = BTreeMap::from([("gpu0".to_string(), device.clone())]);
     let stream_a = VulkanResidentInProcessPlacedPromptStream::from_runtime_model_for_bound_devices(
         devices.clone(),
         manifest_dir,
         runtime_model.clone(),
-        Some(16),
+        Some(64),
         0,
         0,
     )
@@ -453,7 +526,7 @@ fn placed_prompt_engine_overlaps_resident_feedback_windows_across_streams() {
         devices,
         manifest_dir,
         runtime_model,
-        Some(16),
+        Some(64),
         1,
         0,
     )
@@ -487,6 +560,7 @@ fn placed_prompt_engine_overlaps_resident_feedback_windows_across_streams() {
             .resident_feedback;
         assert!(feedback.asynchronous_submission_count > 0);
         assert!(feedback.completion_poll_count > 0);
+        assert!(feedback.bounded_wait_count > 0);
         assert_eq!(
             feedback.asynchronous_submission_count,
             feedback.window_count

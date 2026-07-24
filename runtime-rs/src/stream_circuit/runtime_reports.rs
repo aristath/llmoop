@@ -309,6 +309,8 @@ pub struct RuntimePromptTimingReport {
     pub prefill_activation_batch_count: usize,
     pub decode_activation_batch_count: usize,
     pub max_activation_batch_width: usize,
+    pub physical_multi_stream_batch_count: usize,
+    pub max_physical_multi_stream_batch_width: usize,
     pub max_pending_activation_count: usize,
     pub prefill_activation_count: usize,
     pub decode_activation_count: usize,

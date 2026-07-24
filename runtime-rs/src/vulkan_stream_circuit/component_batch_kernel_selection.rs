@@ -21,6 +21,7 @@ fn component_batch_descriptors_commit_state<'a>(
 #[derive(Clone, Copy)]
 enum VulkanComponentBatchStateSemantics<'a> {
     IndependentCandidates(&'a VulkanResidentStateTransactionBank),
+    IndependentStreams,
     CausalSequence,
 }
 
@@ -42,16 +43,8 @@ fn batch_stage_control_byte_count(stage: &VulkanResidentComponentBatchStageArtif
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum VulkanComponentBatchExecutionMode {
     IndependentCandidates,
+    IndependentStreams,
     CausalSequence,
-}
-
-impl VulkanComponentBatchExecutionMode {
-    fn from_runtime_activation_batch_kind(kind: &RuntimeStreamActivationBatchKind) -> Self {
-        match kind {
-            RuntimeStreamActivationBatchKind::PrefillChunk { .. } => Self::CausalSequence,
-            RuntimeStreamActivationBatchKind::DecodeFeedback { .. } => Self::IndependentCandidates,
-        }
-    }
 }
 
 fn select_component_batch_kernel_artifact<'a>(

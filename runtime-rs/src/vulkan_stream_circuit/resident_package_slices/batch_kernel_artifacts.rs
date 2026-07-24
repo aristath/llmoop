@@ -13,7 +13,8 @@ struct VulkanResidentComponentBatchKernelArtifact {
 impl VulkanResidentComponentBatchKernelArtifact {
     fn is_compatible_with(&self, mode: VulkanComponentBatchExecutionMode) -> bool {
         match mode {
-            VulkanComponentBatchExecutionMode::IndependentCandidates => {
+            VulkanComponentBatchExecutionMode::IndependentCandidates
+            | VulkanComponentBatchExecutionMode::IndependentStreams => {
                 self.independent_candidate_compatible
             }
             VulkanComponentBatchExecutionMode::CausalSequence => {

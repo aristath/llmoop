@@ -367,6 +367,17 @@ fn component_batches_select_only_mode_compatible_kernels() {
     assert_eq!(verification.lane_tile_width, 8);
     assert!(verification.independent_candidate_compatible);
 
+    let independent_streams = select_component_batch_kernel_artifact(
+        &artifacts,
+        "processor",
+        "project",
+        VulkanComponentBatchExecutionMode::IndependentStreams,
+        6,
+    )
+    .unwrap();
+    assert_eq!(independent_streams.lane_tile_width, 8);
+    assert!(independent_streams.independent_candidate_compatible);
+
     let causal = select_component_batch_kernel_artifact(
         &artifacts,
         "processor",
@@ -485,27 +496,6 @@ fn component_batches_use_causal_compatibility_for_temporal_prefill_kernels() {
     .unwrap();
     assert!(causal.causal_sequence_compatible);
     assert!(!causal.independent_candidate_compatible);
-}
-
-#[test]
-fn component_batch_execution_mode_follows_runtime_activation_shape() {
-    let prefill = RuntimeStreamActivationBatchKind::PrefillChunk {
-        execution_class_id: "package".to_string(),
-        token_count: 8,
-    };
-    let decode = RuntimeStreamActivationBatchKind::DecodeFeedback {
-        execution_class_id: "package".to_string(),
-        max_tokens: 4,
-    };
-
-    assert_eq!(
-        VulkanComponentBatchExecutionMode::from_runtime_activation_batch_kind(&prefill),
-        VulkanComponentBatchExecutionMode::CausalSequence
-    );
-    assert_eq!(
-        VulkanComponentBatchExecutionMode::from_runtime_activation_batch_kind(&decode),
-        VulkanComponentBatchExecutionMode::IndependentCandidates
-    );
 }
 
 #[test]

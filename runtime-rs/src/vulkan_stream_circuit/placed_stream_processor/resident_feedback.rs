@@ -311,6 +311,20 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
             .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)
     }
 
+    fn resident_feedback_window_completion_point<'a>(
+        &'a self,
+        pending: &VulkanResidentInProcessPlacedPendingFeedbackWindow,
+    ) -> Result<VulkanTimelineSemaphorePoint<'a>, VulkanResidentInProcessPlacedRuntimeError> {
+        let feedback_loop = self.resident_feedback_loop.as_ref().ok_or_else(|| {
+            VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(
+                "placed resident feedback loop is not mounted".to_string(),
+            ))
+        })?;
+        Ok(feedback_loop
+            .output_synchronization
+            .turn_point(pending.terminal_output_value))
+    }
+
     fn wait_resident_feedback_window_for(
         &self,
         devices: &BTreeMap<String, Rc<VulkanComputeDevice>>,

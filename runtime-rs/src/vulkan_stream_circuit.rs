@@ -34,7 +34,7 @@ use crate::stream_runtime::{
     RuntimeStreamActivation, RuntimeStreamActivationBatch, RuntimeStreamActivationBatchKind,
     RuntimeStreamActivationKind, RuntimeStreamActivationOutcome, RuntimeStreamInputEvent,
     RuntimeStreamScheduler, RuntimeStreamSchedulerBudget, RuntimeStreamSchedulerError,
-    RuntimeStreamStateReservation,
+    RuntimeStreamSchedulerSnapshot, RuntimeStreamStateReservation, RuntimeStreamStatus,
 };
 use crate::stream_state::{
     TransientStateBlockId, TransientStateBlockShape, TransientStateKey, TransientStateSlot,
@@ -93,6 +93,7 @@ include!("vulkan_stream_circuit/output_transducer.rs");
 include!("vulkan_stream_circuit/sampler.rs");
 include!("vulkan_stream_circuit/resident_feedback_control.rs");
 include!("vulkan_stream_circuit/batched_output_projection.rs");
+include!("vulkan_stream_circuit/multi_stream_batch_runner.rs");
 include!("vulkan_stream_circuit/single_token_tick.rs");
 include!("vulkan_stream_circuit/feedback_loop.rs");
 include!("vulkan_stream_circuit/speculative_decode.rs");

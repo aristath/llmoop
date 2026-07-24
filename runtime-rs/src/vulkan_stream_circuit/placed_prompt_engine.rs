@@ -4,6 +4,17 @@ const VULKAN_PENDING_ACTIVATION_CONTROL_WAIT_NS: u64 = 10_000_000;
 pub struct VulkanResidentInProcessPlacedPromptEngine {
     streams: BTreeMap<String, VulkanResidentInProcessPlacedPromptStream>,
     runtime_scheduler: RuntimeStreamScheduler,
+    multi_stream_batch_runners:
+        BTreeMap<VulkanResidentInProcessPlacedPromptEngineBatchKey, VulkanResidentPlacedMultiStreamBatchRunner>,
+    pending_wait_group_cursor: usize,
+}
+
+impl Drop for VulkanResidentInProcessPlacedPromptEngine {
+    fn drop(&mut self) {
+        // Batch runners own descriptor sets that remain bound to buffers owned
+        // by the streams. Destroy those descriptors before stream teardown.
+        self.multi_stream_batch_runners.clear();
+    }
 }
 
 impl VulkanResidentInProcessPlacedPromptEngine {
@@ -11,6 +22,8 @@ impl VulkanResidentInProcessPlacedPromptEngine {
         Self {
             streams: BTreeMap::new(),
             runtime_scheduler: RuntimeStreamScheduler::new(),
+            multi_stream_batch_runners: BTreeMap::new(),
+            pending_wait_group_cursor: 0,
         }
     }
 
@@ -241,16 +254,12 @@ impl VulkanResidentInProcessPlacedPromptEngine {
         let mut prefill_activation_batch_count = 0usize;
         let mut decode_activation_batch_count = 0usize;
         let mut max_activation_batch_width = 0usize;
+        let mut physical_multi_stream_batch_count = 0usize;
+        let mut max_physical_multi_stream_batch_width = 0usize;
         let mut max_pending_activation_count = 0usize;
         let mut pending_activations =
             BTreeMap::<u64, VulkanResidentInProcessPlacedPromptEnginePendingActivation>::new();
         let scheduler_activation_capacity = self.streams.len().max(1);
-        let scheduler_budget = RuntimeStreamSchedulerBudget::new(
-            scheduler_activation_capacity,
-            VULKAN_BACKEND_LOOP_MAX_WINDOW,
-            scheduler_activation_capacity.saturating_mul(VULKAN_BACKEND_LOOP_MAX_WINDOW),
-        )
-        .with_max_decode_tokens_per_activation(VULKAN_BACKEND_LOOP_MAX_WINDOW);
 
         while input_runs.len() < max_input_events {
             let completed_pending = self.poll_pending_scheduler_activations_with_output(
@@ -269,9 +278,23 @@ impl VulkanResidentInProcessPlacedPromptEngine {
                 break;
             }
 
+            let scheduler_snapshot = self.runtime_scheduler.snapshot();
+            let activation_work_width = if self
+                .has_schedulable_physical_multi_stream_batch(&scheduler_snapshot)
+            {
+                1
+            } else {
+                VULKAN_BACKEND_LOOP_MAX_WINDOW
+            };
+            let scheduler_budget = RuntimeStreamSchedulerBudget::new(
+                scheduler_activation_capacity,
+                activation_work_width,
+                scheduler_activation_capacity.saturating_mul(activation_work_width),
+            )
+            .with_max_decode_tokens_per_activation(activation_work_width);
             let scheduler_step = self
                 .runtime_scheduler
-                .schedule_batch_step(scheduler_budget.clone())?;
+                .schedule_batch_step(scheduler_budget)?;
             if scheduler_step.batches.is_empty() {
                 if pending_activations.is_empty() {
                     break;
@@ -294,18 +317,22 @@ impl VulkanResidentInProcessPlacedPromptEngine {
                 )?;
                 max_pending_activation_count =
                     max_pending_activation_count.max(pending_activations.len());
-                match batch_run.execution_mode {
-                    VulkanComponentBatchExecutionMode::CausalSequence => {
-                        prefill_activation_batch_count =
-                            prefill_activation_batch_count.saturating_add(1);
-                    }
-                    VulkanComponentBatchExecutionMode::IndependentCandidates => {
-                        decode_activation_batch_count =
-                            decode_activation_batch_count.saturating_add(1);
-                    }
+                if batch_run.prefill_activation_count > 0 {
+                    prefill_activation_batch_count =
+                        prefill_activation_batch_count.saturating_add(1);
+                }
+                if batch_run.decode_activation_count > 0 {
+                    decode_activation_batch_count =
+                        decode_activation_batch_count.saturating_add(1);
                 }
                 max_activation_batch_width =
                     max_activation_batch_width.max(batch_run.batch_width);
+                if batch_run.physical_multi_stream_batch {
+                    physical_multi_stream_batch_count =
+                        physical_multi_stream_batch_count.saturating_add(1);
+                    max_physical_multi_stream_batch_width =
+                        max_physical_multi_stream_batch_width.max(batch_run.batch_width);
+                }
                 prefill_activation_count =
                     prefill_activation_count.saturating_add(batch_run.prefill_activation_count);
                 decode_activation_count =
@@ -362,6 +389,8 @@ impl VulkanResidentInProcessPlacedPromptEngine {
             prefill_activation_batch_count,
             decode_activation_batch_count,
             max_activation_batch_width,
+            physical_multi_stream_batch_count,
+            max_physical_multi_stream_batch_width,
             max_pending_activation_count,
             prefill_activation_count,
             decode_activation_count,
@@ -387,10 +416,11 @@ impl VulkanResidentInProcessPlacedPromptEngine {
     where
         F: FnMut(VulkanResidentTokenRuntimeSchedulerOutputEvent),
     {
-        let kind = batch.kind;
-        let execution_mode = VulkanComponentBatchExecutionMode::from_runtime_activation_batch_kind(
-            &kind,
-        );
+        if let Some(run) =
+            self.try_run_multi_stream_activation_batch_with_output(&batch, on_output_event)?
+        {
+            return Ok(run);
+        }
         let batch_width = batch.activations.len();
         let mut input_runs = Vec::new();
         let mut output_events = Vec::new();
@@ -466,14 +496,210 @@ impl VulkanResidentInProcessPlacedPromptEngine {
         }
 
         Ok(VulkanResidentInProcessPlacedPromptEngineScheduledBatchRun {
-            execution_mode,
             batch_width,
+            physical_multi_stream_batch: false,
             input_runs,
             output_events,
             prefill_activation_count,
             decode_activation_count,
             prefill_time_ns,
             decode_time_ns,
+        })
+    }
+
+    fn try_run_multi_stream_activation_batch_with_output<F>(
+        &mut self,
+        batch: &RuntimeStreamActivationBatch,
+        on_output_event: &mut F,
+    ) -> Result<
+        Option<VulkanResidentInProcessPlacedPromptEngineScheduledBatchRun>,
+        VulkanResidentInProcessPlacedPromptEngineError,
+    >
+    where
+        F: FnMut(VulkanResidentTokenRuntimeSchedulerOutputEvent),
+    {
+        if batch.activations.len() < 2
+            || batch
+                .activations
+                .iter()
+                .any(|activation| activation.kind.work_units() != 1)
+        {
+            return Ok(None);
+        }
+        let stream_ids = batch
+            .activations
+            .iter()
+            .map(|activation| activation.stream_id.clone())
+            .collect::<Vec<_>>();
+        let first_stream = self
+            .streams
+            .get(&stream_ids[0])
+            .ok_or_else(|| VulkanResidentInProcessPlacedPromptEngineError::UnknownStream {
+                stream_id: stream_ids[0].clone(),
+            })?;
+        let first_devices = first_stream.devices.clone();
+        for stream_id in &stream_ids[1..] {
+            let stream = self.streams.get(stream_id).ok_or_else(|| {
+                VulkanResidentInProcessPlacedPromptEngineError::UnknownStream {
+                    stream_id: stream_id.clone(),
+                }
+            })?;
+            if !placed_prompt_streams_share_physical_batch_contract(first_stream, stream) {
+                return Ok(None);
+            }
+        }
+        let key = VulkanResidentInProcessPlacedPromptEngineBatchKey {
+            execution_class_id: batch.activations[0].execution_class_id.clone(),
+            stream_ids: stream_ids.clone(),
+        };
+        if !self.multi_stream_batch_runners.contains_key(&key) {
+            let processors = stream_ids
+                .iter()
+                .map(|stream_id| {
+                    self.streams
+                        .get(stream_id)
+                        .map(|stream| &stream.processor)
+                        .ok_or_else(|| {
+                            VulkanResidentInProcessPlacedPromptEngineError::UnknownStream {
+                                stream_id: stream_id.clone(),
+                            }
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let runner =
+                VulkanResidentPlacedMultiStreamBatchRunner::new(&first_devices, &processors)?;
+            self.multi_stream_batch_runners.insert(key.clone(), runner);
+        }
+
+        let batch_started = Instant::now();
+        let mut prepared_lanes = Vec::with_capacity(batch.activations.len());
+        for activation in &batch.activations {
+            let stream = self.streams.get_mut(&activation.stream_id).ok_or_else(|| {
+                VulkanResidentInProcessPlacedPromptEngineError::UnknownStream {
+                    stream_id: activation.stream_id.clone(),
+                }
+            })?;
+            prepared_lanes.push(stream.prepare_runtime_scheduler_batch_lane(activation)?);
+        }
+        let input_token_ids = prepared_lanes
+            .iter()
+            .map(|lane| lane.input_token_id)
+            .collect::<Vec<_>>();
+        let stream_ticks = prepared_lanes
+            .iter()
+            .map(|lane| lane.start_stream_tick)
+            .collect::<Vec<_>>();
+        let device_run = {
+            let processors = stream_ids
+                .iter()
+                .map(|stream_id| {
+                    self.streams
+                        .get(stream_id)
+                        .map(|stream| &stream.processor)
+                        .ok_or_else(|| {
+                            VulkanResidentInProcessPlacedPromptEngineError::UnknownStream {
+                                stream_id: stream_id.clone(),
+                            }
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            self.multi_stream_batch_runners
+                .get(&key)
+                .expect("multi-stream batch runner was inserted")
+                .run(
+                    &first_devices,
+                    &processors,
+                    &input_token_ids,
+                    &stream_ticks,
+                )?
+        };
+        let batch_time_ns =
+            u64::try_from(batch_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        let mut input_runs = Vec::new();
+        let mut output_events = Vec::new();
+        for ((activation, prepared), sampled_token_id) in batch
+            .activations
+            .iter()
+            .zip(prepared_lanes)
+            .zip(device_run.sampled_token_ids)
+        {
+            let stream_id = activation.stream_id.clone();
+            let callback_stream_id = stream_id.clone();
+            let scheduled_run = self
+                .streams
+                .get_mut(&stream_id)
+                .ok_or_else(|| {
+                    VulkanResidentInProcessPlacedPromptEngineError::UnknownStream {
+                        stream_id: stream_id.clone(),
+                    }
+                })?
+                .complete_runtime_scheduler_batch_lane(
+                    prepared,
+                    sampled_token_id,
+                    device_run.scheduler_turn_count_per_tick,
+                    device_run.completed_stage_count_per_tick,
+                    |output_event| {
+                        on_output_event(VulkanResidentTokenRuntimeSchedulerOutputEvent {
+                            stream_id: callback_stream_id.clone(),
+                            output_event,
+                        });
+                    },
+                )?;
+            self.runtime_scheduler
+                .complete_activation(activation.id, scheduled_run.outcome.clone())?;
+            let stream_output_events =
+                placed_prompt_engine_output_events_for(&stream_id, &scheduled_run.output_events);
+            output_events.extend(stream_output_events.iter().cloned());
+            if let Some(submitted_run) = scheduled_run.completed_input_run {
+                let generated_token_ids = submitted_run.generated_token_ids.clone();
+                input_runs.push(VulkanResidentInProcessPlacedPromptEngineInputRun {
+                    stream_id,
+                    submitted_run,
+                    output_events: stream_output_events,
+                    generated_token_ids,
+                });
+            }
+        }
+        let (prefill_activation_count, decode_activation_count, prefill_time_ns, decode_time_ns) =
+            match batch.kind {
+                RuntimeStreamActivationBatchKind::PrefillChunk { .. } => {
+                    (batch.activations.len(), 0, batch_time_ns, 0)
+                }
+                RuntimeStreamActivationBatchKind::DecodeFeedback { .. } => {
+                    (0, batch.activations.len(), 0, batch_time_ns)
+                }
+            };
+        Ok(Some(
+            VulkanResidentInProcessPlacedPromptEngineScheduledBatchRun {
+                batch_width: batch.activations.len(),
+                physical_multi_stream_batch: true,
+                input_runs,
+                output_events,
+                prefill_activation_count,
+                decode_activation_count,
+                prefill_time_ns,
+                decode_time_ns,
+            },
+        ))
+    }
+
+    fn has_schedulable_physical_multi_stream_batch(
+        &self,
+        snapshot: &RuntimeStreamSchedulerSnapshot,
+    ) -> bool {
+        let schedulable = snapshot
+            .streams
+            .iter()
+            .filter(|stream| {
+                stream.status == RuntimeStreamStatus::Active
+                    && stream.in_flight_activation_count == 0
+            })
+            .filter_map(|stream| self.streams.get(&stream.stream_id))
+            .collect::<Vec<_>>();
+        schedulable.iter().enumerate().any(|(index, stream)| {
+            schedulable[index + 1..].iter().any(|candidate| {
+                placed_prompt_streams_share_physical_batch_contract(stream, candidate)
+            })
         })
     }
 
@@ -564,23 +790,92 @@ impl VulkanResidentInProcessPlacedPromptEngine {
         >,
         timeout_ns: u64,
     ) -> Result<(), VulkanResidentInProcessPlacedPromptEngineError> {
-        let Some((&activation_id, pending)) = pending_activations.first_key_value() else {
+        if pending_activations.is_empty() {
             return Ok(());
-        };
-        let stream = self.streams.get_mut(&pending.stream_id).ok_or_else(|| {
-            VulkanResidentInProcessPlacedPromptEngineError::UnknownStream {
-                stream_id: pending.stream_id.clone(),
-            }
-        })?;
-        if stream.pending_runtime_scheduler_activation_id() != Some(activation_id) {
-            return Err(VulkanResidentInProcessPlacedPromptEngineError::Stream(
-                placed_scheduler_divergence(format!(
-                    "stream {:?} does not own pending scheduler activation {activation_id}",
-                    pending.stream_id
-                )),
-            ));
         }
-        stream.wait_pending_runtime_scheduler_activation_for(timeout_ns)?;
+        let mut groups = Vec::<(
+            Rc<VulkanComputeDevice>,
+            Vec<(
+                String,
+                VulkanResidentInProcessPlacedPendingSchedulerWaitTarget<'_>,
+            )>,
+        )>::new();
+        for (activation_id, pending) in pending_activations {
+            let stream = self.streams.get(&pending.stream_id).ok_or_else(|| {
+                VulkanResidentInProcessPlacedPromptEngineError::UnknownStream {
+                    stream_id: pending.stream_id.clone(),
+                }
+            })?;
+            if stream.pending_runtime_scheduler_activation_id() != Some(*activation_id) {
+                return Err(VulkanResidentInProcessPlacedPromptEngineError::Stream(
+                    placed_scheduler_divergence(format!(
+                        "stream {:?} does not own pending scheduler activation {activation_id}",
+                        pending.stream_id
+                    )),
+                ));
+            }
+            let target = stream
+                .pending_runtime_scheduler_wait_target()?
+                .ok_or_else(|| {
+                    VulkanResidentInProcessPlacedPromptEngineError::Stream(
+                        placed_scheduler_divergence(format!(
+                            "stream {:?} has no completion target for pending scheduler activation {activation_id}",
+                            pending.stream_id
+                        )),
+                    )
+                })?;
+            if let Some((_, group)) = groups
+                .iter_mut()
+                .find(|(device, _)| Rc::ptr_eq(device, &target.device))
+            {
+                group.push((pending.stream_id.clone(), target));
+            } else {
+                groups.push((
+                    Rc::clone(&target.device),
+                    vec![(pending.stream_id.clone(), target)],
+                ));
+            }
+        }
+        let selected_group_index = self.pending_wait_group_cursor % groups.len();
+        let (device, group) = &groups[selected_group_index];
+        let points = group
+            .iter()
+            .map(|(_, target)| target.point)
+            .collect::<Vec<_>>();
+        device
+            .wait_any_timeline_semaphore_points_for(&points, timeout_ns)
+            .map_err(|error| {
+                VulkanResidentInProcessPlacedPromptEngineError::Stream(
+                    VulkanResidentInProcessPlacedRuntimeError::BackendLoop(error),
+                )
+            })?;
+        let completion_by_stream = group
+            .iter()
+            .map(|(stream_id, target)| {
+                target
+                    .device
+                    .timeline_semaphore_point_is_complete(target.point)
+                    .map(|completed| (stream_id.clone(), completed))
+                    .map_err(|error| {
+                        VulkanResidentInProcessPlacedPromptEngineError::Stream(
+                            VulkanResidentInProcessPlacedRuntimeError::BackendLoop(error),
+                        )
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let next_wait_group_cursor = selected_group_index.saturating_add(1);
+        drop(groups);
+        self.pending_wait_group_cursor = next_wait_group_cursor;
+        for (stream_id, completed) in completion_by_stream {
+            self.streams
+                .get_mut(&stream_id)
+                .ok_or_else(|| {
+                    VulkanResidentInProcessPlacedPromptEngineError::UnknownStream {
+                        stream_id: stream_id.clone(),
+                    }
+                })?
+                .record_pending_runtime_scheduler_wait(completed);
+        }
         Ok(())
     }
 
@@ -662,8 +957,8 @@ pub struct VulkanResidentInProcessPlacedPromptEngineInputRun {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct VulkanResidentInProcessPlacedPromptEngineScheduledBatchRun {
-    execution_mode: VulkanComponentBatchExecutionMode,
     batch_width: usize,
+    physical_multi_stream_batch: bool,
     input_runs: Vec<VulkanResidentInProcessPlacedPromptEngineInputRun>,
     output_events: Vec<VulkanResidentTokenRuntimeSchedulerOutputEvent>,
     prefill_activation_count: usize,
@@ -675,6 +970,12 @@ struct VulkanResidentInProcessPlacedPromptEngineScheduledBatchRun {
 struct VulkanResidentInProcessPlacedPromptEnginePendingActivation {
     stream_id: String,
     activation_started: Instant,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct VulkanResidentInProcessPlacedPromptEngineBatchKey {
+    execution_class_id: String,
+    stream_ids: Vec<String>,
 }
 
 struct VulkanResidentInProcessPlacedPromptEngineCompletedPendingActivation {
@@ -702,6 +1003,8 @@ pub struct VulkanResidentInProcessPlacedPromptEngineRun {
     pub prefill_activation_batch_count: usize,
     pub decode_activation_batch_count: usize,
     pub max_activation_batch_width: usize,
+    pub physical_multi_stream_batch_count: usize,
+    pub max_physical_multi_stream_batch_width: usize,
     pub max_pending_activation_count: usize,
     pub prefill_activation_count: usize,
     pub decode_activation_count: usize,
@@ -793,6 +1096,24 @@ fn placed_prompt_engine_output_events_for(
             },
         )
         .collect()
+}
+
+fn placed_prompt_streams_share_physical_batch_contract(
+    first: &VulkanResidentInProcessPlacedPromptStream,
+    second: &VulkanResidentInProcessPlacedPromptStream,
+) -> bool {
+    Arc::ptr_eq(&first.package, &second.package)
+        && first.speculative_draft_tokens == 0
+        && second.speculative_draft_tokens == 0
+        && first.processor.speculative_decoder_count() == 0
+        && second.processor.speculative_decoder_count() == 0
+        && first.devices.len() == second.devices.len()
+        && second.devices.iter().all(|(device_id, device)| {
+            first
+                .devices
+                .get(device_id)
+                .is_some_and(|first_device| Rc::ptr_eq(first_device, device))
+        })
 }
 
 fn placed_prompt_engine_stream_snapshot(

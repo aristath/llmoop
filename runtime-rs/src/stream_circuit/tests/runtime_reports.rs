@@ -637,6 +637,8 @@
             prefill_activation_batch_count: 1,
             decode_activation_batch_count: 1,
             max_activation_batch_width: 1,
+            physical_multi_stream_batch_count: 0,
+            max_physical_multi_stream_batch_width: 0,
             max_pending_activation_count: 1,
             prefill_activation_count: 1,
             decode_activation_count: 1,

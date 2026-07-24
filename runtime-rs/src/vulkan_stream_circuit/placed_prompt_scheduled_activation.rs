@@ -15,7 +15,155 @@ struct VulkanResidentInProcessPlacedPendingSchedulerActivation {
     window: VulkanResidentInProcessPlacedPendingStreamFeedbackWindow,
 }
 
+struct VulkanResidentInProcessPlacedPendingSchedulerWaitTarget<'a> {
+    device: Rc<VulkanComputeDevice>,
+    point: VulkanTimelineSemaphorePoint<'a>,
+}
+
+struct VulkanResidentInProcessPlacedPreparedBatchLane {
+    activation_id: u64,
+    input_event_id: String,
+    start_stream_tick: u64,
+    state_bindings: Vec<VulkanResidentScheduledActivationStateBinding>,
+    input_token_id: u32,
+    input_is_feedback: bool,
+    should_sample: bool,
+}
+
 impl VulkanResidentInProcessPlacedPromptStream {
+    fn prepare_runtime_scheduler_batch_lane(
+        &mut self,
+        scheduler_activation: &RuntimeStreamActivation,
+    ) -> Result<
+        VulkanResidentInProcessPlacedPreparedBatchLane,
+        VulkanResidentInProcessPlacedRuntimeError,
+    > {
+        if self.pending_scheduler_activation.is_some() {
+            return Err(placed_scheduler_divergence(
+                "cannot prepare a batch lane while scheduler work is pending",
+            ));
+        }
+        if !self.activate_next_input_event()? {
+            return Err(placed_scheduler_divergence(
+                "scheduled batch lane has no active input event",
+            ));
+        }
+        let activation = self
+            .active_input_event
+            .as_ref()
+            .and_then(VulkanResidentInProcessPlacedActivePromptEvent::next_activation)
+            .ok_or(VulkanResidentInProcessPlacedRuntimeError::MissingPrivateFeedback)?;
+        match &scheduler_activation.kind {
+            RuntimeStreamActivationKind::PrefillChunk { token_ids, .. } => {
+                if token_ids.as_slice() != [activation.input_token_id]
+                    || activation.input_is_feedback
+                {
+                    return Err(placed_scheduler_divergence(
+                        "scheduled prefill batch lane diverged from its external input",
+                    ));
+                }
+            }
+            RuntimeStreamActivationKind::DecodeFeedback { max_tokens, .. } => {
+                if *max_tokens != 1 || !activation.input_is_feedback {
+                    return Err(placed_scheduler_divergence(
+                        "scheduled decode batch lane is not one feedback token",
+                    ));
+                }
+            }
+        }
+        let state_bindings = self.scheduler_activation_state_bindings(scheduler_activation)?;
+        Ok(VulkanResidentInProcessPlacedPreparedBatchLane {
+            activation_id: scheduler_activation.id,
+            input_event_id: scheduler_activation.input_event_id.clone(),
+            start_stream_tick: self.next_stream_tick(),
+            state_bindings,
+            input_token_id: activation.input_token_id,
+            input_is_feedback: activation.input_is_feedback,
+            should_sample: activation.should_emit_public_output,
+        })
+    }
+
+    fn complete_runtime_scheduler_batch_lane<F>(
+        &mut self,
+        prepared: VulkanResidentInProcessPlacedPreparedBatchLane,
+        sampled_token_id: u32,
+        scheduler_turn_count: usize,
+        completed_stage_count: usize,
+        mut on_output_event: F,
+    ) -> Result<
+        VulkanResidentInProcessPlacedPromptStreamScheduledActivationRun,
+        VulkanResidentInProcessPlacedRuntimeError,
+    >
+    where
+        F: FnMut(VulkanResidentTokenOutputEvent),
+    {
+        let stream_tick = self.next_stream_tick();
+        if stream_tick != prepared.start_stream_tick {
+            return Err(placed_scheduler_divergence(
+                "batch lane stream tick changed while device work was in flight",
+            ));
+        }
+        let activation = self
+            .active_input_event
+            .as_ref()
+            .and_then(VulkanResidentInProcessPlacedActivePromptEvent::next_activation)
+            .ok_or(VulkanResidentInProcessPlacedRuntimeError::MissingPrivateFeedback)?;
+        if activation.input_token_id != prepared.input_token_id
+            || activation.input_is_feedback != prepared.input_is_feedback
+        {
+            return Err(placed_scheduler_divergence(
+                "batch lane activation changed while device work was in flight",
+            ));
+        }
+        let output_event = self
+            .active_input_event
+            .as_mut()
+            .expect("prepared batch lane requires an active input event")
+            .complete_activation(
+                &activation,
+                stream_tick,
+                scheduler_turn_count,
+                completed_stage_count,
+                &VulkanPlacedEdgeTransportStats::default(),
+                prepared.should_sample.then_some(sampled_token_id),
+            )?;
+        self.session.next_stream_tick = stream_tick
+            .checked_add(1)
+            .ok_or(VulkanResidentInProcessPlacedRuntimeError::StreamTickOverflow)?;
+        let mut output_events = Vec::new();
+        let mut generated_token_ids = Vec::new();
+        if let Some(output_event) = output_event {
+            generated_token_ids.push(output_event.token_id);
+            output_events.push(output_event.clone());
+            on_output_event(output_event);
+        }
+        let mut completed_input_run = self.complete_active_input_event_if_complete()?;
+        if completed_input_run.is_none() {
+            completed_input_run = self.close_scheduled_loop_if_exhausted()?;
+        }
+        let outcome = if generated_token_ids.is_empty() && !prepared.input_is_feedback {
+            RuntimeStreamActivationOutcome::prefill_complete()
+        } else {
+            RuntimeStreamActivationOutcome::generated_tokens(
+                generated_token_ids.clone(),
+                completed_input_run.is_none(),
+            )
+        };
+        Ok(
+            VulkanResidentInProcessPlacedPromptStreamScheduledActivationRun {
+                activation_id: prepared.activation_id,
+                input_event_id: prepared.input_event_id,
+                start_stream_tick: prepared.start_stream_tick,
+                next_stream_tick: self.next_stream_tick(),
+                state_bindings: prepared.state_bindings,
+                output_events,
+                generated_token_ids,
+                outcome,
+                completed_input_run,
+            },
+        )
+    }
+
     fn begin_runtime_scheduler_activation<F>(
         &mut self,
         activation: &RuntimeStreamActivation,
@@ -80,22 +228,34 @@ impl VulkanResidentInProcessPlacedPromptStream {
             .map(|pending| pending.activation_id)
     }
 
-    fn wait_pending_runtime_scheduler_activation_for(
-        &mut self,
-        timeout_ns: u64,
-    ) -> Result<bool, VulkanResidentInProcessPlacedRuntimeError> {
-        let completed = self
-            .pending_scheduler_activation
-            .as_ref()
-            .map(|pending| self.wait_resident_feedback_window_for(&pending.window, timeout_ns))
-            .transpose()
-            .map(Option::unwrap_or_default)?;
+    fn pending_runtime_scheduler_wait_target(
+        &self,
+    ) -> Result<
+        Option<VulkanResidentInProcessPlacedPendingSchedulerWaitTarget<'_>>,
+        VulkanResidentInProcessPlacedRuntimeError,
+    > {
+        let Some(pending) = self.pending_scheduler_activation.as_ref() else {
+            return Ok(None);
+        };
+        let device = self
+            .devices
+            .get(&self.package.output_device_id)
+            .cloned()
+            .ok_or_else(|| VulkanResidentInProcessPlacedRuntimeError::MissingBoundDevice {
+                device_id: self.package.output_device_id.clone(),
+            })?;
+        let point = self
+            .processor
+            .resident_feedback_window_completion_point(&pending.window.window)?;
+        Ok(Some(
+            VulkanResidentInProcessPlacedPendingSchedulerWaitTarget { device, point },
+        ))
+    }
+
+    fn record_pending_runtime_scheduler_wait(&mut self, completed: bool) {
         if let Some(active) = self.active_input_event.as_mut() {
-            active
-                .resident_feedback
-                .record_bounded_wait(completed);
+            active.resident_feedback.record_bounded_wait(completed);
         }
-        Ok(completed)
     }
 
     fn poll_runtime_scheduler_activation_with_output<F>(

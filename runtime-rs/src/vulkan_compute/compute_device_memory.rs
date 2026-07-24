@@ -246,6 +246,45 @@ impl VulkanComputeDevice {
         }
     }
 
+    pub fn wait_any_timeline_semaphore_points_for(
+        &self,
+        points: &[VulkanTimelineSemaphorePoint<'_>],
+        timeout_ns: u64,
+    ) -> Result<bool, VulkanError> {
+        if points.is_empty() {
+            return Err(VulkanError(
+                "cannot wait on an empty timeline semaphore set".to_string(),
+            ));
+        }
+        for point in points {
+            self.validate_local_timeline_semaphore(point.semaphore)?;
+        }
+        let semaphores = points
+            .iter()
+            .map(|point| point.semaphore.semaphore)
+            .collect::<Vec<_>>();
+        let values = points.iter().map(|point| point.value).collect::<Vec<_>>();
+        let wait_info = vk::SemaphoreWaitInfo::default()
+            .flags(vk::SemaphoreWaitFlags::ANY)
+            .semaphores(&semaphores)
+            .values(&values);
+        match unsafe { self.device.wait_semaphores(&wait_info, timeout_ns) } {
+            Ok(()) => Ok(true),
+            Err(vk::Result::TIMEOUT) => Ok(false),
+            Err(error) => Err(VulkanError(format!(
+                "failed to wait for any of {} timeline semaphore points: {error:?}",
+                points.len()
+            ))),
+        }
+    }
+
+    pub fn timeline_semaphore_point_is_complete(
+        &self,
+        point: VulkanTimelineSemaphorePoint<'_>,
+    ) -> Result<bool, VulkanError> {
+        Ok(self.timeline_semaphore_value(point.semaphore)? >= point.value)
+    }
+
     pub fn timeline_semaphore_value(
         &self,
         semaphore: &VulkanTimelineSemaphore,

@@ -708,6 +708,30 @@ fn fixture_model_package_manifest_path() -> PathBuf {
     .join("vulkan_resident_package.json")
 }
 
+fn tiny_fixture_model_package_manifest_path() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("test-fixtures")
+        .join("tiny_model")
+        .join("vulkan_resident_package.json")
+}
+
+fn tiny_fixture_model_runtime_model_with_placement(
+    placement: StreamCircuitPlacementSpec,
+) -> VulkanResidentRuntimeModel {
+    let manifest = VulkanResidentModelPackageManifest::from_json_file(
+        tiny_fixture_model_package_manifest_path(),
+    )
+    .unwrap();
+    let source_graph = manifest
+        .circuit_graph
+        .to_resolved_lowered_execution_graph(PathBuf::from("."))
+        .unwrap();
+    let runtime_graph = source_graph
+        .runtime_graph_from_placement(&placement)
+        .unwrap();
+    manifest.mount_runtime_graph(&runtime_graph).unwrap()
+}
+
 fn fixture_model_package_manifest() -> VulkanResidentModelPackageManifest {
     VulkanResidentModelPackageManifest::from_json_file(fixture_model_package_manifest_path())
         .unwrap()

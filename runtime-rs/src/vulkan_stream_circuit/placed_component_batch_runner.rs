@@ -11,9 +11,98 @@ impl VulkanResidentPlacedComponentBatchRunner {
         distributed_execution_plan: &VulkanDistributedExecutionPlan,
         distributed_parameter_buffers: &VulkanDistributedParameterBuffers,
     ) -> Result<Self, VulkanResidentInProcessPlacedRuntimeError> {
+        let lane_mounteds_by_slice = placed_slices
+            .iter()
+            .map(|slice| vec![&slice.mounted; lane_capacity])
+            .collect::<Vec<_>>();
+        Self::new_with_lane_mounteds(
+            devices,
+            placed_slices,
+            &lane_mounteds_by_slice,
+            quantum_calibrators,
+            lane_capacity,
+            execution_mode,
+            distributed_execution_plan,
+            distributed_parameter_buffers,
+        )
+    }
+
+    fn new_for_independent_streams(
+        devices: &BTreeMap<String, Rc<VulkanComputeDevice>>,
+        processors: &[&VulkanResidentInProcessPlacedStreamProcessor],
+    ) -> Result<Self, VulkanResidentInProcessPlacedRuntimeError> {
+        let first = processors.first().copied().ok_or(
+            VulkanResidentInProcessPlacedRuntimeError::ZeroTickBudget,
+        )?;
+        let lane_capacity = processors.len();
+        for processor in processors.iter().copied().skip(1) {
+            if processor.device_slices.len() != first.device_slices.len()
+                || processor
+                    .device_slices
+                    .iter()
+                    .zip(&first.device_slices)
+                    .any(|(candidate, reference)| {
+                        candidate.device_id != reference.device_id
+                            || candidate.mounted_bound.dispatches.len()
+                                != reference.mounted_bound.dispatches.len()
+                    })
+            {
+                return Err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop(
+                    VulkanError(
+                        "multi-stream component batch requires identical placed device slices"
+                            .to_string(),
+                    ),
+                ));
+            }
+        }
+        let lane_mounteds_by_slice = (0..first.device_slices.len())
+            .map(|slice_index| {
+                processors
+                    .iter()
+                    .map(|processor| &processor.device_slices[slice_index].mounted)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        Self::new_with_lane_mounteds(
+            devices,
+            &first.device_slices,
+            &lane_mounteds_by_slice,
+            &first.execution_quantum_calibrators,
+            lane_capacity,
+            VulkanComponentBatchExecutionMode::IndependentStreams,
+            &first.model.distributed_execution_plan,
+            &first.model.distributed_parameter_buffers,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_lane_mounteds(
+        devices: &BTreeMap<String, Rc<VulkanComputeDevice>>,
+        placed_slices: &[VulkanResidentInProcessPlacedStreamProcessorDevice],
+        lane_mounteds_by_slice: &[Vec<&VulkanMountedPlacedStreamCircuit>],
+        quantum_calibrators: &BTreeMap<
+            String,
+            Rc<RefCell<RuntimeExecutionQuantumCalibrator>>,
+        >,
+        lane_capacity: usize,
+        execution_mode: VulkanComponentBatchExecutionMode,
+        distributed_execution_plan: &VulkanDistributedExecutionPlan,
+        distributed_parameter_buffers: &VulkanDistributedParameterBuffers,
+    ) -> Result<Self, VulkanResidentInProcessPlacedRuntimeError> {
+        if lane_mounteds_by_slice.len() != placed_slices.len() {
+            return Err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop(
+                VulkanError(format!(
+                    "component batch has {} device slices but {} lane-mounted slice sets",
+                    placed_slices.len(),
+                    lane_mounteds_by_slice.len()
+                )),
+            ));
+        }
         let slices = placed_slices
             .iter()
+            .zip(lane_mounteds_by_slice)
             .map(|slice| {
+                let (slice, lane_mounteds) = slice;
                 let device = devices.get(&slice.device_id).ok_or_else(|| {
                     VulkanResidentInProcessPlacedRuntimeError::MissingBoundDevice {
                         device_id: slice.device_id.clone(),
@@ -31,6 +120,7 @@ impl VulkanResidentPlacedComponentBatchRunner {
                     devices,
                     device,
                     slice,
+                    lane_mounteds,
                     lane_capacity,
                     execution_mode,
                     distributed_execution_plan,
@@ -220,6 +310,39 @@ impl VulkanResidentPlacedComponentBatchRunner {
             transaction,
             input_token_ids,
             start_stream_tick,
+            dynamic_state_capacity_activations,
+            |dispatch_index, batch_control| {
+                self.distributed_dispatches.run_dispatch(
+                    devices,
+                    owner_device_id,
+                    dispatch_index,
+                    batch_control,
+                )
+            },
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_independent_streams(
+        &self,
+        devices: &BTreeMap<String, Rc<VulkanComputeDevice>>,
+        device_index: usize,
+        owner_device_id: &str,
+        mounted: &VulkanMountedPlacedStreamCircuit,
+        input_token_ids: &[u32],
+        stream_ticks: &[u64],
+        dynamic_state_capacity_activations: u32,
+    ) -> Result<(), VulkanResidentInProcessPlacedRuntimeError> {
+        let device = devices.get(owner_device_id).ok_or_else(|| {
+            VulkanResidentInProcessPlacedRuntimeError::MissingBoundDevice {
+                device_id: owner_device_id.to_string(),
+            }
+        })?;
+        self.slice(device_index)?.run_independent_streams(
+            device,
+            mounted,
+            input_token_ids,
+            stream_ticks,
             dynamic_state_capacity_activations,
             |dispatch_index, batch_control| {
                 self.distributed_dispatches.run_dispatch(

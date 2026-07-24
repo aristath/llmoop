@@ -26,6 +26,41 @@ impl VulkanResidentBatchedOutputProjectionRunner {
         sampler_kernels: &[VulkanResidentSamplerKernelArtifact],
         sampler_spec: &VulkanResidentSamplerSpec,
     ) -> Result<Self, VulkanResidentInProcessPlacedRuntimeError> {
+        let sampler_lanes = vec![sampler; batch_capacity];
+        Self::new_for_sampler_lanes(
+            device,
+            norm_batch_lane_tile_width,
+            batch_lane_tile_width,
+            raw_frames_buffer,
+            norm_weight,
+            projection_weight,
+            projection_scale,
+            norm_spirv_words,
+            projection_spirv_words,
+            output_spec,
+            &sampler_lanes,
+            sampler_kernels,
+            sampler_spec,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_for_sampler_lanes(
+        device: &VulkanComputeDevice,
+        norm_batch_lane_tile_width: u32,
+        batch_lane_tile_width: u32,
+        raw_frames_buffer: &VulkanResidentBuffer,
+        norm_weight: &VulkanPermanentParameterBufferAllocation,
+        projection_weight: &VulkanPermanentParameterBufferAllocation,
+        projection_scale: Option<&VulkanPermanentParameterBufferAllocation>,
+        norm_spirv_words: &[u32],
+        projection_spirv_words: &[u32],
+        output_spec: &VulkanResidentOutputTransducerSpec,
+        sampler_lanes: &[&VulkanResidentSamplerRunner],
+        sampler_kernels: &[VulkanResidentSamplerKernelArtifact],
+        sampler_spec: &VulkanResidentSamplerSpec,
+    ) -> Result<Self, VulkanResidentInProcessPlacedRuntimeError> {
+        let batch_capacity = sampler_lanes.len();
         if batch_capacity == 0 {
             return Err(VulkanResidentInProcessPlacedRuntimeError::ZeroTickBudget);
         }
@@ -170,7 +205,7 @@ impl VulkanResidentBatchedOutputProjectionRunner {
             )
             .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
         let mut sampler_views = Vec::with_capacity(batch_capacity);
-        for batch_index in 0..batch_capacity {
+        for (batch_index, sampler) in sampler_lanes.iter().copied().enumerate() {
             let logits_byte_offset = output_spec
                 .logits_byte_capacity
                 .checked_mul(batch_index)
@@ -247,6 +282,45 @@ impl VulkanResidentBatchedOutputProjectionRunner {
         dynamic_state_capacity_activations: u32,
     ) -> Result<(), VulkanResidentInProcessPlacedRuntimeError> {
         let batch_width = input_token_ids.len();
+        let stream_ticks =
+            consecutive_component_batch_stream_ticks(start_stream_tick, batch_width)?;
+        let dynamic_state_capacities =
+            vec![dynamic_state_capacity_activations; batch_width];
+        let token_prefixes = (0..batch_width)
+            .map(|batch_index| &input_token_ids[..=batch_index])
+            .collect::<Vec<_>>();
+        self.sample_lanes(
+            device,
+            &token_prefixes,
+            &stream_ticks,
+            &dynamic_state_capacities,
+        )
+    }
+
+    fn sample_independent_streams(
+        &self,
+        device: &VulkanComputeDevice,
+        input_token_ids: &[u32],
+        stream_ticks: &[u64],
+        dynamic_state_capacities: &[u32],
+    ) -> Result<(), VulkanResidentInProcessPlacedRuntimeError> {
+        let token_prefixes = vec![&[][..]; input_token_ids.len()];
+        self.sample_lanes(
+            device,
+            &token_prefixes,
+            stream_ticks,
+            dynamic_state_capacities,
+        )
+    }
+
+    fn sample_lanes(
+        &self,
+        device: &VulkanComputeDevice,
+        token_prefixes: &[&[u32]],
+        stream_ticks: &[u64],
+        dynamic_state_capacities: &[u32],
+    ) -> Result<(), VulkanResidentInProcessPlacedRuntimeError> {
+        let batch_width = token_prefixes.len();
         if batch_width == 0 || batch_width > self.sampler_views.len() {
             return Err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop(
                 VulkanError(format!(
@@ -255,17 +329,25 @@ impl VulkanResidentBatchedOutputProjectionRunner {
                 )),
             ));
         }
+        if stream_ticks.len() != batch_width
+            || dynamic_state_capacities.len() != batch_width
+        {
+            return Err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop(
+                VulkanError(format!(
+                    "batched sampler has {batch_width} token lanes, {} stream ticks, and {} state capacities",
+                    stream_ticks.len(),
+                    dynamic_state_capacities.len()
+                )),
+            ));
+        }
         let submission_batch = VulkanResidentQueueSubmissionBatch::new();
         for (batch_index, view) in self.sampler_views.iter().take(batch_width).enumerate() {
-            view.prepare_token_state(device, &input_token_ids[..=batch_index])
+            view.prepare_token_state(device, token_prefixes[batch_index])
                 .map_err(VulkanResidentInProcessPlacedRuntimeError::Sampler)?;
-            let stream_tick =
-                start_stream_tick
-                    .checked_add(u64::try_from(batch_index).map_err(|_| {
-                        VulkanResidentInProcessPlacedRuntimeError::StreamTickOverflow
-                    })?)
-                    .ok_or(VulkanResidentInProcessPlacedRuntimeError::StreamTickOverflow)?;
-            view.prepare_stream_tick(stream_tick, dynamic_state_capacity_activations)
+            view.prepare_stream_tick(
+                stream_ticks[batch_index],
+                dynamic_state_capacities[batch_index],
+            )
                 .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
             view.record(device)
                 .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;

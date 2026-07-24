@@ -105,6 +105,8 @@ fn run_placed_chat(
                 run.engine_run.prefill_activation_batch_count,
                 run.engine_run.decode_activation_batch_count,
                 run.engine_run.max_activation_batch_width,
+                run.engine_run.physical_multi_stream_batch_count,
+                run.engine_run.max_physical_multi_stream_batch_width,
                 run.engine_run.max_pending_activation_count,
                 run.engine_run.prefill_activation_count,
                 run.engine_run.decode_activation_count,
@@ -236,6 +238,9 @@ fn execute_placed_prompt_run(
     let prefill_activation_batch_count = engine_run.prefill_activation_batch_count;
     let decode_activation_batch_count = engine_run.decode_activation_batch_count;
     let max_activation_batch_width = engine_run.max_activation_batch_width;
+    let physical_multi_stream_batch_count = engine_run.physical_multi_stream_batch_count;
+    let max_physical_multi_stream_batch_width =
+        engine_run.max_physical_multi_stream_batch_width;
     let max_pending_activation_count = engine_run.max_pending_activation_count;
     let run = engine_run
         .input_runs
@@ -266,6 +271,8 @@ fn execute_placed_prompt_run(
         prefill_activation_batch_count,
         decode_activation_batch_count,
         max_activation_batch_width,
+        physical_multi_stream_batch_count,
+        max_physical_multi_stream_batch_width,
         max_pending_activation_count,
         prefill_activation_count,
         decode_activation_count,
