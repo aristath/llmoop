@@ -493,7 +493,25 @@ fn activation_signal_byte_capacity(
     let Some(signal_elements) = signal.shape.as_deref().and_then(product) else {
         return Ok(None);
     };
-    let (Some(slot_bytes), Some(slot_max_elements)) = (slot_bytes, slot_max_elements) else {
+    let Some(slot_bytes) = slot_bytes else {
+        return Ok(None);
+    };
+    if let Some(element_bytes) = signal.element_bytes {
+        let signal_bytes = signal_elements.checked_mul(element_bytes).ok_or_else(|| {
+            VulkanBindingPlanError(format!(
+                "{} node {} activation signal {:?} byte capacity overflowed",
+                circuit.component_id, node.id, signal.id
+            ))
+        })?;
+        if signal_bytes > slot_bytes {
+            return Err(VulkanBindingPlanError(format!(
+                "{} node {} activation signal {:?} requires {signal_bytes} bytes, exceeding slot capacity {slot_bytes}",
+                circuit.component_id, node.id, signal.id
+            )));
+        }
+        return Ok(Some(signal_bytes));
+    }
+    let Some(slot_max_elements) = slot_max_elements else {
         return Ok(None);
     };
     if slot_max_elements == 0 {
@@ -565,4 +583,3 @@ fn state_view_state_id(
             ))
         })
 }
-

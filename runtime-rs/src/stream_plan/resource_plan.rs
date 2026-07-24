@@ -42,6 +42,53 @@ fn state_dtype_bytes(dtype: &str) -> Result<usize, CircuitPlanError> {
     }
 }
 
+fn node_output_element_bytes(
+    component_id: &str,
+    node: &CircuitNode,
+    output_index: usize,
+) -> Result<Option<usize>, CircuitPlanError> {
+    let Some(raw_widths) = node
+        .attrs
+        .as_object()
+        .and_then(|attrs| attrs.get("output_element_bytes"))
+    else {
+        return Ok(None);
+    };
+    let widths = raw_widths.as_array().ok_or_else(|| {
+        CircuitPlanError(format!(
+            "{component_id} node {} output_element_bytes must be an array",
+            node.id
+        ))
+    })?;
+    if widths.len() != node.outputs.len() {
+        return Err(CircuitPlanError(format!(
+            "{component_id} node {} declares {} output byte widths for {} outputs",
+            node.id,
+            widths.len(),
+            node.outputs.len()
+        )));
+    }
+    let width = widths[output_index].as_u64().ok_or_else(|| {
+        CircuitPlanError(format!(
+            "{component_id} node {} output byte width {} must be a positive integer",
+            node.id, output_index
+        ))
+    })?;
+    let width = usize::try_from(width).map_err(|_| {
+        CircuitPlanError(format!(
+            "{component_id} node {} output byte width {} exceeds usize",
+            node.id, output_index
+        ))
+    })?;
+    if width == 0 {
+        return Err(CircuitPlanError(format!(
+            "{component_id} node {} output byte width {} must be positive",
+            node.id, output_index
+        )));
+    }
+    Ok(Some(width))
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlannedActivationSlotBank {
     pub component_id: String,
@@ -58,6 +105,7 @@ pub struct PlannedActivationSlot {
     pub slot: usize,
     pub signal_ids: Vec<String>,
     pub max_elements: Option<usize>,
+    pub max_bytes: Option<usize>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -127,6 +175,7 @@ impl CircuitActivationPlan {
                     producer: SignalProducer::BoundaryInput,
                     consumers: Vec::new(),
                     shape: Some(input.shape.clone()),
+                    element_bytes: None,
                     storage: SignalStorage::Boundary,
                     is_boundary_output: false,
                 },
@@ -141,6 +190,7 @@ impl CircuitActivationPlan {
                     producer: SignalProducer::StatePort,
                     consumers: Vec::new(),
                     shape: state.shape.clone(),
+                    element_bytes: None,
                     storage: SignalStorage::State,
                     is_boundary_output: false,
                 },
@@ -185,6 +235,11 @@ impl CircuitActivationPlan {
                         },
                         consumers: Vec::new(),
                         shape: output_shapes.get(output_index).cloned().unwrap_or(None),
+                        element_bytes: node_output_element_bytes(
+                            &component_id,
+                            node,
+                            output_index,
+                        )?,
                         storage: node_output_storage(node),
                         is_boundary_output: boundary_output_sources.contains(output),
                     },
@@ -429,6 +484,7 @@ pub struct PlannedSignal {
     pub producer: SignalProducer,
     pub consumers: Vec<String>,
     pub shape: Option<Vec<usize>>,
+    pub element_bytes: Option<usize>,
     pub storage: SignalStorage,
     pub is_boundary_output: bool,
 }
@@ -487,4 +543,3 @@ pub struct SignalSlotAssignment {
     pub produced_at: usize,
     pub last_consumed_at: usize,
 }
-

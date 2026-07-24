@@ -14,23 +14,31 @@ fn planned_activation_slots(
         .into_iter()
         .map(|(slot, signal_ids)| {
             let mut max_elements = Some(0usize);
+            let mut max_bytes = Some(0usize);
             for signal_id in &signal_ids {
-                let elements = activation_plan
-                    .signal(signal_id)
+                let signal = activation_plan.signal(signal_id);
+                let elements = signal
                     .and_then(|signal| signal.shape.as_ref())
                     .and_then(|shape| product(shape));
                 match (max_elements, elements) {
                     (Some(max), Some(elements)) => max_elements = Some(max.max(elements)),
-                    _ => {
-                        max_elements = None;
-                        break;
-                    }
+                    _ => max_elements = None,
+                }
+                let bytes = elements.and_then(|elements| {
+                    signal
+                        .and_then(|signal| signal.element_bytes)
+                        .and_then(|element_bytes| elements.checked_mul(element_bytes))
+                });
+                match (max_bytes, bytes) {
+                    (Some(max), Some(bytes)) => max_bytes = Some(max.max(bytes)),
+                    _ => max_bytes = None,
                 }
             }
             PlannedActivationSlot {
                 slot,
                 signal_ids,
                 max_elements,
+                max_bytes,
             }
         })
         .collect()
@@ -169,6 +177,7 @@ mod tests {
                 producer: SignalProducer::BoundaryInput,
                 consumers: vec!["qkv_split".to_string()],
                 shape: Some(vec![32]),
+                element_bytes: None,
                 storage: SignalStorage::Boundary,
                 is_boundary_output: false,
             },
@@ -260,6 +269,7 @@ mod tests {
                 producer: SignalProducer::BoundaryInput,
                 consumers: vec!["append_attention".to_string()],
                 shape: Some(vec![1024]),
+                element_bytes: None,
                 storage: SignalStorage::Boundary,
                 is_boundary_output: false,
             },
@@ -295,6 +305,7 @@ mod tests {
                     producer: SignalProducer::BoundaryInput,
                     consumers: vec!["attention_output_gate".to_string()],
                     shape: Some(vec![6144]),
+                    element_bytes: None,
                     storage: SignalStorage::Boundary,
                     is_boundary_output: false,
                 },
@@ -306,6 +317,7 @@ mod tests {
                     producer: SignalProducer::BoundaryInput,
                     consumers: vec!["attention_output_gate".to_string()],
                     shape: Some(vec![48]),
+                    element_bytes: None,
                     storage: SignalStorage::Boundary,
                     is_boundary_output: false,
                 },
@@ -374,6 +386,7 @@ mod tests {
                 producer: SignalProducer::BoundaryInput,
                 consumers: vec!["qk".to_string()],
                 shape: Some(vec![5120]),
+                element_bytes: None,
                 storage: SignalStorage::Boundary,
                 is_boundary_output: false,
             },
@@ -480,6 +493,7 @@ mod tests {
                 producer: SignalProducer::BoundaryInput,
                 consumers: vec!["fused_ffn".to_string()],
                 shape: Some(vec![1024]),
+                element_bytes: None,
                 storage: SignalStorage::Boundary,
                 is_boundary_output: false,
             },
@@ -918,6 +932,7 @@ mod tests {
                 .map(|consumer| (*consumer).to_string())
                 .collect(),
             shape: Some(vec![8]),
+            element_bytes: Some(if id == "d" { 4 } else { 2 }),
             storage: SignalStorage::Activation,
             is_boundary_output: false,
         };
@@ -956,6 +971,12 @@ mod tests {
         assert_eq!(frame.slot_for("b"), Some(1));
         assert_eq!(frame.slot_for("c"), Some(2));
         assert_eq!(frame.slot_for("d"), Some(0));
+        let slots = planned_activation_slots(&plan, &frame);
+        assert_eq!(slots[0].signal_ids, vec!["a".to_string(), "d".to_string()]);
+        assert_eq!(slots[0].max_elements, Some(8));
+        assert_eq!(slots[0].max_bytes, Some(32));
+        assert_eq!(slots[1].max_bytes, Some(16));
+        assert_eq!(slots[2].max_bytes, Some(16));
 
         let a = frame.liveness_for("a").unwrap();
         assert_eq!(a.produced_by, "node_0");

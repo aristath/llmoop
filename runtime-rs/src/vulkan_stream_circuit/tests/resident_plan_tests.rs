@@ -1,4 +1,48 @@
 #[test]
+fn resident_plan_uses_typed_activation_slot_byte_capacity() {
+    let resource_plan = StreamCircuitResourcePlan {
+        circuit_count: 1,
+        node_count: 2,
+        parameter_ref_count: 0,
+        parameters: Vec::new(),
+        transducer_parameter_ref_count: 0,
+        transducer_parameters: Vec::new(),
+        state_allocations: Vec::new(),
+        activation_banks: vec![crate::stream_plan::PlannedActivationSlotBank {
+            component_id: "layer_00".to_string(),
+            circuit_id: "layer_00".to_string(),
+            temporary_signal_count: 2,
+            state_view_signal_count: 0,
+            slot_count: 1,
+            slots: vec![crate::stream_plan::PlannedActivationSlot {
+                slot: 0,
+                signal_ids: vec!["bf16_signal".to_string(), "f32_signal".to_string()],
+                max_elements: Some(8),
+                max_bytes: Some(32),
+            }],
+            assignments: Vec::new(),
+        }],
+        temporary_signal_count: 2,
+        state_view_signal_count: 0,
+        layer_local_activation_slot_count: 1,
+        unknown_temporary_shape_count: 0,
+        unknown_state_view_shape_count: 0,
+    };
+
+    let resident_plan =
+        VulkanStreamCircuitResidentPlan::from_resource_plan(&resource_plan, None, Some(2))
+            .unwrap();
+
+    assert_eq!(resident_plan.per_stream_activation_slot_elements, Some(8));
+    assert_eq!(resident_plan.per_stream_activation_slot_bytes, Some(32));
+    assert_eq!(
+        resident_plan.activation_banks[0].slots[0].bytes,
+        Some(32)
+    );
+    assert!(resident_plan.unresolved_activation_slots.is_empty());
+}
+
+#[test]
 fn plans_fixture_model_vulkan_resident_allocations_from_stream_circuit_resources() {
     let graph = fixture_model_execution_graph();
     let tensor_index = TensorIndex::from_json_file(fixture_model_tensor_index_path()).unwrap();
@@ -389,4 +433,3 @@ fn placed_stream_circuit_plan_dispatches_only_hosted_components() {
         } if component_id == "layer_02" && state_id == "kv_memory"
     ));
 }
-

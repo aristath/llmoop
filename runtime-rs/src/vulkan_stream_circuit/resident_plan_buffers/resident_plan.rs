@@ -151,6 +151,7 @@ impl VulkanStreamCircuitResidentPlan {
 
         let mut activation_banks = Vec::with_capacity(resource_plan.activation_banks.len());
         let mut per_stream_activation_slot_elements = Some(0usize);
+        let mut per_stream_activation_slot_bytes = Some(0usize);
         let mut unresolved_activation_slots = Vec::new();
 
         for bank in &resource_plan.activation_banks {
@@ -169,6 +170,22 @@ impl VulkanStreamCircuitResidentPlan {
                     }
                     _ => {
                         per_stream_activation_slot_elements = None;
+                    }
+                }
+                let bytes = match slot.max_bytes {
+                    Some(bytes) => Some(bytes),
+                    None => optional_mul(slot.max_elements, activation_element_bytes)?,
+                };
+                match (per_stream_activation_slot_bytes, bytes) {
+                    (Some(total), Some(bytes)) => {
+                        per_stream_activation_slot_bytes = Some(checked_add(
+                            total,
+                            bytes,
+                            "per-stream activation slot bytes",
+                        )?);
+                    }
+                    _ => {
+                        per_stream_activation_slot_bytes = None;
                         unresolved_activation_slots
                             .push(format!("{}.slot_{}", bank.component_id, slot.slot));
                     }
@@ -178,7 +195,7 @@ impl VulkanStreamCircuitResidentPlan {
                     slot: slot.slot,
                     signal_ids: slot.signal_ids.clone(),
                     max_elements: slot.max_elements,
-                    bytes: optional_mul(slot.max_elements, activation_element_bytes)?,
+                    bytes,
                 });
             }
 
@@ -214,10 +231,7 @@ impl VulkanStreamCircuitResidentPlan {
             per_stream_activation_slot_elements,
             per_stream_static_state_bytes,
             per_stream_dynamic_state_bytes_per_activation,
-            per_stream_activation_slot_bytes: optional_mul(
-                per_stream_activation_slot_elements,
-                activation_element_bytes,
-            )?,
+            per_stream_activation_slot_bytes,
             unresolved_parameter_tensors,
             unresolved_activation_slots,
         })
@@ -366,4 +380,3 @@ impl VulkanStreamCircuitResidentPlan {
         })
     }
 }
-
