@@ -27,23 +27,7 @@ context/output limits, or benchmark-only shortcuts.
 
 ## Remaining work, in priority order
 
-### 1. Finish physical block-managed transient state
-
-The backend-neutral allocator and logical state tables exist, but resident state
-storage is still fundamentally flat and host offsets remain in the execution
-path.
-
-- Allocate GPU-resident physical page/chunk pools for every transient state kind.
-- Bind scheduler block IDs to device-visible page tables.
-- Implement allocation, rebinding, free, eviction, and safe reclamation.
-- Perform hot-path state lookup on the device.
-- Make reset, snapshot, fork, shared-prefix state, and copy-on-write semantics
-  physically correct.
-- Cover attention KV, recurrent, Mamba, convolutional, speculative, and future
-  component-owned state through the same abstraction.
-- Remove flat resident buffers as the authoritative state model.
-
-### 2. Wire prefix/state reuse into normal stream admission
+### 1. Wire prefix/state reuse into normal stream admission
 
 Prefix-state primitives exist, but normal chat does not automatically use them.
 
@@ -57,7 +41,7 @@ Prefix-state primitives exist, but normal chat does not automatically use them.
 - Report hits, misses, reused tokens, saved prefill work, and eviction behavior.
 - Validate reuse with real multi-turn and branched conversations.
 
-### 3. Define canonical runtime graph identity and reusable execution templates
+### 2. Define canonical runtime graph identity and reusable execution templates
 
 Execution-class compatibility, prefix reuse, and command/template reuse need one
 precise graph identity.
@@ -84,7 +68,7 @@ precise graph identity.
   rebased without giving independently recorded templates stale relative
   offsets.
 
-### 4. Make cross-device execution efficient without making it mandatory
+### 3. Make cross-device execution efficient without making it mandatory
 
 Everything may run on one device. Multi-device execution should become useful
 when requested by placement or required by model size.
@@ -111,7 +95,7 @@ when requested by placement or required by model size.
   the prior single-device run; repeat under matched context and conversation
   conditions before attributing the entire difference to transport.
 
-### 5. Complete route-native MoE execution
+### 4. Complete route-native MoE execution
 
 Sparse components and selected-route kernels exist, but routing is not yet a
 fully optimized runtime signal path.
@@ -126,7 +110,7 @@ fully optimized runtime signal path.
 - Make the 35B MoE model's performance reflect its active parameter count rather
   than its full declared size.
 
-### 6. Integrate MTP into the steady-state scheduler and device loop
+### 5. Integrate MTP into the steady-state scheduler and device loop
 
 MTP compilation and transactional verification work, but speculative execution
 is not yet part of the optimized steady-state path.
@@ -142,7 +126,7 @@ is not yet part of the optimized steady-state path.
 - Enable MTP by default only where warmed, realistic workloads show a net
   improvement.
 
-### 7. Finish long-context prefill and mixed-workload scheduling
+### 6. Finish long-context prefill and mixed-workload scheduling
 
 - Interleave prefill and decode fairly under memory pressure.
 - Derive prefill chunk size from available memory, device execution limits, and
@@ -152,13 +136,20 @@ is not yet part of the optimized steady-state path.
   grows. The current 256-wide attention-head kernel still executes tile score,
   exponential, and carry updates through a serial lane-zero region; preserve
   numerically stable online semantics while distributing that work.
+- Measure the device-page translation cost introduced by physical transient-state
+  paging. Hoist or specialize invariant page metadata and mapping reads without
+  returning to host-resolved flat offsets. On the first post-paging 27B-FP8
+  conversation, the four completed measured turns averaged 12.495 decode
+  tokens/second, below the pre-paging 15.862-token/second observation, although
+  the different generated lengths and accumulated context make this a lead to
+  isolate rather than a causal attribution.
 - Preallocate, reclaim, and compact physical state pages safely around long
   prompts.
 - Validate 64K/128K context and long agentic outputs without arbitrary low token
   limits.
 - Report prefill and decode throughput separately by default.
 
-### 8. Maintain adversarial correctness and performance gates
+### 7. Maintain adversarial correctness and performance gates
 
 Every meaningful compiler, runtime, state, graph, or kernel change must be tested
 against the supported model set rather than optimized around one model.
@@ -212,6 +203,11 @@ Performance runs must:
   reasoning loop on measured turn three. The two valid turns decoded at 16.041
   and 15.682 tokens/second (15.862 average), confirming no measurable
   single-stream regression but leaving the full conversation gate failed.
+- The first post-physical-paging seed-1 run completed the Corinth turn but entered
+  an unbounded repeated-history loop on the fifth recall turn instead of
+  answering Greece. The four completed measured turns decoded at 13.735, 13.158,
+  11.908, and 11.178 tokens/second (12.495 average). Treat that run as a failed
+  correctness gate, not a five-turn performance result.
 - Finish migrating structural Rust tests to the checked-in deterministic tiny
   compiled package. Prompt-engine batching, wait-set, fairness, and cancellation
   tests now use it; remaining tests must stop depending on the deleted external
