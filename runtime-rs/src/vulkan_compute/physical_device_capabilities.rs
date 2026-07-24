@@ -149,6 +149,7 @@ fn resident_buffer_usage() -> vk::BufferUsageFlags {
     vk::BufferUsageFlags::STORAGE_BUFFER
         | vk::BufferUsageFlags::TRANSFER_SRC
         | vk::BufferUsageFlags::TRANSFER_DST
+        | vk::BufferUsageFlags::INDIRECT_BUFFER
 }
 
 fn physical_device_supports_shared_host_buffer(

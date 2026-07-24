@@ -206,6 +206,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn indirect_dispatch_ranges_require_complete_aligned_commands() {
+        assert!(validate_resident_indirect_dispatch_range(12, 0).is_ok());
+        assert!(validate_resident_indirect_dispatch_range(28, 16).is_ok());
+
+        assert_eq!(
+            validate_resident_indirect_dispatch_range(16, 2).unwrap_err(),
+            VulkanError("resident indirect dispatch offset 2 is not 4-byte aligned".to_string())
+        );
+        assert_eq!(
+            validate_resident_indirect_dispatch_range(16, 8).unwrap_err(),
+            VulkanError(
+                "resident indirect dispatch range 8..20 exceeds buffer capacity 16".to_string()
+            )
+        );
+        assert_eq!(
+            validate_resident_indirect_dispatch_range(usize::MAX, usize::MAX - 3).unwrap_err(),
+            VulkanError("resident indirect dispatch range overflowed".to_string())
+        );
+    }
+
     fn buffer_access(
         buffer: u64,
         access: VulkanResidentKernelBufferAccess,

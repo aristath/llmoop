@@ -44,7 +44,14 @@ struct VulkanResidentKernelRecordedStep {
     workgroup_count_x: u32,
     workgroup_count_y: u32,
     base_workgroup_z: u32,
+    indirect_dispatch: Option<VulkanResidentKernelRecordedIndirectDispatch>,
     push_constants: Vec<u8>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct VulkanResidentKernelRecordedIndirectDispatch {
+    buffer: vk::Buffer,
+    offset: vk::DeviceSize,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -61,6 +68,13 @@ struct VulkanResidentKernelRecordedSnapshotCopy {
 pub struct VulkanResidentKernelSequenceStep<'a> {
     dispatch: &'a VulkanResidentKernelDispatch,
     push_constants: &'a [u8],
+    indirect_dispatch: Option<VulkanResidentKernelSequenceIndirectDispatch<'a>>,
+}
+
+#[derive(Clone, Copy)]
+struct VulkanResidentKernelSequenceIndirectDispatch<'a> {
+    buffer: &'a VulkanResidentBuffer,
+    offset: vk::DeviceSize,
 }
 
 impl<'a> VulkanResidentKernelSequenceStep<'a> {
@@ -68,8 +82,55 @@ impl<'a> VulkanResidentKernelSequenceStep<'a> {
         Self {
             dispatch,
             push_constants,
+            indirect_dispatch: None,
         }
     }
+
+    pub fn new_indirect(
+        dispatch: &'a VulkanResidentKernelDispatch,
+        push_constants: &'a [u8],
+        buffer: &'a VulkanResidentBuffer,
+        byte_offset: usize,
+    ) -> Result<Self, VulkanError> {
+        validate_resident_indirect_dispatch_range(buffer.byte_capacity(), byte_offset)?;
+        if dispatch.base_workgroup_z != 0 {
+            return Err(VulkanError(format!(
+                "indirect resident dispatch cannot encode nonzero base workgroup z {}",
+                dispatch.base_workgroup_z
+            )));
+        }
+        Ok(Self {
+            dispatch,
+            push_constants,
+            indirect_dispatch: Some(VulkanResidentKernelSequenceIndirectDispatch {
+                buffer,
+                offset: byte_offset as vk::DeviceSize,
+            }),
+        })
+    }
+}
+
+pub const VULKAN_RESIDENT_INDIRECT_DISPATCH_BYTE_COUNT: usize =
+    3 * std::mem::size_of::<u32>();
+
+fn validate_resident_indirect_dispatch_range(
+    buffer_byte_capacity: usize,
+    byte_offset: usize,
+) -> Result<(), VulkanError> {
+    if !byte_offset.is_multiple_of(std::mem::size_of::<u32>()) {
+        return Err(VulkanError(format!(
+            "resident indirect dispatch offset {byte_offset} is not 4-byte aligned"
+        )));
+    }
+    let range_end = byte_offset
+        .checked_add(VULKAN_RESIDENT_INDIRECT_DISPATCH_BYTE_COUNT)
+        .ok_or_else(|| VulkanError("resident indirect dispatch range overflowed".to_string()))?;
+    if range_end > buffer_byte_capacity {
+        return Err(VulkanError(format!(
+            "resident indirect dispatch range {byte_offset}..{range_end} exceeds buffer capacity {buffer_byte_capacity}"
+        )));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -378,4 +439,3 @@ fn print_resident_kernel_named_timestamp_groups(
         );
     }
 }
-

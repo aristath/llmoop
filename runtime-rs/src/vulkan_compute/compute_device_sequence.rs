@@ -373,6 +373,13 @@ impl VulkanComputeDevice {
                                     && recorded.workgroup_count_x == step.dispatch.workgroup_count_x
                                     && recorded.workgroup_count_y == step.dispatch.workgroup_count_y
                                     && recorded.base_workgroup_z == step.dispatch.base_workgroup_z
+                                    && recorded.indirect_dispatch
+                                        == step.indirect_dispatch.map(|indirect| {
+                                            VulkanResidentKernelRecordedIndirectDispatch {
+                                                buffer: indirect.buffer.buffer,
+                                                offset: indirect.offset,
+                                            }
+                                        })
                                     && recorded.push_constants == step.push_constants
                             })
                     })
@@ -464,14 +471,17 @@ impl VulkanComputeDevice {
                                 | vk::AccessFlags::SHADER_WRITE,
                         )
                         .dst_access_mask(
-                            vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+                            vk::AccessFlags::SHADER_READ
+                                | vk::AccessFlags::SHADER_WRITE
+                                | vk::AccessFlags::INDIRECT_COMMAND_READ,
                         )];
                     self.device.cmd_pipeline_barrier(
                         sequence.command_buffer,
                         vk::PipelineStageFlags::HOST
                             | vk::PipelineStageFlags::TRANSFER
                             | vk::PipelineStageFlags::COMPUTE_SHADER,
-                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        vk::PipelineStageFlags::COMPUTE_SHADER
+                            | vk::PipelineStageFlags::DRAW_INDIRECT,
                         vk::DependencyFlags::empty(),
                         &input_visibility_barrier,
                         &[],
@@ -534,12 +544,15 @@ impl VulkanComputeDevice {
                             vk::AccessFlags::TRANSFER_WRITE | vk::AccessFlags::HOST_WRITE,
                         )
                         .dst_access_mask(
-                            vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+                            vk::AccessFlags::SHADER_READ
+                                | vk::AccessFlags::SHADER_WRITE
+                                | vk::AccessFlags::INDIRECT_COMMAND_READ,
                         )];
                     self.device.cmd_pipeline_barrier(
                         sequence.command_buffer,
                         vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::HOST,
-                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        vk::PipelineStageFlags::COMPUTE_SHADER
+                            | vk::PipelineStageFlags::DRAW_INDIRECT,
                         vk::DependencyFlags::empty(),
                         &transfer_to_compute,
                         &[],
@@ -608,7 +621,13 @@ impl VulkanComputeDevice {
                             step.push_constants,
                         );
                     }
-                    if step.dispatch.base_workgroup_z == 0 {
+                    if let Some(indirect) = step.indirect_dispatch {
+                        self.device.cmd_dispatch_indirect(
+                            sequence.command_buffer,
+                            indirect.buffer.buffer,
+                            indirect.offset,
+                        );
+                    } else if step.dispatch.base_workgroup_z == 0 {
                         self.device.cmd_dispatch(
                             sequence.command_buffer,
                             step.dispatch.workgroup_count_x,
@@ -735,6 +754,12 @@ impl VulkanComputeDevice {
                                 workgroup_count_x: step.dispatch.workgroup_count_x,
                                 workgroup_count_y: step.dispatch.workgroup_count_y,
                                 base_workgroup_z: step.dispatch.base_workgroup_z,
+                                indirect_dispatch: step.indirect_dispatch.map(|indirect| {
+                                    VulkanResidentKernelRecordedIndirectDispatch {
+                                        buffer: indirect.buffer.buffer,
+                                        offset: indirect.offset,
+                                    }
+                                }),
                                 push_constants: step.push_constants.to_vec(),
                             })
                             .collect(),
