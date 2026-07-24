@@ -254,4 +254,3 @@ impl Drop for VulkanResidentBuffer {
         }
     }
 }
-

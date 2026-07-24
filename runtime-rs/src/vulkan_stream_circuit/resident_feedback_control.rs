@@ -14,6 +14,13 @@ pub(crate) struct VulkanResidentFeedbackControlPlane {
     generation_tail: Option<(usize, usize)>,
     buffers: BTreeMap<String, Arc<VulkanResidentBuffer>>,
     host_buffer_device_id: String,
+    cancel_generation: Arc<std::sync::atomic::AtomicU64>,
+    acknowledged_cancel_generation: Cell<u64>,
+}
+
+#[derive(Clone)]
+pub struct VulkanResidentFeedbackCancellationHandle {
+    cancel_generation: Arc<std::sync::atomic::AtomicU64>,
 }
 
 #[derive(Clone)]
@@ -156,6 +163,8 @@ impl VulkanResidentFeedbackControlPlane {
             generation_tail: None,
             buffers,
             host_buffer_device_id: output_device_id.to_string(),
+            cancel_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            acknowledged_cancel_generation: Cell::new(0),
         })
     }
 
@@ -289,7 +298,12 @@ impl VulkanResidentFeedbackControlPlane {
         let (generation_tail_start, generation_tail_count) = self
             .generation_tail
             .expect("resident feedback registration was validated");
-        let words = resident_feedback_control_words(
+        let cancel_generation_before = self
+            .cancel_generation
+            .load(std::sync::atomic::Ordering::Acquire);
+        let cancel_is_pending =
+            cancel_generation_before != self.acknowledged_cancel_generation.get();
+        let mut words = resident_feedback_control_words(
             self.vocabulary_size,
             self.stop_mask_word_count,
             self.dispatch_word_offset,
@@ -299,6 +313,9 @@ impl VulkanResidentFeedbackControlPlane {
             planned_tick_count,
             stop_token_ids,
         )?;
+        if cancel_is_pending {
+            words[0] |= VULKAN_FEEDBACK_CONTROL_CANCEL_REQUESTED;
+        }
         let bytes = words.into_iter().flat_map(u32::to_le_bytes).collect::<Vec<_>>();
         self.host_buffer()?.write_bytes(&bytes)
     }
@@ -316,13 +333,17 @@ impl VulkanResidentFeedbackControlPlane {
         })
     }
 
-    fn request_cancel(&self) -> Result<(), VulkanError> {
-        let buffer = self.host_buffer()?;
-        let flags = buffer.read_persistently_mapped_u32_le_at(0)?;
-        buffer.write_bytes_at(
-            0,
-            &(flags | VULKAN_FEEDBACK_CONTROL_CANCEL_REQUESTED).to_le_bytes(),
-        )
+    fn cancellation_handle(&self) -> VulkanResidentFeedbackCancellationHandle {
+        VulkanResidentFeedbackCancellationHandle {
+            cancel_generation: Arc::clone(&self.cancel_generation),
+        }
+    }
+
+    fn acknowledge_cancellation(&self) {
+        self.acknowledged_cancel_generation.set(
+            self.cancel_generation
+                .load(std::sync::atomic::Ordering::Acquire),
+        );
     }
 
     fn host_buffer(&self) -> Result<&VulkanResidentBuffer, VulkanError> {
@@ -332,6 +353,18 @@ impl VulkanResidentFeedbackControlPlane {
             .ok_or_else(|| {
                 VulkanError("resident feedback control host buffer disappeared".to_string())
             })
+    }
+}
+
+impl VulkanResidentFeedbackCancellationHandle {
+    /// Requests cancellation at the next feedback submission boundary.
+    ///
+    /// The host token intentionally does not modify mapped Vulkan memory while
+    /// a shader may access it. The feedback-window policy bounds the boundary
+    /// latency, and `arm` transfers the request before the next queue submit.
+    pub fn request_cancel(&self) {
+        self.cancel_generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     }
 }
 

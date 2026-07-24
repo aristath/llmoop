@@ -84,9 +84,24 @@ fn placed_prompt_stream_runs_resident_feedback_across_bridged_slices() {
             Some(8),
             0,
             0,
-        )
-        .unwrap();
-    assert!(stream.processor.resident_feedback_window_width() >= 3);
+    )
+    .unwrap();
+    let maximum_window_tick_count = stream
+        .processor
+        .resident_feedback_loop
+        .as_ref()
+        .unwrap()
+        .window_policy
+        .maximum_tick_count;
+    assert!(maximum_window_tick_count >= 3);
+    stream
+        .processor
+        .resident_feedback_loop
+        .as_ref()
+        .unwrap()
+        .window_policy
+        .next_tick_count
+        .set(maximum_window_tick_count);
 
     let mut first_streamed_output_events = Vec::new();
     stream.enqueue_input_event(
@@ -165,9 +180,24 @@ fn placed_prompt_stream_runs_resident_feedback_across_bridged_slices() {
             Some(8),
             0,
             0,
-        )
-        .unwrap();
-    assert!(bridged_stream.processor.resident_feedback_window_width() >= 3);
+    )
+    .unwrap();
+    let maximum_window_tick_count = bridged_stream
+        .processor
+        .resident_feedback_loop
+        .as_ref()
+        .unwrap()
+        .window_policy
+        .maximum_tick_count;
+    assert!(maximum_window_tick_count >= 3);
+    bridged_stream
+        .processor
+        .resident_feedback_loop
+        .as_ref()
+        .unwrap()
+        .window_policy
+        .next_tick_count
+        .set(maximum_window_tick_count);
     let bridged_first = bridged_stream
         .submit_input_event(
             VulkanResidentTokenInputEvent::new("event", vec![1], 8).with_stop_tokens(vec![558]),
@@ -247,7 +277,7 @@ fn placed_prompt_stream_runs_resident_feedback_across_bridged_slices() {
 }
 
 #[test]
-fn placed_prompt_stream_reuses_full_width_feedback_submission_template() {
+fn placed_prompt_stream_reuses_feedback_submission_templates_across_events() {
     let device = match selected_test_vulkan_device() {
         Ok(device) => device,
         Err(error) => {
@@ -270,11 +300,36 @@ fn placed_prompt_stream_reuses_full_width_feedback_submission_template() {
             0,
         )
         .unwrap();
-    assert_eq!(stream.processor.resident_feedback_window_width(), 4);
+    assert_eq!(
+        stream
+            .processor
+            .resident_feedback_loop
+            .as_ref()
+            .unwrap()
+            .window_policy
+            .maximum_tick_count,
+        4
+    );
+    stream
+        .processor
+        .resident_feedback_loop
+        .as_ref()
+        .unwrap()
+        .window_policy
+        .next_tick_count
+        .set(2);
 
     let first = stream
         .submit_input_event(VulkanResidentTokenInputEvent::new("first", vec![1], 5))
         .unwrap();
+    stream
+        .processor
+        .resident_feedback_loop
+        .as_ref()
+        .unwrap()
+        .window_policy
+        .next_tick_count
+        .set(2);
     let second = stream
         .submit_input_event(VulkanResidentTokenInputEvent::new("second", vec![1], 5))
         .unwrap();
@@ -282,7 +337,7 @@ fn placed_prompt_stream_reuses_full_width_feedback_submission_template() {
     assert_eq!(
         first.session_run.run.resident_feedback,
         VulkanResidentFeedbackExecutionStats {
-            window_count: 1,
+            window_count: 2,
             planned_tick_count: 4,
             submitted_tick_count: 4,
             executed_tick_count: 4,
@@ -290,17 +345,90 @@ fn placed_prompt_stream_reuses_full_width_feedback_submission_template() {
             sampled_tick_count: 4,
             discarded_tick_count: 0,
             template_record_count: 1,
-            template_replay_count: 0,
+            template_replay_count: 1,
         }
     );
     assert_eq!(
         second.session_run.run.resident_feedback,
         VulkanResidentFeedbackExecutionStats {
             template_record_count: 0,
-            template_replay_count: 1,
+            template_replay_count: 2,
             ..first.session_run.run.resident_feedback
         }
     );
+}
+
+#[test]
+fn placed_prompt_stream_device_cancel_commits_one_closing_feedback_tick() {
+    let device = match selected_test_vulkan_device() {
+        Ok(device) => device,
+        Err(error) => {
+            eprintln!("skipping placed feedback cancellation test: {error}");
+            return;
+        }
+    };
+    let manifest_path = fixture_model_package_manifest_path();
+    let devices = BTreeMap::from([(
+        RUNTIME_DEFAULT_LOGICAL_DEVICE_ID.to_string(),
+        Rc::new(device),
+    )]);
+    let mut stream =
+        VulkanResidentInProcessPlacedPromptStream::from_runtime_model_for_bound_devices(
+            devices,
+            manifest_path.parent().unwrap(),
+            fixture_model_runtime_model(),
+            Some(8),
+            0,
+            0,
+        )
+        .unwrap();
+    let maximum_window_tick_count = stream
+        .processor
+        .resident_feedback_loop
+        .as_ref()
+        .unwrap()
+        .window_policy
+        .maximum_tick_count;
+    stream
+        .processor
+        .resident_feedback_loop
+        .as_ref()
+        .unwrap()
+        .window_policy
+        .next_tick_count
+        .set(maximum_window_tick_count);
+    stream.enqueue_input_event(VulkanResidentTokenInputEvent::new(
+        "cancelled",
+        vec![1],
+        8,
+    ));
+    let initial = stream.run_next_activation().unwrap().unwrap();
+    assert!(initial.output_event.is_some());
+
+    stream
+        .resident_feedback_cancellation_handle()
+        .expect("fixture supports resident feedback")
+        .request_cancel();
+    let completed = stream.run_next_queued_input_event().unwrap().unwrap();
+
+    assert_eq!(completed.session_run.run.stop_reason, "cancelled");
+    assert_eq!(completed.generated_token_ids.len(), 2);
+    assert_eq!(completed.session_run.tick_count, 3);
+    assert_eq!(
+        completed.session_run.run.resident_feedback,
+        VulkanResidentFeedbackExecutionStats {
+            window_count: 1,
+            planned_tick_count: 7,
+            submitted_tick_count: 7,
+            executed_tick_count: 2,
+            retained_tick_count: 2,
+            sampled_tick_count: 1,
+            discarded_tick_count: 5,
+            template_record_count: 1,
+            template_replay_count: 0,
+        }
+    );
+    assert!(stream.is_idle());
 }
 
 #[test]

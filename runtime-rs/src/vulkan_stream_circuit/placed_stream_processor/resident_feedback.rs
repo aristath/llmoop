@@ -28,13 +28,13 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
         }
     }
 
-    fn resident_feedback_window_width(&self) -> usize {
+    fn resident_feedback_next_window_tick_count(&self) -> usize {
         if !self.speculative_decoders.is_empty() {
             return 0;
         }
         self.resident_feedback_loop
             .as_ref()
-            .map(|feedback_loop| feedback_loop.window_width)
+            .map(|feedback_loop| feedback_loop.window_policy.next_tick_count())
             .unwrap_or(0)
     }
 
@@ -222,25 +222,28 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
         start_stream_tick: u64,
         tick_count: usize,
         stop_token_ids: &[u32],
-        mut submission_replay: Option<&mut Option<VulkanResidentPlacedFeedbackSubmissionReplay>>,
+        mut submission_replays: Option<
+            &mut BTreeMap<usize, VulkanResidentPlacedFeedbackSubmissionReplay>,
+        >,
         mut on_sampled_token: F,
     ) -> Result<
         VulkanResidentFeedbackControlCompletion,
         VulkanResidentInProcessPlacedRuntimeError,
     >
     where
-        F: FnMut(usize, u32, usize, usize) -> Result<(), VulkanResidentInProcessPlacedRuntimeError>,
+        F: FnMut(usize, u32, usize, usize, bool)
+            -> Result<(), VulkanResidentInProcessPlacedRuntimeError>,
     {
         let feedback_loop = self.resident_feedback_loop.as_ref().ok_or_else(|| {
             VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(
                 "placed resident feedback loop is not mounted".to_string(),
             ))
         })?;
-        if tick_count < 2 || tick_count > feedback_loop.window_width {
+        if tick_count < 2 || tick_count > feedback_loop.window_policy.maximum_tick_count {
             return Err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop(
                 VulkanError(format!(
                     "placed resident feedback window requests {tick_count} ticks, mounted width is {}",
-                    feedback_loop.window_width
+                    feedback_loop.window_policy.maximum_tick_count
                 )),
             ));
         }
@@ -250,7 +253,10 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
             .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
         let mut template_replayed = false;
         let output_timeline_values =
-            if let Some(replay) = submission_replay.as_deref_mut().and_then(Option::as_mut) {
+            if let Some(replay) = submission_replays
+                .as_deref_mut()
+                .and_then(|replays| replays.get_mut(&tick_count))
+            {
                 template_replayed = true;
                 replay
                     .validate_tick_count(tick_count)
@@ -276,8 +282,9 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
                 submission_template
                     .submit_with_timeline_value_offset(0)
                     .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
-                if let Some(replay_slot) = submission_replay {
-                    *replay_slot = Some(
+                if let Some(replays) = submission_replays {
+                    replays.insert(
+                        tick_count,
                         VulkanResidentPlacedFeedbackSubmissionReplay::new(
                             submission_template,
                             tick_count,
@@ -334,6 +341,9 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
                 )),
             ));
         }
+        if completion.stop_reason == VULKAN_FEEDBACK_STOP_REASON_CANCELLED {
+            feedback_loop.control.acknowledge_cancellation();
+        }
         for tick_index in 0..completion.sampled_tick_count {
             let stream_tick = start_stream_tick
                 .checked_add(u64::try_from(tick_index).map_err(|_| {
@@ -350,6 +360,8 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
                 sampled_token_id,
                 feedback_loop.scheduler_turn_count_per_tick,
                 feedback_loop.completed_stage_count_per_tick,
+                completion.stop_reason == VULKAN_FEEDBACK_STOP_REASON_CANCELLED
+                    && tick_index + 1 == completion.sampled_tick_count,
             )?;
         }
         Ok(completion)

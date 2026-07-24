@@ -7,7 +7,8 @@ pub struct VulkanResidentInProcessPlacedPromptStream {
     active_input_event: Option<VulkanResidentInProcessPlacedActivePromptEvent>,
     pending_input_events: VecDeque<VulkanResidentTokenInputEvent>,
     speculative_draft_tokens: usize,
-    resident_feedback_submission_replay: Option<VulkanResidentPlacedFeedbackSubmissionReplay>,
+    resident_feedback_submission_replays:
+        BTreeMap<usize, VulkanResidentPlacedFeedbackSubmissionReplay>,
 }
 
 impl VulkanResidentInProcessPlacedPromptStream {
@@ -90,7 +91,7 @@ impl VulkanResidentInProcessPlacedPromptStream {
             active_input_event: None,
             pending_input_events: VecDeque::new(),
             speculative_draft_tokens: 0,
-            resident_feedback_submission_replay: None,
+            resident_feedback_submission_replays: BTreeMap::new(),
         })
     }
 
@@ -106,6 +107,15 @@ impl VulkanResidentInProcessPlacedPromptStream {
         &self.devices
     }
 
+    pub fn resident_feedback_cancellation_handle(
+        &self,
+    ) -> Option<VulkanResidentFeedbackCancellationHandle> {
+        self.processor
+            .resident_feedback_loop
+            .as_ref()
+            .map(|feedback_loop| feedback_loop.control.cancellation_handle())
+    }
+
     pub fn remount_model_preserving_state(
         &mut self,
         package: Arc<VulkanResidentInProcessPlacedModelPackage>,
@@ -119,7 +129,7 @@ impl VulkanResidentInProcessPlacedPromptStream {
         self.session.transport = VulkanInProcessPlacedEdgeTransport::new();
         self.package = package;
         self.processor = processor;
-        self.resident_feedback_submission_replay = None;
+        self.resident_feedback_submission_replays.clear();
         Ok(())
     }
 
@@ -387,12 +397,6 @@ impl VulkanResidentInProcessPlacedPromptStream {
         VulkanResidentInProcessPlacedRuntimeError,
     > {
         let reason = reason.into();
-        if let Some(feedback_loop) = &self.processor.resident_feedback_loop {
-            feedback_loop
-                .control
-                .request_cancel()
-                .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
-        }
         let control_event = if let Some(active_input_event) = &mut self.active_input_event {
             active_input_event.interrupt(reason)
         } else {
@@ -673,14 +677,14 @@ impl VulkanResidentInProcessPlacedPromptStream {
         let devices = &self.devices;
         let active_input_event = &mut self.active_input_event;
         let session = &mut self.session;
-        let submission_replay = &mut self.resident_feedback_submission_replay;
-        let window_width = processor.resident_feedback_window_width();
+        let submission_replays = &mut self.resident_feedback_submission_replays;
         let mut remaining_feedback_ticks = max_feedback_ticks;
         let mut ran_window = false;
         loop {
+            let window_tick_count = processor.resident_feedback_next_window_tick_count();
             let mut tick_count = active_input_event
                 .as_ref()
-                .map(|event| event.resident_feedback_window_tick_count(window_width))
+                .map(|event| event.resident_feedback_window_tick_count(window_tick_count))
                 .unwrap_or(0);
             tick_count = tick_count.min(remaining_feedback_ticks);
             if tick_count == 0 {
@@ -711,19 +715,23 @@ impl VulkanResidentInProcessPlacedPromptStream {
                 .input_event
                 .stop_token_ids
                 .clone();
-            let replay_slot = (tick_count == window_width
-                && processor
-                    .resident_feedback_loop
-                    .as_ref()
-                    .is_some_and(|feedback_loop| feedback_loop.replayable))
-            .then_some(&mut *submission_replay);
+            let replay_catalog = processor
+                .resident_feedback_loop
+                .as_ref()
+                .is_some_and(|feedback_loop| feedback_loop.replayable)
+                .then_some(&mut *submission_replays);
+            let window_started = Instant::now();
             let completion = processor.run_resident_feedback_window(
                 devices,
                 start_stream_tick,
                 tick_count,
                 &stop_token_ids,
-                replay_slot,
-                |_tick_index, sampled_token_id, scheduler_turn_count, completed_stage_count| {
+                replay_catalog,
+                | _tick_index,
+                  sampled_token_id,
+                  scheduler_turn_count,
+                  completed_stage_count,
+                  closes_after_device_cancel | {
                     let stream_tick = session.next_stream_tick;
                     let output_event = {
                         let active_input_event = active_input_event
@@ -732,7 +740,7 @@ impl VulkanResidentInProcessPlacedPromptStream {
                         let activation = active_input_event.next_activation().ok_or(
                             VulkanResidentInProcessPlacedRuntimeError::MissingPrivateFeedback,
                         )?;
-                        active_input_event.complete_activation(
+                        let output_event = active_input_event.complete_activation(
                             &activation,
                             stream_tick,
                             scheduler_turn_count,
@@ -741,7 +749,11 @@ impl VulkanResidentInProcessPlacedPromptStream {
                             activation
                                 .should_emit_public_output
                                 .then_some(sampled_token_id),
-                        )?
+                        )?;
+                        if closes_after_device_cancel {
+                            active_input_event.stop_after_current("cancelled");
+                        }
+                        output_event
                     };
                     session.next_stream_tick = stream_tick
                         .checked_add(1)
@@ -752,6 +764,19 @@ impl VulkanResidentInProcessPlacedPromptStream {
                     Ok(())
                 },
             )?;
+            let elapsed_time_ns =
+                u64::try_from(window_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            processor
+                .resident_feedback_loop
+                .as_ref()
+                .expect("resident feedback loop is mounted")
+                .window_policy
+                .observe_completed_window(
+                    tick_count,
+                    completion.executed_tick_count,
+                    elapsed_time_ns,
+                    completion.stop_reason != VULKAN_FEEDBACK_STOP_REASON_NONE,
+                );
             active_input_event
                 .as_mut()
                 .expect("resident feedback window requires an active input event")

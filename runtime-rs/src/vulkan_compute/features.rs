@@ -254,4 +254,3 @@ impl Display for VulkanError {
 }
 
 impl Error for VulkanError {}
-

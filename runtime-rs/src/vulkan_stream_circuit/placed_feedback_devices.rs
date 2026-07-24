@@ -46,10 +46,77 @@ struct VulkanResidentInProcessPlacedFeedbackLoop {
     feedback_synchronization: Option<Box<VulkanResidentPlacedFeedbackTimelineSynchronization>>,
     output_synchronization: Box<VulkanResidentPlacedOutputTimelineSynchronization>,
     control: VulkanResidentFeedbackControlPlane,
-    window_width: usize,
+    window_policy: VulkanResidentFeedbackWindowPolicy,
     replayable: bool,
     scheduler_turn_count_per_tick: usize,
     completed_stage_count_per_tick: usize,
+}
+
+const VULKAN_RESIDENT_FEEDBACK_TARGET_CONTROL_LATENCY_NS: u64 = 250_000_000;
+
+/// Learns how many already-recorded ticks may be submitted before returning to
+/// a host control boundary. The width is an execution/responsiveness decision,
+/// never a limit on how many tokens an input event may generate.
+#[derive(Debug)]
+struct VulkanResidentFeedbackWindowPolicy {
+    maximum_tick_count: usize,
+    next_tick_count: Cell<usize>,
+    estimated_tick_time_ns: Cell<Option<u64>>,
+}
+
+impl VulkanResidentFeedbackWindowPolicy {
+    fn new(maximum_tick_count: usize) -> Self {
+        debug_assert!(maximum_tick_count >= 2);
+        Self {
+            maximum_tick_count,
+            next_tick_count: Cell::new(2),
+            estimated_tick_time_ns: Cell::new(None),
+        }
+    }
+
+    fn next_tick_count(&self) -> usize {
+        self.next_tick_count.get()
+    }
+
+    fn observe_completed_window(
+        &self,
+        planned_tick_count: usize,
+        executed_tick_count: usize,
+        elapsed_time_ns: u64,
+        stopped: bool,
+    ) {
+        if stopped
+            || planned_tick_count != executed_tick_count
+            || executed_tick_count == 0
+            || elapsed_time_ns == 0
+        {
+            return;
+        }
+        // Interrupted and predicated windows are deliberately excluded: their
+        // elapsed time does not describe the cost of the submitted shape.
+        let observed_tick_time_ns =
+            elapsed_time_ns.div_ceil(u64::try_from(executed_tick_count).unwrap_or(u64::MAX));
+        let estimated_tick_time_ns = self
+            .estimated_tick_time_ns
+            .get()
+            .map(|previous| {
+                previous
+                    .saturating_mul(3)
+                    .saturating_add(observed_tick_time_ns)
+                    .div_ceil(4)
+            })
+            .unwrap_or(observed_tick_time_ns)
+            .max(1);
+        self.estimated_tick_time_ns
+            .set(Some(estimated_tick_time_ns));
+        let responsive_tick_count =
+            VULKAN_RESIDENT_FEEDBACK_TARGET_CONTROL_LATENCY_NS / estimated_tick_time_ns;
+        self.next_tick_count.set(
+            usize::try_from(responsive_tick_count)
+                .unwrap_or(usize::MAX)
+                .clamp(2, self.maximum_tick_count),
+        );
+    }
 }
 
 struct VulkanResidentPlacedFeedbackMount<'a> {
@@ -430,7 +497,7 @@ impl VulkanResidentInProcessPlacedFeedbackLoop {
             feedback_synchronization,
             output_synchronization,
             control,
-            window_width,
+            window_policy: VulkanResidentFeedbackWindowPolicy::new(window_width),
             replayable: !has_dynamic_push_constants,
             scheduler_turn_count_per_tick: activation_schedule.turns.len(),
             completed_stage_count_per_tick,

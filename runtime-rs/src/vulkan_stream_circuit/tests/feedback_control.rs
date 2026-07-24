@@ -79,3 +79,24 @@ fn feedback_execution_stats_distinguish_committed_work_from_predicated_tail() {
         }
     );
 }
+
+#[test]
+fn feedback_cancellation_handle_can_cross_the_runtime_worker_boundary() {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<VulkanResidentFeedbackCancellationHandle>();
+}
+
+#[test]
+fn feedback_window_policy_learns_a_responsive_execution_width() {
+    let policy = VulkanResidentFeedbackWindowPolicy::new(64);
+    assert_eq!(policy.next_tick_count(), 2);
+
+    policy.observe_completed_window(2, 2, 100_000_000, false);
+    assert_eq!(policy.next_tick_count(), 5);
+
+    policy.observe_completed_window(5, 5, 500_000_000, false);
+    assert_eq!(policy.next_tick_count(), 4);
+
+    policy.observe_completed_window(4, 2, 1, true);
+    assert_eq!(policy.next_tick_count(), 4);
+}
