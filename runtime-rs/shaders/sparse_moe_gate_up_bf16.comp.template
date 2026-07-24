@@ -9,6 +9,7 @@ layout(set = 0, binding = 0) readonly buffer HiddenInput { uint words[]; } hidde
 layout(set = 0, binding = 1) readonly buffer ExpertRoutes { uint words[]; } expert_routes;
 layout(set = 0, binding = 2) buffer ExpertIntermediates { uint words[]; } expert_intermediates;
 layout(set = 0, binding = 3) readonly buffer ExpertInputWeight { uint words[]; } expert_input_weight;
+layout(push_constant) uniform DispatchControl { uint expert_start; } dispatch_control;
 
 const uint HIDDEN_SIZE = {{HIDDEN_SIZE}}u;
 const uint INTERMEDIATE_SIZE = {{INTERMEDIATE_SIZE}}u;
@@ -64,7 +65,7 @@ void main() {
     if (expert >= NUM_EXPERTS) {
         return;
     }
-    uint expert_start = gl_WorkGroupID.z;
+    uint expert_start = dispatch_control.expert_start;
     uint expert_count = expert_input_weight.words.length() / EXPERT_INPUT_WORDS;
     if (expert < expert_start || expert >= expert_start + expert_count) {
         return;

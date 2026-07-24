@@ -25,7 +25,9 @@ enum VulkanComponentBatchStateSemantics<'a> {
 }
 
 fn batch_stage_control_byte_count(stage: &VulkanResidentComponentBatchStageArtifact) -> u32 {
-    if stage.shader_path.contains("append_gqa_attention_temporal_read")
+    if stage.shader_path.contains("sparse_moe_") {
+        2 * VULKAN_COMPONENT_BATCH_WIDTH_CONTROL_BYTE_CAPACITY
+    } else if stage.shader_path.contains("append_gqa_attention_temporal_read")
         || stage.shader_path.contains("append_kv_temporal_commit")
         || stage
             .shader_path

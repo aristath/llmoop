@@ -124,7 +124,7 @@ mod tests {
                 byte_count: Some(bytes),
             },
         };
-        let prepared = VulkanPreparedDispatchPlan {
+        let mut prepared = VulkanPreparedDispatchPlan {
             backend_id: "vulkan_stream_circuit".to_string(),
             reusable_family_count: 1,
             dispatches: vec![VulkanPreparedDispatch {
@@ -146,7 +146,11 @@ mod tests {
                     parameter(3, "expert-weight", 256 * 2048 * 512),
                     parameter(4, "expert-scale", 256 * 16 * 4 * 2),
                 ],
-                push_constants: Vec::new(),
+                push_constants: vec![VulkanKernelScalarBinding {
+                    name: "expert_start".to_string(),
+                    scalar_type: "u32".to_string(),
+                    source: VulkanKernelScalarSource::PushConstant,
+                }],
                 uses_stream_tick: false,
             }],
             total_descriptor_count: 5,
@@ -193,7 +197,11 @@ mod tests {
                 local_size_x: 64,
                 workgroup_count_x: 8192,
                 descriptor_signature: Vec::new(),
-                push_constants: Vec::new(),
+                push_constants: vec![VulkanKernelScalarBinding {
+                    name: "expert_start".to_string(),
+                    scalar_type: "u32".to_string(),
+                    source: VulkanKernelScalarSource::PushConstant,
+                }],
                 uses_stream_tick: false,
             }]);
 
@@ -247,6 +255,20 @@ mod tests {
         assert_eq!(
             dispatch.shards[1].parameters[1].byte_count,
             128 * 16 * 4 * 2
+        );
+
+        prepared.dispatches[0].push_constants.clear();
+        let legacy_plan = VulkanDistributedExecutionPlan::from_prepared_plans(
+            &[("owner", &prepared)],
+            &tensor_index,
+            &artifacts,
+            &["owner".to_string(), "helper".to_string()],
+            256,
+        )
+        .unwrap();
+        assert!(
+            legacy_plan.dispatches.is_empty(),
+            "sparse expert sharding requires the explicit expert_start contract"
         );
     }
 

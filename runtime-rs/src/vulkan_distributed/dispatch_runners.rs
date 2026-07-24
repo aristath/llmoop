@@ -136,9 +136,9 @@ fn create_distributed_resident_dispatch(
             &bindings,
             planned_shard.workgroup_count_x,
             1,
-            planned_shard.base_workgroup_z,
-            artifact.artifact.local_size_x,
             0,
+            artifact.artifact.local_size_x,
+            std::mem::size_of::<u32>() as u32,
             Some(format!(
                 "component={} node={} distributed=device:{} rows={}..{} base_z={} distribution={:?}",
                 planned_dispatch.component_id,
@@ -238,9 +238,16 @@ impl VulkanDistributedDispatchRunners {
                         leader.dispatch_index, tail.dispatch_index, leader_shard.device_id
                     ))
                 })?;
+                let push_constants = planned_shards
+                    .iter()
+                    .map(|shard| shard.base_workgroup_z.to_le_bytes())
+                    .collect::<Vec<_>>();
                 let steps = resident_dispatches
                     .iter()
-                    .map(|dispatch| VulkanResidentKernelSequenceStep::new(dispatch, &[]))
+                    .zip(&push_constants)
+                    .map(|(dispatch, push_constants)| {
+                        VulkanResidentKernelSequenceStep::new(dispatch, push_constants)
+                    })
                     .collect::<Vec<_>>();
                 device
                     .record_resident_kernel_sequence(&sequence, &steps)
@@ -768,4 +775,3 @@ impl From<VulkanError> for VulkanDistributedDispatchRunnerError {
         Self(error.to_string())
     }
 }
-

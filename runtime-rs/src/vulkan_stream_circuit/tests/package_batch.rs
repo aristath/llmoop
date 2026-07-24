@@ -596,6 +596,12 @@ fn component_batch_control_uses_width_only_payload_unless_stage_reads_time() {
         local_size_x: 64,
         workgroup_count_x: 1,
     };
+    let sparse = VulkanResidentComponentBatchStageArtifact {
+        shader_path: "shaders/sparse_moe_gate_up_batch1_bf16.spv".to_string(),
+        spirv_words: Vec::new(),
+        local_size_x: 64,
+        workgroup_count_x: 1,
+    };
 
     assert_eq!(
         batch_stage_control_byte_count(&width_only),
@@ -604,6 +610,10 @@ fn component_batch_control_uses_width_only_payload_unless_stage_reads_time() {
     assert_eq!(
         batch_stage_control_byte_count(&temporal),
         VULKAN_COMPONENT_BATCH_CONTROL_BYTE_CAPACITY
+    );
+    assert_eq!(
+        batch_stage_control_byte_count(&sparse),
+        2 * VULKAN_COMPONENT_BATCH_WIDTH_CONTROL_BYTE_CAPACITY
     );
 }
 

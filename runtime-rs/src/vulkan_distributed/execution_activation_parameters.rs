@@ -15,7 +15,8 @@ use crate::vulkan_compute::{
 use crate::vulkan_stream_circuit::{
     VulkanActivationSlotBufferOverride, VulkanDescriptorResourceAddress,
     VulkanLoadedReusableKernelArtifact, VulkanLoadedReusableKernelArtifactManifest,
-    VulkanPreparedDispatch, VulkanPreparedDispatchPlan, VulkanReusableKernelArtifactManifest,
+    VulkanKernelScalarBinding, VulkanKernelScalarSource, VulkanPreparedDispatch,
+    VulkanPreparedDispatchPlan, VulkanReusableKernelArtifactManifest,
 };
 
 const DISTRIBUTABLE_PARALLEL_PROJECTION_OP: &str = "parallel_linear_silu_multiply";
@@ -959,4 +960,3 @@ impl From<VulkanError> for VulkanDistributedParameterBufferError {
         Self(error.to_string())
     }
 }
-

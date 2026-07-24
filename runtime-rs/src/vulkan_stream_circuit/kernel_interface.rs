@@ -107,6 +107,7 @@ pub struct VulkanKernelStreamMetadata {
     pub control_flags: VulkanKernelScalarBinding,
     pub dynamic_state_capacity_activations: VulkanKernelScalarBinding,
     pub uses_stream_tick: bool,
+    push_constants: Vec<VulkanKernelScalarBinding>,
 }
 
 impl VulkanKernelStreamMetadata {
@@ -128,11 +129,19 @@ impl VulkanKernelStreamMetadata {
                     | "per_layer_embedding"
                     | "rg_lru_step"
             ),
+            push_constants: if matches!(op, "sparse_moe_gate_up" | "sparse_moe_down") {
+                vec![VulkanKernelScalarBinding::push_constant(
+                    "expert_start",
+                    "u32",
+                )]
+            } else {
+                Vec::new()
+            },
         }
     }
 
     pub fn push_constants(&self) -> Vec<VulkanKernelScalarBinding> {
-        Vec::new()
+        self.push_constants.clone()
     }
 }
 

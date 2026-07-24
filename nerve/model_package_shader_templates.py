@@ -1908,10 +1908,16 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
                 "EXPERTS_PER_TOKEN": str(experts_per_token),
                 "TILE_ROWS": str(INT4_CT_OUTPUT_TILE_ROWS),
                 "BATCH_CONTROL": (
-                    ""
+                    "layout(push_constant) uniform DispatchControl { uint "
+                    "expert_start; } dispatch_control;"
                     if batch_tile is None
                     else "layout(push_constant) uniform BatchControl { uint "
-                    "batch_width; } batch_control;"
+                    "batch_width; uint expert_start; } batch_control;"
+                ),
+                "EXPERT_START": (
+                    "dispatch_control.expert_start"
+                    if batch_tile is None
+                    else "batch_control.expert_start"
                 ),
                 "BATCH_INDEX": ("0u" if batch_tile is None else "gl_WorkGroupID.y"),
                 "BATCH_WIDTH": (

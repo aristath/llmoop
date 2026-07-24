@@ -22,7 +22,10 @@ layout(set = 0, binding = 2) buffer ExpertIntermediates { uint words[]; } expert
 layout(set = 0, binding = 3) readonly buffer ExpertInputWeight { uint words[]; } expert_input_weight;
 layout(set = 0, binding = 4) readonly buffer ExpertInputScaleInv { uint words[]; } expert_input_scale_inv;
 
-layout(push_constant) uniform BatchControl { uint batch_width; } batch_control;
+layout(push_constant) uniform BatchControl {
+    uint batch_width;
+    uint expert_start;
+} batch_control;
 
 const uint BLOCK_ROWS = {{BLOCK_ROWS}}u;
 const uint BLOCK_COLUMNS = {{BLOCK_COLUMNS}}u;
@@ -103,7 +106,7 @@ void main() {
     if (expert >= NUM_EXPERTS) {
         return;
     }
-    uint expert_start = gl_WorkGroupID.z;
+    uint expert_start = batch_control.expert_start;
     uint expert_count = expert_input_weight.words.length() / EXPERT_INPUT_WORDS;
     if (expert < expert_start || expert >= expert_start + expert_count) {
         return;

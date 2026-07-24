@@ -366,6 +366,9 @@ fn stream_control_push_constant_bytes(
             ("dynamic_state_capacity_activations", "u32") => {
                 bytes.extend_from_slice(&control.dynamic_state_capacity_activations.to_le_bytes());
             }
+            ("expert_start", "u32") => {
+                bytes.extend_from_slice(&0u32.to_le_bytes());
+            }
             _ => {
                 return Err(
                     VulkanMountedPlacedResidentKernelDispatchError::UnsupportedPushConstantBinding {
@@ -379,4 +382,3 @@ fn stream_control_push_constant_bytes(
 
     Ok(bytes)
 }
-

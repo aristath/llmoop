@@ -115,7 +115,7 @@ void main() {
     uint route_offset = batch_index * EXPERTS_PER_TOKEN;
     uint expert = expert_routes.words[route_offset + route] & 0xffffu;
     if (expert >= NUM_EXPERTS) return;
-    uint expert_start = gl_WorkGroupID.z;
+    uint expert_start = {{EXPERT_START}};
     uint expert_count = expert_input_weight.words.length() / EXPERT_INPUT_WORDS;
     if (expert < expert_start || expert >= expert_start + expert_count) return;
     expert -= expert_start;

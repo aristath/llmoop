@@ -74,6 +74,15 @@ fn component_batch_push_constant_bytes(
     control: &[u8; VULKAN_COMPONENT_BATCH_CONTROL_BYTE_CAPACITY as usize],
 ) -> Result<Vec<u8>, VulkanResidentInProcessPlacedRuntimeError> {
     match byte_count {
+        byte_count if byte_count == 2 * VULKAN_COMPONENT_BATCH_WIDTH_CONTROL_BYTE_CAPACITY => {
+            let mut bytes =
+                Vec::with_capacity(2 * VULKAN_COMPONENT_BATCH_WIDTH_CONTROL_BYTE_CAPACITY as usize);
+            bytes.extend_from_slice(
+                &control[..VULKAN_COMPONENT_BATCH_WIDTH_CONTROL_BYTE_CAPACITY as usize],
+            );
+            bytes.extend_from_slice(&0u32.to_le_bytes());
+            Ok(bytes)
+        }
         VULKAN_COMPONENT_BATCH_WIDTH_CONTROL_BYTE_CAPACITY => {
             Ok(control[..VULKAN_COMPONENT_BATCH_WIDTH_CONTROL_BYTE_CAPACITY as usize].to_vec())
         }

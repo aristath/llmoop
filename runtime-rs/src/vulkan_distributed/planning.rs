@@ -370,7 +370,13 @@ fn plan_sparse_expert_dispatch(
     artifact_workgroup_count_x: u32,
     storage_buffer_offset_alignment: usize,
 ) -> Result<Option<VulkanDistributedDispatchPlan>, VulkanDistributedPlanError> {
-    if !dispatch.push_constants.is_empty() || artifact_workgroup_count_x == 0 {
+    let has_supported_expert_start = dispatch.push_constants.as_slice()
+        == [VulkanKernelScalarBinding {
+            name: "expert_start".to_string(),
+            scalar_type: "u32".to_string(),
+            source: VulkanKernelScalarSource::PushConstant,
+        }];
+    if !has_supported_expert_start || artifact_workgroup_count_x == 0 {
         return Ok(None);
     }
     let parameter_descriptors = dispatch
@@ -719,4 +725,3 @@ fn dispatch_error(
         dispatch.component_id, dispatch.node_id
     ))
 }
-

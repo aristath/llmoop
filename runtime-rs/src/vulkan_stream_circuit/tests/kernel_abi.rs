@@ -149,6 +149,35 @@ fn recurrent_gate_kernel_receives_stream_control_metadata() {
 }
 
 #[test]
+fn sparse_moe_kernels_receive_an_explicit_expert_start() {
+    for op in ["sparse_moe_gate_up", "sparse_moe_down"] {
+        let metadata = VulkanKernelStreamMetadata::for_op(op);
+        let push_constants = metadata.push_constants();
+
+        assert_eq!(
+            push_constants,
+            vec![VulkanKernelScalarBinding {
+                name: "expert_start".to_string(),
+                scalar_type: "u32".to_string(),
+                source: VulkanKernelScalarSource::PushConstant,
+            }]
+        );
+        assert_eq!(
+            stream_control_push_constant_bytes(
+                &push_constants,
+                VulkanMountedPlacedStreamControl {
+                    stream_tick: 42,
+                    control_flags: 7,
+                    dynamic_state_capacity_activations: 65_536,
+                },
+            )
+            .unwrap(),
+            0u32.to_le_bytes()
+        );
+    }
+}
+
+#[test]
 fn fused_head_norm_rope_kernel_receives_stream_control_metadata() {
     let metadata = VulkanKernelStreamMetadata::for_op("parallel_head_norm_rope_2way");
 
@@ -280,4 +309,3 @@ fn dispatch_plan_orders_fixture_model_kernel_commands_for_stream_ticks() {
         })
     );
 }
-
