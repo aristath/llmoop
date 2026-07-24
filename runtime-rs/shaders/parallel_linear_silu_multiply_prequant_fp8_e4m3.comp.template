@@ -13,7 +13,7 @@ spirv_instruction(
 )
 float fp8_dot4_acc32(fe4m3vec4 a, fe4m3vec4 b, float accumulator);
 
-layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(local_size_x = 1024, local_size_y = 1, local_size_z = 1) in;
 
 layout(set = 0, binding = 0) readonly buffer QuantizedInput { uint words[]; } quantized_input;
 layout(set = 0, binding = 1) readonly buffer InputScale { float values[]; } input_scale;

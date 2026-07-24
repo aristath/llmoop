@@ -1040,7 +1040,7 @@ def local_size_x_for_shader_file(shader_file: str, node: Json) -> int:
     if shader_file.startswith("quantize_fp8_e4m3_"):
         return 32
     if "_prequant_fp8_e4m3_" in shader_file:
-        return 256
+        return 1024
     if re.fullmatch(
         r"(linear|linear_residual)_fp8_e4m3_b\d+x\d+_\d+x\d+\.comp",
         shader_file,

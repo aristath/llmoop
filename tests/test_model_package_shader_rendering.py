@@ -101,10 +101,12 @@ def test_compiler_renders_reusable_fp8_activation_kernel_family(
     ).read_text()
     assert "const uint ELEMENT_COUNT = 5120u;" in quantize
     assert "binding = 2) readonly buffer ResidualFrame" in residual
-    assert "const uint OUTPUT_TILE_ROWS = 64u;" in residual
+    assert "const uint OUTPUT_TILE_ROWS = 16u;" in residual
     assert "binding = 2) buffer OutputA" in parallel
     assert "binding = 5) readonly buffer WeightA" in parallel
     assert "const uint OUTPUT_C_SIZE = 1024u;" in parallel
+    assert "layout(local_size_x = 1024" in residual
+    assert "layout(local_size_x = 1024" in parallel
     assert "shared fe4m3vec4 quantized_input" not in residual
     assert "shared fe4m3vec4 quantized_input" not in parallel
     assert "read_gate_scale" in fused
