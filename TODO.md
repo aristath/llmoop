@@ -1,440 +1,272 @@
 # TODO
 
-## Direction
+## Direction and constraints
 
-The goal is not to rebuild llama.cpp or vLLM under a different name.
-
-NERVE remains a continuous stream inference engine:
+NERVE is a continuous-stream execution engine:
 
 ```text
 running stream =
     runtime graph
   + compiled permanent component circuits
-  + mutable transient circuit
+  + mutable transient circuit state
 ```
 
-llama.cpp and vLLM should be used as engineering references for the hard practical parts that mature inference engines already solve: scheduling, memory/state management, batching, graph reuse, kernel selection, quantization, MoE routing, and speculative decoding.
+The compiled package is a neutral component catalog plus canonical topology.
+Runtime configuration owns graph edits, component placement, stream scheduling,
+and device selection.
 
-The product shape remains the execution graph model described in `CONCEPT.md`.
+The logical source-layer component remains the graph-editing and placement
+boundary. Backends may fuse, split, tile, or otherwise lower work inside that
+boundary, but optimization must not erase the user's ability to place, duplicate,
+bypass, replace, migrate, or reconnect the component.
 
-## Core architectural work
+Use llama.cpp, vLLM, and other mature engines as engineering references, not as
+architectural templates. Do not add model-name-specific runtime behavior,
+compiler-time placement, obsolete-format compatibility layers, arbitrary small
+context/output limits, or benchmark-only shortcuts.
 
-### 1. Build a real stream scheduler
+## Remaining work, in priority order
 
-Requests are not the primary runtime object. A request is an event injected into a persistent stream.
+### 1. Close the active feedback loop on the device
 
-Implement a scheduler that operates on streams and stream activations:
+The device currently executes bounded feedback windows, but completion is still
+observed at a host synchronization boundary and work already recorded after EOS
+can still execute. Make the feedback loop behave like a real continuously running
+signal path:
 
-- Track active, idle, interrupted, and closing streams.
-- Admit external input events into existing streams without destroying stream state.
-- Schedule running stream activations before newly waiting work.
-- Maintain a token/work budget per scheduler step.
-- Distinguish prompt/prefill work from decode/feedback work.
-- Support chunked prefill for long inputs.
-- Keep the model mounted between turns.
-- Report timings from normal chat runs without special profiling modes.
+- Let sampling write device-resident continuation, interruption, and termination
+  state.
+- Predicate later ticks or use indirect dispatch so EOS, cancellation, or another
+  stop condition prevents unused tail work from executing.
+- Keep token feedback and transient-state updates on the device between useful
+  host events.
+- Keep persistent feedback submission templates alive across scheduler
+  activations. Key them by canonical runtime graph, placement, execution shape,
+  and state layout.
+- Define exact state commit/rollback behavior at interruption and feedback-window
+  boundaries.
+- Size windows from safe execution cost and responsiveness, not from a semantic
+  generation cap.
+- Report planned, submitted, executed, retained, and discarded ticks so wasted
+  work is visible.
 
-The scheduler should schedule stream events, not convert NERVE into a stateless request/response server.
+The host should inject input/control events and drain public output/control
+events. It should not be required to schedule every generated token.
 
-Current status:
+### 2. Build genuinely optimized shape- and dtype-specific kernel families
 
-- Core stream scheduler exists and tracks persistent streams, queued input events, prefill chunks, decode feedback windows, active/idle/interrupted/closing state, and normal executor-driven runs.
-- Streams can be admitted atomically with package-derived transient state declarations and an execution class identity.
-- Decode activations can represent bounded feedback windows instead of forcing one-token host stepping.
-- Prefill completion can account for the first emitted feedback token when the backend samples from the final prompt activation.
-- The placed Vulkan prompt engine now routes normal prompt/chat execution through the core stream scheduler while keeping the model mounted.
-- Normal prompt/chat reports include prefill/decode token counts, activation counts, scheduler batch counts, maximum batch width, and prefill/decode timing without a special profiling mode.
+Kernel selection exists, but important paths still use generic or matvec-shaped
+work where the workload calls for a different implementation.
 
-### 2. Replace flat transient context with block-managed transient circuit state
+#### Decode
 
-KV is not conceptually a disposable cache in NERVE. It is stream-owned transient circuit state.
+- Fuse operations within a logical component where doing so removes intermediate
+  traffic or dispatches without erasing the component boundary.
+- Quantize an activation once per reusable scope instead of repeating activation
+  quantization for every output tile.
+- Reduce dispatch count in component hot paths; large Qwen components currently
+  produce hundreds of primary kernel dispatches per tick.
+- Add a native tiled/dot-product path for large BF16 projections, especially the
+  output projection, without converting the stored BF16 weights.
+- Evaluate fusing final projection, candidate reduction, and sampling where that
+  preserves exact runtime semantics.
+- Optimize attention and state-update kernels for increasing context length and
+  remove avoidable serial reduction/softmax regions.
 
-Use vLLM-style block management as a practical implementation clue, but expose it in NERVE terms:
+#### Prefill
 
-```text
-node instance state
-  -> allocated in blocks/pages
-  -> owned by a stream
-  -> referenced through state tables
-  -> reusable, freeable, forkable, and snapshot-able
-```
+- Implement true FP8 cooperative-matrix or tiled matrix-matrix kernels rather
+  than executing prefill as repeated FP8 matrix-vector work.
+- Add corresponding optimized BF16 and INT4 prefill families where the device
+  supports them.
+- Implement causal batched state updates for attention, recurrent, Mamba, and
+  convolutional components.
 
-Required pieces:
+#### Compilation and selection
 
-- A block/page allocator for transient state.
-- Per-stream state tables.
-- Per-component or per-state block tables.
-- Slot mappings for writing new state.
-- Ref counts for shared or reused state blocks.
-- Free lists and safe reclamation.
-- State reset, snapshot, fork, and eventual merge semantics.
-- Support for attention KV, recurrent state, Mamba state, conv state, and other component-owned transient state.
+- Compile kernel variants from operation shape, source dtype, and required device
+  features—not model names.
+- Preserve a model's native dtype whenever the selected device supports it.
+- Select variants at runtime from shape, batch width, context state, and actual
+  device capabilities.
+- Maintain correctness tests and representative microbenchmarks for every
+  optimized family.
 
-This should remove the architectural need for arbitrary tiny capacity limits while preserving bounded, explicit resource management.
+### 3. Replace fixed one-component submission quanta with calibrated work quanta
 
-Current status:
+The current conservative submission boundary avoids long graphics-ring jobs but
+leaves substantial scheduling and submission overhead.
 
-- A backend-neutral transient state arena and per-stream state tables exist.
-- State blocks are page-like, reusable, ref-counted, resettable, forkable, and snapshot-able.
-- The stream scheduler reserves transient state slots per scheduled activation for declared stream-owned state.
-- Placed Vulkan packages now expose dynamic per-activation state declarations from resident package metadata, and placed streams register those declarations with the scheduler at stream admission.
-- Scheduled placed activations bind scheduler transient block ids to explicit resident page indexes before computing state-buffer byte offsets. This removes the old fixed circular/modulo aliasing path and fails loudly when resident page capacity is exhausted.
-- This is not finished: resident state buffers are still allocated as flat buffers, and the runtime still needs page free/eviction, block-to-buffer rebinding metadata, and device-side page-table bindings instead of host-side offset calculation.
+- Populate `RuntimeExecutionCost` from compiled component work, memory traffic,
+  dispatch count, and kernel characteristics.
+- Calibrate safe quantum limits per device and kernel family.
+- Coalesce multiple adjacent components into one submission when the calibrated
+  cost permits it.
+- Preserve explicit yield, interruption, and transient-state commit boundaries.
+- Adapt quanta without reintroducing graphics-ring timeouts.
+- Expose quantum size, estimated cost, actual duration, and forced-yield metrics
+  in normal runtime statistics.
 
-### 3. Preserve layer components as runtime/editing/placement boundaries
+### 4. Execute scheduler batches as real multi-stream Vulkan work
 
-For the first practical architecture, each source model layer remains a standalone source component in the compiled package.
+The scheduler can form compatible batches, but the Vulkan batch executor still
+processes their activations sequentially.
 
-The backend may fuse, split, tile, or lower internals however it wants, but the logical layer-component boundary remains available to the runtime graph editor.
-
-The layer component is the unit that can be:
-
-- placed on a device;
-- bypassed;
-- duplicated;
-- inspected;
-- migrated;
-- replaced;
-- connected over a short in-device edge or a longer cross-device edge.
-
-Optimization must not erase the user-facing execution graph contract.
-
-### 4. Put the scheduler below the runtime graph editor
-
-The runtime graph decides what exists and how it is wired.
-
-The scheduler decides when activations happen.
-
-Target shape:
-
-```text
-UI/API event
-   |
-   v
-stream scheduler
-   |
-   v
-runtime graph
-   |
-   v
-node instances + transient state pages
-   |
-   v
-backend execution plan
-```
-
-Placement remains a runtime concern. The compiler should produce a neutral component catalog and canonical topology, not a hardcoded execution placement.
-
-### 5. Make batch execution mean multi-stream signal processing
-
-Batching should not contradict the stream model.
-
-Instead:
-
-```text
-many active streams
-        |
-        v
-same mounted execution graph window
-        |
-        v
-many stream outputs and state updates
-```
-
-Implement batch execution over active streams:
-
-- Batch decode ticks across multiple streams.
+- Consume compatible decode activations in batched kernels.
 - Batch compatible prefill chunks.
-- Keep per-stream state tables separate.
-- Keep public output and private feedback signals separate.
-- Avoid rebuilding or remounting the model for each prompt.
+- Keep transient state, control signals, and public output separate per stream.
+- Support continuous stream admission, prefill/decode interleaving, cancellation,
+  and fairness while the model remains mounted.
+- Avoid increasing single-stream latency merely to report a wider logical batch.
 
-This is the stream/execution graph equivalent of vLLM continuous batching.
+### 5. Finish physical block-managed transient state
 
-Current status:
+The backend-neutral allocator and logical state tables exist, but resident state
+storage is still fundamentally flat and host offsets remain in the execution
+path.
 
-- The scheduler can emit backend-neutral activation batches.
-- Batch compatibility includes execution class identity, so streams from different packages, placements, or context capacities are not grouped together accidentally.
-- The placed Vulkan prompt engine consumes scheduler batch steps and sizes scheduler budgets by current stream count.
-- Placed scheduler batches execute through a dedicated batch executor seam, so real multi-stream Vulkan execution can replace the current sequential internals without rewriting the outer scheduler loop.
-- Current placed execution still runs each activation inside a batch sequentially; actual batched Vulkan kernels need to consume the batch plan next.
+- Allocate GPU-resident physical page/chunk pools for every transient state kind.
+- Bind scheduler block IDs to device-visible page tables.
+- Implement allocation, rebinding, free, eviction, and safe reclamation.
+- Perform hot-path state lookup on the device.
+- Make reset, snapshot, fork, shared-prefix state, and copy-on-write semantics
+  physically correct.
+- Cover attention KV, recurrent, Mamba, convolutional, speculative, and future
+  component-owned state through the same abstraction.
+- Remove flat resident buffers as the authoritative state model.
 
-### 6. Keep the device-owned feedback loop as the long-term target
+### 6. Wire prefix/state reuse into normal stream admission
 
-vLLM schedules each step host-side. That is useful as a starting point, but NERVE's concept wants active generation to live as close to the device as possible.
+Prefix-state primitives exist, but normal chat does not automatically use them.
 
-Short-term acceptable path:
+- Restore the longest compatible cached prefix when admitting prompt input.
+- Insert reusable block-aligned state after normal prefill.
+- Serialize every runtime modifier that can affect state into the cache key.
+- Key reuse by canonical graph identity, exact placement, component/state layout,
+  model/package identity, and token prefix.
+- Connect cache references to physical page refcounts, copy-on-write, eviction,
+  and reclamation.
+- Report hits, misses, reused tokens, saved prefill work, and eviction behavior.
+- Validate reuse with real multi-turn and branched conversations.
 
-- Host scheduler admits events.
-- Host builds bounded execution windows.
-- Device executes those windows.
-- Host receives output/control events.
+### 7. Define canonical runtime graph identity and reusable execution templates
 
-Long-term target:
+Execution-class compatibility, prefix reuse, and command/template reuse need one
+precise graph identity.
 
-- Host injects events and receives public outputs.
-- Device owns bounded steady-state feedback windows.
-- Feedback token/state production stays on device where possible.
-- Host intervention is for control, interruption, stream admission, UI, and cross-device orchestration.
+- Canonicalize source component references, node instances, topology, edge kinds,
+  duplication/bypass edits, exact component placement, state layout, shape class,
+  and selected kernel variants.
+- Include runtime modifiers when they change execution or transient-state
+  semantics.
+- Use the identity consistently for scheduler compatibility, prefix-state keys,
+  resident execution plans, and feedback templates.
+- Maintain reusable prefill, decode, and batch template catalogs.
+- Keep hot metadata in persistent buffers and update it without re-recording or
+  reallocating unaffected work.
+- Invalidate only templates affected by a graph edit, placement change, or shape
+  transition.
 
-### 7. Make kernel dispatch shape-aware
+### 8. Make cross-device execution efficient without making it mandatory
 
-Do not treat every compiled linear/component operation as the same kind of shader problem.
+Everything may run on one device. Multi-device execution should become useful
+when requested by placement or required by model size.
 
-Use llama.cpp as inspiration:
+- Choose edge transport from runtime capabilities: same-device aliasing,
+  peer/external memory, device-local transfer, host staging fallback, and
+  eventually LAN transport.
+- Remove host-backed activation edges from the fast path when peer/device-local
+  transfer is available.
+- Use asynchronous timeline synchronization and overlap transfers with independent
+  device work.
+- Support tensor or expert sharding inside a logical component when that is
+  materially better than transferring a full activation between layer
+  components.
+- Keep the logical source-layer boundary intact even when its internal work is
+  sharded.
+- Report transfer route, bytes, waits, and overlap per graph edge.
+- Compare single-device and necessary multi-device placements; do not force extra
+  devices into benchmarks.
 
-- Decode often wants matvec-style kernels.
-- Prefill often wants matmul-style kernels.
-- Quantized formats need native paths, not wide-scalar expansion unless proven faster.
-- Backend dispatch should pick kernels based on runtime shape, dtype, device features, and component contract.
-- Graph/kernel reuse should avoid hot-path allocation and recompilation.
+### 9. Complete route-native MoE execution
 
-Initial required dispatch families:
+Sparse components and selected-route kernels exist, but routing is not yet a
+fully optimized runtime signal path.
 
-- BF16 dense decode and prefill.
-- FP8 dense decode and prefill.
-- INT4 dense decode and prefill.
-- Attention/state-update paths.
-- Mamba/recurrent/conv state paths.
-- MoE route-native paths.
-- Sampler and speculative decode paths.
+- Group and batch selected routes across tokens and streams.
+- Execute only selected experts and prove this with runtime work counters.
+- Place or shard experts across devices without dense all-expert work.
+- Keep route weights and reduction on the device.
+- Make route signals participate in resident execution templates and feedback
+  control.
+- Validate output correctness and active-expert scaling on real MoE packages.
+- Make the 35B MoE model's performance reflect its active parameter count rather
+  than its full declared size.
 
-Current status:
+### 10. Integrate MTP into the steady-state scheduler and device loop
 
-- Scheduler activation batches now map explicitly onto backend execution modes:
-  prefill chunks are causal sequences, while decode feedback batches are
-  independent candidates.
-- Vulkan component-batch kernel selection already uses execution-domain metadata
-  to choose decode, prefill, or shared decode/prefill implementations by shape.
-- This is still only the dispatch vocabulary and selection seam; dense FP8/INT4,
-  attention/state, MoE route-native, and speculative decode optimized kernel
-  families still need real implementations.
+MTP compilation and transactional verification work, but speculative execution
+is not yet part of the optimized steady-state path.
 
-### 8. Make MoE route-native
-
-MoE components must not behave like dense FFNs with a mask.
-
-Routing is a first-class signal:
-
-```text
-hidden signal -> router -> selected expert routes -> active expert components -> reducer
-```
-
-Required pieces:
-
-- Router/top-k component output as explicit route signal.
-- Expert execution that only processes selected experts/routes.
-- Route grouping or route batching to reduce wasted work.
-- Expert-shard placement across devices.
-- Correct reduction using route weights.
-- Tests that prove work and output shapes scale with selected routes, not total experts.
-
-For MoE models with a small active parameter count, performance should reflect active experts, not the full declared model size.
-
-Current status:
-
-- The compiler represents sparse MoE layers as explicit route-native components:
-  router/top-k, sparse expert gate/up, sparse expert down, and reducer.
-- BF16, FP8, and INT4 sparse expert shader families are generated from the
-  selected-route contract, and compiler tests now guard that expert workgroup
-  counts scale with `experts_per_token`, not the total expert pool.
-- This is not finished: route grouping/batching across streams, expert-shard
-  placement, runtime route counters, and benchmarks proving active-expert
-  scaling on real MoE packages are still required.
-
-### 9. Make MTP/speculative decoding first-class
-
-Speculative decoding should not be treated as benchmark garnish.
-
-For models that ship MTP/draft components, the compiled package should expose them as components or execution graphs with explicit topology:
-
-```text
-main stream state -> draft component(s) -> proposed feedback tokens
-                                |
-                                v
-main execution graph verifies/accepts/rejects
-```
-
-Required pieces:
-
-- Compile MTP/draft components as reusable source components.
-- Runtime graph support for draft components.
-- Scheduler support for lookahead slots.
-- Transient state rollback on rejected draft tokens.
-- Acceptance-rate and accepted-token stats in normal runtime output.
-- Correct behavior with thinking/reasoning models enabled normally.
-
-Current status:
-
-- The compiler discovers structural MTP/draft graphs and lowers them as
-  auxiliary execution graphs with draft input adapters, draft processors, draft
-  output transducers, and explicit transactional state contracts.
-- The runtime can mount speculative decoder packages, run draft steps, verify a
-  target prefix, restore rejected tentative state, catch the draft decoder up to
-  the accepted prefix, and report proposed/accepted draft tokens plus timing in
+- Add scheduler-native lookahead slots and multi-draft routing.
+- Keep draft proposal, target verification, acceptance, rollback, and catch-up on
+  the device where practical.
+- Ensure enabling MTP does not disable resident feedback execution or introduce a
+  host synchronization point per token.
+- Keep thinking/reasoning behavior enabled normally during validation.
+- Report proposal count, acceptance, rollback, useful tokens, and timing in
   normal chat output.
-- This is not finished: scheduler-native lookahead slots, multi-draft routing,
-  larger validation on real thinking models, and warmed benchmarks with MTP
-  enabled are still required.
+- Enable MTP by default only where warmed, realistic workloads show a net
+  improvement.
 
-### 10. Treat prefill as a first-class workload
+### 11. Finish long-context prefill and mixed-workload scheduling
 
-Long context is a normal use case, not an edge case.
+- Interleave prefill and decode fairly under memory pressure.
+- Derive prefill chunk size from available memory, device execution limits, and
+  selected kernel shape.
+- Batch compatible prefill work across streams.
+- Preallocate, reclaim, and compact physical state pages safely around long
+  prompts.
+- Validate 64K/128K context and long agentic outputs without arbitrary low token
+  limits.
+- Report prefill and decode throughput separately by default.
 
-Implement:
+### 12. Maintain adversarial correctness and performance gates
 
-- Chunked prefill.
-- Prefill/decode interleaving.
-- Batch prefill where compatible.
-- Block allocation before prefill chunks.
-- No arbitrary small token limits in tests or benchmarks.
-- Normal 64k+ output capacity and large context operation.
+Every meaningful compiler, runtime, state, graph, or kernel change must be tested
+against the supported model set rather than optimized around one model.
 
-Prefill speed and decode speed should be measured separately by default.
+Correctness coverage must include:
 
-Current status:
+- Teacher-forced source-versus-compiled comparisons where a source runner is
+  available.
+- Real free-running, multi-turn conversations.
+- Thinking/reasoning enabled for thinking models.
+- Graph duplication, bypass, rewiring, and placement changes.
+- State reset, snapshot, fork, shared prefix, copy-on-write, and reclamation.
+- EOS/cancellation tests proving unused feedback-window tail work did not execute.
+- Long-context and long-output operation.
 
-- The stream scheduler emits chunked prefill activations and can batch
-  compatible prefill chunks across streams when activation/work budgets allow.
-- Prefill and decode token counts, activation counts, batch counts, and timings
-  are reported separately in normal prompt/chat output.
-- The runtime default generation budget is 65,536 new tokens rather than a tiny
-  benchmark-oriented cap.
-- This is not finished: device-visible page-table bindings, prefill/decode
-  interleaving under memory pressure, page reclamation, and real long-context
-  validation are still required.
+Performance runs must:
 
-### 11. Add prefix/state reuse after block-managed state exists
+- Keep the model resident for the full run.
+- Use `hi` only as the discarded warmup request.
+- Average the following five measured conversation turns:
+  1. `Who are you?`
+  2. `what is the capital of Greece?`
+  3. `How many cities named "Corinth" are there?`
+  4. `What is your knowledge cutoff date?`
+  5. `I asked you earlier to tell me the capital of a country. Which country was that?`
+- Use a 65,536-token output allowance and a realistic context allocation unless
+  the test explicitly measures another context size.
+- Report setup separately; report prefill and decode throughput, useful versus
+  executed ticks, placement, device identities, kernel variants, and MTP state.
+- Compare equivalent warmed settings with llama.cpp or vLLM where applicable.
+- Exercise one device when the model fits and only the devices actually required
+  when it does not.
+- Treat 20 decode tokens/second on Qwen3.6-27B-FP8 as the current minimum target,
+  not the final optimization ceiling.
 
-Do not start with clever prefix caching before the state allocator is solid.
-
-Once block-managed transient state exists:
-
-- Hash full state blocks by token prefix and relevant runtime modifiers.
-- Reuse block-aligned prefix state across streams.
-- Keep ref counts for shared blocks.
-- Evict with LRU or better policy.
-- Keep model/component identity and runtime graph identity in cache keys.
-- Support future external or remote state connectors.
-
-This maps to vLLM prefix caching while preserving NERVE's transient-circuit semantics.
-
-Current status:
-
-- The runtime now exposes backend-neutral stream state fork/share operations on
-  top of the ref-counted transient state arena. A stream can branch into a new
-  idle stream with the same resident transient blocks, and individual component
-  state can be shared into another stream without copying unrelated state.
-- Prefix-cache keys now include execution class, runtime graph identity, token
-  prefix hash, runtime modifier hash, token count, and normalized component
-  state keys.
-- A backend-neutral retained prefix-state cache can keep state tables alive
-  independently from the source stream, restore them into compatible streams,
-  and evict older entries while releasing retained blocks.
-- Cache insertion now verifies that each cached state entry exactly matches the
-  prefix token depth and ends on a full transient-state block boundary, so the
-  cache cannot silently store partial-block prefixes.
-- The cache can perform longest-compatible-prefix lookup for a longer incoming
-  token stream, and the scheduler exposes wrappers that construct keys from
-  stream execution class plus runtime graph identity instead of forcing callers
-  to hand-roll cache keys.
-- Tests guard shared block ref counts, source-reset survival, per-component
-  sharing, key normalization, eviction release, block-alignment rejection,
-  state-depth mismatch rejection, longest-prefix lookup, and execution-class
-  mismatch rejection.
-- This is not finished prompt prefix caching yet: automatic cache
-  insert/restore around normal prompt events, runtime modifier serialization,
-  page reclamation, and device-visible page-table bindings still need to be
-  wired into normal prompt admission.
-
-### 12. Make graph/kernel reuse explicit
-
-Avoid rebuilding execution shape on every prompt or token.
-
-Required pieces:
-
-- Separate prefill and decode execution plans.
-- Reusable mounted execution graph plans.
-- Reusable batch-size/token-count execution templates.
-- Persistent descriptor/buffer layouts.
-- Hot-path metadata updates without allocation.
-- Stable graph identity based on runtime graph, placement, shape class, and state layout.
-
-This is the Vulkan/SPIR-V analogue of graph reservation/reuse in llama.cpp and CUDA graph capture/replay in vLLM.
-
-Current status:
-
-- Mounted Vulkan dispatch segments keep pipelines, descriptors, command buffers,
-  and fences resident for the lifetime of the mounted model.
-- Resident kernel sequences are cached by execution variant/lane and replay
-  recorded commands when their dispatch shape has no dynamic push constants.
-- Normal chat output includes resident sequence record/reuse/submit counters, so
-  graph/kernel reuse is visible without a special profiling mode.
-- This is not finished: stable runtime graph identity, reusable prefill/decode
-  template catalogs, and hot-path page-table metadata updates still need to be
-  made explicit.
-
-## Validation expectations
-
-Every meaningful architectural change must preserve model usability.
-
-Validation should include:
-
-- Teacher-forced source/compiled comparison where available.
-- Free-running chat validation.
-- Multi-turn memory checks.
-- Thinking/reasoning mode enabled for thinking models.
-- Warmup run discarded when reporting benchmark averages.
-- Five normal chat requests for benchmark sanity:
-  - `hi`
-  - `Who are you?`
-  - `what is the capital of Greece?`
-  - `How many cities named "Corinth" are there?`
-  - `What is your knowledge cutoff date?`
-  - `I asked you earlier to tell me the capital of a country. Which country was that?`
-- Per-model validation after changes that touch compiler/runtime behavior.
-- No broad Vulkan test runs.
-- No parallel tests.
-- No NVIDIA NERVE workloads.
-
-## Near-term implementation order
-
-1. Define runtime stream/request/state scheduler data structures in Rust.
-2. Introduce block-managed transient state tables independent of any one model architecture.
-3. Route current single-chat execution through the scheduler with one stream.
-4. Add decode batching across streams without changing the compiled package format more than necessary.
-5. Add chunked prefill.
-6. Make attention/recurrent/Mamba state use the block/state table abstraction.
-7. Move current fixed-capacity feedback state onto the block-managed transient circuit.
-8. Add shape-aware dispatch selection for decode versus prefill kernels.
-9. Make MoE route execution truly active-route based.
-10. Wire MTP/speculative decoding as real runtime flow.
-11. Add prefix/state reuse.
-12. Re-benchmark all available models and compare against llama.cpp using warmed runs.
-
-## Non-goals
-
-- Do not turn NERVE into a clone of llama.cpp.
-- Do not turn NERVE into a clone of vLLM.
-- Do not make compiler output depend on runtime placement.
-- Do not hardcode model-specific behavior into core runtime files.
-- Do not solve performance by adding arbitrary low limits.
-- Do not optimize only benchmark prompts at the expense of real chat usability.
-- Do not erase component boundaries to gain short-term speed.
-- Do not add compatibility layers for old package formats unless there is a concrete current need.
-
-## Success criteria
-
-The engine is moving in the right direction when:
-
-- A compiled package remains a reusable component catalog.
-- Runtime graph editing controls placement, topology, duplication, and bypass.
-- A stream survives across multiple input events without remounting the model.
-- Transient state is explicit, stream-owned, and block-managed.
-- Multiple active streams can share mounted permanent circuits.
-- Decode and prefill use different optimized execution paths.
-- MoE models execute proportional to active routes.
-- MTP/speculative decoding works as part of normal generation.
-- Normal chat output includes useful performance stats.
-- Benchmarks discard warmup and report realistic multi-request averages.
-- The implementation still feels like the continuous stream/execution graph architecture in `CONCEPT.md`.
+Repository safety requirements remain mandatory: run tests sequentially, select
+Vulkan tests individually, never run a NERVE workload on the NVIDIA GPU, and
+verify AMD device residency before and after every GPU workload.
