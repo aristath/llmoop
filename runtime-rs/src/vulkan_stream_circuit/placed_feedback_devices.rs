@@ -79,8 +79,8 @@ struct VulkanPlacedOutputTimelineTurn<'a> {
     value: u64,
 }
 
-struct VulkanResidentPlacedFeedbackSubmissionReplay<'a> {
-    template: VulkanResidentQueueSubmissionTemplate<'a>,
+struct VulkanResidentPlacedFeedbackSubmissionReplay {
+    template: VulkanResidentQueueSubmissionTemplate,
     tick_count: usize,
     next_timeline_value_offset: u64,
 }
@@ -211,9 +211,9 @@ impl VulkanResidentPlacedOutputTimelineSynchronization {
     }
 }
 
-impl<'a> VulkanResidentPlacedFeedbackSubmissionReplay<'a> {
+impl VulkanResidentPlacedFeedbackSubmissionReplay {
     fn new(
-        template: VulkanResidentQueueSubmissionTemplate<'a>,
+        template: VulkanResidentQueueSubmissionTemplate,
         tick_count: usize,
     ) -> Result<Self, VulkanError> {
         let next_timeline_value_offset = u64::try_from(tick_count)

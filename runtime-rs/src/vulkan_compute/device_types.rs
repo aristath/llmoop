@@ -195,9 +195,11 @@ pub struct VulkanResidentQueueSubmissionBatch<'a> {
 }
 
 /// A mounted queue-submission topology. Command buffers, queue ordering, and
-/// semaphore edges stay fixed; replay only advances timeline values.
-pub struct VulkanResidentQueueSubmissionTemplate<'a> {
-    groups: Vec<VulkanResidentQueueSubmissionGroup<'a>>,
+/// semaphore edges stay fixed; replay only advances timeline values. The
+/// template owns the lightweight queue handles it needs, so its lifetime is
+/// independent from the temporary references used while recording it.
+pub struct VulkanResidentQueueSubmissionTemplate {
+    groups: Vec<VulkanResidentQueueSubmissionTemplateGroup>,
     submission_count: usize,
 }
 
@@ -205,6 +207,18 @@ struct VulkanResidentQueueSubmissionGroup<'a> {
     device: &'a VulkanComputeDevice,
     submissions: Vec<VulkanPreparedResidentQueueSubmission>,
     quantum_ranges: Vec<std::ops::Range<usize>>,
+}
+
+struct VulkanResidentQueueSubmissionTemplateGroup {
+    submitter: VulkanResidentQueueSubmitter,
+    submissions: Vec<VulkanPreparedResidentQueueSubmission>,
+    quantum_ranges: Vec<std::ops::Range<usize>>,
+}
+
+#[derive(Clone)]
+struct VulkanResidentQueueSubmitter {
+    device: ash::Device,
+    queue: vk::Queue,
 }
 
 struct VulkanPreparedResidentQueueSubmission {
@@ -313,7 +327,7 @@ impl<'a> VulkanResidentQueueSubmissionBatch<'a> {
             .sum()
     }
 
-    pub fn mount(self) -> Result<VulkanResidentQueueSubmissionTemplate<'a>, VulkanError> {
+    pub fn mount(self) -> Result<VulkanResidentQueueSubmissionTemplate, VulkanError> {
         let mut groups = self.groups.into_inner();
         if let Some(quantum_budget) = self.quantum_budget {
             for group in &mut groups {
@@ -349,6 +363,17 @@ impl<'a> VulkanResidentQueueSubmissionBatch<'a> {
                 VulkanError("resident queue submission count overflowed".to_string())
             })
         })?;
+        let groups = groups
+            .into_iter()
+            .map(|group| VulkanResidentQueueSubmissionTemplateGroup {
+                submitter: VulkanResidentQueueSubmitter {
+                    device: group.device.device.clone(),
+                    queue: group.device.queue,
+                },
+                submissions: group.submissions,
+                quantum_ranges: group.quantum_ranges,
+            })
+            .collect();
         Ok(VulkanResidentQueueSubmissionTemplate {
             groups,
             submission_count,
@@ -356,7 +381,7 @@ impl<'a> VulkanResidentQueueSubmissionBatch<'a> {
     }
 }
 
-impl VulkanResidentQueueSubmissionTemplate<'_> {
+impl VulkanResidentQueueSubmissionTemplate {
     pub fn submission_count(&self) -> usize {
         self.submission_count
     }
@@ -378,7 +403,7 @@ impl VulkanResidentQueueSubmissionTemplate<'_> {
         }
         for group in &self.groups {
             for quantum_range in &group.quantum_ranges {
-                group.device.submit_prepared_resident_queue_batch(
+                group.submitter.submit_prepared_resident_queue_batch(
                     &group.submissions[quantum_range.clone()],
                     timeline_value_offset,
                 )?;

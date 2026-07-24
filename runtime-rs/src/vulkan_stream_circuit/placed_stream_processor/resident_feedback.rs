@@ -38,16 +38,16 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
             .unwrap_or(0)
     }
 
-    fn mount_resident_feedback_submission_template<'a>(
-        &'a self,
-        devices: &'a BTreeMap<String, Rc<VulkanComputeDevice>>,
+    fn mount_resident_feedback_submission_template(
+        &self,
+        devices: &BTreeMap<String, Rc<VulkanComputeDevice>>,
         start_stream_tick: u64,
         tick_count: usize,
-        static_state_snapshots: &'a [VulkanResidentStateTransactionBank],
-        feedback_synchronization: Option<&'a VulkanResidentPlacedFeedbackTimelineSynchronization>,
-        output_synchronization: &'a VulkanResidentPlacedOutputTimelineSynchronization,
+        static_state_snapshots: &[VulkanResidentStateTransactionBank],
+        feedback_synchronization: Option<&VulkanResidentPlacedFeedbackTimelineSynchronization>,
+        output_synchronization: &VulkanResidentPlacedOutputTimelineSynchronization,
     ) -> Result<
-        (VulkanResidentQueueSubmissionTemplate<'a>, Vec<u64>),
+        (VulkanResidentQueueSubmissionTemplate, Vec<u64>),
         VulkanResidentInProcessPlacedRuntimeError,
     > {
         let mut transport = VulkanInProcessPlacedEdgeTransport::new();
@@ -214,14 +214,12 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
         Ok(())
     }
 
-    fn run_resident_feedback_window<'a, F>(
-        &'a self,
-        devices: &'a BTreeMap<String, Rc<VulkanComputeDevice>>,
+    fn run_resident_feedback_window<F>(
+        &self,
+        devices: &BTreeMap<String, Rc<VulkanComputeDevice>>,
         start_stream_tick: u64,
         tick_count: usize,
-        mut submission_replay: Option<
-            &mut Option<VulkanResidentPlacedFeedbackSubmissionReplay<'a>>,
-        >,
+        mut submission_replay: Option<&mut Option<VulkanResidentPlacedFeedbackSubmissionReplay>>,
         mut on_sampled_token: F,
     ) -> Result<(), VulkanResidentInProcessPlacedRuntimeError>
     where

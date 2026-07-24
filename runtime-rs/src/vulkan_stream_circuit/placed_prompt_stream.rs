@@ -7,6 +7,7 @@ pub struct VulkanResidentInProcessPlacedPromptStream {
     active_input_event: Option<VulkanResidentInProcessPlacedActivePromptEvent>,
     pending_input_events: VecDeque<VulkanResidentTokenInputEvent>,
     speculative_draft_tokens: usize,
+    resident_feedback_submission_replay: Option<VulkanResidentPlacedFeedbackSubmissionReplay>,
 }
 
 impl VulkanResidentInProcessPlacedPromptStream {
@@ -89,6 +90,7 @@ impl VulkanResidentInProcessPlacedPromptStream {
             active_input_event: None,
             pending_input_events: VecDeque::new(),
             speculative_draft_tokens: 0,
+            resident_feedback_submission_replay: None,
         })
     }
 
@@ -117,6 +119,7 @@ impl VulkanResidentInProcessPlacedPromptStream {
         self.session.transport = VulkanInProcessPlacedEdgeTransport::new();
         self.package = package;
         self.processor = processor;
+        self.resident_feedback_submission_replay = None;
         Ok(())
     }
 
@@ -664,9 +667,9 @@ impl VulkanResidentInProcessPlacedPromptStream {
         let devices = &self.devices;
         let active_input_event = &mut self.active_input_event;
         let session = &mut self.session;
+        let submission_replay = &mut self.resident_feedback_submission_replay;
         let window_width = processor.resident_feedback_window_width();
         let mut remaining_feedback_ticks = max_feedback_ticks;
-        let mut submission_replay = None;
         let mut ran_window = false;
         loop {
             let mut tick_count = active_input_event
@@ -702,7 +705,7 @@ impl VulkanResidentInProcessPlacedPromptStream {
                     .resident_feedback_loop
                     .as_ref()
                     .is_some_and(|feedback_loop| feedback_loop.replayable))
-            .then_some(&mut submission_replay);
+            .then_some(&mut *submission_replay);
             processor.run_resident_feedback_window(
                 devices,
                 start_stream_tick,

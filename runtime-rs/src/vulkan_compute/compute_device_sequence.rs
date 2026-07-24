@@ -140,6 +140,9 @@ impl VulkanComputeDevice {
         Ok(())
     }
 
+}
+
+impl VulkanResidentQueueSubmitter {
     fn submit_prepared_resident_queue_batch(
         &self,
         submissions: &[VulkanPreparedResidentQueueSubmission],
@@ -253,7 +256,9 @@ impl VulkanComputeDevice {
         }
         Ok(())
     }
+}
 
+impl VulkanComputeDevice {
     pub fn wait_resident_kernel_sequence(
         &self,
         sequence: &VulkanResidentKernelSequence,
