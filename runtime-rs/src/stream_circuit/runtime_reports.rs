@@ -309,6 +309,7 @@ pub struct RuntimePromptTimingReport {
     pub prefill_activation_batch_count: usize,
     pub decode_activation_batch_count: usize,
     pub max_activation_batch_width: usize,
+    pub max_pending_activation_count: usize,
     pub prefill_activation_count: usize,
     pub decode_activation_count: usize,
     pub prefill_time_ns: u64,
@@ -436,6 +437,10 @@ pub struct RuntimeFeedbackExecutionReport {
     pub discarded_tick_count: usize,
     pub template_record_count: usize,
     pub template_replay_count: usize,
+    pub asynchronous_submission_count: usize,
+    pub completion_poll_count: usize,
+    pub bounded_wait_count: usize,
+    pub bounded_wait_timeout_count: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

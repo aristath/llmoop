@@ -637,6 +637,7 @@
             prefill_activation_batch_count: 1,
             decode_activation_batch_count: 1,
             max_activation_batch_width: 1,
+            max_pending_activation_count: 1,
             prefill_activation_count: 1,
             decode_activation_count: 1,
             prefill_time_ns: 30,
@@ -756,6 +757,10 @@
                 discarded_tick_count: 4,
                 template_record_count: 1,
                 template_replay_count: 0,
+                asynchronous_submission_count: 0,
+                completion_poll_count: 0,
+                bounded_wait_count: 0,
+                bounded_wait_timeout_count: 0,
             },
         };
         let benchmark_transport = RuntimePromptBenchmarkTransportTotalsReport {

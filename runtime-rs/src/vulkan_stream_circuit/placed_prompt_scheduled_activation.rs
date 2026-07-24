@@ -1,7 +1,237 @@
+enum VulkanResidentInProcessPlacedScheduledActivationStart {
+    Complete(VulkanResidentInProcessPlacedPromptStreamScheduledActivationRun),
+    Pending,
+}
+
+struct VulkanResidentInProcessPlacedPendingSchedulerActivation {
+    activation_id: u64,
+    input_event_id: String,
+    start_stream_tick: u64,
+    state_bindings: Vec<VulkanResidentScheduledActivationStateBinding>,
+    output_events: Vec<VulkanResidentTokenOutputEvent>,
+    generated_token_ids: Vec<u32>,
+    max_tokens: usize,
+    generated_tokens: usize,
+    window: VulkanResidentInProcessPlacedPendingStreamFeedbackWindow,
+}
+
 impl VulkanResidentInProcessPlacedPromptStream {
+    fn begin_runtime_scheduler_activation<F>(
+        &mut self,
+        activation: &RuntimeStreamActivation,
+        on_output_event: F,
+    ) -> Result<
+        VulkanResidentInProcessPlacedScheduledActivationStart,
+        VulkanResidentInProcessPlacedRuntimeError,
+    >
+    where
+        F: FnMut(VulkanResidentTokenOutputEvent),
+    {
+        if self.pending_scheduler_activation.is_some() {
+            return Err(placed_scheduler_divergence(
+                "stream already has a submitted scheduler activation",
+            ));
+        }
+        let RuntimeStreamActivationKind::DecodeFeedback { max_tokens, .. } = activation.kind
+        else {
+            return self
+                .run_runtime_scheduler_activation_with_output(activation, on_output_event)
+                .map(VulkanResidentInProcessPlacedScheduledActivationStart::Complete);
+        };
+        if self.speculative_draft_tokens > 0 && self.processor.speculative_decoder_count() > 0 {
+            return self
+                .run_runtime_scheduler_activation_with_output(activation, on_output_event)
+                .map(VulkanResidentInProcessPlacedScheduledActivationStart::Complete);
+        }
+        let state_bindings = self.scheduler_activation_state_bindings(activation)?;
+        let Some(window) = self.submit_resident_feedback_window_limited(max_tokens)? else {
+            return self
+                .run_runtime_scheduler_activation_with_state_bindings(
+                    activation,
+                    state_bindings,
+                    on_output_event,
+                )
+                .map(VulkanResidentInProcessPlacedScheduledActivationStart::Complete);
+        };
+        self.active_input_event
+            .as_mut()
+            .expect("submitted scheduler feedback requires an active input event")
+            .resident_feedback
+            .record_asynchronous_submission();
+        self.pending_scheduler_activation = Some(
+            VulkanResidentInProcessPlacedPendingSchedulerActivation {
+                activation_id: activation.id,
+                input_event_id: activation.input_event_id.clone(),
+                start_stream_tick: self.next_stream_tick(),
+                state_bindings,
+                output_events: Vec::new(),
+                generated_token_ids: Vec::new(),
+                max_tokens,
+                generated_tokens: 0,
+                window,
+            },
+        );
+        Ok(VulkanResidentInProcessPlacedScheduledActivationStart::Pending)
+    }
+
+    fn pending_runtime_scheduler_activation_id(&self) -> Option<u64> {
+        self.pending_scheduler_activation
+            .as_ref()
+            .map(|pending| pending.activation_id)
+    }
+
+    fn wait_pending_runtime_scheduler_activation_for(
+        &mut self,
+        timeout_ns: u64,
+    ) -> Result<bool, VulkanResidentInProcessPlacedRuntimeError> {
+        let completed = self
+            .pending_scheduler_activation
+            .as_ref()
+            .map(|pending| self.wait_resident_feedback_window_for(&pending.window, timeout_ns))
+            .transpose()
+            .map(Option::unwrap_or_default)?;
+        if let Some(active) = self.active_input_event.as_mut() {
+            active
+                .resident_feedback
+                .record_bounded_wait(completed);
+        }
+        Ok(completed)
+    }
+
+    fn poll_runtime_scheduler_activation_with_output<F>(
+        &mut self,
+        mut on_output_event: F,
+    ) -> Result<
+        Option<VulkanResidentInProcessPlacedPromptStreamScheduledActivationRun>,
+        VulkanResidentInProcessPlacedRuntimeError,
+    >
+    where
+        F: FnMut(VulkanResidentTokenOutputEvent),
+    {
+        if self.pending_scheduler_activation.is_none() {
+            return Ok(None);
+        }
+        self.active_input_event
+            .as_mut()
+            .expect("pending scheduler feedback requires an active input event")
+            .resident_feedback
+            .record_completion_poll();
+        let window_is_complete = {
+            let pending = self
+                .pending_scheduler_activation
+                .as_ref()
+                .expect("pending scheduler activation was checked");
+            self.resident_feedback_window_is_complete(&pending.window)?
+        };
+        if !window_is_complete {
+            return Ok(None);
+        }
+
+        let mut pending = self
+            .pending_scheduler_activation
+            .take()
+            .expect("pending scheduler activation disappeared after completion");
+        let generated_before = self.active_generated_token_count();
+        let mut window_output_events = Vec::new();
+        let completion = self.complete_submitted_resident_feedback_window(
+            pending.window,
+            &mut |output_event| window_output_events.push(output_event),
+        )?;
+        let remaining_before = pending
+            .max_tokens
+            .saturating_sub(pending.generated_tokens);
+        let generated_delta = self.scheduled_feedback_generated_delta(
+            generated_before,
+            remaining_before,
+            "resident feedback window emitted more tokens than scheduled",
+        )?;
+        pending.generated_tokens = pending.generated_tokens.saturating_add(generated_delta);
+        pending
+            .generated_token_ids
+            .extend(window_output_events.iter().map(|event| event.token_id));
+        for output_event in &window_output_events {
+            on_output_event(output_event.clone());
+        }
+        pending.output_events.extend(window_output_events);
+
+        let mut completed_input_run = self.complete_active_input_event_if_complete()?;
+        let can_continue = completed_input_run.is_none()
+            && completion.stop_reason == VULKAN_FEEDBACK_STOP_REASON_NONE
+            && completion.executed_tick_count > 0
+            && pending.generated_tokens < pending.max_tokens;
+        if can_continue {
+            let remaining = pending.max_tokens - pending.generated_tokens;
+            if let Some(window) = self.submit_resident_feedback_window_limited(remaining)? {
+                self.active_input_event
+                    .as_mut()
+                    .expect("submitted scheduler feedback requires an active input event")
+                    .resident_feedback
+                    .record_asynchronous_submission();
+                pending.window = window;
+                self.pending_scheduler_activation = Some(pending);
+                return Ok(None);
+            }
+
+            let mut trailing_output_events = Vec::new();
+            completed_input_run = self.run_scheduled_feedback_window_with_output(
+                &pending.input_event_id,
+                remaining,
+                &mut |output_event| trailing_output_events.push(output_event),
+            )?;
+            pending
+                .generated_token_ids
+                .extend(trailing_output_events.iter().map(|event| event.token_id));
+            for output_event in &trailing_output_events {
+                on_output_event(output_event.clone());
+            }
+            pending.output_events.extend(trailing_output_events);
+        }
+        if completed_input_run.is_none() {
+            completed_input_run = self.close_scheduled_loop_if_exhausted()?;
+        }
+
+        let outcome = RuntimeStreamActivationOutcome::generated_tokens(
+            pending.generated_token_ids.clone(),
+            completed_input_run.is_none(),
+        );
+        Ok(Some(
+            VulkanResidentInProcessPlacedPromptStreamScheduledActivationRun {
+                activation_id: pending.activation_id,
+                input_event_id: pending.input_event_id,
+                start_stream_tick: pending.start_stream_tick,
+                next_stream_tick: self.next_stream_tick(),
+                state_bindings: pending.state_bindings,
+                output_events: pending.output_events,
+                generated_token_ids: pending.generated_token_ids,
+                outcome,
+                completed_input_run,
+            },
+        ))
+    }
+
     pub fn run_runtime_scheduler_activation_with_output<F>(
         &mut self,
         activation: &RuntimeStreamActivation,
+        on_output_event: F,
+    ) -> Result<
+        VulkanResidentInProcessPlacedPromptStreamScheduledActivationRun,
+        VulkanResidentInProcessPlacedRuntimeError,
+    >
+    where
+        F: FnMut(VulkanResidentTokenOutputEvent),
+    {
+        let state_bindings = self.scheduler_activation_state_bindings(activation)?;
+        self.run_runtime_scheduler_activation_with_state_bindings(
+            activation,
+            state_bindings,
+            on_output_event,
+        )
+    }
+
+    fn run_runtime_scheduler_activation_with_state_bindings<F>(
+        &mut self,
+        activation: &RuntimeStreamActivation,
+        state_bindings: Vec<VulkanResidentScheduledActivationStateBinding>,
         mut on_output_event: F,
     ) -> Result<
         VulkanResidentInProcessPlacedPromptStreamScheduledActivationRun,
@@ -13,7 +243,6 @@ impl VulkanResidentInProcessPlacedPromptStream {
         let mut output_events = Vec::new();
         let mut generated_token_ids = Vec::new();
         let start_stream_tick = self.next_stream_tick();
-        let state_bindings = self.scheduler_activation_state_bindings(activation)?;
         let mut capture_output_event = |event: VulkanResidentTokenOutputEvent| {
             generated_token_ids.push(event.token_id);
             output_events.push(event.clone());
@@ -29,7 +258,7 @@ impl VulkanResidentInProcessPlacedPromptStream {
                 )?,
             RuntimeStreamActivationKind::DecodeFeedback { max_tokens, .. } => self
                 .run_scheduled_feedback_window_with_output(
-                    activation,
+                    &activation.input_event_id,
                     *max_tokens,
                     &mut capture_output_event,
                 )?,
@@ -138,7 +367,7 @@ impl VulkanResidentInProcessPlacedPromptStream {
 
     fn run_scheduled_feedback_window_with_output<F>(
         &mut self,
-        scheduler_activation: &RuntimeStreamActivation,
+        scheduler_input_event_id: &str,
         max_tokens: usize,
         on_output_event: &mut F,
     ) -> Result<Option<VulkanResidentInProcessPlacedSubmittedInputRun>, VulkanResidentInProcessPlacedRuntimeError>
@@ -190,7 +419,7 @@ impl VulkanResidentInProcessPlacedPromptStream {
             let run = self
                 .run_next_activation()?
                 .ok_or_else(|| placed_scheduler_divergence("scheduled feedback had no backend activation"))?;
-            if run.input_event_id != scheduler_activation.input_event_id {
+            if run.input_event_id != scheduler_input_event_id {
                 return Err(placed_scheduler_divergence(
                     "scheduled feedback ran a different input event",
                 ));

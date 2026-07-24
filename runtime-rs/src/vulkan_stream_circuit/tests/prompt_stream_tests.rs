@@ -137,6 +137,10 @@ fn placed_prompt_stream_runs_resident_feedback_across_bridged_slices() {
             discarded_tick_count: 4,
             template_record_count: 1,
             template_replay_count: 0,
+            asynchronous_submission_count: 0,
+            completion_poll_count: 0,
+            bounded_wait_count: 0,
+            bounded_wait_timeout_count: 0,
         }
     );
 
@@ -346,6 +350,10 @@ fn placed_prompt_stream_reuses_feedback_submission_templates_across_events() {
             discarded_tick_count: 0,
             template_record_count: 1,
             template_replay_count: 1,
+            asynchronous_submission_count: 0,
+            completion_poll_count: 0,
+            bounded_wait_count: 0,
+            bounded_wait_timeout_count: 0,
         }
     );
     assert_eq!(
@@ -426,6 +434,10 @@ fn placed_prompt_stream_device_cancel_commits_one_closing_feedback_tick() {
             discarded_tick_count: 5,
             template_record_count: 1,
             template_replay_count: 0,
+            asynchronous_submission_count: 0,
+            completion_poll_count: 0,
+            bounded_wait_count: 0,
+            bounded_wait_timeout_count: 0,
         }
     );
     assert!(stream.is_idle());

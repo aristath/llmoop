@@ -60,6 +60,10 @@ pub struct VulkanResidentFeedbackExecutionStats {
     pub discarded_tick_count: usize,
     pub template_record_count: usize,
     pub template_replay_count: usize,
+    pub asynchronous_submission_count: usize,
+    pub completion_poll_count: usize,
+    pub bounded_wait_count: usize,
+    pub bounded_wait_timeout_count: usize,
 }
 
 impl VulkanResidentFeedbackExecutionStats {
@@ -89,6 +93,23 @@ impl VulkanResidentFeedbackExecutionStats {
             self.template_replay_count = self.template_replay_count.saturating_add(1);
         } else {
             self.template_record_count = self.template_record_count.saturating_add(1);
+        }
+    }
+
+    fn record_asynchronous_submission(&mut self) {
+        self.asynchronous_submission_count =
+            self.asynchronous_submission_count.saturating_add(1);
+    }
+
+    fn record_completion_poll(&mut self) {
+        self.completion_poll_count = self.completion_poll_count.saturating_add(1);
+    }
+
+    fn record_bounded_wait(&mut self, completed: bool) {
+        self.bounded_wait_count = self.bounded_wait_count.saturating_add(1);
+        if !completed {
+            self.bounded_wait_timeout_count =
+                self.bounded_wait_timeout_count.saturating_add(1);
         }
     }
 }

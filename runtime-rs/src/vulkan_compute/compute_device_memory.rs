@@ -217,15 +217,43 @@ impl VulkanComputeDevice {
         semaphore: &VulkanTimelineSemaphore,
         value: u64,
     ) -> Result<(), VulkanError> {
+        if self.wait_timeline_semaphore_value_for(semaphore, value, u64::MAX)? {
+            return Ok(());
+        }
+        Err(VulkanError(format!(
+            "timeline semaphore value {value} did not complete during an unbounded wait"
+        )))
+    }
+
+    pub fn wait_timeline_semaphore_value_for(
+        &self,
+        semaphore: &VulkanTimelineSemaphore,
+        value: u64,
+        timeout_ns: u64,
+    ) -> Result<bool, VulkanError> {
         self.validate_local_timeline_semaphore(semaphore)?;
         let semaphores = [semaphore.semaphore];
         let values = [value];
         let wait_info = vk::SemaphoreWaitInfo::default()
             .semaphores(&semaphores)
             .values(&values);
-        unsafe { self.device.wait_semaphores(&wait_info, u64::MAX) }.map_err(|error| {
-            VulkanError(format!(
+        match unsafe { self.device.wait_semaphores(&wait_info, timeout_ns) } {
+            Ok(()) => Ok(true),
+            Err(vk::Result::TIMEOUT) => Ok(false),
+            Err(error) => Err(VulkanError(format!(
                 "failed to wait for timeline semaphore value {value}: {error:?}"
+            ))),
+        }
+    }
+
+    pub fn timeline_semaphore_value(
+        &self,
+        semaphore: &VulkanTimelineSemaphore,
+    ) -> Result<u64, VulkanError> {
+        self.validate_local_timeline_semaphore(semaphore)?;
+        unsafe { self.device.get_semaphore_counter_value(semaphore.semaphore) }.map_err(|error| {
+            VulkanError(format!(
+                "failed to read timeline semaphore counter: {error:?}"
             ))
         })
     }

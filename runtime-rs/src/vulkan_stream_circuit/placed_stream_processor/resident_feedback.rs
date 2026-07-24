@@ -1,3 +1,10 @@
+struct VulkanResidentInProcessPlacedPendingFeedbackWindow {
+    start_stream_tick: u64,
+    tick_count: usize,
+    terminal_output_value: u64,
+    template_replayed: bool,
+}
+
 impl VulkanResidentInProcessPlacedStreamProcessor {
     pub fn device(
         &self,
@@ -187,22 +194,17 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
             .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)
     }
 
-    fn run_resident_feedback_window<F>(
+    fn submit_resident_feedback_window(
         &self,
         devices: &BTreeMap<String, Rc<VulkanComputeDevice>>,
         start_stream_tick: u64,
         tick_count: usize,
         stop_token_ids: &[u32],
         mut submission_replay: Option<&mut Option<VulkanResidentPlacedFeedbackSubmissionReplay>>,
-        mut on_sampled_token: F,
     ) -> Result<
-        VulkanResidentFeedbackControlCompletion,
+        VulkanResidentInProcessPlacedPendingFeedbackWindow,
         VulkanResidentInProcessPlacedRuntimeError,
-    >
-    where
-        F: FnMut(usize, u32, usize, usize, bool)
-            -> Result<(), VulkanResidentInProcessPlacedRuntimeError>,
-    {
+    > {
         let feedback_loop = self.resident_feedback_loop.as_ref().ok_or_else(|| {
             VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(
                 "placed resident feedback loop is not mounted".to_string(),
@@ -263,20 +265,90 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
                 }
                 output_timeline_values
             };
-        let output_device = devices.get(&self.model.output_device_id).ok_or_else(|| {
-            VulkanResidentInProcessPlacedRuntimeError::MissingBoundDevice {
-                device_id: self.model.output_device_id.clone(),
-            }
-        })?;
         let terminal_output_value = output_timeline_values.last().copied().ok_or_else(|| {
             VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(
                 "resident feedback window has no output timeline value".to_string(),
             ))
         })?;
+        Ok(VulkanResidentInProcessPlacedPendingFeedbackWindow {
+            start_stream_tick,
+            tick_count,
+            terminal_output_value,
+            template_replayed,
+        })
+    }
+
+    fn resident_feedback_output_device<'a>(
+        &self,
+        devices: &'a BTreeMap<String, Rc<VulkanComputeDevice>>,
+    ) -> Result<&'a VulkanComputeDevice, VulkanResidentInProcessPlacedRuntimeError> {
+        devices
+            .get(&self.model.output_device_id)
+            .map(Rc::as_ref)
+            .ok_or_else(
+                || VulkanResidentInProcessPlacedRuntimeError::MissingBoundDevice {
+                    device_id: self.model.output_device_id.clone(),
+                },
+            )
+    }
+
+    fn resident_feedback_window_is_complete(
+        &self,
+        devices: &BTreeMap<String, Rc<VulkanComputeDevice>>,
+        pending: &VulkanResidentInProcessPlacedPendingFeedbackWindow,
+    ) -> Result<bool, VulkanResidentInProcessPlacedRuntimeError> {
+        let feedback_loop = self.resident_feedback_loop.as_ref().ok_or_else(|| {
+            VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(
+                "placed resident feedback loop is not mounted".to_string(),
+            ))
+        })?;
         feedback_loop
             .output_synchronization
-            .wait_for_turn(output_device, terminal_output_value)
-            .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
+            .turn_is_complete(
+                self.resident_feedback_output_device(devices)?,
+                pending.terminal_output_value,
+            )
+            .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)
+    }
+
+    fn wait_resident_feedback_window_for(
+        &self,
+        devices: &BTreeMap<String, Rc<VulkanComputeDevice>>,
+        pending: &VulkanResidentInProcessPlacedPendingFeedbackWindow,
+        timeout_ns: u64,
+    ) -> Result<bool, VulkanResidentInProcessPlacedRuntimeError> {
+        let feedback_loop = self.resident_feedback_loop.as_ref().ok_or_else(|| {
+            VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(
+                "placed resident feedback loop is not mounted".to_string(),
+            ))
+        })?;
+        feedback_loop
+            .output_synchronization
+            .wait_for_turn_for(
+                self.resident_feedback_output_device(devices)?,
+                pending.terminal_output_value,
+                timeout_ns,
+            )
+            .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)
+    }
+
+    fn complete_resident_feedback_window<F>(
+        &self,
+        pending: VulkanResidentInProcessPlacedPendingFeedbackWindow,
+        mut on_sampled_token: F,
+    ) -> Result<
+        VulkanResidentFeedbackControlCompletion,
+        VulkanResidentInProcessPlacedRuntimeError,
+    >
+    where
+        F: FnMut(usize, u32, usize, usize, bool)
+            -> Result<(), VulkanResidentInProcessPlacedRuntimeError>,
+    {
+        let feedback_loop = self.resident_feedback_loop.as_ref().ok_or_else(|| {
+            VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(
+                "placed resident feedback loop is not mounted".to_string(),
+            ))
+        })?;
         // The output timeline signal is recorded after the terminal output
         // slice. Every upstream slice, distributed shard, and transfer is a
         // semaphore dependency of that slice, so this one wait is the graph
@@ -286,16 +358,18 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
             .control
             .completion()
             .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
-        completion.template_replayed = template_replayed;
+        completion.template_replayed = pending.template_replayed;
         if completion.executed_tick_count == 0
-            || completion.executed_tick_count > tick_count
+            || completion.executed_tick_count > pending.tick_count
             || completion.sampled_tick_count == 0
             || completion.sampled_tick_count > completion.executed_tick_count
         {
             return Err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop(
                 VulkanError(format!(
-                    "resident feedback control completed {} model ticks and {} sampled ticks for a {tick_count}-tick window",
-                    completion.executed_tick_count, completion.sampled_tick_count
+                    "resident feedback control completed {} model ticks and {} sampled ticks for a {}-tick window",
+                    completion.executed_tick_count,
+                    completion.sampled_tick_count,
+                    pending.tick_count,
                 )),
             ));
         }
@@ -304,13 +378,15 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
             VULKAN_FEEDBACK_STOP_REASON_NONE
                 | VULKAN_FEEDBACK_STOP_REASON_EOS
                 | VULKAN_FEEDBACK_STOP_REASON_CANCELLED
-        ) || (completion.executed_tick_count < tick_count
+        ) || (completion.executed_tick_count < pending.tick_count
             && completion.stop_reason == VULKAN_FEEDBACK_STOP_REASON_NONE)
         {
             return Err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop(
                 VulkanError(format!(
-                    "resident feedback control reported invalid stop reason {} after {} of {tick_count} ticks",
-                    completion.stop_reason, completion.executed_tick_count
+                    "resident feedback control reported invalid stop reason {} after {} of {} ticks",
+                    completion.stop_reason,
+                    completion.executed_tick_count,
+                    pending.tick_count,
                 )),
             ));
         }
@@ -318,7 +394,8 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
             feedback_loop.control.acknowledge_cancellation();
         }
         for tick_index in 0..completion.sampled_tick_count {
-            let stream_tick = start_stream_tick
+            let stream_tick = pending
+                .start_stream_tick
                 .checked_add(u64::try_from(tick_index).map_err(|_| {
                     VulkanResidentInProcessPlacedRuntimeError::StreamTickOverflow
                 })?)

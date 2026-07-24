@@ -45,6 +45,10 @@ fn print_runtime_timing_stats(label: &str, timing: &RuntimePromptTimingReport) {
         timing.max_activation_batch_width
     );
     println!(
+        "  max_pending_activations={}",
+        timing.max_pending_activation_count
+    );
+    println!(
         "  prefill_ms={:.3}",
         nanos_to_millis(timing.prefill_time_ns)
     );
@@ -165,6 +169,16 @@ fn print_runtime_feedback_stats(stats: &RuntimeFeedbackExecutionReport) {
     println!("  discarded_ticks={}", stats.discarded_tick_count);
     println!("  template_records={}", stats.template_record_count);
     println!("  template_replays={}", stats.template_replay_count);
+    println!(
+        "  asynchronous_submissions={}",
+        stats.asynchronous_submission_count
+    );
+    println!("  completion_polls={}", stats.completion_poll_count);
+    println!("  bounded_waits={}", stats.bounded_wait_count);
+    println!(
+        "  bounded_wait_timeouts={}",
+        stats.bounded_wait_timeout_count
+    );
 }
 
 fn print_runtime_speculative_stats(

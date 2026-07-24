@@ -76,6 +76,10 @@ fn feedback_execution_stats_distinguish_committed_work_from_predicated_tail() {
             discarded_tick_count: 57,
             template_record_count: 1,
             template_replay_count: 1,
+            asynchronous_submission_count: 0,
+            completion_poll_count: 0,
+            bounded_wait_count: 0,
+            bounded_wait_timeout_count: 0,
         }
     );
 }

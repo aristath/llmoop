@@ -268,6 +268,23 @@ impl VulkanResidentPlacedOutputTimelineSynchronization {
         output_device.wait_timeline_semaphore_value(&self.signal, value)
     }
 
+    fn wait_for_turn_for(
+        &self,
+        output_device: &VulkanComputeDevice,
+        value: u64,
+        timeout_ns: u64,
+    ) -> Result<bool, VulkanError> {
+        output_device.wait_timeline_semaphore_value_for(&self.signal, value, timeout_ns)
+    }
+
+    fn turn_is_complete(
+        &self,
+        output_device: &VulkanComputeDevice,
+        value: u64,
+    ) -> Result<bool, VulkanError> {
+        Ok(output_device.timeline_semaphore_value(&self.signal)? >= value)
+    }
+
     fn reserve_replayed_turns(&self, count: usize) -> Result<Vec<u64>, VulkanError> {
         let count = u64::try_from(count)
             .map_err(|_| VulkanError("resident output replay width exceeds u64".to_string()))?;

@@ -421,6 +421,81 @@ fn placed_prompt_engine_batches_input_events_across_streams() {
 }
 
 #[test]
+#[ignore = "requires the deterministic structural Vulkan fixture tracked in TODO.md"]
+fn placed_prompt_engine_overlaps_resident_feedback_windows_across_streams() {
+    let device = match selected_test_vulkan_device() {
+        Ok(device) => device,
+        Err(error) => {
+            eprintln!("skipping placed prompt engine asynchronous feedback test: {error}");
+            return;
+        }
+    };
+    let runtime_model = fixture_model_runtime_model_with_placement(
+        StreamCircuitPlacementSpec::new("gpu0").with_component_device("layer_02", "gpu1"),
+    );
+    let manifest_path = fixture_model_package_manifest_path();
+    let manifest_dir = manifest_path.parent().unwrap();
+    let device = Rc::new(device);
+    let devices = BTreeMap::from([
+        ("gpu0".to_string(), device.clone()),
+        ("gpu1".to_string(), device.clone()),
+    ]);
+    let stream_a = VulkanResidentInProcessPlacedPromptStream::from_runtime_model_for_bound_devices(
+        devices.clone(),
+        manifest_dir,
+        runtime_model.clone(),
+        Some(16),
+        0,
+        0,
+    )
+    .unwrap();
+    let stream_b = VulkanResidentInProcessPlacedPromptStream::from_runtime_model_for_bound_devices(
+        devices,
+        manifest_dir,
+        runtime_model,
+        Some(16),
+        1,
+        0,
+    )
+    .unwrap();
+
+    let mut engine = VulkanResidentInProcessPlacedPromptEngine::new();
+    engine.add_stream("stream_a", stream_a).unwrap();
+    engine.add_stream("stream_b", stream_b).unwrap();
+    engine
+        .enqueue_input_event(
+            "stream_a",
+            VulkanResidentTokenInputEvent::new("event_a", vec![1], 5),
+        )
+        .unwrap();
+    engine
+        .enqueue_input_event(
+            "stream_b",
+            VulkanResidentTokenInputEvent::new("event_b", vec![1], 5),
+        )
+        .unwrap();
+
+    let run = engine.run_until_idle_bounded(2).unwrap();
+
+    assert_eq!(run.processed_input_event_count, 2);
+    assert_eq!(run.max_pending_activation_count, 2);
+    for input_run in &run.input_runs {
+        let feedback = input_run
+            .submitted_run
+            .session_run
+            .run
+            .resident_feedback;
+        assert!(feedback.asynchronous_submission_count > 0);
+        assert!(feedback.completion_poll_count > 0);
+        assert_eq!(
+            feedback.asynchronous_submission_count,
+            feedback.window_count
+        );
+    }
+    assert!(run.end_snapshot.idle);
+}
+
+#[test]
 fn placed_prompt_engine_preserves_queued_work_at_input_event_budget() {
     let device = match VulkanComputeDevice::new() {
         Ok(device) => device,
