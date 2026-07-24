@@ -27,24 +27,7 @@ context/output limits, or benchmark-only shortcuts.
 
 ## Remaining work, in priority order
 
-### 1. Execute scheduler batches as real multi-stream Vulkan work
-
-The scheduler can form compatible batches, but the Vulkan batch executor still
-processes their activations sequentially.
-
-- Consume compatible decode activations in batched kernels.
-- Batch compatible prefill chunks.
-- Keep transient state, control signals, and public output separate per stream.
-- Support continuous stream admission, prefill/decode interleaving, cancellation,
-  and fairness while the model remains mounted.
-- Avoid increasing single-stream latency merely to report a wider logical batch.
-- Replace per-stream bounded completion polling with a scheduler-level wait set
-  when several device windows are pending. The asynchronous single-stream
-  warmup required 1,048 completion polls and 1,045 bounded waits (996 timeouts);
-  this preserved throughput and control responsiveness, but it is not the final
-  multi-stream completion mechanism.
-
-### 2. Finish physical block-managed transient state
+### 1. Finish physical block-managed transient state
 
 The backend-neutral allocator and logical state tables exist, but resident state
 storage is still fundamentally flat and host offsets remain in the execution
@@ -60,7 +43,7 @@ path.
   component-owned state through the same abstraction.
 - Remove flat resident buffers as the authoritative state model.
 
-### 3. Wire prefix/state reuse into normal stream admission
+### 2. Wire prefix/state reuse into normal stream admission
 
 Prefix-state primitives exist, but normal chat does not automatically use them.
 
@@ -74,7 +57,7 @@ Prefix-state primitives exist, but normal chat does not automatically use them.
 - Report hits, misses, reused tokens, saved prefill work, and eviction behavior.
 - Validate reuse with real multi-turn and branched conversations.
 
-### 4. Define canonical runtime graph identity and reusable execution templates
+### 3. Define canonical runtime graph identity and reusable execution templates
 
 Execution-class compatibility, prefix reuse, and command/template reuse need one
 precise graph identity.
@@ -101,7 +84,7 @@ precise graph identity.
   rebased without giving independently recorded templates stale relative
   offsets.
 
-### 5. Make cross-device execution efficient without making it mandatory
+### 4. Make cross-device execution efficient without making it mandatory
 
 Everything may run on one device. Multi-device execution should become useful
 when requested by placement or required by model size.
@@ -128,7 +111,7 @@ when requested by placement or required by model size.
   the prior single-device run; repeat under matched context and conversation
   conditions before attributing the entire difference to transport.
 
-### 6. Complete route-native MoE execution
+### 5. Complete route-native MoE execution
 
 Sparse components and selected-route kernels exist, but routing is not yet a
 fully optimized runtime signal path.
@@ -143,7 +126,7 @@ fully optimized runtime signal path.
 - Make the 35B MoE model's performance reflect its active parameter count rather
   than its full declared size.
 
-### 7. Integrate MTP into the steady-state scheduler and device loop
+### 6. Integrate MTP into the steady-state scheduler and device loop
 
 MTP compilation and transactional verification work, but speculative execution
 is not yet part of the optimized steady-state path.
@@ -159,7 +142,7 @@ is not yet part of the optimized steady-state path.
 - Enable MTP by default only where warmed, realistic workloads show a net
   improvement.
 
-### 8. Finish long-context prefill and mixed-workload scheduling
+### 7. Finish long-context prefill and mixed-workload scheduling
 
 - Interleave prefill and decode fairly under memory pressure.
 - Derive prefill chunk size from available memory, device execution limits, and
@@ -175,7 +158,7 @@ is not yet part of the optimized steady-state path.
   limits.
 - Report prefill and decode throughput separately by default.
 
-### 9. Maintain adversarial correctness and performance gates
+### 8. Maintain adversarial correctness and performance gates
 
 Every meaningful compiler, runtime, state, graph, or kernel change must be tested
 against the supported model set rather than optimized around one model.
@@ -225,10 +208,14 @@ Performance runs must:
   segments, malformed thinking boundaries, turn contamination, or failure to
   terminate after a valid answer; generating some meaningful text is
   insufficient.
-- Make the structural Rust test gate self-contained. It currently panics when a
-  deleted external 230M lowered-model fixture is absent; tests must use a
-  checked-in or deterministically generated fixture, or skip with an explicit
-  unsupported prerequisite rather than report an implementation failure.
+- The post-multi-stream seed-1 27B-FP8 run again entered a repeated Corinth
+  reasoning loop on measured turn three. The two valid turns decoded at 16.041
+  and 15.682 tokens/second (15.862 average), confirming no measurable
+  single-stream regression but leaving the full conversation gate failed.
+- Finish migrating structural Rust tests to the checked-in deterministic tiny
+  compiled package. Prompt-engine batching, wait-set, fairness, and cancellation
+  tests now use it; remaining tests must stop depending on the deleted external
+  230M lowered-model fixture.
 
 Repository safety requirements remain mandatory: run tests sequentially, select
 Vulkan tests individually, never run a NERVE workload on the NVIDIA GPU, and
