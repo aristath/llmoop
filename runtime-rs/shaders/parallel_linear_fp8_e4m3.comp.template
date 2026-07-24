@@ -26,14 +26,13 @@ const uint BRANCH_COUNT = {{BRANCH_COUNT}}u;
 const uint BLOCK_ROWS = {{BLOCK_ROWS}}u;
 const uint BLOCK_COLUMNS = {{BLOCK_COLUMNS}}u;
 const uint INPUT_SIZE = {{INPUT_SIZE}}u;
-const uint OUTPUT_SIZE = {{OUTPUT_SIZE}}u;
 const uint OUTPUT_TILE_ROWS = {{OUTPUT_TILE_ROWS}}u;
 const uint INPUT_WORDS = INPUT_SIZE / 2u;
-const uint OUTPUT_WORDS = OUTPUT_SIZE / 2u;
 const uint INPUT_FP8_WORDS = INPUT_SIZE / 4u;
 const uint INPUT_BLOCKS = INPUT_SIZE / BLOCK_COLUMNS;
 const uint BLOCK_FP8_WORDS = BLOCK_COLUMNS / 4u;
 const uint SCALE_COLUMNS = INPUT_BLOCKS;
+{{OUTPUT_CONSTANTS}}
 
 shared fe4m3vec4 quantized_input[INPUT_FP8_WORDS];
 shared float input_scales[INPUT_BLOCKS];
@@ -75,8 +74,11 @@ fe4m3vec4 read_branch_weightx4(uint branch, uint row, uint column) {
 }
 
 void write_branch_output(uint branch, uint row, uint value) {
-    uint index = row / 2u;
 {{OUTPUT_WRITES}}
+}
+
+uint branch_output_size(uint branch) {
+{{OUTPUT_SIZE_SELECTION}}
 }
 
 void main() {
@@ -105,7 +107,7 @@ void main() {
         for (uint local_row = 0u; local_row < OUTPUT_TILE_ROWS; local_row++) {
             uint row = first_row + local_row;
             float sum = 0.0;
-            if (row < OUTPUT_SIZE) {
+            if (row < branch_output_size(branch)) {
                 for (uint word = lane; word < INPUT_FP8_WORDS; word += 64u) {
                     uint block = word / BLOCK_FP8_WORDS;
                     sum = fma(
@@ -132,7 +134,7 @@ void main() {
         uint local_row = lane % OUTPUT_TILE_ROWS;
         uint row = first_row + local_row;
         float sum = 0.0;
-        if (row < OUTPUT_SIZE) {
+        if (row < branch_output_size(branch)) {
             for (uint subgroup = 0u; subgroup < gl_NumSubgroups; subgroup++) {
                 sum += subgroup_sum[branch][local_row][subgroup];
             }
@@ -145,8 +147,9 @@ void main() {
         uint branch = lane / ((OUTPUT_TILE_ROWS + 1u) / 2u);
         uint local_pair = lane % ((OUTPUT_TILE_ROWS + 1u) / 2u);
         uint row = first_row + local_pair * 2u;
-        if (row < OUTPUT_SIZE) {
-            uint hi = row + 1u < OUTPUT_SIZE
+        uint output_size = branch_output_size(branch);
+        if (row < output_size) {
+            uint hi = row + 1u < output_size
                 ? f32_to_bf16(output_rows[branch][local_pair * 2u + 1u])
                 : 0u;
             write_branch_output(

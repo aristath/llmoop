@@ -657,7 +657,6 @@ def can_fuse_native_parallel_linears(
     return (
         all(len(parameters) == 2 for parameters in parameter_groups)
         and len(block_shapes) == 1
-        and all(shapes[0] == shape for shape in shapes)
     )
 
 

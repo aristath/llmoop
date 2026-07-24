@@ -396,7 +396,7 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
 
     parallel_fp8 = re.fullmatch(
         r"parallel_linear_(?:batch(\d+)_)?([23])way_fp8_e4m3_"
-        r"b(\d+)x(\d+)_(\d+)x(\d+)\.comp",
+        r"b(\d+)x(\d+)_(\d+)x(\d+)_(\d+)(?:_(\d+))?\.comp",
         shader_file,
     )
     if parallel_fp8 is not None:
@@ -409,22 +409,38 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
         block_rows = int(parallel_fp8.group(3))
         block_columns = int(parallel_fp8.group(4))
         input_size = int(parallel_fp8.group(5))
-        output_size = int(parallel_fp8.group(6))
-        output_tile_rows = fp8_linear_tile_rows(output_size)
+        output_sizes = [
+            int(width)
+            for width in parallel_fp8.groups()[5:]
+            if width is not None
+        ]
+        output_tile_rows = fp8_linear_tile_rows(max(output_sizes))
         if (
             branch_count not in {2, 3}
+            or len(output_sizes) != branch_count
             or (batch_tile_width is not None and batch_tile_width <= 0)
             or block_rows <= 0
             or block_columns != 128
             or input_size <= 0
             or input_size % block_columns != 0
-            or output_size <= 0
-            or output_size % 2 != 0
+            or any(output_size <= 0 or output_size % 2 for output_size in output_sizes)
         ):
             raise ModelCompileError(
                 f"invalid fused FP8 parallel-linear shader shape {shader_file!r}"
             )
         labels = [chr(ord("A") + index) for index in range(branch_count)]
+        output_constants = "\n".join(
+            (
+                f"const uint OUTPUT_{label}_SIZE = {output_size}u;\n"
+                f"const uint OUTPUT_{label}_WORDS = OUTPUT_{label}_SIZE / 2u;"
+            )
+            for label, output_size in zip(labels, output_sizes, strict=True)
+        )
+        output_size_selection = "\n".join(
+            f"    if (branch == {index}u) return OUTPUT_{label}_SIZE;"
+            for index, label in enumerate(labels[:-1])
+        )
+        output_size_selection += f"\n    return OUTPUT_{labels[-1]}_SIZE;"
         output_bindings = "\n\n".join(
             f"layout(set = 0, binding = {index + 1}) buffer Output{label} {{\n"
             "    uint words[];\n"
@@ -472,13 +488,29 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
             "uint8_t(packed), uint8_t(packed >> 8u), uint8_t(packed >> 16u), "
             "uint8_t(packed >> 24u)));"
         )
-        output_writes = "\n".join(
-            f"    if (branch == {index}u) {{ output_{label.lower()}.words[index] = value; return; }}"
-            for index, label in enumerate(labels[:-1])
-        )
-        output_writes += (
-            "\n    output_" + labels[-1].lower() + ".words[index] = value;"
-        )
+        if batch_tile_width is None:
+            output_writes = "\n".join(
+                (
+                    f"    if (branch == {index}u) {{ "
+                    f"output_{label.lower()}.words[row / 2u] = value; return; }}"
+                )
+                for index, label in enumerate(labels[:-1])
+            )
+            output_writes += (
+                f"\n    output_{labels[-1].lower()}.words[row / 2u] = value;"
+            )
+        else:
+            output_writes = "\n".join(
+                (
+                    f"    if (branch == {index}u) {{ output_{label.lower()}.words["
+                    f"batch_index * OUTPUT_{label}_WORDS + row / 2u] = value; return; }}"
+                )
+                for index, label in enumerate(labels[:-1])
+            )
+            output_writes += (
+                f"\n    output_{labels[-1].lower()}.words[batch_index * "
+                f"OUTPUT_{labels[-1]}_WORDS + row / 2u] = value;"
+            )
         return render_shader_template(
             source_dir,
             (
@@ -492,8 +524,9 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
                 "BLOCK_ROWS": str(block_rows),
                 "BLOCK_COLUMNS": str(block_columns),
                 "INPUT_SIZE": str(input_size),
-                "OUTPUT_SIZE": str(output_size),
                 "OUTPUT_TILE_ROWS": str(output_tile_rows),
+                "OUTPUT_CONSTANTS": output_constants,
+                "OUTPUT_SIZE_SELECTION": output_size_selection,
                 "OUTPUT_BINDINGS": output_bindings,
                 "WEIGHT_BINDINGS": weight_bindings,
                 "WEIGHT_SCALE_READS": weight_scale_reads,

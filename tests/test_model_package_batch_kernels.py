@@ -32,9 +32,9 @@ def test_compiler_selects_only_compatible_weight_shared_batch_kernels() -> None:
     )
     assert (
         weight_shared_batch_shader_file(
-            "parallel_linear_2way_fp8_e4m3_b128x128_5120x5120.comp"
+            "parallel_linear_2way_fp8_e4m3_b128x128_5120x5120_1024.comp"
         )
-        == "parallel_linear_batch16_2way_fp8_e4m3_b128x128_5120x5120.comp"
+        == "parallel_linear_batch16_2way_fp8_e4m3_b128x128_5120x5120_1024.comp"
     )
     assert weight_shared_batch_shader_file(
         "parallel_linear_silu_multiply_fp8_e4m3_b128x128_5120x17408.comp"

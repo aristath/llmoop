@@ -21,7 +21,7 @@ def frame_parallel_batch_shader_file(shader_file: str) -> str | None:
             .replace("_int4_ct_", "_batch1_int4_ct_", 1)
         )
     if re.fullmatch(
-        r"parallel_linear_[23]way_fp8_e4m3_b\d+x\d+_\d+x\d+\.comp",
+        r"parallel_linear_[23]way_fp8_e4m3_b\d+x\d+_\d+x\d+_\d+(?:_\d+)?\.comp",
         shader_file,
     ):
         return shader_file.replace(
@@ -42,6 +42,7 @@ def frame_parallel_batch_shader_file(shader_file: str) -> str | None:
     ):
         return re.sub(r"_batch\d+_", "_batch1_", shader_file, count=1)
     return None
+
 
 
 def causal_scan_batch_stages(shader_file: str, local_size_x: int) -> list[Json] | None:
@@ -313,19 +314,25 @@ def weight_shared_batch_shader_file(
                 1,
             )
     parallel_fp8 = re.fullmatch(
-        r"parallel_linear_([23])way_fp8_e4m3_b(\d+)x(\d+)_(\d+)x(\d+)\.comp",
+        r"parallel_linear_([23])way_fp8_e4m3_b(\d+)x(\d+)_"
+        r"(\d+)x(\d+)_(\d+)(?:_(\d+))?\.comp",
         shader_file,
     )
     if parallel_fp8 is not None:
-        _branch_count, block_rows, _block_columns, _input_size, output_size = map(
-            int, parallel_fp8.groups()
+        branch_count, block_rows, _block_columns, _input_size = map(
+            int, parallel_fp8.groups()[:4]
         )
+        output_sizes = [
+            int(width) for width in parallel_fp8.groups()[4:] if width is not None
+        ]
+        if len(output_sizes) != branch_count:
+            return None
         tile = tile_width or min(
             SCALAR_BATCH_LANE_TILE_WIDTH,
             max(1, FP8_LINEAR_MIN_WORKGROUPS // block_rows),
         )
-        if output_size > 0:
-            tile = min(tile, output_size)
+        if output_sizes:
+            tile = min(tile, max(output_sizes))
         if tile <= 1:
             return None
         return shader_file.replace(
@@ -370,4 +377,3 @@ def weight_shared_batch_shader_file(
                 f"{input_size}x{output_size}.comp"
             )
     return None
-

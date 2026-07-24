@@ -1,4 +1,5 @@
 from model_package_layout_common import *
+from nerve.model_package_tensors import can_fuse_native_parallel_linears
 
 def test_parallel_linear_shader_selector_rejects_invalid_metadata_and_layout() -> None:
     node = {
@@ -69,7 +70,7 @@ def test_parallel_linear_shader_selector_supports_fp8_weight_scale_pairs() -> No
             },
             "k_weight": {
                 "dtype": "F8_E4M3",
-                "shape": [5120, 5120],
+                "shape": [1024, 5120],
                 "layout": ROW_MAJOR_LAYOUT,
             },
             "q_weight_scale_inv": {
@@ -79,7 +80,7 @@ def test_parallel_linear_shader_selector_supports_fp8_weight_scale_pairs() -> No
             },
             "k_weight_scale_inv": {
                 "dtype": "BF16",
-                "shape": [40, 40],
+                "shape": [8, 40],
                 "layout": ROW_MAJOR_LAYOUT,
             },
         }
@@ -87,8 +88,25 @@ def test_parallel_linear_shader_selector_supports_fp8_weight_scale_pairs() -> No
 
     dimensions = {"hidden_size": 5120, "intermediate_size": 5120}
 
+    source_nodes = [
+        {
+            "id": "q",
+            "op": "linear",
+            "inputs": ["hidden"],
+            "outputs": ["q"],
+            "params": ["q_weight", "q_weight_scale_inv"],
+        },
+        {
+            "id": "k",
+            "op": "linear",
+            "inputs": ["hidden"],
+            "outputs": ["k"],
+            "params": ["k_weight", "k_weight_scale_inv"],
+        },
+    ]
+    assert can_fuse_native_parallel_linears(circuit, source_nodes, tensor_index)
     assert shader_file_for_node(circuit, node, tensor_index, dimensions) == (
-        "parallel_linear_2way_fp8_e4m3_b128x128_5120x5120.comp"
+        "parallel_linear_2way_fp8_e4m3_b128x128_5120x5120_1024.comp"
     )
     assert workgroup_count_x_for_node(circuit, node, tensor_index) == 320
 

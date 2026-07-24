@@ -164,14 +164,12 @@ def shader_file_for_node(
                     f"parallel-linear FP8 node {node['id']!r} has incompatible block scales"
                 )
             block_rows, block_columns = block_shapes.pop()
-            if len(set(output_widths)) != 1:
-                raise ModelCompileError(
-                    f"parallel-linear FP8 node {node['id']!r} requires equal output widths"
-                )
             input_width = input_widths.pop()
             return (
                 f"parallel_linear_{branch_count}way_fp8_e4m3_"
-                f"b{block_rows}x{block_columns}_{input_width}x{output_widths[0]}.comp"
+                f"b{block_rows}x{block_columns}_{input_width}x"
+                + "_".join(map(str, output_widths))
+                + ".comp"
             )
         if dtypes == {"Q8_0"}:
             for parameter_ids in branch_params:

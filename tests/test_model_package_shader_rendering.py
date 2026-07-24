@@ -4,7 +4,9 @@ def test_compiler_renders_parallel_linear_shaders(tmp_path: Path) -> None:
     shader_source_dir = Path(__file__).parents[1] / "runtime-rs" / "shaders"
     pair = "parallel_linear_2way_bf16_1024x2560_2560.comp"
     triple = "parallel_linear_3way_bf16_1024x1024_512_512.comp"
-    fp8_pair = "parallel_linear_batch16_2way_fp8_e4m3_b128x128_5120x5120.comp"
+    fp8_pair = (
+        "parallel_linear_batch16_2way_fp8_e4m3_b128x128_5120x5120_1024.comp"
+    )
 
     copy_shader_templates(shader_source_dir, tmp_path, {pair, triple, fp8_pair})
 
@@ -21,6 +23,8 @@ def test_compiler_renders_parallel_linear_shaders(tmp_path: Path) -> None:
     assert "binding = 5) readonly buffer WeightB" in fp8_pair_source
     assert "binding = 6) readonly buffer WeightScaleInvB" in fp8_pair_source
     assert "shared fe4m3vec4 quantized_input[INPUT_FP8_WORDS];" in fp8_pair_source
+    assert "const uint OUTPUT_A_SIZE = 5120u;" in fp8_pair_source
+    assert "const uint OUTPUT_B_SIZE = 1024u;" in fp8_pair_source
     assert "for (uint branch = 0u; branch < BRANCH_COUNT; branch++)" in fp8_pair_source
     assert "PAIRED_WEIGHT_LAYOUT" not in pair_source
     assert "PAIRED_WEIGHT_LAYOUT" not in triple_source
