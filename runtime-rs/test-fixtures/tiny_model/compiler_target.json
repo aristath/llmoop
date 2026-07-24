@@ -1,0 +1,20 @@
+{
+  "schema": "nerve.compiler_target.v1",
+  "devices": [
+    {
+      "physical_device_index": 0,
+      "physical_device_id": "test-device-0",
+      "device_name": "test device 0",
+      "device_type": "discrete_gpu",
+      "vendor_id": 0,
+      "device_id": 0,
+      "shader_features": [
+        "shader_bfloat16_type"
+      ],
+      "max_compute_work_group_invocations": 1024,
+      "max_compute_work_group_size_x": 1024,
+      "cooperative_bfloat16_shapes": [],
+      "cooperative_float8_e4m3_shapes": []
+    }
+  ]
+}

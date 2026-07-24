@@ -1,0 +1,252 @@
+{
+  "schema": "nerve.lowered_execution_graph.v1",
+  "source": {
+    "format": "nerve.compiled_execution_graph_artifact.v1",
+    "artifact_root": "."
+  },
+  "architecture": {
+    "family": "decoder_only_transformer",
+    "model_type": "tiny_test",
+    "architectures": [
+      "TinyTestForCausalLM"
+    ],
+    "dtype": "bfloat16"
+  },
+  "dimensions": {
+    "hidden_size": 16,
+    "intermediate_sizes": [
+      32
+    ],
+    "num_hidden_layers": 1,
+    "num_attention_heads": 2,
+    "num_key_value_heads": 1,
+    "head_width": 8,
+    "rotary_width": 8,
+    "attention_window_size": null,
+    "conv_l_cache": 0,
+    "vocab_size": 32,
+    "max_position_embeddings": 64,
+    "num_experts": null,
+    "experts_per_token": null,
+    "attention_layer_shapes": [
+      {
+        "layer": 0,
+        "query_heads": 2,
+        "key_value_heads": 1,
+        "head_width": 8,
+        "rotary_width": 8,
+        "rope_theta": 10000.0,
+        "rope_type": "default",
+        "shared_kv_source_layer": null
+      }
+    ]
+  },
+  "numerics": {
+    "rms_norm_eps": 1e-05,
+    "rope_theta": 10000.0,
+    "rope_interleaved": false,
+    "rms_norm_weight_offset": 0.0,
+    "embedding_scale": 1.0,
+    "residual_scale": 1.0,
+    "attention_scale": 0.3535533905932738,
+    "logits_scale": 1.0,
+    "logits_soft_cap": null
+  },
+  "token_ids": {
+    "bos": 1,
+    "eos": 2,
+    "pad": 0
+  },
+  "graph": {
+    "topology": "explicit_graph",
+    "circuits": [
+      {
+        "id": "input_transducer",
+        "operator_type": "input_transducer",
+        "runtime_role": "input_transducer",
+        "circuit": "input_transducer/circuit.json",
+        "params": "input_transducer/params.json",
+        "state": "input_transducer/state.json",
+        "implementation": "compiled_input_transducer_v1",
+        "behavioral_role": "stream_generation_circuit"
+      },
+      {
+        "id": "layer_00",
+        "operator_type": "full_attention",
+        "runtime_role": "signal_processor",
+        "circuit": "layer_00/circuit.json",
+        "params": "layer_00/params.json",
+        "state": "layer_00/state.json",
+        "implementation": "reference_gqa_attention_layer_circuit_v1",
+        "behavioral_role": "source_reference_circuit"
+      },
+      {
+        "id": "output_transducer",
+        "operator_type": "output_transducer",
+        "runtime_role": "output_transducer",
+        "circuit": "output_transducer/circuit.json",
+        "params": "output_transducer/params.json",
+        "state": "output_transducer/state.json",
+        "implementation": "compiled_output_transducer_v1",
+        "behavioral_role": "stream_generation_circuit"
+      },
+      {
+        "id": "sampler",
+        "operator_type": "sampler",
+        "runtime_role": "sampler",
+        "circuit": "sampler/circuit.json",
+        "params": "sampler/params.json",
+        "state": "sampler/state.json",
+        "implementation": "compiled_sampler_v1",
+        "behavioral_role": "stream_generation_circuit"
+      }
+    ],
+    "edges": [
+      {
+        "id": "edge_0000",
+        "connection": {
+          "kind": "forward"
+        },
+        "source": {
+          "component_id": "input_transducer",
+          "port_id": "output_frame"
+        },
+        "destination": {
+          "component_id": "layer_00",
+          "port_id": "input_frame"
+        }
+      },
+      {
+        "id": "edge_0001",
+        "connection": {
+          "kind": "forward"
+        },
+        "source": {
+          "component_id": "layer_00",
+          "port_id": "output_frame"
+        },
+        "destination": {
+          "component_id": "output_transducer",
+          "port_id": "input_frame"
+        }
+      },
+      {
+        "id": "edge_0002",
+        "connection": {
+          "kind": "forward"
+        },
+        "source": {
+          "component_id": "output_transducer",
+          "port_id": "output_logits"
+        },
+        "destination": {
+          "component_id": "sampler",
+          "port_id": "input_logits"
+        }
+      },
+      {
+        "id": "generation_feedback",
+        "connection": {
+          "kind": "temporal_feedback",
+          "delay_activations": 1
+        },
+        "source": {
+          "component_id": "sampler",
+          "port_id": "sampled_token"
+        },
+        "destination": {
+          "component_id": "input_transducer",
+          "port_id": "input_token"
+        }
+      }
+    ],
+    "boundary": {
+      "external_inputs": [
+        {
+          "id": "user_input",
+          "endpoint": {
+            "component_id": "input_transducer",
+            "port_id": "input_token"
+          }
+        },
+        {
+          "id": "random_seed",
+          "endpoint": {
+            "component_id": "sampler",
+            "port_id": "random_seed"
+          }
+        }
+      ],
+      "public_outputs": [
+        {
+          "id": "model_output",
+          "endpoint": {
+            "component_id": "sampler",
+            "port_id": "sampled_token"
+          }
+        }
+      ]
+    },
+    "input_transducer": {
+      "id": "token_embedding",
+      "type": "embedding_lookup",
+      "output": "stream_frame",
+      "attrs": {
+        "scale": 1.0
+      },
+      "params": {
+        "weight": {
+          "tensor": "model.embed_tokens.weight"
+        }
+      }
+    },
+    "output_transducer": {
+      "components": [
+        {
+          "id": "output_norm",
+          "type": "rms_norm",
+          "attrs": {
+            "eps": 1e-05,
+            "weight_offset": 0.0
+          },
+          "params": {
+            "weight": {
+              "tensor": "model.norm.weight"
+            }
+          }
+        },
+        {
+          "id": "output_projection",
+          "type": "linear_projection",
+          "attrs": {
+            "scale": 1.0,
+            "soft_cap": null
+          },
+          "params": {
+            "weight": {
+              "tensor": "model.embed_tokens.weight"
+            }
+          },
+          "sharing": "same_parameter_object_as_token_embedding"
+        }
+      ]
+    }
+  },
+  "draft_execution_graphs": [],
+  "summary": {
+    "circuit_count": 4,
+    "generation_circuit_count": 4,
+    "draft_execution_graph_count": 0,
+    "operator_counts": {
+      "full_attention": 1,
+      "input_transducer": 1,
+      "output_transducer": 1,
+      "sampler": 1
+    }
+  },
+  "notes": [
+    "This index maps the source execution graph to stream-circuit artifacts.",
+    "The artifacts preserve component boundaries for now; a backend may later fuse or replace connected regions.",
+    "No layer receives privileged treatment; every component is addressed through the same boundary contract."
+  ]
+}

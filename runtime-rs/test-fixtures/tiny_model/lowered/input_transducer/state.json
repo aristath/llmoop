@@ -1,0 +1,5 @@
+{
+  "schema": "nerve.circuit_state.v1",
+  "circuit": "input_transducer_circuit_v1",
+  "state_ports": []
+}

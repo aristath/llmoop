@@ -1,0 +1,26 @@
+{
+  "schema": "nerve.circuit_state.v1",
+  "circuit": "layer_00_gqa_attention_circuit_v1",
+  "state_ports": [
+    {
+      "id": "kv_memory",
+      "type": "append_only_attention_memory",
+      "query_heads": 2,
+      "key_shape_per_token": [
+        1,
+        8
+      ],
+      "value_shape_per_token": [
+        1,
+        8
+      ],
+      "dtype": "BF16",
+      "growth": "per_activation",
+      "max_dynamic_activations": null,
+      "sharing": "per_stream_per_node_instance",
+      "owner": "stream",
+      "layout": "append_only_kv",
+      "source_layout": "batch_kvheads_seq_headdim"
+    }
+  ]
+}

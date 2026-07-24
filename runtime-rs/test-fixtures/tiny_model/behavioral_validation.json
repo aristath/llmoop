@@ -1,0 +1,150 @@
+{
+  "schema": "nerve.behavioral_validation.v1",
+  "status": "passed",
+  "candidate_kind": "exact_reference",
+  "candidate_contract_digest_algorithm": "nerve.json_tree_sha256.v1",
+  "source_oracle": {
+    "kind": "source_checkpoint_contract",
+    "model_contract_digest": "17d3e6eef066554c397f11cf17c4776e6eb628c2f82cf30907b4dba834ebd1f5",
+    "tensor_count": 11,
+    "parameter_count": 2864,
+    "byte_count": 5728
+  },
+  "admission_gate": {
+    "exact_candidates": "proof_carrying_rewrite",
+    "approximate_candidates": [
+      "teacher_forced_oracle_validation",
+      "free_running_oracle_validation"
+    ]
+  },
+  "teacher_forced": {
+    "status": "not_required",
+    "reason": "exact_reference_proof"
+  },
+  "free_running": {
+    "status": "not_required",
+    "reason": "exact_reference_proof"
+  },
+  "circuits": [
+    {
+      "component_id": "input_transducer",
+      "candidate_kind": "exact_reference",
+      "status": "passed",
+      "source_node_count": 1,
+      "candidate_node_count": 1,
+      "candidate_contract_digest": "cde195f55386e2a4d253c8034cf0cd8acfba9256332854b052807cf92252b6b8",
+      "covered_source_node_count": 1,
+      "rewrite_count": 0,
+      "physical_representation_count": 0,
+      "rewrites": []
+    },
+    {
+      "component_id": "layer_00",
+      "candidate_kind": "exact_reference",
+      "status": "passed",
+      "source_node_count": 17,
+      "candidate_node_count": 9,
+      "candidate_contract_digest": "6778f9912a645f2c5740165c492cd391c2fbd849a3baeb9ff831d3a5971da876",
+      "covered_source_node_count": 17,
+      "rewrite_count": 5,
+      "physical_representation_count": 0,
+      "rewrites": [
+        {
+          "candidate_node": "q_projection__k_projection__v_projection",
+          "candidate_op": "parallel_linear_3way",
+          "source_nodes": [
+            "q_projection",
+            "k_projection",
+            "v_projection"
+          ],
+          "source_positions": [
+            1,
+            2,
+            3
+          ],
+          "proof_contract": "parallel_linear_exact_bf16.v1"
+        },
+        {
+          "candidate_node": "kv_memory_append__attention_read",
+          "candidate_op": "append_scaled_dot_product_attention",
+          "source_nodes": [
+            "kv_memory_append",
+            "attention_read"
+          ],
+          "source_positions": [
+            6,
+            7
+          ],
+          "proof_contract": "append_attention_exact_bf16.v1"
+        },
+        {
+          "candidate_node": "attention_out_projection__operator_residual",
+          "candidate_op": "linear_residual",
+          "source_nodes": [
+            "attention_out_projection",
+            "operator_residual"
+          ],
+          "source_positions": [
+            8,
+            9
+          ],
+          "proof_contract": "linear_residual_exact_bf16.v1"
+        },
+        {
+          "candidate_node": "ffn_gate_projection__ffn_up_projection__ffn_gate_activation__ffn_gate_multiply",
+          "candidate_op": "parallel_linear_silu_multiply",
+          "source_nodes": [
+            "ffn_gate_projection",
+            "ffn_up_projection",
+            "ffn_gate_activation",
+            "ffn_gate_multiply"
+          ],
+          "source_positions": [
+            11,
+            12,
+            13,
+            14
+          ],
+          "proof_contract": "parallel_linear_silu_multiply_exact_bf16.v1"
+        },
+        {
+          "candidate_node": "ffn_down_projection__ffn_residual",
+          "candidate_op": "linear_residual",
+          "source_nodes": [
+            "ffn_down_projection",
+            "ffn_residual"
+          ],
+          "source_positions": [
+            15,
+            16
+          ],
+          "proof_contract": "linear_residual_exact_bf16.v1"
+        }
+      ]
+    },
+    {
+      "component_id": "output_transducer",
+      "candidate_kind": "exact_reference",
+      "status": "passed",
+      "source_node_count": 2,
+      "candidate_node_count": 2,
+      "candidate_contract_digest": "add106d6f02a1070c86dbb75770b9508ef505639c60cdcf4580aa75458f7912b",
+      "covered_source_node_count": 2,
+      "rewrite_count": 0,
+      "physical_representation_count": 0,
+      "rewrites": []
+    },
+    {
+      "component_id": "sampler",
+      "candidate_kind": "exact_reference",
+      "status": "passed",
+      "source_node_count": 1,
+      "candidate_node_count": 1,
+      "candidate_contract_digest": "6c7989c6c6917309e1a48d92892882fc95d5c3a70746143f78f842e6d21f18b6",
+      "covered_source_node_count": 1,
+      "rewrite_count": 0,
+      "physical_representation_count": 0,
+      "rewrites": []
+    }
+  ]
+}

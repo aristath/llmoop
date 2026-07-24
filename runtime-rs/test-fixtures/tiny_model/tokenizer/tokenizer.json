@@ -1,0 +1,50 @@
+{
+  "version": "1.0",
+  "truncation": null,
+  "padding": null,
+  "added_tokens": [],
+  "normalizer": null,
+  "pre_tokenizer": {
+    "type": "Whitespace"
+  },
+  "post_processor": null,
+  "decoder": null,
+  "model": {
+    "type": "WordLevel",
+    "vocab": {
+      "[PAD]": 0,
+      "[BOS]": 1,
+      "[EOS]": 2,
+      "[UNK]": 3,
+      "token_04": 4,
+      "token_05": 5,
+      "token_06": 6,
+      "token_07": 7,
+      "token_08": 8,
+      "token_09": 9,
+      "token_10": 10,
+      "token_11": 11,
+      "token_12": 12,
+      "token_13": 13,
+      "token_14": 14,
+      "token_15": 15,
+      "token_16": 16,
+      "token_17": 17,
+      "token_18": 18,
+      "token_19": 19,
+      "token_20": 20,
+      "token_21": 21,
+      "token_22": 22,
+      "token_23": 23,
+      "token_24": 24,
+      "token_25": 25,
+      "token_26": 26,
+      "token_27": 27,
+      "token_28": 28,
+      "token_29": 29,
+      "token_30": 30,
+      "token_31": 31
+    },
+    "unk_token": "[UNK]"
+  }
+}

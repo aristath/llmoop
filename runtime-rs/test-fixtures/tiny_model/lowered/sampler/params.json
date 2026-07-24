@@ -1,0 +1,7 @@
+{
+  "schema": "nerve.circuit_params.v1",
+  "circuit": "sampler_circuit_v1",
+  "layout": "source_tensor_refs",
+  "storage": "safetensors",
+  "refs": {}
+}

@@ -1,0 +1,145 @@
+{
+  "schema": "nerve.model_graph.v1",
+  "source": {
+    "model_dir": "/tmp/nerve-tiny-test-source-hp8kbl4v/source",
+    "weights_file": "/tmp/nerve-tiny-test-source-hp8kbl4v/source/model.safetensors",
+    "weights_files": [
+      {
+        "path": "/tmp/nerve-tiny-test-source-hp8kbl4v/source/model.safetensors",
+        "safetensors_header_bytes": 1064,
+        "metadata": {}
+      }
+    ]
+  },
+  "architecture": {
+    "family": "decoder_only_transformer",
+    "model_type": "tiny_test",
+    "architectures": [
+      "TinyTestForCausalLM"
+    ],
+    "dtype": "bfloat16"
+  },
+  "dimensions": {
+    "hidden_size": 16,
+    "intermediate_sizes": [
+      32
+    ],
+    "num_hidden_layers": 1,
+    "num_attention_heads": 2,
+    "num_key_value_heads": 1,
+    "head_width": 8,
+    "rotary_width": 8,
+    "attention_window_size": null,
+    "conv_l_cache": 0,
+    "vocab_size": 32,
+    "max_position_embeddings": 64,
+    "num_experts": null,
+    "experts_per_token": null,
+    "attention_layer_shapes": [
+      {
+        "layer": 0,
+        "query_heads": 2,
+        "key_value_heads": 1,
+        "head_width": 8,
+        "rotary_width": 8,
+        "rope_theta": 10000.0,
+        "rope_type": "default",
+        "shared_kv_source_layer": null
+      }
+    ]
+  },
+  "numerics": {
+    "rms_norm_eps": 1e-05,
+    "rope_theta": 10000.0,
+    "rope_interleaved": false,
+    "rms_norm_weight_offset": 0.0,
+    "embedding_scale": 1.0,
+    "residual_scale": 1.0,
+    "attention_scale": 0.3535533905932738,
+    "logits_scale": 1.0,
+    "logits_soft_cap": null
+  },
+  "quantization": null,
+  "sampling": {
+    "method": "greedy",
+    "presence_penalty": 0.0,
+    "repetition_penalty": 1.0
+  },
+  "token_ids": {
+    "bos": 1,
+    "eos": 2,
+    "pad": 0
+  },
+  "files": {
+    "tensor_index": "tensors.json",
+    "components_dir": "layers/"
+  },
+  "graph": {
+    "input_transducer": {
+      "id": "token_embedding",
+      "type": "embedding_lookup",
+      "output": "stream_frame",
+      "attrs": {
+        "scale": 1.0
+      },
+      "params": {
+        "weight": {
+          "tensor": "model.embed_tokens.weight"
+        }
+      }
+    },
+    "execution_graph": {
+      "topology": "series",
+      "components": [
+        {
+          "id": "layer_00",
+          "type": "node_instance",
+          "component_class": "gqa_attention_layer_h16_q2_kv1_d8_ffn32_v1",
+          "operator_type": "full_attention",
+          "file": "layers/layer_00.json"
+        }
+      ]
+    },
+    "output_transducer": {
+      "components": [
+        {
+          "id": "output_norm",
+          "type": "rms_norm",
+          "attrs": {
+            "eps": 1e-05,
+            "weight_offset": 0.0
+          },
+          "params": {
+            "weight": {
+              "tensor": "model.norm.weight"
+            }
+          }
+        },
+        {
+          "id": "output_projection",
+          "type": "linear_projection",
+          "attrs": {
+            "scale": 1.0,
+            "soft_cap": null
+          },
+          "params": {
+            "weight": {
+              "tensor": "model.embed_tokens.weight"
+            }
+          },
+          "sharing": "same_parameter_object_as_token_embedding"
+        }
+      ]
+    },
+    "draft_execution_graphs": []
+  },
+  "component_templates": {
+    "shortconv_layer": "opaque layer component with fixed rolling temporal state",
+    "rg_lru_layer": "opaque recurrent layer component with fixed convolution and recurrent state",
+    "gqa_attention_layer": "opaque layer component with append-only KV state",
+    "swiglu_feed_forward": "dense gated feed-forward operator",
+    "rms_norm": "stateless normalization operator",
+    "residual_add": "stateless signal mixer"
+  },
+  "output_dir": "."
+}

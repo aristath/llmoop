@@ -1,0 +1,12 @@
+{
+  "schema": "nerve.circuit_params.v1",
+  "circuit": "input_transducer_circuit_v1",
+  "layout": "source_tensor_refs",
+  "storage": "safetensors",
+  "refs": {
+    "weight": {
+      "tensor": "model.embed_tokens.weight",
+      "role": "input_transducer.weight"
+    }
+  }
+}

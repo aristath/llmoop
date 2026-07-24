@@ -1,0 +1,99 @@
+{
+  "schema": "nerve.stream_circuit.v1",
+  "id": "output_transducer_circuit_v1",
+  "source": {
+    "component_id": "output_transducer",
+    "source_layer_index": null,
+    "source_operator_type": "output_transducer"
+  },
+  "runtime_role": "output_transducer",
+  "behavioral_role": "stream_generation_circuit",
+  "implementation": "compiled_output_transducer_v1",
+  "boundary": {
+    "inputs": [
+      {
+        "id": "input_frame",
+        "signal": "frame",
+        "shape": [
+          16
+        ],
+        "component_port": "frame"
+      }
+    ],
+    "outputs": [
+      {
+        "id": "output_logits",
+        "signal": "logits",
+        "shape": [
+          32
+        ],
+        "component_port": "logits",
+        "source": "output_logits"
+      }
+    ],
+    "controls": []
+  },
+  "state_ports": [],
+  "parameters": {
+    "layout": "source_tensor_refs",
+    "storage": "safetensors",
+    "refs": {
+      "output_norm.weight": {
+        "tensor": "model.norm.weight",
+        "role": "output_transducer.output_norm.weight"
+      },
+      "output_projection.weight": {
+        "tensor": "model.embed_tokens.weight",
+        "role": "output_transducer.output_projection.weight"
+      }
+    }
+  },
+  "nodes": [
+    {
+      "id": "output_norm",
+      "op": "rms_norm",
+      "inputs": [
+        "input_frame"
+      ],
+      "outputs": [
+        "output_norm_output"
+      ],
+      "params": [
+        "output_norm.weight"
+      ],
+      "state_reads": [],
+      "state_writes": [],
+      "attrs": {
+        "eps": 1e-05,
+        "weight_offset": 0.0
+      }
+    },
+    {
+      "id": "output_projection",
+      "op": "linear_projection",
+      "inputs": [
+        "output_norm_output"
+      ],
+      "outputs": [
+        "output_logits"
+      ],
+      "params": [
+        "output_projection.weight"
+      ],
+      "state_reads": [],
+      "state_writes": [],
+      "attrs": {
+        "scale": 1.0,
+        "soft_cap": null
+      }
+    }
+  ],
+  "behavioral_error_contract": {
+    "mode": "exact_source_operation",
+    "reference": "output_transducer"
+  },
+  "lowering_notes": [
+    "This stream entity is part of the editable execution graph contract.",
+    "Its optimized Vulkan implementation is a backend lowering, not a host-side exception."
+  ]
+}

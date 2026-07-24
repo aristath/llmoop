@@ -1,0 +1,279 @@
+{
+  "schema": "nerve.tensor_index.v1",
+  "source": {
+    "packaged": true,
+    "compiled": true,
+    "weights_dir": "weights",
+    "weights_file": "weights/tensor_60800b5c9d5cc40f.safetensors",
+    "weights_files": [
+      {
+        "path": "weights/tensor_60800b5c9d5cc40f.safetensors",
+        "safetensors_header_bytes": 144,
+        "metadata": {
+          "format": "nerve",
+          "layout": "row_major"
+        }
+      },
+      {
+        "path": "weights/tensor_308a709a8ae7ddb2.safetensors",
+        "safetensors_header_bytes": 152,
+        "metadata": {
+          "format": "nerve",
+          "layout": "row_major"
+        }
+      },
+      {
+        "path": "weights/tensor_7de186429d1774aa.safetensors",
+        "safetensors_header_bytes": 152,
+        "metadata": {
+          "format": "nerve",
+          "layout": "row_major"
+        }
+      },
+      {
+        "path": "weights/tensor_0951c6e9b5e5bcb3.safetensors",
+        "safetensors_header_bytes": 152,
+        "metadata": {
+          "format": "nerve",
+          "layout": "row_major"
+        }
+      },
+      {
+        "path": "weights/tensor_fa1fdc5e3fc3f0ff.safetensors",
+        "safetensors_header_bytes": 152,
+        "metadata": {
+          "format": "nerve",
+          "layout": "row_major"
+        }
+      },
+      {
+        "path": "weights/tensor_0096122738da5577.safetensors",
+        "safetensors_header_bytes": 160,
+        "metadata": {
+          "format": "nerve",
+          "layout": "row_major"
+        }
+      },
+      {
+        "path": "weights/tensor_407e2a3a0399d043.safetensors",
+        "safetensors_header_bytes": 152,
+        "metadata": {
+          "format": "nerve",
+          "layout": "row_major"
+        }
+      },
+      {
+        "path": "weights/tensor_28ad2efe9634c02a.safetensors",
+        "safetensors_header_bytes": 160,
+        "metadata": {
+          "format": "nerve",
+          "layout": "row_major"
+        }
+      },
+      {
+        "path": "weights/tensor_b9045f5429005d09.safetensors",
+        "safetensors_header_bytes": 160,
+        "metadata": {
+          "format": "nerve",
+          "layout": "row_major"
+        }
+      },
+      {
+        "path": "weights/tensor_9a45043a6625d9b5.safetensors",
+        "safetensors_header_bytes": 152,
+        "metadata": {
+          "format": "nerve",
+          "layout": "row_major"
+        }
+      },
+      {
+        "path": "weights/tensor_efc64374061622ae.safetensors",
+        "safetensors_header_bytes": 128,
+        "metadata": {
+          "format": "nerve",
+          "layout": "row_major"
+        }
+      }
+    ]
+  },
+  "totals": {
+    "tensor_count": 11,
+    "parameter_count": 2864,
+    "byte_count": 5728
+  },
+  "tensors": {
+    "model.embed_tokens.weight": {
+      "dtype": "BF16",
+      "shape": [
+        32,
+        16
+      ],
+      "data_offsets": [
+        0,
+        1024
+      ],
+      "parameter_count": 512,
+      "byte_count": 1024,
+      "source_file": "weights/tensor_60800b5c9d5cc40f.safetensors",
+      "data_sha256": "355249d7232b4e6ef8fa7bb9d5f4ca8ef057e9b69bd5526758c763be006927c3",
+      "layout": "row_major"
+    },
+    "model.layers.0.input_layernorm.weight": {
+      "dtype": "BF16",
+      "shape": [
+        16
+      ],
+      "data_offsets": [
+        0,
+        32
+      ],
+      "parameter_count": 16,
+      "byte_count": 32,
+      "source_file": "weights/tensor_308a709a8ae7ddb2.safetensors",
+      "data_sha256": "a214ae5c03e0c56b5540a2f2e924a30f3a059d4d38c2b8c62b9182a78e8afb24",
+      "layout": "row_major"
+    },
+    "model.layers.0.mlp.down_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        16,
+        32
+      ],
+      "data_offsets": [
+        0,
+        1024
+      ],
+      "parameter_count": 512,
+      "byte_count": 1024,
+      "source_file": "weights/tensor_7de186429d1774aa.safetensors",
+      "data_sha256": "ef375c3406f567b86f95c94f6338283ce3c8c987bd4714badcd2b93b4069576d",
+      "layout": "row_major"
+    },
+    "model.layers.0.mlp.gate_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        32,
+        16
+      ],
+      "data_offsets": [
+        0,
+        1024
+      ],
+      "parameter_count": 512,
+      "byte_count": 1024,
+      "source_file": "weights/tensor_0951c6e9b5e5bcb3.safetensors",
+      "data_sha256": "1ee1319f10203ee91cb6a21eae03cbdd29696323db49f09f890f17259a196cd7",
+      "layout": "row_major"
+    },
+    "model.layers.0.mlp.up_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        32,
+        16
+      ],
+      "data_offsets": [
+        0,
+        1024
+      ],
+      "parameter_count": 512,
+      "byte_count": 1024,
+      "source_file": "weights/tensor_fa1fdc5e3fc3f0ff.safetensors",
+      "data_sha256": "d2eb40a7a757bc8f911247d93c50ad60e4c6b50dc94189f7eea0624ee1c76f55",
+      "layout": "row_major"
+    },
+    "model.layers.0.post_attention_layernorm.weight": {
+      "dtype": "BF16",
+      "shape": [
+        16
+      ],
+      "data_offsets": [
+        0,
+        32
+      ],
+      "parameter_count": 16,
+      "byte_count": 32,
+      "source_file": "weights/tensor_0096122738da5577.safetensors",
+      "data_sha256": "a214ae5c03e0c56b5540a2f2e924a30f3a059d4d38c2b8c62b9182a78e8afb24",
+      "layout": "row_major"
+    },
+    "model.layers.0.self_attn.k_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        8,
+        16
+      ],
+      "data_offsets": [
+        0,
+        256
+      ],
+      "parameter_count": 128,
+      "byte_count": 256,
+      "source_file": "weights/tensor_407e2a3a0399d043.safetensors",
+      "data_sha256": "0866abdf72a34d84f4b1c32002b30f8e4b4e3dca6e22c788f0b079dc1c45b432",
+      "layout": "row_major"
+    },
+    "model.layers.0.self_attn.o_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        16,
+        16
+      ],
+      "data_offsets": [
+        0,
+        512
+      ],
+      "parameter_count": 256,
+      "byte_count": 512,
+      "source_file": "weights/tensor_28ad2efe9634c02a.safetensors",
+      "data_sha256": "59bae099aa5a74a8db89ee2183b75ecff83ed06c424240b99970a600e6de5a55",
+      "layout": "row_major"
+    },
+    "model.layers.0.self_attn.q_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        16,
+        16
+      ],
+      "data_offsets": [
+        0,
+        512
+      ],
+      "parameter_count": 256,
+      "byte_count": 512,
+      "source_file": "weights/tensor_b9045f5429005d09.safetensors",
+      "data_sha256": "803be95acff5a379b460490e836ed53d84fc073988d309a9444770ea7e06d99a",
+      "layout": "row_major"
+    },
+    "model.layers.0.self_attn.v_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        8,
+        16
+      ],
+      "data_offsets": [
+        0,
+        256
+      ],
+      "parameter_count": 128,
+      "byte_count": 256,
+      "source_file": "weights/tensor_9a45043a6625d9b5.safetensors",
+      "data_sha256": "3180b7a73a4802b2596ca3265b433ffb8dde5a18ae14c0292def57dbb2e025bb",
+      "layout": "row_major"
+    },
+    "model.norm.weight": {
+      "dtype": "BF16",
+      "shape": [
+        16
+      ],
+      "data_offsets": [
+        0,
+        32
+      ],
+      "parameter_count": 16,
+      "byte_count": 32,
+      "source_file": "weights/tensor_efc64374061622ae.safetensors",
+      "data_sha256": "a214ae5c03e0c56b5540a2f2e924a30f3a059d4d38c2b8c62b9182a78e8afb24",
+      "layout": "row_major"
+    }
+  }
+}

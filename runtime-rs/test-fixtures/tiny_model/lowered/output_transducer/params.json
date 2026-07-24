@@ -1,0 +1,16 @@
+{
+  "schema": "nerve.circuit_params.v1",
+  "circuit": "output_transducer_circuit_v1",
+  "layout": "source_tensor_refs",
+  "storage": "safetensors",
+  "refs": {
+    "output_norm.weight": {
+      "tensor": "model.norm.weight",
+      "role": "output_transducer.output_norm.weight"
+    },
+    "output_projection.weight": {
+      "tensor": "model.embed_tokens.weight",
+      "role": "output_transducer.output_projection.weight"
+    }
+  }
+}

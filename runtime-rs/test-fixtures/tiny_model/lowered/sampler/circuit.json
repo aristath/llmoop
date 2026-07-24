@@ -1,0 +1,84 @@
+{
+  "schema": "nerve.stream_circuit.v1",
+  "id": "sampler_circuit_v1",
+  "source": {
+    "component_id": "sampler",
+    "source_layer_index": null,
+    "source_operator_type": "sampler"
+  },
+  "runtime_role": "sampler",
+  "behavioral_role": "stream_generation_circuit",
+  "implementation": "compiled_sampler_v1",
+  "boundary": {
+    "inputs": [
+      {
+        "id": "input_logits",
+        "signal": "logits",
+        "shape": [
+          32
+        ],
+        "component_port": "logits"
+      },
+      {
+        "id": "random_seed",
+        "signal": "random_seed",
+        "shape": [
+          1
+        ],
+        "component_port": "randomness"
+      }
+    ],
+    "outputs": [
+      {
+        "id": "sampled_token",
+        "signal": "token_id",
+        "shape": [
+          1
+        ],
+        "component_port": "token",
+        "source": "sampled_token"
+      }
+    ],
+    "controls": []
+  },
+  "state_ports": [],
+  "parameters": {
+    "layout": "source_tensor_refs",
+    "storage": "safetensors",
+    "refs": {}
+  },
+  "nodes": [
+    {
+      "id": "sample",
+      "op": "sample_token",
+      "inputs": [
+        "input_logits",
+        "random_seed"
+      ],
+      "outputs": [
+        "sampled_token"
+      ],
+      "params": [],
+      "state_reads": [],
+      "state_writes": [],
+      "attrs": {
+        "method": "greedy",
+        "temperature": 1.0,
+        "top_k": 1,
+        "top_p": 1.0,
+        "min_p": 0.0,
+        "presence_penalty": 0.0,
+        "repetition_penalty": 1.0,
+        "randomness": "seed_and_stream_tick"
+      }
+    }
+  ],
+  "behavioral_error_contract": {
+    "mode": "exact_source_operation",
+    "reference": "sampler"
+  },
+  "lowering_notes": [
+    "This stream entity is part of the editable execution graph contract.",
+    "Its optimized Vulkan implementation is a backend lowering, not a host-side exception."
+  ]
+}

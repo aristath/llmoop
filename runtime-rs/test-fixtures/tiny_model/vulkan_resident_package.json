@@ -1,0 +1,2871 @@
+{
+  "schema": "nerve.vulkan_resident_model_package.v3",
+  "package_id": "model_0d29b926_vulkan_resident",
+  "compiler_fingerprint": "nerve.package_compiler_sha256.v1:953320df0ef6215fa21e452808187fbc8bf432054fd38b892f87a911e9401121",
+  "compiler_target": {
+    "schema": "nerve.compiler_target.v1",
+    "devices": [
+      {
+        "physical_device_index": 0,
+        "physical_device_id": "test-device-0",
+        "device_name": "test device 0",
+        "device_type": "discrete_gpu",
+        "vendor_id": 0,
+        "device_id": 0,
+        "shader_features": [
+          "shader_bfloat16_type"
+        ],
+        "max_compute_work_group_invocations": 1024,
+        "max_compute_work_group_size_x": 1024,
+        "cooperative_bfloat16_shapes": [],
+        "cooperative_float8_e4m3_shapes": []
+      }
+    ]
+  },
+  "circuit_graph": {
+    "topology": "explicit_graph",
+    "edges": [
+      {
+        "id": "edge_0000",
+        "connection": {
+          "kind": "forward"
+        },
+        "source": {
+          "component_id": "input_transducer",
+          "port_id": "output_frame"
+        },
+        "destination": {
+          "component_id": "layer_00",
+          "port_id": "input_frame"
+        }
+      },
+      {
+        "id": "edge_0001",
+        "connection": {
+          "kind": "forward"
+        },
+        "source": {
+          "component_id": "layer_00",
+          "port_id": "output_frame"
+        },
+        "destination": {
+          "component_id": "output_transducer",
+          "port_id": "input_frame"
+        }
+      },
+      {
+        "id": "edge_0002",
+        "connection": {
+          "kind": "forward"
+        },
+        "source": {
+          "component_id": "output_transducer",
+          "port_id": "output_logits"
+        },
+        "destination": {
+          "component_id": "sampler",
+          "port_id": "input_logits"
+        }
+      },
+      {
+        "id": "generation_feedback",
+        "connection": {
+          "kind": "temporal_feedback",
+          "delay_activations": 1
+        },
+        "source": {
+          "component_id": "sampler",
+          "port_id": "sampled_token"
+        },
+        "destination": {
+          "component_id": "input_transducer",
+          "port_id": "input_token"
+        }
+      }
+    ],
+    "boundary": {
+      "external_inputs": [
+        {
+          "id": "user_input",
+          "endpoint": {
+            "component_id": "input_transducer",
+            "port_id": "input_token"
+          }
+        },
+        {
+          "id": "random_seed",
+          "endpoint": {
+            "component_id": "sampler",
+            "port_id": "random_seed"
+          }
+        }
+      ],
+      "public_outputs": [
+        {
+          "id": "model_output",
+          "endpoint": {
+            "component_id": "sampler",
+            "port_id": "sampled_token"
+          }
+        }
+      ]
+    },
+    "architecture": {
+      "family": "decoder_only_transformer",
+      "model_type": "tiny_test",
+      "architectures": [
+        "TinyTestForCausalLM"
+      ],
+      "dtype": "bfloat16"
+    },
+    "dimensions": {
+      "hidden_size": 16,
+      "intermediate_sizes": [
+        32
+      ],
+      "num_hidden_layers": 1,
+      "num_attention_heads": 2,
+      "num_key_value_heads": 1,
+      "head_width": 8,
+      "rotary_width": 8,
+      "attention_window_size": null,
+      "conv_l_cache": 0,
+      "vocab_size": 32,
+      "max_position_embeddings": 64,
+      "num_experts": null,
+      "experts_per_token": null,
+      "attention_layer_shapes": [
+        {
+          "layer": 0,
+          "query_heads": 2,
+          "key_value_heads": 1,
+          "head_width": 8,
+          "rotary_width": 8,
+          "rope_theta": 10000.0,
+          "rope_type": "default",
+          "shared_kv_source_layer": null
+        }
+      ]
+    },
+    "input_transducer": {
+      "id": "token_embedding",
+      "type": "embedding_lookup",
+      "output": "stream_frame",
+      "attrs": {
+        "scale": 1.0
+      },
+      "params": {
+        "weight": {
+          "tensor": "model.embed_tokens.weight"
+        }
+      }
+    },
+    "output_transducer": {
+      "components": [
+        {
+          "id": "output_norm",
+          "type": "rms_norm",
+          "attrs": {
+            "eps": 1e-05,
+            "weight_offset": 0.0
+          },
+          "params": {
+            "weight": {
+              "tensor": "model.norm.weight"
+            }
+          }
+        },
+        {
+          "id": "output_projection",
+          "type": "linear_projection",
+          "attrs": {
+            "scale": 1.0,
+            "soft_cap": null
+          },
+          "params": {
+            "weight": {
+              "tensor": "model.embed_tokens.weight"
+            }
+          },
+          "sharing": "same_parameter_object_as_token_embedding"
+        }
+      ]
+    },
+    "components": [
+      {
+        "component_id": "input_transducer",
+        "operator_type": "input_transducer",
+        "runtime_role": "input_transducer",
+        "implementation": "compiled_input_transducer_v1",
+        "behavioral_role": "stream_generation_circuit",
+        "circuit": {
+          "schema": "nerve.stream_circuit.v1",
+          "id": "input_transducer_circuit_v1",
+          "source": {
+            "component_id": "input_transducer",
+            "source_layer_index": null,
+            "source_operator_type": "input_transducer"
+          },
+          "runtime_role": "input_transducer",
+          "behavioral_role": "stream_generation_circuit",
+          "implementation": "compiled_input_transducer_v1",
+          "boundary": {
+            "inputs": [
+              {
+                "id": "input_token",
+                "signal": "token_id",
+                "shape": [
+                  1
+                ],
+                "component_port": "token"
+              }
+            ],
+            "outputs": [
+              {
+                "id": "output_frame",
+                "signal": "frame",
+                "shape": [
+                  16
+                ],
+                "component_port": "frame",
+                "source": "output_frame"
+              }
+            ],
+            "controls": []
+          },
+          "state_ports": [],
+          "parameters": {
+            "layout": "source_tensor_refs",
+            "storage": "safetensors",
+            "refs": {
+              "weight": {
+                "tensor": "model.embed_tokens.weight",
+                "role": "input_transducer.weight"
+              }
+            }
+          },
+          "nodes": [
+            {
+              "id": "token_embedding",
+              "op": "embedding_lookup",
+              "inputs": [
+                "input_token"
+              ],
+              "outputs": [
+                "output_frame"
+              ],
+              "params": [
+                "weight"
+              ],
+              "state_reads": [],
+              "state_writes": [],
+              "attrs": {
+                "scale": 1.0,
+                "output_element_bytes": [
+                  2
+                ]
+              }
+            }
+          ],
+          "behavioral_error_contract": {
+            "mode": "exact_source_operation",
+            "reference": "input_transducer"
+          },
+          "lowering_notes": [
+            "This stream entity is part of the editable execution graph contract.",
+            "Its optimized Vulkan implementation is a backend lowering, not a host-side exception."
+          ]
+        },
+        "params": {
+          "schema": "nerve.circuit_params.v1",
+          "circuit": "input_transducer_circuit_v1",
+          "layout": "source_tensor_refs",
+          "storage": "safetensors",
+          "refs": {
+            "weight": {
+              "tensor": "model.embed_tokens.weight",
+              "role": "input_transducer.weight"
+            }
+          }
+        },
+        "state": {
+          "schema": "nerve.circuit_state.v1",
+          "circuit": "input_transducer_circuit_v1",
+          "state_ports": []
+        }
+      },
+      {
+        "component_id": "layer_00",
+        "operator_type": "full_attention",
+        "runtime_role": "signal_processor",
+        "implementation": "reference_gqa_attention_layer_circuit_v1",
+        "behavioral_role": "source_reference_circuit",
+        "circuit": {
+          "schema": "nerve.stream_circuit.v1",
+          "id": "layer_00_gqa_attention_circuit_v1",
+          "source": {
+            "component_id": "layer_00",
+            "source_layer_index": 0,
+            "source_operator_type": "full_attention"
+          },
+          "runtime_role": "signal_processor",
+          "behavioral_role": "source_reference_circuit",
+          "implementation": "reference_gqa_attention_layer_circuit_v1",
+          "boundary": {
+            "inputs": [
+              {
+                "id": "input_frame",
+                "signal": "frame",
+                "shape": [
+                  16
+                ],
+                "component_port": "input"
+              }
+            ],
+            "outputs": [
+              {
+                "id": "output_frame",
+                "signal": "frame",
+                "shape": [
+                  16
+                ],
+                "source": "output_frame",
+                "component_port": "output"
+              }
+            ],
+            "controls": []
+          },
+          "state_ports": [
+            {
+              "id": "kv_memory",
+              "type": "append_only_attention_memory",
+              "query_heads": 2,
+              "key_shape_per_token": [
+                1,
+                8
+              ],
+              "value_shape_per_token": [
+                1,
+                8
+              ],
+              "dtype": "BF16",
+              "growth": "per_activation",
+              "max_dynamic_activations": null,
+              "sharing": "per_stream_per_node_instance",
+              "owner": "stream",
+              "layout": "append_only_kv",
+              "source_layout": "batch_kvheads_seq_headdim"
+            }
+          ],
+          "parameters": {
+            "layout": "gqa_attention_layer_params_v1_dense_swiglu",
+            "storage": "source_tensor_refs",
+            "refs": {
+              "operator_norm": {
+                "tensor": "model.layers.0.input_layernorm.weight",
+                "role": "operator_normalization_weight"
+              },
+              "ffn_norm": {
+                "tensor": "model.layers.0.post_attention_layernorm.weight",
+                "role": "feed_forward_normalization_weight"
+              },
+              "ffn_gate": {
+                "tensor": "model.layers.0.mlp.gate_proj.weight",
+                "role": "feed_forward_swiglu_gate_projection"
+              },
+              "ffn_down": {
+                "tensor": "model.layers.0.mlp.down_proj.weight",
+                "role": "feed_forward_down_projection"
+              },
+              "ffn_up": {
+                "tensor": "model.layers.0.mlp.up_proj.weight",
+                "role": "feed_forward_up_projection"
+              },
+              "q_projection": {
+                "tensor": "model.layers.0.self_attn.q_proj.weight",
+                "role": "attention_query_projection"
+              },
+              "k_projection": {
+                "tensor": "model.layers.0.self_attn.k_proj.weight",
+                "role": "attention_key_projection"
+              },
+              "v_projection": {
+                "tensor": "model.layers.0.self_attn.v_proj.weight",
+                "role": "attention_value_projection"
+              },
+              "attention_out_projection": {
+                "tensor": "model.layers.0.self_attn.o_proj.weight",
+                "role": "attention_output_projection"
+              }
+            }
+          },
+          "semantic_module_tree": {
+            "schema": "nerve.semantic_module_tree.v1",
+            "root_module_id": "layer",
+            "modules": [
+              {
+                "id": "layer",
+                "role": "layer",
+                "responsibility": "Editable source-layer component",
+                "parent_id": null,
+                "parameter_ref_ids": [],
+                "owned_state_port_ids": [],
+                "virtual": false,
+                "attrs": {},
+                "source_node_ids": [],
+                "child_ids": [
+                  "layer.token_mixer",
+                  "layer.feature_transform"
+                ],
+                "input_signals": [
+                  "input_frame"
+                ],
+                "output_signals": [
+                  "output_frame"
+                ]
+              },
+              {
+                "id": "layer.token_mixer",
+                "role": "token_mixer",
+                "responsibility": "full attention temporal/token mixing block",
+                "parent_id": "layer",
+                "parameter_ref_ids": [],
+                "owned_state_port_ids": [],
+                "virtual": false,
+                "attrs": {},
+                "source_node_ids": [],
+                "child_ids": [
+                  "layer.token_mixer.normalization",
+                  "layer.token_mixer.input_projections",
+                  "layer.token_mixer.position",
+                  "layer.token_mixer.attention_state",
+                  "layer.token_mixer.output_projection",
+                  "layer.token_mixer.residual"
+                ],
+                "input_signals": [
+                  "input_frame"
+                ],
+                "output_signals": [
+                  "operator_residual_out"
+                ]
+              },
+              {
+                "id": "layer.feature_transform",
+                "role": "feature_transform",
+                "responsibility": "dense swiglu feature transform",
+                "parent_id": "layer",
+                "parameter_ref_ids": [],
+                "owned_state_port_ids": [],
+                "virtual": false,
+                "attrs": {},
+                "source_node_ids": [],
+                "child_ids": [
+                  "layer.feature_transform.normalization",
+                  "layer.feature_transform.projections",
+                  "layer.feature_transform.gate",
+                  "layer.feature_transform.residual"
+                ],
+                "input_signals": [
+                  "operator_residual_out"
+                ],
+                "output_signals": [
+                  "output_frame"
+                ]
+              },
+              {
+                "id": "layer.token_mixer.normalization",
+                "role": "normalization",
+                "responsibility": "Normalize the layer input for the token mixer",
+                "parent_id": "layer.token_mixer",
+                "parameter_ref_ids": [
+                  "operator_norm"
+                ],
+                "owned_state_port_ids": [],
+                "virtual": false,
+                "attrs": {},
+                "source_node_ids": [
+                  "operator_norm"
+                ],
+                "child_ids": [],
+                "input_signals": [
+                  "input_frame"
+                ],
+                "output_signals": [
+                  "operator_norm_out"
+                ]
+              },
+              {
+                "id": "layer.token_mixer.output_projection",
+                "role": "projection",
+                "responsibility": "Project the mixed representation back to the layer width",
+                "parent_id": "layer.token_mixer",
+                "parameter_ref_ids": [
+                  "attention_out_projection"
+                ],
+                "owned_state_port_ids": [],
+                "virtual": false,
+                "attrs": {},
+                "source_node_ids": [
+                  "attention_out_projection"
+                ],
+                "child_ids": [],
+                "input_signals": [
+                  "attention_out"
+                ],
+                "output_signals": [
+                  "operator_out"
+                ]
+              },
+              {
+                "id": "layer.token_mixer.residual",
+                "role": "residual_path",
+                "responsibility": "Merge the token-mixer update with the incoming frame",
+                "parent_id": "layer.token_mixer",
+                "parameter_ref_ids": [],
+                "owned_state_port_ids": [],
+                "virtual": false,
+                "attrs": {},
+                "source_node_ids": [
+                  "operator_residual"
+                ],
+                "child_ids": [],
+                "input_signals": [
+                  "input_frame",
+                  "operator_out"
+                ],
+                "output_signals": [
+                  "operator_residual_out"
+                ]
+              },
+              {
+                "id": "layer.token_mixer.input_projections",
+                "role": "projection",
+                "responsibility": "Produce query, key, value, and optional gate channels",
+                "parent_id": "layer.token_mixer",
+                "parameter_ref_ids": [
+                  "q_projection",
+                  "k_projection",
+                  "v_projection"
+                ],
+                "owned_state_port_ids": [],
+                "virtual": false,
+                "attrs": {},
+                "source_node_ids": [
+                  "q_projection",
+                  "k_projection",
+                  "v_projection"
+                ],
+                "child_ids": [],
+                "input_signals": [
+                  "operator_norm_out"
+                ],
+                "output_signals": [
+                  "q_projected",
+                  "k_projected",
+                  "v_projected"
+                ]
+              },
+              {
+                "id": "layer.token_mixer.position",
+                "role": "position_operation",
+                "responsibility": "Apply rotary position transformations",
+                "parent_id": "layer.token_mixer",
+                "parameter_ref_ids": [],
+                "owned_state_port_ids": [],
+                "virtual": false,
+                "attrs": {},
+                "source_node_ids": [
+                  "q_rope",
+                  "k_rope"
+                ],
+                "child_ids": [],
+                "input_signals": [
+                  "q_projected",
+                  "k_projected"
+                ],
+                "output_signals": [
+                  "q_positioned",
+                  "k_positioned"
+                ]
+              },
+              {
+                "id": "layer.token_mixer.attention_state",
+                "role": "state_attachment",
+                "responsibility": "Own, append, and read the stream-specific attention memory",
+                "parent_id": "layer.token_mixer",
+                "parameter_ref_ids": [],
+                "owned_state_port_ids": [
+                  "kv_memory"
+                ],
+                "virtual": false,
+                "attrs": {},
+                "source_node_ids": [
+                  "kv_memory_append",
+                  "attention_read"
+                ],
+                "child_ids": [],
+                "input_signals": [
+                  "k_positioned",
+                  "v_projected",
+                  "q_positioned"
+                ],
+                "output_signals": [
+                  "attention_out"
+                ]
+              },
+              {
+                "id": "layer.feature_transform.normalization",
+                "role": "normalization",
+                "responsibility": "Normalize the token-mixer residual for feature transformation",
+                "parent_id": "layer.feature_transform",
+                "parameter_ref_ids": [
+                  "ffn_norm"
+                ],
+                "owned_state_port_ids": [],
+                "virtual": false,
+                "attrs": {},
+                "source_node_ids": [
+                  "ffn_norm"
+                ],
+                "child_ids": [],
+                "input_signals": [
+                  "operator_residual_out"
+                ],
+                "output_signals": [
+                  "ffn_norm_out"
+                ]
+              },
+              {
+                "id": "layer.feature_transform.residual",
+                "role": "residual_path",
+                "responsibility": "Merge the feature-transform update with the token-mixer residual",
+                "parent_id": "layer.feature_transform",
+                "parameter_ref_ids": [],
+                "owned_state_port_ids": [],
+                "virtual": false,
+                "attrs": {},
+                "source_node_ids": [
+                  "ffn_residual"
+                ],
+                "child_ids": [],
+                "input_signals": [
+                  "operator_residual_out",
+                  "ffn_out"
+                ],
+                "output_signals": [
+                  "output_frame"
+                ]
+              },
+              {
+                "id": "layer.feature_transform.projections",
+                "role": "projection",
+                "responsibility": "Project into and out of the dense gated feature space",
+                "parent_id": "layer.feature_transform",
+                "parameter_ref_ids": [
+                  "ffn_gate",
+                  "ffn_up",
+                  "ffn_down"
+                ],
+                "owned_state_port_ids": [],
+                "virtual": false,
+                "attrs": {},
+                "source_node_ids": [
+                  "ffn_gate_projection",
+                  "ffn_up_projection",
+                  "ffn_down_projection"
+                ],
+                "child_ids": [],
+                "input_signals": [
+                  "ffn_norm_out",
+                  "ffn_hidden"
+                ],
+                "output_signals": [
+                  "ffn_gate",
+                  "ffn_up",
+                  "ffn_out"
+                ]
+              },
+              {
+                "id": "layer.feature_transform.gate",
+                "role": "gate",
+                "responsibility": "Activate and combine the dense feature branches",
+                "parent_id": "layer.feature_transform",
+                "parameter_ref_ids": [],
+                "owned_state_port_ids": [],
+                "virtual": false,
+                "attrs": {},
+                "source_node_ids": [
+                  "ffn_gate_activation",
+                  "ffn_gate_multiply"
+                ],
+                "child_ids": [],
+                "input_signals": [
+                  "ffn_gate",
+                  "ffn_up"
+                ],
+                "output_signals": [
+                  "ffn_hidden"
+                ]
+              }
+            ]
+          },
+          "semantic_execution_nodes": [
+            {
+              "id": "operator_norm",
+              "op": "rms_norm",
+              "inputs": [
+                "input_frame"
+              ],
+              "outputs": [
+                "operator_norm_out"
+              ],
+              "params": [
+                "operator_norm"
+              ],
+              "attrs": {
+                "eps": 1e-05,
+                "weight_offset": 0.0
+              }
+            },
+            {
+              "id": "q_projection",
+              "op": "linear",
+              "inputs": [
+                "operator_norm_out"
+              ],
+              "outputs": [
+                "q_projected"
+              ],
+              "params": [
+                "q_projection"
+              ]
+            },
+            {
+              "id": "k_projection",
+              "op": "linear",
+              "inputs": [
+                "operator_norm_out"
+              ],
+              "outputs": [
+                "k_projected"
+              ],
+              "params": [
+                "k_projection"
+              ]
+            },
+            {
+              "id": "v_projection",
+              "op": "linear",
+              "inputs": [
+                "operator_norm_out"
+              ],
+              "outputs": [
+                "v_projected"
+              ],
+              "params": [
+                "v_projection"
+              ]
+            },
+            {
+              "id": "q_rope",
+              "op": "rotary_position_embedding",
+              "inputs": [
+                "q_projected"
+              ],
+              "outputs": [
+                "q_positioned"
+              ],
+              "attrs": {
+                "position_source": "stream_tick",
+                "theta": 10000.0,
+                "rope_type": "default",
+                "scaling": null,
+                "interleaved": false,
+                "rotary_width": 8,
+                "query_heads": 2,
+                "key_value_heads": 1,
+                "head_width": 8,
+                "query_groups_per_kv_head": 2,
+                "head_count": 2
+              }
+            },
+            {
+              "id": "k_rope",
+              "op": "rotary_position_embedding",
+              "inputs": [
+                "k_projected"
+              ],
+              "outputs": [
+                "k_positioned"
+              ],
+              "attrs": {
+                "position_source": "stream_tick",
+                "theta": 10000.0,
+                "rope_type": "default",
+                "scaling": null,
+                "interleaved": false,
+                "rotary_width": 8,
+                "query_heads": 2,
+                "key_value_heads": 1,
+                "head_width": 8,
+                "query_groups_per_kv_head": 2,
+                "head_count": 1
+              }
+            },
+            {
+              "id": "kv_memory_append",
+              "op": "append_state_update",
+              "inputs": [
+                "k_positioned",
+                "v_projected",
+                "kv_memory"
+              ],
+              "outputs": [
+                "k_memory",
+                "v_memory"
+              ],
+              "state_reads": [
+                "kv_memory"
+              ],
+              "state_writes": [
+                "kv_memory"
+              ],
+              "attrs": {
+                "growth": "per_activation",
+                "query_heads": 2,
+                "key_value_heads": 1,
+                "head_width": 8,
+                "query_groups_per_kv_head": 2
+              }
+            },
+            {
+              "id": "attention_read",
+              "op": "scaled_dot_product_attention",
+              "inputs": [
+                "q_positioned",
+                "k_memory",
+                "v_memory"
+              ],
+              "outputs": [
+                "attention_out"
+              ],
+              "params": [],
+              "attrs": {
+                "causal": true,
+                "scale": 0.3535533905932738,
+                "window_size": null,
+                "attention_sinks": false,
+                "query_heads": 2,
+                "key_value_heads": 1,
+                "head_width": 8,
+                "query_groups_per_kv_head": 2
+              }
+            },
+            {
+              "id": "attention_out_projection",
+              "op": "linear",
+              "inputs": [
+                "attention_out"
+              ],
+              "outputs": [
+                "operator_out"
+              ],
+              "params": [
+                "attention_out_projection"
+              ]
+            },
+            {
+              "id": "operator_residual",
+              "op": "residual_add",
+              "inputs": [
+                "input_frame",
+                "operator_out"
+              ],
+              "outputs": [
+                "operator_residual_out"
+              ]
+            },
+            {
+              "id": "ffn_norm",
+              "op": "rms_norm",
+              "inputs": [
+                "operator_residual_out"
+              ],
+              "outputs": [
+                "ffn_norm_out"
+              ],
+              "params": [
+                "ffn_norm"
+              ],
+              "attrs": {
+                "eps": 1e-05,
+                "weight_offset": 0.0
+              }
+            },
+            {
+              "id": "ffn_gate_projection",
+              "op": "linear",
+              "inputs": [
+                "ffn_norm_out"
+              ],
+              "outputs": [
+                "ffn_gate"
+              ],
+              "params": [
+                "ffn_gate"
+              ]
+            },
+            {
+              "id": "ffn_up_projection",
+              "op": "linear",
+              "inputs": [
+                "ffn_norm_out"
+              ],
+              "outputs": [
+                "ffn_up"
+              ],
+              "params": [
+                "ffn_up"
+              ]
+            },
+            {
+              "id": "ffn_gate_activation",
+              "op": "silu",
+              "inputs": [
+                "ffn_gate"
+              ],
+              "outputs": [
+                "ffn_gate_activated"
+              ],
+              "attrs": {
+                "element_count": 32
+              }
+            },
+            {
+              "id": "ffn_gate_multiply",
+              "op": "multiply",
+              "inputs": [
+                "ffn_gate_activated",
+                "ffn_up"
+              ],
+              "outputs": [
+                "ffn_hidden"
+              ]
+            },
+            {
+              "id": "ffn_down_projection",
+              "op": "linear",
+              "inputs": [
+                "ffn_hidden"
+              ],
+              "outputs": [
+                "ffn_out"
+              ],
+              "params": [
+                "ffn_down"
+              ]
+            },
+            {
+              "id": "ffn_residual",
+              "op": "residual_add",
+              "inputs": [
+                "operator_residual_out",
+                "ffn_out"
+              ],
+              "outputs": [
+                "output_frame"
+              ]
+            }
+          ],
+          "nodes": [
+            {
+              "id": "operator_norm",
+              "op": "rms_norm",
+              "inputs": [
+                "input_frame"
+              ],
+              "outputs": [
+                "operator_norm_out"
+              ],
+              "params": [
+                "operator_norm"
+              ],
+              "attrs": {
+                "eps": 1e-05,
+                "weight_offset": 0.0,
+                "output_element_bytes": [
+                  2
+                ]
+              }
+            },
+            {
+              "id": "q_projection__k_projection__v_projection",
+              "op": "parallel_linear_3way",
+              "inputs": [
+                "operator_norm_out"
+              ],
+              "outputs": [
+                "q_projected",
+                "k_projected",
+                "v_projected"
+              ],
+              "params": [
+                "q_projection",
+                "k_projection",
+                "v_projection"
+              ],
+              "attrs": {
+                "compiled_from": [
+                  "q_projection",
+                  "k_projection",
+                  "v_projection"
+                ],
+                "branch_count": 3,
+                "output_element_bytes": [
+                  2,
+                  2,
+                  2
+                ]
+              }
+            },
+            {
+              "id": "q_rope",
+              "op": "rotary_position_embedding",
+              "inputs": [
+                "q_projected"
+              ],
+              "outputs": [
+                "q_positioned"
+              ],
+              "attrs": {
+                "position_source": "stream_tick",
+                "theta": 10000.0,
+                "rope_type": "default",
+                "scaling": null,
+                "interleaved": false,
+                "rotary_width": 8,
+                "query_heads": 2,
+                "key_value_heads": 1,
+                "head_width": 8,
+                "query_groups_per_kv_head": 2,
+                "head_count": 2,
+                "output_element_bytes": [
+                  2
+                ]
+              }
+            },
+            {
+              "id": "k_rope",
+              "op": "rotary_position_embedding",
+              "inputs": [
+                "k_projected"
+              ],
+              "outputs": [
+                "k_positioned"
+              ],
+              "attrs": {
+                "position_source": "stream_tick",
+                "theta": 10000.0,
+                "rope_type": "default",
+                "scaling": null,
+                "interleaved": false,
+                "rotary_width": 8,
+                "query_heads": 2,
+                "key_value_heads": 1,
+                "head_width": 8,
+                "query_groups_per_kv_head": 2,
+                "head_count": 1,
+                "output_element_bytes": [
+                  2
+                ]
+              }
+            },
+            {
+              "id": "kv_memory_append__attention_read",
+              "op": "append_scaled_dot_product_attention",
+              "inputs": [
+                "q_positioned",
+                "k_positioned",
+                "v_projected",
+                "kv_memory"
+              ],
+              "outputs": [
+                "attention_out"
+              ],
+              "params": [],
+              "state_reads": [
+                "kv_memory"
+              ],
+              "state_writes": [
+                "kv_memory"
+              ],
+              "attrs": {
+                "compiled_from": [
+                  "kv_memory_append",
+                  "attention_read"
+                ],
+                "append": {
+                  "growth": "per_activation",
+                  "query_heads": 2,
+                  "key_value_heads": 1,
+                  "head_width": 8,
+                  "query_groups_per_kv_head": 2
+                },
+                "attention": {
+                  "causal": true,
+                  "scale": 0.3535533905932738,
+                  "window_size": null,
+                  "attention_sinks": false,
+                  "query_heads": 2,
+                  "key_value_heads": 1,
+                  "head_width": 8,
+                  "query_groups_per_kv_head": 2
+                },
+                "current_kv_source": "direct_bf16_input",
+                "output_element_bytes": [
+                  2
+                ]
+              }
+            },
+            {
+              "id": "attention_out_projection__operator_residual",
+              "op": "linear_residual",
+              "inputs": [
+                "attention_out",
+                "input_frame"
+              ],
+              "outputs": [
+                "operator_residual_out"
+              ],
+              "params": [
+                "attention_out_projection"
+              ],
+              "attrs": {
+                "compiled_from": [
+                  "attention_out_projection",
+                  "operator_residual"
+                ],
+                "intermediate_rounding": "BF16",
+                "output_element_bytes": [
+                  2
+                ]
+              }
+            },
+            {
+              "id": "ffn_norm",
+              "op": "rms_norm",
+              "inputs": [
+                "operator_residual_out"
+              ],
+              "outputs": [
+                "ffn_norm_out"
+              ],
+              "params": [
+                "ffn_norm"
+              ],
+              "attrs": {
+                "eps": 1e-05,
+                "weight_offset": 0.0,
+                "output_element_bytes": [
+                  2
+                ]
+              }
+            },
+            {
+              "id": "ffn_gate_projection__ffn_up_projection__ffn_gate_activation__ffn_gate_multiply",
+              "op": "parallel_linear_silu_multiply",
+              "inputs": [
+                "ffn_norm_out"
+              ],
+              "outputs": [
+                "ffn_hidden"
+              ],
+              "params": [
+                "ffn_gate",
+                "ffn_up"
+              ],
+              "attrs": {
+                "compiled_from": [
+                  "ffn_gate_projection",
+                  "ffn_up_projection",
+                  "ffn_gate_activation",
+                  "ffn_gate_multiply"
+                ],
+                "branch_count": 2,
+                "intermediate_rounding": "BF16",
+                "element_count": 32,
+                "output_element_bytes": [
+                  2
+                ]
+              }
+            },
+            {
+              "id": "ffn_down_projection__ffn_residual",
+              "op": "linear_residual",
+              "inputs": [
+                "ffn_hidden",
+                "operator_residual_out"
+              ],
+              "outputs": [
+                "output_frame"
+              ],
+              "params": [
+                "ffn_down"
+              ],
+              "attrs": {
+                "compiled_from": [
+                  "ffn_down_projection",
+                  "ffn_residual"
+                ],
+                "intermediate_rounding": "BF16",
+                "output_element_bytes": [
+                  2
+                ]
+              }
+            }
+          ],
+          "behavioral_error_contract": {
+            "mode": "source_reference_circuit",
+            "reference": "source_checkpoint_entity:model.layers.0",
+            "current_tolerance": {
+              "atol": 1e-06,
+              "rtol": 1e-05
+            },
+            "notes": [
+              "This circuit preserves the source grouped-query attention layer decomposition.",
+              "KV is represented as stream-owned append-only transient state, not as a disposable host cache."
+            ]
+          },
+          "lowering_notes": [
+            "Layer is represented as one component-level circuit with explicit internal nodes.",
+            "Transient memory belongs to the stream instance.",
+            "The graph is ordered topologically so a backend can fuse or replace regions without changing the boundary contract."
+          ]
+        },
+        "params": {
+          "schema": "nerve.circuit_params.v1",
+          "circuit": "layer_00_gqa_attention_circuit_v1",
+          "layout": "gqa_attention_layer_params_v1_dense_swiglu",
+          "storage": "source_tensor_refs",
+          "refs": {
+            "operator_norm": {
+              "tensor": "model.layers.0.input_layernorm.weight",
+              "role": "operator_normalization_weight"
+            },
+            "ffn_norm": {
+              "tensor": "model.layers.0.post_attention_layernorm.weight",
+              "role": "feed_forward_normalization_weight"
+            },
+            "ffn_gate": {
+              "tensor": "model.layers.0.mlp.gate_proj.weight",
+              "role": "feed_forward_swiglu_gate_projection"
+            },
+            "ffn_down": {
+              "tensor": "model.layers.0.mlp.down_proj.weight",
+              "role": "feed_forward_down_projection"
+            },
+            "ffn_up": {
+              "tensor": "model.layers.0.mlp.up_proj.weight",
+              "role": "feed_forward_up_projection"
+            },
+            "q_projection": {
+              "tensor": "model.layers.0.self_attn.q_proj.weight",
+              "role": "attention_query_projection"
+            },
+            "k_projection": {
+              "tensor": "model.layers.0.self_attn.k_proj.weight",
+              "role": "attention_key_projection"
+            },
+            "v_projection": {
+              "tensor": "model.layers.0.self_attn.v_proj.weight",
+              "role": "attention_value_projection"
+            },
+            "attention_out_projection": {
+              "tensor": "model.layers.0.self_attn.o_proj.weight",
+              "role": "attention_output_projection"
+            }
+          }
+        },
+        "state": {
+          "schema": "nerve.circuit_state.v1",
+          "circuit": "layer_00_gqa_attention_circuit_v1",
+          "state_ports": [
+            {
+              "id": "kv_memory",
+              "type": "append_only_attention_memory",
+              "query_heads": 2,
+              "key_shape_per_token": [
+                1,
+                8
+              ],
+              "value_shape_per_token": [
+                1,
+                8
+              ],
+              "dtype": "BF16",
+              "growth": "per_activation",
+              "max_dynamic_activations": null,
+              "sharing": "per_stream_per_node_instance",
+              "owner": "stream",
+              "layout": "append_only_kv",
+              "source_layout": "batch_kvheads_seq_headdim"
+            }
+          ]
+        }
+      },
+      {
+        "component_id": "output_transducer",
+        "operator_type": "output_transducer",
+        "runtime_role": "output_transducer",
+        "implementation": "compiled_output_transducer_v1",
+        "behavioral_role": "stream_generation_circuit",
+        "circuit": {
+          "schema": "nerve.stream_circuit.v1",
+          "id": "output_transducer_circuit_v1",
+          "source": {
+            "component_id": "output_transducer",
+            "source_layer_index": null,
+            "source_operator_type": "output_transducer"
+          },
+          "runtime_role": "output_transducer",
+          "behavioral_role": "stream_generation_circuit",
+          "implementation": "compiled_output_transducer_v1",
+          "boundary": {
+            "inputs": [
+              {
+                "id": "input_frame",
+                "signal": "frame",
+                "shape": [
+                  16
+                ],
+                "component_port": "frame"
+              }
+            ],
+            "outputs": [
+              {
+                "id": "output_logits",
+                "signal": "logits",
+                "shape": [
+                  32
+                ],
+                "component_port": "logits",
+                "source": "output_logits"
+              }
+            ],
+            "controls": []
+          },
+          "state_ports": [],
+          "parameters": {
+            "layout": "source_tensor_refs",
+            "storage": "safetensors",
+            "refs": {
+              "output_norm.weight": {
+                "tensor": "model.norm.weight",
+                "role": "output_transducer.output_norm.weight"
+              },
+              "output_projection.weight": {
+                "tensor": "model.embed_tokens.weight",
+                "role": "output_transducer.output_projection.weight"
+              }
+            }
+          },
+          "nodes": [
+            {
+              "id": "output_norm",
+              "op": "rms_norm",
+              "inputs": [
+                "input_frame"
+              ],
+              "outputs": [
+                "output_norm_output"
+              ],
+              "params": [
+                "output_norm.weight"
+              ],
+              "state_reads": [],
+              "state_writes": [],
+              "attrs": {
+                "eps": 1e-05,
+                "weight_offset": 0.0,
+                "output_element_bytes": [
+                  2
+                ]
+              }
+            },
+            {
+              "id": "output_projection",
+              "op": "linear_projection",
+              "inputs": [
+                "output_norm_output"
+              ],
+              "outputs": [
+                "output_logits"
+              ],
+              "params": [
+                "output_projection.weight"
+              ],
+              "state_reads": [],
+              "state_writes": [],
+              "attrs": {
+                "scale": 1.0,
+                "soft_cap": null,
+                "output_element_bytes": [
+                  2
+                ]
+              }
+            }
+          ],
+          "behavioral_error_contract": {
+            "mode": "exact_source_operation",
+            "reference": "output_transducer"
+          },
+          "lowering_notes": [
+            "This stream entity is part of the editable execution graph contract.",
+            "Its optimized Vulkan implementation is a backend lowering, not a host-side exception."
+          ]
+        },
+        "params": {
+          "schema": "nerve.circuit_params.v1",
+          "circuit": "output_transducer_circuit_v1",
+          "layout": "source_tensor_refs",
+          "storage": "safetensors",
+          "refs": {
+            "output_norm.weight": {
+              "tensor": "model.norm.weight",
+              "role": "output_transducer.output_norm.weight"
+            },
+            "output_projection.weight": {
+              "tensor": "model.embed_tokens.weight",
+              "role": "output_transducer.output_projection.weight"
+            }
+          }
+        },
+        "state": {
+          "schema": "nerve.circuit_state.v1",
+          "circuit": "output_transducer_circuit_v1",
+          "state_ports": []
+        }
+      },
+      {
+        "component_id": "sampler",
+        "operator_type": "sampler",
+        "runtime_role": "sampler",
+        "implementation": "compiled_sampler_v1",
+        "behavioral_role": "stream_generation_circuit",
+        "circuit": {
+          "schema": "nerve.stream_circuit.v1",
+          "id": "sampler_circuit_v1",
+          "source": {
+            "component_id": "sampler",
+            "source_layer_index": null,
+            "source_operator_type": "sampler"
+          },
+          "runtime_role": "sampler",
+          "behavioral_role": "stream_generation_circuit",
+          "implementation": "compiled_sampler_v1",
+          "boundary": {
+            "inputs": [
+              {
+                "id": "input_logits",
+                "signal": "logits",
+                "shape": [
+                  32
+                ],
+                "component_port": "logits"
+              },
+              {
+                "id": "random_seed",
+                "signal": "random_seed",
+                "shape": [
+                  1
+                ],
+                "component_port": "randomness"
+              }
+            ],
+            "outputs": [
+              {
+                "id": "sampled_token",
+                "signal": "token_id",
+                "shape": [
+                  1
+                ],
+                "component_port": "token",
+                "source": "sampled_token"
+              }
+            ],
+            "controls": []
+          },
+          "state_ports": [],
+          "parameters": {
+            "layout": "source_tensor_refs",
+            "storage": "safetensors",
+            "refs": {}
+          },
+          "nodes": [
+            {
+              "id": "sample",
+              "op": "sample_token",
+              "inputs": [
+                "input_logits",
+                "random_seed"
+              ],
+              "outputs": [
+                "sampled_token"
+              ],
+              "params": [],
+              "state_reads": [],
+              "state_writes": [],
+              "attrs": {
+                "method": "greedy",
+                "temperature": 1.0,
+                "top_k": 1,
+                "top_p": 1.0,
+                "min_p": 0.0,
+                "presence_penalty": 0.0,
+                "repetition_penalty": 1.0,
+                "randomness": "seed_and_stream_tick",
+                "output_element_bytes": [
+                  2
+                ]
+              }
+            }
+          ],
+          "behavioral_error_contract": {
+            "mode": "exact_source_operation",
+            "reference": "sampler"
+          },
+          "lowering_notes": [
+            "This stream entity is part of the editable execution graph contract.",
+            "Its optimized Vulkan implementation is a backend lowering, not a host-side exception."
+          ]
+        },
+        "params": {
+          "schema": "nerve.circuit_params.v1",
+          "circuit": "sampler_circuit_v1",
+          "layout": "source_tensor_refs",
+          "storage": "safetensors",
+          "refs": {}
+        },
+        "state": {
+          "schema": "nerve.circuit_state.v1",
+          "circuit": "sampler_circuit_v1",
+          "state_ports": []
+        }
+      }
+    ]
+  },
+  "tensor_index_path": "tensors.json",
+  "behavioral_validation_path": "behavioral_validation.json",
+  "config_path": "config.json",
+  "tokenizer": {
+    "path": "tokenizer",
+    "files": [
+      "tokenizer.json",
+      "tokenizer_config.json"
+    ]
+  },
+  "activation_element_bytes": 2,
+  "max_context_activations": 64,
+  "required_vulkan_device_extensions": [],
+  "required_vulkan_features": [],
+  "required_vulkan_subgroup_operations": [
+    "arithmetic",
+    "basic"
+  ],
+  "input_transducer": {
+    "spec": {
+      "transducer_id": "input_transducer.token_embedding",
+      "parameter_tensor": "model.embed_tokens.weight",
+      "parameter_dtype": "BF16",
+      "parameter_shape": [
+        32,
+        16
+      ],
+      "parameter_byte_capacity": 1024,
+      "output_signal_id": "input_frame",
+      "output_frame_byte_capacity": 32,
+      "output_frame_word_count": 8,
+      "local_size_x": 256
+    },
+    "shader_path": "shaders/embedding_lookup_bf16_32x16_scale1.spv",
+    "batch_shader_path": "shaders/embedding_lookup_batch_bf16_32x16_scale1.spv"
+  },
+  "output_transducer": {
+    "spec": {
+      "transducer_id": "output_transducer",
+      "input_signal_id": "output_frame",
+      "node_ids": [
+        "output_norm",
+        "output_projection"
+      ],
+      "norm_parameter_tensor": "model.norm.weight",
+      "norm_parameter_dtype": "BF16",
+      "norm_parameter_shape": [
+        16
+      ],
+      "norm_parameter_byte_capacity": 32,
+      "projection_parameter_tensor": "model.embed_tokens.weight",
+      "projection_parameter_dtype": "BF16",
+      "projection_parameter_shape": [
+        32,
+        16
+      ],
+      "projection_parameter_byte_capacity": 1024,
+      "projection_scale_parameter_tensor": null,
+      "projection_scale_parameter_dtype": null,
+      "projection_scale_parameter_shape": null,
+      "projection_scale_parameter_byte_capacity": null,
+      "input_frame_byte_capacity": 32,
+      "normalized_frame_byte_capacity": 32,
+      "logits_byte_capacity": 128,
+      "projection_workgroup_count_x": 16,
+      "norm_local_size_x": 64,
+      "projection_local_size_x": 64
+    },
+    "embedding_norm_shader_path": "shaders/rms_norm_bf16_h16_eps1e-05_offset0.spv",
+    "embedding_norm_batch_shader_path": "shaders/rms_norm_batch4_bf16_h16_eps1e-05_offset0.spv",
+    "embedding_norm_batch_lane_tile_width": 4,
+    "projection_shader_path": "shaders/tied_output_projection_bf16_32x16_scale1_to_f32.spv",
+    "projection_batch_shader_path": "shaders/tied_output_projection_batch4_bf16_32x16_scale1_to_f32.spv",
+    "projection_batch_lane_tile_width": 4
+  },
+  "sampler": {
+    "spec": {
+      "sampler_id": "greedy_sampler",
+      "method": "greedy",
+      "temperature": 1.0,
+      "top_k": 1,
+      "top_p": 1.0,
+      "min_p": 0.0,
+      "presence_penalty": 0.0,
+      "repetition_penalty": 1.0,
+      "top_k_capacity": 32,
+      "runtime_parameterized": false,
+      "logits_byte_capacity": 128,
+      "output_byte_capacity": 16,
+      "scratch_byte_capacity": 32768
+    },
+    "kernels": [
+      {
+        "role": "sample_logits",
+        "shader_path": "shaders/greedy_sampler_f32_32.spv",
+        "local_size_x": 1024,
+        "workgroup_count_x": 1
+      },
+      {
+        "role": "runtime_record_current_token",
+        "shader_path": "shaders/record_seen_token_32.spv",
+        "local_size_x": 1,
+        "workgroup_count_x": 1
+      },
+      {
+        "role": "runtime_record_token_batch",
+        "shader_path": "shaders/record_seen_tokens_batch64_32.spv",
+        "local_size_x": 64,
+        "workgroup_count_x": 1
+      },
+      {
+        "role": "runtime_sample_logits",
+        "shader_path": "shaders/greedy_sampler_runtime_f32_32.spv",
+        "local_size_x": 1024,
+        "workgroup_count_x": 1
+      },
+      {
+        "role": "runtime_partition_top_k",
+        "shader_path": "shaders/temperature_top_k_candidates_runtime_f32_32_kc32_g128_l256.spv",
+        "local_size_x": 256,
+        "workgroup_count_x": 128
+      },
+      {
+        "role": "runtime_sample_candidates",
+        "shader_path": "shaders/temperature_top_k_top_p_sampler_runtime_f32_kc32_g128_l256.spv",
+        "local_size_x": 256,
+        "workgroup_count_x": 1
+      },
+      {
+        "role": "feedback_control",
+        "shader_path": "shaders/resident_feedback_control.spv",
+        "local_size_x": 1,
+        "workgroup_count_x": 1
+      }
+    ]
+  },
+  "component_executions": [
+    {
+      "component_id": "layer_00",
+      "operator_type": "full_attention",
+      "implementation": "reference_gqa_attention_layer_circuit_v1",
+      "kernels": [
+        {
+          "execution_index": 0,
+          "node_id": "operator_norm",
+          "op": "rms_norm",
+          "source_node_ids": [
+            "operator_norm"
+          ],
+          "semantic_module_ids": [
+            "layer.token_mixer.normalization"
+          ],
+          "execution_domain": "decode",
+          "shader_path": "shaders/rms_norm_bf16_h16_eps1e-05_offset0.spv",
+          "local_size_x": 64,
+          "workgroup_count_x": 1,
+          "batch_mode": "weight_shared",
+          "batch_implementations": [
+            {
+              "execution_domain": "prefill",
+              "lane_tile_width": 1,
+              "independent_candidate_compatible": true,
+              "causal_sequence_compatible": true,
+              "device_requirements": {
+                "vulkan_device_extensions": [],
+                "vulkan_features": [],
+                "subgroup_operations": [
+                  "arithmetic",
+                  "basic"
+                ],
+                "subgroup_size": 64
+              },
+              "stages": [
+                {
+                  "shader_path": "shaders/rms_norm_batch1_bf16_h16_eps1e-05_offset0.spv",
+                  "local_size_x": 64,
+                  "workgroup_count_x": 1
+                }
+              ]
+            },
+            {
+              "execution_domain": "decode_and_prefill",
+              "lane_tile_width": 2,
+              "independent_candidate_compatible": true,
+              "causal_sequence_compatible": true,
+              "device_requirements": {
+                "vulkan_device_extensions": [],
+                "vulkan_features": [],
+                "subgroup_operations": [
+                  "arithmetic",
+                  "basic"
+                ]
+              },
+              "stages": [
+                {
+                  "shader_path": "shaders/rms_norm_batch2_bf16_h16_eps1e-05_offset0.spv",
+                  "local_size_x": 64,
+                  "workgroup_count_x": 1
+                }
+              ]
+            },
+            {
+              "execution_domain": "decode_and_prefill",
+              "lane_tile_width": 4,
+              "independent_candidate_compatible": true,
+              "causal_sequence_compatible": true,
+              "device_requirements": {
+                "vulkan_device_extensions": [],
+                "vulkan_features": [],
+                "subgroup_operations": [
+                  "arithmetic",
+                  "basic"
+                ]
+              },
+              "stages": [
+                {
+                  "shader_path": "shaders/rms_norm_batch4_bf16_h16_eps1e-05_offset0.spv",
+                  "local_size_x": 64,
+                  "workgroup_count_x": 1
+                }
+              ]
+            },
+            {
+              "execution_domain": "decode_and_prefill",
+              "lane_tile_width": 8,
+              "independent_candidate_compatible": true,
+              "causal_sequence_compatible": true,
+              "device_requirements": {
+                "vulkan_device_extensions": [],
+                "vulkan_features": [],
+                "subgroup_operations": [
+                  "arithmetic",
+                  "basic"
+                ]
+              },
+              "stages": [
+                {
+                  "shader_path": "shaders/rms_norm_batch8_bf16_h16_eps1e-05_offset0.spv",
+                  "local_size_x": 64,
+                  "workgroup_count_x": 1
+                }
+              ]
+            },
+            {
+              "execution_domain": "decode_and_prefill",
+              "lane_tile_width": 16,
+              "independent_candidate_compatible": true,
+              "causal_sequence_compatible": true,
+              "device_requirements": {
+                "vulkan_device_extensions": [],
+                "vulkan_features": [],
+                "subgroup_operations": [
+                  "arithmetic",
+                  "basic"
+                ]
+              },
+              "stages": [
+                {
+                  "shader_path": "shaders/rms_norm_batch16_bf16_h16_eps1e-05_offset0.spv",
+                  "local_size_x": 64,
+                  "workgroup_count_x": 1
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "execution_index": 1,
+          "node_id": "q_projection__k_projection__v_projection",
+          "op": "parallel_linear_3way",
+          "source_node_ids": [
+            "q_projection",
+            "k_projection",
+            "v_projection"
+          ],
+          "semantic_module_ids": [
+            "layer.token_mixer.input_projections"
+          ],
+          "execution_domain": "decode",
+          "shader_path": "shaders/parallel_linear_3way_bf16_16x16_8_8.spv",
+          "local_size_x": 64,
+          "workgroup_count_x": 16,
+          "batch_mode": "weight_shared",
+          "batch_implementations": [
+            {
+              "execution_domain": "prefill",
+              "lane_tile_width": 64,
+              "independent_candidate_compatible": false,
+              "causal_sequence_compatible": true,
+              "device_requirements": {
+                "vulkan_device_extensions": [
+                  "VK_KHR_cooperative_matrix",
+                  "VK_KHR_shader_bfloat16"
+                ],
+                "vulkan_features": [
+                  "cooperative_matrix",
+                  "shader_bfloat16_cooperative_matrix",
+                  "shader_bfloat16_type",
+                  "shader_float16",
+                  "shader_int16",
+                  "vulkan_memory_model"
+                ],
+                "subgroup_operations": [
+                  "basic"
+                ],
+                "cooperative_bfloat16_shape": [
+                  16,
+                  16,
+                  16
+                ],
+                "subgroup_size": 64
+              },
+              "stages": [
+                {
+                  "shader_path": "shaders/parallel_linear_batch64_cooperative_3way_bf16_16x16_8_8.spv",
+                  "local_size_x": 256,
+                  "workgroup_count_x": 3
+                }
+              ]
+            },
+            {
+              "execution_domain": "decode_and_prefill",
+              "lane_tile_width": 2,
+              "independent_candidate_compatible": true,
+              "causal_sequence_compatible": true,
+              "device_requirements": {
+                "vulkan_device_extensions": [],
+                "vulkan_features": [],
+                "subgroup_operations": [
+                  "arithmetic",
+                  "basic"
+                ]
+              },
+              "stages": [
+                {
+                  "shader_path": "shaders/parallel_linear_batch2_3way_bf16_16x16_8_8.spv",
+                  "local_size_x": 64,
+                  "workgroup_count_x": 16
+                }
+              ]
+            },
+            {
+              "execution_domain": "decode_and_prefill",
+              "lane_tile_width": 4,
+              "independent_candidate_compatible": true,
+              "causal_sequence_compatible": true,
+              "device_requirements": {
+                "vulkan_device_extensions": [],
+                "vulkan_features": [],
+                "subgroup_operations": [
+                  "arithmetic",
+                  "basic"
+                ]
+              },
+              "stages": [
+                {
+                  "shader_path": "shaders/parallel_linear_batch4_3way_bf16_16x16_8_8.spv",
+                  "local_size_x": 64,
+                  "workgroup_count_x": 16
+                }
+              ]
+            },
+            {
+              "execution_domain": "decode_and_prefill",
+              "lane_tile_width": 8,
+              "independent_candidate_compatible": true,
+              "causal_sequence_compatible": true,
+              "device_requirements": {
+                "vulkan_device_extensions": [],
+                "vulkan_features": [],
+                "subgroup_operations": [
+                  "arithmetic",
+                  "basic"
+                ]
+              },
+              "stages": [
+                {
+                  "shader_path": "shaders/parallel_linear_batch8_3way_bf16_16x16_8_8.spv",
+                  "local_size_x": 64,
+                  "workgroup_count_x": 16
+                }
+              ]
+            },
+            {
+              "execution_domain": "decode_and_prefill",
+              "lane_tile_width": 16,
+              "independent_candidate_compatible": true,
+              "causal_sequence_compatible": true,
+              "device_requirements": {
+                "vulkan_device_extensions": [],
+                "vulkan_features": [],
+                "subgroup_operations": [
+                  "arithmetic",
+                  "basic"
+                ]
+              },
+              "stages": [
+                {
+                  "shader_path": "shaders/parallel_linear_batch16_3way_bf16_16x16_8_8.spv",
+                  "local_size_x": 64,
+                  "workgroup_count_x": 16
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "execution_index": 2,
+          "node_id": "q_rope",
+          "op": "rotary_position_embedding",
+          "source_node_ids": [
+            "q_rope"
+          ],
+          "semantic_module_ids": [
+            "layer.token_mixer.position"
+          ],
+          "execution_domain": "decode",
+          "shader_path": "shaders/rotary_bf16_2x8_r8_theta10000_half__sc2.spv",
+          "local_size_x": 64,
+          "workgroup_count_x": 2,
+          "batch_mode": "serial_lanes",
+          "batch_implementations": []
+        },
+        {
+          "execution_index": 3,
+          "node_id": "k_rope",
+          "op": "rotary_position_embedding",
+          "source_node_ids": [
+            "k_rope"
+          ],
+          "semantic_module_ids": [
+            "layer.token_mixer.position"
+          ],
+          "execution_domain": "decode",
+          "shader_path": "shaders/rotary_bf16_1x8_r8_theta10000_half__sc2.spv",
+          "local_size_x": 64,
+          "workgroup_count_x": 1,
+          "batch_mode": "serial_lanes",
+          "batch_implementations": []
+        },
+        {
+          "execution_index": 4,
+          "node_id": "kv_memory_append__attention_read",
+          "op": "append_scaled_dot_product_attention",
+          "source_node_ids": [
+            "kv_memory_append",
+            "attention_read"
+          ],
+          "semantic_module_ids": [
+            "layer.token_mixer.attention_state"
+          ],
+          "execution_domain": "decode",
+          "shader_path": "shaders/append_gqa_attention_bf16_q2_kv1_d8_scale0.353553391__sc7.spv",
+          "local_size_x": 1024,
+          "workgroup_count_x": 2,
+          "batch_mode": "causal_scan",
+          "batch_implementations": [
+            {
+              "execution_domain": "prefill",
+              "lane_tile_width": 64,
+              "independent_candidate_compatible": false,
+              "causal_sequence_compatible": true,
+              "device_requirements": {
+                "vulkan_device_extensions": [],
+                "vulkan_features": [],
+                "subgroup_operations": [
+                  "arithmetic",
+                  "basic"
+                ]
+              },
+              "stages": [
+                {
+                  "shader_path": "shaders/append_gqa_attention_temporal_read_bf16_q2_kv1_d8_scale0.353553391.spv",
+                  "local_size_x": 1024,
+                  "workgroup_count_x": 128
+                },
+                {
+                  "shader_path": "shaders/append_kv_temporal_commit_bf16_kv1_d8_w0.spv",
+                  "local_size_x": 64,
+                  "workgroup_count_x": 1
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "execution_index": 5,
+          "node_id": "attention_out_projection__operator_residual",
+          "op": "linear_residual",
+          "source_node_ids": [
+            "attention_out_projection",
+            "operator_residual"
+          ],
+          "semantic_module_ids": [
+            "layer.token_mixer.output_projection",
+            "layer.token_mixer.residual"
+          ],
+          "execution_domain": "decode",
+          "shader_path": "shaders/linear_residual_bf16_16x16.spv",
+          "local_size_x": 64,
+          "workgroup_count_x": 8,
+          "batch_mode": "weight_shared",
+          "batch_implementations": [
+            {
+              "execution_domain": "prefill",
+              "lane_tile_width": 64,
+              "independent_candidate_compatible": false,
+              "causal_sequence_compatible": true,
+              "device_requirements": {
+                "vulkan_device_extensions": [
+                  "VK_KHR_cooperative_matrix",
+                  "VK_KHR_shader_bfloat16"
+                ],
+                "vulkan_features": [
+                  "cooperative_matrix",
+                  "shader_bfloat16_cooperative_matrix",
+                  "shader_bfloat16_type",
+                  "shader_float16",
+                  "shader_int16",
+                  "vulkan_memory_model"
+                ],
+                "subgroup_operations": [
+                  "basic"
+                ],
+                "cooperative_bfloat16_shape": [
+                  16,
+                  16,
+                  16
+                ],
+                "subgroup_size": 64
+              },
+              "stages": [
+                {
+                  "shader_path": "shaders/linear_residual_batch64_cooperative_bf16_16x16.spv",
+                  "local_size_x": 256,
+                  "workgroup_count_x": 1
+                }
+              ]
+            },
+            {
+              "execution_domain": "decode_and_prefill",
+              "lane_tile_width": 2,
+              "independent_candidate_compatible": true,
+              "causal_sequence_compatible": true,
+              "device_requirements": {
+                "vulkan_device_extensions": [],
+                "vulkan_features": [],
+                "subgroup_operations": [
+                  "arithmetic",
+                  "basic"
+                ]
+              },
+              "stages": [
+                {
+                  "shader_path": "shaders/linear_residual_batch2_bf16_16x16.spv",
+                  "local_size_x": 64,
+                  "workgroup_count_x": 8
+                }
+              ]
+            },
+            {
+              "execution_domain": "decode_and_prefill",
+              "lane_tile_width": 4,
+              "independent_candidate_compatible": true,
+              "causal_sequence_compatible": true,
+              "device_requirements": {
+                "vulkan_device_extensions": [],
+                "vulkan_features": [],
+                "subgroup_operations": [
+                  "arithmetic",
+                  "basic"
+                ]
+              },
+              "stages": [
+                {
+                  "shader_path": "shaders/linear_residual_batch4_bf16_16x16.spv",
+                  "local_size_x": 64,
+                  "workgroup_count_x": 8
+                }
+              ]
+            },
+            {
+              "execution_domain": "decode_and_prefill",
+              "lane_tile_width": 8,
+              "independent_candidate_compatible": true,
+              "causal_sequence_compatible": true,
+              "device_requirements": {
+                "vulkan_device_extensions": [],
+                "vulkan_features": [],
+                "subgroup_operations": [
+                  "arithmetic",
+                  "basic"
+                ]
+              },
+              "stages": [
+                {
+                  "shader_path": "shaders/linear_residual_batch8_bf16_16x16.spv",
+                  "local_size_x": 64,
+                  "workgroup_count_x": 8
+                }
+              ]
+            },
+            {
+              "execution_domain": "decode_and_prefill",
+              "lane_tile_width": 16,
+              "independent_candidate_compatible": true,
+              "causal_sequence_compatible": true,
+              "device_requirements": {
+                "vulkan_device_extensions": [],
+                "vulkan_features": [],
+                "subgroup_operations": [
+                  "arithmetic",
+                  "basic"
+                ]
+              },
+              "stages": [
+                {
+                  "shader_path": "shaders/linear_residual_batch16_bf16_16x16.spv",
+                  "local_size_x": 64,
+                  "workgroup_count_x": 8
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "execution_index": 6,
+          "node_id": "ffn_norm",
+          "op": "rms_norm",
+          "source_node_ids": [
+            "ffn_norm"
+          ],
+          "semantic_module_ids": [
+            "layer.feature_transform.normalization"
+          ],
+          "execution_domain": "decode",
+          "shader_path": "shaders/rms_norm_bf16_h16_eps1e-05_offset0.spv",
+          "local_size_x": 64,
+          "workgroup_count_x": 1,
+          "batch_mode": "weight_shared",
+          "batch_implementations": [
+            {
+              "execution_domain": "prefill",
+              "lane_tile_width": 1,
+              "independent_candidate_compatible": true,
+              "causal_sequence_compatible": true,
+              "device_requirements": {
+                "vulkan_device_extensions": [],
+                "vulkan_features": [],
+                "subgroup_operations": [
+                  "arithmetic",
+                  "basic"
+                ],
+                "subgroup_size": 64
+              },
+              "stages": [
+                {
+                  "shader_path": "shaders/rms_norm_batch1_bf16_h16_eps1e-05_offset0.spv",
+                  "local_size_x": 64,
+                  "workgroup_count_x": 1
+                }
+              ]
+            },
+            {
+              "execution_domain": "decode_and_prefill",
+              "lane_tile_width": 2,
+              "independent_candidate_compatible": true,
+              "causal_sequence_compatible": true,
+              "device_requirements": {
+                "vulkan_device_extensions": [],
+                "vulkan_features": [],
+                "subgroup_operations": [
+                  "arithmetic",
+                  "basic"
+                ]
+              },
+              "stages": [
+                {
+                  "shader_path": "shaders/rms_norm_batch2_bf16_h16_eps1e-05_offset0.spv",
+                  "local_size_x": 64,
+                  "workgroup_count_x": 1
+                }
+              ]
+            },
+            {
+              "execution_domain": "decode_and_prefill",
+              "lane_tile_width": 4,
+              "independent_candidate_compatible": true,
+              "causal_sequence_compatible": true,
+              "device_requirements": {
+                "vulkan_device_extensions": [],
+                "vulkan_features": [],
+                "subgroup_operations": [
+                  "arithmetic",
+                  "basic"
+                ]
+              },
+              "stages": [
+                {
+                  "shader_path": "shaders/rms_norm_batch4_bf16_h16_eps1e-05_offset0.spv",
+                  "local_size_x": 64,
+                  "workgroup_count_x": 1
+                }
+              ]
+            },
+            {
+              "execution_domain": "decode_and_prefill",
+              "lane_tile_width": 8,
+              "independent_candidate_compatible": true,
+              "causal_sequence_compatible": true,
+              "device_requirements": {
+                "vulkan_device_extensions": [],
+                "vulkan_features": [],
+                "subgroup_operations": [
+                  "arithmetic",
+                  "basic"
+                ]
+              },
+              "stages": [
+                {
+                  "shader_path": "shaders/rms_norm_batch8_bf16_h16_eps1e-05_offset0.spv",
+                  "local_size_x": 64,
+                  "workgroup_count_x": 1
+                }
+              ]
+            },
+            {
+              "execution_domain": "decode_and_prefill",
+              "lane_tile_width": 16,
+              "independent_candidate_compatible": true,
+              "causal_sequence_compatible": true,
+              "device_requirements": {
+                "vulkan_device_extensions": [],
+                "vulkan_features": [],
+                "subgroup_operations": [
+                  "arithmetic",
+                  "basic"
+                ]
+              },
+              "stages": [
+                {
+                  "shader_path": "shaders/rms_norm_batch16_bf16_h16_eps1e-05_offset0.spv",
+                  "local_size_x": 64,
+                  "workgroup_count_x": 1
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "execution_index": 7,
+          "node_id": "ffn_gate_projection__ffn_up_projection__ffn_gate_activation__ffn_gate_multiply",
+          "op": "parallel_linear_silu_multiply",
+          "source_node_ids": [
+            "ffn_gate_projection",
+            "ffn_up_projection",
+            "ffn_gate_activation",
+            "ffn_gate_multiply"
+          ],
+          "semantic_module_ids": [
+            "layer.feature_transform.projections",
+            "layer.feature_transform.gate"
+          ],
+          "execution_domain": "decode",
+          "shader_path": "shaders/parallel_linear_silu_multiply_bf16_16x32.spv",
+          "local_size_x": 64,
+          "workgroup_count_x": 16,
+          "batch_mode": "weight_shared",
+          "batch_implementations": [
+            {
+              "execution_domain": "prefill",
+              "lane_tile_width": 64,
+              "independent_candidate_compatible": false,
+              "causal_sequence_compatible": true,
+              "device_requirements": {
+                "vulkan_device_extensions": [
+                  "VK_KHR_cooperative_matrix",
+                  "VK_KHR_shader_bfloat16"
+                ],
+                "vulkan_features": [
+                  "cooperative_matrix",
+                  "shader_bfloat16_cooperative_matrix",
+                  "shader_bfloat16_type",
+                  "shader_float16",
+                  "shader_int16",
+                  "storage_buffer16_bit_access",
+                  "vulkan_memory_model"
+                ],
+                "subgroup_operations": [
+                  "basic"
+                ],
+                "cooperative_bfloat16_shape": [
+                  16,
+                  16,
+                  16
+                ],
+                "subgroup_size": 64
+              },
+              "stages": [
+                {
+                  "shader_path": "shaders/parallel_linear_silu_multiply_batch64_cooperative_bf16_16x32.spv",
+                  "local_size_x": 256,
+                  "workgroup_count_x": 1
+                }
+              ]
+            },
+            {
+              "execution_domain": "decode_and_prefill",
+              "lane_tile_width": 2,
+              "independent_candidate_compatible": true,
+              "causal_sequence_compatible": true,
+              "device_requirements": {
+                "vulkan_device_extensions": [],
+                "vulkan_features": [],
+                "subgroup_operations": [
+                  "arithmetic",
+                  "basic"
+                ]
+              },
+              "stages": [
+                {
+                  "shader_path": "shaders/parallel_linear_silu_multiply_batch2_bf16_16x32.spv",
+                  "local_size_x": 64,
+                  "workgroup_count_x": 16
+                }
+              ]
+            },
+            {
+              "execution_domain": "decode_and_prefill",
+              "lane_tile_width": 4,
+              "independent_candidate_compatible": true,
+              "causal_sequence_compatible": true,
+              "device_requirements": {
+                "vulkan_device_extensions": [],
+                "vulkan_features": [],
+                "subgroup_operations": [
+                  "arithmetic",
+                  "basic"
+                ]
+              },
+              "stages": [
+                {
+                  "shader_path": "shaders/parallel_linear_silu_multiply_batch4_bf16_16x32.spv",
+                  "local_size_x": 64,
+                  "workgroup_count_x": 16
+                }
+              ]
+            },
+            {
+              "execution_domain": "decode_and_prefill",
+              "lane_tile_width": 8,
+              "independent_candidate_compatible": true,
+              "causal_sequence_compatible": true,
+              "device_requirements": {
+                "vulkan_device_extensions": [],
+                "vulkan_features": [],
+                "subgroup_operations": [
+                  "arithmetic",
+                  "basic"
+                ]
+              },
+              "stages": [
+                {
+                  "shader_path": "shaders/parallel_linear_silu_multiply_batch8_bf16_16x32.spv",
+                  "local_size_x": 64,
+                  "workgroup_count_x": 16
+                }
+              ]
+            },
+            {
+              "execution_domain": "decode_and_prefill",
+              "lane_tile_width": 16,
+              "independent_candidate_compatible": true,
+              "causal_sequence_compatible": true,
+              "device_requirements": {
+                "vulkan_device_extensions": [],
+                "vulkan_features": [],
+                "subgroup_operations": [
+                  "arithmetic",
+                  "basic"
+                ]
+              },
+              "stages": [
+                {
+                  "shader_path": "shaders/parallel_linear_silu_multiply_batch16_bf16_16x32.spv",
+                  "local_size_x": 64,
+                  "workgroup_count_x": 16
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "execution_index": 8,
+          "node_id": "ffn_down_projection__ffn_residual",
+          "op": "linear_residual",
+          "source_node_ids": [
+            "ffn_down_projection",
+            "ffn_residual"
+          ],
+          "semantic_module_ids": [
+            "layer.feature_transform.residual",
+            "layer.feature_transform.projections"
+          ],
+          "execution_domain": "decode",
+          "shader_path": "shaders/linear_residual_bf16_32x16.spv",
+          "local_size_x": 64,
+          "workgroup_count_x": 8,
+          "batch_mode": "weight_shared",
+          "batch_implementations": [
+            {
+              "execution_domain": "prefill",
+              "lane_tile_width": 64,
+              "independent_candidate_compatible": false,
+              "causal_sequence_compatible": true,
+              "device_requirements": {
+                "vulkan_device_extensions": [
+                  "VK_KHR_cooperative_matrix",
+                  "VK_KHR_shader_bfloat16"
+                ],
+                "vulkan_features": [
+                  "cooperative_matrix",
+                  "shader_bfloat16_cooperative_matrix",
+                  "shader_bfloat16_type",
+                  "shader_float16",
+                  "shader_int16",
+                  "vulkan_memory_model"
+                ],
+                "subgroup_operations": [
+                  "basic"
+                ],
+                "cooperative_bfloat16_shape": [
+                  16,
+                  16,
+                  16
+                ],
+                "subgroup_size": 64
+              },
+              "stages": [
+                {
+                  "shader_path": "shaders/linear_residual_batch64_cooperative_bf16_32x16.spv",
+                  "local_size_x": 256,
+                  "workgroup_count_x": 1
+                }
+              ]
+            },
+            {
+              "execution_domain": "decode_and_prefill",
+              "lane_tile_width": 2,
+              "independent_candidate_compatible": true,
+              "causal_sequence_compatible": true,
+              "device_requirements": {
+                "vulkan_device_extensions": [],
+                "vulkan_features": [],
+                "subgroup_operations": [
+                  "arithmetic",
+                  "basic"
+                ]
+              },
+              "stages": [
+                {
+                  "shader_path": "shaders/linear_residual_batch2_bf16_32x16.spv",
+                  "local_size_x": 64,
+                  "workgroup_count_x": 8
+                }
+              ]
+            },
+            {
+              "execution_domain": "decode_and_prefill",
+              "lane_tile_width": 4,
+              "independent_candidate_compatible": true,
+              "causal_sequence_compatible": true,
+              "device_requirements": {
+                "vulkan_device_extensions": [],
+                "vulkan_features": [],
+                "subgroup_operations": [
+                  "arithmetic",
+                  "basic"
+                ]
+              },
+              "stages": [
+                {
+                  "shader_path": "shaders/linear_residual_batch4_bf16_32x16.spv",
+                  "local_size_x": 64,
+                  "workgroup_count_x": 8
+                }
+              ]
+            },
+            {
+              "execution_domain": "decode_and_prefill",
+              "lane_tile_width": 8,
+              "independent_candidate_compatible": true,
+              "causal_sequence_compatible": true,
+              "device_requirements": {
+                "vulkan_device_extensions": [],
+                "vulkan_features": [],
+                "subgroup_operations": [
+                  "arithmetic",
+                  "basic"
+                ]
+              },
+              "stages": [
+                {
+                  "shader_path": "shaders/linear_residual_batch8_bf16_32x16.spv",
+                  "local_size_x": 64,
+                  "workgroup_count_x": 8
+                }
+              ]
+            },
+            {
+              "execution_domain": "decode_and_prefill",
+              "lane_tile_width": 16,
+              "independent_candidate_compatible": true,
+              "causal_sequence_compatible": true,
+              "device_requirements": {
+                "vulkan_device_extensions": [],
+                "vulkan_features": [],
+                "subgroup_operations": [
+                  "arithmetic",
+                  "basic"
+                ]
+              },
+              "stages": [
+                {
+                  "shader_path": "shaders/linear_residual_batch16_bf16_32x16.spv",
+                  "local_size_x": 64,
+                  "workgroup_count_x": 8
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "speculative_decoders": [],
+  "artifact_integrity": {
+    "schema": "nerve.package_artifact_integrity.v1",
+    "algorithm": "sha256",
+    "files": {
+      "behavioral_validation.json": {
+        "byte_count": 4594,
+        "sha256": "96723c949cf71070a2ab741fbfab5119868dc656249b76357b38611258a4319a"
+      },
+      "compiler_target.json": {
+        "byte_count": 519,
+        "sha256": "757ace81def7a7b5b1c47a9fc2634f0022a0d09d5e1f0efd826dd9276970960c"
+      },
+      "config.json": {
+        "byte_count": 1080,
+        "sha256": "74dce23747cf262fe673693d0d0eace143d3f917f4b8261e45565c1eaabe2896"
+      },
+      "lowered/execution_graph.circuits.json": {
+        "byte_count": 6579,
+        "sha256": "98862988b354fc0bdf10c82250511f0c0d376cec3d8b4beaf1c7e9ca690049e9"
+      },
+      "lowered/input_transducer/circuit.json": {
+        "byte_count": 1667,
+        "sha256": "1832cea821546866470d73225af13c972e58281e7a9ddc439225ef170317771b"
+      },
+      "lowered/input_transducer/params.json": {
+        "byte_count": 272,
+        "sha256": "2c2013618f274eca3c85f77c36ae4dca8d3fa4a1fdafdd99ee3474481af6da95"
+      },
+      "lowered/input_transducer/state.json": {
+        "byte_count": 106,
+        "sha256": "4d6fe7bc704b29f261f5deccc38ad53fbd44da8840ad9a241ba1389bc3043d20"
+      },
+      "lowered/layer_00/circuit.json": {
+        "byte_count": 22028,
+        "sha256": "b834570d261713d12a54aa2afb648f85427238134b3682a6fb1a29fbf2157385"
+      },
+      "lowered/layer_00/params.json": {
+        "byte_count": 1382,
+        "sha256": "5b6385cca6c883b4a2c2a3888642754da80de457c0d157bf05e6e5dd621e5077"
+      },
+      "lowered/layer_00/state.json": {
+        "byte_count": 601,
+        "sha256": "c98fbbc3759ece54da0782982d5bcb52ad0f42c24a2df32a14ff166876deb0a5"
+      },
+      "lowered/output_transducer/circuit.json": {
+        "byte_count": 2253,
+        "sha256": "a493d327ce28a8c0f15e401e54991fb8d0838e0d531015378aa2380a001a6510"
+      },
+      "lowered/output_transducer/params.json": {
+        "byte_count": 435,
+        "sha256": "3ec0c1c1d61283a7e5d0e37495ab675a9c00690e638eda109d4d72d42fde471f"
+      },
+      "lowered/output_transducer/state.json": {
+        "byte_count": 107,
+        "sha256": "d91196e93887fa57dbf56737d06063c14794ec0eb30ec5989b722fdea807c7b4"
+      },
+      "lowered/sampler/circuit.json": {
+        "byte_count": 1858,
+        "sha256": "971a321ff078c75dc869aa95c17606fd27b835b4b3283bf8288ff5f508ca1907"
+      },
+      "lowered/sampler/params.json": {
+        "byte_count": 153,
+        "sha256": "9151952af38be21907a315e2e738f9d43fb2929689427645a2f549ac661e0ad0"
+      },
+      "lowered/sampler/state.json": {
+        "byte_count": 97,
+        "sha256": "1722b53d01285e75090e6b44f3d2199d1de1294d7a6687bbf08267d20ec8b222"
+      },
+      "shaders/append_gqa_attention_bf16_q2_kv1_d8_scale0.353553391__sc7.spv": {
+        "byte_count": 19752,
+        "sha256": "4dc12295c12693fd56be4eacf4f606480f37c4c38b6e6fbfdc7f6c2718b7445b"
+      },
+      "shaders/append_gqa_attention_temporal_read_bf16_q2_kv1_d8_scale0.353553391.spv": {
+        "byte_count": 18108,
+        "sha256": "be4a05039863cd01ff3a05c8483be8aad966433dba507576b93e12fa00ffad24"
+      },
+      "shaders/append_kv_temporal_commit_bf16_kv1_d8_w0.spv": {
+        "byte_count": 3476,
+        "sha256": "e7833adf2a5b8f9d55a24c1f597a8cb21a9f2108210b5fe5f701241f021b8517"
+      },
+      "shaders/embedding_lookup_batch_bf16_32x16_scale1.spv": {
+        "byte_count": 3360,
+        "sha256": "995826dce9af705756a6a7676af233d29c8478f378d5014ab597d43838c12224"
+      },
+      "shaders/embedding_lookup_bf16_32x16_scale1.spv": {
+        "byte_count": 2936,
+        "sha256": "41c637c81384f94179388d8a7a54671768b6a2b5cc1d83d2a013d3757ce44a26"
+      },
+      "shaders/greedy_sampler_f32_32.spv": {
+        "byte_count": 7576,
+        "sha256": "2a8e823d475dc57f271bebd9731e80737327d84ae741767c40746e05d0f99354"
+      },
+      "shaders/greedy_sampler_runtime_f32_32.spv": {
+        "byte_count": 9148,
+        "sha256": "0fc44a3cde000cb62806231706fa2e0538804f7b5da6d9c1dd76607891a685dd"
+      },
+      "shaders/linear_residual_batch16_bf16_16x16.spv": {
+        "byte_count": 11708,
+        "sha256": "dd9adcf952b286e919fc3f87f5c637965e26fa7e26d1891d2078099077919f8d"
+      },
+      "shaders/linear_residual_batch16_bf16_32x16.spv": {
+        "byte_count": 11724,
+        "sha256": "877c8bb9e862d6da1b3a01e1473d20c32f990f63918d79cde58b56b16fa8e7e7"
+      },
+      "shaders/linear_residual_batch2_bf16_16x16.spv": {
+        "byte_count": 11708,
+        "sha256": "b92483c2206de39060a0bdf91f8cac7c6fbe7017a6b3691d5eb94b2f31e67a41"
+      },
+      "shaders/linear_residual_batch2_bf16_32x16.spv": {
+        "byte_count": 11724,
+        "sha256": "a563d9cabe5b0870fe29e664203d96b07fbb3067bed6fffb99762dacd6a2ca1d"
+      },
+      "shaders/linear_residual_batch4_bf16_16x16.spv": {
+        "byte_count": 11724,
+        "sha256": "34be9d3901398c3cef4e543d200ebe016361739e83be68352e2ceb62c02bf4ce"
+      },
+      "shaders/linear_residual_batch4_bf16_32x16.spv": {
+        "byte_count": 11740,
+        "sha256": "8331792c3c7f45bd59e227e6edc74f07c06a22211af7bc1fadadf736c740db52"
+      },
+      "shaders/linear_residual_batch64_cooperative_bf16_16x16.spv": {
+        "byte_count": 12616,
+        "sha256": "28648a2a428cb2ecc74a2999f867fb19c45349938bd68181ad58c9612ae1bbbb"
+      },
+      "shaders/linear_residual_batch64_cooperative_bf16_32x16.spv": {
+        "byte_count": 12632,
+        "sha256": "639e51ca9e3c274dbaa1c70a556b779194ba55106f25977120887ab97d905bf0"
+      },
+      "shaders/linear_residual_batch8_bf16_16x16.spv": {
+        "byte_count": 11708,
+        "sha256": "7c14051fbfc91e54b00c9975d1c0df6b3909cf5f188cead5998784f3a7965e50"
+      },
+      "shaders/linear_residual_batch8_bf16_32x16.spv": {
+        "byte_count": 11724,
+        "sha256": "6bb65a7825c50a4088f85cfad701580687e08631f82c07cf598683d13a0c9c75"
+      },
+      "shaders/linear_residual_bf16_16x16.spv": {
+        "byte_count": 8336,
+        "sha256": "acce0ae2c63ae45db19a89bbc4ffb42e11ce9cb4915031bac3262690167cf1c9"
+      },
+      "shaders/linear_residual_bf16_32x16.spv": {
+        "byte_count": 8352,
+        "sha256": "58867cc5a9e799ddc07f788564c821044e8f374c9ef9358c2030026deb396434"
+      },
+      "shaders/parallel_linear_3way_bf16_16x16_8_8.spv": {
+        "byte_count": 9440,
+        "sha256": "172cabeb8fede222f8e498b585241ea4e5f763470c2ec235415c2bba9446f654"
+      },
+      "shaders/parallel_linear_batch16_3way_bf16_16x16_8_8.spv": {
+        "byte_count": 13176,
+        "sha256": "860a6e57a508987554d6d442107a22cafa27c41b75f0bf82bbbd0dc4899c40d3"
+      },
+      "shaders/parallel_linear_batch2_3way_bf16_16x16_8_8.spv": {
+        "byte_count": 13176,
+        "sha256": "a45d314f4fef814398ebc7f52ccfbd6e44b463c8b56bf52eff7539e32420f033"
+      },
+      "shaders/parallel_linear_batch4_3way_bf16_16x16_8_8.spv": {
+        "byte_count": 13176,
+        "sha256": "60838bd019fda4f38533659143ac2c02fbd1b42a6bab8a102bfeebd4e7dd8664"
+      },
+      "shaders/parallel_linear_batch64_cooperative_3way_bf16_16x16_8_8.spv": {
+        "byte_count": 16656,
+        "sha256": "806cd0a72134825c9d631c78729624cdae95c4185eb17ef227e32eb6ba5cd3f0"
+      },
+      "shaders/parallel_linear_batch8_3way_bf16_16x16_8_8.spv": {
+        "byte_count": 13176,
+        "sha256": "ee2b7be01f6264c12587bb4245cdbb11ca786671db6f381f0197ae0556c65391"
+      },
+      "shaders/parallel_linear_silu_multiply_batch16_bf16_16x32.spv": {
+        "byte_count": 14672,
+        "sha256": "e85d6345ea05511511936dcbd647a68e0bdebc3d7496125298195a823476298a"
+      },
+      "shaders/parallel_linear_silu_multiply_batch2_bf16_16x32.spv": {
+        "byte_count": 14672,
+        "sha256": "d5ef0ca7d43cee03f0ff0c12684659ecfeae3e32ea246e0ab3c3ea82760668fd"
+      },
+      "shaders/parallel_linear_silu_multiply_batch4_bf16_16x32.spv": {
+        "byte_count": 14688,
+        "sha256": "80968111ddf3f1d9caae2d09a4a65876b7c0e5d763bcbe478cd4d560c38f24c8"
+      },
+      "shaders/parallel_linear_silu_multiply_batch64_cooperative_bf16_16x32.spv": {
+        "byte_count": 12944,
+        "sha256": "0b08e866a40c996e498c9bc31f9401aa3c045626cf33080af7d5090d1b5013f7"
+      },
+      "shaders/parallel_linear_silu_multiply_batch8_bf16_16x32.spv": {
+        "byte_count": 14672,
+        "sha256": "e2043fbff637452b0d47cc543508c5eb130888c9c15000a16ea40b82ed928002"
+      },
+      "shaders/parallel_linear_silu_multiply_bf16_16x32.spv": {
+        "byte_count": 10768,
+        "sha256": "9c7024c3a8831b0155518a4a68f59b6565dffad82fe67c6595deb1070636e79a"
+      },
+      "shaders/record_seen_token_32.spv": {
+        "byte_count": 1156,
+        "sha256": "bb9634df7da0bd1b72547918d7d5229f6b6a044bed7ab5a4701ad60adc173ccb"
+      },
+      "shaders/record_seen_tokens_batch64_32.spv": {
+        "byte_count": 1648,
+        "sha256": "1783ece29748987d016c10078eaa1fc4aaed9a869d19a1e3c6ca9f69b2626ca1"
+      },
+      "shaders/resident_feedback_control.spv": {
+        "byte_count": 3340,
+        "sha256": "3db06a3f4a7ee9d71090da7487c33f759fa9894cb0cd80dad0db5ab170a3c249"
+      },
+      "shaders/rms_norm_batch16_bf16_h16_eps1e-05_offset0.spv": {
+        "byte_count": 8876,
+        "sha256": "e8ef39f14667aab74c3987a74b4f430222f7f55342cd1fa89d35da55e9877672"
+      },
+      "shaders/rms_norm_batch1_bf16_h16_eps1e-05_offset0.spv": {
+        "byte_count": 8876,
+        "sha256": "4acafc8f50b149f2ad7a8b248879a8a2ffea05961220e8e19ea09c32e3e9a4a0"
+      },
+      "shaders/rms_norm_batch2_bf16_h16_eps1e-05_offset0.spv": {
+        "byte_count": 8876,
+        "sha256": "4b4396eb14761552a89ffa10c0d91295c2a789413c79dec60d9ebdb8db0e85e7"
+      },
+      "shaders/rms_norm_batch4_bf16_h16_eps1e-05_offset0.spv": {
+        "byte_count": 8892,
+        "sha256": "0fd6dc41813f10a4669d808c7b1ef43a89b4df6859b8fe10afa9738413531757"
+      },
+      "shaders/rms_norm_batch8_bf16_h16_eps1e-05_offset0.spv": {
+        "byte_count": 8876,
+        "sha256": "4670ed4df21e648d110e5f7e944a067430ebe2f5ee5a31547d0ce536394c11df"
+      },
+      "shaders/rms_norm_bf16_h16_eps1e-05_offset0.spv": {
+        "byte_count": 5960,
+        "sha256": "a4fe854f416cff773cdf5e41cd5092c047434e70ef649098a1081d051c863914"
+      },
+      "shaders/rotary_bf16_1x8_r8_theta10000_half__sc2.spv": {
+        "byte_count": 9172,
+        "sha256": "70548b1e44db8bf6100b4da93b1f1a6d3e02cf22da0937d123c6e12dbedd9421"
+      },
+      "shaders/rotary_bf16_2x8_r8_theta10000_half__sc2.spv": {
+        "byte_count": 9172,
+        "sha256": "c9d8f1249cca4e34629cea23cf06cb8d5441e0363775e4ed7c996664cd2cad55"
+      },
+      "shaders/temperature_top_k_candidates_runtime_f32_32_kc32_g128_l256.spv": {
+        "byte_count": 8480,
+        "sha256": "ffadd5395ecfb060b163206164fbe71202ebb1ca1eb36e37288ac613dca7d181"
+      },
+      "shaders/temperature_top_k_top_p_sampler_runtime_f32_kc32_g128_l256.spv": {
+        "byte_count": 14208,
+        "sha256": "ccc7e05d722646777c6b18acbe81971519a622ab81073851f819085ace375589"
+      },
+      "shaders/tied_output_projection_batch4_bf16_32x16_scale1_to_f32.spv": {
+        "byte_count": 10576,
+        "sha256": "3f43f98c40b25d9ce7cf90c3ed57fd9a7b292c86144b7349beaada75fa73973e"
+      },
+      "shaders/tied_output_projection_bf16_32x16_scale1_to_f32.spv": {
+        "byte_count": 6844,
+        "sha256": "24641bf75bb74ff97a65dc9880e0d69ff4699bd205aa8fea3b3c0f658154144a"
+      },
+      "tensors.json": {
+        "byte_count": 7272,
+        "sha256": "8d9e4c69b7ea86becd326f0a7e617247ca99d9bf102ee30cf7d2cb49e534af78"
+      },
+      "tokenizer/tokenizer.json": {
+        "byte_count": 974,
+        "sha256": "d74ee0eb4c73ae5b428793af1e2c321621f6788ccaefeb72db21760e89bfe951"
+      },
+      "tokenizer/tokenizer_config.json": {
+        "byte_count": 99,
+        "sha256": "fdd1575e8bd811652f3708f5d70495fd581ca5b59111e6edaa903e43783ce944"
+      },
+      "transpiled/layers/layer_00.json": {
+        "byte_count": 8308,
+        "sha256": "eff6079e74481f7d8b9697a70e2090d74969ecdcf90b9c284ab2d82ad32c7477"
+      },
+      "transpiled/model.json": {
+        "byte_count": 3694,
+        "sha256": "76181de06e8f2fd52f0b96760d4f7f84a76581c43c5f2eda638bf6fd3c8682de"
+      },
+      "transpiled/tensors.json": {
+        "byte_count": 7272,
+        "sha256": "8d9e4c69b7ea86becd326f0a7e617247ca99d9bf102ee30cf7d2cb49e534af78"
+      }
+    }
+  }
+}
