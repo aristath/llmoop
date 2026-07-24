@@ -275,6 +275,13 @@ impl VulkanResidentComponentBatchSliceRunner {
         let mut dispatch_spans = Vec::with_capacity(slice.mounted_bound.dispatches.len());
         for dispatch in &slice.mounted_bound.dispatches {
             let dispatch_step_start = steps.len();
+            let commits_state = dispatch.descriptors.iter().any(|descriptor| {
+                matches!(
+                    descriptor.usage,
+                    VulkanKernelDescriptorUsage::StateWrite
+                        | VulkanKernelDescriptorUsage::StateView
+                )
+            });
             if distributed_execution_plan
                 .dispatches
                 .iter()
@@ -382,6 +389,7 @@ impl VulkanResidentComponentBatchSliceRunner {
                         batch_control_byte_count,
                         push_constants: Vec::new(),
                         lane_index: None,
+                        commits_state,
                         snapshot_state_buffer_indices: BTreeSet::new(),
                     });
                 }
@@ -463,6 +471,7 @@ impl VulkanResidentComponentBatchSliceRunner {
                     batch_control_byte_count: 0,
                     push_constants: dispatch.push_constants.clone(),
                     lane_index: Some(lane_index),
+                    commits_state,
                     snapshot_state_buffer_indices: snapshot_state_buffer_indices.clone(),
                 });
             }
@@ -762,7 +771,7 @@ impl VulkanResidentComponentBatchSliceRunner {
             );
             execution_region.commits_state_after = active_steps
                 .iter()
-                .any(|step| !step.snapshot_state_buffer_indices.is_empty());
+                .any(|step| step.commits_state);
             device
                 .record_resident_kernel_sequence_with_snapshot_copies(
                     &self.sequences[segment_index],

@@ -3,6 +3,7 @@ struct VulkanComponentBatchDispatchStep {
     batch_control_byte_count: u32,
     push_constants: Vec<VulkanKernelScalarBinding>,
     lane_index: Option<usize>,
+    commits_state: bool,
     snapshot_state_buffer_indices: BTreeSet<usize>,
 }
 
