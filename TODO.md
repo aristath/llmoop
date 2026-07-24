@@ -27,26 +27,7 @@ context/output limits, or benchmark-only shortcuts.
 
 ## Remaining work, in priority order
 
-### 1. Replace fixed one-component submission quanta with calibrated work quanta
-
-The current conservative submission boundary avoids long graphics-ring jobs but
-leaves substantial scheduling and submission overhead.
-
-- Populate `RuntimeExecutionCost` from compiled component work, memory traffic,
-  dispatch count, and kernel characteristics.
-- Calibrate safe quantum limits per device and kernel family.
-- Coalesce multiple adjacent components into one submission when the calibrated
-  cost permits it.
-- Preserve explicit yield, interruption, and transient-state commit boundaries.
-- Adapt quanta without reintroducing graphics-ring timeouts.
-- Expose quantum size, estimated cost, actual duration, and forced-yield metrics
-  in normal runtime statistics.
-- Decouple interruption responsiveness from a synchronous host wait after every
-  small feedback window. The current adaptive 2-3-tick windows kept discarded
-  work near zero, but a 1,908-tick real conversation turn still incurred 1,391
-  fence waits and 1,492 queue-batch submissions.
-
-### 2. Execute scheduler batches as real multi-stream Vulkan work
+### 1. Execute scheduler batches as real multi-stream Vulkan work
 
 The scheduler can form compatible batches, but the Vulkan batch executor still
 processes their activations sequentially.
@@ -57,8 +38,13 @@ processes their activations sequentially.
 - Support continuous stream admission, prefill/decode interleaving, cancellation,
   and fairness while the model remains mounted.
 - Avoid increasing single-stream latency merely to report a wider logical batch.
+- Replace per-stream bounded completion polling with a scheduler-level wait set
+  when several device windows are pending. The asynchronous single-stream
+  warmup required 1,048 completion polls and 1,045 bounded waits (996 timeouts);
+  this preserved throughput and control responsiveness, but it is not the final
+  multi-stream completion mechanism.
 
-### 3. Finish physical block-managed transient state
+### 2. Finish physical block-managed transient state
 
 The backend-neutral allocator and logical state tables exist, but resident state
 storage is still fundamentally flat and host offsets remain in the execution
@@ -74,7 +60,7 @@ path.
   component-owned state through the same abstraction.
 - Remove flat resident buffers as the authoritative state model.
 
-### 4. Wire prefix/state reuse into normal stream admission
+### 3. Wire prefix/state reuse into normal stream admission
 
 Prefix-state primitives exist, but normal chat does not automatically use them.
 
@@ -88,7 +74,7 @@ Prefix-state primitives exist, but normal chat does not automatically use them.
 - Report hits, misses, reused tokens, saved prefill work, and eviction behavior.
 - Validate reuse with real multi-turn and branched conversations.
 
-### 5. Define canonical runtime graph identity and reusable execution templates
+### 4. Define canonical runtime graph identity and reusable execution templates
 
 Execution-class compatibility, prefix reuse, and command/template reuse need one
 precise graph identity.
@@ -105,13 +91,17 @@ precise graph identity.
   reallocating unaffected work.
 - Invalidate only templates affected by a graph edit, placement change, or shape
   transition.
+- Preserve calibrated cost knowledge across compatible shape classes without
+  applying unsafe measurements to different launch geometry. A newly encountered
+  prompt shape still falls back to 64 one-component quanta before that exact
+  shape is calibrated.
 - Eliminate per-turn recording of the unchanged 65-command resident sequence and
   replace the stream-local current-shape feedback template with a synchronized
   catalog that can safely replay every compatible shape. Timeline values must be
   rebased without giving independently recorded templates stale relative
   offsets.
 
-### 6. Make cross-device execution efficient without making it mandatory
+### 5. Make cross-device execution efficient without making it mandatory
 
 Everything may run on one device. Multi-device execution should become useful
 when requested by placement or required by model size.
@@ -138,7 +128,7 @@ when requested by placement or required by model size.
   the prior single-device run; repeat under matched context and conversation
   conditions before attributing the entire difference to transport.
 
-### 7. Complete route-native MoE execution
+### 6. Complete route-native MoE execution
 
 Sparse components and selected-route kernels exist, but routing is not yet a
 fully optimized runtime signal path.
@@ -153,7 +143,7 @@ fully optimized runtime signal path.
 - Make the 35B MoE model's performance reflect its active parameter count rather
   than its full declared size.
 
-### 8. Integrate MTP into the steady-state scheduler and device loop
+### 7. Integrate MTP into the steady-state scheduler and device loop
 
 MTP compilation and transactional verification work, but speculative execution
 is not yet part of the optimized steady-state path.
@@ -169,7 +159,7 @@ is not yet part of the optimized steady-state path.
 - Enable MTP by default only where warmed, realistic workloads show a net
   improvement.
 
-### 9. Finish long-context prefill and mixed-workload scheduling
+### 8. Finish long-context prefill and mixed-workload scheduling
 
 - Interleave prefill and decode fairly under memory pressure.
 - Derive prefill chunk size from available memory, device execution limits, and
@@ -185,7 +175,7 @@ is not yet part of the optimized steady-state path.
   limits.
 - Report prefill and decode throughput separately by default.
 
-### 10. Maintain adversarial correctness and performance gates
+### 9. Maintain adversarial correctness and performance gates
 
 Every meaningful compiler, runtime, state, graph, or kernel change must be tested
 against the supported model set rather than optimized around one model.
