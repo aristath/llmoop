@@ -187,35 +187,6 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
             .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)
     }
 
-    fn wait_resident_feedback_terminal_work(
-        &self,
-        devices: &BTreeMap<String, Rc<VulkanComputeDevice>>,
-        feedback_lane: usize,
-    ) -> Result<(), VulkanResidentInProcessPlacedRuntimeError> {
-        let device_by_id = devices
-            .iter()
-            .map(|(device_id, device)| (device_id.clone(), device.as_ref()))
-            .collect::<BTreeMap<_, _>>();
-        for slice in &self.device_slices {
-            let device = device_by_id.get(&slice.device_id).copied().ok_or_else(|| {
-                VulkanResidentInProcessPlacedRuntimeError::MissingBoundDevice {
-                    device_id: slice.device_id.clone(),
-                }
-            })?;
-            wait_for_compact_execution_plan_terminal_work(
-                &slice.device_id,
-                device,
-                &slice.resident_execution_plan,
-                VulkanResidentPlacedTokenTickTail::Sample.sequence_variant(),
-                &device_by_id,
-                &self.distributed_dispatch_runners,
-                Some(feedback_lane),
-            )
-            .map_err(VulkanResidentInProcessPlacedRuntimeError::Tick)?;
-        }
-        Ok(())
-    }
-
     fn run_resident_feedback_window<F>(
         &self,
         devices: &BTreeMap<String, Rc<VulkanComputeDevice>>,
@@ -306,7 +277,11 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
             .output_synchronization
             .wait_for_turn(output_device, terminal_output_value)
             .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
-        self.wait_resident_feedback_terminal_work(devices, tick_count - 1)?;
+        // The output timeline signal is recorded after the terminal output
+        // slice. Every upstream slice, distributed shard, and transfer is a
+        // semaphore dependency of that slice, so this one wait is the graph
+        // completion proof. Waiting every slice fence again only serialized
+        // host control on already-completed work.
         let mut completion = feedback_loop
             .control
             .completion()

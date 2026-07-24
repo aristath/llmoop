@@ -110,7 +110,7 @@ fn print_runtime_execution_counters(counters: &VulkanResidentExecutionCounters) 
     );
     println!("  resident_copy_waits={}", counters.resident_copy_waits);
     println!(
-        "  execution_quantums={}",
+        "  execution_quanta={}",
         counters.execution_quantum_count
     );
     println!(
