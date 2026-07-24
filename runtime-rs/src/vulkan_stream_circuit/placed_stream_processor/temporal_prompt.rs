@@ -168,6 +168,7 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
         let execution_graph = VulkanResidentPlacedComponentBatchRunner::new(
             devices,
             &self.device_slices,
+            &self.execution_quantum_calibrators,
             block_width,
             VulkanComponentBatchExecutionMode::CausalSequence,
             &self.model.distributed_execution_plan,

@@ -1,5 +1,6 @@
 use crate::execution_schedule::{
-    RuntimeExecutionQuantumBudget, RuntimeExecutionRegion, RuntimeExecutionSchedule,
+    RuntimeExecutionQuantum, RuntimeExecutionQuantumBudget, RuntimeExecutionQuantumCalibrator,
+    RuntimeExecutionRegion, RuntimeExecutionSchedule,
 };
 
 include!("vulkan_compute/features.rs");

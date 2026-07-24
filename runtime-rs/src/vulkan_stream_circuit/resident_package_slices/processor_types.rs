@@ -10,6 +10,8 @@ pub struct VulkanResidentInProcessPlacedStreamProcessor {
     resident_feedback_loop: Option<VulkanResidentInProcessPlacedFeedbackLoop>,
     activation_schedule: VulkanMountedPlacedResidentInProcessSchedule,
     device_slices: Vec<VulkanResidentInProcessPlacedStreamProcessorDevice>,
+    execution_quantum_calibrators:
+        BTreeMap<String, Rc<RefCell<RuntimeExecutionQuantumCalibrator>>>,
     speculative_decoders: Vec<VulkanResidentSpeculativeDecoderProcessor>,
     verification_state_transactions: RefCell<Option<Vec<VulkanResidentStateTransactionBank>>>,
     component_batch_execution: RefCell<Option<VulkanResidentPlacedComponentBatchRunner>>,

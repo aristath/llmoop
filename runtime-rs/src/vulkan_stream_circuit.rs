@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 use smallvec::SmallVec;
 
 use crate::execution_schedule::{
-    RuntimeExecutionCost, RuntimeExecutionQuantumBudget, RuntimeExecutionRegion,
+    RuntimeExecutionCost, RuntimeExecutionQuantumCalibrator, RuntimeExecutionRegion,
 };
 use crate::stream_circuit::{
     CircuitNode, CircuitParamsArtifact, CircuitRuntimeRole, CircuitStateArtifact,
@@ -50,7 +50,7 @@ use crate::vulkan_compute::{
     VulkanResidentKernelSequenceStep, VulkanResidentMappedBufferCopy,
     VulkanResidentQueueSubmissionBatch, VulkanResidentQueueSubmissionTemplate, VulkanShaderFeature,
     VulkanSubgroupOperation, VulkanTimelineSemaphore, VulkanTimelineSemaphorePoint,
-    vulkan_spirv_requirements,
+    record_vulkan_execution_quantum_measurement, vulkan_spirv_requirements,
 };
 use crate::vulkan_distributed::{
     VulkanDistributedActivationBufferPlan, VulkanDistributedActivationBuffers,

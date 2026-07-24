@@ -11,6 +11,7 @@ pub struct VulkanResidentKernelDispatch {
     base_workgroup_z: u32,
     push_constant_byte_count: u32,
     buffer_accesses: Vec<VulkanResidentKernelBufferAccessRecord>,
+    estimated_memory_bytes: u64,
     semantic_label: Option<String>,
 }
 
@@ -407,7 +408,7 @@ fn print_resident_kernel_timestamp_summary(
     }
 }
 
-fn semantic_label_field<'a>(label: &'a str, field: &str) -> Option<&'a str> {
+pub(crate) fn semantic_label_field<'a>(label: &'a str, field: &str) -> Option<&'a str> {
     let prefix = format!("{field}=");
     label
         .split_ascii_whitespace()

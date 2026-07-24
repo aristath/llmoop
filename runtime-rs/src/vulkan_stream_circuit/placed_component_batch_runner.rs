@@ -2,6 +2,10 @@ impl VulkanResidentPlacedComponentBatchRunner {
     fn new(
         devices: &BTreeMap<String, Rc<VulkanComputeDevice>>,
         placed_slices: &[VulkanResidentInProcessPlacedStreamProcessorDevice],
+        quantum_calibrators: &BTreeMap<
+            String,
+            Rc<RefCell<RuntimeExecutionQuantumCalibrator>>,
+        >,
         lane_capacity: usize,
         execution_mode: VulkanComponentBatchExecutionMode,
         distributed_execution_plan: &VulkanDistributedExecutionPlan,
@@ -15,6 +19,14 @@ impl VulkanResidentPlacedComponentBatchRunner {
                         device_id: slice.device_id.clone(),
                     }
                 })?;
+                let quantum_calibrator = quantum_calibrators
+                    .get(&slice.device_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        VulkanResidentInProcessPlacedRuntimeError::MissingBoundDevice {
+                            device_id: slice.device_id.clone(),
+                        }
+                    })?;
                 VulkanResidentComponentBatchSliceRunner::new(
                     devices,
                     device,
@@ -22,6 +34,7 @@ impl VulkanResidentPlacedComponentBatchRunner {
                     lane_capacity,
                     execution_mode,
                     distributed_execution_plan,
+                    quantum_calibrator,
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;

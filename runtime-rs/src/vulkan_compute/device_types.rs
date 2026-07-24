@@ -34,6 +34,16 @@ pub struct VulkanResidentExecutionCounters {
     pub resident_queue_batch_commands: u64,
     pub resident_copy_queue_submits: u64,
     pub resident_copy_waits: u64,
+    pub execution_quantum_count: u64,
+    pub execution_quantum_region_count: u64,
+    pub execution_quantum_forced_yield_count: u64,
+    pub execution_quantum_estimated_work_units: u64,
+    pub execution_quantum_estimated_memory_bytes: u64,
+    pub execution_quantum_dispatch_count: u64,
+    pub execution_quantum_predicted_duration_ns: u64,
+    pub execution_quantum_actual_duration_ns: u64,
+    pub execution_quantum_max_region_count: u64,
+    pub execution_quantum_max_actual_duration_ns: u64,
 }
 
 static RESIDENT_SEQUENCE_PREPARE_CALLS: AtomicU64 = AtomicU64::new(0);
@@ -45,6 +55,16 @@ static RESIDENT_QUEUE_BATCH_SUBMITS: AtomicU64 = AtomicU64::new(0);
 static RESIDENT_QUEUE_BATCH_COMMANDS: AtomicU64 = AtomicU64::new(0);
 static RESIDENT_COPY_QUEUE_SUBMITS: AtomicU64 = AtomicU64::new(0);
 static RESIDENT_COPY_WAITS: AtomicU64 = AtomicU64::new(0);
+static EXECUTION_QUANTUM_COUNT: AtomicU64 = AtomicU64::new(0);
+static EXECUTION_QUANTUM_REGION_COUNT: AtomicU64 = AtomicU64::new(0);
+static EXECUTION_QUANTUM_FORCED_YIELD_COUNT: AtomicU64 = AtomicU64::new(0);
+static EXECUTION_QUANTUM_ESTIMATED_WORK_UNITS: AtomicU64 = AtomicU64::new(0);
+static EXECUTION_QUANTUM_ESTIMATED_MEMORY_BYTES: AtomicU64 = AtomicU64::new(0);
+static EXECUTION_QUANTUM_DISPATCH_COUNT: AtomicU64 = AtomicU64::new(0);
+static EXECUTION_QUANTUM_PREDICTED_DURATION_NS: AtomicU64 = AtomicU64::new(0);
+static EXECUTION_QUANTUM_ACTUAL_DURATION_NS: AtomicU64 = AtomicU64::new(0);
+static EXECUTION_QUANTUM_MAX_REGION_COUNT: AtomicU64 = AtomicU64::new(0);
+static EXECUTION_QUANTUM_MAX_ACTUAL_DURATION_NS: AtomicU64 = AtomicU64::new(0);
 
 pub fn reset_vulkan_resident_execution_counters() {
     RESIDENT_SEQUENCE_PREPARE_CALLS.store(0, Ordering::Relaxed);
@@ -56,6 +76,16 @@ pub fn reset_vulkan_resident_execution_counters() {
     RESIDENT_QUEUE_BATCH_COMMANDS.store(0, Ordering::Relaxed);
     RESIDENT_COPY_QUEUE_SUBMITS.store(0, Ordering::Relaxed);
     RESIDENT_COPY_WAITS.store(0, Ordering::Relaxed);
+    EXECUTION_QUANTUM_COUNT.store(0, Ordering::Relaxed);
+    EXECUTION_QUANTUM_REGION_COUNT.store(0, Ordering::Relaxed);
+    EXECUTION_QUANTUM_FORCED_YIELD_COUNT.store(0, Ordering::Relaxed);
+    EXECUTION_QUANTUM_ESTIMATED_WORK_UNITS.store(0, Ordering::Relaxed);
+    EXECUTION_QUANTUM_ESTIMATED_MEMORY_BYTES.store(0, Ordering::Relaxed);
+    EXECUTION_QUANTUM_DISPATCH_COUNT.store(0, Ordering::Relaxed);
+    EXECUTION_QUANTUM_PREDICTED_DURATION_NS.store(0, Ordering::Relaxed);
+    EXECUTION_QUANTUM_ACTUAL_DURATION_NS.store(0, Ordering::Relaxed);
+    EXECUTION_QUANTUM_MAX_REGION_COUNT.store(0, Ordering::Relaxed);
+    EXECUTION_QUANTUM_MAX_ACTUAL_DURATION_NS.store(0, Ordering::Relaxed);
 }
 
 pub fn vulkan_resident_execution_counters() -> VulkanResidentExecutionCounters {
@@ -71,7 +101,56 @@ pub fn vulkan_resident_execution_counters() -> VulkanResidentExecutionCounters {
         resident_queue_batch_commands: RESIDENT_QUEUE_BATCH_COMMANDS.load(Ordering::Relaxed),
         resident_copy_queue_submits: RESIDENT_COPY_QUEUE_SUBMITS.load(Ordering::Relaxed),
         resident_copy_waits: RESIDENT_COPY_WAITS.load(Ordering::Relaxed),
+        execution_quantum_count: EXECUTION_QUANTUM_COUNT.load(Ordering::Relaxed),
+        execution_quantum_region_count: EXECUTION_QUANTUM_REGION_COUNT.load(Ordering::Relaxed),
+        execution_quantum_forced_yield_count: EXECUTION_QUANTUM_FORCED_YIELD_COUNT
+            .load(Ordering::Relaxed),
+        execution_quantum_estimated_work_units: EXECUTION_QUANTUM_ESTIMATED_WORK_UNITS
+            .load(Ordering::Relaxed),
+        execution_quantum_estimated_memory_bytes: EXECUTION_QUANTUM_ESTIMATED_MEMORY_BYTES
+            .load(Ordering::Relaxed),
+        execution_quantum_dispatch_count: EXECUTION_QUANTUM_DISPATCH_COUNT.load(Ordering::Relaxed),
+        execution_quantum_predicted_duration_ns: EXECUTION_QUANTUM_PREDICTED_DURATION_NS
+            .load(Ordering::Relaxed),
+        execution_quantum_actual_duration_ns: EXECUTION_QUANTUM_ACTUAL_DURATION_NS
+            .load(Ordering::Relaxed),
+        execution_quantum_max_region_count: EXECUTION_QUANTUM_MAX_REGION_COUNT
+            .load(Ordering::Relaxed),
+        execution_quantum_max_actual_duration_ns: EXECUTION_QUANTUM_MAX_ACTUAL_DURATION_NS
+            .load(Ordering::Relaxed),
     }
+}
+
+pub(crate) fn record_vulkan_execution_quantum_measurement(
+    measurement: &VulkanResidentExecutionQuantumMeasurement,
+) {
+    EXECUTION_QUANTUM_COUNT.fetch_add(1, Ordering::Relaxed);
+    EXECUTION_QUANTUM_REGION_COUNT.fetch_add(
+        u64::try_from(measurement.region_count).unwrap_or(u64::MAX),
+        Ordering::Relaxed,
+    );
+    EXECUTION_QUANTUM_FORCED_YIELD_COUNT.fetch_add(
+        u64::from(measurement.forced_yield_after),
+        Ordering::Relaxed,
+    );
+    EXECUTION_QUANTUM_ESTIMATED_WORK_UNITS
+        .fetch_add(measurement.cost.work_units, Ordering::Relaxed);
+    EXECUTION_QUANTUM_ESTIMATED_MEMORY_BYTES
+        .fetch_add(measurement.cost.memory_bytes, Ordering::Relaxed);
+    EXECUTION_QUANTUM_DISPATCH_COUNT
+        .fetch_add(measurement.cost.dispatches, Ordering::Relaxed);
+    EXECUTION_QUANTUM_PREDICTED_DURATION_NS.fetch_add(
+        measurement.cost.predicted_duration_ns,
+        Ordering::Relaxed,
+    );
+    EXECUTION_QUANTUM_ACTUAL_DURATION_NS
+        .fetch_add(measurement.duration_ns, Ordering::Relaxed);
+    EXECUTION_QUANTUM_MAX_REGION_COUNT.fetch_max(
+        u64::try_from(measurement.region_count).unwrap_or(u64::MAX),
+        Ordering::Relaxed,
+    );
+    EXECUTION_QUANTUM_MAX_ACTUAL_DURATION_NS
+        .fetch_max(measurement.duration_ns, Ordering::Relaxed);
 }
 
 struct VulkanInstanceContext {
@@ -210,12 +289,14 @@ struct VulkanResidentQueueSubmissionGroup<'a> {
     device: &'a VulkanComputeDevice,
     submissions: Vec<VulkanPreparedResidentQueueSubmission>,
     quantum_ranges: Vec<std::ops::Range<usize>>,
+    quanta: Vec<Option<RuntimeExecutionQuantum>>,
 }
 
 struct VulkanResidentQueueSubmissionTemplateGroup {
     submitter: VulkanResidentQueueSubmitter,
     submissions: Vec<VulkanPreparedResidentQueueSubmission>,
     quantum_ranges: Vec<std::ops::Range<usize>>,
+    quanta: Vec<Option<RuntimeExecutionQuantum>>,
 }
 
 #[derive(Clone)]
@@ -228,8 +309,19 @@ struct VulkanPreparedResidentQueueSubmission {
     command_buffer: vk::CommandBuffer,
     wait_points: Vec<(vk::Semaphore, u64)>,
     signal_points: Vec<(vk::Semaphore, u64)>,
-    completion_fence: Option<vk::Fence>,
+    completion_fence: vk::Fence,
+    signal_completion: bool,
     execution_region: Option<RuntimeExecutionRegion>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VulkanResidentExecutionQuantumMeasurement {
+    pub cost: crate::execution_schedule::RuntimeExecutionCost,
+    pub region_count: usize,
+    pub component_ids: Vec<String>,
+    pub kernel_families: Vec<String>,
+    pub duration_ns: u64,
+    pub forced_yield_after: bool,
 }
 
 impl Default for VulkanResidentQueueSubmissionBatch<'_> {
@@ -303,7 +395,8 @@ impl<'a> VulkanResidentQueueSubmissionBatch<'a> {
                 .iter()
                 .map(|point| (point.semaphore.semaphore, point.value))
                 .collect(),
-            completion_fence: signal_completion.then_some(sequence.completion_fence),
+            completion_fence: sequence.completion_fence,
+            signal_completion,
             execution_region,
         };
         let mut groups = self.groups.borrow_mut();
@@ -317,6 +410,7 @@ impl<'a> VulkanResidentQueueSubmissionBatch<'a> {
                 device,
                 submissions: vec![submission],
                 quantum_ranges: Vec::new(),
+                quanta: Vec::new(),
             });
         }
         Ok(())
@@ -331,10 +425,25 @@ impl<'a> VulkanResidentQueueSubmissionBatch<'a> {
     }
 
     pub fn mount(self) -> Result<VulkanResidentQueueSubmissionTemplate, VulkanError> {
+        self.mount_with_calibrator(None)
+    }
+
+    pub fn mount_calibrated(
+        self,
+        calibrator: &RuntimeExecutionQuantumCalibrator,
+    ) -> Result<VulkanResidentQueueSubmissionTemplate, VulkanError> {
+        self.mount_with_calibrator(Some(calibrator))
+    }
+
+    fn mount_with_calibrator(
+        self,
+        calibrator: Option<&RuntimeExecutionQuantumCalibrator>,
+    ) -> Result<VulkanResidentQueueSubmissionTemplate, VulkanError> {
+        let quantum_budget = self.quantum_budget;
         let mut groups = self.groups.into_inner();
-        if let Some(quantum_budget) = self.quantum_budget {
+        if quantum_budget.is_some() || calibrator.is_some() {
             for group in &mut groups {
-                let regions = group
+                let mut regions = group
                     .submissions
                     .iter()
                     .enumerate()
@@ -346,18 +455,26 @@ impl<'a> VulkanResidentQueueSubmissionBatch<'a> {
                         })
                     })
                     .collect::<Result<Vec<_>, _>>()?;
+                let quantum_budget = if let Some(calibrator) = calibrator {
+                    calibrator.prepare_regions(&mut regions)
+                } else {
+                    quantum_budget
+                        .expect("bounded submission has a quantum budget")
+                };
                 let schedule = RuntimeExecutionSchedule::linear(&regions, quantum_budget)
                     .map_err(|error| VulkanError(error.to_string()))?;
                 group.quantum_ranges = schedule
                     .quanta
-                    .into_iter()
-                    .map(|quantum| quantum.region_range)
+                    .iter()
+                    .map(|quantum| quantum.region_range.clone())
                     .collect();
+                group.quanta = schedule.quanta.into_iter().map(Some).collect();
             }
         } else {
             for group in &mut groups {
                 if !group.submissions.is_empty() {
                     group.quantum_ranges.push(0..group.submissions.len());
+                    group.quanta.push(None);
                 }
             }
         }
@@ -375,6 +492,7 @@ impl<'a> VulkanResidentQueueSubmissionBatch<'a> {
                 },
                 submissions: group.submissions,
                 quantum_ranges: group.quantum_ranges,
+                quanta: group.quanta,
             })
             .collect();
         Ok(VulkanResidentQueueSubmissionTemplate {
@@ -409,10 +527,78 @@ impl VulkanResidentQueueSubmissionTemplate {
                 group.submitter.submit_prepared_resident_queue_batch(
                     &group.submissions[quantum_range.clone()],
                     timeline_value_offset,
+                    None,
                 )?;
             }
         }
         Ok(self.submission_count)
+    }
+
+    pub fn submit_calibrated_quanta_and_wait(
+        &self,
+        timeline_value_offset: u64,
+    ) -> Result<Vec<VulkanResidentExecutionQuantumMeasurement>, VulkanError> {
+        if self.groups.len() != 1 {
+            return Err(VulkanError(
+                "calibrated execution quanta require one logical device per mounted template"
+                    .to_string(),
+            ));
+        }
+        for group in &self.groups {
+            for submission in &group.submissions {
+                for (_, value) in submission
+                    .wait_points
+                    .iter()
+                    .chain(&submission.signal_points)
+                {
+                    offset_timeline_value(*value, timeline_value_offset)?;
+                }
+            }
+        }
+        let total_quantum_count = self
+            .groups
+            .iter()
+            .map(|group| group.quantum_ranges.len())
+            .sum::<usize>();
+        let mut measurements = Vec::with_capacity(total_quantum_count);
+        for group in &self.groups {
+            for (quantum_index, (quantum_range, quantum)) in group
+                .quantum_ranges
+                .iter()
+                .zip(&group.quanta)
+                .enumerate()
+            {
+                let quantum = quantum.as_ref().ok_or_else(|| {
+                    VulkanError(
+                        "execution quantum measurement requires calibrated schedule metadata"
+                            .to_string(),
+                    )
+                })?;
+                let submissions = &group.submissions[quantum_range.clone()];
+                let completion_fence = submissions
+                    .last()
+                    .map(|submission| submission.completion_fence)
+                    .ok_or_else(|| {
+                        VulkanError("execution quantum contains no submissions".to_string())
+                    })?;
+                let started = Instant::now();
+                group.submitter.submit_prepared_resident_queue_batch(
+                    submissions,
+                    timeline_value_offset,
+                    Some(completion_fence),
+                )?;
+                group.submitter.wait_for_completion_fence(completion_fence)?;
+                measurements.push(VulkanResidentExecutionQuantumMeasurement {
+                    cost: quantum.cost,
+                    region_count: quantum.region_count(),
+                    component_ids: quantum.component_ids.clone(),
+                    kernel_families: quantum.kernel_families.clone(),
+                    duration_ns: u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                    forced_yield_after: quantum_index + 1 < total_quantum_count,
+                });
+            }
+        }
+        Ok(measurements)
     }
 }
 

@@ -6,6 +6,7 @@ struct VulkanResidentComponentBatchSliceRunner {
     steps: Vec<VulkanComponentBatchDispatchStep>,
     execution_units: Vec<VulkanComponentBatchExecutionUnit>,
     sequences: Vec<VulkanResidentKernelSequence>,
+    quantum_calibrator: Rc<RefCell<RuntimeExecutionQuantumCalibrator>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -139,6 +140,7 @@ impl VulkanResidentComponentBatchSliceRunner {
         lane_capacity: usize,
         execution_mode: VulkanComponentBatchExecutionMode,
         distributed_execution_plan: &VulkanDistributedExecutionPlan,
+        quantum_calibrator: Rc<RefCell<RuntimeExecutionQuantumCalibrator>>,
     ) -> Result<Self, VulkanResidentInProcessPlacedRuntimeError> {
         if lane_capacity == 0 {
             return Err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop(
@@ -512,6 +514,7 @@ impl VulkanResidentComponentBatchSliceRunner {
             steps,
             execution_units,
             sequences,
+            quantum_calibrator,
         })
     }
 
@@ -611,10 +614,7 @@ impl VulkanResidentComponentBatchSliceRunner {
             dynamic_state_capacity_activations,
         );
         let mut sequence_index = 0usize;
-        let quantum_budget = RuntimeExecutionQuantumBudget::one_region();
-        let mut local_submission_batch =
-            VulkanResidentQueueSubmissionBatch::new_bounded(quantum_budget);
-        let mut pending_completion_sequence_index = None;
+        let mut local_submission_batch = VulkanResidentQueueSubmissionBatch::new();
         for (unit_index, unit) in self.execution_units.iter().enumerate() {
             match unit {
                 VulkanComponentBatchExecutionUnit::LocalComponent {
@@ -646,17 +646,13 @@ impl VulkanResidentComponentBatchSliceRunner {
                         Some(&local_submission_batch),
                         flush_after_segment,
                     )?;
-                    pending_completion_sequence_index =
-                        flush_after_segment.then_some(sequence_index);
                     sequence_index += 1;
                     if flush_after_segment {
                         self.submit_and_wait_local_batch(
-                            device,
                             std::mem::replace(
                                 &mut local_submission_batch,
-                                VulkanResidentQueueSubmissionBatch::new_bounded(quantum_budget),
+                                VulkanResidentQueueSubmissionBatch::new(),
                             ),
-                            pending_completion_sequence_index.take(),
                         )?;
                     }
                 }
@@ -666,9 +662,7 @@ impl VulkanResidentComponentBatchSliceRunner {
             }
         }
         self.submit_and_wait_local_batch(
-            device,
             local_submission_batch,
-            pending_completion_sequence_index,
         )?;
         debug_assert_eq!(sequence_index, self.sequences.len());
         Ok(())
@@ -760,7 +754,9 @@ impl VulkanResidentComponentBatchSliceRunner {
                 active_steps.iter().fold(0u64, |total, step| {
                     total.saturating_add(step.dispatch.estimated_work_units())
                 }),
-                0,
+                active_steps.iter().fold(0u64, |total, step| {
+                    total.saturating_add(step.dispatch.estimated_memory_bytes())
+                }),
                 u64::try_from(active_steps.len()).unwrap_or(u64::MAX),
             );
             let mut execution_region = RuntimeExecutionRegion::new(
@@ -768,6 +764,12 @@ impl VulkanResidentComponentBatchSliceRunner {
                 component_id,
                 execution_cost,
             );
+            execution_region.kernel_families = active_steps
+                .iter()
+                .map(|step| step.dispatch.execution_family())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
             execution_region.commits_state_after = active_steps
                 .iter()
                 .any(|step| step.commits_state);
@@ -801,23 +803,30 @@ impl VulkanResidentComponentBatchSliceRunner {
 
     fn submit_and_wait_local_batch<'a>(
         &'a self,
-        device: &'a VulkanComputeDevice,
         submission_batch: VulkanResidentQueueSubmissionBatch<'a>,
-        completion_sequence_index: Option<usize>,
     ) -> Result<(), VulkanResidentInProcessPlacedRuntimeError> {
         if submission_batch.pending_submission_count() == 0 {
             return Ok(());
         }
-        let completion_sequence_index = completion_sequence_index.ok_or_else(|| {
-            VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(
-                "component batch local submission has no completion sequence".to_string(),
-            ))
-        })?;
-        submission_batch
-            .mount()
-            .and_then(|template| template.submit_with_timeline_value_offset(0))
-            .and_then(|_| device.wait_resident_kernel_sequence(&self.sequences[completion_sequence_index]))
-            .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)
+        let template = {
+            let calibrator = self.quantum_calibrator.borrow();
+            submission_batch
+                .mount_calibrated(&calibrator)
+                .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?
+        };
+        let measurements = template
+            .submit_calibrated_quanta_and_wait(0)
+            .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
+        let mut calibrator = self.quantum_calibrator.borrow_mut();
+        for measurement in measurements {
+            calibrator.observe_quantum(
+                measurement.cost,
+                &measurement.kernel_families,
+                measurement.duration_ns,
+            );
+            record_vulkan_execution_quantum_measurement(&measurement);
+        }
+        Ok(())
     }
 
     fn signal_buffer(

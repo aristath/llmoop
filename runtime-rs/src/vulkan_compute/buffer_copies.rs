@@ -203,6 +203,24 @@ impl VulkanResidentKernelDispatch {
             .saturating_mul(u64::from(self.pipeline_key.local_size_x))
     }
 
+    pub fn estimated_memory_bytes(&self) -> u64 {
+        self.estimated_memory_bytes
+    }
+
+    pub fn execution_family(&self) -> String {
+        let operation = self
+            .semantic_label
+            .as_deref()
+            .and_then(|label| semantic_label_field(label, "op"))
+            .unwrap_or("unlabeled");
+        format!(
+            "{operation}@{}x{}x{}",
+            self.workgroup_count_x,
+            self.workgroup_count_y,
+            self.pipeline_key.local_size_x
+        )
+    }
+
     pub fn push_constant_byte_count(&self) -> u32 {
         self.push_constant_byte_count
     }

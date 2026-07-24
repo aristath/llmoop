@@ -95,6 +95,7 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
             let runner = VulkanResidentPlacedComponentBatchRunner::new(
                 devices,
                 &self.device_slices,
+                &self.execution_quantum_calibrators,
                 transaction_width,
                 VulkanComponentBatchExecutionMode::IndependentCandidates,
                 &self.model.distributed_execution_plan,

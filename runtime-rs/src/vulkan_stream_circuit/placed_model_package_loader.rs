@@ -794,6 +794,15 @@ impl VulkanResidentInProcessPlacedModelPackage {
                 random_seed,
             )?);
         }
+        let execution_quantum_calibrators = devices
+            .iter()
+            .map(|slice| {
+                (
+                    slice.device_id.clone(),
+                    Rc::new(RefCell::new(RuntimeExecutionQuantumCalibrator::default())),
+                )
+            })
+            .collect();
         Ok(VulkanResidentInProcessPlacedStreamProcessor {
             model: self.clone(),
             distributed_dispatch_runners,
@@ -806,6 +815,7 @@ impl VulkanResidentInProcessPlacedModelPackage {
             resident_feedback_loop,
             activation_schedule,
             device_slices: devices,
+            execution_quantum_calibrators,
             speculative_decoders,
             verification_state_transactions: RefCell::new(None),
             component_batch_execution: RefCell::new(None),

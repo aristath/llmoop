@@ -116,6 +116,7 @@ impl VulkanComputeDevice {
         let mut descriptor_bindings = Vec::with_capacity(buffers.len());
         let mut buffer_accesses =
             Vec::<VulkanResidentKernelBufferAccessRecord>::with_capacity(buffers.len());
+        let mut estimated_memory_bytes = 0u64;
         for buffer in buffers {
             buffer
                 .buffer
@@ -127,6 +128,16 @@ impl VulkanComputeDevice {
                 )));
             }
             descriptor_bindings.push(buffer.binding);
+            let access_multiplier = match buffer.access {
+                VulkanResidentKernelBufferAccess::Read
+                | VulkanResidentKernelBufferAccess::Write => 1,
+                VulkanResidentKernelBufferAccess::ReadWrite => 2,
+            };
+            estimated_memory_bytes = estimated_memory_bytes.saturating_add(
+                u64::try_from(buffer.byte_len)
+                    .unwrap_or(u64::MAX)
+                    .saturating_mul(access_multiplier),
+            );
             if let Some(existing) = buffer_accesses
                 .iter_mut()
                 .find(|existing| existing.buffer == buffer.buffer.buffer)
@@ -221,6 +232,7 @@ impl VulkanComputeDevice {
                 base_workgroup_z,
                 push_constant_byte_count,
                 buffer_accesses,
+                estimated_memory_bytes,
                 semantic_label,
             })
         }

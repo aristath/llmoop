@@ -109,6 +109,46 @@ fn print_runtime_execution_counters(counters: &VulkanResidentExecutionCounters) 
         counters.resident_copy_queue_submits
     );
     println!("  resident_copy_waits={}", counters.resident_copy_waits);
+    println!(
+        "  execution_quantums={}",
+        counters.execution_quantum_count
+    );
+    println!(
+        "  execution_quantum_regions={}",
+        counters.execution_quantum_region_count
+    );
+    println!(
+        "  execution_quantum_forced_yields={}",
+        counters.execution_quantum_forced_yield_count
+    );
+    println!(
+        "  execution_quantum_estimated_work_units={}",
+        counters.execution_quantum_estimated_work_units
+    );
+    println!(
+        "  execution_quantum_estimated_memory_bytes={}",
+        counters.execution_quantum_estimated_memory_bytes
+    );
+    println!(
+        "  execution_quantum_dispatches={}",
+        counters.execution_quantum_dispatch_count
+    );
+    println!(
+        "  execution_quantum_predicted_ms={:.3}",
+        nanos_to_millis(counters.execution_quantum_predicted_duration_ns)
+    );
+    println!(
+        "  execution_quantum_actual_ms={:.3}",
+        nanos_to_millis(counters.execution_quantum_actual_duration_ns)
+    );
+    println!(
+        "  execution_quantum_max_regions={}",
+        counters.execution_quantum_max_region_count
+    );
+    println!(
+        "  execution_quantum_max_actual_ms={:.3}",
+        nanos_to_millis(counters.execution_quantum_max_actual_duration_ns)
+    );
 }
 
 fn print_runtime_feedback_stats(stats: &RuntimeFeedbackExecutionReport) {

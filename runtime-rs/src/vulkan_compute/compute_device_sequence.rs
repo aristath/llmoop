@@ -147,6 +147,7 @@ impl VulkanResidentQueueSubmitter {
         &self,
         submissions: &[VulkanPreparedResidentQueueSubmission],
         timeline_value_offset: u64,
+        completion_fence_override: Option<vk::Fence>,
     ) -> Result<(), VulkanError> {
         if submissions.is_empty() {
             return Ok(());
@@ -203,13 +204,16 @@ impl VulkanResidentQueueSubmitter {
                     .signal_semaphore_infos(&signal_infos[index])
             })
             .collect::<Vec<_>>();
-        let mut completion_fences = Vec::new();
-        for fence in submissions
-            .iter()
-            .filter_map(|submission| submission.completion_fence)
-        {
-            if !completion_fences.contains(&fence) {
-                completion_fences.push(fence);
+        let mut completion_fences = completion_fence_override.into_iter().collect::<Vec<_>>();
+        if completion_fence_override.is_none() {
+            for fence in submissions.iter().filter_map(|submission| {
+                submission
+                    .signal_completion
+                    .then_some(submission.completion_fence)
+            }) {
+                if !completion_fences.contains(&fence) {
+                    completion_fences.push(fence);
+                }
             }
         }
         unsafe {
@@ -254,6 +258,20 @@ impl VulkanResidentQueueSubmitter {
                 }
             }
         }
+        Ok(())
+    }
+
+    fn wait_for_completion_fence(&self, fence: vk::Fence) -> Result<(), VulkanError> {
+        unsafe {
+            self.device
+                .wait_for_fences(&[fence], true, u64::MAX)
+                .map_err(|error| {
+                    VulkanError(format!(
+                        "failed to wait for resident execution quantum: {error:?}"
+                    ))
+                })?;
+        }
+        RESIDENT_SEQUENCE_FENCE_WAITS.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 }
