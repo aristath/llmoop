@@ -1,6 +1,9 @@
+from copy import deepcopy
+
 from nerve.circuit_lowering_common import *
 from nerve.circuit_lowering_helpers import *
 from nerve.circuit_lowering_nodes import *
+from nerve.semantic_modules import build_layer_semantic_module_tree
 
 def build_conv_circuit(component: Json, component_path: Path) -> Json:
     hidden_size = component["ports"]["inputs"][0]["shape"][0]
@@ -129,6 +132,7 @@ def _base_circuit(
     output_port = output_ports[0]
     params = component["parameter_block"]["params"]
     operator_type = component["operator_type"]
+    semantic_module_tree = build_layer_semantic_module_tree(component, nodes)
     return {
         "schema": "nerve.stream_circuit.v1",
         "id": circuit_id,
@@ -169,6 +173,8 @@ def _base_circuit(
             "storage": component["parameter_block"]["storage"],
             "refs": {name: _param_ref(name, ref) for name, ref in params.items()},
         },
+        "semantic_module_tree": semantic_module_tree,
+        "semantic_execution_nodes": deepcopy(nodes),
         "nodes": nodes,
         "behavioral_error_contract": {
             "mode": behavioral_role,

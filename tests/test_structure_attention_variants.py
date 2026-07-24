@@ -189,6 +189,17 @@ def test_discovers_nested_hybrid_decoder_by_tensor_structure() -> None:
     gated = make_layer(structure, structure.layers[0])
     assert gated["state_ports"][0]["dtype"] == "BF16"
     assert gated["state_ports"][1]["dtype"] == "F32"
+    gated_circuit = build_component_circuit(gated, Path("layer_00.json"))
+    gated_modules = {
+        module["id"]: module
+        for module in gated_circuit["semantic_module_tree"]["modules"]
+    }
+    assert gated_modules["layer.token_mixer.convolution_state"][
+        "owned_state_port_ids"
+    ] == ["conv_state"]
+    assert gated_modules["layer.token_mixer.recurrent_state"][
+        "owned_state_port_ids"
+    ] == ["recurrent_state"]
     attention_circuit = build_component_circuit(
         make_layer(structure, structure.layers[1]), Path("layer_01.json")
     )
@@ -275,6 +286,24 @@ def test_discovers_sparse_moe_and_model_specific_numerics_by_structure(
     assert nodes["sparse_moe_down"]["params"] == ["moe_output"]
     assert nodes["moe_reduce"]["outputs"] == ["ffn_out"]
     assert nodes["moe_reduce"]["attrs"]["routed_scaling_factor"] == 2.5
+    modules = {
+        module["id"]: module for module in circuit["semantic_module_tree"]["modules"]
+    }
+    assert modules["layer.feature_transform.expert_bank"]["source_node_ids"] == [
+        "sparse_moe_gate_up",
+        "sparse_moe_down",
+    ]
+    experts = [
+        module
+        for module in circuit["semantic_module_tree"]["modules"]
+        if module["role"] == "expert"
+    ]
+    assert len(experts) == 32
+    assert experts[7]["attrs"]["parameter_slices"][0] == {
+        "parameter_ref_id": "moe_input",
+        "axis": 0,
+        "index": 7,
+    }
 
 
 def test_discovers_mixed_window_attention_sinks_and_shared_sparse_experts() -> None:

@@ -97,6 +97,18 @@ def test_discovers_recurrent_block_pattern_biases_and_numerics_by_structure() ->
     assert nodes["rg_lru_step"]["attrs"]["block_width"] == 8
     assert nodes["ffn_gate_projection"]["params"] == ["ffn_gate", "ffn_gate_bias"]
     assert nodes["ffn_gate_activation"]["op"] == "gelu_tanh"
+    modules = {
+        module["id"]: module for module in circuit["semantic_module_tree"]["modules"]
+    }
+    assert modules["layer.token_mixer.recurrent_state"]["owned_state_port_ids"] == [
+        "conv_state",
+        "recurrent_state",
+    ]
+    assert modules["layer.feature_transform.projections"]["source_node_ids"] == [
+        "ffn_gate_projection",
+        "ffn_up_projection",
+        "ffn_down_projection",
+    ]
 
     attention = build_component_circuit(
         make_layer(structure, structure.layers[2]), Path("layer_02.json")
@@ -107,3 +119,10 @@ def test_discovers_recurrent_block_pattern_biases_and_numerics_by_structure() ->
         "attention_out_projection",
         "attention_out_projection_bias",
     ]
+    attention_modules = {
+        module["id"]: module
+        for module in attention["semantic_module_tree"]["modules"]
+    }
+    assert attention_modules["layer.token_mixer.attention_state"][
+        "owned_state_port_ids"
+    ] == ["kv_memory"]

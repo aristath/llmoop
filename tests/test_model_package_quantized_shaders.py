@@ -188,6 +188,7 @@ def test_compiler_batches_internal_q8_0_dense_kernels() -> None:
         spec = component_kernel_spec(
             execution_index=0,
             node={"id": "project", "op": "linear"},
+            circuit={},
             shader_file=shader_file,
             local_size_x=64,
             workgroup_count_x=24,
@@ -476,6 +477,7 @@ def test_compiler_parallelizes_only_selected_sparse_expert_routes() -> None:
     spec = component_kernel_spec(
         execution_index=0,
         node={"id": "sparse_moe_gate_up", "op": "sparse_moe_gate_up"},
+        circuit={},
         shader_file=("sparse_moe_gate_up_fp8_e4m3_b128x128_h2048_i512_e256_k8.comp"),
         local_size_x=64,
         workgroup_count_x=128,

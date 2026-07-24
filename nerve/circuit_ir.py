@@ -197,7 +197,252 @@ def validate_circuit(circuit: Json) -> CircuitValidationReport:
         else:
             checks.append(f"boundary output {port['id']} source resolves")
 
+    _validate_semantic_module_tree(
+        circuit.get("semantic_module_tree"),
+        circuit.get("semantic_execution_nodes", nodes),
+        declared_params,
+        declared_state,
+        checks,
+        issues,
+    )
+
     return CircuitValidationReport(checks=tuple(checks), issues=tuple(issues))
+
+
+def _validate_semantic_module_tree(
+    tree: Any,
+    nodes: list[Json],
+    declared_params: set[str],
+    declared_state: set[str],
+    checks: list[str],
+    issues: list[CircuitIssue],
+) -> None:
+    if tree is None:
+        return
+    if not isinstance(tree, dict):
+        issues.append(
+            CircuitIssue("error", "semantic module tree must be an object", "semantic_module_tree")
+        )
+        return
+    if tree.get("schema") != "nerve.semantic_module_tree.v1":
+        issues.append(
+            CircuitIssue(
+                "error",
+                f"unsupported semantic module tree schema {tree.get('schema')!r}",
+                "semantic_module_tree.schema",
+            )
+        )
+    else:
+        checks.append("semantic module tree schema is supported")
+
+    modules = tree.get("modules")
+    if not isinstance(modules, list) or not modules:
+        issues.append(
+            CircuitIssue(
+                "error",
+                "semantic module tree modules must be a non-empty list",
+                "semantic_module_tree.modules",
+            )
+        )
+        return
+
+    module_by_id: dict[str, Json] = {}
+    for index, module in enumerate(modules):
+        path = f"semantic_module_tree.modules[{index}]"
+        if not isinstance(module, dict):
+            issues.append(CircuitIssue("error", "semantic module must be an object", path))
+            continue
+        module_id = module.get("id")
+        if not isinstance(module_id, str) or not module_id:
+            issues.append(
+                CircuitIssue("error", "semantic module id must be non-empty", f"{path}.id")
+            )
+            continue
+        if module_id in module_by_id:
+            issues.append(
+                CircuitIssue(
+                    "error", f"duplicate semantic module id {module_id!r}", f"{path}.id"
+                )
+            )
+            continue
+        module_by_id[module_id] = module
+        if not isinstance(module.get("role"), str) or not module["role"]:
+            issues.append(
+                CircuitIssue("error", "semantic module role must be non-empty", f"{path}.role")
+            )
+        if not isinstance(module.get("responsibility"), str) or not module["responsibility"]:
+            issues.append(
+                CircuitIssue(
+                    "error",
+                    "semantic module responsibility must be non-empty",
+                    f"{path}.responsibility",
+                )
+            )
+        for field, declared in (
+            ("parameter_ref_ids", declared_params),
+            ("owned_state_port_ids", declared_state),
+        ):
+            values = _string_list(module.get(field, []), issues, f"{path}.{field}")
+            unknown = sorted(set(values) - declared)
+            if unknown:
+                issues.append(
+                    CircuitIssue(
+                        "error",
+                        f"semantic module references unknown {field}: {unknown}",
+                        f"{path}.{field}",
+                    )
+                )
+
+    root_id = tree.get("root_module_id")
+    root = module_by_id.get(root_id) if isinstance(root_id, str) else None
+    if root is None:
+        issues.append(
+            CircuitIssue(
+                "error",
+                f"semantic module root {root_id!r} does not resolve",
+                "semantic_module_tree.root_module_id",
+            )
+        )
+        return
+    if root.get("parent_id") is not None:
+        issues.append(
+            CircuitIssue(
+                "error", "semantic module root must not have a parent", "semantic_module_tree.root_module_id"
+            )
+        )
+
+    visited: set[str] = set()
+    active: set[str] = set()
+
+    def visit(module_id: str) -> None:
+        if module_id in active:
+            issues.append(
+                CircuitIssue(
+                    "error",
+                    f"semantic module tree contains a cycle at {module_id!r}",
+                    "semantic_module_tree.modules",
+                )
+            )
+            return
+        if module_id in visited:
+            return
+        visited.add(module_id)
+        active.add(module_id)
+        module = module_by_id[module_id]
+        for child_id in _string_list(
+            module.get("child_ids", []),
+            issues,
+            f"semantic_module_tree.modules[{modules.index(module)}].child_ids",
+        ):
+            child = module_by_id.get(child_id)
+            if child is None:
+                issues.append(
+                    CircuitIssue(
+                        "error",
+                        f"semantic module child {child_id!r} does not resolve",
+                        "semantic_module_tree.modules",
+                    )
+                )
+                continue
+            if child.get("parent_id") != module_id:
+                issues.append(
+                    CircuitIssue(
+                        "error",
+                        f"semantic module child {child_id!r} does not point back to {module_id!r}",
+                        "semantic_module_tree.modules",
+                    )
+                )
+            visit(child_id)
+        active.remove(module_id)
+
+    visit(root_id)
+    if visited != set(module_by_id):
+        issues.append(
+            CircuitIssue(
+                "error",
+                f"semantic modules are unreachable from root: {sorted(set(module_by_id) - visited)}",
+                "semantic_module_tree.modules",
+            )
+        )
+
+    source_node_ids = {str(node.get("id")) for node in nodes}
+    node_owner: dict[str, str] = {}
+    state_owner: dict[str, str] = {}
+    node_by_id = {str(node.get("id")): node for node in nodes}
+    for index, module in enumerate(modules):
+        if not isinstance(module, dict) or not isinstance(module.get("id"), str):
+            continue
+        module_id = module["id"]
+        for node_id in _string_list(
+            module.get("source_node_ids", []),
+            issues,
+            f"semantic_module_tree.modules[{index}].source_node_ids",
+        ):
+            if node_id not in source_node_ids:
+                issues.append(
+                    CircuitIssue(
+                        "error",
+                        f"semantic module references unknown source node {node_id!r}",
+                        f"semantic_module_tree.modules[{index}].source_node_ids",
+                    )
+                )
+            elif node_id in node_owner:
+                issues.append(
+                    CircuitIssue(
+                        "error",
+                        f"source node {node_id!r} belongs to both {node_owner[node_id]!r} and {module_id!r}",
+                        f"semantic_module_tree.modules[{index}].source_node_ids",
+                    )
+                )
+            else:
+                node_owner[node_id] = module_id
+            if node_id in node_by_id:
+                missing_params = sorted(
+                    set(node_by_id[node_id].get("params", []))
+                    - set(module.get("parameter_ref_ids", []))
+                )
+                if missing_params:
+                    issues.append(
+                        CircuitIssue(
+                            "error",
+                            f"semantic module omits source-node parameters {missing_params}",
+                            f"semantic_module_tree.modules[{index}].parameter_ref_ids",
+                        )
+                    )
+        for state_id in _string_list(
+            module.get("owned_state_port_ids", []),
+            issues,
+            f"semantic_module_tree.modules[{index}].owned_state_port_ids",
+        ):
+            if state_id in state_owner:
+                issues.append(
+                    CircuitIssue(
+                        "error",
+                        f"state {state_id!r} is owned by both {state_owner[state_id]!r} and {module_id!r}",
+                        f"semantic_module_tree.modules[{index}].owned_state_port_ids",
+                    )
+                )
+            else:
+                state_owner[state_id] = module_id
+
+    if set(node_owner) != source_node_ids:
+        issues.append(
+            CircuitIssue(
+                "error",
+                f"semantic module source-node coverage mismatch: missing={sorted(source_node_ids - set(node_owner))}",
+                "semantic_module_tree.modules",
+            )
+        )
+    if set(state_owner) != declared_state:
+        issues.append(
+            CircuitIssue(
+                "error",
+                f"semantic module state ownership mismatch: missing={sorted(declared_state - set(state_owner))}",
+                "semantic_module_tree.modules",
+            )
+        )
+    if not any(issue.path and issue.path.startswith("semantic_module_tree") for issue in issues):
+        checks.append("semantic module tree has exact node and state ownership")
 
 
 def validate_circuit_against_component(circuit: Json, component: Json) -> CircuitValidationReport:

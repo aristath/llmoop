@@ -109,6 +109,7 @@ def test_compiler_orders_frame_parallel_before_portable_batch_implementation() -
     spec = component_kernel_spec(
         execution_index=0,
         node={"id": "norm", "op": "rms_norm"},
+        circuit={},
         shader_file="rms_norm_bf16_h4096_eps1e-06_offset1.comp",
         local_size_x=64,
         workgroup_count_x=1,
@@ -202,6 +203,7 @@ def test_compiler_selects_stateful_causal_scan_kernels() -> None:
     attention_spec = component_kernel_spec(
         execution_index=0,
         node={"id": "attention", "op": "append_scaled_dot_product_attention"},
+        circuit={},
         shader_file="append_gqa_attention_bf16_q16_kv4_d256_scale0.0625__sc7.comp",
         local_size_x=attention_local_size,
         workgroup_count_x=16,
@@ -289,6 +291,7 @@ def test_projection_component_compiles_ordered_target_native_and_scalar_implemen
     spec = component_kernel_spec(
         execution_index=0,
         node={"id": "project", "op": "linear"},
+        circuit={},
         shader_file="linear_bf16_1024x4096.comp",
         local_size_x=64,
         workgroup_count_x=2048,
@@ -486,4 +489,3 @@ def test_attention_tile_stays_within_portable_shared_memory_budget(
     assert local_size <= 1024
     assert tile_tokens > physical_tile_tokens
     assert shared_floats * 4 <= 32 * 1024
-

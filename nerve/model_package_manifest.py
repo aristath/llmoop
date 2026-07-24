@@ -1,5 +1,9 @@
 from nerve.model_package_common import *
 from nerve.model_package_assets import all_lowered_circuit_refs
+from nerve.semantic_modules import (
+    normalized_source_node_ids,
+    semantic_module_ids_for_source_nodes,
+)
 from nerve.model_package_batching import *
 from nerve.model_package_shaders import *
 from nerve.model_package_shader_compiler import (
@@ -682,6 +686,7 @@ def component_execution_specs(
                 component_kernel_spec(
                     execution_index=index,
                     node=node,
+                    circuit=circuit,
                     shader_file=shader_file,
                     local_size_x=local_size_x_for_shader_file(shader_file, node),
                     workgroup_count_x=workgroup_count_x_for_node(
@@ -854,6 +859,7 @@ def component_execution_spec(
             component_kernel_spec(
                 execution_index=index,
                 node=node,
+                circuit=circuit,
                 shader_file=shader_file,
                 local_size_x=local_size_x_for_shader_file(shader_file, node),
                 workgroup_count_x=workgroup_count_x_for_node(
@@ -873,10 +879,12 @@ def component_kernel_spec(
     *,
     execution_index: int,
     node: Json,
+    circuit: Json,
     shader_file: str,
     local_size_x: int,
     workgroup_count_x: int,
 ) -> Json:
+    source_node_ids = normalized_source_node_ids(node)
     causal_scan_stages = causal_scan_batch_stages(shader_file, local_size_x)
     direct_frame_parallel_shader_file = (
         None
@@ -903,6 +911,10 @@ def component_kernel_spec(
         "execution_index": execution_index,
         "node_id": node["id"],
         "op": node["op"],
+        "source_node_ids": source_node_ids,
+        "semantic_module_ids": semantic_module_ids_for_source_nodes(
+            circuit, source_node_ids
+        ),
         "execution_domain": "decode",
         "shader_path": f"shaders/{shader_file}",
         "local_size_x": local_size_x,
