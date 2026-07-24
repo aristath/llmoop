@@ -715,7 +715,7 @@ fn tiny_fixture_model_package_manifest_path() -> PathBuf {
         .join("vulkan_resident_package.json")
 }
 
-fn tiny_fixture_model_runtime_model_with_placement(
+pub(super) fn tiny_fixture_model_runtime_model_with_placement(
     placement: StreamCircuitPlacementSpec,
 ) -> VulkanResidentRuntimeModel {
     let manifest = VulkanResidentModelPackageManifest::from_json_file(

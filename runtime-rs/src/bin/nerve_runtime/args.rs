@@ -25,6 +25,7 @@ use nerve_runtime::{
     VulkanResidentHfTokenizerTextCodec, VulkanResidentInProcessPlacedPromptEngine,
     VulkanResidentInProcessPlacedPromptStream, VulkanResidentModelPackageDeviceSlice,
     VulkanResidentModelPackageManifest, VulkanResidentRuntimeModel,
+    VulkanResidentPlacedPrefixStateCacheStats,
     VulkanResidentSamplerRuntimeConfig, VulkanResidentTokenInputEvent,
     VulkanResidentTokenTextCodec, VulkanReusableKernelArtifactManifest, discover_runtime_devices,
     reset_vulkan_resident_execution_counters, vulkan_resident_execution_counters,

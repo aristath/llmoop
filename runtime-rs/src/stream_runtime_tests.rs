@@ -49,6 +49,7 @@ fn scheduler_chunks_prefill_before_decode_feedback() {
         RuntimeStreamActivationKind::PrefillChunk {
             token_offset: 0,
             token_ids: vec![1, 2],
+            remaining_prompt_token_count: 1,
         }
     );
     scheduler
@@ -64,6 +65,7 @@ fn scheduler_chunks_prefill_before_decode_feedback() {
         RuntimeStreamActivationKind::PrefillChunk {
             token_offset: 2,
             token_ids: vec![3],
+            remaining_prompt_token_count: 0,
         }
     );
     scheduler
@@ -108,6 +110,57 @@ fn scheduler_prioritizes_running_streams_before_new_waiting_events() {
         next.activations[0].kind,
         RuntimeStreamActivationKind::DecodeFeedback { .. }
     ));
+}
+
+#[test]
+fn scheduler_prefill_chunk_lands_on_the_next_state_page_boundary() {
+    let mut scheduler = RuntimeStreamScheduler::new();
+    scheduler
+        .add_stream_with_state_declarations(
+            "stream_a",
+            [(state_key(), TransientStateBlockShape::new(16, 4).unwrap())],
+        )
+        .unwrap();
+    scheduler
+        .enqueue_input_event(
+            "stream_a",
+            RuntimeStreamInputEvent::new("first", [1, 2, 3], 0),
+        )
+        .unwrap();
+    let first = scheduler
+        .schedule_step(RuntimeStreamSchedulerBudget::new(1, 64, 64))
+        .unwrap()
+        .activations[0]
+        .clone();
+    scheduler
+        .complete_activation(first.id, RuntimeStreamActivationOutcome::prefill_complete())
+        .unwrap();
+    scheduler
+        .enqueue_input_event(
+            "stream_a",
+            RuntimeStreamInputEvent::new("second", [4, 5], 0),
+        )
+        .unwrap();
+
+    let boundary = scheduler
+        .schedule_step(RuntimeStreamSchedulerBudget::new(1, 64, 64))
+        .unwrap()
+        .activations[0]
+        .clone();
+
+    assert_eq!(
+        boundary.kind,
+        RuntimeStreamActivationKind::PrefillChunk {
+            token_offset: 0,
+            token_ids: vec![4],
+            remaining_prompt_token_count: 1,
+        }
+    );
+    assert_eq!(boundary.state_reservations[0].slots.len(), 1);
+    assert_eq!(
+        boundary.state_reservations[0].slots[0].block_activation_offset,
+        3
+    );
 }
 
 #[test]
@@ -196,7 +249,7 @@ fn scheduler_reserves_transient_state_slots_for_prefill_and_decode() {
 
     let second = scheduler.schedule_step(budget(1)).unwrap().activations[0].clone();
     assert_eq!(second.kind.work_units(), 1);
-    assert_eq!(second.state_reservations[0].slots.len(), 1);
+    assert_eq!(second.state_reservations[0].slots.len(), 2);
     assert_eq!(
         second.state_reservations[0].slots[0].block_activation_offset,
         0
@@ -217,7 +270,7 @@ fn scheduler_reserves_transient_state_slots_for_prefill_and_decode() {
         decode.kind,
         RuntimeStreamActivationKind::DecodeFeedback { .. }
     ));
-    assert_eq!(decode.state_reservations[0].slots.len(), 1);
+    assert_eq!(decode.state_reservations[0].slots.len(), 2);
     assert_eq!(
         decode.state_reservations[0].slots[0].block_activation_offset,
         1
@@ -251,11 +304,11 @@ fn scheduler_interrupt_rolls_back_unexecuted_reservations_and_preserves_committe
         .unwrap();
     assert_eq!(
         scheduled.activations[0].state_reservations[0].slots.len(),
-        4
+        5
     );
     assert_eq!(
         scheduler.snapshot().transient_state_arena.live_block_count,
-        3
+        4
     );
 
     let interrupted = scheduler.interrupt_stream("stream_a", "cancel").unwrap();
@@ -273,7 +326,7 @@ fn scheduler_interrupt_rolls_back_unexecuted_reservations_and_preserves_committe
     );
     assert_eq!(
         scheduler.snapshot().transient_state_arena.free_block_count,
-        3
+        4
     );
 }
 
@@ -353,7 +406,7 @@ fn scheduler_forks_stream_transient_state_without_copying_blocks() {
     assert_eq!(child_state.logical_activation_count, 2);
     let arena_after_source_interrupt = scheduler.transient_state_arena_snapshot().unwrap();
     assert_eq!(arena_after_source_interrupt.live_block_count, 1);
-    assert_eq!(arena_after_source_interrupt.free_block_count, 0);
+    assert_eq!(arena_after_source_interrupt.free_block_count, 1);
     assert_eq!(arena_after_source_interrupt.blocks[0].ref_count, 2);
 }
 
@@ -907,6 +960,7 @@ fn scheduler_batch_step_admits_waiting_prefill_alongside_running_prefill_when_ca
         RuntimeStreamActivationKind::PrefillChunk {
             token_offset: 0,
             token_ids: vec![1, 2],
+            remaining_prompt_token_count: 3,
         }
     );
     scheduler
@@ -952,6 +1006,7 @@ fn scheduler_batch_step_admits_waiting_prefill_alongside_running_prefill_when_ca
                 RuntimeStreamActivationKind::PrefillChunk {
                     token_offset: 2,
                     token_ids: vec![3, 4],
+                    remaining_prompt_token_count: 1,
                 },
                 0,
             ),
@@ -960,6 +1015,7 @@ fn scheduler_batch_step_admits_waiting_prefill_alongside_running_prefill_when_ca
                 RuntimeStreamActivationKind::PrefillChunk {
                     token_offset: 0,
                     token_ids: vec![9, 10],
+                    remaining_prompt_token_count: 0,
                 },
                 0,
             ),
@@ -1152,7 +1208,7 @@ fn scheduler_commits_only_the_feedback_ticks_that_actually_executed() {
             .stream_transient_state_snapshot("stream_a")
             .unwrap()
             .logical_activation_count,
-        5
+        6
     );
 
     scheduler
@@ -1190,7 +1246,7 @@ fn scheduler_rejects_a_processed_tick_count_larger_than_the_reservation() {
     let error = scheduler
         .complete_activation(
             prefill.id,
-            RuntimeStreamActivationOutcome::prefill_complete().with_processed_state_activations(2),
+            RuntimeStreamActivationOutcome::prefill_complete().with_processed_state_activations(3),
         )
         .unwrap_err();
 
@@ -1225,6 +1281,7 @@ fn scheduler_prefill_completion_can_emit_initial_feedback_token() {
         RuntimeStreamActivationKind::PrefillChunk {
             token_offset: 0,
             token_ids: vec![1, 2],
+            remaining_prompt_token_count: 0,
         }
     );
     let active = scheduler

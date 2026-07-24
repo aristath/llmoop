@@ -575,6 +575,41 @@ impl TransientStateTable {
         self.entries.keys().cloned().collect()
     }
 
+    pub fn next_append_block_boundary_distance(
+        &self,
+        maximum_distance: usize,
+    ) -> Result<Option<usize>, TransientStateError> {
+        if maximum_distance == 0 {
+            return Ok(None);
+        }
+        let append_entries = self
+            .entries
+            .values()
+            .filter(|entry| entry.shape.retention == TransientStateRetention::Append)
+            .collect::<Vec<_>>();
+        let Some(first) = append_entries.first() else {
+            return Ok(None);
+        };
+        if append_entries
+            .iter()
+            .any(|entry| entry.logical_activation_count != first.logical_activation_count)
+        {
+            return Err(TransientStateError(
+                "append-state activation depths diverged within one stream".to_string(),
+            ));
+        }
+        let alignment = append_entries.iter().try_fold(1usize, |alignment, entry| {
+            checked_least_common_multiple(alignment, entry.shape.activation_capacity)
+        })?;
+        let remainder = first.logical_activation_count % alignment;
+        let distance = if remainder == 0 {
+            alignment
+        } else {
+            alignment - remainder
+        };
+        Ok((distance <= maximum_distance).then_some(distance))
+    }
+
     fn entry(&self, key: &TransientStateKey) -> Result<&TransientStateEntry, TransientStateError> {
         self.entries.get(key).ok_or_else(|| {
             TransientStateError(format!(
@@ -693,6 +728,22 @@ fn unique_block_ids(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect()
+}
+
+fn checked_least_common_multiple(left: usize, right: usize) -> Result<usize, TransientStateError> {
+    let divisor = greatest_common_divisor(left, right);
+    left.checked_div(divisor)
+        .and_then(|value| value.checked_mul(right))
+        .ok_or_else(|| TransientStateError("transient state block alignment overflow".to_string()))
+}
+
+fn greatest_common_divisor(mut left: usize, mut right: usize) -> usize {
+    while right != 0 {
+        let remainder = left % right;
+        left = right;
+        right = remainder;
+    }
+    left
 }
 
 #[cfg(test)]

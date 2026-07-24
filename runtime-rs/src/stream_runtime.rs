@@ -3,8 +3,8 @@ use std::error::Error;
 use std::fmt::{Display, Formatter};
 
 use crate::stream_prefix_cache::{
-    RuntimePrefixStateCache, RuntimePrefixStateCacheError, RuntimePrefixStateCacheKey,
-    RuntimePrefixStateCacheSnapshot,
+    RuntimePrefixStateCache, RuntimePrefixStateCacheError, RuntimePrefixStateCacheInsert,
+    RuntimePrefixStateCacheKey, RuntimePrefixStateCacheSnapshot,
 };
 use crate::stream_state::{
     TransientStateArena, TransientStateArenaSnapshot, TransientStateBlockShape,
@@ -46,6 +46,7 @@ pub enum RuntimeStreamActivationKind {
     PrefillChunk {
         token_offset: usize,
         token_ids: Vec<u32>,
+        remaining_prompt_token_count: usize,
     },
     DecodeFeedback {
         feedback_depth: usize,
@@ -75,6 +76,7 @@ pub struct RuntimeStreamActivation {
     pub execution_class_id: String,
     pub input_event_id: String,
     pub kind: RuntimeStreamActivationKind,
+    pub max_state_activation_count: usize,
     pub state_reservations: Vec<RuntimeStreamStateReservation>,
 }
 
@@ -540,6 +542,24 @@ impl RuntimeStreamScheduler {
         self.prefix_state_cache.snapshot()
     }
 
+    pub fn set_prefix_state_cache_capacity(
+        &mut self,
+        capacity_entries: usize,
+    ) -> Result<Vec<RuntimePrefixStateCacheKey>, RuntimeStreamSchedulerError> {
+        Ok(self
+            .prefix_state_cache
+            .set_capacity(&mut self.transient_state_arena, capacity_entries)?)
+    }
+
+    pub fn evict_prefix_state(
+        &mut self,
+        key: &RuntimePrefixStateCacheKey,
+    ) -> Result<bool, RuntimeStreamSchedulerError> {
+        Ok(self
+            .prefix_state_cache
+            .evict(&mut self.transient_state_arena, key)?)
+    }
+
     pub fn fork_stream_transient_state(
         &mut self,
         source_stream_id: &str,
@@ -597,7 +617,7 @@ impl RuntimeStreamScheduler {
         &mut self,
         stream_id: &str,
         key: RuntimePrefixStateCacheKey,
-    ) -> Result<(), RuntimeStreamSchedulerError> {
+    ) -> Result<RuntimePrefixStateCacheInsert, RuntimeStreamSchedulerError> {
         let source = self.stream(stream_id)?;
         if source.execution_class_id != key.execution_class_id {
             return Err(RuntimeStreamSchedulerError(format!(
@@ -606,9 +626,9 @@ impl RuntimeStreamScheduler {
             )));
         }
         let source_table = source.transient_state_table.clone();
-        self.prefix_state_cache
-            .insert(&mut self.transient_state_arena, key, &source_table)?;
-        Ok(())
+        Ok(self
+            .prefix_state_cache
+            .insert(&mut self.transient_state_arena, key, &source_table)?)
     }
 
     pub fn cache_stream_prefix_state_for_tokens<I>(
@@ -1017,10 +1037,10 @@ impl RuntimeStreamScheduler {
         let activation = self.in_flight.get(&activation_id).cloned().ok_or_else(|| {
             RuntimeStreamSchedulerError(format!("unknown in-flight activation {activation_id}"))
         })?;
-        let reserved_state_activation_count = activation.kind.work_units();
+        let reserved_state_activation_count = activation.max_state_activation_count;
         let processed_state_activation_count = outcome
             .processed_state_activation_count
-            .unwrap_or(reserved_state_activation_count);
+            .unwrap_or_else(|| activation.kind.work_units());
         if processed_state_activation_count > reserved_state_activation_count {
             return Err(RuntimeStreamSchedulerError(format!(
                 "activation {activation_id} processed {processed_state_activation_count} state activations, exceeding its reservation of {reserved_state_activation_count}"
@@ -1204,7 +1224,7 @@ impl RuntimeStreamScheduler {
             .checked_add(1)
             .ok_or_else(|| RuntimeStreamSchedulerError("activation id overflow".to_string()))?;
 
-        let (execution_class_id, input_event_id, kind, state_keys) = {
+        let (execution_class_id, input_event_id, kind, state_keys, can_close_feedback_loop) = {
             let stream = self.stream_mut(stream_id)?;
             if stream.has_in_flight_work() {
                 return Ok(None);
@@ -1223,11 +1243,22 @@ impl RuntimeStreamScheduler {
             let input_event_id = current.event.id.clone();
             let kind = if !current.prompt_done() {
                 let token_offset = current.next_prompt_token_index;
-                let token_limit =
-                    (token_offset + max_prefill_tokens).min(current.event.token_ids.len());
+                let remaining_prompt_tokens =
+                    current.event.token_ids.len().saturating_sub(token_offset);
+                let maximum_chunk = max_prefill_tokens.min(remaining_prompt_tokens);
+                let chunk_token_count = stream
+                    .transient_state_table
+                    .next_append_block_boundary_distance(maximum_chunk)?
+                    .unwrap_or(maximum_chunk);
+                let token_limit = token_offset + chunk_token_count;
                 RuntimeStreamActivationKind::PrefillChunk {
                     token_offset,
                     token_ids: current.event.token_ids[token_offset..token_limit].to_vec(),
+                    remaining_prompt_token_count: current
+                        .event
+                        .token_ids
+                        .len()
+                        .saturating_sub(token_limit),
                 }
             } else if !current.generation_done() {
                 let max_tokens = max_decode_tokens.min(
@@ -1243,21 +1274,41 @@ impl RuntimeStreamScheduler {
             } else {
                 return Ok(None);
             };
+            let can_close_feedback_loop = match &kind {
+                RuntimeStreamActivationKind::PrefillChunk { token_ids, .. } => {
+                    current
+                        .next_prompt_token_index
+                        .saturating_add(token_ids.len())
+                        == current.event.token_ids.len()
+                        && current.generated_token_count < current.event.max_public_tokens
+                }
+                RuntimeStreamActivationKind::DecodeFeedback { .. } => true,
+            };
             (
                 stream.execution_class_id.clone(),
                 input_event_id,
                 kind,
                 stream.transient_state_table.state_keys(),
+                can_close_feedback_loop,
             )
         };
+        let max_state_activation_count = kind
+            .work_units()
+            .checked_add(usize::from(can_close_feedback_loop))
+            .ok_or_else(|| {
+                RuntimeStreamSchedulerError(
+                    "activation state reservation width overflowed".to_string(),
+                )
+            })?;
         let state_reservations =
-            self.reserve_activation_state(stream_id, &state_keys, kind.work_units())?;
+            self.reserve_activation_state(stream_id, &state_keys, max_state_activation_count)?;
         let activation = RuntimeStreamActivation {
             id: activation_id,
             stream_id: stream_id.to_string(),
             execution_class_id,
             input_event_id,
             kind,
+            max_state_activation_count,
             state_reservations,
         };
         let stream = self.stream_mut(stream_id)?;

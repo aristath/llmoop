@@ -205,6 +205,16 @@ impl VulkanResidentTransientStatePageTable {
             bytes_per_activation,
         })
     }
+
+    fn resident_page_for_block(
+        &self,
+        key: &TransientStateKey,
+        block_id: TransientStateBlockId,
+    ) -> Option<usize> {
+        self.states
+            .get(key)
+            .and_then(|pages| pages.block_to_physical.get(&block_id).copied())
+    }
 }
 
 #[cfg(test)]

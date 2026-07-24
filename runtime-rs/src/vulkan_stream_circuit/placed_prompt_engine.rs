@@ -1,12 +1,27 @@
 const VULKAN_PENDING_ACTIVATION_CONTROL_WAIT_NS: u64 = 10_000_000;
 
-#[derive(Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct VulkanResidentInProcessPlacedPromptEngineStreamHistory {
+    committed_state_token_ids: Vec<u32>,
+    pending_feedback_token_ids: VecDeque<u32>,
+}
+
 pub struct VulkanResidentInProcessPlacedPromptEngine {
     streams: BTreeMap<String, VulkanResidentInProcessPlacedPromptStream>,
     runtime_scheduler: RuntimeStreamScheduler,
+    stream_histories:
+        BTreeMap<String, VulkanResidentInProcessPlacedPromptEngineStreamHistory>,
+    resident_prefix_state_cache: VulkanResidentPlacedPrefixStateCache,
+    latest_prefix_checkpoint_by_stream: BTreeMap<String, RuntimePrefixStateCacheKey>,
     multi_stream_batch_runners:
         BTreeMap<VulkanResidentInProcessPlacedPromptEngineBatchKey, VulkanResidentPlacedMultiStreamBatchRunner>,
     pending_wait_group_cursor: usize,
+}
+
+impl Default for VulkanResidentInProcessPlacedPromptEngine {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Drop for VulkanResidentInProcessPlacedPromptEngine {
@@ -21,7 +36,10 @@ impl VulkanResidentInProcessPlacedPromptEngine {
     pub fn new() -> Self {
         Self {
             streams: BTreeMap::new(),
-            runtime_scheduler: RuntimeStreamScheduler::new(),
+            runtime_scheduler: RuntimeStreamScheduler::with_prefix_state_cache_capacity(1),
+            stream_histories: BTreeMap::new(),
+            resident_prefix_state_cache: VulkanResidentPlacedPrefixStateCache::default(),
+            latest_prefix_checkpoint_by_stream: BTreeMap::new(),
             multi_stream_batch_runners: BTreeMap::new(),
             pending_wait_group_cursor: 0,
         }
@@ -39,6 +57,12 @@ impl VulkanResidentInProcessPlacedPromptEngine {
         if self.streams.contains_key(&stream_id) {
             return Err(VulkanResidentInProcessPlacedPromptEngineError::DuplicateStream(stream_id));
         }
+        let evicted = self
+            .runtime_scheduler
+            .set_prefix_state_cache_capacity(self.streams.len().saturating_add(1))?;
+        self.resident_prefix_state_cache.evict_keys(&evicted);
+        self.latest_prefix_checkpoint_by_stream
+            .retain(|_, key| !evicted.contains(key));
         let state_declarations = stream
             .package()
             .transient_state_declarations()
@@ -53,6 +77,7 @@ impl VulkanResidentInProcessPlacedPromptEngine {
                 state_declarations,
             )?;
         let snapshot = placed_prompt_engine_stream_snapshot(&stream_id, &stream);
+        self.stream_histories.insert(stream_id.clone(), Default::default());
         self.streams.insert(stream_id, stream);
         Ok(snapshot)
     }
@@ -82,6 +107,19 @@ impl VulkanResidentInProcessPlacedPromptEngine {
             }
         })?;
         let forked = source.fork_preserving_state(random_seed)?;
+        let source_history = self
+            .stream_histories
+            .get(source_stream_id)
+            .cloned()
+            .ok_or_else(|| VulkanResidentInProcessPlacedPromptEngineError::UnknownStream {
+                stream_id: source_stream_id.to_string(),
+            })?;
+        let evicted = self
+            .runtime_scheduler
+            .set_prefix_state_cache_capacity(self.streams.len().saturating_add(1))?;
+        self.resident_prefix_state_cache.evict_keys(&evicted);
+        self.latest_prefix_checkpoint_by_stream
+            .retain(|_, key| !evicted.contains(key));
         let execution_class_id = forked.package().stream_execution_class_id();
         self.runtime_scheduler.fork_stream_transient_state(
             source_stream_id,
@@ -89,6 +127,8 @@ impl VulkanResidentInProcessPlacedPromptEngine {
             execution_class_id,
         )?;
         let snapshot = placed_prompt_engine_stream_snapshot(&target_stream_id, &forked);
+        self.stream_histories
+            .insert(target_stream_id.clone(), source_history);
         self.streams.insert(target_stream_id, forked);
         Ok(snapshot)
     }
@@ -105,6 +145,7 @@ impl VulkanResidentInProcessPlacedPromptEngine {
         let zeroed = stream.reset_transient_state()?;
         self.runtime_scheduler
             .reset_stream_transient_state(stream_id)?;
+        self.stream_histories.insert(stream_id.to_string(), Default::default());
         Ok(zeroed)
     }
 
@@ -134,17 +175,84 @@ impl VulkanResidentInProcessPlacedPromptEngine {
             .streams
             .remove(stream_id)
             .expect("validated placed prompt stream exists");
+        self.stream_histories.remove(stream_id);
+        self.latest_prefix_checkpoint_by_stream.remove(stream_id);
+        let evicted = self
+            .runtime_scheduler
+            .set_prefix_state_cache_capacity(self.streams.len())?;
+        self.resident_prefix_state_cache.evict_keys(&evicted);
+        self.latest_prefix_checkpoint_by_stream
+            .retain(|_, key| !evicted.contains(key));
         Ok(placed_prompt_engine_stream_snapshot(stream_id, &stream))
     }
 
     pub fn enqueue_input_event(
         &mut self,
         stream_id: &str,
-        event: VulkanResidentTokenInputEvent,
+        mut event: VulkanResidentTokenInputEvent,
     ) -> Result<
         VulkanResidentInProcessPlacedPromptEngineQueuedInputEvent,
         VulkanResidentInProcessPlacedPromptEngineError,
     > {
+        let original_token_count = event.token_ids.len();
+        let mut reused_prefix_token_count = 0usize;
+        let can_restore_prefix = self
+            .streams
+            .get(stream_id)
+            .is_some_and(|stream| stream.is_idle() && stream.next_stream_tick() == 0)
+            && self
+                .stream_histories
+                .get(stream_id)
+                .is_some_and(|history| history.committed_state_token_ids.is_empty())
+            && event.token_ids.len() > 1;
+        if can_restore_prefix {
+            let stream = self.streams.get(stream_id).ok_or_else(|| {
+                VulkanResidentInProcessPlacedPromptEngineError::UnknownStream {
+                    stream_id: stream_id.to_string(),
+                }
+            })?;
+            let state_keys = stream
+                .package()
+                .transient_state_declarations()
+                .map_err(VulkanResidentInProcessPlacedRuntimeError::Package)?
+                .into_iter()
+                .map(|declaration| declaration.key)
+                .collect::<Vec<_>>();
+            let runtime_graph_id = stream.package().runtime_execution_identity.clone();
+            let runtime_modifier_bytes = prefix_cache_runtime_modifier_bytes(stream)?;
+            let restorable_token_ids = &event.token_ids[..event.token_ids.len() - 1];
+            let restored_key = self.runtime_scheduler.restore_longest_stream_prefix_state(
+                stream_id,
+                runtime_graph_id,
+                restorable_token_ids,
+                &runtime_modifier_bytes,
+                state_keys,
+            )?;
+            if let Some(key) = restored_key {
+                let restore_result = self.resident_prefix_state_cache.restore(
+                    &key,
+                    self.streams.get_mut(stream_id).expect("stream was validated"),
+                );
+                if let Err(error) = restore_result {
+                    self.runtime_scheduler
+                        .reset_stream_transient_state(stream_id)?;
+                    self.streams
+                        .get_mut(stream_id)
+                        .expect("stream was validated")
+                        .reset_transient_state()?;
+                    return Err(error.into());
+                }
+                reused_prefix_token_count = key.token_count;
+                self.stream_histories
+                    .get_mut(stream_id)
+                    .expect("stream history was registered")
+                    .committed_state_token_ids = key.token_ids;
+                event.token_ids.drain(..reused_prefix_token_count);
+            } else {
+                self.resident_prefix_state_cache.record_miss();
+            }
+        }
+
         let queued_input_event = {
             let stream = self.streams.get_mut(stream_id).ok_or_else(|| {
                 VulkanResidentInProcessPlacedPromptEngineError::UnknownStream {
@@ -164,6 +272,8 @@ impl VulkanResidentInProcessPlacedPromptEngine {
         Ok(VulkanResidentInProcessPlacedPromptEngineQueuedInputEvent {
             stream_id: stream_id.to_string(),
             queued_input_event,
+            original_token_count,
+            reused_prefix_token_count,
         })
     }
 
@@ -472,6 +582,7 @@ impl VulkanResidentInProcessPlacedPromptEngine {
             decode_activation_count,
             prefill_time_ns,
             decode_time_ns,
+            prefix_state_cache: self.resident_prefix_state_cache.stats(),
             start_snapshot,
             end_snapshot,
         })
@@ -532,6 +643,7 @@ impl VulkanResidentInProcessPlacedPromptEngine {
                         VulkanResidentInProcessPlacedPromptEnginePendingActivation {
                             stream_id,
                             activation_started: activation_start,
+                            activation: activation.clone(),
                         },
                     )
                     .is_some()
@@ -556,6 +668,7 @@ impl VulkanResidentInProcessPlacedPromptEngine {
             }
             self.runtime_scheduler
                 .complete_activation(activation.id, scheduled_run.outcome.clone())?;
+            self.record_completed_activation_state(&activation, &scheduled_run)?;
 
             let stream_output_events =
                 placed_prompt_engine_output_events_for(&stream_id, &scheduled_run.output_events);
@@ -723,6 +836,7 @@ impl VulkanResidentInProcessPlacedPromptEngine {
                 )?;
             self.runtime_scheduler
                 .complete_activation(activation.id, scheduled_run.outcome.clone())?;
+            self.record_completed_activation_state(activation, &scheduled_run)?;
             let stream_output_events =
                 placed_prompt_engine_output_events_for(&stream_id, &scheduled_run.output_events);
             output_events.extend(stream_output_events.iter().cloned());
@@ -777,6 +891,171 @@ impl VulkanResidentInProcessPlacedPromptEngine {
                 placed_prompt_streams_share_physical_batch_contract(stream, candidate)
             })
         })
+    }
+
+    fn record_completed_activation_state(
+        &mut self,
+        activation: &RuntimeStreamActivation,
+        scheduled_run: &VulkanResidentInProcessPlacedPromptStreamScheduledActivationRun,
+    ) -> Result<(), VulkanResidentInProcessPlacedPromptEngineError> {
+        let processed_count = scheduled_run
+            .outcome
+            .processed_state_activation_count
+            .unwrap_or_else(|| activation.kind.work_units());
+        let history = self
+            .stream_histories
+            .get_mut(&activation.stream_id)
+            .ok_or_else(|| VulkanResidentInProcessPlacedPromptEngineError::UnknownStream {
+                stream_id: activation.stream_id.clone(),
+            })?;
+        match &activation.kind {
+            RuntimeStreamActivationKind::PrefillChunk { token_ids, .. } => {
+                let processed_prompt_count = processed_count.min(token_ids.len());
+                history
+                    .committed_state_token_ids
+                    .extend_from_slice(&token_ids[..processed_prompt_count]);
+                history
+                    .pending_feedback_token_ids
+                    .extend(scheduled_run.generated_token_ids.iter().copied());
+                for _ in processed_prompt_count..processed_count {
+                    let token_id =
+                        history.pending_feedback_token_ids.pop_front().ok_or_else(|| {
+                            VulkanResidentInProcessPlacedPromptEngineError::Stream(
+                                placed_scheduler_divergence(format!(
+                                    "prefill activation {} closed with no feedback token",
+                                    activation.id
+                                )),
+                            )
+                        })?;
+                    history.committed_state_token_ids.push(token_id);
+                }
+            }
+            RuntimeStreamActivationKind::DecodeFeedback { .. } => {
+                history
+                    .pending_feedback_token_ids
+                    .extend(scheduled_run.generated_token_ids.iter().copied());
+                for _ in 0..processed_count {
+                    let token_id = history.pending_feedback_token_ids.pop_front().ok_or_else(|| {
+                        VulkanResidentInProcessPlacedPromptEngineError::Stream(
+                            placed_scheduler_divergence(format!(
+                                "decode activation {} executed an input tick with no feedback token",
+                                activation.id
+                            )),
+                        )
+                    })?;
+                    history.committed_state_token_ids.push(token_id);
+                }
+            }
+        }
+
+        if let RuntimeStreamActivationKind::PrefillChunk {
+            remaining_prompt_token_count,
+            ..
+        } = activation.kind
+        {
+            self.capture_aligned_prefix_checkpoint(
+                &activation.stream_id,
+                remaining_prompt_token_count,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn capture_aligned_prefix_checkpoint(
+        &mut self,
+        stream_id: &str,
+        remaining_prompt_token_count: usize,
+    ) -> Result<(), VulkanResidentInProcessPlacedPromptEngineError> {
+        let state = self
+            .runtime_scheduler
+            .stream_transient_state_snapshot(stream_id)?;
+        let append_entries = state
+            .entries
+            .iter()
+            .filter(|entry| entry.shape.retention == TransientStateRetention::Append)
+            .collect::<Vec<_>>();
+        if append_entries.is_empty()
+            || append_entries.iter().any(|entry| {
+                entry.logical_activation_count == 0
+                    || entry.logical_activation_count % entry.shape.activation_capacity != 0
+            })
+        {
+            return Ok(());
+        }
+        let append_alignment =
+            append_entries
+                .iter()
+                .try_fold(1usize, |alignment, entry| {
+                    let divisor =
+                        greatest_common_divisor(alignment, entry.shape.activation_capacity);
+                    alignment
+                        .checked_div(divisor)
+                        .and_then(|value| value.checked_mul(entry.shape.activation_capacity))
+                        .ok_or_else(|| {
+                            VulkanResidentInProcessPlacedPromptEngineError::Stream(
+                                placed_scheduler_divergence(
+                                    "prefix checkpoint state-page alignment overflowed",
+                                ),
+                            )
+                        })
+                })?;
+        if remaining_prompt_token_count >= append_alignment {
+            return Ok(());
+        }
+        let token_ids = self
+            .stream_histories
+            .get(stream_id)
+            .ok_or_else(|| VulkanResidentInProcessPlacedPromptEngineError::UnknownStream {
+                stream_id: stream_id.to_string(),
+            })?
+            .committed_state_token_ids
+            .clone();
+        if token_ids.is_empty()
+            || append_entries
+                .iter()
+                .any(|entry| entry.logical_activation_count != token_ids.len())
+        {
+            return Ok(());
+        }
+        let stream = self.streams.get(stream_id).ok_or_else(|| {
+            VulkanResidentInProcessPlacedPromptEngineError::UnknownStream {
+                stream_id: stream_id.to_string(),
+            }
+        })?;
+        let runtime_graph_id = stream.package().runtime_execution_identity.clone();
+        let runtime_modifier_bytes = prefix_cache_runtime_modifier_bytes(stream)?;
+        let key = RuntimePrefixStateCacheKey::from_token_prefix(
+            stream.package().stream_execution_class_id(),
+            runtime_graph_id,
+            &token_ids,
+            &runtime_modifier_bytes,
+            state.entries.iter().map(|entry| entry.key.clone()),
+        )
+        .map_err(RuntimeStreamSchedulerError::from)?;
+
+        let prepared_entry = self.resident_prefix_state_cache.prepare_capture(
+            key.clone(),
+            self.streams.get(stream_id).expect("stream was validated"),
+            &state,
+        )?;
+        let cache_insert = self
+            .runtime_scheduler
+            .cache_stream_prefix_state(stream_id, key.clone())?;
+        self.resident_prefix_state_cache
+            .install(prepared_entry, &cache_insert);
+        if let Some(previous) = self.latest_prefix_checkpoint_by_stream.get(stream_id)
+            && previous != &key
+            && !cache_insert.evicted_keys.contains(previous)
+        {
+            let previous = previous.clone();
+            self.runtime_scheduler.evict_prefix_state(&previous)?;
+            self.resident_prefix_state_cache.evict(&previous);
+        }
+        self.latest_prefix_checkpoint_by_stream
+            .retain(|_, checkpoint| !cache_insert.evicted_keys.contains(checkpoint));
+        self.latest_prefix_checkpoint_by_stream
+            .insert(stream_id.to_string(), key);
+        Ok(())
     }
 
     fn poll_pending_scheduler_activations_with_output<F>(
@@ -836,6 +1115,7 @@ impl VulkanResidentInProcessPlacedPromptEngine {
                     .unwrap_or(u64::MAX);
             self.runtime_scheduler
                 .complete_activation(activation_id, scheduled_run.outcome.clone())?;
+            self.record_completed_activation_state(&pending.activation, &scheduled_run)?;
             let output_events =
                 placed_prompt_engine_output_events_for(&stream_id, &scheduled_run.output_events);
             let input_run = scheduled_run.completed_input_run.map(|submitted_run| {
@@ -972,6 +1252,7 @@ impl VulkanResidentInProcessPlacedPromptEngine {
             active_stream_count: active_stream_ids.len(),
             active_stream_ids,
             idle,
+            prefix_state_cache: self.resident_prefix_state_cache.stats(),
             streams,
         }
     }
@@ -997,6 +1278,8 @@ impl VulkanResidentInProcessPlacedPromptEngineInputRequest {
 pub struct VulkanResidentInProcessPlacedPromptEngineQueuedInputEvent {
     pub stream_id: String,
     pub queued_input_event: VulkanResidentInProcessPlacedQueuedInputEvent,
+    pub original_token_count: usize,
+    pub reused_prefix_token_count: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1046,6 +1329,7 @@ struct VulkanResidentInProcessPlacedPromptEngineScheduledBatchRun {
 struct VulkanResidentInProcessPlacedPromptEnginePendingActivation {
     stream_id: String,
     activation_started: Instant,
+    activation: RuntimeStreamActivation,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -1086,6 +1370,7 @@ pub struct VulkanResidentInProcessPlacedPromptEngineRun {
     pub decode_activation_count: usize,
     pub prefill_time_ns: u64,
     pub decode_time_ns: u64,
+    pub prefix_state_cache: VulkanResidentPlacedPrefixStateCacheStats,
     pub start_snapshot: VulkanResidentInProcessPlacedPromptEngineSnapshot,
     pub end_snapshot: VulkanResidentInProcessPlacedPromptEngineSnapshot,
 }
@@ -1096,6 +1381,7 @@ pub struct VulkanResidentInProcessPlacedPromptEngineSnapshot {
     pub active_stream_count: usize,
     pub active_stream_ids: Vec<String>,
     pub idle: bool,
+    pub prefix_state_cache: VulkanResidentPlacedPrefixStateCacheStats,
     pub streams: Vec<VulkanResidentInProcessPlacedPromptEngineStreamSnapshot>,
 }
 
@@ -1172,6 +1458,33 @@ fn placed_prompt_engine_output_events_for(
             },
         )
         .collect()
+}
+
+fn prefix_cache_runtime_modifier_bytes(
+    stream: &VulkanResidentInProcessPlacedPromptStream,
+) -> Result<Vec<u8>, VulkanResidentInProcessPlacedPromptEngineError> {
+    serde_json::to_vec(&serde_json::json!({
+        "schema": "nerve.prefix_state_runtime_modifiers.v1",
+        "sampler": stream.package.sampler_spec,
+        "speculative_draft_tokens": stream.speculative_draft_tokens,
+    }))
+    .map_err(|error| {
+        VulkanResidentInProcessPlacedRuntimeError::Package(
+            VulkanResidentTokenModelPackageError::new(format!(
+                "failed to serialize prefix-state runtime modifiers: {error}"
+            )),
+        )
+        .into()
+    })
+}
+
+fn greatest_common_divisor(mut left: usize, mut right: usize) -> usize {
+    while right != 0 {
+        let remainder = left % right;
+        left = right;
+        right = remainder;
+    }
+    left
 }
 
 fn placed_prompt_streams_share_physical_batch_contract(

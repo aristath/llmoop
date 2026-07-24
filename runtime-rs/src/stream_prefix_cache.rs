@@ -2,7 +2,9 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 
-use crate::stream_state::{TransientStateArena, TransientStateKey, TransientStateTable};
+use crate::stream_state::{
+    TransientStateArena, TransientStateKey, TransientStateRetention, TransientStateTable,
+};
 
 const FNV64_OFFSET: u64 = 0xcbf29ce484222325;
 const FNV64_PRIME: u64 = 0x100000001b3;
@@ -12,6 +14,7 @@ pub struct RuntimePrefixStateCacheKey {
     pub execution_class_id: String,
     pub runtime_graph_id: String,
     pub token_count: usize,
+    pub token_ids: Vec<u32>,
     pub token_hash: u64,
     pub runtime_modifier_hash: u64,
     pub state_keys: Vec<TransientStateKey>,
@@ -57,6 +60,7 @@ impl RuntimePrefixStateCacheKey {
             execution_class_id,
             runtime_graph_id,
             token_count: token_ids.len(),
+            token_ids: token_ids.to_vec(),
             token_hash: stable_token_prefix_hash(token_ids),
             runtime_modifier_hash: stable_runtime_modifier_hash(runtime_modifier_bytes),
             state_keys,
@@ -78,7 +82,14 @@ pub struct RuntimePrefixStateCacheEntrySnapshot {
 pub struct RuntimePrefixStateCacheSnapshot {
     pub capacity_entries: usize,
     pub entry_count: usize,
+    pub eviction_count: usize,
     pub entries: Vec<RuntimePrefixStateCacheEntrySnapshot>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuntimePrefixStateCacheInsert {
+    pub replaced_existing: bool,
+    pub evicted_keys: Vec<RuntimePrefixStateCacheKey>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -95,6 +106,7 @@ pub struct RuntimePrefixStateCache {
     entries: BTreeMap<RuntimePrefixStateCacheKey, RuntimePrefixStateCacheEntry>,
     next_tick: u64,
     next_cached_stream_id: u64,
+    eviction_count: usize,
 }
 
 impl RuntimePrefixStateCache {
@@ -104,6 +116,7 @@ impl RuntimePrefixStateCache {
             entries: BTreeMap::new(),
             next_tick: 0,
             next_cached_stream_id: 0,
+            eviction_count: 0,
         }
     }
 
@@ -111,20 +124,47 @@ impl RuntimePrefixStateCache {
         self.capacity_entries
     }
 
+    pub fn set_capacity(
+        &mut self,
+        arena: &mut TransientStateArena,
+        capacity_entries: usize,
+    ) -> Result<Vec<RuntimePrefixStateCacheKey>, RuntimePrefixStateCacheError> {
+        self.capacity_entries = capacity_entries;
+        self.evict_until_within_capacity(arena)
+    }
+
+    pub fn evict(
+        &mut self,
+        arena: &mut TransientStateArena,
+        key: &RuntimePrefixStateCacheKey,
+    ) -> Result<bool, RuntimePrefixStateCacheError> {
+        let Some(mut entry) = self.entries.remove(key) else {
+            return Ok(false);
+        };
+        entry.table.reset_all(arena)?;
+        self.eviction_count = self.eviction_count.saturating_add(1);
+        Ok(true)
+    }
+
     pub fn insert(
         &mut self,
         arena: &mut TransientStateArena,
         key: RuntimePrefixStateCacheKey,
         source: &TransientStateTable,
-    ) -> Result<(), RuntimePrefixStateCacheError> {
+    ) -> Result<RuntimePrefixStateCacheInsert, RuntimePrefixStateCacheError> {
         if self.capacity_entries == 0 {
-            return Ok(());
+            return Ok(RuntimePrefixStateCacheInsert {
+                replaced_existing: false,
+                evicted_keys: Vec::new(),
+            });
         }
         validate_source_matches_prefix_key(&key, source)?;
         let cached_stream_id = self.next_cached_stream_id()?;
         let cached_table = source.fork(arena, cached_stream_id.clone())?;
+        let mut replaced_existing = false;
         if let Some(mut old) = self.entries.remove(&key) {
             old.table.reset_all(arena)?;
+            replaced_existing = true;
         }
         let tick = self.next_tick()?;
         self.entries.insert(
@@ -136,8 +176,11 @@ impl RuntimePrefixStateCache {
                 use_count: 0,
             },
         );
-        self.evict_until_within_capacity(arena)?;
-        Ok(())
+        let evicted_keys = self.evict_until_within_capacity(arena)?;
+        Ok(RuntimePrefixStateCacheInsert {
+            replaced_existing,
+            evicted_keys,
+        })
     }
 
     pub fn restore_into(
@@ -218,6 +261,7 @@ impl RuntimePrefixStateCache {
         RuntimePrefixStateCacheSnapshot {
             capacity_entries: self.capacity_entries,
             entry_count: entries.len(),
+            eviction_count: self.eviction_count,
             entries,
         }
     }
@@ -225,7 +269,8 @@ impl RuntimePrefixStateCache {
     fn evict_until_within_capacity(
         &mut self,
         arena: &mut TransientStateArena,
-    ) -> Result<(), RuntimePrefixStateCacheError> {
+    ) -> Result<Vec<RuntimePrefixStateCacheKey>, RuntimePrefixStateCacheError> {
+        let mut evicted_keys = Vec::new();
         while self.entries.len() > self.capacity_entries {
             let eviction_key = self
                 .entries
@@ -241,8 +286,10 @@ impl RuntimePrefixStateCache {
                 RuntimePrefixStateCacheError("prefix cache eviction entry disappeared".to_string())
             })?;
             evicted.table.reset_all(arena)?;
+            self.eviction_count = self.eviction_count.saturating_add(1);
+            evicted_keys.push(eviction_key);
         }
-        Ok(())
+        Ok(evicted_keys)
     }
 
     fn next_tick(&mut self) -> Result<u64, RuntimePrefixStateCacheError> {
@@ -321,23 +368,35 @@ fn validate_source_matches_prefix_key(
                     source_snapshot.stream_id, state_key.node_instance_id, state_key.state_id
                 ))
             })?;
-        if entry.logical_activation_count != key.token_count {
-            return Err(RuntimePrefixStateCacheError(format!(
-                "prefix cache key for {} tokens does not match source state {}.{} with {} activations",
-                key.token_count,
-                state_key.node_instance_id,
-                state_key.state_id,
-                entry.logical_activation_count
-            )));
-        }
-        if entry.logical_activation_count % entry.shape.activation_capacity != 0 {
-            return Err(RuntimePrefixStateCacheError(format!(
-                "prefix cache source state {}.{} has {} activations, which is not aligned to block capacity {}",
-                state_key.node_instance_id,
-                state_key.state_id,
-                entry.logical_activation_count,
-                entry.shape.activation_capacity
-            )));
+        match entry.shape.retention {
+            TransientStateRetention::Append => {
+                if entry.logical_activation_count != key.token_count {
+                    return Err(RuntimePrefixStateCacheError(format!(
+                        "prefix cache key for {} tokens does not match source state {}.{} with {} activations",
+                        key.token_count,
+                        state_key.node_instance_id,
+                        state_key.state_id,
+                        entry.logical_activation_count
+                    )));
+                }
+                if entry.logical_activation_count % entry.shape.activation_capacity != 0 {
+                    return Err(RuntimePrefixStateCacheError(format!(
+                        "prefix cache source state {}.{} has {} activations, which is not aligned to block capacity {}",
+                        state_key.node_instance_id,
+                        state_key.state_id,
+                        entry.logical_activation_count,
+                        entry.shape.activation_capacity
+                    )));
+                }
+            }
+            TransientStateRetention::MutableSingleton => {
+                if entry.logical_activation_count != 1 || entry.block_ids.len() != 1 {
+                    return Err(RuntimePrefixStateCacheError(format!(
+                        "prefix cache source mutable state {}.{} is not initialized",
+                        state_key.node_instance_id, state_key.state_id
+                    )));
+                }
+            }
         }
     }
     Ok(())
@@ -423,6 +482,37 @@ mod tests {
         assert!(error.0.contains("is not aligned to block capacity"));
         assert_eq!(cache.snapshot().entry_count, 0);
         assert_eq!(arena.snapshot().unwrap().blocks[0].ref_count, 1);
+    }
+
+    #[test]
+    fn prefix_cache_accepts_initialized_mutable_state_alongside_aligned_append_state() {
+        let mut arena = TransientStateArena::new();
+        let mut source = TransientStateTable::new("source").unwrap();
+        source.declare_state(key("kv"), shape()).unwrap();
+        source
+            .declare_state(
+                key("recurrent"),
+                TransientStateBlockShape::mutable_singleton(64).unwrap(),
+            )
+            .unwrap();
+        source
+            .append_activations(&mut arena, &key("kv"), 2)
+            .unwrap();
+        source
+            .append_activations(&mut arena, &key("recurrent"), 2)
+            .unwrap();
+        let mut cache = RuntimePrefixStateCache::new(1);
+
+        cache
+            .insert(
+                &mut arena,
+                cache_key(&[1, 2], vec![key("kv"), key("recurrent")]),
+                &source,
+            )
+            .unwrap();
+
+        assert_eq!(cache.snapshot().entry_count, 1);
+        assert_eq!(cache.snapshot().entries[0].block_count, 2);
     }
 
     #[test]

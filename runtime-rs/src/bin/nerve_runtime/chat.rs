@@ -259,6 +259,7 @@ struct RuntimeChatTurn {
     streamed: bool,
     timing: RuntimePromptTimingReport,
     execution_counters: VulkanResidentExecutionCounters,
+    prefix_state_cache: VulkanResidentPlacedPrefixStateCacheStats,
     speculative_cycle_count: usize,
     proposed_draft_token_count: usize,
     accepted_draft_token_count: usize,
@@ -372,6 +373,7 @@ where
             }
             print_runtime_timing_stats("stats", &turn.timing);
             print_runtime_execution_counters(&turn.execution_counters);
+            print_runtime_prefix_state_cache_stats(&turn.prefix_state_cache);
             print_runtime_speculative_stats(
                 turn.speculative_cycle_count,
                 turn.proposed_draft_token_count,

@@ -30,6 +30,7 @@ use crate::stream_plan::{
     CircuitActivationPlan, PlannedNode, PlannedParameterResource, PlannedPort, SignalProducer,
     SignalStorage, StreamCircuitExecutionPlan, StreamCircuitResourcePlan, TensorIndex,
 };
+use crate::stream_prefix_cache::{RuntimePrefixStateCacheInsert, RuntimePrefixStateCacheKey};
 use crate::stream_runtime::{
     RuntimeStreamActivation, RuntimeStreamActivationBatch, RuntimeStreamActivationBatchKind,
     RuntimeStreamActivationKind, RuntimeStreamActivationOutcome, RuntimeStreamInputEvent,
@@ -37,7 +38,8 @@ use crate::stream_runtime::{
     RuntimeStreamSchedulerSnapshot, RuntimeStreamStateReservation, RuntimeStreamStatus,
 };
 use crate::stream_state::{
-    TransientStateBlockId, TransientStateBlockShape, TransientStateKey, TransientStateSlot,
+    TransientStateBlockId, TransientStateBlockShape, TransientStateKey, TransientStateRetention,
+    TransientStateSlot, TransientStateTableSnapshot,
 };
 use crate::tensor_storage::TensorStorage;
 use crate::vulkan::{DEFAULT_COMPUTE_LOCAL_SIZE_X, DEFAULT_SPIRV_ENTRY_POINT, read_spirv_words};
@@ -111,12 +113,14 @@ include!("vulkan_stream_circuit/token_runtime.rs");
 include!("vulkan_stream_circuit/token_engine.rs");
 include!("vulkan_stream_circuit/resident_package_slices.rs");
 include!("vulkan_stream_circuit/placed_feedback_devices.rs");
+include!("vulkan_stream_circuit/runtime_execution_identity.rs");
 include!("vulkan_stream_circuit/placed_model_package_loader.rs");
 include!("vulkan_stream_circuit/placed_stream_processor.rs");
 include!("vulkan_stream_circuit/placed_prompt_event.rs");
 include!("vulkan_stream_circuit/placed_prompt_session.rs");
 include!("vulkan_stream_circuit/placed_prompt_stream.rs");
 include!("vulkan_stream_circuit/placed_prompt_scheduled_activation.rs");
+include!("vulkan_stream_circuit/placed_prefix_state_cache.rs");
 include!("vulkan_stream_circuit/placed_prompt_engine.rs");
 include!("vulkan_stream_circuit/placed_prompt_device.rs");
 include!("vulkan_stream_circuit/placed_runtime_error.rs");

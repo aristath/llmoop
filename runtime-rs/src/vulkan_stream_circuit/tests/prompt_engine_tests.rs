@@ -91,6 +91,9 @@ fn placed_prompt_engine_owns_streams_and_submits_input_events() {
 fn placed_prompt_engine_reuses_physical_state_pages_beyond_context_capacity() {
     let device = match selected_test_vulkan_device() {
         Ok(device) => device,
+        Err(error) if std::env::var_os("NERVE_TEST_VULKAN_DEVICE_INDEX").is_some() => {
+            panic!("explicit Vulkan device for physical state paging was unavailable: {error}")
+        }
         Err(error) => {
             eprintln!("skipping placed prompt engine context-wrap test: {error}");
             return;
@@ -130,7 +133,7 @@ fn placed_prompt_engine_reuses_physical_state_pages_beyond_context_capacity() {
         .runtime_scheduler
         .stream_transient_state_snapshot("main")
         .unwrap();
-    assert_eq!(state.logical_activation_count, 6);
+    assert_eq!(state.logical_activation_count, 7);
     assert!(state.logical_activation_count > 4);
     assert_eq!(state.block_count, 1);
     assert_eq!(
@@ -139,7 +142,223 @@ fn placed_prompt_engine_reuses_physical_state_pages_beyond_context_capacity() {
             .transient_state_arena_snapshot()
             .unwrap()
             .live_block_count,
-        1
+        2
+    );
+    assert_eq!(engine.snapshot().prefix_state_cache.resident_entry_count, 1);
+
+    engine.remove_stream("main").unwrap();
+    assert_eq!(
+        engine
+            .runtime_scheduler
+            .transient_state_arena_snapshot()
+            .unwrap()
+            .live_block_count,
+        0
+    );
+    assert_eq!(engine.snapshot().prefix_state_cache.resident_entry_count, 0);
+}
+
+#[test]
+fn placed_prompt_engine_restores_device_resident_prefix_pages_for_branches() {
+    let device = match selected_test_vulkan_device() {
+        Ok(device) => device,
+        Err(error) if std::env::var_os("NERVE_TEST_VULKAN_DEVICE_INDEX").is_some() => {
+            panic!("explicit Vulkan device for resident prefix caching was unavailable: {error}")
+        }
+        Err(error) => {
+            eprintln!("skipping resident prefix page cache test: {error}");
+            return;
+        }
+    };
+    let runtime_model = tiny_fixture_model_runtime_model_with_placement(
+        StreamCircuitPlacementSpec::new("gpu0"),
+    );
+    let manifest_path = tiny_fixture_model_package_manifest_path();
+    let manifest_dir = manifest_path.parent().unwrap();
+    let devices = BTreeMap::from([("gpu0".to_string(), Rc::new(device))]);
+    let source = VulkanResidentInProcessPlacedPromptStream::from_runtime_model_for_bound_devices(
+        devices.clone(),
+        manifest_dir,
+        runtime_model,
+        Some(8),
+        17,
+        0,
+    )
+    .unwrap();
+    let package = Arc::clone(&source.package);
+    let branch_a =
+        VulkanResidentInProcessPlacedPromptStream::new(package.clone(), devices.clone(), 29)
+            .unwrap();
+    let branch_b = VulkanResidentInProcessPlacedPromptStream::new(package, devices, 29).unwrap();
+    let mut engine = VulkanResidentInProcessPlacedPromptEngine::new();
+    engine.add_stream("source", source).unwrap();
+    engine.add_stream("branch_a", branch_a).unwrap();
+    engine.add_stream("branch_b", branch_b).unwrap();
+
+    engine
+        .submit_input_event_until_idle(
+            "source",
+            VulkanResidentTokenInputEvent::new(
+                "source_prompt",
+                (4..24).collect::<Vec<_>>(),
+                2,
+            ),
+        )
+        .unwrap();
+    let branch_tokens = (4..25).collect::<Vec<_>>();
+    let branch_a_run = engine
+        .submit_input_event_until_idle(
+            "branch_a",
+            VulkanResidentTokenInputEvent::new("branch_a_prompt", branch_tokens.clone(), 1),
+        )
+        .unwrap();
+    let branch_b_run = engine
+        .submit_input_event_until_idle(
+            "branch_b",
+            VulkanResidentTokenInputEvent::new("branch_b_prompt", branch_tokens, 1),
+        )
+        .unwrap();
+
+    assert_eq!(branch_a_run.queued_input_event.original_token_count, 21);
+    assert_eq!(
+        branch_a_run.queued_input_event.reused_prefix_token_count,
+        16
+    );
+    assert_eq!(
+        branch_b_run.queued_input_event.reused_prefix_token_count,
+        16
+    );
+    assert_eq!(branch_a_run.engine_run.prefill_activation_count, 1);
+    assert_eq!(branch_b_run.engine_run.prefill_activation_count, 1);
+    assert_eq!(
+        branch_a_run.generated_token_ids,
+        branch_b_run.generated_token_ids
+    );
+    let stats = engine.snapshot().prefix_state_cache;
+    assert_eq!(stats.hit_count, 2);
+    assert_eq!(stats.miss_count, 1);
+    assert_eq!(stats.reused_token_count, 32);
+    assert_eq!(stats.saved_prefill_token_count, 32);
+    assert_eq!(stats.insertion_count, 1);
+    assert_eq!(stats.resident_entry_count, 1);
+    assert!(stats.resident_byte_count > 0);
+
+    let continued = engine
+        .submit_input_event_until_idle(
+            "branch_a",
+            VulkanResidentTokenInputEvent::new("next_turn", vec![25, 26], 1),
+        )
+        .unwrap();
+    assert_eq!(continued.queued_input_event.reused_prefix_token_count, 0);
+    assert_eq!(continued.generated_token_ids.len(), 1);
+
+    let source_state = engine
+        .runtime_scheduler
+        .stream_transient_state_snapshot("source")
+        .unwrap();
+    let source_activation_count = source_state
+        .entries
+        .iter()
+        .find(|entry| entry.shape.retention == TransientStateRetention::Append)
+        .unwrap()
+        .logical_activation_count;
+    let advance_to_boundary = 8 - (source_activation_count % 8);
+    engine
+        .submit_input_event_until_idle(
+            "source",
+            VulkanResidentTokenInputEvent::new(
+                "advance_source_checkpoint",
+                vec![24; advance_to_boundary + 1],
+                1,
+            ),
+        )
+        .unwrap();
+    let stats = engine.snapshot().prefix_state_cache;
+    assert_eq!(stats.resident_entry_count, 1);
+    assert_eq!(stats.insertion_count, 2);
+    assert_eq!(stats.eviction_count, 1);
+}
+
+#[test]
+fn placed_prompt_engine_reclaims_unused_state_after_cancelled_decode_window() {
+    let device = match selected_test_vulkan_device() {
+        Ok(device) => device,
+        Err(error) if std::env::var_os("NERVE_TEST_VULKAN_DEVICE_INDEX").is_some() => {
+            panic!("explicit Vulkan device for cancellation rollback was unavailable: {error}")
+        }
+        Err(error) => {
+            eprintln!("skipping early-stop state rollback test: {error}");
+            return;
+        }
+    };
+    let runtime_model = tiny_fixture_model_runtime_model_with_placement(
+        StreamCircuitPlacementSpec::new("gpu0"),
+    );
+    let manifest_path = tiny_fixture_model_package_manifest_path();
+    let manifest_dir = manifest_path.parent().unwrap();
+    let devices = BTreeMap::from([("gpu0".to_string(), Rc::new(device))]);
+    let stopped =
+        VulkanResidentInProcessPlacedPromptStream::from_runtime_model_for_bound_devices(
+            devices,
+            manifest_dir,
+            runtime_model,
+            Some(16),
+            41,
+            0,
+        )
+        .unwrap();
+    let feedback_loop = stopped
+        .processor
+        .resident_feedback_loop
+        .as_ref()
+        .expect("tiny fixture supports resident feedback");
+    feedback_loop
+        .window_policy
+        .next_tick_count
+        .set(feedback_loop.window_policy.maximum_tick_count);
+    let mut engine = VulkanResidentInProcessPlacedPromptEngine::new();
+    engine.add_stream("stopped", stopped).unwrap();
+    engine
+        .enqueue_input_event(
+            "stopped",
+            VulkanResidentTokenInputEvent::new("stopped_prompt", vec![4], 8),
+        )
+        .unwrap();
+    engine
+        .stream("stopped")
+        .unwrap()
+        .resident_feedback_cancellation_handle()
+        .expect("tiny fixture supports resident feedback cancellation")
+        .request_cancel();
+    let stopped_run = engine.run_until_idle_bounded(1).unwrap();
+
+    assert_eq!(stopped_run.generated_token_ids.len(), 2);
+    assert_eq!(
+        stopped_run
+            .end_snapshot
+            .streams
+            .iter()
+            .find(|stream| stream.stream_id == "stopped")
+            .unwrap()
+            .next_stream_tick,
+        3
+    );
+    let state = engine
+        .runtime_scheduler
+        .stream_transient_state_snapshot("stopped")
+        .unwrap();
+    assert!(state
+        .entries
+        .iter()
+        .filter(|entry| entry.shape.retention == TransientStateRetention::Append)
+        .all(|entry| entry.logical_activation_count == 3));
+    let submitted = &stopped_run.input_runs[0].submitted_run;
+    assert!(
+        submitted.session_run.run.resident_feedback.planned_tick_count
+            > submitted.session_run.run.resident_feedback.executed_tick_count
+    );
+    assert!(
+        submitted.session_run.run.resident_feedback.discarded_tick_count > 0
     );
 }
 

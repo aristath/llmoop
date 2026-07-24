@@ -34,10 +34,19 @@ impl<'a> VulkanResidentBufferRangeCopy<'a> {
         destination_offset: usize,
         byte_len: usize,
     ) -> Result<Self, VulkanError> {
+        const VULKAN_BUFFER_COPY_ALIGNMENT: usize = 4;
         if byte_len == 0 {
             return Err(VulkanError(
                 "resident buffer range copy length must not be zero".to_string(),
             ));
+        }
+        if !source_offset.is_multiple_of(VULKAN_BUFFER_COPY_ALIGNMENT)
+            || !destination_offset.is_multiple_of(VULKAN_BUFFER_COPY_ALIGNMENT)
+            || !byte_len.is_multiple_of(VULKAN_BUFFER_COPY_ALIGNMENT)
+        {
+            return Err(VulkanError(format!(
+                "resident buffer range copy offsets and length must be multiples of {VULKAN_BUFFER_COPY_ALIGNMENT}, got source offset {source_offset}, destination offset {destination_offset}, and length {byte_len}"
+            )));
         }
         source.byte_range(source_offset, byte_len)?;
         destination.byte_range(destination_offset, byte_len)?;

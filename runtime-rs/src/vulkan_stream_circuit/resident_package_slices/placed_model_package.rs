@@ -1,5 +1,6 @@
 pub struct VulkanResidentInProcessPlacedModelPackage {
     pub package_id: String,
+    pub runtime_execution_identity: String,
     pub input_device_id: String,
     pub output_device_id: String,
     pub dynamic_state_capacity_activations: usize,
@@ -40,12 +41,7 @@ pub struct VulkanResidentStreamStateDeclaration {
 
 impl VulkanResidentInProcessPlacedModelPackage {
     pub fn stream_execution_class_id(&self) -> String {
-        format!(
-            "{}|devices={}|context={}",
-            self.package_id,
-            self.device_ids.join(","),
-            self.dynamic_state_capacity_activations
-        )
+        self.runtime_execution_identity.clone()
     }
 
     pub fn resident_state_buffer(

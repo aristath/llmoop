@@ -109,6 +109,12 @@ impl VulkanResidentInProcessPlacedModelPackage {
                 ),
             ));
         }
+        let runtime_execution_identity = canonical_runtime_execution_identity(
+            &runtime_model,
+            capacity,
+            mount_speculative_decoders,
+        )
+        .map_err(VulkanResidentInProcessPlacedRuntimeError::Package)?;
         let tensor_index_path = resolve_resident_model_package_path(
             manifest_dir,
             &runtime_model.package.tensor_index_path,
@@ -357,6 +363,7 @@ impl VulkanResidentInProcessPlacedModelPackage {
 
         Ok(Self {
             package_id,
+            runtime_execution_identity,
             input_device_id,
             output_device_id,
             dynamic_state_capacity_activations: capacity,

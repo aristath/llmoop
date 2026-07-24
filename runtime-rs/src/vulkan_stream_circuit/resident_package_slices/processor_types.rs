@@ -21,18 +21,25 @@ pub struct VulkanResidentInProcessPlacedStreamProcessor {
 }
 
 impl VulkanResidentInProcessPlacedStreamProcessor {
+    fn mounted_state_buffer_with_device_id(
+        &self,
+        key: &TransientStateKey,
+    ) -> Option<(&str, &VulkanStreamStateBufferAllocation)> {
+        self.device_slices.iter().find_map(|slice| {
+            slice
+                .mounted
+                .buffers
+                .state_buffer(&key.node_instance_id, &key.state_id)
+                .map(|state| (slice.device_id.as_str(), state))
+        })
+    }
+
     fn mounted_state_buffer(
         &self,
         key: &TransientStateKey,
     ) -> Option<&VulkanStreamStateBufferAllocation> {
-        self.device_slices
-            .iter()
-            .find_map(|slice| {
-                slice
-                    .mounted
-                    .buffers
-                    .state_buffer(&key.node_instance_id, &key.state_id)
-            })
+        self.mounted_state_buffer_with_device_id(key)
+            .map(|(_, state)| state)
     }
 
     fn reset_transient_state_buffers(

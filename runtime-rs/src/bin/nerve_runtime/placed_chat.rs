@@ -119,6 +119,7 @@ fn run_placed_chat(
                     .run
                     .scheduler_turn_count,
             );
+            let prefix_state_cache = run.engine_run.prefix_state_cache.clone();
             if let Some(error) = output_error {
                 return Err(Box::new(io::Error::new(io::ErrorKind::InvalidData, error)));
             }
@@ -127,6 +128,7 @@ fn run_placed_chat(
                 streamed: true,
                 timing,
                 execution_counters,
+                prefix_state_cache,
                 speculative_cycle_count: submitted_run
                     .submitted_run
                     .session_run

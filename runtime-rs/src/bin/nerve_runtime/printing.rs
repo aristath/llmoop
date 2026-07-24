@@ -163,6 +163,21 @@ fn print_runtime_execution_counters(counters: &VulkanResidentExecutionCounters) 
     );
 }
 
+fn print_runtime_prefix_state_cache_stats(stats: &VulkanResidentPlacedPrefixStateCacheStats) {
+    println!("prefix_state_cache:");
+    println!("  hits={}", stats.hit_count);
+    println!("  misses={}", stats.miss_count);
+    println!("  reused_tokens={}", stats.reused_token_count);
+    println!(
+        "  saved_prefill_tokens={}",
+        stats.saved_prefill_token_count
+    );
+    println!("  insertions={}", stats.insertion_count);
+    println!("  evictions={}", stats.eviction_count);
+    println!("  resident_entries={}", stats.resident_entry_count);
+    println!("  resident_bytes={}", stats.resident_byte_count);
+}
+
 fn print_runtime_feedback_stats(stats: &RuntimeFeedbackExecutionReport) {
     if stats.window_count == 0 {
         return;
