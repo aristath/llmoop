@@ -2,6 +2,7 @@
 
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
+{{FP8_EXTENSIONS}}
 
 layout(local_size_x = {{VALUE_HEAD_WIDTH}}, local_size_y = 1, local_size_z = 1) in;
 
@@ -10,11 +11,12 @@ layout(set = 0, binding = 1) readonly buffer ZInput { uint words[]; } z_input;
 layout(set = 0, binding = 2) readonly buffer BInput { uint words[]; } b_input;
 layout(set = 0, binding = 3) readonly buffer AInput { uint words[]; } a_input;
 layout(set = 0, binding = 4) buffer OutputFrame { uint words[]; } output_frame;
-layout(set = 0, binding = 5) readonly buffer ALog { uint words[]; } a_log;
-layout(set = 0, binding = 6) readonly buffer DtBias { uint words[]; } dt_bias;
-layout(set = 0, binding = 7) readonly buffer NormWeight { uint words[]; } norm_weight;
-layout(set = 0, binding = 8) readonly buffer StateRead { float values[]; } state_read;
-layout(set = 0, binding = 9) buffer StateWrite { float values[]; } state_write;
+{{PHYSICAL_OUTPUT_BINDINGS}}
+layout(set = 0, binding = {{A_LOG_BINDING}}) readonly buffer ALog { uint words[]; } a_log;
+layout(set = 0, binding = {{DT_BIAS_BINDING}}) readonly buffer DtBias { uint words[]; } dt_bias;
+layout(set = 0, binding = {{NORM_WEIGHT_BINDING}}) readonly buffer NormWeight { uint words[]; } norm_weight;
+layout(set = 0, binding = {{STATE_READ_BINDING}}) readonly buffer StateRead { float values[]; } state_read;
+layout(set = 0, binding = {{STATE_WRITE_BINDING}}) buffer StateWrite { float values[]; } state_write;
 
 layout(push_constant) uniform BatchControl { uint batch_width; } batch_control;
 
@@ -78,6 +80,7 @@ float read_norm_weight(uint index) { return {{READ_NORM_WEIGHT}}; }
 float softplus(float value) {
     return value > 20.0 ? value : log(1.0 + exp(value));
 }
+{{FP8_HELPERS}}
 
 void main() {
     uint value_head = gl_WorkGroupID.x;
@@ -185,13 +188,7 @@ void main() {
             * (z / (1.0 + exp(-z)));
         barrier();
 
-        if ((value_dim & 1u) == 0u) {
-            uint output_index = value_head * VALUE_HEAD_WIDTH + value_dim;
-            uint output_word = (position * VALUE_WIDTH + output_index) >> 1u;
-            output_frame.words[output_word] =
-                (f32_to_bf16(head_output[value_dim + 1u]) << 16u)
-                | f32_to_bf16(head_output[value_dim]);
-        }
+{{OUTPUT_STORE}}
         barrier();
     }
 

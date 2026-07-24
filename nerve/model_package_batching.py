@@ -163,7 +163,8 @@ def causal_scan_batch_shader_file(shader_file: str) -> str | None:
         )
     if re.fullmatch(
         r"gated_delta_step_k\d+x\d+_v\d+x\d+"
-        r"_a(?:f32|bf16)_dt(?:f32|bf16)_n(?:f32|bf16)_eps[0-9eE+.-]+\.comp",
+        r"_a(?:f32|bf16)_dt(?:f32|bf16)_n(?:f32|bf16)_eps[0-9eE+.-]+"
+        r"(?:_qfp8b\d+)?\.comp",
         shader_file,
     ):
         return shader_file.replace("gated_delta_step_", "gated_delta_scan_", 1)
@@ -195,7 +196,8 @@ def causal_scan_workgroup_count_x(shader_file: str) -> int:
         return (channels + 127) // 128
     gated_delta = re.fullmatch(
         r"gated_delta_step_k\d+x\d+_v(\d+)x\d+"
-        r"_a(?:f32|bf16)_dt(?:f32|bf16)_n(?:f32|bf16)_eps[0-9eE+.-]+\.comp",
+        r"_a(?:f32|bf16)_dt(?:f32|bf16)_n(?:f32|bf16)_eps[0-9eE+.-]+"
+        r"(?:_qfp8b\d+)?\.comp",
         shader_file,
     )
     if gated_delta is not None:

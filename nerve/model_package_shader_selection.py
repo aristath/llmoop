@@ -765,14 +765,35 @@ def shader_file_for_node(
                     "expected F32 or BF16"
                 )
             parameter_tokens[parameter_id] = dtype_tokens[actual_dtype]
-        return (
+        shader_file = (
             f"gated_delta_step_k{attrs['key_heads']}x{attrs['key_head_width']}"
             f"_v{attrs['value_heads']}x{attrs['value_head_width']}"
             f"_a{parameter_tokens['delta_a_log']}"
             f"_dt{parameter_tokens['delta_dt_bias']}"
             f"_n{parameter_tokens['delta_norm']}"
-            f"_eps{shader_float_token(float(attrs['norm_eps']))}.comp"
+            f"_eps{shader_float_token(float(attrs['norm_eps']))}"
         )
+        representations = attrs.get("physical_output_representations")
+        if representations:
+            if (
+                len(representations) != 1
+                or representations[0].get("contract")
+                != "bf16_blockwise_fp8_e4m3_f32_scale.v1"
+                or representations[0].get("logical_signal")
+                != node.get("outputs", [None])[0]
+                or int(representations[0].get("element_count", 0))
+                != int(attrs["value_heads"]) * int(attrs["value_head_width"])
+                or int(representations[0].get("block_columns", 0))
+                != int(attrs["value_head_width"])
+            ):
+                raise ModelCompileError(
+                    f"gated-delta node {node['id']!r} has an invalid physical "
+                    "FP8 output representation"
+                )
+            shader_file += (
+                f"_qfp8b{int(representations[0]['block_columns'])}"
+            )
+        return f"{shader_file}.comp"
     if op == "rg_lru_step":
         attrs = node["attrs"]
         binding = stream_control_binding_for_node(circuit, node)

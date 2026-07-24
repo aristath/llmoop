@@ -183,6 +183,14 @@ def test_compiler_selects_stateful_causal_scan_kernels() -> None:
         )
         == "gated_delta_scan_k16x128_v32x128_af32_dtbf16_nf32_eps1e-06.comp"
     )
+    assert (
+        causal_scan_batch_shader_file(
+            "gated_delta_step_k16x128_v32x128_af32_dtbf16_nf32_"
+            "eps1e-06_qfp8b128.comp"
+        )
+        == "gated_delta_scan_k16x128_v32x128_af32_dtbf16_nf32_"
+        "eps1e-06_qfp8b128.comp"
+    )
     assert causal_scan_batch_shader_file(
         "parallel_head_norm_rope_2way_bf16_h16_4_d256_r64_eps1e-06_"
         "offset1_theta10000000_half__sc6.comp"

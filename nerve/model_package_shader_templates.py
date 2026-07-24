@@ -2076,7 +2076,8 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
 
     gated_delta_shape = re.fullmatch(
         r"gated_delta_(step|scan)_k(\d+)x(\d+)_v(\d+)x(\d+)"
-        r"_a(f32|bf16)_dt(f32|bf16)_n(f32|bf16)_eps([0-9eE+.-]+)\.comp",
+        r"_a(f32|bf16)_dt(f32|bf16)_n(f32|bf16)_eps([0-9eE+.-]+)"
+        r"(?:_qfp8b(\d+))?\.comp",
         shader_file,
     )
     if gated_delta_shape is not None:
@@ -2091,6 +2092,99 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
         if value_width > 1024 or value_width < 2 or value_width % 2 != 0:
             raise ModelCompileError(
                 f"gated-delta value head width {value_width} is not a supported workgroup width"
+            )
+        quantized_block_columns = (
+            int(gated_delta_shape.group(10))
+            if gated_delta_shape.group(10) is not None
+            else None
+        )
+        if quantized_block_columns is not None and (
+            quantized_block_columns != value_width or value_width % 4
+        ):
+            raise ModelCompileError(
+                f"gated-delta FP8 block width {quantized_block_columns} does not "
+                f"match value head width {value_width}"
+            )
+        physical_output_bindings = ""
+        fp8_extensions = ""
+        fp8_helpers = ""
+        a_log_binding = 5
+        if quantized_block_columns is not None:
+            physical_output_bindings = (
+                "layout(set = 0, binding = 5) buffer QuantizedOutput "
+                "{ uint words[]; } quantized_output;\n"
+                "layout(set = 0, binding = 6) buffer OutputScale "
+                "{ float values[]; } output_scale;"
+            )
+            fp8_extensions = (
+                "#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require\n"
+                "#extension GL_EXT_float_e4m3 : require"
+            )
+            fp8_helpers = (
+                "uint pack_fp8(fe4m3vec4 value) {\n"
+                "    u8vec4 bits = floate4m3BitsToUintEXT(value);\n"
+                "    return uint(bits.x)\n"
+                "        | (uint(bits.y) << 8u)\n"
+                "        | (uint(bits.z) << 16u)\n"
+                "        | (uint(bits.w) << 24u);\n"
+                "}"
+            )
+            a_log_binding = 7
+        if quantized_block_columns is None:
+            output_store = (
+                "    if ((value_dim & 1u) == 0u) {\n"
+                "        uint output_index = value_head * VALUE_HEAD_WIDTH + value_dim;\n"
+                + (
+                    "        uint output_word = (position * VALUE_WIDTH + output_index) >> 1u;\n"
+                    if execution_mode == "scan"
+                    else "        uint output_word = output_index >> 1u;\n"
+                )
+                + "        output_frame.words[output_word] =\n"
+                "            (f32_to_bf16(head_output[value_dim + 1u]) << 16u)\n"
+                "            | f32_to_bf16(head_output[value_dim]);\n"
+                "    }"
+            )
+        else:
+            output_store = (
+                "    uint rounded = f32_to_bf16(head_output[value_dim]);\n"
+                "    head_output[value_dim] = bf16_to_f32(rounded);\n"
+                "    float subgroup_max = subgroupMax(abs(head_output[value_dim]));\n"
+                "    if (gl_SubgroupInvocationID == 0u) {\n"
+                "        reduction[gl_SubgroupID] = subgroup_max;\n"
+                "    }\n"
+                "    barrier();\n"
+                "    float block_max = 0.0;\n"
+                "    for (uint subgroup = 0u; subgroup < gl_NumSubgroups; subgroup++) {\n"
+                "        block_max = max(block_max, reduction[subgroup]);\n"
+                "    }\n"
+                "    float block_scale = block_max > 0.0 ? block_max / 448.0 : 1.0;\n"
+                + (
+                    "    uint scale_index = position * VALUE_HEADS + value_head;\n"
+                    "    uint output_base = position * VALUE_WIDTH + value_head * VALUE_HEAD_WIDTH;\n"
+                    if execution_mode == "scan"
+                    else "    uint scale_index = value_head;\n"
+                    "    uint output_base = value_head * VALUE_HEAD_WIDTH;\n"
+                )
+                + "    if (value_dim == 0u) {\n"
+                "        output_scale.values[scale_index] = block_scale;\n"
+                "    }\n"
+                "    if ((value_dim & 1u) == 0u) {\n"
+                "        uint output_index = output_base + value_dim;\n"
+                "        output_frame.words[output_index >> 1u] =\n"
+                "            (f32_to_bf16(head_output[value_dim + 1u]) << 16u)\n"
+                "            | f32_to_bf16(head_output[value_dim]);\n"
+                "    }\n"
+                "    if ((value_dim & 3u) == 0u) {\n"
+                "        uint output_index = output_base + value_dim;\n"
+                "        quantized_output.words[output_index >> 2u] = pack_fp8(\n"
+                "            fe4m3vec4(vec4(\n"
+                "                head_output[value_dim],\n"
+                "                head_output[value_dim + 1u],\n"
+                "                head_output[value_dim + 2u],\n"
+                "                head_output[value_dim + 3u]\n"
+                "            ) / block_scale)\n"
+                "        );\n"
+                "    }"
             )
         return render_shader_template(
             source_dir,
@@ -2115,6 +2209,15 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
                     "norm_weight", gated_delta_shape.group(8)
                 ),
                 "NORM_EPS": gated_delta_shape.group(9),
+                "FP8_EXTENSIONS": fp8_extensions,
+                "PHYSICAL_OUTPUT_BINDINGS": physical_output_bindings,
+                "A_LOG_BINDING": str(a_log_binding),
+                "DT_BIAS_BINDING": str(a_log_binding + 1),
+                "NORM_WEIGHT_BINDING": str(a_log_binding + 2),
+                "STATE_READ_BINDING": str(a_log_binding + 3),
+                "STATE_WRITE_BINDING": str(a_log_binding + 4),
+                "FP8_HELPERS": fp8_helpers,
+                "OUTPUT_STORE": output_store,
             },
         )
 

@@ -24,7 +24,14 @@ def can_emit_fp8_representation_from_producer(
     operation = producer.get("op")
     operation_shape_supported = (
         operation == "rms_norm" and int(scope["input_size"]) == hidden_size
-    ) or operation == "sigmoid_multiply"
+    ) or operation == "sigmoid_multiply" or (
+        operation == "gated_delta_step"
+        and int(scope["input_size"])
+        == int(producer.get("attrs", {}).get("value_heads", 0))
+        * int(producer.get("attrs", {}).get("value_head_width", 0))
+        and int(scope["block_columns"])
+        == int(producer.get("attrs", {}).get("value_head_width", 0))
+    )
     return (
         operation_shape_supported
         and producer.get("outputs") == [scope["logical_signal"]]

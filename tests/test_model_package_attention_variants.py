@@ -111,6 +111,8 @@ def test_compiler_renders_hybrid_recurrent_and_gated_attention_components(
         "gated_delta_step_k16x128_v16x128_af32_dtbf16_nf32_eps1e-06.comp",
         "gated_delta_step_k16x128_v16x128_abf16_dtbf16_nbf16_eps1e-06.comp",
         "gated_delta_scan_k16x128_v16x128_af32_dtbf16_nf32_eps1e-06.comp",
+        "gated_delta_step_k16x128_v16x128_af32_dtbf16_nf32_eps1e-06_qfp8b128.comp",
+        "gated_delta_scan_k16x128_v16x128_af32_dtbf16_nf32_eps1e-06_qfp8b128.comp",
         "split_bf16_2x8x256_head_interleaved.comp",
         "sigmoid_multiply_bf16.comp",
     }
@@ -126,6 +128,14 @@ def test_compiler_renders_hybrid_recurrent_and_gated_attention_components(
     ).read_text()
     temporal_recurrence = (
         tmp_path / "gated_delta_scan_k16x128_v16x128_af32_dtbf16_nf32_eps1e-06.comp"
+    ).read_text()
+    quantized_recurrence = (
+        tmp_path
+        / "gated_delta_step_k16x128_v16x128_af32_dtbf16_nf32_eps1e-06_qfp8b128.comp"
+    ).read_text()
+    quantized_temporal_recurrence = (
+        tmp_path
+        / "gated_delta_scan_k16x128_v16x128_af32_dtbf16_nf32_eps1e-06_qfp8b128.comp"
     ).read_text()
     split = (tmp_path / "split_bf16_2x8x256_head_interleaved.comp").read_text()
     assert "const uint CHANNELS = 6144u;" in convolution
@@ -148,6 +158,14 @@ def test_compiler_renders_hybrid_recurrent_and_gated_attention_components(
     )
     assert "recurrent_state[key_dim] = previous;" in temporal_recurrence
     assert "float next = recurrent_state[key_dim] + key * delta;" in temporal_recurrence
+    for source in (quantized_recurrence, quantized_temporal_recurrence):
+        assert "binding = 5) buffer QuantizedOutput" in source
+        assert "binding = 6) buffer OutputScale" in source
+        assert "binding = 10) readonly buffer StateRead" in source
+        assert "binding = 11) buffer StateWrite" in source
+        assert "subgroupMax(abs(head_output[value_dim]))" in source
+        assert "pack_fp8(" in source
+        assert "{{" not in source
     assert (
         "recurrent_state[key_dim] * head_decay + key * delta" not in temporal_recurrence
     )
@@ -156,4 +174,3 @@ def test_compiler_renders_hybrid_recurrent_and_gated_attention_components(
     assert all(
         "{{" not in (tmp_path / shader_file).read_text() for shader_file in shader_files
     )
-
