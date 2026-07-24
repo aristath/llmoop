@@ -205,53 +205,6 @@ impl RuntimeExecutionSchedule {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct RuntimeExecutionTimingModel {
-    observed_work_units: u64,
-    observed_duration_ns: u64,
-}
-
-impl RuntimeExecutionTimingModel {
-    pub fn observe(&mut self, cost: RuntimeExecutionCost, duration_ns: u64) {
-        if cost.work_units == 0 || duration_ns == 0 {
-            return;
-        }
-        if self.observed_work_units == 0 {
-            self.observed_work_units = cost.work_units;
-            self.observed_duration_ns = duration_ns;
-            return;
-        }
-
-        // Keep a stable, integer EWMA. Recent mounted-graph behavior matters
-        // more than old measurements after topology, placement, or signal shape
-        // changes, while one noisy activation must not replace the model.
-        self.observed_work_units = self
-            .observed_work_units
-            .saturating_mul(3)
-            .saturating_add(cost.work_units)
-            / 4;
-        self.observed_duration_ns = self
-            .observed_duration_ns
-            .saturating_mul(3)
-            .saturating_add(duration_ns)
-            / 4;
-    }
-
-    pub fn has_observation(self) -> bool {
-        self.observed_work_units != 0 && self.observed_duration_ns != 0
-    }
-
-    pub fn work_units_for_duration(self, target_duration_ns: u64) -> Option<u64> {
-        if !self.has_observation() || target_duration_ns == 0 {
-            return None;
-        }
-        let numerator =
-            u128::from(self.observed_work_units).checked_mul(u128::from(target_duration_ns))?;
-        let work_units = numerator / u128::from(self.observed_duration_ns);
-        u64::try_from(work_units.max(1)).ok()
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RuntimeExecutionScheduleError {
     EmptyRegions,
@@ -404,19 +357,5 @@ mod tests {
 
         assert_eq!(schedule.quanta.len(), 1);
         assert!(schedule.quanta[0].commits_state_after);
-    }
-
-    #[test]
-    fn timing_model_ignores_empty_samples_and_predicts_work_budget() {
-        let mut timing = RuntimeExecutionTimingModel::default();
-        timing.observe(RuntimeExecutionCost::default(), 100);
-        timing.observe(RuntimeExecutionCost::new(100, 0, 1), 0);
-        assert!(!timing.has_observation());
-
-        timing.observe(RuntimeExecutionCost::new(1_000, 0, 1), 2_000);
-        assert_eq!(timing.work_units_for_duration(500), Some(250));
-        timing.observe(RuntimeExecutionCost::new(2_000, 0, 1), 2_000);
-        assert_eq!(timing.observed_work_units, 1_250);
-        assert_eq!(timing.observed_duration_ns, 2_000);
     }
 }
