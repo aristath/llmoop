@@ -1,11 +1,11 @@
 {
   "schema": "nerve.model_graph.v1",
   "source": {
-    "model_dir": "/tmp/nerve-tiny-test-source-hp8kbl4v/source",
-    "weights_file": "/tmp/nerve-tiny-test-source-hp8kbl4v/source/model.safetensors",
+    "model_dir": "/tmp/nerve-tiny-test-source-e8r2d1vl/source",
+    "weights_file": "/tmp/nerve-tiny-test-source-e8r2d1vl/source/model.safetensors",
     "weights_files": [
       {
-        "path": "/tmp/nerve-tiny-test-source-hp8kbl4v/source/model.safetensors",
+        "path": "/tmp/nerve-tiny-test-source-e8r2d1vl/source/model.safetensors",
         "safetensors_header_bytes": 1064,
         "metadata": {}
       }

@@ -141,6 +141,57 @@ impl VulkanResidentInProcessPlacedPromptStream {
         Ok(())
     }
 
+    pub fn fork_preserving_state(
+        &self,
+        random_seed: u32,
+    ) -> Result<Self, VulkanResidentInProcessPlacedRuntimeError> {
+        if !self.is_idle() || self.pending_scheduler_activation.is_some() {
+            return Err(placed_scheduler_divergence(
+                "cannot fork a placed prompt stream while work is pending",
+            ));
+        }
+        let processor = self
+            .package
+            .create_stream_processor_inheriting_state_for_bound_devices(
+                &self.devices,
+                random_seed,
+                &self.processor,
+            )?;
+        Ok(Self {
+            package: Arc::clone(&self.package),
+            processor,
+            devices: self.devices.clone(),
+            session: VulkanResidentInProcessPlacedPromptSession {
+                next_stream_tick: self.session.next_stream_tick,
+                completed_prompt_event_count: self.session.completed_prompt_event_count,
+                generated_token_count: self.session.generated_token_count,
+                output_token_count: self.session.output_token_count,
+                transport: VulkanInProcessPlacedEdgeTransport::new(),
+            },
+            transient_state_pages: self.transient_state_pages.clone(),
+            active_input_event: None,
+            pending_input_events: VecDeque::new(),
+            speculative_draft_tokens: self.speculative_draft_tokens,
+            resident_feedback_submission_replay: None,
+            pending_scheduler_activation: None,
+        })
+    }
+
+    pub fn reset_transient_state(
+        &mut self,
+    ) -> Result<usize, VulkanResidentInProcessPlacedRuntimeError> {
+        if !self.is_idle() || self.pending_scheduler_activation.is_some() {
+            return Err(placed_scheduler_divergence(
+                "cannot reset placed prompt stream state while work is pending",
+            ));
+        }
+        let zeroed = self.processor.reset_transient_state_buffers()?;
+        self.transient_state_pages.clear();
+        self.session.next_stream_tick = 0;
+        self.resident_feedback_submission_replay = None;
+        Ok(zeroed)
+    }
+
     pub fn next_stream_tick(&self) -> u64 {
         self.session.next_stream_tick
     }

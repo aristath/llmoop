@@ -1,7 +1,7 @@
 {
   "schema": "nerve.vulkan_resident_model_package.v3",
-  "package_id": "model_0d29b926_vulkan_resident",
-  "compiler_fingerprint": "nerve.package_compiler_sha256.v1:953320df0ef6215fa21e452808187fbc8bf432054fd38b892f87a911e9401121",
+  "package_id": "model_ddd89a8d_vulkan_resident",
+  "compiler_fingerprint": "nerve.package_compiler_sha256.v1:74c7e4987187214b20bca30c0bcc4efd0bbb498014d3eecd7aae532841ea2301",
   "compiler_target": {
     "schema": "nerve.compiler_target.v1",
     "devices": [
@@ -2659,16 +2659,16 @@
         "sha256": "1722b53d01285e75090e6b44f3d2199d1de1294d7a6687bbf08267d20ec8b222"
       },
       "shaders/append_gqa_attention_bf16_q2_kv1_d8_scale0.353553391__sc7.spv": {
-        "byte_count": 19752,
-        "sha256": "4dc12295c12693fd56be4eacf4f606480f37c4c38b6e6fbfdc7f6c2718b7445b"
+        "byte_count": 22304,
+        "sha256": "f7ef90fa8d1445e477466eeb14939fa4aef7ebe2be8243a579f331b980767bbe"
       },
       "shaders/append_gqa_attention_temporal_read_bf16_q2_kv1_d8_scale0.353553391.spv": {
-        "byte_count": 18108,
-        "sha256": "be4a05039863cd01ff3a05c8483be8aad966433dba507576b93e12fa00ffad24"
+        "byte_count": 19432,
+        "sha256": "24b368edd7d99d6ecf73fb7485b0eeb440837829033022cf238240ec438e963a"
       },
       "shaders/append_kv_temporal_commit_bf16_kv1_d8_w0.spv": {
-        "byte_count": 3476,
-        "sha256": "e7833adf2a5b8f9d55a24c1f597a8cb21a9f2108210b5fe5f701241f021b8517"
+        "byte_count": 4800,
+        "sha256": "3daa6e584b650ea28a70796bbe03cff07e8a6084c11f50d6d8bd604c482dee0e"
       },
       "shaders/embedding_lookup_batch_bf16_32x16_scale1.spv": {
         "byte_count": 3360,
@@ -2860,7 +2860,7 @@
       },
       "transpiled/model.json": {
         "byte_count": 3694,
-        "sha256": "76181de06e8f2fd52f0b96760d4f7f84a76581c43c5f2eda638bf6fd3c8682de"
+        "sha256": "7815f88f0a8e038f4dae600870118c3a4ceb48cf62bbe70b5b0215a26c747229"
       },
       "transpiled/tensors.json": {
         "byte_count": 7272,

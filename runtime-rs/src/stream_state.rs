@@ -24,6 +24,14 @@ impl TransientStateKey {
 pub struct TransientStateBlockShape {
     pub bytes_per_activation: usize,
     pub activation_capacity: usize,
+    pub maximum_activation_count: Option<usize>,
+    pub retention: TransientStateRetention,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum TransientStateRetention {
+    Append,
+    MutableSingleton,
 }
 
 impl TransientStateBlockShape {
@@ -44,7 +52,28 @@ impl TransientStateBlockShape {
         Ok(Self {
             bytes_per_activation,
             activation_capacity,
+            maximum_activation_count: None,
+            retention: TransientStateRetention::Append,
         })
+    }
+
+    pub fn with_maximum_activation_count(
+        mut self,
+        maximum_activation_count: usize,
+    ) -> Result<Self, TransientStateError> {
+        if maximum_activation_count == 0 {
+            return Err(TransientStateError(
+                "transient state maximum activation count must be positive".to_string(),
+            ));
+        }
+        self.maximum_activation_count = Some(maximum_activation_count);
+        Ok(self)
+    }
+
+    pub fn mutable_singleton(byte_capacity: usize) -> Result<Self, TransientStateError> {
+        let mut shape = Self::new(byte_capacity, 1)?;
+        shape.retention = TransientStateRetention::MutableSingleton;
+        Ok(shape)
     }
 
     pub fn byte_capacity(&self) -> Result<usize, TransientStateError> {
@@ -63,6 +92,7 @@ pub struct TransientStateSlot {
     pub block_id: TransientStateBlockId,
     pub block_activation_offset: usize,
     pub block_activation_capacity: usize,
+    pub copy_from_block_id: Option<TransientStateBlockId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -295,25 +325,41 @@ impl TransientStateTable {
             return Ok(Vec::new());
         }
         let entry = self.entry_mut(key)?;
+        if entry.shape.retention == TransientStateRetention::MutableSingleton {
+            return reserve_mutable_singleton(arena, key, entry);
+        }
         let mut slots = Vec::with_capacity(activation_count);
         for _ in 0..activation_count {
-            if entry.logical_activation_count % entry.shape.activation_capacity == 0 {
+            let resident_activation_index = entry
+                .shape
+                .maximum_activation_count
+                .map(|maximum| entry.logical_activation_count % maximum)
+                .unwrap_or(entry.logical_activation_count);
+            let logical_page_index = resident_activation_index / entry.shape.activation_capacity;
+            let block_activation_offset =
+                resident_activation_index % entry.shape.activation_capacity;
+            let mut copy_from_block_id = None;
+            if logical_page_index == entry.block_ids.len() {
                 let block_id = arena.allocate_block(entry.shape.clone())?;
                 entry.block_ids.push(block_id);
+            } else {
+                let block_id = entry.block_ids[logical_page_index];
+                if arena.ref_count(block_id)? > 1 {
+                    let replacement = arena.allocate_block(entry.shape.clone())?;
+                    arena.release_block(block_id)?;
+                    entry.block_ids[logical_page_index] = replacement;
+                    copy_from_block_id = Some(block_id);
+                }
             }
             let logical_activation_index = entry.logical_activation_count;
-            let block_id = *entry
-                .block_ids
-                .last()
-                .expect("block exists after allocation boundary");
-            let block_activation_offset =
-                logical_activation_index % entry.shape.activation_capacity;
+            let block_id = entry.block_ids[logical_page_index];
             slots.push(TransientStateSlot {
                 key: key.clone(),
                 logical_activation_index,
                 block_id,
                 block_activation_offset,
                 block_activation_capacity: entry.shape.activation_capacity,
+                copy_from_block_id,
             });
             entry.logical_activation_count = entry.logical_activation_count.saturating_add(1);
         }
@@ -475,6 +521,38 @@ impl TransientStateTable {
     }
 }
 
+fn reserve_mutable_singleton(
+    arena: &mut TransientStateArena,
+    key: &TransientStateKey,
+    entry: &mut TransientStateEntry,
+) -> Result<Vec<TransientStateSlot>, TransientStateError> {
+    let mut copy_from_block_id = None;
+    let block_id = match entry.block_ids.first().copied() {
+        Some(block_id) if arena.ref_count(block_id)? > 1 => {
+            let replacement = arena.allocate_block(entry.shape.clone())?;
+            arena.release_block(block_id)?;
+            entry.block_ids[0] = replacement;
+            copy_from_block_id = Some(block_id);
+            replacement
+        }
+        Some(block_id) => block_id,
+        None => {
+            let block_id = arena.allocate_block(entry.shape.clone())?;
+            entry.block_ids.push(block_id);
+            entry.logical_activation_count = 1;
+            block_id
+        }
+    };
+    Ok(vec![TransientStateSlot {
+        key: key.clone(),
+        logical_activation_index: 0,
+        block_id,
+        block_activation_offset: 0,
+        block_activation_capacity: 1,
+        copy_from_block_id,
+    }])
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransientStateError(pub String);
 
@@ -582,6 +660,87 @@ mod tests {
         child.reset_all(&mut arena).unwrap();
         assert_eq!(arena.ref_count(block_id).unwrap(), 0);
         assert_eq!(arena.snapshot().unwrap().free_block_count, 1);
+    }
+
+    #[test]
+    fn transient_state_fork_copies_a_shared_partial_append_block_before_writing() {
+        let mut arena = TransientStateArena::new();
+        let mut parent = TransientStateTable::new("parent").unwrap();
+        parent.declare_state(key(), shape()).unwrap();
+        let shared_block = parent.append_activations(&mut arena, &key(), 3).unwrap()[0].block_id;
+        let mut child = parent.fork(&mut arena, "child").unwrap();
+
+        let child_slot = child.append_activations(&mut arena, &key(), 1).unwrap()[0].clone();
+
+        assert_ne!(child_slot.block_id, shared_block);
+        assert_eq!(child_slot.copy_from_block_id, Some(shared_block));
+        assert_eq!(child_slot.block_activation_offset, 3);
+        assert_eq!(parent.snapshot().entries[0].block_ids, vec![shared_block]);
+        assert_eq!(arena.ref_count(shared_block).unwrap(), 1);
+        assert_eq!(arena.ref_count(child_slot.block_id).unwrap(), 1);
+    }
+
+    #[test]
+    fn bounded_append_state_reuses_its_physical_block_after_wrapping() {
+        let mut arena = TransientStateArena::new();
+        let mut table = TransientStateTable::new("stream").unwrap();
+        let bounded = shape().with_maximum_activation_count(4).unwrap();
+        table.declare_state(key(), bounded).unwrap();
+        let first_block = table.append_activations(&mut arena, &key(), 4).unwrap()[0].block_id;
+
+        let wrapped = table.append_activations(&mut arena, &key(), 1).unwrap();
+
+        assert_eq!(wrapped[0].logical_activation_index, 4);
+        assert_eq!(wrapped[0].block_activation_offset, 0);
+        assert_eq!(wrapped[0].block_id, first_block);
+        assert_eq!(wrapped[0].copy_from_block_id, None);
+        assert_eq!(table.snapshot().block_count, 1);
+        assert_eq!(arena.snapshot().unwrap().allocated_block_count, 1);
+        assert_eq!(arena.snapshot().unwrap().live_block_count, 1);
+    }
+
+    #[test]
+    fn bounded_append_state_copies_a_shared_page_before_wrapped_write() {
+        let mut arena = TransientStateArena::new();
+        let mut parent = TransientStateTable::new("parent").unwrap();
+        let bounded = shape().with_maximum_activation_count(4).unwrap();
+        parent.declare_state(key(), bounded).unwrap();
+        let shared_block = parent.append_activations(&mut arena, &key(), 4).unwrap()[0].block_id;
+        let mut child = parent.fork(&mut arena, "child").unwrap();
+
+        let wrapped = child.append_activations(&mut arena, &key(), 1).unwrap()[0].clone();
+
+        assert_eq!(wrapped.logical_activation_index, 4);
+        assert_eq!(wrapped.block_activation_offset, 0);
+        assert_ne!(wrapped.block_id, shared_block);
+        assert_eq!(wrapped.copy_from_block_id, Some(shared_block));
+        assert_eq!(parent.snapshot().entries[0].block_ids, vec![shared_block]);
+        assert_eq!(arena.ref_count(shared_block).unwrap(), 1);
+        assert_eq!(arena.ref_count(wrapped.block_id).unwrap(), 1);
+    }
+
+    #[test]
+    fn mutable_singleton_state_reuses_one_block_and_copies_on_forked_write() {
+        let mut arena = TransientStateArena::new();
+        let mut parent = TransientStateTable::new("parent").unwrap();
+        let mutable = TransientStateBlockShape::mutable_singleton(128).unwrap();
+        parent.declare_state(key(), mutable).unwrap();
+
+        let first = parent.append_activations(&mut arena, &key(), 64).unwrap();
+        assert_eq!(first.len(), 1);
+        let shared_block = first[0].block_id;
+        assert_eq!(parent.snapshot().logical_activation_count, 1);
+
+        let mut child = parent.fork(&mut arena, "child").unwrap();
+        let child_slot = child.append_activations(&mut arena, &key(), 64).unwrap()[0].clone();
+        assert_ne!(child_slot.block_id, shared_block);
+        assert_eq!(child_slot.copy_from_block_id, Some(shared_block));
+        assert_eq!(child.snapshot().logical_activation_count, 1);
+
+        let next = child.append_activations(&mut arena, &key(), 64).unwrap();
+        assert_eq!(next.len(), 1);
+        assert_eq!(next[0].block_id, child_slot.block_id);
+        assert_eq!(next[0].copy_from_block_id, None);
     }
 
     #[test]

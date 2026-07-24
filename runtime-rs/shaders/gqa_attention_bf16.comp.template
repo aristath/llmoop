@@ -45,6 +45,7 @@ const uint MAX_SUBGROUPS_PER_TOKEN = (HEAD_WIDTH + 31u) / 32u;
 const float ATTENTION_SCALE = {{ATTENTION_SCALE}};
 const uint ATTENTION_WINDOW = {{ATTENTION_WINDOW}}u;
 const float LOWEST_FLOAT = -3.4028234663852886e38;
+const uint STATE_PAGE_TABLE_WORDS = 9u;
 
 shared float query_values[{{HEAD_WIDTH}}];
 shared float subgroup_partials[{{TILE_TOKENS}} * MAX_SUBGROUPS_PER_TOKEN];
@@ -75,16 +76,40 @@ float read_query(uint index) {
     return bf16_to_f32(value);
 }
 
+uint k_memory_word(uint logical_word) {
+    uint logical_byte = logical_word * 4u;
+    if (logical_byte < k_memory.words[2]) {
+        return (k_memory.words[3] + logical_byte) / 4u;
+    }
+    uint dynamic_byte = logical_byte - k_memory.words[2];
+    uint page_bytes = k_memory.words[4];
+    uint physical_page =
+        k_memory.words[STATE_PAGE_TABLE_WORDS + dynamic_byte / page_bytes];
+    return (k_memory.words[8] + physical_page * page_bytes + dynamic_byte % page_bytes) / 4u;
+}
+
+uint v_memory_word(uint logical_word) {
+    uint logical_byte = logical_word * 4u;
+    if (logical_byte < v_memory.words[2]) {
+        return (v_memory.words[3] + logical_byte) / 4u;
+    }
+    uint dynamic_byte = logical_byte - v_memory.words[2];
+    uint page_bytes = v_memory.words[4];
+    uint physical_page =
+        v_memory.words[STATE_PAGE_TABLE_WORDS + dynamic_byte / page_bytes];
+    return (v_memory.words[8] + physical_page * page_bytes + dynamic_byte % page_bytes) / 4u;
+}
+
 float read_k(uint slot, uint kv_head, uint dim) {
     uint element_index = (slot * SLOT_ELEMENT_COUNT) + (kv_head * HEAD_WIDTH) + dim;
-    uint packed = k_memory.words[element_index >> 1];
+    uint packed = k_memory.words[k_memory_word(element_index >> 1)];
     uint value = ((element_index & 1u) == 0u) ? (packed & 0xffffu) : (packed >> 16);
     return bf16_to_f32(value);
 }
 
 float read_v(uint slot, uint kv_head, uint dim) {
     uint element_index = (slot * SLOT_ELEMENT_COUNT) + KV_ELEMENT_COUNT + (kv_head * HEAD_WIDTH) + dim;
-    uint packed = v_memory.words[element_index >> 1];
+    uint packed = v_memory.words[v_memory_word(element_index >> 1)];
     uint value = ((element_index & 1u) == 0u) ? (packed & 0xffffu) : (packed >> 16);
     return bf16_to_f32(value);
 }

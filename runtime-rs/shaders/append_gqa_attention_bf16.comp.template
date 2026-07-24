@@ -55,6 +55,7 @@ const uint MAX_SUBGROUPS_PER_TOKEN = (HEAD_WIDTH + 31u) / 32u;
 const float ATTENTION_SCALE = {{ATTENTION_SCALE}};
 const uint ATTENTION_WINDOW = {{ATTENTION_WINDOW}}u;
 const float LOWEST_FLOAT = -3.4028234663852886e38;
+const uint STATE_PAGE_TABLE_WORDS = 9u;
 
 shared float query_values[{{HEAD_WIDTH}}];
 shared float subgroup_partials[{{TILE_TOKENS}} * MAX_SUBGROUPS_PER_TOKEN];
@@ -84,6 +85,40 @@ float read_packed_bf16(uint packed, uint element_index) {
     return bf16_to_f32(value);
 }
 
+uint kv_state_read_word(uint logical_word) {
+    uint logical_byte = logical_word * 4u;
+    uint static_bytes = kv_state_read.words[2];
+    if (logical_byte < static_bytes) {
+        return (kv_state_read.words[3] + logical_byte) / 4u;
+    }
+    uint dynamic_byte = logical_byte - static_bytes;
+    uint page_bytes = kv_state_read.words[4];
+    uint logical_page = dynamic_byte / page_bytes;
+    uint physical_page = kv_state_read.words[STATE_PAGE_TABLE_WORDS + logical_page];
+    return (
+        kv_state_read.words[8]
+        + physical_page * page_bytes
+        + dynamic_byte % page_bytes
+    ) / 4u;
+}
+
+uint kv_state_write_word(uint logical_word) {
+    uint logical_byte = logical_word * 4u;
+    uint static_bytes = kv_state_write.words[2];
+    if (logical_byte < static_bytes) {
+        return (kv_state_write.words[3] + logical_byte) / 4u;
+    }
+    uint dynamic_byte = logical_byte - static_bytes;
+    uint page_bytes = kv_state_write.words[4];
+    uint logical_page = dynamic_byte / page_bytes;
+    uint physical_page = kv_state_write.words[STATE_PAGE_TABLE_WORDS + logical_page];
+    return (
+        kv_state_write.words[8]
+        + physical_page * page_bytes
+        + dynamic_byte % page_bytes
+    ) / 4u;
+}
+
 float read_query(uint index) {
     return read_packed_bf16(query_frame.words[index >> 1], index);
 }
@@ -103,7 +138,10 @@ float read_k(uint token_index, uint tokens, uint slot, uint kv_head, uint dim) {
         return read_current_k(kv_head, dim);
     }
     uint element_index = (slot * SLOT_ELEMENT_COUNT) + (kv_head * HEAD_WIDTH) + dim;
-    return read_packed_bf16(kv_state_read.words[element_index >> 1], element_index);
+    return read_packed_bf16(
+        kv_state_read.words[kv_state_read_word(element_index >> 1)],
+        element_index
+    );
 }
 
 float read_v(uint token_index, uint tokens, uint slot, uint kv_head, uint dim) {
@@ -112,7 +150,10 @@ float read_v(uint token_index, uint tokens, uint slot, uint kv_head, uint dim) {
     }
     uint element_index =
         (slot * SLOT_ELEMENT_COUNT) + KV_ELEMENT_COUNT + (kv_head * HEAD_WIDTH) + dim;
-    return read_packed_bf16(kv_state_read.words[element_index >> 1], element_index);
+    return read_packed_bf16(
+        kv_state_read.words[kv_state_read_word(element_index >> 1)],
+        element_index
+    );
 }
 
 #if {{HAS_SINKS}}
@@ -138,8 +179,9 @@ void write_current_kv(uint query_head, uint kv_head, uint local_index, uint capa
         uint slot = stream_control.words[1] % capacity;
         uint slot_base = slot * SLOT_WORD_COUNT;
         uint head_word = kv_head * (HEAD_WIDTH / 2u) + local_index;
-        kv_state_write.words[slot_base + head_word] = current_k_frame.words[head_word];
-        kv_state_write.words[slot_base + KV_WORD_COUNT + head_word] =
+        kv_state_write.words[kv_state_write_word(slot_base + head_word)] =
+            current_k_frame.words[head_word];
+        kv_state_write.words[kv_state_write_word(slot_base + KV_WORD_COUNT + head_word)] =
             current_v_frame.words[head_word];
     }
 }

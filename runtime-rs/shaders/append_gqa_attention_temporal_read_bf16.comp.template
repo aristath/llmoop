@@ -55,6 +55,7 @@ const uint MAX_SUBGROUPS_PER_TOKEN = (HEAD_WIDTH + 31u) / 32u;
 const float ATTENTION_SCALE = {{ATTENTION_SCALE}};
 const uint ATTENTION_WINDOW = {{ATTENTION_WINDOW}}u;
 const float LOWEST_FLOAT = -3.4028234663852886e38;
+const uint STATE_PAGE_TABLE_WORDS = 9u;
 
 shared float query_values[{{HEAD_WIDTH}}];
 shared float subgroup_partials[{{TILE_TOKENS}} * MAX_SUBGROUPS_PER_TOKEN];
@@ -80,6 +81,23 @@ uint f32_to_bf16(float value) {
 float read_packed_bf16(uint packed, uint element_index) {
     uint value = ((element_index & 1u) == 0u) ? (packed & 0xffffu) : (packed >> 16);
     return bf16_to_f32(value);
+}
+
+uint kv_state_read_word(uint logical_word) {
+    uint logical_byte = logical_word * 4u;
+    uint static_bytes = kv_state_read.words[2];
+    if (logical_byte < static_bytes) {
+        return (kv_state_read.words[3] + logical_byte) / 4u;
+    }
+    uint dynamic_byte = logical_byte - static_bytes;
+    uint page_bytes = kv_state_read.words[4];
+    uint logical_page = dynamic_byte / page_bytes;
+    uint physical_page = kv_state_read.words[STATE_PAGE_TABLE_WORDS + logical_page];
+    return (
+        kv_state_read.words[8]
+        + physical_page * page_bytes
+        + dynamic_byte % page_bytes
+    ) / 4u;
 }
 
 float read_query(uint position, uint index) {
@@ -109,7 +127,10 @@ float read_k(uint absolute_tick, uint capacity, uint kv_head, uint dim) {
     }
     uint slot = absolute_tick % capacity;
     uint element_index = slot * SLOT_ELEMENT_COUNT + kv_head * HEAD_WIDTH + dim;
-    return read_packed_bf16(kv_state_read.words[element_index >> 1], element_index);
+    return read_packed_bf16(
+        kv_state_read.words[kv_state_read_word(element_index >> 1)],
+        element_index
+    );
 }
 
 float read_v(uint absolute_tick, uint capacity, uint kv_head, uint dim) {
@@ -123,7 +144,10 @@ float read_v(uint absolute_tick, uint capacity, uint kv_head, uint dim) {
     uint slot = absolute_tick % capacity;
     uint element_index =
         slot * SLOT_ELEMENT_COUNT + KV_ELEMENT_COUNT + kv_head * HEAD_WIDTH + dim;
-    return read_packed_bf16(kv_state_read.words[element_index >> 1], element_index);
+    return read_packed_bf16(
+        kv_state_read.words[kv_state_read_word(element_index >> 1)],
+        element_index
+    );
 }
 
 #if {{HAS_SINKS}}

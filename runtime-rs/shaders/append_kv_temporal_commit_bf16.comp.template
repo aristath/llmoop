@@ -27,6 +27,24 @@ const uint ATTENTION_WINDOW = {{ATTENTION_WINDOW}}u;
 const uint HEAD_WORD_COUNT = HEAD_WIDTH / 2u;
 const uint KV_WORD_COUNT = KV_HEADS * HEAD_WORD_COUNT;
 const uint SLOT_WORD_COUNT = KV_WORD_COUNT * 2u;
+const uint STATE_PAGE_TABLE_WORDS = 9u;
+
+uint kv_state_write_word(uint logical_word) {
+    uint logical_byte = logical_word * 4u;
+    uint static_bytes = kv_state_write.words[2];
+    if (logical_byte < static_bytes) {
+        return (kv_state_write.words[3] + logical_byte) / 4u;
+    }
+    uint dynamic_byte = logical_byte - static_bytes;
+    uint page_bytes = kv_state_write.words[4];
+    uint logical_page = dynamic_byte / page_bytes;
+    uint physical_page = kv_state_write.words[STATE_PAGE_TABLE_WORDS + logical_page];
+    return (
+        kv_state_write.words[8]
+        + physical_page * page_bytes
+        + dynamic_byte % page_bytes
+    ) / 4u;
+}
 
 void main() {
     uint kv_head = gl_WorkGroupID.x;
@@ -42,8 +60,9 @@ void main() {
             uint slot = (batch_control.start_stream_tick_low + position) % capacity;
             uint source = position * KV_WORD_COUNT + head_word;
             uint destination = slot * SLOT_WORD_COUNT + head_word;
-            kv_state_write.words[destination] = current_k_frames.words[source];
-            kv_state_write.words[destination + KV_WORD_COUNT] =
+            kv_state_write.words[kv_state_write_word(destination)] =
+                current_k_frames.words[source];
+            kv_state_write.words[kv_state_write_word(destination + KV_WORD_COUNT)] =
                 current_v_frames.words[source];
         }
     }

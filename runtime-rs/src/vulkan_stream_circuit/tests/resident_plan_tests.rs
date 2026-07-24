@@ -154,8 +154,10 @@ fn bounds_each_dynamic_state_buffer_by_its_own_activation_limit() {
         .unwrap();
 
     assert_eq!(state.max_dynamic_activations, Some(2));
-    assert_eq!(stream_state_byte_capacity(state, 4).unwrap(), 4_096);
-    assert_eq!(descriptor_state_byte_capacity(state, 4).unwrap(), 4_096);
+    let layout = VulkanTransientStateBufferLayout::for_state(state, 4).unwrap();
+    assert_eq!(layout.dynamic_page_byte_capacity, 4_096);
+    assert_eq!(layout.byte_capacity, 4_352);
+    assert_eq!(descriptor_state_byte_capacity(state, 4).unwrap(), 4_352);
 }
 
 #[test]

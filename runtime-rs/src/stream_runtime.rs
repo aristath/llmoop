@@ -731,17 +731,54 @@ impl RuntimeStreamScheduler {
             self.in_flight.remove(&activation_id);
         }
         let snapshot = {
-            let arena = &mut self.transient_state_arena;
             let stream = self.streams.get_mut(stream_id).ok_or_else(|| {
                 RuntimeStreamSchedulerError(format!("unknown stream {stream_id:?}"))
             })?;
             stream.in_flight_activation_ids.clear();
-            stream.transient_state_table.reset_all(arena)?;
             stream.status = RuntimeStreamStatus::Interrupted;
             stream.snapshot()
         };
         self.active_queue.retain(|candidate| candidate != stream_id);
         Ok(snapshot)
+    }
+
+    pub fn reset_stream_transient_state(
+        &mut self,
+        stream_id: &str,
+    ) -> Result<RuntimeStreamSnapshot, RuntimeStreamSchedulerError> {
+        let arena = &mut self.transient_state_arena;
+        let stream = self
+            .streams
+            .get_mut(stream_id)
+            .ok_or_else(|| RuntimeStreamSchedulerError(format!("unknown stream {stream_id:?}")))?;
+        if !stream.in_flight_activation_ids.is_empty() {
+            return Err(RuntimeStreamSchedulerError(format!(
+                "cannot reset transient state for stream {stream_id:?} while activations are in flight"
+            )));
+        }
+        stream.transient_state_table.reset_all(arena)?;
+        Ok(stream.snapshot())
+    }
+
+    pub fn remove_stream(
+        &mut self,
+        stream_id: &str,
+    ) -> Result<RuntimeStreamSnapshot, RuntimeStreamSchedulerError> {
+        let mut stream = self
+            .streams
+            .remove(stream_id)
+            .ok_or_else(|| RuntimeStreamSchedulerError(format!("unknown stream {stream_id:?}")))?;
+        if !stream.in_flight_activation_ids.is_empty() {
+            self.streams.insert(stream_id.to_string(), stream);
+            return Err(RuntimeStreamSchedulerError(format!(
+                "cannot remove stream {stream_id:?} while activations are in flight"
+            )));
+        }
+        stream
+            .transient_state_table
+            .reset_all(&mut self.transient_state_arena)?;
+        self.active_queue.retain(|candidate| candidate != stream_id);
+        Ok(stream.snapshot())
     }
 
     pub fn close_stream_after_current(

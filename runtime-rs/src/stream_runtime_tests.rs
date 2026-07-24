@@ -225,7 +225,7 @@ fn scheduler_reserves_transient_state_slots_for_prefill_and_decode() {
 }
 
 #[test]
-fn scheduler_interrupt_releases_transient_state_reservations() {
+fn scheduler_interrupt_preserves_state_until_an_explicit_reset_reclaims_it() {
     let mut scheduler = RuntimeStreamScheduler::new();
     scheduler.add_stream("stream_a").unwrap();
     scheduler
@@ -249,8 +249,47 @@ fn scheduler_interrupt_releases_transient_state_reservations() {
 
     let interrupted = scheduler.interrupt_stream("stream_a", "cancel").unwrap();
 
-    assert_eq!(interrupted.transient_state_block_count, 0);
-    assert_eq!(interrupted.transient_state_logical_activation_count, 0);
+    assert_eq!(interrupted.transient_state_block_count, 1);
+    assert_eq!(interrupted.transient_state_logical_activation_count, 2);
+    assert_eq!(
+        scheduler.snapshot().transient_state_arena.live_block_count,
+        1
+    );
+    scheduler.reset_stream_transient_state("stream_a").unwrap();
+    assert_eq!(
+        scheduler.snapshot().transient_state_arena.live_block_count,
+        0
+    );
+    assert_eq!(
+        scheduler.snapshot().transient_state_arena.free_block_count,
+        1
+    );
+}
+
+#[test]
+fn scheduler_stream_removal_reclaims_all_transient_blocks() {
+    let mut scheduler = RuntimeStreamScheduler::new();
+    scheduler
+        .add_stream_with_state_declarations("stream_a", [(state_key(), state_shape())])
+        .unwrap();
+    scheduler
+        .enqueue_input_event("stream_a", RuntimeStreamInputEvent::new("event_0", [1], 0))
+        .unwrap();
+    let activation = scheduler.schedule_step(budget(1)).unwrap().activations[0].clone();
+    scheduler
+        .complete_activation(
+            activation.id,
+            RuntimeStreamActivationOutcome::generated_tokens([], false),
+        )
+        .unwrap();
+    assert_eq!(
+        scheduler.snapshot().transient_state_arena.live_block_count,
+        1
+    );
+
+    scheduler.remove_stream("stream_a").unwrap();
+
+    assert_eq!(scheduler.snapshot().stream_count, 0);
     assert_eq!(
         scheduler.snapshot().transient_state_arena.live_block_count,
         0

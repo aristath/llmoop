@@ -22,6 +22,7 @@ const uint HEADS = {{HEADS}}u;
 const uint BLOCK_WIDTH = {{BLOCK_WIDTH}}u;
 const uint KERNEL_WIDTH = {{KERNEL_WIDTH}}u;
 const uint HISTORY_WIDTH = KERNEL_WIDTH - 1u;
+const uint STATE_PAGE_TABLE_WORDS = 9u;
 
 shared float convolved[BLOCK_WIDTH];
 shared float recurrent_output[BLOCK_WIDTH];
@@ -44,10 +45,72 @@ float read_input_gate_bias(uint index) { return unpack_bf16(input_gate_bias.word
 float read_recurrent_gate_weight(uint index) { return unpack_bf16(recurrent_gate_weight.words[index >> 1u], index); }
 float read_recurrent_gate_bias(uint index) { return unpack_bf16(recurrent_gate_bias.words[index >> 1u], index); }
 float read_recurrent_param(uint index) { return unpack_bf16(recurrent_param.words[index >> 1u], index); }
-float read_conv_state(uint index) { return unpack_bf16(conv_state_read.words[index >> 1u], index); }
+uint conv_state_read_word(uint logical_word) {
+    uint logical_byte = logical_word * 4u;
+    if (logical_byte < conv_state_read.words[2]) {
+        return (conv_state_read.words[3] + logical_byte) / 4u;
+    }
+    uint dynamic_byte = logical_byte - conv_state_read.words[2];
+    uint page_bytes = conv_state_read.words[4];
+    uint physical_page =
+        conv_state_read.words[STATE_PAGE_TABLE_WORDS + dynamic_byte / page_bytes];
+    return (
+        conv_state_read.words[8] + physical_page * page_bytes + dynamic_byte % page_bytes
+    ) / 4u;
+}
+uint conv_state_write_word(uint logical_word) {
+    uint logical_byte = logical_word * 4u;
+    if (logical_byte < conv_state_write.words[2]) {
+        return (conv_state_write.words[3] + logical_byte) / 4u;
+    }
+    uint dynamic_byte = logical_byte - conv_state_write.words[2];
+    uint page_bytes = conv_state_write.words[4];
+    uint physical_page =
+        conv_state_write.words[STATE_PAGE_TABLE_WORDS + dynamic_byte / page_bytes];
+    return (
+        conv_state_write.words[8] + physical_page * page_bytes + dynamic_byte % page_bytes
+    ) / 4u;
+}
+uint recurrent_state_read_index(uint logical_index) {
+    uint logical_byte = logical_index * 4u;
+    uint static_bytes = floatBitsToUint(recurrent_state_read.values[2]);
+    if (logical_byte < static_bytes) {
+        return (floatBitsToUint(recurrent_state_read.values[3]) + logical_byte) / 4u;
+    }
+    uint dynamic_byte = logical_byte - static_bytes;
+    uint page_bytes = floatBitsToUint(recurrent_state_read.values[4]);
+    uint physical_page = floatBitsToUint(
+        recurrent_state_read.values[STATE_PAGE_TABLE_WORDS + dynamic_byte / page_bytes]
+    );
+    return (
+        floatBitsToUint(recurrent_state_read.values[8])
+        + physical_page * page_bytes
+        + dynamic_byte % page_bytes
+    ) / 4u;
+}
+uint recurrent_state_write_index(uint logical_index) {
+    uint logical_byte = logical_index * 4u;
+    uint static_bytes = floatBitsToUint(recurrent_state_write.values[2]);
+    if (logical_byte < static_bytes) {
+        return (floatBitsToUint(recurrent_state_write.values[3]) + logical_byte) / 4u;
+    }
+    uint dynamic_byte = logical_byte - static_bytes;
+    uint page_bytes = floatBitsToUint(recurrent_state_write.values[4]);
+    uint physical_page = floatBitsToUint(
+        recurrent_state_write.values[STATE_PAGE_TABLE_WORDS + dynamic_byte / page_bytes]
+    );
+    return (
+        floatBitsToUint(recurrent_state_write.values[8])
+        + physical_page * page_bytes
+        + dynamic_byte % page_bytes
+    ) / 4u;
+}
+float read_conv_state(uint index) {
+    return unpack_bf16(conv_state_read.words[conv_state_read_word(index >> 1u)], index);
+}
 void write_conv_state(uint index, float value) {
     uint encoded = f32_to_bf16(value);
-    uint word = index >> 1u;
+    uint word = conv_state_write_word(index >> 1u);
     uint previous = conv_state_write.words[word];
     conv_state_write.words[word] = (index & 1u) == 0u
         ? (previous & 0xffff0000u) | encoded
@@ -105,8 +168,10 @@ void main() {
         ? 1.0
         : round_bf16(sqrt(max(0.0, 1.0 - round_bf16(recurrence * recurrence))));
     float normalized = round_bf16(round_bf16(convolved[lane] * input_gate) * multiplier);
-    float next_state = recurrence * recurrent_state_read.values[channel] + normalized;
-    recurrent_state_write.values[channel] = next_state;
+    float next_state =
+        recurrence * recurrent_state_read.values[recurrent_state_read_index(channel)]
+        + normalized;
+    recurrent_state_write.values[recurrent_state_write_index(channel)] = next_state;
     recurrent_output[lane] = next_state;
     barrier();
     if ((lane & 1u) == 0u) {

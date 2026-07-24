@@ -55,6 +55,7 @@ const uint KEY_HEAD_REPEAT = {{KEY_HEAD_REPEAT}}u;
 const uint KEY_WIDTH = KEY_HEADS * KEY_HEAD_WIDTH;
 const uint VALUE_WIDTH = VALUE_HEADS * VALUE_HEAD_WIDTH;
 const float NORM_EPS = {{NORM_EPS}};
+const uint STATE_PAGE_TABLE_WORDS = 9u;
 
 shared float q_inv_norm;
 shared float k_inv_norm;
@@ -110,6 +111,42 @@ float softplus(float value) {
 }
 {{FP8_HELPERS}}
 
+uint state_read_index(uint logical_index) {
+    uint logical_byte = logical_index * 4u;
+    uint static_bytes = floatBitsToUint(state_read.values[2]);
+    if (logical_byte < static_bytes) {
+        return (floatBitsToUint(state_read.values[3]) + logical_byte) / 4u;
+    }
+    uint dynamic_byte = logical_byte - static_bytes;
+    uint page_bytes = floatBitsToUint(state_read.values[4]);
+    uint physical_page = floatBitsToUint(
+        state_read.values[STATE_PAGE_TABLE_WORDS + dynamic_byte / page_bytes]
+    );
+    return (
+        floatBitsToUint(state_read.values[8])
+        + physical_page * page_bytes
+        + dynamic_byte % page_bytes
+    ) / 4u;
+}
+
+uint state_write_index(uint logical_index) {
+    uint logical_byte = logical_index * 4u;
+    uint static_bytes = floatBitsToUint(state_write.values[2]);
+    if (logical_byte < static_bytes) {
+        return (floatBitsToUint(state_write.values[3]) + logical_byte) / 4u;
+    }
+    uint dynamic_byte = logical_byte - static_bytes;
+    uint page_bytes = floatBitsToUint(state_write.values[4]);
+    uint physical_page = floatBitsToUint(
+        state_write.values[STATE_PAGE_TABLE_WORDS + dynamic_byte / page_bytes]
+    );
+    return (
+        floatBitsToUint(state_write.values[8])
+        + physical_page * page_bytes
+        + dynamic_byte % page_bytes
+    ) / 4u;
+}
+
 void main() {
     uint value_head = gl_WorkGroupID.x;
     uint value_dim = gl_LocalInvocationID.x;
@@ -147,7 +184,7 @@ void main() {
     float key_memory = 0.0;
     for (uint key_dim = 0u; key_dim < KEY_HEAD_WIDTH; key_dim++) {
         uint state_index = state_base + key_dim * VALUE_HEAD_WIDTH + value_dim;
-        float previous = state_read.values[state_index] * decay;
+        float previous = state_read.values[state_read_index(state_index)] * decay;
         float key = read_qkv(k_base + key_dim) * k_inv_norm;
         key_memory = fma(previous, key, key_memory);
     }
@@ -159,8 +196,8 @@ void main() {
     for (uint key_dim = 0u; key_dim < KEY_HEAD_WIDTH; key_dim++) {
         uint state_index = state_base + key_dim * VALUE_HEAD_WIDTH + value_dim;
         float key = read_qkv(k_base + key_dim) * k_inv_norm;
-        float next = state_read.values[state_index] * decay + key * delta;
-        state_write.values[state_index] = next;
+        float next = state_read.values[state_read_index(state_index)] * decay + key * delta;
+        state_write.values[state_write_index(state_index)] = next;
         float query = read_qkv(q_base + key_dim) * q_inv_norm;
         mixed = fma(next, query * attention_scale, mixed);
     }

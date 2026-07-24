@@ -79,8 +79,10 @@ impl VulkanResidentInProcessPlacedModelPackage {
                 .resident_plan
                 .stream_state_buffers
             {
-                if let Some(declaration) =
-                    transient_state_declaration_for_resident_state_buffer(state)?
+                if let Some(declaration) = transient_state_declaration_for_resident_state_buffer(
+                    state,
+                    self.dynamic_state_capacity_activations,
+                )?
                 {
                     declarations.insert(declaration.key.clone(), declaration);
                 }
@@ -92,21 +94,31 @@ impl VulkanResidentInProcessPlacedModelPackage {
 
 fn transient_state_declaration_for_resident_state_buffer(
     state: &VulkanResidentStateBuffer,
+    package_dynamic_state_capacity_activations: usize,
 ) -> Result<Option<VulkanResidentStreamStateDeclaration>, VulkanResidentTokenModelPackageError> {
-    let Some(bytes_per_activation) = state.bytes_per_activation else {
-        return Ok(None);
-    };
-    let activation_capacity = state
-        .max_dynamic_activations
-        .map(|limit| limit.min(VULKAN_BACKEND_LOOP_MAX_WINDOW))
-        .unwrap_or(VULKAN_BACKEND_LOOP_MAX_WINDOW);
-    let block_shape = TransientStateBlockShape::new(bytes_per_activation, activation_capacity)
-        .map_err(|error| {
-            VulkanResidentTokenModelPackageError::new(format!(
-                "failed to declare transient state for {}.{}: {error}",
-                state.component_id, state.state_id
-            ))
-        })?;
+    let block_shape = match state.bytes_per_activation {
+        Some(bytes_per_activation) => {
+            let maximum_activation_count = state
+                .max_dynamic_activations
+                .map(|limit| limit.min(package_dynamic_state_capacity_activations))
+                .unwrap_or(package_dynamic_state_capacity_activations);
+            let activation_capacity =
+                maximum_activation_count.min(VULKAN_BACKEND_LOOP_MAX_WINDOW);
+            TransientStateBlockShape::new(bytes_per_activation, activation_capacity).and_then(
+                |shape| shape.with_maximum_activation_count(maximum_activation_count),
+            )
+        }
+        None => match state.static_bytes {
+            Some(static_bytes) => TransientStateBlockShape::mutable_singleton(static_bytes),
+            None => return Ok(None),
+        },
+    }
+    .map_err(|error| {
+        VulkanResidentTokenModelPackageError::new(format!(
+            "failed to declare transient state for {}.{}: {error}",
+            state.component_id, state.state_id
+        ))
+    })?;
     Ok(Some(VulkanResidentStreamStateDeclaration {
         key: TransientStateKey::new(state.component_id.clone(), state.state_id.clone()),
         block_shape,

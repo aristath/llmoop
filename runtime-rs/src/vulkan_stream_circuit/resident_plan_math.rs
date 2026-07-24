@@ -44,49 +44,6 @@ fn optional_state_contribution_bytes(
     }
 }
 
-fn stream_state_byte_capacity(
-    state: &VulkanResidentStateBuffer,
-    dynamic_state_capacity_activations: usize,
-) -> Result<usize, VulkanError> {
-    let static_bytes = state.static_bytes.unwrap_or(0);
-    let dynamic_bytes = match state.bytes_per_activation {
-        Some(bytes_per_activation) => {
-            if dynamic_state_capacity_activations == 0 {
-                return Err(VulkanError(format!(
-                    "{}.{} requires non-zero dynamic state capacity",
-                    state.component_id, state.state_id
-                )));
-            }
-            let state_capacity = state
-                .max_dynamic_activations
-                .map(|limit| limit.min(dynamic_state_capacity_activations))
-                .unwrap_or(dynamic_state_capacity_activations);
-            bytes_per_activation
-                .checked_mul(state_capacity)
-                .ok_or_else(|| {
-                    VulkanError(format!(
-                        "{}.{} dynamic state byte capacity overflowed",
-                        state.component_id, state.state_id
-                    ))
-                })?
-        }
-        None => 0,
-    };
-    let total = static_bytes.checked_add(dynamic_bytes).ok_or_else(|| {
-        VulkanError(format!(
-            "{}.{} state byte capacity overflowed",
-            state.component_id, state.state_id
-        ))
-    })?;
-    if total == 0 {
-        return Err(VulkanError(format!(
-            "{}.{} has unknown or zero byte capacity",
-            state.component_id, state.state_id
-        )));
-    }
-    Ok(total)
-}
-
 fn checked_add_bytes(left: usize, right: usize, label: &str) -> Result<usize, VulkanError> {
     left.checked_add(right)
         .ok_or_else(|| VulkanError(format!("{label} overflowed")))

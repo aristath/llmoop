@@ -1,4 +1,4 @@
-fn selected_test_vulkan_device() -> Result<VulkanComputeDevice, VulkanError> {
+pub(super) fn selected_test_vulkan_device() -> Result<VulkanComputeDevice, VulkanError> {
     match std::env::var("NERVE_TEST_VULKAN_DEVICE_INDEX") {
         Ok(raw_index) => {
             let index = raw_index.parse::<usize>().map_err(|error| {

@@ -687,7 +687,7 @@ impl VulkanResidentInProcessPlacedPromptStream {
     > {
         let mut bindings = Vec::with_capacity(reservation.slots.len());
         for slot in &reservation.slots {
-            let state = self.package.resident_state_buffer(&slot.key).ok_or_else(|| {
+            let state = self.processor.mounted_state_buffer(&slot.key).ok_or_else(|| {
                 VulkanResidentInProcessPlacedRuntimeError::Package(
                     VulkanResidentTokenModelPackageError::new(format!(
                         "scheduled transient state {}.{} is not resident in package {:?}",
@@ -697,11 +697,7 @@ impl VulkanResidentInProcessPlacedPromptStream {
             })?;
             let page_binding = self
                 .transient_state_pages
-                .bind_slot(
-                    state,
-                    self.package.dynamic_state_capacity_activations,
-                    slot,
-                )
+                .bind_slot(state, slot)
                 .map_err(VulkanResidentInProcessPlacedRuntimeError::Package)?;
             bindings.push(VulkanResidentScheduledActivationStateBinding {
                 key: page_binding.key,

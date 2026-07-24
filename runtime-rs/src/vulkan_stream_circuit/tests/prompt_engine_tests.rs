@@ -88,6 +88,172 @@ fn placed_prompt_engine_owns_streams_and_submits_input_events() {
 }
 
 #[test]
+fn placed_prompt_engine_reuses_physical_state_pages_beyond_context_capacity() {
+    let device = match selected_test_vulkan_device() {
+        Ok(device) => device,
+        Err(error) => {
+            eprintln!("skipping placed prompt engine context-wrap test: {error}");
+            return;
+        }
+    };
+    let runtime_model = tiny_fixture_model_runtime_model_with_placement(
+        StreamCircuitPlacementSpec::new("gpu0"),
+    );
+    let manifest_path = tiny_fixture_model_package_manifest_path();
+    let manifest_dir = manifest_path.parent().unwrap();
+    let devices = BTreeMap::from([("gpu0".to_string(), Rc::new(device))]);
+    let stream = VulkanResidentInProcessPlacedPromptStream::from_runtime_model_for_bound_devices(
+        devices,
+        manifest_dir,
+        runtime_model,
+        Some(4),
+        7,
+        0,
+    )
+    .unwrap();
+    let mut engine = VulkanResidentInProcessPlacedPromptEngine::new();
+    engine.add_stream("main", stream).unwrap();
+
+    let run = engine
+        .submit_input_event_until_idle(
+            "main",
+            VulkanResidentTokenInputEvent::new("wrap", vec![4, 5, 6, 7, 8, 9], 1),
+        )
+        .unwrap();
+
+    assert_eq!(run.generated_token_ids.len(), 1);
+    assert_eq!(
+        run.engine_run.end_snapshot.streams[0].next_stream_tick,
+        7
+    );
+    let state = engine
+        .runtime_scheduler
+        .stream_transient_state_snapshot("main")
+        .unwrap();
+    assert_eq!(state.logical_activation_count, 6);
+    assert!(state.logical_activation_count > 4);
+    assert_eq!(state.block_count, 1);
+    assert_eq!(
+        engine
+            .runtime_scheduler
+            .transient_state_arena_snapshot()
+            .unwrap()
+            .live_block_count,
+        1
+    );
+}
+
+#[test]
+fn placed_prompt_engine_fork_cow_reset_and_removal_are_physically_consistent() {
+    let device = match selected_test_vulkan_device() {
+        Ok(device) => device,
+        Err(error) => {
+            eprintln!("skipping placed prompt engine physical state lifecycle test: {error}");
+            return;
+        }
+    };
+    let runtime_model = tiny_fixture_model_runtime_model_with_placement(
+        StreamCircuitPlacementSpec::new("gpu0"),
+    );
+    let manifest_path = tiny_fixture_model_package_manifest_path();
+    let manifest_dir = manifest_path.parent().unwrap();
+    let devices = BTreeMap::from([("gpu0".to_string(), Rc::new(device))]);
+    let stream = VulkanResidentInProcessPlacedPromptStream::from_runtime_model_for_bound_devices(
+        devices,
+        manifest_dir,
+        runtime_model,
+        Some(64),
+        7,
+        0,
+    )
+    .unwrap();
+    let mut engine = VulkanResidentInProcessPlacedPromptEngine::new();
+    engine.add_stream("parent", stream).unwrap();
+    engine
+        .submit_input_event_until_idle(
+            "parent",
+            VulkanResidentTokenInputEvent::new("seed", vec![4], 1),
+        )
+        .unwrap();
+
+    let parent_before = engine
+        .runtime_scheduler
+        .stream_transient_state_snapshot("parent")
+        .unwrap();
+    assert_eq!(parent_before.block_count, 1);
+    let shared_block = parent_before.entries[0].block_ids[0];
+    engine.fork_stream("parent", "child", 7).unwrap();
+    assert_eq!(
+        engine
+            .runtime_scheduler
+            .transient_state_arena_snapshot()
+            .unwrap()
+            .blocks
+            .into_iter()
+            .find(|block| block.block_id == shared_block)
+            .unwrap()
+            .ref_count,
+        2,
+    );
+
+    let parent_run = engine
+        .submit_input_event_until_idle(
+            "parent",
+            VulkanResidentTokenInputEvent::new("parent_next", vec![5], 1),
+        )
+        .unwrap();
+    let child_run = engine
+        .submit_input_event_until_idle(
+            "child",
+            VulkanResidentTokenInputEvent::new("child_next", vec![5], 1),
+        )
+        .unwrap();
+    assert_eq!(parent_run.generated_token_ids, child_run.generated_token_ids);
+
+    let parent_after = engine
+        .runtime_scheduler
+        .stream_transient_state_snapshot("parent")
+        .unwrap();
+    let child_after = engine
+        .runtime_scheduler
+        .stream_transient_state_snapshot("child")
+        .unwrap();
+    assert_ne!(
+        parent_after.entries[0].block_ids[0],
+        child_after.entries[0].block_ids[0]
+    );
+    assert_eq!(
+        engine
+            .runtime_scheduler
+            .transient_state_arena_snapshot()
+            .unwrap()
+            .live_block_count,
+        2
+    );
+
+    engine.remove_stream("child").unwrap();
+    assert_eq!(
+        engine
+            .runtime_scheduler
+            .transient_state_arena_snapshot()
+            .unwrap()
+            .live_block_count,
+        1
+    );
+    let zeroed = engine.reset_stream_transient_state("parent").unwrap();
+    assert!(zeroed > 0);
+    assert_eq!(engine.stream("parent").unwrap().next_stream_tick(), 0);
+    assert_eq!(
+        engine
+            .runtime_scheduler
+            .transient_state_arena_snapshot()
+            .unwrap()
+            .live_block_count,
+        0
+    );
+}
+
+#[test]
 fn placed_prompt_engine_returns_completion_from_a_boundary_closing_drain() {
     let device = match selected_test_vulkan_device() {
         Ok(device) => device,

@@ -82,6 +82,7 @@ const VULKAN_BACKEND_LOOP_MIN_TRANSACTION_BUDGET_BYTES: usize = 64 * 1024 * 1024
 const VULKAN_BACKEND_LOOP_TRANSACTION_HEAP_FRACTION_DIVISOR: usize = 8;
 
 include!("vulkan_stream_circuit/resident_plan_buffers.rs");
+include!("vulkan_stream_circuit/transient_state_buffer_layout.rs");
 include!("vulkan_stream_circuit/transient_state_pages.rs");
 include!("vulkan_stream_circuit/edge_plan.rs");
 include!("vulkan_stream_circuit/edge_buffers.rs");

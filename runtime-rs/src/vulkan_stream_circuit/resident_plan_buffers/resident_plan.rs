@@ -319,8 +319,11 @@ impl VulkanStreamCircuitResidentPlan {
         }
 
         for state in &self.stream_state_buffers {
-            let byte_capacity =
-                stream_state_byte_capacity(state, dynamic_state_capacity_activations)?;
+            let layout = VulkanTransientStateBufferLayout::for_state(
+                state,
+                dynamic_state_capacity_activations,
+            )?;
+            let byte_capacity = layout.byte_capacity;
             total_byte_capacity = checked_add_bytes(
                 total_byte_capacity,
                 byte_capacity,
@@ -331,6 +334,7 @@ impl VulkanStreamCircuitResidentPlan {
                 state_id: state.state_id.clone(),
                 state_type: state.state_type.clone(),
                 byte_capacity,
+                layout,
                 static_byte_capacity: state.static_bytes,
                 bytes_per_activation: state.bytes_per_activation,
                 clone_from: state.clone_from.clone(),

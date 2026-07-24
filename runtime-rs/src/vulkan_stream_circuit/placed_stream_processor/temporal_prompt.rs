@@ -310,20 +310,6 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
         let end_stream_tick = start_stream_tick
             .checked_add(tick_count - 1)
             .ok_or(VulkanResidentInProcessPlacedRuntimeError::StreamTickOverflow)?;
-        if end_stream_tick
-            >= u64::try_from(self.model.dynamic_state_capacity_activations).map_err(|_| {
-                VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(
-                    "temporal context capacity exceeds u64".to_string(),
-                ))
-            })?
-        {
-            return Err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop(
-                VulkanError(format!(
-                    "temporal block ending at stream tick {end_stream_tick} exceeds dynamic state capacity {}",
-                    self.model.dynamic_state_capacity_activations
-                )),
-            ));
-        }
         self.ensure_temporal_block_execution(devices, input_token_ids.len())?;
         let capacity =
             u32::try_from(self.model.dynamic_state_capacity_activations).map_err(|_| {

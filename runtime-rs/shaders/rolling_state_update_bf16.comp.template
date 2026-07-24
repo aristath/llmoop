@@ -28,20 +28,59 @@ layout(set = 0, binding = 5) buffer StateView {
 
 const uint FRAME_COUNT = {{FRAME_COUNT}}u;
 const uint FRAME_WORD_COUNT = ({{HIDDEN_SIZE}}u + 1u) / 2u;
+const uint STATE_PAGE_TABLE_WORDS = 9u;
+
+uint state_read_word(uint logical_word) {
+    uint logical_byte = logical_word * 4u;
+    if (logical_byte < state_read.words[2]) {
+        return (state_read.words[3] + logical_byte) / 4u;
+    }
+    uint dynamic_byte = logical_byte - state_read.words[2];
+    uint page_bytes = state_read.words[4];
+    uint physical_page =
+        state_read.words[STATE_PAGE_TABLE_WORDS + dynamic_byte / page_bytes];
+    return (state_read.words[8] + physical_page * page_bytes + dynamic_byte % page_bytes) / 4u;
+}
+
+uint state_write_word(uint logical_word) {
+    uint logical_byte = logical_word * 4u;
+    if (logical_byte < state_write.words[2]) {
+        return (state_write.words[3] + logical_byte) / 4u;
+    }
+    uint dynamic_byte = logical_byte - state_write.words[2];
+    uint page_bytes = state_write.words[4];
+    uint physical_page =
+        state_write.words[STATE_PAGE_TABLE_WORDS + dynamic_byte / page_bytes];
+    return (state_write.words[8] + physical_page * page_bytes + dynamic_byte % page_bytes) / 4u;
+}
+
+uint state_view_word(uint logical_word) {
+    uint logical_byte = logical_word * 4u;
+    if (logical_byte < state_view.words[2]) {
+        return (state_view.words[3] + logical_byte) / 4u;
+    }
+    uint dynamic_byte = logical_byte - state_view.words[2];
+    uint page_bytes = state_view.words[4];
+    uint physical_page =
+        state_view.words[STATE_PAGE_TABLE_WORDS + dynamic_byte / page_bytes];
+    return (state_view.words[8] + physical_page * page_bytes + dynamic_byte % page_bytes) / 4u;
+}
 
 void main() {
     for (uint word_index = gl_LocalInvocationID.x; word_index < FRAME_WORD_COUNT; word_index += 64u) {
         for (uint frame = 0u; frame + 1u < FRAME_COUNT; frame += 1u) {
-            uint shifted = state_read.words[((frame + 1u) * FRAME_WORD_COUNT) + word_index];
+            uint logical_word = ((frame + 1u) * FRAME_WORD_COUNT) + word_index;
+            uint shifted = state_read.words[state_read_word(logical_word)];
             window_out.words[(frame * FRAME_WORD_COUNT) + word_index] = shifted;
-            state_write.words[(frame * FRAME_WORD_COUNT) + word_index] = shifted;
-            state_view.words[(frame * FRAME_WORD_COUNT) + word_index] = shifted;
+            logical_word = (frame * FRAME_WORD_COUNT) + word_index;
+            state_write.words[state_write_word(logical_word)] = shifted;
+            state_view.words[state_view_word(logical_word)] = shifted;
         }
 
         uint final_index = ((FRAME_COUNT - 1u) * FRAME_WORD_COUNT) + word_index;
         uint appended = current_frame.words[word_index];
         window_out.words[final_index] = appended;
-        state_write.words[final_index] = appended;
-        state_view.words[final_index] = appended;
+        state_write.words[state_write_word(final_index)] = appended;
+        state_view.words[state_view_word(final_index)] = appended;
     }
 }

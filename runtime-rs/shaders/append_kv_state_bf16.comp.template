@@ -23,6 +23,24 @@ const uint HEAD_WIDTH = {{HEAD_WIDTH}}u;
 const uint KV_ELEMENT_COUNT = KV_HEADS * HEAD_WIDTH;
 const uint KV_WORD_COUNT = KV_ELEMENT_COUNT / 2u;
 const uint SLOT_WORD_COUNT = KV_WORD_COUNT * 2u;
+const uint STATE_PAGE_TABLE_WORDS = 9u;
+
+uint kv_state_word(uint logical_word) {
+    uint logical_byte = logical_word * 4u;
+    uint static_bytes = kv_state_write.words[2];
+    if (logical_byte < static_bytes) {
+        return (kv_state_write.words[3] + logical_byte) / 4u;
+    }
+    uint dynamic_byte = logical_byte - static_bytes;
+    uint page_bytes = kv_state_write.words[4];
+    uint logical_page = dynamic_byte / page_bytes;
+    uint physical_page = kv_state_write.words[STATE_PAGE_TABLE_WORDS + logical_page];
+    return (
+        kv_state_write.words[8]
+        + physical_page * page_bytes
+        + dynamic_byte % page_bytes
+    ) / 4u;
+}
 
 void main() {
     uint capacity = stream_control.words[4];
@@ -35,7 +53,7 @@ void main() {
     uint v_base = slot_base + KV_WORD_COUNT;
 
     for (uint word_index = gl_LocalInvocationID.x; word_index < KV_WORD_COUNT; word_index += 64u) {
-        kv_state_write.words[slot_base + word_index] = k_input.words[word_index];
-        kv_state_write.words[v_base + word_index] = v_input.words[word_index];
+        kv_state_write.words[kv_state_word(slot_base + word_index)] = k_input.words[word_index];
+        kv_state_write.words[kv_state_word(v_base + word_index)] = v_input.words[word_index];
     }
 }

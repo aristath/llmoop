@@ -20,6 +20,41 @@ pub struct VulkanResidentInProcessPlacedStreamProcessor {
     batched_output_projection: RefCell<Option<VulkanResidentBatchedOutputProjectionRunner>>,
 }
 
+impl VulkanResidentInProcessPlacedStreamProcessor {
+    fn mounted_state_buffer(
+        &self,
+        key: &TransientStateKey,
+    ) -> Option<&VulkanStreamStateBufferAllocation> {
+        self.device_slices
+            .iter()
+            .find_map(|slice| {
+                slice
+                    .mounted
+                    .buffers
+                    .state_buffer(&key.node_instance_id, &key.state_id)
+            })
+    }
+
+    fn reset_transient_state_buffers(
+        &self,
+    ) -> Result<usize, VulkanResidentInProcessPlacedRuntimeError> {
+        self.device_slices
+            .iter()
+            .try_fold(0usize, |total, slice| {
+                let bytes = slice
+                    .mounted
+                    .buffers
+                    .zero_state_buffers()
+                    .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
+                total.checked_add(bytes).ok_or_else(|| {
+                    VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(
+                        "reset transient state byte count overflowed".to_string(),
+                    ))
+                })
+            })
+    }
+}
+
 fn create_placed_state_transactions<'a, F>(
     devices: &[VulkanResidentInProcessPlacedStreamProcessorDevice],
     transaction_width: usize,

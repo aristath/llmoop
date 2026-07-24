@@ -49,6 +49,7 @@ pub struct VulkanStreamStateBufferAllocation {
     pub state_id: String,
     pub state_type: String,
     pub byte_capacity: usize,
+    pub layout: VulkanTransientStateBufferLayout,
     pub static_byte_capacity: Option<usize>,
     pub bytes_per_activation: Option<usize>,
     pub clone_from: Option<(String, String)>,
@@ -107,7 +108,10 @@ impl VulkanStreamCircuitStreamBuffers {
     pub fn zero_state_buffers(&self) -> Result<usize, VulkanError> {
         let mut total_zeroed = 0usize;
         for state in &self.state_buffers {
-            state.buffer.write_bytes(&vec![0u8; state.byte_capacity])?;
+            let mut bytes = vec![0u8; state.byte_capacity];
+            let page_table = state.layout.initial_page_table_bytes()?;
+            bytes[..page_table.len()].copy_from_slice(&page_table);
+            state.buffer.write_bytes(&bytes)?;
             total_zeroed = total_zeroed
                 .checked_add(state.byte_capacity)
                 .ok_or_else(|| VulkanError("state zero byte count overflowed".to_string()))?;
@@ -229,6 +233,7 @@ fn validate_state_buffer_copy(
         || target.byte_capacity != source.byte_capacity
         || target.static_byte_capacity != source.static_byte_capacity
         || target.bytes_per_activation != source.bytes_per_activation
+        || target.layout != source.layout
     {
         return Err(VulkanError(format!(
             "cannot inherit state {}.{} ({}, {} bytes, static {:?}, per activation {:?}) from incompatible state {}.{} ({}, {} bytes, static {:?}, per activation {:?})",

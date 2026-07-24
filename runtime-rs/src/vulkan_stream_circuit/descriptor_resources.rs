@@ -467,42 +467,7 @@ fn descriptor_state_byte_capacity(
     state: &VulkanResidentStateBuffer,
     dynamic_state_capacity_activations: usize,
 ) -> Result<usize, VulkanDescriptorResourcePlanError> {
-    let static_bytes = state.static_bytes.unwrap_or(0);
-    let dynamic_bytes = match state.bytes_per_activation {
-        Some(bytes_per_activation) => {
-            if dynamic_state_capacity_activations == 0 {
-                return Err(VulkanDescriptorResourcePlanError(format!(
-                    "{}.{} requires non-zero dynamic state capacity",
-                    state.component_id, state.state_id
-                )));
-            }
-            let state_capacity = state
-                .max_dynamic_activations
-                .map(|limit| limit.min(dynamic_state_capacity_activations))
-                .unwrap_or(dynamic_state_capacity_activations);
-            bytes_per_activation
-                .checked_mul(state_capacity)
-                .ok_or_else(|| {
-                    VulkanDescriptorResourcePlanError(format!(
-                        "{}.{} dynamic state byte capacity overflowed",
-                        state.component_id, state.state_id
-                    ))
-                })?
-        }
-        None => 0,
-    };
-    let total = static_bytes.checked_add(dynamic_bytes).ok_or_else(|| {
-        VulkanDescriptorResourcePlanError(format!(
-            "{}.{} state byte capacity overflowed",
-            state.component_id, state.state_id
-        ))
-    })?;
-    if total == 0 {
-        return Err(VulkanDescriptorResourcePlanError(format!(
-            "{}.{} has unknown or zero byte capacity",
-            state.component_id, state.state_id
-        )));
-    }
-    Ok(total)
+    VulkanTransientStateBufferLayout::for_state(state, dynamic_state_capacity_activations)
+        .map(|layout| layout.byte_capacity)
+        .map_err(|error| VulkanDescriptorResourcePlanError(error.to_string()))
 }
-

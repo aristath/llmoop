@@ -29,6 +29,7 @@ const uint KEY_WIDTH = KEY_HEADS * KEY_HEAD_WIDTH;
 const uint VALUE_WIDTH = VALUE_HEADS * VALUE_HEAD_WIDTH;
 const uint QKV_WIDTH = 2u * KEY_WIDTH + VALUE_WIDTH;
 const float NORM_EPS = {{NORM_EPS}};
+const uint STATE_PAGE_TABLE_WORDS = 9u;
 
 shared float q_inv_norm;
 shared float k_inv_norm;
@@ -82,6 +83,42 @@ float softplus(float value) {
 }
 {{FP8_HELPERS}}
 
+uint state_read_index(uint logical_index) {
+    uint logical_byte = logical_index * 4u;
+    uint static_bytes = floatBitsToUint(state_read.values[2]);
+    if (logical_byte < static_bytes) {
+        return (floatBitsToUint(state_read.values[3]) + logical_byte) / 4u;
+    }
+    uint dynamic_byte = logical_byte - static_bytes;
+    uint page_bytes = floatBitsToUint(state_read.values[4]);
+    uint physical_page = floatBitsToUint(
+        state_read.values[STATE_PAGE_TABLE_WORDS + dynamic_byte / page_bytes]
+    );
+    return (
+        floatBitsToUint(state_read.values[8])
+        + physical_page * page_bytes
+        + dynamic_byte % page_bytes
+    ) / 4u;
+}
+
+uint state_write_index(uint logical_index) {
+    uint logical_byte = logical_index * 4u;
+    uint static_bytes = floatBitsToUint(state_write.values[2]);
+    if (logical_byte < static_bytes) {
+        return (floatBitsToUint(state_write.values[3]) + logical_byte) / 4u;
+    }
+    uint dynamic_byte = logical_byte - static_bytes;
+    uint page_bytes = floatBitsToUint(state_write.values[4]);
+    uint physical_page = floatBitsToUint(
+        state_write.values[STATE_PAGE_TABLE_WORDS + dynamic_byte / page_bytes]
+    );
+    return (
+        floatBitsToUint(state_write.values[8])
+        + physical_page * page_bytes
+        + dynamic_byte % page_bytes
+    ) / 4u;
+}
+
 void main() {
     uint value_head = gl_WorkGroupID.x;
     uint value_dim = gl_LocalInvocationID.x;
@@ -94,9 +131,9 @@ void main() {
     uint state_base = value_head * KEY_HEAD_WIDTH * VALUE_HEAD_WIDTH;
     float recurrent_state[KEY_HEAD_WIDTH];
     for (uint key_dim = 0u; key_dim < KEY_HEAD_WIDTH; key_dim++) {
-        recurrent_state[key_dim] = state_read.values[
+        recurrent_state[key_dim] = state_read.values[state_read_index(
             state_base + key_dim * VALUE_HEAD_WIDTH + value_dim
-        ];
+        )];
     }
     float norm_scale = read_norm_weight(value_dim);
     float attention_scale = inversesqrt(float(KEY_HEAD_WIDTH));
@@ -193,7 +230,9 @@ void main() {
     }
 
     for (uint key_dim = 0u; key_dim < KEY_HEAD_WIDTH; key_dim++) {
-        state_write.values[state_base + key_dim * VALUE_HEAD_WIDTH + value_dim] =
+        state_write.values[state_write_index(
+            state_base + key_dim * VALUE_HEAD_WIDTH + value_dim
+        )] =
             recurrent_state[key_dim];
     }
 }

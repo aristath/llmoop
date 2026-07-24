@@ -24,6 +24,31 @@ layout(set = 0, binding = 4) buffer StateWrite {
 
 const uint CHANNELS = {{CHANNELS}}u;
 const uint KERNEL_WIDTH = {{KERNEL_WIDTH}}u;
+const uint STATE_PAGE_TABLE_WORDS = 9u;
+
+uint state_read_word(uint logical_word) {
+    uint logical_byte = logical_word * 4u;
+    if (logical_byte < state_read.words[2]) {
+        return (state_read.words[3] + logical_byte) / 4u;
+    }
+    uint dynamic_byte = logical_byte - state_read.words[2];
+    uint page_bytes = state_read.words[4];
+    uint physical_page =
+        state_read.words[STATE_PAGE_TABLE_WORDS + dynamic_byte / page_bytes];
+    return (state_read.words[8] + physical_page * page_bytes + dynamic_byte % page_bytes) / 4u;
+}
+
+uint state_write_word(uint logical_word) {
+    uint logical_byte = logical_word * 4u;
+    if (logical_byte < state_write.words[2]) {
+        return (state_write.words[3] + logical_byte) / 4u;
+    }
+    uint dynamic_byte = logical_byte - state_write.words[2];
+    uint page_bytes = state_write.words[4];
+    uint physical_page =
+        state_write.words[STATE_PAGE_TABLE_WORDS + dynamic_byte / page_bytes];
+    return (state_write.words[8] + physical_page * page_bytes + dynamic_byte % page_bytes) / 4u;
+}
 
 float bf16_to_f32(uint value) {
     return uintBitsToFloat((value & 0xffffu) << 16);
@@ -49,7 +74,7 @@ uint read_kernel(uint index) {
 }
 
 uint read_state(uint index) {
-    return unpack_bf16(state_read.words[index >> 1u], index);
+    return unpack_bf16(state_read.words[state_read_word(index >> 1u)], index);
 }
 
 uint convolve_and_advance(uint channel) {
@@ -62,7 +87,8 @@ uint convolve_and_advance(uint channel) {
         uint second = tap + 2u < KERNEL_WIDTH
             ? read_state(state_base + tap + 2u)
             : read_current(channel);
-        state_write.words[(state_base + tap) >> 1u] = first | (second << 16);
+        state_write.words[state_write_word((state_base + tap) >> 1u)] =
+            first | (second << 16);
         convolution = fma(
             bf16_to_f32(first),
             bf16_to_f32(read_kernel(state_base + tap)),

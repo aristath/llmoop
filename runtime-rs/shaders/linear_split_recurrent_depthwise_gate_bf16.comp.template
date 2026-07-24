@@ -41,6 +41,31 @@ const uint INPUT_GATE_B_INDEX = {{INPUT_GATE_B_INDEX}}u;
 const uint OUTPUT_GATE_INDEX = {{OUTPUT_GATE_INDEX}}u;
 const uint INPUT_WORDS = INPUT_SIZE / 2u;
 const uint OUTPUT_WORDS = HIDDEN_SIZE / 2u;
+const uint STATE_PAGE_TABLE_WORDS = 9u;
+
+uint state_read_word(uint logical_word) {
+    uint logical_byte = logical_word * 4u;
+    if (logical_byte < state_read.words[2]) {
+        return (state_read.words[3] + logical_byte) / 4u;
+    }
+    uint dynamic_byte = logical_byte - state_read.words[2];
+    uint page_bytes = state_read.words[4];
+    uint physical_page =
+        state_read.words[STATE_PAGE_TABLE_WORDS + dynamic_byte / page_bytes];
+    return (state_read.words[8] + physical_page * page_bytes + dynamic_byte % page_bytes) / 4u;
+}
+
+uint state_write_word(uint logical_word) {
+    uint logical_byte = logical_word * 4u;
+    if (logical_byte < state_write.words[2]) {
+        return (state_write.words[3] + logical_byte) / 4u;
+    }
+    uint dynamic_byte = logical_byte - state_write.words[2];
+    uint page_bytes = state_write.words[4];
+    uint physical_page =
+        state_write.words[STATE_PAGE_TABLE_WORDS + dynamic_byte / page_bytes];
+    return (state_write.words[8] + physical_page * page_bytes + dynamic_byte % page_bytes) / 4u;
+}
 
 shared float subgroup_lo[3][64];
 shared float subgroup_hi[3][64];
@@ -125,14 +150,16 @@ void finalize_output(
     uint temporal_words[FRAME_COUNT];
     for (uint tap = 0u; tap + 1u < FRAME_COUNT; tap++) {
         temporal_words[tap] =
-            state_read.words[((tap + 1u) * OUTPUT_WORDS) + word_index];
+            state_read.words[state_read_word(
+                ((tap + 1u) * OUTPUT_WORDS) + word_index
+            )];
     }
     temporal_words[FRAME_COUNT - 1u] = multiply_pair(
         input_gate_a,
         input_gate_b
     );
     for (uint tap = 0u; tap < FRAME_COUNT; tap++) {
-        state_write.words[(tap * OUTPUT_WORDS) + word_index] =
+        state_write.words[state_write_word((tap * OUTPUT_WORDS) + word_index)] =
             temporal_words[tap];
     }
 

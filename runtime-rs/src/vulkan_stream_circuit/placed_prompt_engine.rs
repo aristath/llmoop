@@ -61,6 +61,82 @@ impl VulkanResidentInProcessPlacedPromptEngine {
         self.streams.get(stream_id)
     }
 
+    pub fn fork_stream(
+        &mut self,
+        source_stream_id: &str,
+        target_stream_id: impl Into<String>,
+        random_seed: u32,
+    ) -> Result<
+        VulkanResidentInProcessPlacedPromptEngineStreamSnapshot,
+        VulkanResidentInProcessPlacedPromptEngineError,
+    > {
+        let target_stream_id = target_stream_id.into();
+        if self.streams.contains_key(&target_stream_id) {
+            return Err(VulkanResidentInProcessPlacedPromptEngineError::DuplicateStream(
+                target_stream_id,
+            ));
+        }
+        let source = self.streams.get(source_stream_id).ok_or_else(|| {
+            VulkanResidentInProcessPlacedPromptEngineError::UnknownStream {
+                stream_id: source_stream_id.to_string(),
+            }
+        })?;
+        let forked = source.fork_preserving_state(random_seed)?;
+        let execution_class_id = forked.package().stream_execution_class_id();
+        self.runtime_scheduler.fork_stream_transient_state(
+            source_stream_id,
+            &target_stream_id,
+            execution_class_id,
+        )?;
+        let snapshot = placed_prompt_engine_stream_snapshot(&target_stream_id, &forked);
+        self.streams.insert(target_stream_id, forked);
+        Ok(snapshot)
+    }
+
+    pub fn reset_stream_transient_state(
+        &mut self,
+        stream_id: &str,
+    ) -> Result<usize, VulkanResidentInProcessPlacedPromptEngineError> {
+        let stream = self.streams.get_mut(stream_id).ok_or_else(|| {
+            VulkanResidentInProcessPlacedPromptEngineError::UnknownStream {
+                stream_id: stream_id.to_string(),
+            }
+        })?;
+        let zeroed = stream.reset_transient_state()?;
+        self.runtime_scheduler
+            .reset_stream_transient_state(stream_id)?;
+        Ok(zeroed)
+    }
+
+    pub fn remove_stream(
+        &mut self,
+        stream_id: &str,
+    ) -> Result<
+        VulkanResidentInProcessPlacedPromptEngineStreamSnapshot,
+        VulkanResidentInProcessPlacedPromptEngineError,
+    > {
+        let stream = self.streams.get(stream_id).ok_or_else(|| {
+            VulkanResidentInProcessPlacedPromptEngineError::UnknownStream {
+                stream_id: stream_id.to_string(),
+            }
+        })?;
+        if !stream.is_idle() || stream.pending_scheduler_activation.is_some() {
+            return Err(VulkanResidentInProcessPlacedPromptEngineError::Stream(
+                placed_scheduler_divergence(
+                    "cannot remove a placed prompt stream while work is pending",
+                ),
+            ));
+        }
+        self.multi_stream_batch_runners
+            .retain(|key, _| !key.stream_ids.iter().any(|candidate| candidate == stream_id));
+        self.runtime_scheduler.remove_stream(stream_id)?;
+        let stream = self
+            .streams
+            .remove(stream_id)
+            .expect("validated placed prompt stream exists");
+        Ok(placed_prompt_engine_stream_snapshot(stream_id, &stream))
+    }
+
     pub fn enqueue_input_event(
         &mut self,
         stream_id: &str,
