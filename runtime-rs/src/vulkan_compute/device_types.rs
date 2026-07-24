@@ -186,11 +186,12 @@ impl<'a> VulkanTimelineSemaphorePoint<'a> {
 }
 
 /// Collects already-recorded resident command buffers by logical device.
-/// Timeline waits and signals remain attached to their original command, so a
-/// caller can enqueue a complete cross-device DAG before issuing one
-/// `vkQueueSubmit2` call per participating queue.
+/// Timeline waits and signals remain attached to their original command. A
+/// bounded batch is partitioned into execution quanta before submission so a
+/// complete graph cannot accidentally become one watchdog-visible GPU job.
 pub struct VulkanResidentQueueSubmissionBatch<'a> {
     groups: RefCell<Vec<VulkanResidentQueueSubmissionGroup<'a>>>,
+    quantum_budget: Option<RuntimeExecutionQuantumBudget>,
 }
 
 /// A mounted queue-submission topology. Command buffers, queue ordering, and
@@ -203,6 +204,7 @@ pub struct VulkanResidentQueueSubmissionTemplate<'a> {
 struct VulkanResidentQueueSubmissionGroup<'a> {
     device: &'a VulkanComputeDevice,
     submissions: Vec<VulkanPreparedResidentQueueSubmission>,
+    quantum_ranges: Vec<std::ops::Range<usize>>,
 }
 
 struct VulkanPreparedResidentQueueSubmission {
@@ -210,6 +212,7 @@ struct VulkanPreparedResidentQueueSubmission {
     wait_points: Vec<(vk::Semaphore, u64)>,
     signal_points: Vec<(vk::Semaphore, u64)>,
     completion_fence: Option<vk::Fence>,
+    execution_region: Option<RuntimeExecutionRegion>,
 }
 
 impl Default for VulkanResidentQueueSubmissionBatch<'_> {
@@ -222,6 +225,14 @@ impl<'a> VulkanResidentQueueSubmissionBatch<'a> {
     pub fn new() -> Self {
         Self {
             groups: RefCell::new(Vec::new()),
+            quantum_budget: None,
+        }
+    }
+
+    pub fn new_bounded(quantum_budget: RuntimeExecutionQuantumBudget) -> Self {
+        Self {
+            groups: RefCell::new(Vec::new()),
+            quantum_budget: Some(quantum_budget),
         }
     }
 
@@ -232,6 +243,25 @@ impl<'a> VulkanResidentQueueSubmissionBatch<'a> {
         wait_points: &[VulkanTimelineSemaphorePoint<'_>],
         signal_points: &[VulkanTimelineSemaphorePoint<'_>],
         signal_completion: bool,
+    ) -> Result<(), VulkanError> {
+        self.enqueue_recorded_sequence_with_execution_region(
+            device,
+            sequence,
+            wait_points,
+            signal_points,
+            signal_completion,
+            None,
+        )
+    }
+
+    pub fn enqueue_recorded_sequence_with_execution_region(
+        &self,
+        device: &'a VulkanComputeDevice,
+        sequence: &VulkanResidentKernelSequence,
+        wait_points: &[VulkanTimelineSemaphorePoint<'_>],
+        signal_points: &[VulkanTimelineSemaphorePoint<'_>],
+        signal_completion: bool,
+        execution_region: Option<RuntimeExecutionRegion>,
     ) -> Result<(), VulkanError> {
         if !sequence.has_recorded_commands() {
             return Err(VulkanError(
@@ -257,6 +287,7 @@ impl<'a> VulkanResidentQueueSubmissionBatch<'a> {
                 .map(|point| (point.semaphore.semaphore, point.value))
                 .collect(),
             completion_fence: signal_completion.then_some(sequence.completion_fence),
+            execution_region,
         };
         let mut groups = self.groups.borrow_mut();
         if let Some(group) = groups
@@ -268,6 +299,7 @@ impl<'a> VulkanResidentQueueSubmissionBatch<'a> {
             groups.push(VulkanResidentQueueSubmissionGroup {
                 device,
                 submissions: vec![submission],
+                quantum_ranges: Vec::new(),
             });
         }
         Ok(())
@@ -282,7 +314,36 @@ impl<'a> VulkanResidentQueueSubmissionBatch<'a> {
     }
 
     pub fn mount(self) -> Result<VulkanResidentQueueSubmissionTemplate<'a>, VulkanError> {
-        let groups = self.groups.into_inner();
+        let mut groups = self.groups.into_inner();
+        if let Some(quantum_budget) = self.quantum_budget {
+            for group in &mut groups {
+                let regions = group
+                    .submissions
+                    .iter()
+                    .enumerate()
+                    .map(|(submission_index, submission)| {
+                        submission.execution_region.clone().ok_or_else(|| {
+                            VulkanError(format!(
+                                "bounded resident queue submission {submission_index} has no execution-region contract"
+                            ))
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let schedule = RuntimeExecutionSchedule::linear(&regions, quantum_budget)
+                    .map_err(|error| VulkanError(error.to_string()))?;
+                group.quantum_ranges = schedule
+                    .quanta
+                    .into_iter()
+                    .map(|quantum| quantum.region_range)
+                    .collect();
+            }
+        } else {
+            for group in &mut groups {
+                if !group.submissions.is_empty() {
+                    group.quantum_ranges.push(0..group.submissions.len());
+                }
+            }
+        }
         let submission_count = groups.iter().try_fold(0usize, |total, group| {
             total.checked_add(group.submissions.len()).ok_or_else(|| {
                 VulkanError("resident queue submission count overflowed".to_string())
@@ -316,9 +377,12 @@ impl VulkanResidentQueueSubmissionTemplate<'_> {
             }
         }
         for group in &self.groups {
-            group
-                .device
-                .submit_prepared_resident_queue_batch(&group.submissions, timeline_value_offset)?;
+            for quantum_range in &group.quantum_ranges {
+                group.device.submit_prepared_resident_queue_batch(
+                    &group.submissions[quantum_range.clone()],
+                    timeline_value_offset,
+                )?;
+            }
         }
         Ok(self.submission_count)
     }

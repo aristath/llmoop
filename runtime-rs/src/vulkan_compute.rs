@@ -1,3 +1,7 @@
+use crate::execution_schedule::{
+    RuntimeExecutionQuantumBudget, RuntimeExecutionRegion, RuntimeExecutionSchedule,
+};
+
 include!("vulkan_compute/features.rs");
 include!("vulkan_compute/device_types.rs");
 include!("vulkan_compute/resident_buffers.rs");

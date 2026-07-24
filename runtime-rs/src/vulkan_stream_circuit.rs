@@ -14,6 +14,9 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use smallvec::SmallVec;
 
+use crate::execution_schedule::{
+    RuntimeExecutionCost, RuntimeExecutionQuantumBudget, RuntimeExecutionRegion,
+};
 use crate::stream_circuit::{
     CircuitParamsArtifact, CircuitRuntimeRole, CircuitStateArtifact, ComponentEdgePlacement,
     EdgeTransport, LOWERED_EXECUTION_GRAPH_SCHEMA, LoweredCircuitRef, LoweredExecutionGraph,

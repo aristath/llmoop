@@ -603,14 +603,16 @@ impl VulkanResidentComponentBatchSliceRunner {
             dynamic_state_capacity_activations,
         );
         let mut sequence_index = 0usize;
-        let mut local_submission_batch = VulkanResidentQueueSubmissionBatch::new();
+        let quantum_budget = RuntimeExecutionQuantumBudget::one_region();
+        let mut local_submission_batch =
+            VulkanResidentQueueSubmissionBatch::new_bounded(quantum_budget);
         let mut pending_completion_sequence_index = None;
         for (unit_index, unit) in self.execution_units.iter().enumerate() {
             match unit {
                 VulkanComponentBatchExecutionUnit::LocalComponent {
+                    component_id,
                     step_start,
                     step_end,
-                    ..
                 } => {
                     let flush_after_segment = self
                         .execution_units
@@ -629,6 +631,7 @@ impl VulkanResidentComponentBatchSliceRunner {
                         start_stream_tick,
                         dynamic_state_capacity_activations,
                         &batch_control,
+                        component_id,
                         sequence_index,
                         *step_start,
                         *step_end,
@@ -641,7 +644,10 @@ impl VulkanResidentComponentBatchSliceRunner {
                     if flush_after_segment {
                         self.submit_and_wait_local_batch(
                             device,
-                            std::mem::take(&mut local_submission_batch),
+                            std::mem::replace(
+                                &mut local_submission_batch,
+                                VulkanResidentQueueSubmissionBatch::new_bounded(quantum_budget),
+                            ),
                             pending_completion_sequence_index.take(),
                         )?;
                     }
@@ -670,6 +676,7 @@ impl VulkanResidentComponentBatchSliceRunner {
         start_stream_tick: u64,
         dynamic_state_capacity_activations: u32,
         batch_control: &[u8; VULKAN_COMPONENT_BATCH_CONTROL_BYTE_CAPACITY as usize],
+        component_id: &str,
         segment_index: usize,
         step_start: usize,
         step_end: usize,
@@ -741,6 +748,21 @@ impl VulkanResidentComponentBatchSliceRunner {
             }
         }
         if let Some(submission_batch) = submission_batch {
+            let execution_cost = RuntimeExecutionCost::new(
+                active_steps.iter().fold(0u64, |total, step| {
+                    total.saturating_add(step.dispatch.estimated_work_units())
+                }),
+                0,
+                u64::try_from(active_steps.len()).unwrap_or(u64::MAX),
+            );
+            let mut execution_region = RuntimeExecutionRegion::new(
+                format!("{component_id}:{step_start}..{step_end}"),
+                component_id,
+                execution_cost,
+            );
+            execution_region.commits_state_after = active_steps
+                .iter()
+                .any(|step| !step.snapshot_state_buffer_indices.is_empty());
             device
                 .record_resident_kernel_sequence_with_snapshot_copies(
                     &self.sequences[segment_index],
@@ -748,12 +770,13 @@ impl VulkanResidentComponentBatchSliceRunner {
                     &snapshot_copies,
                 )
                 .and_then(|_| {
-                    submission_batch.enqueue_recorded_sequence(
+                    submission_batch.enqueue_recorded_sequence_with_execution_region(
                         device,
                         &self.sequences[segment_index],
                         &[],
                         &[],
                         signal_completion,
+                        Some(execution_region),
                     )
                 })
                 .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)

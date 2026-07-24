@@ -193,6 +193,16 @@ impl VulkanResidentKernelDispatch {
         self.workgroup_count_y
     }
 
+    pub fn local_size_x(&self) -> u32 {
+        self.pipeline_key.local_size_x
+    }
+
+    pub fn estimated_work_units(&self) -> u64 {
+        u64::from(self.workgroup_count_x)
+            .saturating_mul(u64::from(self.workgroup_count_y))
+            .saturating_mul(u64::from(self.pipeline_key.local_size_x))
+    }
+
     pub fn push_constant_byte_count(&self) -> u32 {
         self.push_constant_byte_count
     }
@@ -215,4 +225,3 @@ impl Drop for VulkanResidentKernelSequence {
         }
     }
 }
-
