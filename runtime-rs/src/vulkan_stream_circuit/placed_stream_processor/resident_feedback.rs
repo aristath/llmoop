@@ -222,9 +222,7 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
         start_stream_tick: u64,
         tick_count: usize,
         stop_token_ids: &[u32],
-        mut submission_replays: Option<
-            &mut BTreeMap<usize, VulkanResidentPlacedFeedbackSubmissionReplay>,
-        >,
+        mut submission_replay: Option<&mut Option<VulkanResidentPlacedFeedbackSubmissionReplay>>,
         mut on_sampled_token: F,
     ) -> Result<
         VulkanResidentFeedbackControlCompletion,
@@ -253,9 +251,10 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
             .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
         let mut template_replayed = false;
         let output_timeline_values =
-            if let Some(replay) = submission_replays
+            if let Some(replay) = submission_replay
                 .as_deref_mut()
-                .and_then(|replays| replays.get_mut(&tick_count))
+                .and_then(Option::as_mut)
+                .filter(|replay| replay.tick_count == tick_count)
             {
                 template_replayed = true;
                 replay
@@ -282,9 +281,8 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
                 submission_template
                     .submit_with_timeline_value_offset(0)
                     .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
-                if let Some(replays) = submission_replays {
-                    replays.insert(
-                        tick_count,
+                if let Some(replay_slot) = submission_replay {
+                    *replay_slot = Some(
                         VulkanResidentPlacedFeedbackSubmissionReplay::new(
                             submission_template,
                             tick_count,

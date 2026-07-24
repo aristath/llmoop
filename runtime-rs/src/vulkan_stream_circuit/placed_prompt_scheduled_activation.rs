@@ -266,7 +266,12 @@ impl VulkanResidentInProcessPlacedPromptStream {
         if !should_close {
             return self.complete_active_input_event_if_complete();
         }
-        let _ = self.run_next_activation()?;
+        if let Some(completed_input_run) = self
+            .run_next_activation()?
+            .and_then(|run| run.completed_input_run)
+        {
+            return Ok(Some(completed_input_run));
+        }
         self.complete_active_input_event_if_complete()
     }
 

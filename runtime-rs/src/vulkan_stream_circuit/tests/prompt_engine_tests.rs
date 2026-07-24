@@ -91,6 +91,54 @@ fn placed_prompt_engine_owns_streams_and_submits_input_events() {
 }
 
 #[test]
+fn placed_prompt_engine_returns_completion_from_a_boundary_closing_drain() {
+    let device = match selected_test_vulkan_device() {
+        Ok(device) => device,
+        Err(error) => {
+            eprintln!("skipping placed prompt engine closing-drain test: {error}");
+            return;
+        }
+    };
+    let manifest_path = fixture_model_package_manifest_path();
+    let devices = BTreeMap::from([(
+        RUNTIME_DEFAULT_LOGICAL_DEVICE_ID.to_string(),
+        Rc::new(device),
+    )]);
+    let stream =
+        VulkanResidentInProcessPlacedPromptStream::from_runtime_model_for_bound_devices(
+            devices,
+            manifest_path.parent().unwrap(),
+            fixture_model_runtime_model(),
+            Some(8),
+            0,
+            0,
+        )
+        .unwrap();
+    let mut engine = VulkanResidentInProcessPlacedPromptEngine::new();
+    engine.add_stream("main", stream).unwrap();
+
+    let submitted = engine
+        .submit_input_event_until_idle(
+            "main",
+            VulkanResidentTokenInputEvent::new("boundary", vec![1], 3),
+        )
+        .unwrap();
+
+    assert_eq!(submitted.generated_token_ids.len(), 3);
+    assert_eq!(submitted.engine_run.input_runs.len(), 1);
+    assert_eq!(
+        submitted.engine_run.input_runs[0]
+            .submitted_run
+            .session_run
+            .run
+            .stop_reason,
+        "max_new_tokens"
+    );
+    assert!(submitted.engine_run.end_snapshot.idle);
+    assert!(engine.snapshot().idle);
+}
+
+#[test]
 fn placed_prompt_engine_single_submit_runs_the_engine_queue() {
     let device = match VulkanComputeDevice::new() {
         Ok(device) => device,
