@@ -11,6 +11,7 @@ from nerve.model_package_integrity import *
 from nerve.model_package_validation import *
 from nerve.model_package_tensors import *
 from nerve.model_package_derived_tensors import *
+from nerve.compiler_target import CompilerTarget
 
 def compile_model_package(
     model_dir: Path,
@@ -21,6 +22,7 @@ def compile_model_package(
     shader_source_dir: Path = Path("runtime-rs/shaders"),
     event_sink: Callable[[Json], None] | None = None,
     cancel_requested: Callable[[], bool] | None = None,
+    target: CompilerTarget,
 ) -> CompiledModelReport:
     slug = compiled_model_slug(model_dir)
     package_dir = package_dir or DEFAULT_COMPILED_MODELS_DIR / slug
@@ -30,6 +32,7 @@ def compile_model_package(
     if package_dir.exists():
         shutil.rmtree(package_dir)
     package_dir.mkdir(parents=True, exist_ok=True)
+    write_json(package_dir / "compiler_target.json", target.to_json())
 
     structure = transpile_model(
         model_dir,
@@ -46,7 +49,7 @@ def compile_model_package(
     check_compile_cancelled(cancel_requested)
     tensor_index = read_json(transpiled_dir / "tensors.json")
     model_graph = read_json(transpiled_dir / "model.json")
-    derive_output_projection_tensors(model_graph, tensor_index)
+    derive_output_projection_tensors(model_graph, tensor_index, target=target)
     write_json(transpiled_dir / "tensors.json", tensor_index)
     write_json(transpiled_dir / "model.json", model_graph)
     check_compile_cancelled(cancel_requested)
@@ -65,7 +68,12 @@ def compile_model_package(
         cancel_requested=cancel_requested,
     )
     check_compile_cancelled(cancel_requested)
-    derive_internal_q8_linear_tensors(lowered["index"], lowered_dir, tensor_index)
+    lower_unsupported_linear_tensor_dtypes(
+        lowered["index"],
+        lowered_dir,
+        tensor_index,
+        target=target,
+    )
     write_json(transpiled_dir / "tensors.json", tensor_index)
     tensor_index = referenced_tensor_index(
         tensor_index,
@@ -103,6 +111,7 @@ def compile_model_package(
         package_id=f"{slug}_vulkan_resident",
         shader_source_dir=shader_source_dir,
         tokenizer_manifest=tokenizer_manifest,
+        compiler_target=target.to_json(),
         event_sink=event_sink,
         cancel_requested=cancel_requested,
     )

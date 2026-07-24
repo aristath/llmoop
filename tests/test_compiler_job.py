@@ -18,6 +18,7 @@ from nerve.model_compiler import (
     discover_source_model,
     publish_staged_directories,
 )
+from nerve.compiler_target import CompilerTarget
 
 
 def write_discoverable_source(root: Path) -> None:
@@ -183,6 +184,7 @@ def test_failed_compile_preserves_public_outputs_and_removes_staging(
             source,
             compiled_model_dir=destination,
             event_sink=events.append,
+            target=CompilerTarget.for_features({"shader_bfloat16_type"}),
         )
 
     assert (destination / "identity").read_text() == "published"
@@ -220,6 +222,12 @@ def test_cli_compile_forwards_one_compiled_model_destination(
         )
 
     monkeypatch.setattr("nerve.cli.compile_model", fake_compile_model)
+    monkeypatch.setattr(
+        "nerve.cli.discover_compiler_target",
+        lambda **_kwargs: CompilerTarget.for_features(
+            {"shader_bfloat16_type"}
+        ),
+    )
     monkeypatch.setattr(
         sys,
         "argv",

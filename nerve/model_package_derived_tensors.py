@@ -1,8 +1,14 @@
 from nerve.model_package_common import *
 from nerve.model_package_tensors import dtype_byte_count, tensor_dtype, tensor_shape
+from nerve.compiler_target import CompilerTarget
 
 
-def derive_output_projection_tensors(model_graph: Json, tensor_index: Json) -> None:
+def derive_output_projection_tensors(
+    model_graph: Json,
+    tensor_index: Json,
+    *,
+    target: CompilerTarget,
+) -> None:
     """Compile the output projection into the best generic artifact we can use.
 
     Some FP8 checkpoints keep the final LM head in BF16 even when the decoder
@@ -22,7 +28,10 @@ def derive_output_projection_tensors(model_graph: Json, tensor_index: Json) -> N
     dtype = tensor_dtype(tensor_index, source_tensor)
     if dtype == "F8_E4M3":
         scale_tensor = f"{source_tensor}_scale_inv"
-        if scale_tensor in tensor_index["tensors"]:
+        if (
+            scale_tensor in tensor_index["tensors"]
+            and target.supports_native_dtype("F8_E4M3")
+        ):
             params["weight_scale_inv"] = {"tensor": scale_tensor}
             update_draft_output_projection_params(
                 model_graph,
@@ -30,8 +39,28 @@ def derive_output_projection_tensors(model_graph: Json, tensor_index: Json) -> N
                 weight_tensor=source_tensor,
                 scale_tensor=scale_tensor,
             )
+        elif scale_tensor in tensor_index["tensors"]:
+            bf16_tensor = ensure_bf16_tensor_for_fp8_pair(
+                tensor_index,
+                weight_tensor=source_tensor,
+                scale_tensor=scale_tensor,
+            )
+            params["weight"] = {"tensor": bf16_tensor}
+            params.pop("weight_scale_inv", None)
+            output_projection["compiled_parameter_dtype"] = "BF16"
+            output_projection["compiled_from_tensor"] = source_tensor
+            update_draft_output_projection_params(
+                model_graph,
+                source_tensor=source_tensor,
+                weight_tensor=bf16_tensor,
+                scale_tensor=None,
+            )
         return
     if dtype != "BF16":
+        return
+    if target.supports_native_dtype("BF16"):
+        return
+    if not target.supports_native_dtype("F8_E4M3"):
         return
 
     shape = tensor_shape(tensor_index, source_tensor)
@@ -97,7 +126,7 @@ def update_draft_output_projection_params(
     *,
     source_tensor: str,
     weight_tensor: str,
-    scale_tensor: str,
+    scale_tensor: str | None,
 ) -> None:
     for draft in model_graph["graph"].get("draft_execution_graphs", []):
         output = draft.get("output_transducer", {})
@@ -106,7 +135,10 @@ def update_draft_output_projection_params(
         if not isinstance(projection, dict) or projection.get("tensor") != source_tensor:
             continue
         params["projection"] = {"tensor": weight_tensor}
-        params["weight_scale_inv"] = {"tensor": scale_tensor}
+        if scale_tensor is None:
+            params.pop("weight_scale_inv", None)
+        else:
+            params["weight_scale_inv"] = {"tensor": scale_tensor}
 
 
 def output_projection_component(model_graph: Json) -> Json:
@@ -135,6 +167,22 @@ def derive_internal_q8_linear_tensors(
             write_json(circuit_path, circuit)
 
 
+def lower_unsupported_linear_tensor_dtypes(
+    lowered_index: Json,
+    lowered_dir: Path,
+    tensor_index: Json,
+    *,
+    target: CompilerTarget,
+) -> None:
+    if target.supports_native_dtype("F8_E4M3"):
+        return
+    for circuit_ref in lowered_circuit_refs(lowered_index):
+        circuit_path = lowered_dir / circuit_ref["circuit"]
+        circuit = read_json(circuit_path)
+        if rewrite_circuit_fp8_linears_to_bf16(circuit, tensor_index):
+            write_json(circuit_path, circuit)
+
+
 def lowered_circuit_refs(lowered_index: Json) -> list[Json]:
     refs = list(lowered_index["graph"]["circuits"])
     refs.extend(
@@ -146,12 +194,57 @@ def lowered_circuit_refs(lowered_index: Json) -> list[Json]:
 
 
 def rewrite_circuit_fp8_linears_to_q8(circuit: Json, tensor_index: Json) -> bool:
+    return rewrite_circuit_fp8_linears(
+        circuit,
+        tensor_index,
+        replacement_dtype="Q8_0",
+    )
+
+
+def rewrite_circuit_fp8_linears_to_bf16(circuit: Json, tensor_index: Json) -> bool:
+    return rewrite_circuit_fp8_linears(
+        circuit,
+        tensor_index,
+        replacement_dtype="BF16",
+    )
+
+
+def rewrite_circuit_fp8_linears(
+    circuit: Json,
+    tensor_index: Json,
+    *,
+    replacement_dtype: str,
+) -> bool:
+    if replacement_dtype not in {"BF16", "Q8_0"}:
+        raise ModelCompileError(
+            f"unsupported FP8 linear replacement dtype {replacement_dtype!r}"
+        )
     rewritten = False
     refs = circuit["parameters"]["refs"]
     used_params_after_rewrite: set[str] = set()
     for node in circuit.get("nodes", []):
         params = list(node.get("params", []))
         op = node.get("op")
+        if op in {"sparse_moe_gate_up", "sparse_moe_down"}:
+            if replacement_dtype == "BF16" and len(params) == 2:
+                pair = fp8_pair_tensors(
+                    refs,
+                    tensor_index,
+                    weight_id=params[0],
+                    scale_id=params[1],
+                )
+                if pair is not None:
+                    refs[params[0]]["tensor"] = ensure_bf16_tensor_for_fp8_pair(
+                        tensor_index,
+                        weight_tensor=pair[0],
+                        scale_tensor=pair[1],
+                    )
+                    node["params"] = [params[0]]
+                    used_params_after_rewrite.add(params[0])
+                    rewritten = True
+                    continue
+            used_params_after_rewrite.update(params)
+            continue
         if op in {"parallel_linear_2way", "parallel_linear_3way"}:
             branch_count = int(node.get("attrs", {}).get("branch_count", 0))
             branch_parameter_counts = [
@@ -181,10 +274,11 @@ def rewrite_circuit_fp8_linears_to_q8(circuit: Json, tensor_index: Json) -> bool
                     offset += count
                 if len(replacement_pairs) == branch_count:
                     for weight_id, weight_tensor, scale_tensor in replacement_pairs:
-                        refs[weight_id]["tensor"] = ensure_q8_tensor_for_fp8_pair(
+                        refs[weight_id]["tensor"] = ensure_replacement_tensor_for_fp8_pair(
                             tensor_index,
                             weight_tensor=weight_tensor,
                             scale_tensor=scale_tensor,
+                            replacement_dtype=replacement_dtype,
                         )
                     node["params"] = replacement_params
                     node["attrs"]["branch_parameter_counts"] = [1] * branch_count
@@ -216,12 +310,13 @@ def rewrite_circuit_fp8_linears_to_q8(circuit: Json, tensor_index: Json) -> bool
                     ):
                         if pair is None:
                             raise ModelCompileError(
-                                "internal Q8 rewrite lost a validated FP8 pair"
+                                "FP8 rewrite lost a validated weight/scale pair"
                             )
-                        refs[weight_id]["tensor"] = ensure_q8_tensor_for_fp8_pair(
+                        refs[weight_id]["tensor"] = ensure_replacement_tensor_for_fp8_pair(
                             tensor_index,
                             weight_tensor=pair[0],
                             scale_tensor=pair[1],
+                            replacement_dtype=replacement_dtype,
                         )
                     node["params"] = [params[0], params[2]]
                     used_params_after_rewrite.update(node["params"])
@@ -238,8 +333,12 @@ def rewrite_circuit_fp8_linears_to_q8(circuit: Json, tensor_index: Json) -> bool
         if len(params) < 2 or params[1] != scale_id:
             used_params_after_rewrite.update(params)
             continue
-        replacement = q8_replacement_for_fp8_pair(
-            refs, tensor_index, weight_id=weight_id, scale_id=scale_id
+        replacement = replacement_for_fp8_pair(
+            refs,
+            tensor_index,
+            weight_id=weight_id,
+            scale_id=scale_id,
+            replacement_dtype=replacement_dtype,
         )
         if replacement is None:
             used_params_after_rewrite.update(params)
@@ -262,19 +361,37 @@ def q8_replacement_for_fp8_pair(
     weight_id: str,
     scale_id: str,
 ) -> str | None:
+    return replacement_for_fp8_pair(
+        refs,
+        tensor_index,
+        weight_id=weight_id,
+        scale_id=scale_id,
+        replacement_dtype="Q8_0",
+    )
+
+
+def replacement_for_fp8_pair(
+    refs: Json,
+    tensor_index: Json,
+    *,
+    weight_id: str,
+    scale_id: str,
+    replacement_dtype: str,
+) -> str | None:
     pair = fp8_pair_tensors(
         refs, tensor_index, weight_id=weight_id, scale_id=scale_id
     )
     if pair is None:
         return None
     weight_tensor, scale_tensor = pair
-    q8_tensor = ensure_q8_tensor_for_fp8_pair(
+    replacement = ensure_replacement_tensor_for_fp8_pair(
         tensor_index,
         weight_tensor=weight_tensor,
         scale_tensor=scale_tensor,
+        replacement_dtype=replacement_dtype,
     )
-    refs[weight_id]["tensor"] = q8_tensor
-    return q8_tensor
+    refs[weight_id]["tensor"] = replacement
+    return replacement
 
 
 def fp8_pair_tensors(
@@ -297,10 +414,75 @@ def fp8_pair_tensors(
         or tensor_dtype(tensor_index, scale_tensor) != "BF16"
     ):
         return None
-    shape = tensor_shape(tensor_index, weight_tensor)
-    if len(shape) != 2 or shape[1] % Q8_0_GROUP_SIZE:
-        return None
     return weight_tensor, scale_tensor
+
+
+def ensure_replacement_tensor_for_fp8_pair(
+    tensor_index: Json,
+    *,
+    weight_tensor: str,
+    scale_tensor: str,
+    replacement_dtype: str,
+) -> str:
+    if replacement_dtype == "BF16":
+        return ensure_bf16_tensor_for_fp8_pair(
+            tensor_index,
+            weight_tensor=weight_tensor,
+            scale_tensor=scale_tensor,
+        )
+    if replacement_dtype == "Q8_0":
+        return ensure_q8_tensor_for_fp8_pair(
+            tensor_index,
+            weight_tensor=weight_tensor,
+            scale_tensor=scale_tensor,
+        )
+    raise ModelCompileError(
+        f"unsupported FP8 linear replacement dtype {replacement_dtype!r}"
+    )
+
+
+def ensure_bf16_tensor_for_fp8_pair(
+    tensor_index: Json, *, weight_tensor: str, scale_tensor: str
+) -> str:
+    bf16_tensor = f"{weight_tensor}.__nerve_bf16"
+    if bf16_tensor in tensor_index["tensors"]:
+        return bf16_tensor
+
+    weight_info = tensor_index["tensors"][weight_tensor]
+    scale_info = tensor_index["tensors"][scale_tensor]
+    shape = tensor_shape(tensor_index, weight_tensor)
+    scale_shape = tensor_shape(tensor_index, scale_tensor)
+    if (
+        len(shape) not in {2, 3}
+        or len(scale_shape) != len(shape)
+        or shape[:-2] != scale_shape[:-2]
+    ):
+        raise ModelCompileError(
+            f"cannot derive BF16 from FP8 tensor {weight_tensor!r} with "
+            f"weight/scale shapes {shape} / {scale_shape}"
+        )
+    parameter_count = math.prod(shape)
+    tensor_index["tensors"][bf16_tensor] = {
+        "dtype": "BF16",
+        "shape": shape,
+        "parameter_count": parameter_count,
+        "byte_count": parameter_count * dtype_byte_count("BF16"),
+        "layout": ROW_MAJOR_LAYOUT,
+        "derived": {
+            "kind": "fp8_e4m3_to_bf16",
+            "source_tensor": weight_tensor,
+            "source_file": weight_info["source_file"],
+            "source_header_bytes": int(weight_info["source_header_bytes"]),
+            "data_offsets": list(weight_info["data_offsets"]),
+            "source_shape": shape,
+            "scale_tensor": scale_tensor,
+            "scale_source_file": scale_info["source_file"],
+            "scale_source_header_bytes": int(scale_info["source_header_bytes"]),
+            "scale_data_offsets": list(scale_info["data_offsets"]),
+            "scale_shape": scale_shape,
+        },
+    }
+    return bf16_tensor
 
 
 def ensure_q8_tensor_for_fp8_pair(

@@ -20,6 +20,7 @@ from nerve.compilation import (
     read_json,
 )
 from nerve.model_package import compiled_model_slug, compile_model_package
+from nerve.compiler_target import CompilerTarget, discover_compiler_target
 
 @dataclass(frozen=True)
 class SourceModelDiscovery:
@@ -52,6 +53,7 @@ def compile_model(
     shader_source_dir: Path = Path("runtime-rs/shaders"),
     event_sink: CompileEventSink | None = None,
     cancel_requested: CancelCheck | None = None,
+    target: CompilerTarget | None = None,
 ) -> CompiledModelReport:
     model_dir = model_dir.expanduser()
     emit_compile_event(event_sink, "DiscoveryStarted", model_dir=str(model_dir))
@@ -60,6 +62,13 @@ def compile_model(
         emit_compile_event(event_sink, "SourceDiscovered", source=discovery.to_json())
         check_compile_cancelled(cancel_requested)
         emit_compile_event(event_sink, "ValidationStarted", model_dir=str(model_dir))
+        if target is None:
+            target = discover_compiler_target()
+        emit_compile_event(
+            event_sink,
+            "TargetDevicesDiscovered",
+            target=target.to_json(),
+        )
 
         slug = compiled_model_slug(model_dir)
         final_compiled_model = compiled_model_dir or DEFAULT_COMPILED_MODELS_DIR / slug
@@ -82,6 +91,7 @@ def compile_model(
                 shader_source_dir=shader_source_dir,
                 event_sink=event_sink,
                 cancel_requested=cancel_requested,
+                target=target,
             )
             check_compile_cancelled(cancel_requested)
             publish_staged_directories(

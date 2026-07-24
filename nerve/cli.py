@@ -12,6 +12,7 @@ from pathlib import Path
 
 from nerve.compilation import ModelCompileCancelled, ModelCompileError
 from nerve.model_compiler import compile_model, discover_source_model
+from nerve.compiler_target import discover_compiler_target
 
 
 RUNTIME_PACKAGE_MANIFEST = "vulkan_resident_package.json"
@@ -318,6 +319,7 @@ def main() -> None:
             shader_source_dir=args.shader_source_dir,
             event_sink=reporter,
             cancel_requested=lambda: cancel_requested,
+            target=discover_compiler_target(runtime_bin=args.runtime_bin),
         )
     except ModelCompileCancelled:
         raise SystemExit(130) from None
@@ -355,7 +357,6 @@ def validate_action_options(
         ("--inspect-graph", args.inspect_graph),
         ("--inspect-placement", args.inspect_placement),
         ("--inspect-device-slice", args.inspect_device_slice is not None),
-        ("--runtime-bin", args.runtime_bin is not None),
         ("--device", args.device is not None),
         ("--place-node", bool(args.place_node)),
         ("--bind-device", bool(args.bind_device)),
@@ -380,6 +381,12 @@ def validate_action_options(
         for option, provided in runtime_options:
             if provided:
                 parser.error(f"{option} is only supported with --run")
+    if (
+        args.runtime_bin is not None
+        and args.run is None
+        and args.compile_model is None
+    ):
+        parser.error("--runtime-bin is only supported with --run or --compile-model")
 
     compiler_options = (
         ("--compiled-model-dir", args.compiled_model_dir is not None),

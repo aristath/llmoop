@@ -359,6 +359,114 @@ def write_compiled_derived_q8_0_from_fp8_e4m3(
     return len(header), data_digest.hexdigest()
 
 
+def write_compiled_derived_bf16_from_fp8_e4m3(
+    *,
+    tensor_name: str,
+    info: Json,
+    destination: Path,
+    layout: str,
+) -> tuple[int, str]:
+    if layout != ROW_MAJOR_LAYOUT:
+        raise ModelCompileError("derived BF16 tensors require row-major layout")
+    derivation = info.get("derived")
+    if (
+        not isinstance(derivation, dict)
+        or derivation.get("kind") != "fp8_e4m3_to_bf16"
+    ):
+        raise ModelCompileError(
+            f"tensor {tensor_name!r} is not a derived FP8-to-BF16 tensor"
+        )
+
+    source_shape = [int(value) for value in derivation["source_shape"]]
+    scale_shape = [int(value) for value in derivation["scale_shape"]]
+    if len(source_shape) not in {2, 3}:
+        raise ModelCompileError(
+            f"derived BF16 tensor {tensor_name!r} requires a rank-2 or rank-3 source"
+        )
+    output_rows, input_columns = source_shape[-2:]
+    leading_shape = source_shape[:-2]
+    if len(scale_shape) != len(source_shape) or scale_shape[:-2] != leading_shape:
+        raise ModelCompileError(
+            f"derived BF16 tensor {tensor_name!r} has incompatible scale shape "
+            f"{scale_shape} for source shape {source_shape}"
+        )
+    if info["shape"] != source_shape:
+        raise ModelCompileError(
+            f"derived BF16 tensor {tensor_name!r} shape {info['shape']} "
+            f"does not match source shape {source_shape}"
+        )
+    expected_byte_count = math.prod(source_shape) * 2
+    if int(info["byte_count"]) != expected_byte_count:
+        raise ModelCompileError(
+            f"derived BF16 tensor {tensor_name!r} byte count {info['byte_count']} "
+            f"does not match expected {expected_byte_count}"
+        )
+    block_rows, block_columns = regular_block_shape(
+        source_shape[-2:],
+        scale_shape[-2:],
+    )
+
+    source = Path(derivation["source_file"])
+    scale_source = Path(derivation["scale_source_file"])
+    if not source.is_file():
+        raise ModelCompileError(f"derived BF16 FP8 source does not exist: {source}")
+    if not scale_source.is_file():
+        raise ModelCompileError(
+            f"derived BF16 scale source does not exist: {scale_source}"
+        )
+    scale_bytes = read_source_tensor_payload(
+        source=scale_source,
+        source_header_bytes=int(derivation["scale_source_header_bytes"]),
+        data_offsets=[int(value) for value in derivation["scale_data_offsets"]],
+    )
+    scales = bf16_bytes_to_f32(scale_bytes, scale_shape)
+
+    header = compiled_safetensors_header(
+        tensor_name,
+        dtype="BF16",
+        shape=source_shape,
+        byte_count=expected_byte_count,
+        layout=layout,
+    )
+    source_start = (
+        8
+        + int(derivation["source_header_bytes"])
+        + int(derivation["data_offsets"][0])
+    )
+    data_digest = sha256()
+    with (
+        source.open("rb") as source_handle,
+        destination.open("wb") as destination_handle,
+    ):
+        destination_handle.write(struct.pack("<Q", len(header)))
+        destination_handle.write(header)
+        source_handle.seek(source_start)
+        leading_indices = np.ndindex(*leading_shape) if leading_shape else [()]
+        for leading_index in leading_indices:
+            for row_start in range(0, output_rows, block_rows):
+                row_count = min(block_rows, output_rows - row_start)
+                encoded = source_handle.read(row_count * input_columns)
+                if len(encoded) != row_count * input_columns:
+                    raise ModelCompileError(
+                        f"unexpected end of FP8 tensor while deriving {tensor_name!r}"
+                    )
+                values = e4m3fn_to_f32(
+                    np.frombuffer(encoded, dtype=np.uint8).reshape(
+                        row_count,
+                        input_columns,
+                    )
+                )
+                scale_row = row_start // block_rows
+                expanded_scales = np.repeat(
+                    scales[(*leading_index, scale_row, slice(None))],
+                    block_columns,
+                )[:input_columns]
+                payload = f32_to_bf16_bytes(values * expanded_scales)
+                destination_handle.write(payload)
+                data_digest.update(payload)
+    return len(header), data_digest.hexdigest()
+
+
 def compiled_safetensors_header(
     tensor_name: str,
     *,
@@ -381,7 +489,11 @@ def compiled_safetensors_header(
 
 
 def bf16_bytes_to_f32_matrix(data: bytes, rows: int, columns: int) -> np.ndarray:
-    bf16 = np.frombuffer(data, dtype="<u2").reshape(rows, columns)
+    return bf16_bytes_to_f32(data, [rows, columns])
+
+
+def bf16_bytes_to_f32(data: bytes, shape: list[int]) -> np.ndarray:
+    bf16 = np.frombuffer(data, dtype="<u2").reshape(shape)
     bits = bf16.astype(np.uint32) << 16
     return bits.view(np.float32)
 

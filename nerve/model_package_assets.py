@@ -213,6 +213,33 @@ def copy_tensor_package(
             continue
         if (
             isinstance(derivation, dict)
+            and derivation.get("kind") == "fp8_e4m3_to_bf16"
+        ):
+            header_bytes, data_sha256 = write_compiled_derived_bf16_from_fp8_e4m3(
+                tensor_name=tensor_name,
+                info=info,
+                destination=destination,
+                layout=layout,
+            )
+            relative_destination = relative_json_path(package_dir, destination)
+            info["source_file"] = relative_destination
+            info["data_offsets"] = [0, int(info["byte_count"])]
+            info["data_sha256"] = data_sha256
+            info["layout"] = layout
+            info.pop("derived", None)
+            compiled_sources.append(
+                {
+                    "path": relative_destination,
+                    "safetensors_header_bytes": header_bytes,
+                    "metadata": {
+                        "format": "nerve",
+                        "layout": layout,
+                    },
+                }
+            )
+            continue
+        if (
+            isinstance(derivation, dict)
             and derivation.get("kind") == "fp8_e4m3_to_q8_0"
         ):
             header_bytes, data_sha256 = write_compiled_derived_q8_0_from_fp8_e4m3(

@@ -19,6 +19,7 @@ def build_vulkan_resident_package_manifest(
     package_id: str,
     shader_source_dir: Path,
     tokenizer_manifest: Json,
+    compiler_target: Json,
     event_sink: Callable[[Json], None] | None = None,
     cancel_requested: Callable[[], bool] | None = None,
 ) -> Json:
@@ -510,6 +511,7 @@ def build_vulkan_resident_package_manifest(
         "schema": PACKAGE_SCHEMA,
         "package_id": package_id,
         "compiler_fingerprint": package_compiler_fingerprint(shader_source_dir),
+        "compiler_target": compiler_target,
         "circuit_graph": package_circuit_graph(
             lowered_index, lowered_dir, compiled_circuits
         ),

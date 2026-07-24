@@ -2,12 +2,16 @@ from model_package_layout_common import *
 from nerve.model_package_derived_tensors import (
     derive_internal_q8_linear_tensors,
     derive_output_projection_tensors,
+    lower_unsupported_linear_tensor_dtypes,
+    rewrite_circuit_fp8_linears_to_bf16,
 )
+from nerve.compiler_target import CompilerTarget
 from nerve.model_package_tensors import (
     e4m3fn_to_f32,
     f32_to_bf16_bytes,
     f32_to_e4m3fn,
     write_compiled_derived_fp8_e4m3_output_projection,
+    write_compiled_derived_bf16_from_fp8_e4m3,
     write_compiled_derived_q8_0_from_fp8_e4m3,
 )
 
@@ -107,7 +111,16 @@ def test_compiler_derives_fp8_output_projection_tensor_pair(tmp_path: Path) -> N
         }
     }
 
-    derive_output_projection_tensors(model_graph, tensor_index)
+    derive_output_projection_tensors(
+        model_graph,
+        tensor_index,
+        target=CompilerTarget.for_features(
+            {
+                "shader_float8",
+                "shader_mixed_float_dot_product_float8_acc_float32",
+            }
+        ),
+    )
 
     projection = model_graph["graph"]["output_transducer"]["components"][1]
     weight = projection["params"]["weight"]["tensor"]
@@ -140,6 +153,199 @@ def test_compiler_derives_fp8_output_projection_tensor_pair(tmp_path: Path) -> N
     assert set(digests) == {weight, scale}
     assert destinations[weight].stat().st_size > 16 * 128
     assert destinations[scale].stat().st_size > 2
+
+
+def test_compiler_preserves_native_bf16_output_projection() -> None:
+    tensor_index = {
+        "tensors": {
+            "lm_head.weight": {
+                "dtype": "BF16",
+                "shape": [16, 128],
+            }
+        }
+    }
+    model_graph = {
+        "graph": {
+            "output_transducer": {
+                "components": [
+                    {
+                        "id": "output_projection",
+                        "type": "linear_projection",
+                        "params": {"weight": {"tensor": "lm_head.weight"}},
+                    }
+                ]
+            },
+            "draft_execution_graphs": [],
+        }
+    }
+
+    derive_output_projection_tensors(
+        model_graph,
+        tensor_index,
+        target=CompilerTarget.for_features({"shader_bfloat16_type"}),
+    )
+
+    projection = model_graph["graph"]["output_transducer"]["components"][0]
+    assert projection["params"] == {"weight": {"tensor": "lm_head.weight"}}
+    assert set(tensor_index["tensors"]) == {"lm_head.weight"}
+
+
+def test_compiler_writes_fidelity_preserving_bf16_fallback_from_fp8(
+    tmp_path: Path,
+) -> None:
+    source_tensor = "layer.weight"
+    scale_tensor = "layer.weight_scale_inv"
+    tensor_name = "layer.weight.__nerve_bf16"
+    source_values = np.linspace(-3.0, 3.0, 64, dtype=np.float32).reshape(2, 32)
+    fp8_bytes = f32_to_e4m3fn(source_values / 0.5).tobytes(order="C")
+    scale_bytes = f32_to_bf16_bytes(np.asarray([0.5], dtype=np.float32))
+    source_header_payload = json.dumps(
+        {
+            source_tensor: {
+                "dtype": "F8_E4M3",
+                "shape": [2, 32],
+                "data_offsets": [0, len(fp8_bytes)],
+            }
+        }
+    ).encode("utf-8")
+    scale_header_payload = json.dumps(
+        {
+            scale_tensor: {
+                "dtype": "BF16",
+                "shape": [1, 1],
+                "data_offsets": [0, len(scale_bytes)],
+            }
+        }
+    ).encode("utf-8")
+    source = tmp_path / "source.safetensors"
+    scale_source = tmp_path / "scale.safetensors"
+    source.write_bytes(
+        struct.pack("<Q", len(source_header_payload))
+        + source_header_payload
+        + fp8_bytes
+    )
+    scale_source.write_bytes(
+        struct.pack("<Q", len(scale_header_payload))
+        + scale_header_payload
+        + scale_bytes
+    )
+    destination = tmp_path / "bf16.safetensors"
+
+    write_compiled_derived_bf16_from_fp8_e4m3(
+        tensor_name=tensor_name,
+        info={
+            "dtype": "BF16",
+            "shape": [2, 32],
+            "byte_count": 2 * 32 * 2,
+            "derived": {
+                "kind": "fp8_e4m3_to_bf16",
+                "source_tensor": source_tensor,
+                "source_file": str(source),
+                "source_header_bytes": len(source_header_payload),
+                "data_offsets": [0, len(fp8_bytes)],
+                "source_shape": [2, 32],
+                "scale_tensor": scale_tensor,
+                "scale_source_file": str(scale_source),
+                "scale_source_header_bytes": len(scale_header_payload),
+                "scale_data_offsets": [0, len(scale_bytes)],
+                "scale_shape": [1, 1],
+            },
+        },
+        destination=destination,
+        layout=ROW_MAJOR_LAYOUT,
+    )
+
+    compiled = destination.read_bytes()
+    header_bytes = struct.unpack("<Q", compiled[:8])[0]
+    payload = compiled[8 + header_bytes :]
+    decoded = (
+        np.frombuffer(payload, dtype="<u2").astype(np.uint32) << 16
+    ).view(np.float32)
+    expected = (
+        e4m3fn_to_f32(np.frombuffer(fp8_bytes, dtype=np.uint8)) * 0.5
+    )
+    np.testing.assert_array_equal(decoded, expected)
+
+
+def test_compiler_writes_rank3_bf16_fallback_for_fp8_experts(
+    tmp_path: Path,
+) -> None:
+    source_tensor = "experts.weight"
+    scale_tensor = "experts.weight_scale_inv"
+    tensor_name = "experts.weight.__nerve_bf16"
+    scales = np.asarray([0.5, 2.0], dtype=np.float32).reshape(2, 1, 1)
+    unscaled = np.stack(
+        [
+            np.linspace(-2.0, 2.0, 64, dtype=np.float32).reshape(2, 32),
+            np.linspace(-1.0, 1.0, 64, dtype=np.float32).reshape(2, 32),
+        ]
+    )
+    fp8_bytes = f32_to_e4m3fn(unscaled).tobytes(order="C")
+    scale_bytes = f32_to_bf16_bytes(scales)
+    source_header_payload = json.dumps(
+        {
+            source_tensor: {
+                "dtype": "F8_E4M3",
+                "shape": [2, 2, 32],
+                "data_offsets": [0, len(fp8_bytes)],
+            }
+        }
+    ).encode("utf-8")
+    scale_header_payload = json.dumps(
+        {
+            scale_tensor: {
+                "dtype": "BF16",
+                "shape": [2, 1, 1],
+                "data_offsets": [0, len(scale_bytes)],
+            }
+        }
+    ).encode("utf-8")
+    source = tmp_path / "experts.safetensors"
+    scale_source = tmp_path / "expert_scales.safetensors"
+    source.write_bytes(
+        struct.pack("<Q", len(source_header_payload))
+        + source_header_payload
+        + fp8_bytes
+    )
+    scale_source.write_bytes(
+        struct.pack("<Q", len(scale_header_payload))
+        + scale_header_payload
+        + scale_bytes
+    )
+    destination = tmp_path / "experts_bf16.safetensors"
+
+    write_compiled_derived_bf16_from_fp8_e4m3(
+        tensor_name=tensor_name,
+        info={
+            "dtype": "BF16",
+            "shape": [2, 2, 32],
+            "byte_count": 2 * 2 * 32 * 2,
+            "derived": {
+                "kind": "fp8_e4m3_to_bf16",
+                "source_file": str(source),
+                "source_header_bytes": len(source_header_payload),
+                "data_offsets": [0, len(fp8_bytes)],
+                "source_shape": [2, 2, 32],
+                "scale_source_file": str(scale_source),
+                "scale_source_header_bytes": len(scale_header_payload),
+                "scale_data_offsets": [0, len(scale_bytes)],
+                "scale_shape": [2, 1, 1],
+            },
+        },
+        destination=destination,
+        layout=ROW_MAJOR_LAYOUT,
+    )
+
+    compiled = destination.read_bytes()
+    header_bytes = struct.unpack("<Q", compiled[:8])[0]
+    payload = compiled[8 + header_bytes :]
+    decoded = (
+        np.frombuffer(payload, dtype="<u2").astype(np.uint32) << 16
+    ).view(np.float32).reshape(2, 2, 32)
+    expected = e4m3fn_to_f32(
+        np.frombuffer(fp8_bytes, dtype=np.uint8).reshape(2, 2, 32)
+    ) * scales
+    np.testing.assert_array_equal(decoded, expected)
 
 
 def test_compiler_writes_internal_q8_0_blocks_from_block_scaled_fp8(
@@ -305,6 +511,169 @@ def test_compiler_rewrites_eligible_fp8_linears_to_internal_q8(
     assert tensor_index["tensors"][q8_tensor]["derived"]["kind"] == (
         "fp8_e4m3_to_q8_0"
     )
+
+
+def test_target_capabilities_preserve_native_fp8_and_lower_only_when_unsupported(
+    tmp_path: Path,
+) -> None:
+    def write_circuit(root: Path) -> tuple[Path, dict[str, object], dict[str, object]]:
+        circuit_dir = root / "lowered" / "layer_00"
+        circuit_dir.mkdir(parents=True)
+        circuit = {
+            "parameters": {
+                "refs": {
+                    "projection": {"tensor": "layer.proj.weight"},
+                    "projection_scale_inv": {
+                        "tensor": "layer.proj.weight_scale_inv"
+                    },
+                }
+            },
+            "nodes": [
+                {
+                    "id": "projection",
+                    "op": "linear",
+                    "params": ["projection", "projection_scale_inv"],
+                }
+            ],
+        }
+        (circuit_dir / "circuit.json").write_text(json.dumps(circuit))
+        lowered_index = {
+            "graph": {
+                "circuits": [
+                    {
+                        "id": "layer_00",
+                        "circuit": "layer_00/circuit.json",
+                    }
+                ]
+            }
+        }
+        tensor_index = {
+            "tensors": {
+                "layer.proj.weight": {
+                    "dtype": "F8_E4M3",
+                    "shape": [64, 128],
+                    "source_file": "/models/source.safetensors",
+                    "source_header_bytes": 128,
+                    "data_offsets": [0, 64 * 128],
+                    "parameter_count": 64 * 128,
+                    "byte_count": 64 * 128,
+                },
+                "layer.proj.weight_scale_inv": {
+                    "dtype": "BF16",
+                    "shape": [1, 1],
+                    "source_file": "/models/source.safetensors",
+                    "source_header_bytes": 128,
+                    "data_offsets": [64 * 128, 64 * 128 + 2],
+                    "parameter_count": 1,
+                    "byte_count": 2,
+                },
+            }
+        }
+        return root / "lowered", lowered_index, tensor_index
+
+    native_dir, native_index, native_tensors = write_circuit(tmp_path / "native")
+    lower_unsupported_linear_tensor_dtypes(
+        native_index,
+        native_dir,
+        native_tensors,
+        target=CompilerTarget.for_features(
+            {
+                "shader_float8",
+                "shader_mixed_float_dot_product_float8_acc_float32",
+            }
+        ),
+    )
+    native_circuit = json.loads(
+        (native_dir / "layer_00" / "circuit.json").read_text()
+    )
+    assert native_circuit["nodes"][0]["params"] == [
+        "projection",
+        "projection_scale_inv",
+    ]
+    assert set(native_tensors["tensors"]) == {
+        "layer.proj.weight",
+        "layer.proj.weight_scale_inv",
+    }
+
+    fallback_dir, fallback_index, fallback_tensors = write_circuit(
+        tmp_path / "fallback"
+    )
+    lower_unsupported_linear_tensor_dtypes(
+        fallback_index,
+        fallback_dir,
+        fallback_tensors,
+        target=CompilerTarget.for_features({"shader_integer_dot_product"}),
+    )
+    fallback_circuit = json.loads(
+        (fallback_dir / "layer_00" / "circuit.json").read_text()
+    )
+    bf16_tensor = "layer.proj.weight.__nerve_bf16"
+    assert fallback_circuit["nodes"][0]["params"] == ["projection"]
+    assert fallback_circuit["parameters"]["refs"] == {
+        "projection": {"tensor": bf16_tensor}
+    }
+    assert fallback_tensors["tensors"][bf16_tensor]["dtype"] == "BF16"
+    assert fallback_tensors["tensors"][bf16_tensor]["derived"]["kind"] == (
+        "fp8_e4m3_to_bf16"
+    )
+
+
+def test_unsupported_fp8_sparse_experts_lower_to_bf16() -> None:
+    circuit = {
+        "parameters": {
+            "refs": {
+                "moe_input": {"tensor": "experts.gate_up"},
+                "moe_input_scale_inv": {
+                    "tensor": "experts.gate_up_scale_inv"
+                },
+            }
+        },
+        "nodes": [
+            {
+                "id": "sparse_moe_gate_up",
+                "op": "sparse_moe_gate_up",
+                "params": ["moe_input", "moe_input_scale_inv"],
+                "attrs": {
+                    "num_experts": 2,
+                    "hidden_size": 32,
+                    "intermediate_size": 2,
+                    "experts_per_token": 1,
+                },
+            }
+        ],
+    }
+    tensor_index = {
+        "tensors": {
+            "experts.gate_up": {
+                "dtype": "F8_E4M3",
+                "shape": [2, 4, 32],
+                "source_file": "/models/source.safetensors",
+                "source_header_bytes": 128,
+                "data_offsets": [0, 2 * 4 * 32],
+                "parameter_count": 2 * 4 * 32,
+                "byte_count": 2 * 4 * 32,
+            },
+            "experts.gate_up_scale_inv": {
+                "dtype": "BF16",
+                "shape": [2, 1, 1],
+                "source_file": "/models/source.safetensors",
+                "source_header_bytes": 128,
+                "data_offsets": [2 * 4 * 32, 2 * 4 * 32 + 4],
+                "parameter_count": 2,
+                "byte_count": 4,
+            },
+        }
+    }
+
+    assert rewrite_circuit_fp8_linears_to_bf16(circuit, tensor_index)
+
+    bf16_tensor = "experts.gate_up.__nerve_bf16"
+    assert circuit["nodes"][0]["params"] == ["moe_input"]
+    assert circuit["parameters"]["refs"] == {
+        "moe_input": {"tensor": bf16_tensor}
+    }
+    assert tensor_index["tensors"][bf16_tensor]["shape"] == [2, 4, 32]
+    assert tensor_index["tensors"][bf16_tensor]["dtype"] == "BF16"
 
 
 def test_compiler_rewrites_parallel_and_fused_fp8_linears_to_internal_q8(
