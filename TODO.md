@@ -44,6 +44,11 @@ tokens/second minimum.
   quantization for every output tile.
 - Reduce dispatch count in component hot paths; large Qwen components currently
   produce hundreds of primary kernel dispatches per tick.
+- Preserve enough independent workgroups to saturate the selected device when
+  reducing dispatches. Collapsing each 17,408-wide FFN from 1,088 workgroups to
+  136 removed all 64 standalone quantization kernels but regressed the same
+  single-device warmup from 19.641 to 18.590 decode tokens/second; dispatch
+  elimination is not a win when it serializes output-row work.
 - Add a native tiled/dot-product path for large BF16 projections, especially the
   output projection, without converting the stored BF16 weights.
 - Evaluate fusing final projection, candidate reduction, and sampling where that
