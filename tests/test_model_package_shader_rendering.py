@@ -67,6 +67,52 @@ def test_compiler_renders_fp8_output_projection_shaders(tmp_path: Path) -> None:
     assert "batch_index * VOCAB_SIZE + row" in batch
 
 
+def test_compiler_renders_reusable_fp8_activation_kernel_family(
+    tmp_path: Path,
+) -> None:
+    shader_source_dir = Path(__file__).parents[1] / "runtime-rs" / "shaders"
+    shader_files = {
+        "quantize_fp8_e4m3_b128_h5120.comp",
+        "quantize_batch16_fp8_e4m3_b128_h5120.comp",
+        "linear_residual_prequant_fp8_e4m3_b128x128_5120x5120.comp",
+        "linear_residual_prequant_batch16_fp8_e4m3_b128x128_5120x5120.comp",
+        "parallel_linear_batch16_3way_prequant_fp8_e4m3_"
+        "b128x128_5120x4096_1024_1024.comp",
+        "parallel_linear_silu_multiply_prequant_batch16_fp8_e4m3_"
+        "b128x128_5120x17408.comp",
+    }
+
+    copy_shader_templates(shader_source_dir, tmp_path, shader_files)
+
+    quantize = (tmp_path / "quantize_fp8_e4m3_b128_h5120.comp").read_text()
+    residual = (
+        tmp_path
+        / "linear_residual_prequant_fp8_e4m3_b128x128_5120x5120.comp"
+    ).read_text()
+    parallel = (
+        tmp_path
+        / "parallel_linear_batch16_3way_prequant_fp8_e4m3_"
+        "b128x128_5120x4096_1024_1024.comp"
+    ).read_text()
+    fused = (
+        tmp_path
+        / "parallel_linear_silu_multiply_prequant_batch16_fp8_e4m3_"
+        "b128x128_5120x17408.comp"
+    ).read_text()
+    assert "const uint ELEMENT_COUNT = 5120u;" in quantize
+    assert "binding = 2) readonly buffer ResidualFrame" in residual
+    assert "const uint OUTPUT_TILE_ROWS = 64u;" in residual
+    assert "binding = 2) buffer OutputA" in parallel
+    assert "binding = 5) readonly buffer WeightA" in parallel
+    assert "const uint OUTPUT_C_SIZE = 1024u;" in parallel
+    assert "shared fe4m3vec4 quantized_input" not in residual
+    assert "shared fe4m3vec4 quantized_input" not in parallel
+    assert "read_gate_scale" in fused
+    assert "layout(push_constant) uniform BatchControl" in fused
+    for shader_file in shader_files:
+        assert "{{" not in (tmp_path / shader_file).read_text()
+
+
 def test_compiler_renders_fused_parallel_ffn_projection_shader(
     tmp_path: Path,
 ) -> None:

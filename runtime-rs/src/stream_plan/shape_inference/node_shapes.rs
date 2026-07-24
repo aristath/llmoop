@@ -9,6 +9,33 @@ fn infer_node_output_shapes(
     let unknown = || Ok(vec![None; outputs]);
 
     match node.op.as_str() {
+        "quantize_fp8_e4m3" => {
+            let element_count = attr_usize(node, "element_count");
+            let block_columns = attr_usize(node, "block_columns");
+            if node.inputs.len() != 1
+                || node.outputs.len() != 2
+                || element_count.is_none()
+                || block_columns.is_none()
+                || element_count.unwrap() % block_columns.unwrap() != 0
+            {
+                return Err(CircuitPlanError(format!(
+                    "{} node {} has invalid FP8 quantization geometry",
+                    component_id, node.id
+                )));
+            }
+            let element_count = element_count.unwrap();
+            let block_columns = block_columns.unwrap();
+            if first_input_shape(node, signals) != Some(vec![element_count]) {
+                return Err(CircuitPlanError(format!(
+                    "{} node {} FP8 quantization input shape does not match {} elements",
+                    component_id, node.id, element_count
+                )));
+            }
+            Ok(vec![
+                Some(vec![element_count]),
+                Some(vec![element_count / block_columns]),
+            ])
+        }
         "rms_norm"
         | "rms_norm_per_head"
         | "rms_norm_per_head_unscaled"

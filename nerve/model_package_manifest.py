@@ -382,6 +382,9 @@ def build_vulkan_resident_package_manifest(
             can_fuse_append_attention=lambda append, attention, circuit=circuit: (
                 can_fuse_bf16_append_attention(circuit, append, attention, tensor_index)
             ),
+            fp8_prequantization_spec=lambda node, circuit=circuit: (
+                fp8_prequantization_spec(circuit, node, tensor_index)
+            ),
         )
     behavioral_validation = build_behavioral_validation(
         model_graph=model_graph,

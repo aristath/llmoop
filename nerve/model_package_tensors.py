@@ -660,6 +660,44 @@ def can_fuse_native_parallel_linears(
     )
 
 
+def fp8_prequantization_spec(
+    circuit: Json, node: Json, tensor_index: Json
+) -> Json | None:
+    if node.get("op") not in {
+        "linear",
+        "linear_residual",
+        "parallel_linear_2way",
+        "parallel_linear_3way",
+        "parallel_linear_silu_multiply",
+    }:
+        return None
+    params = node.get("params", [])
+    if not params:
+        return None
+    try:
+        if parameter_dtype_for_id(circuit, params[0], tensor_index) != "F8_E4M3":
+            return None
+        shape = parameter_shape_for_id(circuit, params[0], tensor_index)
+        block_rows, block_columns = fp8_block_shape_for_node(
+            circuit,
+            {"id": node["id"], "params": params[:2]},
+            tensor_index,
+        )
+    except (KeyError, ModelCompileError):
+        return None
+    if (
+        len(shape) != 2
+        or int(shape[1]) <= 0
+        or int(shape[1]) % block_columns
+    ):
+        return None
+    return {
+        "input_size": int(shape[1]),
+        "block_rows": block_rows,
+        "block_columns": block_columns,
+    }
+
+
 def can_fuse_parallel_linear_silu_multiply(
     circuit: Json,
     projection: Json,

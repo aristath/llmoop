@@ -1,0 +1,139 @@
+#version 460
+
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_float_e4m3 : require
+#extension GL_EXT_spirv_intrinsics : require
+
+spirv_instruction(
+    extensions = ["SPV_VALVE_mixed_float_dot_product"],
+    capabilities = [6915],
+    id = 6918
+)
+float fp8_dot4_acc32(fe4m3vec4 a, fe4m3vec4 b, float accumulator);
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer QuantizedInput {
+    uint words[];
+} quantized_input;
+layout(set = 0, binding = 1) readonly buffer InputScale {
+    float values[];
+} input_scale;
+
+{{OUTPUT_BINDINGS}}
+
+{{WEIGHT_BINDINGS}}
+
+const uint BRANCH_COUNT = {{BRANCH_COUNT}}u;
+const uint BLOCK_ROWS = {{BLOCK_ROWS}}u;
+const uint BLOCK_COLUMNS = {{BLOCK_COLUMNS}}u;
+const uint INPUT_SIZE = {{INPUT_SIZE}}u;
+const uint OUTPUT_TILE_ROWS = {{OUTPUT_TILE_ROWS}}u;
+const uint INPUT_FP8_WORDS = INPUT_SIZE / 4u;
+const uint BLOCK_FP8_WORDS = BLOCK_COLUMNS / 4u;
+const uint SCALE_COLUMNS = INPUT_SIZE / BLOCK_COLUMNS;
+{{OUTPUT_CONSTANTS}}
+
+shared float output_rows[BRANCH_COUNT][OUTPUT_TILE_ROWS];
+
+float bf16_to_f32(uint value) {
+    return uintBitsToFloat((value & 0xffffu) << 16u);
+}
+
+uint f32_to_bf16(float value) {
+    uint bits = floatBitsToUint(value);
+    uint lsb = (bits >> 16u) & 1u;
+    return (bits + 0x7fffu + lsb) >> 16u;
+}
+
+float read_bf16_word(uint packed, uint index) {
+    return bf16_to_f32(packed >> ((index & 1u) * 16u));
+}
+
+fe4m3vec4 read_fp8x4(uint packed) {
+    return uintBitsToFloate4m3EXT(u8vec4(
+        uint8_t(packed),
+        uint8_t(packed >> 8u),
+        uint8_t(packed >> 16u),
+        uint8_t(packed >> 24u)
+    ));
+}
+
+float read_branch_weight_scale(uint branch, uint row, uint block) {
+    uint index = (row / BLOCK_ROWS) * SCALE_COLUMNS + block;
+{{WEIGHT_SCALE_READS}}
+}
+
+fe4m3vec4 read_branch_weightx4(uint branch, uint row, uint word) {
+    uint index = row * INPUT_FP8_WORDS + word;
+{{WEIGHT_READS}}
+}
+
+void write_branch_output(uint branch, uint row, uint value) {
+{{OUTPUT_WRITES}}
+}
+
+uint branch_output_size(uint branch) {
+{{OUTPUT_SIZE_SELECTION}}
+}
+
+void main() {
+    uint first_row = gl_WorkGroupID.x * OUTPUT_TILE_ROWS;
+    for (uint branch = 0u; branch < BRANCH_COUNT; branch++) {
+        for (
+            uint local_row = gl_SubgroupID;
+            local_row < OUTPUT_TILE_ROWS;
+            local_row += gl_NumSubgroups
+        ) {
+            uint row = first_row + local_row;
+            float sum = 0.0;
+            if (row < branch_output_size(branch)) {
+                for (
+                    uint word = gl_SubgroupInvocationID;
+                    word < INPUT_FP8_WORDS;
+                    word += gl_SubgroupSize
+                ) {
+                    uint block = word / BLOCK_FP8_WORDS;
+                    sum = fma(
+                        fp8_dot4_acc32(
+                            read_fp8x4(quantized_input.words[word]),
+                            read_branch_weightx4(branch, row, word),
+                            0.0
+                        ),
+                        input_scale.values[block]
+                            * read_branch_weight_scale(branch, row, block),
+                        sum
+                    );
+                }
+            }
+            sum = subgroupAdd(sum);
+            if (gl_SubgroupInvocationID == 0u) {
+                output_rows[branch][local_row] = sum;
+            }
+        }
+    }
+    barrier();
+
+    for (
+        uint item = gl_LocalInvocationID.x;
+        item < BRANCH_COUNT * ((OUTPUT_TILE_ROWS + 1u) / 2u);
+        item += gl_WorkGroupSize.x
+    ) {
+        uint branch = item / ((OUTPUT_TILE_ROWS + 1u) / 2u);
+        uint local_pair = item % ((OUTPUT_TILE_ROWS + 1u) / 2u);
+        uint row = first_row + local_pair * 2u;
+        uint output_size = branch_output_size(branch);
+        if (row < output_size) {
+            uint hi = row + 1u < output_size
+                ? f32_to_bf16(output_rows[branch][local_pair * 2u + 1u])
+                : 0u;
+            write_branch_output(
+                branch,
+                row,
+                (hi << 16u) | f32_to_bf16(output_rows[branch][local_pair * 2u])
+            );
+        }
+    }
+}

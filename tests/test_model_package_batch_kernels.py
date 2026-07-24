@@ -12,6 +12,18 @@ def test_compiler_selects_only_compatible_weight_shared_batch_kernels() -> None:
     )
     assert (
         weight_shared_batch_shader_file(
+            "quantize_fp8_e4m3_b128_h5120.comp"
+        )
+        == "quantize_batch16_fp8_e4m3_b128_h5120.comp"
+    )
+    assert (
+        weight_shared_batch_shader_file(
+            "linear_prequant_fp8_e4m3_b128x128_5120x17408.comp"
+        )
+        == "linear_prequant_batch16_fp8_e4m3_b128x128_5120x17408.comp"
+    )
+    assert (
+        weight_shared_batch_shader_file(
             "linear_residual_fp8_e4m3_b128x128_17408x5120.comp"
         )
         == "linear_residual_batch16_fp8_e4m3_b128x128_17408x5120.comp"
@@ -39,6 +51,19 @@ def test_compiler_selects_only_compatible_weight_shared_batch_kernels() -> None:
     assert weight_shared_batch_shader_file(
         "parallel_linear_silu_multiply_fp8_e4m3_b128x128_5120x17408.comp"
     ) == ("parallel_linear_silu_multiply_batch16_fp8_e4m3_b128x128_5120x17408.comp")
+    assert weight_shared_batch_shader_file(
+        "parallel_linear_silu_multiply_prequant_fp8_e4m3_b128x128_5120x17408.comp"
+    ) == (
+        "parallel_linear_silu_multiply_prequant_batch16_fp8_e4m3_"
+        "b128x128_5120x17408.comp"
+    )
+    assert weight_shared_batch_shader_file(
+        "parallel_linear_2way_prequant_fp8_e4m3_"
+        "b128x128_5120x5120_1024.comp"
+    ) == (
+        "parallel_linear_batch16_2way_prequant_fp8_e4m3_"
+        "b128x128_5120x5120_1024.comp"
+    )
     assert (
         weight_shared_batch_shader_file("linear_bf16_1024x1024.comp")
         == "linear_batch16_bf16_1024x1024.comp"

@@ -665,6 +665,96 @@ class VulkanCircuitOptimizerTest(unittest.TestCase):
         )
         self.assertEqual([2, 2], fused["attrs"]["branch_parameter_counts"])
 
+    def test_lowers_fp8_input_quantization_to_one_reusable_physical_signal(self) -> None:
+        circuit = {
+            "nodes": [
+                {
+                    "id": "projection",
+                    "op": "linear_residual",
+                    "inputs": ["normalized", "residual"],
+                    "outputs": ["output"],
+                    "params": ["weight", "weight_scale_inv"],
+                    "attrs": {
+                        "compiled_from": ["linear", "residual_add"],
+                        "intermediate_rounding": "BF16",
+                    },
+                }
+            ]
+        }
+
+        optimized = optimize_circuit_for_vulkan(
+            circuit,
+            fp8_prequantization_spec=lambda _node: {
+                "input_size": 5120,
+                "block_rows": 128,
+                "block_columns": 128,
+            },
+        )
+
+        self.assertEqual(2, len(optimized["nodes"]))
+        quantize, projection = optimized["nodes"]
+        self.assertEqual("quantize_fp8_e4m3", quantize["op"])
+        self.assertEqual(["normalized"], quantize["inputs"])
+        self.assertEqual([1, 4], quantize["attrs"]["output_element_bytes"])
+        self.assertEqual(
+            ["projection"], quantize["attrs"]["consumer_node_ids"]
+        )
+        self.assertEqual(
+            ["linear", "residual_add"],
+            quantize["attrs"]["semantic_source_node_ids"],
+        )
+        self.assertEqual(
+            [*quantize["outputs"], "residual"],
+            projection["inputs"],
+        )
+        self.assertEqual(
+            ["normalized", "residual"],
+            projection["attrs"]["physical_logical_inputs"],
+        )
+        self.assertEqual([2], projection["attrs"]["output_element_bytes"])
+
+    def test_shares_fp8_input_quantization_across_compatible_consumers(self) -> None:
+        circuit = {
+            "nodes": [
+                {
+                    "id": "wide_projection",
+                    "op": "linear",
+                    "inputs": ["normalized"],
+                    "outputs": ["wide"],
+                    "params": ["wide_weight", "wide_scale"],
+                },
+                {
+                    "id": "narrow_projection",
+                    "op": "linear",
+                    "inputs": ["normalized"],
+                    "outputs": ["narrow"],
+                    "params": ["narrow_weight", "narrow_scale"],
+                },
+            ]
+        }
+
+        optimized = optimize_circuit_for_vulkan(
+            circuit,
+            fp8_prequantization_spec=lambda _node: {
+                "input_size": 5120,
+                "block_rows": 128,
+                "block_columns": 128,
+            },
+        )
+
+        self.assertEqual(3, len(optimized["nodes"]))
+        quantize, wide, narrow = optimized["nodes"]
+        self.assertEqual(
+            ["wide_projection", "narrow_projection"],
+            quantize["attrs"]["consumer_node_ids"],
+        )
+        self.assertEqual(quantize["outputs"], wide["inputs"])
+        self.assertEqual(quantize["outputs"], narrow["inputs"])
+        self.assertEqual(
+            wide["attrs"]["physical_input_helper_id"],
+            narrow["attrs"]["physical_input_helper_id"],
+        )
+
     def test_does_not_fuse_linears_with_different_inputs(self) -> None:
         circuit = {
             "nodes": [

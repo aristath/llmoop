@@ -22,6 +22,11 @@ def shader_file_for_node(
     hidden_size = int(dimensions["hidden_size"])
     op = node["op"]
 
+    if op == "quantize_fp8_e4m3":
+        return (
+            f"quantize_fp8_e4m3_b{int(node['attrs']['block_columns'])}"
+            f"_h{int(node['attrs']['element_count'])}.comp"
+        )
     if op == "rms_norm":
         return rms_norm_shader_file(
             hidden_size,
@@ -67,6 +72,8 @@ def shader_file_for_node(
             )
             has_bias = len(node.get("params", [])) == 3
             prefix = "linear_bias" if has_bias else "linear"
+            if uses_prequantized_fp8_input(node):
+                prefix += "_prequant"
             return (
                 f"{prefix}_fp8_e4m3_b{block_rows}x{block_columns}_"
                 f"{in_features}x{out_features}.comp"
@@ -166,7 +173,9 @@ def shader_file_for_node(
             block_rows, block_columns = block_shapes.pop()
             input_width = input_widths.pop()
             return (
-                f"parallel_linear_{branch_count}way_fp8_e4m3_"
+                f"parallel_linear_{branch_count}way"
+                f"{'_prequant' if uses_prequantized_fp8_input(node) else ''}"
+                "_fp8_e4m3_"
                 f"b{block_rows}x{block_columns}_{input_width}x"
                 + "_".join(map(str, output_widths))
                 + ".comp"
@@ -198,8 +207,9 @@ def shader_file_for_node(
         )
     if op == "parallel_linear_silu_multiply":
         params = node.get("params", [])
+        expected_input_count = 2 if uses_prequantized_fp8_input(node) else 1
         if (
-            len(node.get("inputs", [])) != 1
+            len(node.get("inputs", [])) != expected_input_count
             or len(node.get("outputs", [])) != 1
             or int(node.get("attrs", {}).get("branch_count", 0)) != 2
         ):
@@ -300,7 +310,9 @@ def shader_file_for_node(
         if block_shape is not None:
             block_rows, block_columns = block_shape
             return (
-                "parallel_linear_silu_multiply_fp8_e4m3_"
+                "parallel_linear_silu_multiply"
+                f"{'_prequant' if uses_prequantized_fp8_input(node) else ''}"
+                "_fp8_e4m3_"
                 f"b{block_rows}x{block_columns}_{input_width}x{output_width}.comp"
             )
         if q8_shape:
@@ -371,7 +383,9 @@ def shader_file_for_node(
                 circuit, node, tensor_index
             )
             return (
-                f"linear_residual_fp8_e4m3_b{block_rows}x{block_columns}_"
+                "linear_residual"
+                f"{'_prequant' if uses_prequantized_fp8_input(node) else ''}"
+                f"_fp8_e4m3_b{block_rows}x{block_columns}_"
                 f"{in_features}x{out_features}.comp"
             )
         if parameter_dtype == "Q8_0":
@@ -823,6 +837,10 @@ def shader_file_for_node(
 
 
 def workgroup_count_x_for_node(circuit: Json, node: Json, tensor_index: Json) -> int:
+    if node["op"] == "quantize_fp8_e4m3":
+        return int(node["attrs"]["element_count"]) // int(
+            node["attrs"]["block_columns"]
+        )
     if node["op"] == "linear_split_recurrent_depthwise_gate":
         hidden_size = int(state_port(circuit, node["state_reads"][0])["shape"][1])
         return hidden_size // 2
@@ -852,8 +870,20 @@ def workgroup_count_x_for_node(circuit: Json, node: Json, tensor_index: Json) ->
                 for parameter_id in branch_weight_ids
             ]
             return max(
-                (output_size + fp8_linear_tile_rows(output_size) - 1)
-                // fp8_linear_tile_rows(output_size)
+                (
+                    output_size
+                    + (
+                        FP8_PREQUANT_TILE_ROWS
+                        if uses_prequantized_fp8_input(node)
+                        else fp8_linear_tile_rows(output_size)
+                    )
+                    - 1
+                )
+                // (
+                    FP8_PREQUANT_TILE_ROWS
+                    if uses_prequantized_fp8_input(node)
+                    else fp8_linear_tile_rows(output_size)
+                )
                 for output_size in output_sizes
             )
         if {
@@ -882,8 +912,18 @@ def workgroup_count_x_for_node(circuit: Json, node: Json, tensor_index: Json) ->
             == "F8_E4M3"
         ):
             return (
-                int(out_features) + FP8_FUSED_FFN_TILE_ROWS - 1
-            ) // FP8_FUSED_FFN_TILE_ROWS
+                int(out_features)
+                + (
+                    FP8_PREQUANT_TILE_ROWS
+                    if uses_prequantized_fp8_input(node)
+                    else FP8_FUSED_FFN_TILE_ROWS
+                )
+                - 1
+            ) // (
+                FP8_PREQUANT_TILE_ROWS
+                if uses_prequantized_fp8_input(node)
+                else FP8_FUSED_FFN_TILE_ROWS
+            )
         if (
             parameter_dtype_for_id(circuit, node["params"][0], tensor_index)
             == "Q8_0"
@@ -911,7 +951,11 @@ def workgroup_count_x_for_node(circuit: Json, node: Json, tensor_index: Json) ->
                 )
             return (int(out_features) + tile_rows - 1) // tile_rows
         if parameter_dtype == "F8_E4M3":
-            tile_rows = fp8_linear_tile_rows(int(out_features))
+            tile_rows = (
+                FP8_PREQUANT_TILE_ROWS
+                if uses_prequantized_fp8_input(node)
+                else fp8_linear_tile_rows(int(out_features))
+            )
             return (int(out_features) + tile_rows - 1) // tile_rows
         if parameter_dtype == "Q8_0":
             return (
@@ -993,6 +1037,10 @@ def local_size_x_for_node(node: Json) -> int:
 
 
 def local_size_x_for_shader_file(shader_file: str, node: Json) -> int:
+    if shader_file.startswith("quantize_fp8_e4m3_"):
+        return 32
+    if "_prequant_fp8_e4m3_" in shader_file:
+        return 256
     if re.fullmatch(
         r"(linear|linear_residual)_fp8_e4m3_b\d+x\d+_\d+x\d+\.comp",
         shader_file,
@@ -1002,6 +1050,13 @@ def local_size_x_for_shader_file(shader_file: str, node: Json) -> int:
     ):
         return 1024
     return local_size_x_for_node(node)
+
+
+def uses_prequantized_fp8_input(node: Json) -> bool:
+    return (
+        node.get("attrs", {}).get("physical_input_contract")
+        == "bf16_blockwise_fp8_e4m3_f32_scale.v1"
+    )
 
 
 def fp8_linear_tile_rows(output_size: int) -> int:

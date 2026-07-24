@@ -1,0 +1,71 @@
+#version 460
+
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_float_e4m3 : require
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer InputFrames { uint words[]; } input_frames;
+layout(set = 0, binding = 1) buffer QuantizedFrames { uint words[]; } quantized_frames;
+layout(set = 0, binding = 2) buffer Scales { float values[]; } scales;
+
+layout(push_constant) uniform BatchControl { uint batch_width; } batch_control;
+
+const uint BATCH_TILE_WIDTH = {{BATCH_TILE_WIDTH}}u;
+const uint BLOCK_COLUMNS = {{BLOCK_COLUMNS}}u;
+const uint ELEMENT_COUNT = {{ELEMENT_COUNT}}u;
+const uint INPUT_WORDS = ELEMENT_COUNT / 2u;
+const uint FP8_WORDS = ELEMENT_COUNT / 4u;
+const uint BLOCK_COUNT = ELEMENT_COUNT / BLOCK_COLUMNS;
+const uint WORDS_PER_BLOCK = BLOCK_COLUMNS / 4u;
+
+float bf16_to_f32(uint value) {
+    return uintBitsToFloat((value & 0xffffu) << 16u);
+}
+
+vec4 read_inputx4(uint batch_index, uint column) {
+    uint word = batch_index * INPUT_WORDS + (column >> 1u);
+    uint lo = input_frames.words[word];
+    uint hi = input_frames.words[word + 1u];
+    return vec4(
+        bf16_to_f32(lo),
+        bf16_to_f32(lo >> 16u),
+        bf16_to_f32(hi),
+        bf16_to_f32(hi >> 16u)
+    );
+}
+
+uint pack_fp8(fe4m3vec4 value) {
+    u8vec4 bits = floate4m3BitsToUintEXT(value);
+    return uint(bits.x)
+        | (uint(bits.y) << 8u)
+        | (uint(bits.z) << 16u)
+        | (uint(bits.w) << 24u);
+}
+
+void main() {
+    uint block = gl_WorkGroupID.x;
+    uint lane = gl_LocalInvocationID.x;
+    uint batch_start = gl_WorkGroupID.y * BATCH_TILE_WIDTH;
+    for (uint batch_lane = 0u; batch_lane < BATCH_TILE_WIDTH; batch_lane++) {
+        uint batch_index = batch_start + batch_lane;
+        if (batch_index >= batch_control.batch_width) {
+            break;
+        }
+        uint local_word = block * WORDS_PER_BLOCK + lane;
+        uint column = local_word * 4u;
+        vec4 input_value = read_inputx4(batch_index, column);
+        float lane_max = max(
+            max(abs(input_value.x), abs(input_value.y)),
+            max(abs(input_value.z), abs(input_value.w))
+        );
+        float block_max = subgroupMax(lane_max);
+        float block_scale = block_max > 0.0 ? block_max / 448.0 : 1.0;
+        if (lane == 0u) {
+            scales.values[batch_index * BLOCK_COUNT + block] = block_scale;
+        }
+        quantized_frames.words[batch_index * FP8_WORDS + local_word] =
+            pack_fp8(fe4m3vec4(input_value / block_scale));
+    }
+}

@@ -190,6 +190,48 @@ mod tests {
     }
 
     #[test]
+    fn infers_fp8_quantization_representation_shapes() {
+        let node = crate::stream_circuit::CircuitNode {
+            id: "quantize".to_string(),
+            op: "quantize_fp8_e4m3".to_string(),
+            inputs: vec!["hidden".to_string()],
+            outputs: vec!["hidden_fp8".to_string(), "hidden_scale".to_string()],
+            params: Vec::new(),
+            state_reads: Vec::new(),
+            state_writes: Vec::new(),
+            attrs: serde_json::json!({
+                "element_count": 5120,
+                "block_columns": 128,
+                "output_element_bytes": [1, 4]
+            }),
+        };
+        let signals = BTreeMap::from([(
+            "hidden".to_string(),
+            PlannedSignal {
+                id: "hidden".to_string(),
+                producer: SignalProducer::BoundaryInput,
+                consumers: vec!["quantize".to_string()],
+                shape: Some(vec![5120]),
+                element_bytes: Some(2),
+                storage: SignalStorage::Boundary,
+                is_boundary_output: false,
+            },
+        )]);
+
+        assert_eq!(
+            infer_node_output_shapes(
+                "layer_00",
+                &node,
+                &signals,
+                &BTreeMap::new(),
+                None,
+            )
+            .unwrap(),
+            vec![Some(vec![5120]), Some(vec![40])]
+        );
+    }
+
+    #[test]
     fn sparse_moe_signal_shapes_scale_with_selected_routes_not_all_experts() {
         let signals = BTreeMap::new();
         let params = BTreeMap::new();

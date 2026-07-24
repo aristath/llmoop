@@ -1,0 +1,137 @@
+#version 460
+
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_float_e4m3 : require
+#extension GL_EXT_spirv_intrinsics : require
+
+spirv_instruction(
+    extensions = ["SPV_VALVE_mixed_float_dot_product"],
+    capabilities = [6915],
+    id = 6918
+)
+float fp8_dot4_acc32(fe4m3vec4 a, fe4m3vec4 b, float accumulator);
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer QuantizedInputs { uint words[]; } quantized_inputs;
+layout(set = 0, binding = 1) readonly buffer InputScales { float values[]; } input_scales;
+{{AUXILIARY_BUFFER}}
+layout(set = 0, binding = {{OUTPUT_BINDING}}) buffer OutputFrames { uint words[]; } output_frames;
+layout(set = 0, binding = {{WEIGHT_BINDING}}) readonly buffer Weight { uint words[]; } weight;
+layout(set = 0, binding = {{WEIGHT_SCALE_BINDING}}) readonly buffer WeightScaleInv {
+    uint words[];
+} weight_scale_inv;
+
+layout(push_constant) uniform BatchControl { uint batch_width; } batch_control;
+
+const uint BATCH_TILE_WIDTH = {{BATCH_TILE_WIDTH}}u;
+const uint BLOCK_ROWS = {{BLOCK_ROWS}}u;
+const uint BLOCK_COLUMNS = {{BLOCK_COLUMNS}}u;
+const uint INPUT_SIZE = {{INPUT_SIZE}}u;
+const uint OUTPUT_SIZE = {{OUTPUT_SIZE}}u;
+const uint OUTPUT_TILE_ROWS = {{OUTPUT_TILE_ROWS}}u;
+const uint INPUT_FP8_WORDS = INPUT_SIZE / 4u;
+const uint OUTPUT_WORDS = OUTPUT_SIZE / 2u;
+const uint BLOCK_FP8_WORDS = BLOCK_COLUMNS / 4u;
+const uint SCALE_COLUMNS = INPUT_SIZE / BLOCK_COLUMNS;
+
+shared float output_rows[OUTPUT_TILE_ROWS];
+
+float bf16_to_f32(uint value) {
+    return uintBitsToFloat((value & 0xffffu) << 16u);
+}
+
+uint f32_to_bf16(float value) {
+    uint bits = floatBitsToUint(value);
+    uint lsb = (bits >> 16u) & 1u;
+    return (bits + 0x7fffu + lsb) >> 16u;
+}
+
+float read_bf16_word(uint packed, uint index) {
+    return bf16_to_f32(packed >> ((index & 1u) * 16u));
+}
+
+float read_weight_scale(uint row, uint block) {
+    uint index = (row / BLOCK_ROWS) * SCALE_COLUMNS + block;
+    return read_bf16_word(weight_scale_inv.words[index >> 1u], index);
+}
+
+fe4m3vec4 read_fp8x4(uint packed) {
+    return uintBitsToFloate4m3EXT(u8vec4(
+        uint8_t(packed),
+        uint8_t(packed >> 8u),
+        uint8_t(packed >> 16u),
+        uint8_t(packed >> 24u)
+    ));
+}
+
+fe4m3vec4 read_weightx4(uint row, uint word) {
+    return read_fp8x4(weight.words[row * INPUT_FP8_WORDS + word]);
+}
+
+{{FINALIZE_OUTPUT_FUNCTION}}
+
+void main() {
+    uint first_row = gl_WorkGroupID.x * OUTPUT_TILE_ROWS;
+    uint batch_start = gl_WorkGroupID.y * BATCH_TILE_WIDTH;
+    for (uint batch_lane = 0u; batch_lane < BATCH_TILE_WIDTH; batch_lane++) {
+        uint batch_index = batch_start + batch_lane;
+        if (batch_index >= batch_control.batch_width) {
+            break;
+        }
+        for (
+            uint local_row = gl_SubgroupID;
+            local_row < OUTPUT_TILE_ROWS;
+            local_row += gl_NumSubgroups
+        ) {
+            uint row = first_row + local_row;
+            float sum = 0.0;
+            if (row < OUTPUT_SIZE) {
+                for (
+                    uint word = gl_SubgroupInvocationID;
+                    word < INPUT_FP8_WORDS;
+                    word += gl_SubgroupSize
+                ) {
+                    uint block = word / BLOCK_FP8_WORDS;
+                    sum = fma(
+                        fp8_dot4_acc32(
+                            read_fp8x4(
+                                quantized_inputs.words[
+                                    batch_index * INPUT_FP8_WORDS + word
+                                ]
+                            ),
+                            read_weightx4(row, word),
+                            0.0
+                        ),
+                        input_scales.values[batch_index * SCALE_COLUMNS + block]
+                            * read_weight_scale(row, block),
+                        sum
+                    );
+                }
+            }
+            sum = subgroupAdd(sum);
+            if (gl_SubgroupInvocationID == 0u) {
+                output_rows[local_row] = finalize_output(batch_index, row, sum);
+            }
+        }
+        barrier();
+
+        for (
+            uint pair = gl_LocalInvocationID.x;
+            pair < OUTPUT_TILE_ROWS / 2u;
+            pair += gl_WorkGroupSize.x
+        ) {
+            uint row = first_row + pair * 2u;
+            if (row < OUTPUT_SIZE) {
+                uint hi = row + 1u < OUTPUT_SIZE
+                    ? f32_to_bf16(output_rows[pair * 2u + 1u])
+                    : 0u;
+                output_frames.words[batch_index * OUTPUT_WORDS + row / 2u] =
+                    (hi << 16u) | f32_to_bf16(output_rows[pair * 2u]);
+            }
+        }
+        barrier();
+    }
+}

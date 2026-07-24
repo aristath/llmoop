@@ -207,9 +207,25 @@ def test_exact_candidate_gate_proves_fp8_parallel_linear_parameter_pairs() -> No
     candidate = deepcopy(source)
     candidate["nodes"] = [
         {
+            "id": "q_projection__k_projection__quantize_input",
+            "op": "quantize_fp8_e4m3",
+            "inputs": ["x"],
+            "outputs": ["x_fp8", "x_scale"],
+            "attrs": {
+                "physical_representation_contract": (
+                    "bf16_blockwise_fp8_e4m3_f32_scale.v1"
+                ),
+                "consumer_node_ids": ["q_projection__k_projection"],
+                "semantic_source_node_ids": ["q_projection", "k_projection"],
+                "element_count": 5120,
+                "block_columns": 128,
+                "output_element_bytes": [1, 4],
+            },
+        },
+        {
             "id": "q_projection__k_projection",
             "op": "parallel_linear_2way",
-            "inputs": ["x"],
+            "inputs": ["x_fp8", "x_scale"],
             "outputs": ["q", "k"],
             "params": [
                 "q_weight",
@@ -221,6 +237,14 @@ def test_exact_candidate_gate_proves_fp8_parallel_linear_parameter_pairs() -> No
                 "compiled_from": ["q_projection", "k_projection"],
                 "branch_count": 2,
                 "branch_parameter_counts": [2, 2],
+                "physical_input_contract": (
+                    "bf16_blockwise_fp8_e4m3_f32_scale.v1"
+                ),
+                "physical_input_helper_id": (
+                    "q_projection__k_projection__quantize_input"
+                ),
+                "physical_logical_inputs": ["x"],
+                "output_element_bytes": [2, 2],
             },
         }
     ]
@@ -231,6 +255,7 @@ def test_exact_candidate_gate_proves_fp8_parallel_linear_parameter_pairs() -> No
 
     assert evidence["status"] == "passed"
     assert evidence["candidate_kind"] == "exact_reference"
+    assert evidence["physical_helper_count"] == 1
     assert evidence["rewrites"][0]["proof_contract"] == "parallel_linear_exact_bf16.v1"
 
 

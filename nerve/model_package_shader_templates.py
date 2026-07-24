@@ -394,6 +394,277 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
             },
         )
 
+    fp8_quantizer = re.fullmatch(
+        r"quantize(?:_batch(\d+))?_fp8_e4m3_b(\d+)_h(\d+)\.comp",
+        shader_file,
+    )
+    if fp8_quantizer is not None:
+        batch_tile_width = (
+            int(fp8_quantizer.group(1))
+            if fp8_quantizer.group(1) is not None
+            else None
+        )
+        block_columns = int(fp8_quantizer.group(2))
+        element_count = int(fp8_quantizer.group(3))
+        if (
+            (batch_tile_width is not None and batch_tile_width <= 0)
+            or block_columns != 128
+            or element_count <= 0
+            or element_count % block_columns
+        ):
+            raise ModelCompileError(
+                f"invalid FP8 activation-quantizer shader shape {shader_file!r}"
+            )
+        return render_shader_template(
+            source_dir,
+            (
+                "quantize_batch_fp8_e4m3.comp.template"
+                if batch_tile_width is not None
+                else "quantize_fp8_e4m3.comp.template"
+            ),
+            {
+                "BATCH_TILE_WIDTH": str(batch_tile_width or 1),
+                "BLOCK_COLUMNS": str(block_columns),
+                "ELEMENT_COUNT": str(element_count),
+            },
+        )
+
+    prequant_fp8_linear = re.fullmatch(
+        r"(linear|linear_bias|linear_residual)_prequant"
+        r"(?:_batch(\d+))?_fp8_e4m3_"
+        r"b(\d+)x(\d+)_(\d+)x(\d+)\.comp",
+        shader_file,
+    )
+    if prequant_fp8_linear is not None:
+        operation = prequant_fp8_linear.group(1)
+        batch_tile_width = (
+            int(prequant_fp8_linear.group(2))
+            if prequant_fp8_linear.group(2) is not None
+            else None
+        )
+        block_rows, block_columns, input_size, output_size = map(
+            int, prequant_fp8_linear.groups()[2:]
+        )
+        if (
+            (batch_tile_width is not None and batch_tile_width <= 0)
+            or block_rows <= 0
+            or block_columns != 128
+            or input_size <= 0
+            or input_size % block_columns
+            or output_size <= 0
+            or output_size % 2
+        ):
+            raise ModelCompileError(
+                f"invalid prequantized FP8 linear shader shape {shader_file!r}"
+            )
+        has_residual = operation == "linear_residual"
+        has_bias = operation == "linear_bias"
+        output_binding = 3 if has_residual else 2
+        weight_binding = output_binding + 1
+        auxiliary_buffer = (
+            "layout(set = 0, binding = 2) readonly buffer ResidualFrame"
+            f"{'s' if batch_tile_width is not None else ''} {{\n"
+            "    uint words[];\n"
+            f"}} residual_frame{'s' if batch_tile_width is not None else ''};"
+            if has_residual
+            else (
+                f"layout(set = 0, binding = {weight_binding + 2}) "
+                "readonly buffer Bias {\n"
+                "    uint words[];\n"
+                "} bias;"
+                if has_bias
+                else ""
+            )
+        )
+        if batch_tile_width is None:
+            finalize_output = (
+                "float finalize_output(uint row, float value) {\n"
+                "    return read_bf16_word(residual_frame.words[row >> 1u], row)"
+                " + value;\n"
+                "}"
+                if has_residual
+                else (
+                    "float finalize_output(uint row, float value) {\n"
+                    "    return read_bf16_word(bias.words[row >> 1u], row) + value;\n"
+                    "}"
+                    if has_bias
+                    else (
+                        "float finalize_output(uint row, float value) {\n"
+                        "    return value;\n"
+                        "}"
+                    )
+                )
+            )
+        else:
+            finalize_output = (
+                "float finalize_output(uint batch_index, uint row, float value) {\n"
+                "    return read_bf16_word(residual_frames.words[\n"
+                "        batch_index * (OUTPUT_SIZE / 2u) + (row >> 1u)\n"
+                "    ], row) + value;\n"
+                "}"
+                if has_residual
+                else (
+                    "float finalize_output(uint batch_index, uint row, float value) {\n"
+                    "    return read_bf16_word(bias.words[row >> 1u], row) + value;\n"
+                    "}"
+                    if has_bias
+                    else (
+                        "float finalize_output(uint batch_index, uint row, float value) {\n"
+                        "    return value;\n"
+                        "}"
+                    )
+                )
+            )
+        return render_shader_template(
+            source_dir,
+            (
+                "linear_prequant_batch_fp8_e4m3.comp.template"
+                if batch_tile_width is not None
+                else "linear_prequant_fp8_e4m3.comp.template"
+            ),
+            {
+                "BATCH_TILE_WIDTH": str(batch_tile_width or 1),
+                "BLOCK_ROWS": str(block_rows),
+                "BLOCK_COLUMNS": str(block_columns),
+                "INPUT_SIZE": str(input_size),
+                "OUTPUT_SIZE": str(output_size),
+                "OUTPUT_TILE_ROWS": str(FP8_PREQUANT_TILE_ROWS),
+                "AUXILIARY_BUFFER": auxiliary_buffer,
+                "OUTPUT_BINDING": str(output_binding),
+                "WEIGHT_BINDING": str(weight_binding),
+                "WEIGHT_SCALE_BINDING": str(weight_binding + 1),
+                "FINALIZE_OUTPUT_FUNCTION": finalize_output,
+            },
+        )
+
+    prequant_parallel_fp8 = re.fullmatch(
+        r"parallel_linear_(?:batch(\d+)_)?([23])way_prequant_fp8_e4m3_"
+        r"b(\d+)x(\d+)_(\d+)x(\d+)_(\d+)(?:_(\d+))?\.comp",
+        shader_file,
+    )
+    if prequant_parallel_fp8 is not None:
+        batch_tile_width = (
+            int(prequant_parallel_fp8.group(1))
+            if prequant_parallel_fp8.group(1) is not None
+            else None
+        )
+        branch_count = int(prequant_parallel_fp8.group(2))
+        block_rows = int(prequant_parallel_fp8.group(3))
+        block_columns = int(prequant_parallel_fp8.group(4))
+        input_size = int(prequant_parallel_fp8.group(5))
+        output_sizes = [
+            int(width)
+            for width in prequant_parallel_fp8.groups()[5:]
+            if width is not None
+        ]
+        if (
+            branch_count not in {2, 3}
+            or len(output_sizes) != branch_count
+            or (batch_tile_width is not None and batch_tile_width <= 0)
+            or block_rows <= 0
+            or block_columns != 128
+            or input_size <= 0
+            or input_size % block_columns
+            or any(output_size <= 0 or output_size % 2 for output_size in output_sizes)
+        ):
+            raise ModelCompileError(
+                f"invalid prequantized parallel FP8 shader shape {shader_file!r}"
+            )
+        labels = [chr(ord("A") + index) for index in range(branch_count)]
+        output_constants = "\n".join(
+            (
+                f"const uint OUTPUT_{label}_SIZE = {output_size}u;\n"
+                f"const uint OUTPUT_{label}_WORDS = OUTPUT_{label}_SIZE / 2u;"
+            )
+            for label, output_size in zip(labels, output_sizes, strict=True)
+        )
+        output_size_selection = "\n".join(
+            f"    if (branch == {index}u) return OUTPUT_{label}_SIZE;"
+            for index, label in enumerate(labels[:-1])
+        )
+        output_size_selection += f"\n    return OUTPUT_{labels[-1]}_SIZE;"
+        output_bindings = "\n\n".join(
+            f"layout(set = 0, binding = {index + 2}) buffer Output{label} {{\n"
+            "    uint words[];\n"
+            f"}} output_{label.lower()};"
+            for index, label in enumerate(labels)
+        )
+        weight_bindings = "\n\n".join(
+            "\n\n".join(
+                [
+                    f"layout(set = 0, binding = {branch_count + index * 2 + 2}) "
+                    f"readonly buffer Weight{label} {{\n"
+                    "    uint words[];\n"
+                    f"}} weight_{label.lower()};",
+                    f"layout(set = 0, binding = {branch_count + index * 2 + 3}) "
+                    f"readonly buffer WeightScaleInv{label} {{\n"
+                    "    uint words[];\n"
+                    f"}} weight_scale_inv_{label.lower()};",
+                ]
+            )
+            for index, label in enumerate(labels)
+        )
+        weight_scale_reads = "\n".join(
+            "    if (branch == "
+            f"{index}u) return read_bf16_word("
+            f"weight_scale_inv_{label.lower()}.words[index >> 1u], index);"
+            for index, label in enumerate(labels[:-1])
+        )
+        weight_scale_reads += (
+            "\n    return read_bf16_word(weight_scale_inv_"
+            + labels[-1].lower()
+            + ".words[index >> 1u], index);"
+        )
+        weight_reads = "\n".join(
+            f"    if (branch == {index}u) "
+            f"return read_fp8x4(weight_{label.lower()}.words[index]);"
+            for index, label in enumerate(labels[:-1])
+        )
+        weight_reads += (
+            f"\n    return read_fp8x4(weight_{labels[-1].lower()}.words[index]);"
+        )
+        output_index = (
+            "batch_index * OUTPUT_{label}_WORDS + row / 2u"
+            if batch_tile_width is not None
+            else "row / 2u"
+        )
+        output_writes = "\n".join(
+            f"    if (branch == {index}u) {{ output_{label.lower()}.words["
+            + output_index.format(label=label)
+            + "] = value; return; }"
+            for index, label in enumerate(labels[:-1])
+        )
+        output_writes += (
+            "\n    output_"
+            + labels[-1].lower()
+            + ".words["
+            + output_index.format(label=labels[-1])
+            + "] = value;"
+        )
+        return render_shader_template(
+            source_dir,
+            (
+                "parallel_linear_prequant_batch_fp8_e4m3.comp.template"
+                if batch_tile_width is not None
+                else "parallel_linear_prequant_fp8_e4m3.comp.template"
+            ),
+            {
+                "BATCH_TILE_WIDTH": str(batch_tile_width or 1),
+                "BRANCH_COUNT": str(branch_count),
+                "BLOCK_ROWS": str(block_rows),
+                "BLOCK_COLUMNS": str(block_columns),
+                "INPUT_SIZE": str(input_size),
+                "OUTPUT_TILE_ROWS": str(FP8_PREQUANT_TILE_ROWS),
+                "OUTPUT_CONSTANTS": output_constants,
+                "OUTPUT_SIZE_SELECTION": output_size_selection,
+                "OUTPUT_BINDINGS": output_bindings,
+                "WEIGHT_BINDINGS": weight_bindings,
+                "WEIGHT_SCALE_READS": weight_scale_reads,
+                "WEIGHT_READS": weight_reads,
+                "OUTPUT_WRITES": output_writes,
+            },
+        )
+
     parallel_fp8 = re.fullmatch(
         r"parallel_linear_(?:batch(\d+)_)?([23])way_fp8_e4m3_"
         r"b(\d+)x(\d+)_(\d+)x(\d+)_(\d+)(?:_(\d+))?\.comp",
@@ -731,6 +1002,51 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
             source_dir,
             "concatenate_bf16.comp.template",
             {"WIDTH_A": str(width_a), "WIDTH_B": str(width_b)},
+        )
+
+    prequant_fused_fp8_ffn_projection = re.fullmatch(
+        r"parallel_linear_silu_multiply_prequant"
+        r"(?:_batch(\d+))?_fp8_e4m3_"
+        r"b(\d+)x(\d+)_(\d+)x(\d+)\.comp",
+        shader_file,
+    )
+    if prequant_fused_fp8_ffn_projection is not None:
+        batch_tile_width = (
+            int(prequant_fused_fp8_ffn_projection.group(1))
+            if prequant_fused_fp8_ffn_projection.group(1) is not None
+            else None
+        )
+        block_rows = int(prequant_fused_fp8_ffn_projection.group(2))
+        block_columns = int(prequant_fused_fp8_ffn_projection.group(3))
+        input_size = int(prequant_fused_fp8_ffn_projection.group(4))
+        output_size = int(prequant_fused_fp8_ffn_projection.group(5))
+        if (
+            (batch_tile_width is not None and batch_tile_width <= 0)
+            or block_rows <= 0
+            or block_columns != 128
+            or input_size <= 0
+            or input_size % block_columns
+            or output_size <= 0
+            or output_size % 2
+        ):
+            raise ModelCompileError(
+                f"invalid prequantized FP8 FFN shader shape {shader_file!r}"
+            )
+        return render_shader_template(
+            source_dir,
+            (
+                "parallel_linear_silu_multiply_prequant_batch_fp8_e4m3.comp.template"
+                if batch_tile_width is not None
+                else "parallel_linear_silu_multiply_prequant_fp8_e4m3.comp.template"
+            ),
+            {
+                "BATCH_TILE_WIDTH": str(batch_tile_width or 1),
+                "BLOCK_ROWS": str(block_rows),
+                "BLOCK_COLUMNS": str(block_columns),
+                "INPUT_SIZE": str(input_size),
+                "OUTPUT_SIZE": str(output_size),
+                "OUTPUT_TILE_ROWS": str(FP8_PREQUANT_TILE_ROWS),
+            },
         )
 
     fused_fp8_ffn_projection = re.fullmatch(

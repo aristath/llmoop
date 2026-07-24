@@ -46,6 +46,11 @@ def semantic_module_ids_for_source_nodes(
 
 
 def normalized_source_node_ids(node: Json) -> list[str]:
+    semantic_source_node_ids = node.get("attrs", {}).get("semantic_source_node_ids")
+    if isinstance(semantic_source_node_ids, list) and semantic_source_node_ids:
+        return list(
+            dict.fromkeys(str(node_id) for node_id in semantic_source_node_ids)
+        )
     compiled_from = node.get("attrs", {}).get("compiled_from")
     if isinstance(compiled_from, list) and compiled_from:
         return list(dict.fromkeys(str(node_id) for node_id in compiled_from))

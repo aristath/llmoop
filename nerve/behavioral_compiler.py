@@ -62,6 +62,13 @@ EXACT_REWRITE_SOURCE_OPS = {
     "parallel_linear_silu_multiply": {("linear", "linear", "silu", "multiply")},
     "silu_multiply": {("silu", "multiply")},
 }
+PHYSICAL_NODE_ATTRS = {
+    "output_element_bytes",
+    "physical_input_contract",
+    "physical_input_helper_id",
+    "physical_logical_inputs",
+}
+FP8_PREQUANTIZATION_CONTRACT = "bf16_blockwise_fp8_e4m3_f32_scale.v1"
 
 
 def build_behavioral_validation(
@@ -174,13 +181,21 @@ def prove_exact_circuit_candidate(
         port.get("source", port["id"])
         for port in source.get("boundary", {}).get("outputs", [])
     }
+    physical_helper_ids = _validate_physical_representation_helpers(
+        component_id,
+        candidate_nodes,
+        boundary_outputs,
+    )
     covered: list[str] = []
     rewrites = []
-    for node in candidate_nodes:
+    for physical_node in candidate_nodes:
+        if physical_node["id"] in physical_helper_ids:
+            continue
+        node = _logical_candidate_node(physical_node)
         source_node = source_by_id.get(node["id"])
         compiled_from = node.get("attrs", {}).get("compiled_from")
         if source_node is not None and compiled_from is None:
-            if node != source_node:
+            if node != _logical_candidate_node(source_node):
                 _require_closed_loop_evidence(
                     empirical_evidence, expected_model_contract_digest
                 )
@@ -272,8 +287,123 @@ def prove_exact_circuit_candidate(
         "candidate_contract_digest": candidate_digest,
         "covered_source_node_count": len(covered),
         "rewrite_count": len(rewrites),
+        "physical_helper_count": len(physical_helper_ids),
         "rewrites": rewrites,
     }
+
+
+def _logical_candidate_node(node: Json) -> Json:
+    logical = deepcopy(node)
+    attrs = logical.get("attrs")
+    if not isinstance(attrs, dict):
+        logical["attrs"] = {}
+        return logical
+    logical_inputs = attrs.get("physical_logical_inputs")
+    if isinstance(logical_inputs, list):
+        logical["inputs"] = deepcopy(logical_inputs)
+    for key in PHYSICAL_NODE_ATTRS:
+        attrs.pop(key, None)
+    return logical
+
+
+def _validate_physical_representation_helpers(
+    component_id: str,
+    nodes: list[Json],
+    boundary_outputs: set[str],
+) -> set[str]:
+    node_by_id = {node["id"]: node for node in nodes}
+    consumers = _signal_consumers(nodes)
+    helper_ids: set[str] = set()
+    target_ids: set[str] = set()
+
+    for helper in nodes:
+        if helper.get("op") != "quantize_fp8_e4m3":
+            continue
+        attrs = helper.get("attrs", {})
+        helper_id = helper["id"]
+        consumer_node_ids = attrs.get("consumer_node_ids")
+        outputs = helper.get("outputs", [])
+        if (
+            set(attrs)
+            != {
+                "physical_representation_contract",
+                "consumer_node_ids",
+                "semantic_source_node_ids",
+                "element_count",
+                "block_columns",
+                "output_element_bytes",
+            }
+            or attrs.get("physical_representation_contract")
+            != FP8_PREQUANTIZATION_CONTRACT
+            or not isinstance(consumer_node_ids, list)
+            or not consumer_node_ids
+            or len(set(consumer_node_ids)) != len(consumer_node_ids)
+            or any(not isinstance(target_id, str) for target_id in consumer_node_ids)
+            or len(outputs) != 2
+            or attrs.get("output_element_bytes") != [1, 4]
+            or helper.get("params")
+            or helper.get("state_reads")
+            or helper.get("state_writes")
+            or not isinstance(attrs.get("element_count"), int)
+            or attrs["element_count"] <= 0
+            or not isinstance(attrs.get("block_columns"), int)
+            or attrs["block_columns"] <= 0
+            or attrs["element_count"] % attrs["block_columns"]
+            or any(output in boundary_outputs for output in outputs)
+            or any(consumers.get(output) != set(consumer_node_ids) for output in outputs)
+        ):
+            raise ModelCompileError(
+                f"candidate circuit {component_id!r} has an invalid FP8 "
+                f"representation helper {helper_id!r}"
+            )
+        semantic_source_ids: list[str] = []
+        for target_id in consumer_node_ids:
+            target = node_by_id.get(target_id)
+            target_attrs = target.get("attrs", {}) if isinstance(target, dict) else {}
+            logical_inputs = target_attrs.get("physical_logical_inputs")
+            target_source_ids = target_attrs.get("compiled_from") or (
+                [target["id"]] if isinstance(target, dict) else []
+            )
+            semantic_source_ids.extend(target_source_ids)
+            if (
+                target is None
+                or target_id in target_ids
+                or not isinstance(logical_inputs, list)
+                or not logical_inputs
+                or helper.get("inputs") != [logical_inputs[0]]
+                or target.get("inputs") != [*outputs, *logical_inputs[1:]]
+                or target_attrs.get("physical_input_contract")
+                != FP8_PREQUANTIZATION_CONTRACT
+                or target_attrs.get("physical_input_helper_id") != helper_id
+                or target_attrs.get("output_element_bytes")
+                != [2] * len(target.get("outputs", []))
+            ):
+                raise ModelCompileError(
+                    f"candidate circuit {component_id!r} has an invalid FP8 "
+                    f"representation helper {helper_id!r}"
+                )
+            target_ids.add(target_id)
+        if attrs.get("semantic_source_node_ids") != list(
+            dict.fromkeys(semantic_source_ids)
+        ):
+            raise ModelCompileError(
+                f"candidate circuit {component_id!r} has an invalid FP8 "
+                f"representation helper {helper_id!r}"
+            )
+        helper_ids.add(helper_id)
+
+    unlinked_targets = [
+        node["id"]
+        for node in nodes
+        if node.get("attrs", {}).get("physical_input_contract") is not None
+        and node["id"] not in target_ids
+    ]
+    if unlinked_targets:
+        raise ModelCompileError(
+            f"candidate circuit {component_id!r} has physical inputs without "
+            f"representation helpers: {unlinked_targets}"
+        )
+    return helper_ids
 
 
 def model_contract_digest(model_graph: Json, tensor_index: Json) -> str:

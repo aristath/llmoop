@@ -218,6 +218,45 @@ def weight_shared_batch_shader_file(
     if tile_width <= 0:
         raise ValueError("batch tile width must be positive")
     tile = tile_width
+    if re.fullmatch(r"quantize_fp8_e4m3_b128_h\d+\.comp", shader_file):
+        return shader_file.replace(
+            "quantize_fp8_e4m3_",
+            f"quantize_batch{tile}_fp8_e4m3_",
+            1,
+        )
+    prequant_fp8 = re.fullmatch(
+        r"(linear|linear_bias|linear_residual)_prequant_fp8_e4m3_"
+        r"b(\d+)x(\d+)_(\d+)x(\d+)\.comp",
+        shader_file,
+    )
+    if prequant_fp8 is not None:
+        return shader_file.replace(
+            "_prequant_fp8_e4m3_",
+            f"_prequant_batch{tile}_fp8_e4m3_",
+            1,
+        )
+    prequant_parallel_fp8 = re.fullmatch(
+        r"parallel_linear_[23]way_prequant_fp8_e4m3_"
+        r"b\d+x\d+_\d+x\d+_\d+(?:_\d+)?\.comp",
+        shader_file,
+    )
+    if prequant_parallel_fp8 is not None:
+        return shader_file.replace(
+            "parallel_linear_",
+            f"parallel_linear_batch{tile}_",
+            1,
+        )
+    prequant_fused_ffn = re.fullmatch(
+        r"parallel_linear_silu_multiply_prequant_fp8_e4m3_"
+        r"b\d+x\d+_\d+x\d+\.comp",
+        shader_file,
+    )
+    if prequant_fused_ffn is not None:
+        return shader_file.replace(
+            "_prequant_fp8_e4m3_",
+            f"_prequant_batch{tile}_fp8_e4m3_",
+            1,
+        )
     if re.fullmatch(r"split_bf16_2x\d+x\d+_head_interleaved\.comp", shader_file):
         return shader_file.replace("split_bf16_", f"split_batch{tile}_bf16_", 1)
     if shader_file == "sigmoid_multiply_bf16.comp":

@@ -1,0 +1,60 @@
+#version 460
+
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_float_e4m3 : require
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer InputFrame { uint words[]; } input_frame;
+layout(set = 0, binding = 1) buffer QuantizedFrame { uint words[]; } quantized_frame;
+layout(set = 0, binding = 2) buffer Scale { float values[]; } scale;
+
+const uint BLOCK_COLUMNS = {{BLOCK_COLUMNS}}u;
+const uint ELEMENT_COUNT = {{ELEMENT_COUNT}}u;
+const uint WORDS_PER_BLOCK = BLOCK_COLUMNS / 4u;
+
+float bf16_to_f32(uint value) {
+    return uintBitsToFloat((value & 0xffffu) << 16u);
+}
+
+vec4 read_inputx4(uint column) {
+    uint word = column >> 1u;
+    uint lo = input_frame.words[word];
+    uint hi = input_frame.words[word + 1u];
+    return vec4(
+        bf16_to_f32(lo),
+        bf16_to_f32(lo >> 16u),
+        bf16_to_f32(hi),
+        bf16_to_f32(hi >> 16u)
+    );
+}
+
+uint pack_fp8(fe4m3vec4 value) {
+    u8vec4 bits = floate4m3BitsToUintEXT(value);
+    return uint(bits.x)
+        | (uint(bits.y) << 8u)
+        | (uint(bits.z) << 16u)
+        | (uint(bits.w) << 24u);
+}
+
+void main() {
+    uint block = gl_WorkGroupID.x;
+    uint lane = gl_LocalInvocationID.x;
+    uint word = block * WORDS_PER_BLOCK + lane;
+    uint column = word * 4u;
+    if (column >= ELEMENT_COUNT) {
+        return;
+    }
+    vec4 input_value = read_inputx4(column);
+    float lane_max = max(
+        max(abs(input_value.x), abs(input_value.y)),
+        max(abs(input_value.z), abs(input_value.w))
+    );
+    float block_max = subgroupMax(lane_max);
+    float block_scale = block_max > 0.0 ? block_max / 448.0 : 1.0;
+    if (lane == 0u) {
+        scale.values[block] = block_scale;
+    }
+    quantized_frame.words[word] = pack_fp8(fe4m3vec4(input_value / block_scale));
+}
