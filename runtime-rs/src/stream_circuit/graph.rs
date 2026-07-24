@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 pub const STREAM_CIRCUIT_SCHEMA: &str = "nerve.stream_circuit.v1";
+pub const SEMANTIC_MODULE_TREE_SCHEMA: &str = "nerve.semantic_module_tree.v1";
 pub const CIRCUIT_PARAMS_SCHEMA: &str = "nerve.circuit_params.v1";
 pub const CIRCUIT_STATE_SCHEMA: &str = "nerve.circuit_state.v1";
 pub const LOWERED_EXECUTION_GRAPH_SCHEMA: &str = "nerve.lowered_execution_graph.v1";
@@ -154,6 +155,38 @@ pub struct CircuitNode {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SemanticModule {
+    pub id: String,
+    pub role: String,
+    pub responsibility: String,
+    #[serde(default)]
+    pub parent_id: Option<String>,
+    #[serde(default)]
+    pub child_ids: Vec<String>,
+    #[serde(default)]
+    pub source_node_ids: Vec<String>,
+    #[serde(default)]
+    pub parameter_ref_ids: Vec<String>,
+    #[serde(default)]
+    pub owned_state_port_ids: Vec<String>,
+    #[serde(default)]
+    pub input_signals: Vec<String>,
+    #[serde(default)]
+    pub output_signals: Vec<String>,
+    #[serde(default, rename = "virtual")]
+    pub r#virtual: bool,
+    #[serde(default)]
+    pub attrs: Value,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SemanticModuleTree {
+    pub schema: String,
+    pub root_module_id: String,
+    pub modules: Vec<SemanticModule>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct StreamCircuit {
     pub schema: String,
     pub id: String,
@@ -165,6 +198,10 @@ pub struct StreamCircuit {
     #[serde(default)]
     pub state_ports: Vec<StatePort>,
     pub parameters: CircuitParameters,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_module_tree: Option<SemanticModuleTree>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub semantic_execution_nodes: Vec<CircuitNode>,
     #[serde(default)]
     pub nodes: Vec<CircuitNode>,
     #[serde(default)]
@@ -317,6 +354,38 @@ impl StreamCircuit {
             }
         }
 
+        if let Some(tree) = &self.semantic_module_tree {
+            let semantic_nodes = if self.semantic_execution_nodes.is_empty() {
+                &self.nodes
+            } else {
+                &self.semantic_execution_nodes
+            };
+            let semantic_node_ids = semantic_nodes
+                .iter()
+                .map(|node| node.id.clone())
+                .collect::<BTreeSet<_>>();
+            let mut semantic_signals = self
+                .boundary
+                .inputs
+                .iter()
+                .map(|port| port.id.clone())
+                .collect::<BTreeSet<_>>();
+            semantic_signals.extend(
+                semantic_nodes
+                    .iter()
+                    .flat_map(|node| node.outputs.iter().cloned()),
+            );
+            self.validate_semantic_module_tree(
+                tree,
+                semantic_nodes,
+                &semantic_node_ids,
+                &state_ids,
+                &param_ids,
+                &semantic_signals,
+                &mut issues,
+            );
+        }
+
         if issues.is_empty() {
             Ok(())
         } else {
@@ -327,6 +396,201 @@ impl StreamCircuit {
             )))
         }
     }
+
+    fn validate_semantic_module_tree(
+        &self,
+        tree: &SemanticModuleTree,
+        semantic_nodes: &[CircuitNode],
+        node_ids: &BTreeSet<String>,
+        state_ids: &BTreeSet<&String>,
+        param_ids: &BTreeSet<&String>,
+        known_signals: &BTreeSet<String>,
+        issues: &mut Vec<String>,
+    ) {
+        if tree.schema != SEMANTIC_MODULE_TREE_SCHEMA {
+            issues.push(format!(
+                "{} has unsupported semantic module tree schema {:?}",
+                self.id, tree.schema
+            ));
+        }
+        if tree.modules.is_empty() {
+            issues.push(format!("{} semantic module tree must not be empty", self.id));
+            return;
+        }
+        let modules = tree
+            .modules
+            .iter()
+            .map(|module| (module.id.as_str(), module))
+            .collect::<BTreeMap<_, _>>();
+        if modules.len() != tree.modules.len() {
+            issues.push(format!("{} has duplicate semantic module ids", self.id));
+        }
+        let Some(root) = modules.get(tree.root_module_id.as_str()) else {
+            issues.push(format!(
+                "{} semantic module root {:?} does not resolve",
+                self.id, tree.root_module_id
+            ));
+            return;
+        };
+        if root.parent_id.is_some() {
+            issues.push(format!(
+                "{} semantic module root {:?} must not have a parent",
+                self.id, tree.root_module_id
+            ));
+        }
+
+        let mut visited = BTreeSet::new();
+        let mut active = BTreeSet::new();
+        visit_semantic_module(
+            tree.root_module_id.as_str(),
+            &modules,
+            &mut visited,
+            &mut active,
+            issues,
+        );
+        if visited.len() != modules.len() {
+            let unreachable = modules
+                .keys()
+                .filter(|module_id| !visited.contains(**module_id))
+                .copied()
+                .collect::<Vec<_>>();
+            issues.push(format!(
+                "{} semantic modules are unreachable from the root: {:?}",
+                self.id, unreachable
+            ));
+        }
+
+        let node_by_id = semantic_nodes
+            .iter()
+            .map(|node| (node.id.as_str(), node))
+            .collect::<BTreeMap<_, _>>();
+        let mut node_owners = BTreeMap::new();
+        let mut state_owners = BTreeMap::new();
+        for module in &tree.modules {
+            if module.id.is_empty()
+                || module.role.is_empty()
+                || module.responsibility.is_empty()
+            {
+                issues.push(format!(
+                    "{} semantic modules require non-empty id, role, and responsibility",
+                    self.id
+                ));
+            }
+            for node_id in &module.source_node_ids {
+                if !node_ids.contains(node_id) {
+                    issues.push(format!(
+                        "{} semantic module {} references unknown source node {:?}",
+                        self.id, module.id, node_id
+                    ));
+                } else if let Some(previous) =
+                    node_owners.insert(node_id.as_str(), module.id.as_str())
+                {
+                    issues.push(format!(
+                        "{} source node {:?} belongs to semantic modules {:?} and {:?}",
+                        self.id, node_id, previous, module.id
+                    ));
+                }
+                if let Some(node) = node_by_id.get(node_id.as_str()) {
+                    for parameter in &node.params {
+                        if !module.parameter_ref_ids.contains(parameter) {
+                            issues.push(format!(
+                                "{} semantic module {} omits parameter {:?} used by source node {:?}",
+                                self.id, module.id, parameter, node_id
+                            ));
+                        }
+                    }
+                }
+            }
+            for parameter in &module.parameter_ref_ids {
+                if !param_ids.contains(parameter) {
+                    issues.push(format!(
+                        "{} semantic module {} references unknown parameter {:?}",
+                        self.id, module.id, parameter
+                    ));
+                }
+            }
+            for state in &module.owned_state_port_ids {
+                if !state_ids.contains(state) {
+                    issues.push(format!(
+                        "{} semantic module {} owns unknown state {:?}",
+                        self.id, module.id, state
+                    ));
+                } else if let Some(previous) =
+                    state_owners.insert(state.as_str(), module.id.as_str())
+                {
+                    issues.push(format!(
+                        "{} state {:?} belongs to semantic modules {:?} and {:?}",
+                        self.id, state, previous, module.id
+                    ));
+                }
+            }
+            for signal in module
+                .input_signals
+                .iter()
+                .chain(module.output_signals.iter())
+            {
+                if !known_signals.contains(signal) {
+                    issues.push(format!(
+                        "{} semantic module {} references unknown signal {:?}",
+                        self.id, module.id, signal
+                    ));
+                }
+            }
+        }
+        if node_owners.keys().copied().collect::<BTreeSet<_>>()
+            != node_ids.iter().map(String::as_str).collect()
+        {
+            issues.push(format!(
+                "{} semantic module tree does not cover every source node exactly once",
+                self.id
+            ));
+        }
+        if state_owners.keys().copied().collect::<BTreeSet<_>>()
+            != state_ids.iter().map(|state| state.as_str()).collect()
+        {
+            issues.push(format!(
+                "{} semantic module tree does not own every state port exactly once",
+                self.id
+            ));
+        }
+    }
+}
+
+fn visit_semantic_module<'a>(
+    module_id: &'a str,
+    modules: &BTreeMap<&'a str, &'a SemanticModule>,
+    visited: &mut BTreeSet<&'a str>,
+    active: &mut BTreeSet<&'a str>,
+    issues: &mut Vec<String>,
+) {
+    if !active.insert(module_id) {
+        issues.push(format!(
+            "semantic module tree contains a cycle at {module_id:?}"
+        ));
+        return;
+    }
+    if !visited.insert(module_id) {
+        active.remove(module_id);
+        return;
+    }
+    let module = modules[module_id];
+    for child_id in &module.child_ids {
+        let Some(child) = modules.get(child_id.as_str()) else {
+            issues.push(format!(
+                "semantic module {:?} references unknown child {:?}",
+                module.id, child_id
+            ));
+            continue;
+        };
+        if child.parent_id.as_deref() != Some(module_id) {
+            issues.push(format!(
+                "semantic module {:?} child {:?} does not point back to its parent",
+                module.id, child_id
+            ));
+        }
+        visit_semantic_module(child_id, modules, visited, active, issues);
+    }
+    active.remove(module_id);
 }
 
 fn validate_boundary_port(port: &CircuitPort, direction: &str, issues: &mut Vec<String>) {

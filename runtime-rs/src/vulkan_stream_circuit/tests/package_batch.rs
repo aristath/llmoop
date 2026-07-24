@@ -523,6 +523,8 @@ fn component_batch_execution_contract_requires_matching_shader_mode() {
                 execution_index: 0,
                 node_id: "project".to_string(),
                 op: "linear".to_string(),
+                source_node_ids: vec!["project".to_string()],
+                semantic_module_ids: vec!["layer.token_mixer.output_projection".to_string()],
                 execution_domain: VulkanResidentComponentKernelExecutionDomain::Decode,
                 shader_path: "shaders/project.spv".to_string(),
                 local_size_x: 64,

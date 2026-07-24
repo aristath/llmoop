@@ -109,6 +109,8 @@ pub struct VulkanResidentComponentKernelSpec {
     pub execution_index: usize,
     pub node_id: String,
     pub op: String,
+    pub source_node_ids: Vec<String>,
+    pub semantic_module_ids: Vec<String>,
     pub execution_domain: VulkanResidentComponentKernelExecutionDomain,
     pub shader_path: String,
     pub local_size_x: u32,

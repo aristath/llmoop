@@ -498,9 +498,41 @@ fn validate_component_executions_against_graph(
             .zip(&artifact.circuit.nodes)
             .enumerate()
         {
+            let source_node_ids = node
+                .attrs
+                .get("compiled_from")
+                .and_then(Value::as_array)
+                .map(|sources| {
+                    sources
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .filter(|sources| !sources.is_empty())
+                .unwrap_or_else(|| vec![node.id.clone()]);
+            let semantic_module_ids = artifact
+                .circuit
+                .semantic_module_tree
+                .as_ref()
+                .map(|tree| {
+                    tree.modules
+                        .iter()
+                        .filter(|module| {
+                            module
+                                .source_node_ids
+                                .iter()
+                                .any(|node_id| source_node_ids.contains(node_id))
+                        })
+                        .map(|module| module.id.clone())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
             if kernel.execution_index != expected_index
                 || kernel.node_id != node.id
                 || kernel.op != node.op
+                || kernel.source_node_ids != source_node_ids
+                || kernel.semantic_module_ids != semantic_module_ids
                 || kernel.shader_path.is_empty()
             {
                 return Err(VulkanResidentTokenModelPackageError::new(format!(
@@ -695,4 +727,3 @@ fn validate_component_executions_cover_prepared_dispatches(
 
     Ok(())
 }
-
