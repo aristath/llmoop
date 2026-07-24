@@ -535,3 +535,23 @@ fn generation_contract_rejects_execution_and_graph_drift() {
             .to_string();
     assert!(boundary_error.contains("sampler public output"));
 }
+#[test]
+fn physical_helper_uses_declared_semantic_source_nodes() {
+    let helper = CircuitNode {
+        id: "projection__quantize_input".to_string(),
+        op: "quantize_fp8_e4m3".to_string(),
+        inputs: vec!["hidden".to_string()],
+        outputs: vec!["hidden_fp8".to_string(), "hidden_scale".to_string()],
+        params: Vec::new(),
+        state_reads: Vec::new(),
+        state_writes: Vec::new(),
+        attrs: serde_json::json!({
+            "semantic_source_node_ids": ["q_projection", "k_projection"]
+        }),
+    };
+
+    assert_eq!(
+        semantic_source_node_ids(&helper),
+        vec!["q_projection".to_string(), "k_projection".to_string()]
+    );
+}

@@ -498,19 +498,7 @@ fn validate_component_executions_against_graph(
             .zip(&artifact.circuit.nodes)
             .enumerate()
         {
-            let source_node_ids = node
-                .attrs
-                .get("compiled_from")
-                .and_then(Value::as_array)
-                .map(|sources| {
-                    sources
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .map(str::to_string)
-                        .collect::<Vec<_>>()
-                })
-                .filter(|sources| !sources.is_empty())
-                .unwrap_or_else(|| vec![node.id.clone()]);
+            let source_node_ids = semantic_source_node_ids(node);
             let semantic_module_ids = artifact
                 .circuit
                 .semantic_module_tree
@@ -543,6 +531,27 @@ fn validate_component_executions_against_graph(
         }
     }
     Ok(())
+}
+
+fn semantic_source_node_ids(node: &CircuitNode) -> Vec<String> {
+    for attr in ["semantic_source_node_ids", "compiled_from"] {
+        let source_node_ids = node
+            .attrs
+            .get(attr)
+            .and_then(Value::as_array)
+            .map(|sources| {
+                sources
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .filter(|sources| !sources.is_empty());
+        if let Some(source_node_ids) = source_node_ids {
+            return source_node_ids;
+        }
+    }
+    vec![node.id.clone()]
 }
 
 fn validate_component_executions_against_mounted_dispatches(

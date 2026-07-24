@@ -18,12 +18,13 @@ use crate::execution_schedule::{
     RuntimeExecutionCost, RuntimeExecutionQuantumBudget, RuntimeExecutionRegion,
 };
 use crate::stream_circuit::{
-    CircuitParamsArtifact, CircuitRuntimeRole, CircuitStateArtifact, ComponentEdgePlacement,
-    EdgeTransport, LOWERED_EXECUTION_GRAPH_SCHEMA, LoweredCircuitRef, LoweredExecutionGraph,
-    LoweredExecutionGraphGraph, LoweredExecutionGraphSource, LoweredExecutionGraphSummary,
-    RUNTIME_DEFAULT_LOGICAL_DEVICE_ID, ResolvedCircuitArtifact, ResolvedLoweredExecutionGraph,
-    StreamCircuit, StreamCircuitGraphBoundary, StreamCircuitNodeInstanceStatePolicy,
-    StreamCircuitPlacementPlan, StreamCircuitPlacementSpec, StreamCircuitRuntimeGraph,
+    CircuitNode, CircuitParamsArtifact, CircuitRuntimeRole, CircuitStateArtifact,
+    ComponentEdgePlacement, EdgeTransport, LOWERED_EXECUTION_GRAPH_SCHEMA, LoweredCircuitRef,
+    LoweredExecutionGraph, LoweredExecutionGraphGraph, LoweredExecutionGraphSource,
+    LoweredExecutionGraphSummary, RUNTIME_DEFAULT_LOGICAL_DEVICE_ID, ResolvedCircuitArtifact,
+    ResolvedLoweredExecutionGraph, StreamCircuit, StreamCircuitGraphBoundary,
+    StreamCircuitNodeInstanceStatePolicy, StreamCircuitPlacementPlan, StreamCircuitPlacementSpec,
+    StreamCircuitRuntimeGraph,
 };
 use crate::stream_plan::{
     CircuitActivationPlan, PlannedNode, PlannedParameterResource, PlannedPort, SignalProducer,
