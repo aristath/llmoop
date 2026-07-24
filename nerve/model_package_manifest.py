@@ -447,11 +447,21 @@ def build_vulkan_resident_package_manifest(
         candidate_circuits=compiled_circuits,
     )
     write_json(package_dir / "behavioral_validation.json", behavioral_validation)
+    cooperative_float8_e4m3_shapes = tuple(
+        sorted(
+            {
+                tuple(map(int, shape))
+                for device in compiler_target.get("devices", [])
+                for shape in device.get("cooperative_float8_e4m3_shapes", [])
+            }
+        )
+    )
     component_executions = component_execution_specs(
         lowered_index=lowered_index,
         compiled_circuits=compiled_circuits,
         tensor_index=tensor_index,
         dimensions=dimensions,
+        cooperative_float8_e4m3_shapes=cooperative_float8_e4m3_shapes,
     )
     speculative_decoders = speculative_decoder_specs(
         lowered_index=lowered_index,
@@ -465,6 +475,7 @@ def build_vulkan_resident_package_manifest(
         logits_bytes=logits_bytes,
         vocab_size=vocab_size,
         hidden_size=hidden_size,
+        cooperative_float8_e4m3_shapes=cooperative_float8_e4m3_shapes,
     )
     all_component_executions = [
         *component_executions,
@@ -723,6 +734,7 @@ def component_execution_specs(
     compiled_circuits: dict[str, Json],
     tensor_index: Json,
     dimensions: Json,
+    cooperative_float8_e4m3_shapes: tuple[tuple[int, int, int], ...] = (),
 ) -> list[Json]:
     executions: list[Json] = []
 
@@ -747,6 +759,9 @@ def component_execution_specs(
                     local_size_x=local_size_x_for_shader_file(shader_file, node),
                     workgroup_count_x=workgroup_count_x_for_node(
                         circuit, node, tensor_index
+                    ),
+                    cooperative_float8_e4m3_shapes=(
+                        cooperative_float8_e4m3_shapes
                     ),
                 )
             )
@@ -775,6 +790,7 @@ def speculative_decoder_specs(
     logits_bytes: int,
     vocab_size: int,
     hidden_size: int,
+    cooperative_float8_e4m3_shapes: tuple[tuple[int, int, int], ...] = (),
 ) -> list[Json]:
     decoders = []
     for draft in lowered_index.get("draft_execution_graphs", []):
@@ -798,6 +814,9 @@ def speculative_decoder_specs(
                 circuit=compiled_circuits[ref["id"]],
                 tensor_index=tensor_index,
                 dimensions=dimensions,
+                cooperative_float8_e4m3_shapes=(
+                    cooperative_float8_e4m3_shapes
+                ),
             )
             for ref in executable_refs
         ]
@@ -907,6 +926,7 @@ def component_execution_spec(
     circuit: Json,
     tensor_index: Json,
     dimensions: Json,
+    cooperative_float8_e4m3_shapes: tuple[tuple[int, int, int], ...] = (),
 ) -> Json:
     kernels = []
     for index, node in enumerate(circuit["nodes"]):
@@ -921,6 +941,7 @@ def component_execution_spec(
                 workgroup_count_x=workgroup_count_x_for_node(
                     circuit, node, tensor_index
                 ),
+                cooperative_float8_e4m3_shapes=cooperative_float8_e4m3_shapes,
             )
         )
     return {
@@ -939,6 +960,7 @@ def component_kernel_spec(
     shader_file: str,
     local_size_x: int,
     workgroup_count_x: int,
+    cooperative_float8_e4m3_shapes: tuple[tuple[int, int, int], ...] = (),
 ) -> Json:
     source_node_ids = normalized_source_node_ids(node)
     causal_scan_stages = causal_scan_batch_stages(shader_file, local_size_x)
@@ -953,11 +975,20 @@ def component_kernel_spec(
         or direct_frame_parallel_shader_file is not None
         else weight_shared_batch_shader_file(shader_file)
     )
-    cooperative_shader_file = (
+    cooperative_bfloat16_shader_file = (
         cooperative_bfloat16_batch_shader_file(shader_file)
         if scalar_batch_shader_file is not None
         else None
     )
+    cooperative_float8_shader_files = [
+        (shape, cooperative_float8_e4m3_batch_shader_file(shader_file, shape=shape))
+        for shape in cooperative_float8_e4m3_shapes
+    ]
+    cooperative_float8_shader_files = [
+        (shape, candidate)
+        for shape, candidate in cooperative_float8_shader_files
+        if candidate is not None
+    ]
     frame_parallel_shader_file = direct_frame_parallel_shader_file or (
         frame_parallel_batch_shader_file(scalar_batch_shader_file)
         if scalar_batch_shader_file is not None
@@ -1000,7 +1031,38 @@ def component_kernel_spec(
             }
         )
     elif scalar_batch_shader_file is not None or frame_parallel_shader_file is not None:
-        if scalar_batch_shader_file is not None and cooperative_shader_file is not None:
+        for shape, cooperative_shader_file in cooperative_float8_shader_files:
+            spec["batch_implementations"].append(
+                {
+                    "execution_domain": "prefill",
+                    "lane_tile_width": 4 * shape[1],
+                    "exact_primary_equivalence": False,
+                    "exact_causal_sequence_equivalence": False,
+                    "device_requirements": {
+                        "vulkan_device_extensions": [],
+                        "vulkan_features": [],
+                        "subgroup_operations": [],
+                        "cooperative_float8_e4m3_shape": list(shape),
+                        "subgroup_size": 64,
+                    },
+                    "stages": [
+                        {
+                            "shader_path": f"shaders/{cooperative_shader_file}",
+                            "local_size_x": 256,
+                            "workgroup_count_x": (
+                                cooperative_float8_e4m3_workgroup_count_x(
+                                    shader_file,
+                                    shape=shape,
+                                )
+                            ),
+                        }
+                    ],
+                }
+            )
+        if (
+            scalar_batch_shader_file is not None
+            and cooperative_bfloat16_shader_file is not None
+        ):
             spec["batch_implementations"].append(
                 {
                     "execution_domain": "prefill",
@@ -1016,7 +1078,9 @@ def component_kernel_spec(
                     },
                     "stages": [
                         {
-                            "shader_path": f"shaders/{cooperative_shader_file}",
+                            "shader_path": (
+                                f"shaders/{cooperative_bfloat16_shader_file}"
+                            ),
                             "local_size_x": 256,
                             "workgroup_count_x": cooperative_bfloat16_workgroup_count_x(
                                 shader_file

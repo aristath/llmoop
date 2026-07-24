@@ -154,6 +154,53 @@ def cooperative_bfloat16_workgroup_count_x(shader_file: str) -> int:
     )
 
 
+def cooperative_float8_e4m3_batch_shader_file(
+    shader_file: str,
+    *,
+    shape: tuple[int, int, int],
+) -> str | None:
+    linear = re.fullmatch(
+        r"(linear|linear_residual)_prequant_fp8_e4m3_"
+        r"b(\d+)x(\d+)_(\d+)x(\d+)\.comp",
+        shader_file,
+    )
+    if linear is None:
+        return None
+    operation, block_rows, block_columns, input_size, output_size = linear.groups()
+    m, n, k = shape
+    if (
+        min(shape) <= 0
+        or int(block_columns) % k
+        or int(input_size) % int(block_columns)
+    ):
+        return None
+    batch_tile_width = 4 * n
+    return (
+        f"{operation}_prequant_batch{batch_tile_width}_cooperative_"
+        f"fp8_e4m3_m{m}n{n}k{k}_b{block_rows}x{block_columns}_"
+        f"{input_size}x{output_size}.comp"
+    )
+
+
+def cooperative_float8_e4m3_workgroup_count_x(
+    shader_file: str,
+    *,
+    shape: tuple[int, int, int],
+) -> int:
+    linear = re.fullmatch(
+        r"(?:linear|linear_residual)_prequant_fp8_e4m3_"
+        r"b\d+x\d+_\d+x(\d+)\.comp",
+        shader_file,
+    )
+    if linear is None:
+        raise ModelCompileError(
+            f"shader {shader_file!r} has no cooperative FP8 batch geometry"
+        )
+    output_size = int(linear.group(1))
+    output_tile = 4 * shape[0]
+    return (output_size + output_tile - 1) // output_tile
+
+
 def causal_scan_batch_shader_file(shader_file: str) -> str | None:
     if re.fullmatch(r"causal_conv1d_silu_bf16_c\d+_k\d+\.comp", shader_file):
         return shader_file.replace(

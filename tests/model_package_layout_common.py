@@ -17,6 +17,8 @@ from nerve.model_package import (
     causal_scan_workgroup_count_x,
     cooperative_bfloat16_batch_shader_file,
     cooperative_bfloat16_workgroup_count_x,
+    cooperative_float8_e4m3_batch_shader_file,
+    cooperative_float8_e4m3_workgroup_count_x,
     copy_shader_templates,
     frame_parallel_batch_shader_file,
     fp8_moe_block_shape_for_stage,
@@ -38,4 +40,3 @@ def write_spirv_module(path: Path, capabilities: list[int]) -> None:
         words.extend([(2 << 16) | 17, capability])
     words.extend([(3 << 16) | 14, 0, 3 if 5345 in capabilities else 1])
     path.write_bytes(struct.pack(f"<{len(words)}I", *words))
-

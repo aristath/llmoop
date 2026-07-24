@@ -429,6 +429,87 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
             },
         )
 
+    cooperative_prequant_fp8_linear = re.fullmatch(
+        r"(linear|linear_residual)_prequant_batch(\d+)_cooperative_"
+        r"fp8_e4m3_m(\d+)n(\d+)k(\d+)_"
+        r"b(\d+)x(\d+)_(\d+)x(\d+)\.comp",
+        shader_file,
+    )
+    if cooperative_prequant_fp8_linear is not None:
+        operation = cooperative_prequant_fp8_linear.group(1)
+        (
+            batch_tile_width,
+            matrix_m,
+            matrix_n,
+            matrix_k,
+            block_rows,
+            block_columns,
+            input_size,
+            output_size,
+        ) = map(int, cooperative_prequant_fp8_linear.groups()[1:])
+        if (
+            min(
+                batch_tile_width,
+                matrix_m,
+                matrix_n,
+                matrix_k,
+                block_rows,
+                block_columns,
+                input_size,
+                output_size,
+            )
+            <= 0
+            or batch_tile_width != 4 * matrix_n
+            or block_columns % matrix_k
+            or input_size % block_columns
+            or output_size % 2
+        ):
+            raise ModelCompileError(
+                f"invalid cooperative FP8 linear shader shape {shader_file!r}"
+            )
+        residual = operation == "linear_residual"
+        output_binding = 3 if residual else 2
+        weight_binding = output_binding + 1
+        finalize_function = (
+            "float finalize_result(uint batch_index, uint output_index, float value) {\n"
+            "    uint residual_index = batch_index * OUTPUT_SIZE + output_index;\n"
+            "    float residual = uintBitsToFloat(\n"
+            "        uint(residual_frames.values[residual_index]) << 16u\n"
+            "    );\n"
+            "    return value + residual;\n"
+            "}"
+            if residual
+            else (
+                "float finalize_result(uint batch_index, uint output_index, float value) {\n"
+                "    return value;\n"
+                "}"
+            )
+        )
+        return render_shader_template(
+            source_dir,
+            "linear_prequant_batch_cooperative_fp8_e4m3.comp.template",
+            {
+                "MATRIX_M": str(matrix_m),
+                "MATRIX_N": str(matrix_n),
+                "MATRIX_K": str(matrix_k),
+                "BLOCK_ROWS": str(block_rows),
+                "BLOCK_COLUMNS": str(block_columns),
+                "INPUT_SIZE": str(input_size),
+                "OUTPUT_SIZE": str(output_size),
+                "RESIDUAL_BINDING": (
+                    "layout(set = 0, binding = 2) readonly buffer ResidualFrames {\n"
+                    "    uint16_t values[];\n"
+                    "} residual_frames;"
+                    if residual
+                    else ""
+                ),
+                "OUTPUT_BINDING": str(output_binding),
+                "WEIGHT_BINDING": str(weight_binding),
+                "WEIGHT_SCALE_BINDING": str(weight_binding + 1),
+                "FINALIZE_FUNCTION": finalize_function,
+            },
+        )
+
     prequant_fp8_linear = re.fullmatch(
         r"(linear|linear_bias|linear_residual)_prequant"
         r"(?:_batch(\d+))?_fp8_e4m3_"

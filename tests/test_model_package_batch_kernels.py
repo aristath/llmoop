@@ -128,6 +128,21 @@ def test_compiler_selects_only_compatible_weight_shared_batch_kernels() -> None:
         frame_parallel_batch_shader_file("moe_reduce_bf16_h2048_k8_scale1.comp")
         == "moe_reduce_batch1_bf16_h2048_k8_scale1.comp"
     )
+    fp8_cooperative = cooperative_float8_e4m3_batch_shader_file(
+        "linear_residual_prequant_fp8_e4m3_b128x128_17408x5120.comp",
+        shape=(16, 16, 16),
+    )
+    assert fp8_cooperative == (
+        "linear_residual_prequant_batch64_cooperative_"
+        "fp8_e4m3_m16n16k16_b128x128_17408x5120.comp"
+    )
+    assert (
+        cooperative_float8_e4m3_workgroup_count_x(
+            "linear_residual_prequant_fp8_e4m3_b128x128_17408x5120.comp",
+            shape=(16, 16, 16),
+        )
+        == 80
+    )
 
 
 def test_compiler_orders_frame_parallel_before_portable_batch_implementation() -> None:
@@ -384,6 +399,86 @@ def test_projection_component_compiles_ordered_target_native_and_scalar_implemen
                 }
             ],
         }
+
+
+def test_compiler_selects_device_typed_cooperative_fp8_prefill() -> None:
+    spec = component_kernel_spec(
+        execution_index=0,
+        node={"id": "down", "op": "linear_residual"},
+        circuit={},
+        shader_file=(
+            "linear_residual_prequant_fp8_e4m3_"
+            "b128x128_17408x5120.comp"
+        ),
+        local_size_x=1024,
+        workgroup_count_x=320,
+        cooperative_float8_e4m3_shapes=((16, 16, 16),),
+    )
+
+    cooperative, *exact = spec["batch_implementations"]
+    assert cooperative == {
+        "execution_domain": "prefill",
+        "lane_tile_width": 64,
+        "exact_primary_equivalence": False,
+        "exact_causal_sequence_equivalence": False,
+        "device_requirements": {
+            "vulkan_device_extensions": [],
+            "vulkan_features": [],
+            "subgroup_operations": [],
+            "cooperative_float8_e4m3_shape": [16, 16, 16],
+            "subgroup_size": 64,
+        },
+        "stages": [
+            {
+                "shader_path": (
+                    "shaders/linear_residual_prequant_batch64_cooperative_"
+                    "fp8_e4m3_m16n16k16_b128x128_17408x5120.comp"
+                ),
+                "local_size_x": 256,
+                "workgroup_count_x": 80,
+            }
+        ],
+    }
+    assert [implementation["lane_tile_width"] for implementation in exact] == [
+        2,
+        4,
+        8,
+        16,
+    ]
+
+
+def test_compiler_renders_cooperative_fp8_prefill_shader(tmp_path: Path) -> None:
+    shader_source_dir = Path(__file__).parents[1] / "runtime-rs" / "shaders"
+    shader_files = {
+        "linear_prequant_batch64_cooperative_"
+        "fp8_e4m3_m16n16k16_b128x128_5120x17408.comp",
+        "linear_residual_prequant_batch64_cooperative_"
+        "fp8_e4m3_m16n16k16_b128x128_17408x5120.comp",
+    }
+
+    copy_shader_templates(shader_source_dir, tmp_path, shader_files)
+
+    linear = next(
+        (tmp_path / name).read_text()
+        for name in shader_files
+        if name.startswith("linear_prequant_")
+    )
+    residual = next(
+        (tmp_path / name).read_text()
+        for name in shader_files
+        if name.startswith("linear_residual_")
+    )
+    for source in (linear, residual):
+        assert "coopmat<floate4m3_t" in source
+        assert "const uint MATRIX_M = 16u;" in source
+        assert "const uint MATRIX_N = 16u;" in source
+        assert "const uint MATRIX_K = 16u;" in source
+        assert "const uint BLOCK_COLUMNS = 128u;" in source
+        assert "shared float result_tile[OUTPUT_TILE * BATCH_TILE];" in source
+        assert "{{" not in source
+    assert "binding = 2) buffer OutputFrames" in linear
+    assert "binding = 2) readonly buffer ResidualFrames" in residual
+    assert "binding = 3) buffer OutputFrames" in residual
 
 
 def test_compiler_renders_weight_shared_component_batch_shaders(tmp_path: Path) -> None:

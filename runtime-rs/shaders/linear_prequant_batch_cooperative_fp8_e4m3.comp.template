@@ -1,0 +1,250 @@
+#version 460
+
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_float_e4m3 : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer QuantizedInputs {
+    floate4m3_t values[];
+} quantized_inputs;
+layout(set = 0, binding = 1) readonly buffer InputScales {
+    float values[];
+} input_scales;
+{{RESIDUAL_BINDING}}
+layout(set = 0, binding = {{OUTPUT_BINDING}}) buffer OutputFrames {
+    uint16_t values[];
+} output_frames;
+layout(set = 0, binding = {{WEIGHT_BINDING}}) readonly buffer Weight {
+    floate4m3_t values[];
+} weight;
+layout(set = 0, binding = {{WEIGHT_SCALE_BINDING}}) readonly buffer WeightScaleInv {
+    uint words[];
+} weight_scale_inv;
+
+layout(push_constant) uniform BatchControl {
+    uint batch_width;
+} batch_control;
+
+const uint MATRIX_M = {{MATRIX_M}}u;
+const uint MATRIX_N = {{MATRIX_N}}u;
+const uint MATRIX_K = {{MATRIX_K}}u;
+const uint OUTPUT_TILE = 4u * MATRIX_M;
+const uint BATCH_TILE = 4u * MATRIX_N;
+const uint BATCH_SUBTILES = BATCH_TILE / MATRIX_N;
+const uint BLOCK_ROWS = {{BLOCK_ROWS}}u;
+const uint BLOCK_COLUMNS = {{BLOCK_COLUMNS}}u;
+const uint INPUT_SIZE = {{INPUT_SIZE}}u;
+const uint OUTPUT_SIZE = {{OUTPUT_SIZE}}u;
+const uint SCALE_COLUMNS = INPUT_SIZE / BLOCK_COLUMNS;
+
+shared floate4m3_t weight_tile[OUTPUT_TILE * MATRIX_K];
+shared floate4m3_t input_tile[MATRIX_K * BATCH_TILE];
+shared float block_result[OUTPUT_TILE * BATCH_TILE];
+shared float result_tile[OUTPUT_TILE * BATCH_TILE];
+
+float bf16_to_f32(uint value) {
+    return uintBitsToFloat((value & 0xffffu) << 16u);
+}
+
+uint f32_to_bf16(float value) {
+    uint bits = floatBitsToUint(value);
+    uint lsb = (bits >> 16u) & 1u;
+    return (bits + 0x7fffu + lsb) >> 16u;
+}
+
+float read_weight_scale(uint row, uint block) {
+    uint index = (row / BLOCK_ROWS) * SCALE_COLUMNS + block;
+    uint packed = weight_scale_inv.words[index >> 1u];
+    return bf16_to_f32(packed >> ((index & 1u) * 16u));
+}
+
+{{FINALIZE_FUNCTION}}
+
+void main() {
+    uint output_start = gl_WorkGroupID.x * OUTPUT_TILE;
+    uint batch_start = gl_WorkGroupID.y * BATCH_TILE;
+    uint lane = gl_LocalInvocationID.x;
+    uint output_subtile = gl_SubgroupID;
+
+    for (
+        uint index = lane;
+        index < OUTPUT_TILE * BATCH_TILE;
+        index += gl_WorkGroupSize.x
+    ) {
+        result_tile[index] = 0.0;
+    }
+    barrier();
+
+    for (
+        uint input_block_start = 0u;
+        input_block_start < INPUT_SIZE;
+        input_block_start += BLOCK_COLUMNS
+    ) {
+        coopmat<float, gl_ScopeSubgroup, {{MATRIX_M}}, {{MATRIX_N}},
+            gl_MatrixUseAccumulator> block_sums[BATCH_SUBTILES];
+        for (
+            uint batch_subtile = 0u;
+            batch_subtile < BATCH_SUBTILES;
+            batch_subtile++
+        ) {
+            block_sums[batch_subtile] = coopmat<float, gl_ScopeSubgroup,
+                {{MATRIX_M}}, {{MATRIX_N}}, gl_MatrixUseAccumulator>(0.0);
+        }
+
+        for (
+            uint input_start = input_block_start;
+            input_start < input_block_start + BLOCK_COLUMNS;
+            input_start += MATRIX_K
+        ) {
+            bool stage_weight =
+                output_start + OUTPUT_TILE > OUTPUT_SIZE;
+            if (stage_weight) {
+                for (
+                    uint index = lane;
+                    index < OUTPUT_TILE * MATRIX_K;
+                    index += gl_WorkGroupSize.x
+                ) {
+                    uint row = index / MATRIX_K;
+                    uint column = index % MATRIX_K;
+                    uint output_index = output_start + row;
+                    weight_tile[index] = output_index < OUTPUT_SIZE
+                        ? weight.values[
+                            output_index * INPUT_SIZE + input_start + column
+                        ]
+                        : floate4m3_t(0.0);
+                }
+            }
+            for (
+                uint index = lane;
+                index < MATRIX_K * BATCH_TILE;
+                index += gl_WorkGroupSize.x
+            ) {
+                uint input_row = index / BATCH_TILE;
+                uint batch_lane = index % BATCH_TILE;
+                uint batch_index = batch_start + batch_lane;
+                input_tile[index] =
+                    batch_index < batch_control.batch_width
+                    ? quantized_inputs.values[
+                        batch_index * INPUT_SIZE + input_start + input_row
+                    ]
+                    : floate4m3_t(0.0);
+            }
+            barrier();
+
+            coopmat<floate4m3_t, gl_ScopeSubgroup, {{MATRIX_M}}, {{MATRIX_K}},
+                gl_MatrixUseA> a;
+            if (stage_weight) {
+                coopMatLoad(
+                    a,
+                    weight_tile,
+                    output_subtile * MATRIX_M * MATRIX_K,
+                    MATRIX_K,
+                    gl_CooperativeMatrixLayoutRowMajor
+                );
+            } else {
+                coopMatLoad(
+                    a,
+                    weight.values,
+                    (output_start + output_subtile * MATRIX_M) * INPUT_SIZE
+                        + input_start,
+                    INPUT_SIZE,
+                    gl_CooperativeMatrixLayoutRowMajor
+                );
+            }
+            for (
+                uint batch_subtile = 0u;
+                batch_subtile < BATCH_SUBTILES;
+                batch_subtile++
+            ) {
+                coopmat<floate4m3_t, gl_ScopeSubgroup, {{MATRIX_K}}, {{MATRIX_N}},
+                    gl_MatrixUseB> b;
+                coopMatLoad(
+                    b,
+                    input_tile,
+                    batch_subtile * MATRIX_N,
+                    BATCH_TILE,
+                    gl_CooperativeMatrixLayoutRowMajor
+                );
+                block_sums[batch_subtile] = coopMatMulAdd(
+                    a,
+                    b,
+                    block_sums[batch_subtile]
+                );
+            }
+            barrier();
+        }
+
+        for (
+            uint batch_subtile = 0u;
+            batch_subtile < BATCH_SUBTILES;
+            batch_subtile++
+        ) {
+            coopMatStore(
+                block_sums[batch_subtile],
+                block_result,
+                output_subtile * MATRIX_M * BATCH_TILE
+                    + batch_subtile * MATRIX_N,
+                BATCH_TILE,
+                gl_CooperativeMatrixLayoutRowMajor
+            );
+        }
+        barrier();
+
+        uint input_block = input_block_start / BLOCK_COLUMNS;
+        for (
+            uint index = lane;
+            index < OUTPUT_TILE * BATCH_TILE;
+            index += gl_WorkGroupSize.x
+        ) {
+            uint row = index / BATCH_TILE;
+            uint batch_lane = index % BATCH_TILE;
+            uint output_index = output_start + row;
+            uint batch_index = batch_start + batch_lane;
+            if (
+                output_index < OUTPUT_SIZE
+                && batch_index < batch_control.batch_width
+            ) {
+                float scale =
+                    read_weight_scale(output_index, input_block)
+                    * input_scales.values[
+                        batch_index * SCALE_COLUMNS + input_block
+                    ];
+                result_tile[index] = fma(
+                    block_result[index],
+                    scale,
+                    result_tile[index]
+                );
+            }
+        }
+        barrier();
+    }
+
+    for (
+        uint index = lane;
+        index < OUTPUT_TILE * BATCH_TILE;
+        index += gl_WorkGroupSize.x
+    ) {
+        uint row = index / BATCH_TILE;
+        uint batch_lane = index % BATCH_TILE;
+        uint output_index = output_start + row;
+        uint batch_index = batch_start + batch_lane;
+        if (
+            output_index < OUTPUT_SIZE
+            && batch_index < batch_control.batch_width
+        ) {
+            output_frames.values[batch_index * OUTPUT_SIZE + output_index] =
+                uint16_t(f32_to_bf16(finalize_result(
+                    batch_index,
+                    output_index,
+                    result_tile[index]
+                )));
+        }
+    }
+}
