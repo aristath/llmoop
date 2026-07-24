@@ -334,25 +334,26 @@ fn speculative_verification_stops_at_the_first_emitted_stop_token() {
 }
 
 #[test]
-fn component_batches_never_select_a_numerically_unproven_kernel() {
-    let artifact =
-        |lane_tile_width, exact_primary_equivalence| VulkanResidentComponentBatchKernelArtifact {
+fn component_batches_select_only_mode_compatible_kernels() {
+    let artifact = |lane_tile_width,
+                    independent_candidate_compatible,
+                    causal_sequence_compatible| VulkanResidentComponentBatchKernelArtifact {
             component_id: "processor".to_string(),
             node_id: "project".to_string(),
             execution_domain: VulkanResidentComponentKernelExecutionDomain::DecodeAndPrefill,
             batch_mode: VulkanResidentComponentKernelBatchMode::WeightShared,
             lane_tile_width,
-            exact_primary_equivalence,
-            exact_causal_sequence_equivalence: exact_primary_equivalence,
+            independent_candidate_compatible,
+            causal_sequence_compatible,
             device_requirements: VulkanResidentVulkanDeviceRequirements::default(),
             stages: Vec::new(),
         };
     let artifacts = vec![
-        artifact(64, false),
-        artifact(2, true),
-        artifact(4, true),
-        artifact(8, true),
-        artifact(16, true),
+        artifact(64, false, true),
+        artifact(2, true, true),
+        artifact(4, true, true),
+        artifact(8, true, true),
+        artifact(16, true, true),
     ];
 
     let verification = select_component_batch_kernel_artifact(
@@ -364,7 +365,7 @@ fn component_batches_never_select_a_numerically_unproven_kernel() {
     )
     .unwrap();
     assert_eq!(verification.lane_tile_width, 8);
-    assert!(verification.exact_primary_equivalence);
+    assert!(verification.independent_candidate_compatible);
 
     let causal = select_component_batch_kernel_artifact(
         &artifacts,
@@ -374,8 +375,18 @@ fn component_batches_never_select_a_numerically_unproven_kernel() {
         6,
     )
     .unwrap();
-    assert_eq!(causal.lane_tile_width, 16);
-    assert!(causal.exact_primary_equivalence);
+    assert_eq!(causal.lane_tile_width, 8);
+    assert!(causal.causal_sequence_compatible);
+
+    let full_prefill = select_component_batch_kernel_artifact(
+        &artifacts,
+        "processor",
+        "project",
+        VulkanComponentBatchExecutionMode::CausalSequence,
+        64,
+    )
+    .unwrap();
+    assert_eq!(full_prefill.lane_tile_width, 64);
 
     let heterogeneous = select_component_batch_kernel_artifact_where(
         &artifacts,
@@ -386,7 +397,7 @@ fn component_batches_never_select_a_numerically_unproven_kernel() {
         |artifact| artifact.lane_tile_width != 64,
     )
     .unwrap();
-    assert_eq!(heterogeneous.lane_tile_width, 16);
+    assert_eq!(heterogeneous.lane_tile_width, 8);
 }
 
 #[test]
@@ -397,8 +408,8 @@ fn component_batches_select_only_artifacts_for_the_requested_execution_domain() 
         execution_domain,
         batch_mode: VulkanResidentComponentKernelBatchMode::WeightShared,
         lane_tile_width,
-        exact_primary_equivalence: true,
-        exact_causal_sequence_equivalence: true,
+        independent_candidate_compatible: true,
+        causal_sequence_compatible: true,
         device_requirements: VulkanResidentVulkanDeviceRequirements::default(),
         stages: Vec::new(),
     };
@@ -441,15 +452,15 @@ fn component_batches_select_only_artifacts_for_the_requested_execution_domain() 
 }
 
 #[test]
-fn component_batches_use_causal_exactness_for_temporal_prefill_kernels() {
+fn component_batches_use_causal_compatibility_for_temporal_prefill_kernels() {
     let artifacts = vec![VulkanResidentComponentBatchKernelArtifact {
         component_id: "processor".to_string(),
         node_id: "attention".to_string(),
         execution_domain: VulkanResidentComponentKernelExecutionDomain::Prefill,
         batch_mode: VulkanResidentComponentKernelBatchMode::CausalScan,
         lane_tile_width: 64,
-        exact_primary_equivalence: false,
-        exact_causal_sequence_equivalence: true,
+        independent_candidate_compatible: false,
+        causal_sequence_compatible: true,
         device_requirements: VulkanResidentVulkanDeviceRequirements::default(),
         stages: Vec::new(),
     }];
@@ -472,8 +483,8 @@ fn component_batches_use_causal_exactness_for_temporal_prefill_kernels() {
         4,
     )
     .unwrap();
-    assert!(causal.exact_causal_sequence_equivalence);
-    assert!(!causal.exact_primary_equivalence);
+    assert!(causal.causal_sequence_compatible);
+    assert!(!causal.independent_candidate_compatible);
 }
 
 #[test]
@@ -505,8 +516,8 @@ fn component_batch_execution_contract_requires_matching_shader_mode() {
             .map(|shader_path| VulkanResidentComponentBatchImplementationSpec {
                 execution_domain: VulkanResidentComponentKernelExecutionDomain::DecodeAndPrefill,
                 lane_tile_width: 16,
-                exact_primary_equivalence: true,
-                exact_causal_sequence_equivalence: true,
+                independent_candidate_compatible: true,
+                causal_sequence_compatible: true,
                 device_requirements: VulkanResidentVulkanDeviceRequirements::default(),
                 stages: vec![VulkanResidentComponentBatchStageSpec {
                     shader_path,

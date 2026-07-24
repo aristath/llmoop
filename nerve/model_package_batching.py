@@ -164,22 +164,72 @@ def cooperative_float8_e4m3_batch_shader_file(
         r"b(\d+)x(\d+)_(\d+)x(\d+)\.comp",
         shader_file,
     )
-    if linear is None:
-        return None
-    operation, block_rows, block_columns, input_size, output_size = linear.groups()
     m, n, k = shape
-    if (
-        min(shape) <= 0
-        or int(block_columns) % k
-        or int(input_size) % int(block_columns)
-    ):
+    if min(shape) <= 0:
         return None
     batch_tile_width = 4 * n
-    return (
-        f"{operation}_prequant_batch{batch_tile_width}_cooperative_"
-        f"fp8_e4m3_m{m}n{n}k{k}_b{block_rows}x{block_columns}_"
-        f"{input_size}x{output_size}.comp"
+    if linear is not None:
+        (
+            operation,
+            block_rows,
+            block_columns,
+            input_size,
+            output_size,
+        ) = linear.groups()
+        if (
+            int(block_columns) % k
+            or int(input_size) % int(block_columns)
+        ):
+            return None
+        return (
+            f"{operation}_prequant_batch{batch_tile_width}_cooperative_"
+            f"fp8_e4m3_m{m}n{n}k{k}_b{block_rows}x{block_columns}_"
+            f"{input_size}x{output_size}.comp"
+        )
+
+    parallel = re.fullmatch(
+        r"parallel_linear_([23])way_prequant_fp8_e4m3_"
+        r"b(\d+)x(\d+)_(\d+)x(\d+)_(\d+)(?:_(\d+))?\.comp",
+        shader_file,
     )
+    if parallel is not None:
+        branch_count, block_rows, block_columns, input_size, *output_sizes = (
+            parallel.groups()
+        )
+        output_sizes = [size for size in output_sizes if size is not None]
+        if (
+            len(output_sizes) != int(branch_count)
+            or int(block_columns) % k
+            or int(input_size) % int(block_columns)
+        ):
+            return None
+        return (
+            f"parallel_linear_batch{batch_tile_width}_{branch_count}way_"
+            f"prequant_cooperative_fp8_e4m3_m{m}n{n}k{k}_"
+            f"b{block_rows}x{block_columns}_{input_size}x"
+            f"{'_'.join(output_sizes)}.comp"
+        )
+
+    fused_ffn = re.fullmatch(
+        r"parallel_linear_silu_multiply_prequant_fp8_e4m3_"
+        r"b(\d+)x(\d+)_(\d+)x(\d+)\.comp",
+        shader_file,
+    )
+    if fused_ffn is not None:
+        block_rows, block_columns, input_size, output_size = fused_ffn.groups()
+        if (
+            int(block_columns) % k
+            or int(input_size) % int(block_columns)
+        ):
+            return None
+        return (
+            "parallel_linear_silu_multiply_prequant_"
+            f"batch{batch_tile_width}_cooperative_fp8_e4m3_"
+            f"m{m}n{n}k{k}_b{block_rows}x{block_columns}_"
+            f"{input_size}x{output_size}.comp"
+        )
+
+    return None
 
 
 def cooperative_float8_e4m3_workgroup_count_x(
@@ -192,12 +242,36 @@ def cooperative_float8_e4m3_workgroup_count_x(
         r"b\d+x\d+_\d+x(\d+)\.comp",
         shader_file,
     )
-    if linear is None:
+    output_sizes: list[int]
+    if linear is not None:
+        output_sizes = [int(linear.group(1))]
+    else:
+        parallel = re.fullmatch(
+            r"parallel_linear_[23]way_prequant_fp8_e4m3_"
+            r"b\d+x\d+_\d+x(\d+)_(\d+)(?:_(\d+))?\.comp",
+            shader_file,
+        )
+        if parallel is not None:
+            output_sizes = [
+                int(size) for size in parallel.groups() if size is not None
+            ]
+        else:
+            fused_ffn = re.fullmatch(
+                r"parallel_linear_silu_multiply_prequant_fp8_e4m3_"
+                r"b\d+x\d+_\d+x(\d+)\.comp",
+                shader_file,
+            )
+            if fused_ffn is None:
+                raise ModelCompileError(
+                    f"shader {shader_file!r} has no cooperative FP8 batch geometry"
+                )
+            output_sizes = [int(fused_ffn.group(1))]
+    if not output_sizes:
         raise ModelCompileError(
             f"shader {shader_file!r} has no cooperative FP8 batch geometry"
         )
-    output_size = int(linear.group(1))
     output_tile = 4 * shape[0]
+    output_size = max(output_sizes)
     return (output_size + output_tile - 1) // output_tile
 
 

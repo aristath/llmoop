@@ -557,8 +557,8 @@ def test_package_integrity_rejects_batch_requirements_that_do_not_match_spirv(
         {
             "execution_domain": "decode_and_prefill",
             "lane_tile_width": 4,
-            "exact_primary_equivalence": True,
-            "exact_causal_sequence_equivalence": True,
+            "independent_candidate_compatible": True,
+            "causal_sequence_compatible": True,
             "device_requirements": {
                 "vulkan_device_extensions": [],
                 "vulkan_features": ["shader_int8"],

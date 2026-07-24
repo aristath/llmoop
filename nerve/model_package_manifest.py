@@ -1020,8 +1020,8 @@ def component_kernel_spec(
             {
                 "execution_domain": "prefill",
                 "lane_tile_width": CAUSAL_SCAN_LANE_TILE_WIDTH,
-                "exact_primary_equivalence": False,
-                "exact_causal_sequence_equivalence": True,
+                "independent_candidate_compatible": False,
+                "causal_sequence_compatible": True,
                 "device_requirements": {
                     "vulkan_device_extensions": [],
                     "vulkan_features": [],
@@ -1036,8 +1036,8 @@ def component_kernel_spec(
                 {
                     "execution_domain": "prefill",
                     "lane_tile_width": 4 * shape[1],
-                    "exact_primary_equivalence": False,
-                    "exact_causal_sequence_equivalence": False,
+                    "independent_candidate_compatible": False,
+                    "causal_sequence_compatible": True,
                     "device_requirements": {
                         "vulkan_device_extensions": [],
                         "vulkan_features": [],
@@ -1067,8 +1067,8 @@ def component_kernel_spec(
                 {
                     "execution_domain": "prefill",
                     "lane_tile_width": COOPERATIVE_BATCH_LANE_TILE_WIDTH,
-                    "exact_primary_equivalence": False,
-                    "exact_causal_sequence_equivalence": False,
+                    "independent_candidate_compatible": False,
+                    "causal_sequence_compatible": True,
                     "device_requirements": {
                         "vulkan_device_extensions": [],
                         "vulkan_features": [],
@@ -1094,8 +1094,8 @@ def component_kernel_spec(
                 {
                     "execution_domain": "prefill",
                     "lane_tile_width": 1,
-                    "exact_primary_equivalence": True,
-                    "exact_causal_sequence_equivalence": True,
+                    "independent_candidate_compatible": True,
+                    "causal_sequence_compatible": True,
                     "device_requirements": {
                         "vulkan_device_extensions": [],
                         "vulkan_features": [],
@@ -1125,8 +1125,8 @@ def component_kernel_spec(
                 {
                     "execution_domain": "decode_and_prefill",
                     "lane_tile_width": tile_width,
-                    "exact_primary_equivalence": True,
-                    "exact_causal_sequence_equivalence": True,
+                    "independent_candidate_compatible": True,
+                    "causal_sequence_compatible": True,
                     "device_requirements": {
                         "vulkan_device_extensions": [],
                         "vulkan_features": [],

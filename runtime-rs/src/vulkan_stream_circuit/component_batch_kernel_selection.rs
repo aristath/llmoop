@@ -89,11 +89,11 @@ fn select_component_batch_kernel_artifact_where<'a>(
                     .supports_batch_mode(execution_mode)
                 && (artifact.batch_mode == VulkanResidentComponentKernelBatchMode::WeightShared
                     || execution_mode == VulkanComponentBatchExecutionMode::CausalSequence)
-                && artifact.is_exact_for(execution_mode)
+                && artifact.is_compatible_with(execution_mode)
                 && compatible(artifact)
         })
         .min_by_key(|artifact| {
-            if execution_mode == VulkanComponentBatchExecutionMode::CausalSequence {
+            if artifact.batch_mode == VulkanResidentComponentKernelBatchMode::CausalScan {
                 (0usize, usize::MAX - artifact.lane_tile_width)
             } else if artifact.lane_tile_width >= lane_capacity {
                 (0usize, artifact.lane_tile_width)

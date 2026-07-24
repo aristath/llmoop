@@ -143,6 +143,40 @@ def test_compiler_selects_only_compatible_weight_shared_batch_kernels() -> None:
         )
         == 80
     )
+    parallel_fp8_cooperative = cooperative_float8_e4m3_batch_shader_file(
+        "parallel_linear_3way_prequant_fp8_e4m3_"
+        "b128x128_5120x6144_1024_1024.comp",
+        shape=(16, 16, 16),
+    )
+    assert parallel_fp8_cooperative == (
+        "parallel_linear_batch64_3way_prequant_cooperative_"
+        "fp8_e4m3_m16n16k16_b128x128_5120x6144_1024_1024.comp"
+    )
+    assert (
+        cooperative_float8_e4m3_workgroup_count_x(
+            "parallel_linear_3way_prequant_fp8_e4m3_"
+            "b128x128_5120x6144_1024_1024.comp",
+            shape=(16, 16, 16),
+        )
+        == 96
+    )
+    fused_ffn_fp8_cooperative = cooperative_float8_e4m3_batch_shader_file(
+        "parallel_linear_silu_multiply_prequant_fp8_e4m3_"
+        "b128x128_5120x17408.comp",
+        shape=(16, 16, 16),
+    )
+    assert fused_ffn_fp8_cooperative == (
+        "parallel_linear_silu_multiply_prequant_batch64_cooperative_"
+        "fp8_e4m3_m16n16k16_b128x128_5120x17408.comp"
+    )
+    assert (
+        cooperative_float8_e4m3_workgroup_count_x(
+            "parallel_linear_silu_multiply_prequant_fp8_e4m3_"
+            "b128x128_5120x17408.comp",
+            shape=(16, 16, 16),
+        )
+        == 272
+    )
 
 
 def test_compiler_orders_frame_parallel_before_portable_batch_implementation() -> None:
@@ -159,8 +193,8 @@ def test_compiler_orders_frame_parallel_before_portable_batch_implementation() -
     assert spec["execution_domain"] == "decode"
     assert frame_parallel["execution_domain"] == "prefill"
     assert frame_parallel["lane_tile_width"] == 1
-    assert frame_parallel["exact_primary_equivalence"] is True
-    assert frame_parallel["exact_causal_sequence_equivalence"] is True
+    assert frame_parallel["independent_candidate_compatible"] is True
+    assert frame_parallel["causal_sequence_compatible"] is True
     assert frame_parallel["device_requirements"] == {
         "vulkan_device_extensions": [],
         "vulkan_features": [],
@@ -177,11 +211,11 @@ def test_compiler_orders_frame_parallel_before_portable_batch_implementation() -
         16,
     ]
     assert all(
-        implementation["exact_primary_equivalence"] is True
+        implementation["independent_candidate_compatible"] is True
         for implementation in portable
     )
     assert all(
-        implementation["exact_causal_sequence_equivalence"] is True
+        implementation["causal_sequence_compatible"] is True
         for implementation in portable
     )
 
@@ -258,8 +292,8 @@ def test_compiler_selects_stateful_causal_scan_kernels() -> None:
     )
     temporal = attention_spec["batch_implementations"][0]
     assert temporal["execution_domain"] == "prefill"
-    assert temporal["exact_primary_equivalence"] is False
-    assert temporal["exact_causal_sequence_equivalence"] is True
+    assert temporal["independent_candidate_compatible"] is False
+    assert temporal["causal_sequence_compatible"] is True
 
 
 def test_compiler_renders_temporal_attention_stages(tmp_path: Path) -> None:
@@ -352,8 +386,8 @@ def test_projection_component_compiles_ordered_target_native_and_scalar_implemen
     assert cooperative == {
         "execution_domain": "prefill",
         "lane_tile_width": 64,
-        "exact_primary_equivalence": False,
-        "exact_causal_sequence_equivalence": False,
+        "independent_candidate_compatible": False,
+        "causal_sequence_compatible": True,
         "device_requirements": {
             "vulkan_device_extensions": [],
             "vulkan_features": [],
@@ -382,8 +416,8 @@ def test_projection_component_compiles_ordered_target_native_and_scalar_implemen
         assert implementation == {
             "execution_domain": "decode_and_prefill",
             "lane_tile_width": tile_width,
-            "exact_primary_equivalence": True,
-            "exact_causal_sequence_equivalence": True,
+            "independent_candidate_compatible": True,
+            "causal_sequence_compatible": True,
             "device_requirements": {
                 "vulkan_device_extensions": [],
                 "vulkan_features": [],
@@ -419,8 +453,8 @@ def test_compiler_selects_device_typed_cooperative_fp8_prefill() -> None:
     assert cooperative == {
         "execution_domain": "prefill",
         "lane_tile_width": 64,
-        "exact_primary_equivalence": False,
-        "exact_causal_sequence_equivalence": False,
+        "independent_candidate_compatible": False,
+        "causal_sequence_compatible": True,
         "device_requirements": {
             "vulkan_device_extensions": [],
             "vulkan_features": [],
@@ -479,6 +513,42 @@ def test_compiler_renders_cooperative_fp8_prefill_shader(tmp_path: Path) -> None
     assert "binding = 2) buffer OutputFrames" in linear
     assert "binding = 2) readonly buffer ResidualFrames" in residual
     assert "binding = 3) buffer OutputFrames" in residual
+
+
+def test_compiler_renders_cooperative_parallel_fp8_prefill_shaders(
+    tmp_path: Path,
+) -> None:
+    shader_source_dir = Path(__file__).parents[1] / "runtime-rs" / "shaders"
+    parallel = (
+        "parallel_linear_batch64_3way_prequant_cooperative_"
+        "fp8_e4m3_m16n16k16_b128x128_5120x6144_1024_1024.comp"
+    )
+    fused_ffn = (
+        "parallel_linear_silu_multiply_prequant_batch64_cooperative_"
+        "fp8_e4m3_m16n16k16_b128x128_5120x17408.comp"
+    )
+
+    copy_shader_templates(shader_source_dir, tmp_path, {parallel, fused_ffn})
+
+    parallel_source = (tmp_path / parallel).read_text()
+    assert "const uint BRANCH_COUNT = 3u;" in parallel_source
+    assert "const uint OUTPUT_A_SIZE = 6144u;" in parallel_source
+    assert "const uint OUTPUT_B_SIZE = 1024u;" in parallel_source
+    assert "const uint OUTPUT_C_SIZE = 1024u;" in parallel_source
+    assert "binding = 2) buffer OutputA" in parallel_source
+    assert "binding = 4) buffer OutputC" in parallel_source
+    assert "binding = 10) readonly buffer WeightScaleInvC" in parallel_source
+    assert "coopmat<floate4m3_t" in parallel_source
+    assert "{{" not in parallel_source
+
+    fused_source = (tmp_path / fused_ffn).read_text()
+    assert "shared float result_tiles[2]" in fused_source
+    assert "const uint OUTPUT_SIZE = 17408u;" in fused_source
+    assert "binding = 3) readonly buffer GateWeight" in fused_source
+    assert "binding = 5) readonly buffer UpWeight" in fused_source
+    assert "rounded_silu(gate) * up" in fused_source
+    assert "coopmat<floate4m3_t" in fused_source
+    assert "{{" not in fused_source
 
 
 def test_compiler_renders_weight_shared_component_batch_shaders(tmp_path: Path) -> None:

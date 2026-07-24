@@ -205,9 +205,9 @@ fn load_resident_component_batch_kernels(
                     execution_domain: implementation.execution_domain,
                     batch_mode: kernel.batch_mode,
                     lane_tile_width: implementation.lane_tile_width as usize,
-                    exact_primary_equivalence: implementation.exact_primary_equivalence,
-                    exact_causal_sequence_equivalence: implementation
-                        .exact_causal_sequence_equivalence,
+                    independent_candidate_compatible: implementation
+                        .independent_candidate_compatible,
+                    causal_sequence_compatible: implementation.causal_sequence_compatible,
                     device_requirements: implementation.device_requirements.clone(),
                     stages: implementation
                         .stages

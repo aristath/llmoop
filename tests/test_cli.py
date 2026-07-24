@@ -643,10 +643,11 @@ class CompiledPackageTest(unittest.TestCase):
                         )
                         self.assertGreater(implementation["lane_tile_width"], 0)
                         self.assertIsInstance(
-                            implementation["exact_primary_equivalence"], bool
+                            implementation["independent_candidate_compatible"],
+                            bool,
                         )
                         self.assertIsInstance(
-                            implementation["exact_causal_sequence_equivalence"], bool
+                            implementation["causal_sequence_compatible"], bool
                         )
                         self.assertIn("device_requirements", implementation)
                         self.assertGreaterEqual(len(implementation["stages"]), 1)

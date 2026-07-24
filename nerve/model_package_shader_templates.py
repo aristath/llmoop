@@ -510,6 +510,192 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
             },
         )
 
+    cooperative_prequant_parallel_fp8 = re.fullmatch(
+        r"parallel_linear_batch(\d+)_([23])way_prequant_cooperative_"
+        r"fp8_e4m3_m(\d+)n(\d+)k(\d+)_"
+        r"b(\d+)x(\d+)_(\d+)x(\d+)_(\d+)(?:_(\d+))?\.comp",
+        shader_file,
+    )
+    if cooperative_prequant_parallel_fp8 is not None:
+        (
+            batch_tile_width,
+            branch_count,
+            matrix_m,
+            matrix_n,
+            matrix_k,
+            block_rows,
+            block_columns,
+            input_size,
+            *optional_output_sizes,
+        ) = map(
+            lambda value: int(value) if value is not None else None,
+            cooperative_prequant_parallel_fp8.groups(),
+        )
+        output_sizes = [
+            int(size) for size in optional_output_sizes if size is not None
+        ]
+        if (
+            min(
+                batch_tile_width,
+                branch_count,
+                matrix_m,
+                matrix_n,
+                matrix_k,
+                block_rows,
+                block_columns,
+                input_size,
+                *output_sizes,
+            )
+            <= 0
+            or branch_count not in {2, 3}
+            or len(output_sizes) != branch_count
+            or batch_tile_width != 4 * matrix_n
+            or block_columns % matrix_k
+            or input_size % block_columns
+        ):
+            raise ModelCompileError(
+                f"invalid cooperative parallel FP8 shader shape {shader_file!r}"
+            )
+        labels = [chr(ord("A") + index) for index in range(branch_count)]
+        output_constants = "\n".join(
+            f"const uint OUTPUT_{label}_SIZE = {output_size}u;"
+            for label, output_size in zip(labels, output_sizes, strict=True)
+        )
+        output_size_selection = "\n".join(
+            f"    if (branch == {index}u) return OUTPUT_{label}_SIZE;"
+            for index, label in enumerate(labels[:-1])
+        )
+        output_size_selection += f"\n    return OUTPUT_{labels[-1]}_SIZE;"
+        output_bindings = "\n\n".join(
+            f"layout(set = 0, binding = {index + 2}) buffer Output{label} {{\n"
+            "    uint16_t values[];\n"
+            f"}} output_{label.lower()};"
+            for index, label in enumerate(labels)
+        )
+        weight_bindings = "\n\n".join(
+            "\n\n".join(
+                [
+                    f"layout(set = 0, binding = {branch_count + index * 2 + 2}) "
+                    f"readonly buffer Weight{label} {{\n"
+                    "    floate4m3_t values[];\n"
+                    f"}} weight_{label.lower()};",
+                    f"layout(set = 0, binding = {branch_count + index * 2 + 3}) "
+                    f"readonly buffer WeightScaleInv{label} {{\n"
+                    "    uint words[];\n"
+                    f"}} weight_scale_inv_{label.lower()};",
+                ]
+            )
+            for index, label in enumerate(labels)
+        )
+        weight_scale_reads = "\n".join(
+            f"    if (branch == {index}u) {{\n"
+            f"        uint packed = weight_scale_inv_{label.lower()}."
+            "words[index >> 1u];\n"
+            "        return bf16_to_f32("
+            "packed >> ((index & 1u) * 16u));\n"
+            "    }"
+            for index, label in enumerate(labels[:-1])
+        )
+        weight_scale_reads += (
+            "\n    uint packed = weight_scale_inv_"
+            + labels[-1].lower()
+            + ".words[index >> 1u];\n"
+            "    return bf16_to_f32(packed >> ((index & 1u) * 16u));"
+        )
+        weight_reads = "\n".join(
+            f"    if (branch == {index}u) "
+            f"return weight_{label.lower()}.values[index];"
+            for index, label in enumerate(labels[:-1])
+        )
+        weight_reads += (
+            f"\n    return weight_{labels[-1].lower()}.values[index];"
+        )
+        output_writes = "\n".join(
+            f"    if (branch == {index}u) {{\n"
+            f"        output_{label.lower()}.values["
+            f"batch_index * OUTPUT_{label}_SIZE + row] = value;\n"
+            "        return;\n"
+            "    }"
+            for index, label in enumerate(labels[:-1])
+        )
+        output_writes += (
+            f"\n    output_{labels[-1].lower()}.values["
+            f"batch_index * OUTPUT_{labels[-1]}_SIZE + row] = value;"
+        )
+        return render_shader_template(
+            source_dir,
+            "parallel_linear_prequant_batch_cooperative_fp8_e4m3.comp.template",
+            {
+                "MATRIX_M": str(matrix_m),
+                "MATRIX_N": str(matrix_n),
+                "MATRIX_K": str(matrix_k),
+                "BRANCH_COUNT": str(branch_count),
+                "BLOCK_ROWS": str(block_rows),
+                "BLOCK_COLUMNS": str(block_columns),
+                "INPUT_SIZE": str(input_size),
+                "OUTPUT_CONSTANTS": output_constants,
+                "OUTPUT_SIZE_SELECTION": output_size_selection,
+                "OUTPUT_BINDINGS": output_bindings,
+                "WEIGHT_BINDINGS": weight_bindings,
+                "WEIGHT_SCALE_READS": weight_scale_reads,
+                "WEIGHT_READS": weight_reads,
+                "OUTPUT_WRITES": output_writes,
+            },
+        )
+
+    cooperative_prequant_fused_fp8_ffn = re.fullmatch(
+        r"parallel_linear_silu_multiply_prequant_batch(\d+)_cooperative_"
+        r"fp8_e4m3_m(\d+)n(\d+)k(\d+)_"
+        r"b(\d+)x(\d+)_(\d+)x(\d+)\.comp",
+        shader_file,
+    )
+    if cooperative_prequant_fused_fp8_ffn is not None:
+        (
+            batch_tile_width,
+            matrix_m,
+            matrix_n,
+            matrix_k,
+            block_rows,
+            block_columns,
+            input_size,
+            output_size,
+        ) = map(int, cooperative_prequant_fused_fp8_ffn.groups())
+        if (
+            min(
+                batch_tile_width,
+                matrix_m,
+                matrix_n,
+                matrix_k,
+                block_rows,
+                block_columns,
+                input_size,
+                output_size,
+            )
+            <= 0
+            or batch_tile_width != 4 * matrix_n
+            or block_columns % matrix_k
+            or input_size % block_columns
+        ):
+            raise ModelCompileError(
+                f"invalid cooperative FP8 FFN shader shape {shader_file!r}"
+            )
+        return render_shader_template(
+            source_dir,
+            (
+                "parallel_linear_silu_multiply_prequant_batch_"
+                "cooperative_fp8_e4m3.comp.template"
+            ),
+            {
+                "MATRIX_M": str(matrix_m),
+                "MATRIX_N": str(matrix_n),
+                "MATRIX_K": str(matrix_k),
+                "BLOCK_ROWS": str(block_rows),
+                "BLOCK_COLUMNS": str(block_columns),
+                "INPUT_SIZE": str(input_size),
+                "OUTPUT_SIZE": str(output_size),
+            },
+        )
+
     prequant_fp8_linear = re.fullmatch(
         r"(linear|linear_bias|linear_residual)_prequant"
         r"(?:_batch(\d+))?_fp8_e4m3_"

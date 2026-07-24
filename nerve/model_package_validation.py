@@ -466,7 +466,7 @@ def validate_compiled_component_executions(
                     or all(
                         implementation["execution_domain"]
                         in {"prefill", "decode_and_prefill"}
-                        and implementation["exact_causal_sequence_equivalence"]
+                        and implementation["causal_sequence_compatible"]
                         for implementation in batch_implementations
                     )
                 )
@@ -505,8 +505,10 @@ def valid_batch_implementation(implementation: Any) -> bool:
         isinstance(implementation.get("lane_tile_width"), int)
         and not isinstance(implementation.get("lane_tile_width"), bool)
         and implementation["lane_tile_width"] > 0
-        and isinstance(implementation.get("exact_primary_equivalence"), bool)
-        and isinstance(implementation.get("exact_causal_sequence_equivalence"), bool)
+        and isinstance(
+            implementation.get("independent_candidate_compatible"), bool
+        )
+        and isinstance(implementation.get("causal_sequence_compatible"), bool)
         and isinstance(stages, list)
         and bool(stages)
         and all(valid_batch_stage(stage) for stage in stages)
@@ -1096,4 +1098,3 @@ def package_artifact_path(package_dir: Path, value: Any, label: str) -> Path:
             f"compiled package {label} path must stay inside the package: {value!r}"
         )
     return package_dir / relative
-

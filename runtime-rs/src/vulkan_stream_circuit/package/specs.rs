@@ -123,8 +123,8 @@ pub struct VulkanResidentComponentKernelSpec {
 pub struct VulkanResidentComponentBatchImplementationSpec {
     pub execution_domain: VulkanResidentComponentKernelExecutionDomain,
     pub lane_tile_width: u32,
-    pub exact_primary_equivalence: bool,
-    pub exact_causal_sequence_equivalence: bool,
+    pub independent_candidate_compatible: bool,
+    pub causal_sequence_compatible: bool,
     pub device_requirements: VulkanResidentVulkanDeviceRequirements,
     pub stages: Vec<VulkanResidentComponentBatchStageSpec>,
 }
