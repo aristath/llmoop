@@ -65,8 +65,9 @@ EXACT_REWRITE_SOURCE_OPS = {
 PHYSICAL_NODE_ATTRS = {
     "output_element_bytes",
     "physical_input_contract",
-    "physical_input_helper_id",
+    "physical_input_provider_id",
     "physical_logical_inputs",
+    "physical_output_representations",
 }
 FP8_PREQUANTIZATION_CONTRACT = "bf16_blockwise_fp8_e4m3_f32_scale.v1"
 
@@ -181,7 +182,10 @@ def prove_exact_circuit_candidate(
         port.get("source", port["id"])
         for port in source.get("boundary", {}).get("outputs", [])
     }
-    physical_helper_ids = _validate_physical_representation_helpers(
+    (
+        physical_helper_ids,
+        physical_representation_count,
+    ) = _validate_physical_representation_providers(
         component_id,
         candidate_nodes,
         boundary_outputs,
@@ -287,7 +291,7 @@ def prove_exact_circuit_candidate(
         "candidate_contract_digest": candidate_digest,
         "covered_source_node_count": len(covered),
         "rewrite_count": len(rewrites),
-        "physical_helper_count": len(physical_helper_ids),
+        "physical_representation_count": physical_representation_count,
         "rewrites": rewrites,
     }
 
@@ -301,16 +305,29 @@ def _logical_candidate_node(node: Json) -> Json:
     logical_inputs = attrs.get("physical_logical_inputs")
     if isinstance(logical_inputs, list):
         logical["inputs"] = deepcopy(logical_inputs)
+    representations = attrs.get("physical_output_representations")
+    if isinstance(representations, list):
+        physical_outputs = {
+            output
+            for representation in representations
+            if isinstance(representation, dict)
+            for output in representation.get("outputs", [])
+        }
+        logical["outputs"] = [
+            output
+            for output in logical.get("outputs", [])
+            if output not in physical_outputs
+        ]
     for key in PHYSICAL_NODE_ATTRS:
         attrs.pop(key, None)
     return logical
 
 
-def _validate_physical_representation_helpers(
+def _validate_physical_representation_providers(
     component_id: str,
     nodes: list[Json],
     boundary_outputs: set[str],
-) -> set[str]:
+) -> tuple[set[str], int]:
     node_by_id = {node["id"]: node for node in nodes}
     consumers = _signal_consumers(nodes)
     helper_ids: set[str] = set()
@@ -374,7 +391,7 @@ def _validate_physical_representation_helpers(
                 or target.get("inputs") != [*outputs, *logical_inputs[1:]]
                 or target_attrs.get("physical_input_contract")
                 != FP8_PREQUANTIZATION_CONTRACT
-                or target_attrs.get("physical_input_helper_id") != helper_id
+                or target_attrs.get("physical_input_provider_id") != helper_id
                 or target_attrs.get("output_element_bytes")
                 != [2] * len(target.get("outputs", []))
             ):
@@ -392,6 +409,109 @@ def _validate_physical_representation_helpers(
             )
         helper_ids.add(helper_id)
 
+    representation_count = len(helper_ids)
+    for provider in nodes:
+        attrs = provider.get("attrs", {})
+        representations = attrs.get("physical_output_representations")
+        if representations is None:
+            continue
+        if not isinstance(representations, list) or not representations:
+            raise ModelCompileError(
+                f"candidate circuit {component_id!r} has an invalid physical "
+                f"representation provider {provider['id']!r}"
+            )
+        representation_outputs = [
+            output
+            for representation in representations
+            if isinstance(representation, dict)
+            for output in representation.get("outputs", [])
+        ]
+        logical_outputs = [
+            output
+            for output in provider.get("outputs", [])
+            if output not in set(representation_outputs)
+        ]
+        if (
+            len(representation_outputs) != 2 * len(representations)
+            or len(set(representation_outputs)) != len(representation_outputs)
+            or provider.get("outputs")
+            != [
+                *logical_outputs,
+                *representation_outputs,
+            ]
+            or attrs.get("output_element_bytes")
+            != [
+                *([2] * len(logical_outputs)),
+                *([1, 4] * len(representations)),
+            ]
+        ):
+            raise ModelCompileError(
+                f"candidate circuit {component_id!r} has an invalid physical "
+                f"representation provider {provider['id']!r}"
+            )
+        for representation in representations:
+            if not isinstance(representation, dict):
+                raise ModelCompileError(
+                    f"candidate circuit {component_id!r} has an invalid physical "
+                    f"representation provider {provider['id']!r}"
+                )
+            consumer_node_ids = representation.get("consumer_node_ids")
+            outputs = representation.get("outputs")
+            logical_signal = representation.get("logical_signal")
+            if (
+                set(representation)
+                != {
+                    "contract",
+                    "logical_signal",
+                    "outputs",
+                    "consumer_node_ids",
+                    "element_count",
+                    "block_columns",
+                }
+                or representation.get("contract") != FP8_PREQUANTIZATION_CONTRACT
+                or logical_signal not in logical_outputs
+                or not isinstance(outputs, list)
+                or len(outputs) != 2
+                or not isinstance(consumer_node_ids, list)
+                or not consumer_node_ids
+                or len(set(consumer_node_ids)) != len(consumer_node_ids)
+                or any(not isinstance(target_id, str) for target_id in consumer_node_ids)
+                or not isinstance(representation.get("element_count"), int)
+                or representation["element_count"] <= 0
+                or not isinstance(representation.get("block_columns"), int)
+                or representation["block_columns"] <= 0
+                or representation["element_count"] % representation["block_columns"]
+                or any(output in boundary_outputs for output in outputs)
+                or any(consumers.get(output) != set(consumer_node_ids) for output in outputs)
+            ):
+                raise ModelCompileError(
+                    f"candidate circuit {component_id!r} has an invalid physical "
+                    f"representation provider {provider['id']!r}"
+                )
+            for target_id in consumer_node_ids:
+                target = node_by_id.get(target_id)
+                target_attrs = target.get("attrs", {}) if isinstance(target, dict) else {}
+                logical_inputs = target_attrs.get("physical_logical_inputs")
+                if (
+                    target is None
+                    or target_id in target_ids
+                    or not isinstance(logical_inputs, list)
+                    or not logical_inputs
+                    or logical_inputs[0] != logical_signal
+                    or target.get("inputs") != [*outputs, *logical_inputs[1:]]
+                    or target_attrs.get("physical_input_contract")
+                    != FP8_PREQUANTIZATION_CONTRACT
+                    or target_attrs.get("physical_input_provider_id") != provider["id"]
+                    or target_attrs.get("output_element_bytes")
+                    != [2] * len(target.get("outputs", []))
+                ):
+                    raise ModelCompileError(
+                        f"candidate circuit {component_id!r} has an invalid physical "
+                        f"representation provider {provider['id']!r}"
+                    )
+                target_ids.add(target_id)
+            representation_count += 1
+
     unlinked_targets = [
         node["id"]
         for node in nodes
@@ -401,9 +521,9 @@ def _validate_physical_representation_helpers(
     if unlinked_targets:
         raise ModelCompileError(
             f"candidate circuit {component_id!r} has physical inputs without "
-            f"representation helpers: {unlinked_targets}"
+            f"representation providers: {unlinked_targets}"
         )
-    return helper_ids
+    return helper_ids, representation_count
 
 
 def model_contract_digest(model_graph: Json, tensor_index: Json) -> str:

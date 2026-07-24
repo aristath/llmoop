@@ -27,6 +27,7 @@ def optimize_circuit_for_vulkan(
     can_fuse_linear_split_recurrent: Callable[[Json, Json], bool] | None = None,
     can_fuse_append_attention: Callable[[Json, Json], bool] | None = None,
     fp8_prequantization_spec: Callable[[Json], Json | None] | None = None,
+    can_emit_fp8_representation: Callable[[Json, Json], bool] | None = None,
 ) -> Json:
     """Compile discoverable node regions without changing the component boundary."""
     optimized = deepcopy(circuit)
@@ -105,6 +106,7 @@ def optimize_circuit_for_vulkan(
     optimized["nodes"] = _lower_fp8_prequantized_inputs(
         compiled_nodes,
         fp8_prequantization_spec,
+        can_emit_fp8_representation,
     )
     return optimized
 
@@ -112,6 +114,7 @@ def optimize_circuit_for_vulkan(
 def _lower_fp8_prequantized_inputs(
     nodes: list[Json],
     describe: Callable[[Json], Json | None] | None,
+    can_emit: Callable[[Json, Json], bool] | None,
 ) -> list[Json]:
     if describe is None:
         return nodes
@@ -147,6 +150,7 @@ def _lower_fp8_prequantized_inputs(
                 "scale_signal": f"{node['id']}__input_scale_f32",
                 "consumer_node_ids": [],
                 "semantic_source_node_ids": [],
+                "logical_signal": key[0],
                 "input_size": input_size,
                 "block_columns": block_columns,
             },
@@ -161,9 +165,45 @@ def _lower_fp8_prequantized_inputs(
             )
         )
 
+    producer_by_signal = {
+        str(signal): node
+        for node, _spec in prepared
+        for signal in node.get("outputs", [])
+    }
+    producer_scopes: dict[str, list[Json]] = defaultdict(list)
+    for key, scope in scopes.items():
+        producer = producer_by_signal.get(key[0])
+        if producer is None or can_emit is None or not can_emit(producer, scope):
+            scope["provider_id"] = scope["helper_id"]
+            continue
+        scope["provider_id"] = producer["id"]
+        producer_scopes[producer["id"]].append(scope)
+
     compiled: list[Json] = []
     emitted_scopes: set[tuple[str, int, int]] = set()
     for node, spec in prepared:
+        emitted = producer_scopes.get(node["id"], [])
+        if emitted:
+            representations = []
+            for scope in emitted:
+                node["outputs"].extend(
+                    [scope["quantized_signal"], scope["scale_signal"]]
+                )
+                node["attrs"]["output_element_bytes"].extend([1, 4])
+                representations.append(
+                    {
+                        "contract": "bf16_blockwise_fp8_e4m3_f32_scale.v1",
+                        "logical_signal": scope["logical_signal"],
+                        "outputs": [
+                            scope["quantized_signal"],
+                            scope["scale_signal"],
+                        ],
+                        "consumer_node_ids": scope["consumer_node_ids"],
+                        "element_count": scope["input_size"],
+                        "block_columns": scope["block_columns"],
+                    }
+                )
+            node["attrs"]["physical_output_representations"] = representations
         if spec is None:
             compiled.append(node)
             continue
@@ -177,27 +217,28 @@ def _lower_fp8_prequantized_inputs(
         scope = scopes[key]
         contract = "bf16_blockwise_fp8_e4m3_f32_scale.v1"
         if key not in emitted_scopes:
-            compiled.append(
-                {
-                    "id": scope["helper_id"],
-                    "op": "quantize_fp8_e4m3",
-                    "inputs": [inputs[0]],
-                    "outputs": [
-                        scope["quantized_signal"],
-                        scope["scale_signal"],
-                    ],
-                    "attrs": {
-                        "physical_representation_contract": contract,
-                        "consumer_node_ids": scope["consumer_node_ids"],
-                        "semantic_source_node_ids": scope[
-                            "semantic_source_node_ids"
+            if scope["provider_id"] == scope["helper_id"]:
+                compiled.append(
+                    {
+                        "id": scope["helper_id"],
+                        "op": "quantize_fp8_e4m3",
+                        "inputs": [inputs[0]],
+                        "outputs": [
+                            scope["quantized_signal"],
+                            scope["scale_signal"],
                         ],
-                        "element_count": scope["input_size"],
-                        "block_columns": scope["block_columns"],
-                        "output_element_bytes": [1, 4],
-                    },
-                }
-            )
+                        "attrs": {
+                            "physical_representation_contract": contract,
+                            "consumer_node_ids": scope["consumer_node_ids"],
+                            "semantic_source_node_ids": scope[
+                                "semantic_source_node_ids"
+                            ],
+                            "element_count": scope["input_size"],
+                            "block_columns": scope["block_columns"],
+                            "output_element_bytes": [1, 4],
+                        },
+                    }
+                )
             emitted_scopes.add(key)
         node["inputs"] = [
             scope["quantized_signal"],
@@ -205,7 +246,7 @@ def _lower_fp8_prequantized_inputs(
             *inputs[1:],
         ]
         node_attrs["physical_input_contract"] = contract
-        node_attrs["physical_input_helper_id"] = scope["helper_id"]
+        node_attrs["physical_input_provider_id"] = scope["provider_id"]
         node_attrs["physical_logical_inputs"] = inputs
         compiled.append(node)
     return compiled

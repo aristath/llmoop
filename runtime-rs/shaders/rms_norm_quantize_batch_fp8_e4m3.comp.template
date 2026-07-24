@@ -1,0 +1,164 @@
+#version 460
+
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_float_e4m3 : require
+
+layout(local_size_x = 1024, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer InputFrames {
+    uint words[];
+} input_frames;
+layout(set = 0, binding = 1) buffer OutputFrames {
+    uint words[];
+} output_frames;
+layout(set = 0, binding = 2) buffer QuantizedFrames {
+    uint words[];
+} quantized_frames;
+layout(set = 0, binding = 3) buffer Scales {
+    float values[];
+} scales;
+layout(set = 0, binding = 4) readonly buffer Weight {
+    uint words[];
+} weight;
+
+layout(push_constant) uniform BatchControl {
+    uint batch_width;
+} batch_control;
+
+const uint BATCH_TILE_WIDTH = {{BATCH_TILE_WIDTH}}u;
+const uint HIDDEN_SIZE = {{HIDDEN_SIZE}}u;
+const uint BLOCK_COLUMNS = {{BLOCK_COLUMNS}}u;
+const uint BLOCK_COUNT = HIDDEN_SIZE / BLOCK_COLUMNS;
+const uint FRAME_WORDS = HIDDEN_SIZE / 2u;
+const uint FP8_FRAME_WORDS = HIDDEN_SIZE / 4u;
+const uint FP8_WORDS_PER_BLOCK = BLOCK_COLUMNS / 4u;
+const float NORM_EPS = {{NORM_EPS}};
+const float WEIGHT_OFFSET = {{WEIGHT_OFFSET}};
+
+shared float subgroup_sums[BATCH_TILE_WIDTH][16];
+
+float bf16_to_f32(uint value) {
+    return uintBitsToFloat((value & 0xffffu) << 16u);
+}
+
+uint f32_to_bf16(float value) {
+    uint bits = floatBitsToUint(value);
+    uint lsb = (bits >> 16u) & 1u;
+    return (bits + 0x7fffu + lsb) >> 16u;
+}
+
+float read_input(uint batch_index, uint index) {
+    uint packed =
+        input_frames.words[batch_index * FRAME_WORDS + (index >> 1u)];
+    return bf16_to_f32(
+        ((index & 1u) == 0u) ? (packed & 0xffffu) : (packed >> 16u)
+    );
+}
+
+float read_weight(uint index) {
+    uint packed = weight.words[index >> 1u];
+    return bf16_to_f32(
+        ((index & 1u) == 0u) ? (packed & 0xffffu) : (packed >> 16u)
+    );
+}
+
+uint pack_fp8(fe4m3vec4 value) {
+    u8vec4 bits = floate4m3BitsToUintEXT(value);
+    return uint(bits.x)
+        | (uint(bits.y) << 8u)
+        | (uint(bits.z) << 16u)
+        | (uint(bits.w) << 24u);
+}
+
+void main() {
+    uint lane = gl_LocalInvocationID.x;
+    uint subgroup_lane = gl_SubgroupInvocationID;
+    uint batch_start = gl_WorkGroupID.y * BATCH_TILE_WIDTH;
+
+    float sum_squares[BATCH_TILE_WIDTH];
+    for (uint batch_lane = 0u; batch_lane < BATCH_TILE_WIDTH; batch_lane++) {
+        sum_squares[batch_lane] = 0.0;
+    }
+    for (uint index = lane; index < HIDDEN_SIZE; index += gl_WorkGroupSize.x) {
+        for (uint batch_lane = 0u; batch_lane < BATCH_TILE_WIDTH; batch_lane++) {
+            uint batch_index = batch_start + batch_lane;
+            if (batch_index < batch_control.batch_width) {
+                float value = read_input(batch_index, index);
+                sum_squares[batch_lane] = fma(
+                    value,
+                    value,
+                    sum_squares[batch_lane]
+                );
+            }
+        }
+    }
+    for (uint batch_lane = 0u; batch_lane < BATCH_TILE_WIDTH; batch_lane++) {
+        sum_squares[batch_lane] = subgroupAdd(sum_squares[batch_lane]);
+        if (subgroup_lane == 0u) {
+            subgroup_sums[batch_lane][gl_SubgroupID] =
+                sum_squares[batch_lane];
+        }
+    }
+    barrier();
+
+    float inv_rms[BATCH_TILE_WIDTH];
+    for (uint batch_lane = 0u; batch_lane < BATCH_TILE_WIDTH; batch_lane++) {
+        float total = 0.0;
+        for (uint subgroup = 0u; subgroup < gl_NumSubgroups; subgroup++) {
+            total += subgroup_sums[batch_lane][subgroup];
+        }
+        inv_rms[batch_lane] =
+            inversesqrt((total / float(HIDDEN_SIZE)) + NORM_EPS);
+    }
+
+    uint representation_count = BATCH_TILE_WIDTH * BLOCK_COUNT;
+    for (
+        uint task = gl_SubgroupID;
+        task < representation_count;
+        task += gl_NumSubgroups
+    ) {
+        uint batch_lane = task / BLOCK_COUNT;
+        uint block = task % BLOCK_COUNT;
+        uint batch_index = batch_start + batch_lane;
+        bool valid_batch_lane = batch_index < batch_control.batch_width;
+        vec4 rounded = vec4(0.0);
+        uint output_lo = 0u;
+        uint output_hi = 0u;
+        if (valid_batch_lane && subgroup_lane < FP8_WORDS_PER_BLOCK) {
+            uint column = block * BLOCK_COLUMNS + subgroup_lane * 4u;
+            uint rounded_bits[4];
+            for (uint element = 0u; element < 4u; element++) {
+                uint index = column + element;
+                float normalized =
+                    read_input(batch_index, index)
+                    * inv_rms[batch_lane]
+                    * (read_weight(index) + WEIGHT_OFFSET);
+                rounded_bits[element] = f32_to_bf16(normalized);
+                rounded[element] = bf16_to_f32(rounded_bits[element]);
+            }
+            output_lo = rounded_bits[0] | (rounded_bits[1] << 16u);
+            output_hi = rounded_bits[2] | (rounded_bits[3] << 16u);
+        }
+        float lane_max = max(
+            max(abs(rounded.x), abs(rounded.y)),
+            max(abs(rounded.z), abs(rounded.w))
+        );
+        float block_max = subgroupMax(lane_max);
+        float block_scale = block_max > 0.0 ? block_max / 448.0 : 1.0;
+
+        if (valid_batch_lane && subgroup_lane == 0u) {
+            scales.values[batch_index * BLOCK_COUNT + block] = block_scale;
+        }
+        if (valid_batch_lane && subgroup_lane < FP8_WORDS_PER_BLOCK) {
+            uint word = block * FP8_WORDS_PER_BLOCK + subgroup_lane;
+            uint output_word = batch_index * FRAME_WORDS + word * 2u;
+            output_frames.words[output_word] = output_lo;
+            output_frames.words[output_word + 1u] = output_hi;
+            quantized_frames.words[
+                batch_index * FP8_FRAME_WORDS + word
+            ] = pack_fp8(fe4m3vec4(rounded / block_scale));
+        }
+    }
+}

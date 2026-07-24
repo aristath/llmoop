@@ -1561,6 +1561,29 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
             ("BATCH_TILE_WIDTH", "VOCAB_SIZE", "INPUT_SIZE", "OUTPUT_SCALE"),
         ),
         (
+            r"rms_norm_quantize_fp8_e4m3_b(\d+)_h(\d+)_"
+            r"eps([0-9eE+.-]+)_offset([0-9eE+.-]+)\.comp",
+            "rms_norm_quantize_fp8_e4m3.comp.template",
+            (
+                "BLOCK_COLUMNS",
+                "HIDDEN_SIZE",
+                "NORM_EPS",
+                "WEIGHT_OFFSET",
+            ),
+        ),
+        (
+            r"rms_norm_quantize_batch(\d+)_fp8_e4m3_b(\d+)_h(\d+)_"
+            r"eps([0-9eE+.-]+)_offset([0-9eE+.-]+)\.comp",
+            "rms_norm_quantize_batch_fp8_e4m3.comp.template",
+            (
+                "BATCH_TILE_WIDTH",
+                "BLOCK_COLUMNS",
+                "HIDDEN_SIZE",
+                "NORM_EPS",
+                "WEIGHT_OFFSET",
+            ),
+        ),
+        (
             r"rms_norm_bf16_h(\d+)_eps([0-9eE+.-]+)_offset([0-9eE+.-]+)\.comp",
             "rms_norm_bf16.comp.template",
             ("HIDDEN_SIZE", "NORM_EPS", "WEIGHT_OFFSET"),

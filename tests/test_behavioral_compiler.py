@@ -240,7 +240,7 @@ def test_exact_candidate_gate_proves_fp8_parallel_linear_parameter_pairs() -> No
                 "physical_input_contract": (
                     "bf16_blockwise_fp8_e4m3_f32_scale.v1"
                 ),
-                "physical_input_helper_id": (
+                "physical_input_provider_id": (
                     "q_projection__k_projection__quantize_input"
                 ),
                 "physical_logical_inputs": ["x"],
@@ -255,8 +255,62 @@ def test_exact_candidate_gate_proves_fp8_parallel_linear_parameter_pairs() -> No
 
     assert evidence["status"] == "passed"
     assert evidence["candidate_kind"] == "exact_reference"
-    assert evidence["physical_helper_count"] == 1
+    assert evidence["physical_representation_count"] == 1
     assert evidence["rewrites"][0]["proof_contract"] == "parallel_linear_exact_bf16.v1"
+
+
+def test_exact_candidate_gate_accepts_fused_physical_representation_provider() -> None:
+    source = {
+        "nodes": [
+            {
+                "id": "normalization",
+                "op": "rms_norm",
+                "inputs": ["hidden"],
+                "outputs": ["normalized"],
+                "params": ["norm_weight"],
+                "attrs": {"eps": 1e-6, "weight_offset": 1.0},
+            },
+            {
+                "id": "projection",
+                "op": "linear",
+                "inputs": ["normalized"],
+                "outputs": ["projected"],
+                "params": ["projection_weight", "projection_scale"],
+            },
+        ]
+    }
+    candidate = deepcopy(source)
+    quantized_outputs = ["normalized_fp8", "normalized_scale"]
+    candidate["nodes"][0]["outputs"].extend(quantized_outputs)
+    candidate["nodes"][0]["attrs"].update(
+        {
+            "output_element_bytes": [2, 1, 4],
+            "physical_output_representations": [
+                {
+                    "contract": "bf16_blockwise_fp8_e4m3_f32_scale.v1",
+                    "logical_signal": "normalized",
+                    "outputs": quantized_outputs,
+                    "consumer_node_ids": ["projection"],
+                    "element_count": 5120,
+                    "block_columns": 128,
+                }
+            ],
+        }
+    )
+    candidate["nodes"][1]["inputs"] = quantized_outputs
+    candidate["nodes"][1]["attrs"] = {
+        "output_element_bytes": [2],
+        "physical_input_contract": "bf16_blockwise_fp8_e4m3_f32_scale.v1",
+        "physical_input_provider_id": "normalization",
+        "physical_logical_inputs": ["normalized"],
+    }
+
+    evidence = prove_exact_circuit_candidate(
+        component_id="layer_00", source=source, candidate=candidate
+    )
+
+    assert evidence["status"] == "passed"
+    assert evidence["physical_representation_count"] == 1
 
 
 def test_exact_candidate_gate_rejects_dropped_source_behavior() -> None:

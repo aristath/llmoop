@@ -28,6 +28,28 @@ def shader_file_for_node(
             f"_h{int(node['attrs']['element_count'])}.comp"
         )
     if op == "rms_norm":
+        representations = node.get("attrs", {}).get(
+            "physical_output_representations"
+        )
+        if representations:
+            if (
+                len(representations) != 1
+                or representations[0].get("contract")
+                != "bf16_blockwise_fp8_e4m3_f32_scale.v1"
+                or representations[0].get("logical_signal")
+                != node.get("outputs", [None])[0]
+                or int(representations[0].get("element_count", 0)) != hidden_size
+                or int(representations[0].get("block_columns", 0)) != 128
+            ):
+                raise ModelCompileError(
+                    f"RMS normalization node {node['id']!r} has an invalid "
+                    "physical FP8 output representation"
+                )
+            return (
+                "rms_norm_quantize_fp8_e4m3_b128_"
+                f"h{hidden_size}_eps{shader_float_token(float(node['attrs']['eps']))}"
+                f"_offset{shader_float_token(float(node['attrs']['weight_offset']))}.comp"
+            )
         return rms_norm_shader_file(
             hidden_size,
             float(node["attrs"]["eps"]),
@@ -1037,6 +1059,8 @@ def local_size_x_for_node(node: Json) -> int:
 
 
 def local_size_x_for_shader_file(shader_file: str, node: Json) -> int:
+    if shader_file.startswith("rms_norm_quantize_"):
+        return 1024
     if shader_file.startswith("quantize_fp8_e4m3_"):
         return 32
     if "_prequant_fp8_e4m3_" in shader_file:

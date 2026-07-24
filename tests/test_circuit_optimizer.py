@@ -751,8 +751,78 @@ class VulkanCircuitOptimizerTest(unittest.TestCase):
         self.assertEqual(quantize["outputs"], wide["inputs"])
         self.assertEqual(quantize["outputs"], narrow["inputs"])
         self.assertEqual(
-            wide["attrs"]["physical_input_helper_id"],
-            narrow["attrs"]["physical_input_helper_id"],
+            wide["attrs"]["physical_input_provider_id"],
+            narrow["attrs"]["physical_input_provider_id"],
+        )
+
+    def test_fuses_reusable_fp8_representation_into_eligible_producer(self) -> None:
+        circuit = {
+            "nodes": [
+                {
+                    "id": "normalization",
+                    "op": "rms_norm",
+                    "inputs": ["hidden"],
+                    "outputs": ["normalized"],
+                    "params": ["weight"],
+                    "attrs": {"eps": 1e-6, "weight_offset": 1.0},
+                },
+                {
+                    "id": "projection",
+                    "op": "linear",
+                    "inputs": ["normalized"],
+                    "outputs": ["projected"],
+                    "params": ["projection_weight", "projection_scale"],
+                },
+            ]
+        }
+
+        optimized = optimize_circuit_for_vulkan(
+            circuit,
+            fp8_prequantization_spec=lambda node: (
+                {
+                    "input_size": 5120,
+                    "block_rows": 128,
+                    "block_columns": 128,
+                }
+                if node["id"] == "projection"
+                else None
+            ),
+            can_emit_fp8_representation=lambda producer, _scope: (
+                producer["op"] == "rms_norm"
+            ),
+        )
+
+        self.assertEqual(2, len(optimized["nodes"]))
+        normalization, projection = optimized["nodes"]
+        self.assertEqual(
+            [
+                "normalized",
+                "projection__input_fp8_e4m3",
+                "projection__input_scale_f32",
+            ],
+            normalization["outputs"],
+        )
+        self.assertEqual([2, 1, 4], normalization["attrs"]["output_element_bytes"])
+        self.assertEqual(
+            [
+                {
+                    "contract": "bf16_blockwise_fp8_e4m3_f32_scale.v1",
+                    "logical_signal": "normalized",
+                    "outputs": [
+                        "projection__input_fp8_e4m3",
+                        "projection__input_scale_f32",
+                    ],
+                    "consumer_node_ids": ["projection"],
+                    "element_count": 5120,
+                    "block_columns": 128,
+                }
+            ],
+            normalization["attrs"]["physical_output_representations"],
+        )
+        self.assertEqual(normalization["outputs"][1:], projection["inputs"])
+        self.assertEqual(
+            "normalization",
+            projection["attrs"]["physical_input_provider_id"],
         )
 
     def test_does_not_fuse_linears_with_different_inputs(self) -> None:
