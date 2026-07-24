@@ -27,55 +27,7 @@ context/output limits, or benchmark-only shortcuts.
 
 ## Remaining work, in priority order
 
-### 1. Build genuinely optimized shape- and dtype-specific kernel families
-
-Kernel selection exists, but important paths still use generic or matvec-shaped
-work where the workload calls for a different implementation. On a clean
-Qwen3.6-27B-FP8 package, the current runtime produced 14.519 decode tokens/second
-on the first measured turn before a later turn exposed the separate stochastic
-correctness failure tracked in the final gate. This remains below the 20
-tokens/second minimum.
-
-#### Decode
-
-- Fuse operations within a logical component where doing so removes intermediate
-  traffic or dispatches without erasing the component boundary.
-- Quantize an activation once per reusable scope instead of repeating activation
-  quantization for every output tile.
-- Reduce dispatch count in component hot paths; large Qwen components currently
-  produce hundreds of primary kernel dispatches per tick.
-- Preserve enough independent workgroups to saturate the selected device when
-  reducing dispatches. Collapsing each 17,408-wide FFN from 1,088 workgroups to
-  136 removed all 64 standalone quantization kernels but regressed the same
-  single-device warmup from 19.641 to 18.590 decode tokens/second; dispatch
-  elimination is not a win when it serializes output-row work.
-- Add a native tiled/dot-product path for large BF16 projections, especially the
-  output projection, without converting the stored BF16 weights.
-- Evaluate fusing final projection, candidate reduction, and sampling where that
-  preserves exact runtime semantics.
-- Optimize attention and state-update kernels for increasing context length and
-  remove avoidable serial reduction/softmax regions.
-
-#### Prefill
-
-- Implement true FP8 cooperative-matrix or tiled matrix-matrix kernels rather
-  than executing prefill as repeated FP8 matrix-vector work.
-- Add corresponding optimized BF16 and INT4 prefill families where the device
-  supports them.
-- Implement causal batched state updates for attention, recurrent, Mamba, and
-  convolutional components.
-
-#### Compilation and selection
-
-- Compile kernel variants from operation shape, source dtype, and required device
-  features—not model names.
-- Preserve a model's native dtype whenever the selected device supports it.
-- Select variants at runtime from shape, batch width, context state, and actual
-  device capabilities.
-- Maintain correctness tests and representative microbenchmarks for every
-  optimized family.
-
-### 2. Replace fixed one-component submission quanta with calibrated work quanta
+### 1. Replace fixed one-component submission quanta with calibrated work quanta
 
 The current conservative submission boundary avoids long graphics-ring jobs but
 leaves substantial scheduling and submission overhead.
@@ -94,7 +46,7 @@ leaves substantial scheduling and submission overhead.
   work near zero, but a 1,908-tick real conversation turn still incurred 1,391
   fence waits and 1,492 queue-batch submissions.
 
-### 3. Execute scheduler batches as real multi-stream Vulkan work
+### 2. Execute scheduler batches as real multi-stream Vulkan work
 
 The scheduler can form compatible batches, but the Vulkan batch executor still
 processes their activations sequentially.
@@ -106,7 +58,7 @@ processes their activations sequentially.
   and fairness while the model remains mounted.
 - Avoid increasing single-stream latency merely to report a wider logical batch.
 
-### 4. Finish physical block-managed transient state
+### 3. Finish physical block-managed transient state
 
 The backend-neutral allocator and logical state tables exist, but resident state
 storage is still fundamentally flat and host offsets remain in the execution
@@ -122,7 +74,7 @@ path.
   component-owned state through the same abstraction.
 - Remove flat resident buffers as the authoritative state model.
 
-### 5. Wire prefix/state reuse into normal stream admission
+### 4. Wire prefix/state reuse into normal stream admission
 
 Prefix-state primitives exist, but normal chat does not automatically use them.
 
@@ -136,7 +88,7 @@ Prefix-state primitives exist, but normal chat does not automatically use them.
 - Report hits, misses, reused tokens, saved prefill work, and eviction behavior.
 - Validate reuse with real multi-turn and branched conversations.
 
-### 6. Define canonical runtime graph identity and reusable execution templates
+### 5. Define canonical runtime graph identity and reusable execution templates
 
 Execution-class compatibility, prefix reuse, and command/template reuse need one
 precise graph identity.
@@ -159,7 +111,7 @@ precise graph identity.
   rebased without giving independently recorded templates stale relative
   offsets.
 
-### 7. Make cross-device execution efficient without making it mandatory
+### 6. Make cross-device execution efficient without making it mandatory
 
 Everything may run on one device. Multi-device execution should become useful
 when requested by placement or required by model size.
@@ -179,8 +131,14 @@ when requested by placement or required by model size.
 - Report transfer route, bytes, waits, and overlap per graph edge.
 - Compare single-device and necessary multi-device placements; do not force extra
   devices into benchmarks.
+- Isolate the approximately 3.5-token/second decode loss observed when the
+  27B-FP8 stream moved from a fitting single-device context to the required
+  two-device 64K placement. The first two valid seed-1 measured turns decoded at
+  15.951 and 16.715 tokens/second, versus approximately 19.66 tokens/second in
+  the prior single-device run; repeat under matched context and conversation
+  conditions before attributing the entire difference to transport.
 
-### 8. Complete route-native MoE execution
+### 7. Complete route-native MoE execution
 
 Sparse components and selected-route kernels exist, but routing is not yet a
 fully optimized runtime signal path.
@@ -195,7 +153,7 @@ fully optimized runtime signal path.
 - Make the 35B MoE model's performance reflect its active parameter count rather
   than its full declared size.
 
-### 9. Integrate MTP into the steady-state scheduler and device loop
+### 8. Integrate MTP into the steady-state scheduler and device loop
 
 MTP compilation and transactional verification work, but speculative execution
 is not yet part of the optimized steady-state path.
@@ -211,19 +169,23 @@ is not yet part of the optimized steady-state path.
 - Enable MTP by default only where warmed, realistic workloads show a net
   improvement.
 
-### 10. Finish long-context prefill and mixed-workload scheduling
+### 9. Finish long-context prefill and mixed-workload scheduling
 
 - Interleave prefill and decode fairly under memory pressure.
 - Derive prefill chunk size from available memory, device execution limits, and
   selected kernel shape.
 - Batch compatible prefill work across streams.
+- Parallelize the stable online attention softmax and value reduction as context
+  grows. The current 256-wide attention-head kernel still executes tile score,
+  exponential, and carry updates through a serial lane-zero region; preserve
+  numerically stable online semantics while distributing that work.
 - Preallocate, reclaim, and compact physical state pages safely around long
   prompts.
 - Validate 64K/128K context and long agentic outputs without arbitrary low token
   limits.
 - Report prefill and decode throughput separately by default.
 
-### 11. Maintain adversarial correctness and performance gates
+### 10. Maintain adversarial correctness and performance gates
 
 Every meaningful compiler, runtime, state, graph, or kernel change must be tested
 against the supported model set rather than optimized around one model.
@@ -266,9 +228,13 @@ Performance runs must:
 - Make fixed-seed sampling and execution reproducible. A fresh seed-1 package
   whose tensors, shaders, and executable artifacts were byte-identical to the
   earlier successful package entered an unbounded emoji loop on the second
-  measured turn. Fail the gate on repeated final segments, malformed thinking
-  boundaries, turn contamination, or failure to terminate after a valid answer;
-  generating some meaningful text is insufficient.
+  measured turn. In the post-kernel-family review, seed 0 answered the Corinth
+  turn with the preceding Athens answer and then repeated indefinitely on the
+  next turn; seed 1 produced a correct Athens turn but repeated city names for
+  hundreds of tokens while answering Corinth. Fail the gate on repeated final
+  segments, malformed thinking boundaries, turn contamination, or failure to
+  terminate after a valid answer; generating some meaningful text is
+  insufficient.
 - Make the structural Rust test gate self-contained. It currently panics when a
   deleted external 230M lowered-model fixture is absent; tests must use a
   checked-in or deterministically generated fixture, or skip with an explicit
