@@ -175,7 +175,7 @@ mod tests {
         ];
 
         assert_eq!(
-            preferred_compute_queue_family_indices(queue_families),
+            preferred_compute_queue_family_indices(&queue_families),
             vec![1, 0]
         );
     }
@@ -188,7 +188,7 @@ mod tests {
         ];
 
         assert_eq!(
-            preferred_compute_queue_family_indices(queue_families),
+            preferred_compute_queue_family_indices(&queue_families),
             vec![1]
         );
     }
@@ -201,7 +201,7 @@ mod tests {
         ];
 
         assert_eq!(
-            preferred_compute_queue_family_indices(queue_families),
+            preferred_compute_queue_family_indices(&queue_families),
             vec![1]
         );
     }

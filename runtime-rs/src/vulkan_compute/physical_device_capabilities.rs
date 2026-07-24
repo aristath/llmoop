@@ -114,15 +114,13 @@ unsafe fn select_compute_device_index(
         let properties = unsafe { instance.get_physical_device_properties(*physical_device) };
         let queue_families =
             unsafe { instance.get_physical_device_queue_family_properties(*physical_device) };
-        for family in queue_families {
-            if family.queue_flags.contains(vk::QueueFlags::COMPUTE) {
-                if properties.device_type == vk::PhysicalDeviceType::DISCRETE_GPU
-                    || properties.device_type == vk::PhysicalDeviceType::INTEGRATED_GPU
-                {
-                    return Some(physical_device_index);
-                }
-                fallback.get_or_insert(physical_device_index);
+        if !preferred_compute_queue_family_indices(&queue_families).is_empty() {
+            if properties.device_type == vk::PhysicalDeviceType::DISCRETE_GPU
+                || properties.device_type == vk::PhysicalDeviceType::INTEGRATED_GPU
+            {
+                return Some(physical_device_index);
             }
+            fallback.get_or_insert(physical_device_index);
         }
     }
     fallback
@@ -735,13 +733,14 @@ unsafe fn compute_queue_family_indices(
     instance: &ash::Instance,
     physical_device: vk::PhysicalDevice,
 ) -> Vec<u32> {
-    preferred_compute_queue_family_indices(unsafe {
+    let queue_families = unsafe {
         instance.get_physical_device_queue_family_properties(physical_device)
-    })
+    };
+    preferred_compute_queue_family_indices(&queue_families)
 }
 
 fn preferred_compute_queue_family_indices(
-    queue_families: Vec<vk::QueueFamilyProperties>,
+    queue_families: &[vk::QueueFamilyProperties],
 ) -> Vec<u32> {
     let mut indices = queue_families
         .iter()
