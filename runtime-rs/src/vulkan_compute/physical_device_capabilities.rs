@@ -244,6 +244,7 @@ fn vulkan_shader_feature_for_spirv_capability(capability: u32) -> Option<VulkanS
         5118 => VulkanShaderFeature::ShaderBfloat16CooperativeMatrix,
         6018 => VulkanShaderFeature::ShaderIntegerDotProduct,
         6019 => VulkanShaderFeature::ShaderIntegerDotProduct,
+        6914 => VulkanShaderFeature::ShaderMixedFloatDotProductBfloat16Acc,
         6915 => VulkanShaderFeature::ShaderMixedFloatDotProductFloat8AccFloat32,
         5345 => VulkanShaderFeature::VulkanMemoryModel,
         5346 => VulkanShaderFeature::VulkanMemoryModelDeviceScope,
@@ -542,6 +543,9 @@ fn physical_device_supported_shader_features(
     )? {
         let mixed =
             physical_device_shader_mixed_float_dot_product_support(instance, physical_device);
+        if mixed.shader_bfloat16_acc {
+            supported.insert(VulkanShaderFeature::ShaderMixedFloatDotProductBfloat16Acc);
+        }
         if mixed.shader_float8_acc_float32 {
             supported.insert(
                 VulkanShaderFeature::ShaderMixedFloatDotProductFloat8AccFloat32,
@@ -602,6 +606,7 @@ fn physical_device_shader_mixed_float_dot_product_support(
         instance.get_physical_device_features2(physical_device, &mut features);
     }
     VulkanShaderMixedFloatDotProductSupport {
+        shader_bfloat16_acc: mixed_float_dot_product.shader_bfloat16_acc == vk::TRUE,
         shader_float8_acc_float32: mixed_float_dot_product.shader_float8_acc_float32 == vk::TRUE,
     }
 }

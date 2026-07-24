@@ -156,6 +156,8 @@ impl VulkanComputeDeviceCatalog {
                     .contains(&VulkanShaderFeature::ShaderBfloat16CooperativeMatrix),
             };
             let mixed_float_dot_product_support = VulkanShaderMixedFloatDotProductSupport {
+                shader_bfloat16_acc: enabled_shader_features
+                    .contains(&VulkanShaderFeature::ShaderMixedFloatDotProductBfloat16Acc),
                 shader_float8_acc_float32: enabled_shader_features.contains(
                     &VulkanShaderFeature::ShaderMixedFloatDotProductFloat8AccFloat32,
                 ),
@@ -324,8 +326,13 @@ impl VulkanComputeDeviceCatalog {
                 enabled_device_extensions
                     .insert(VK_KHR_SHADER_BFLOAT16_NAME.to_string_lossy().into_owned());
             }
-            if mixed_float_dot_product_support.shader_float8_acc_float32 {
-                mixed_float_dot_product_features.shader_float8_acc_float32 = vk::TRUE;
+            if mixed_float_dot_product_support.shader_bfloat16_acc
+                || mixed_float_dot_product_support.shader_float8_acc_float32
+            {
+                mixed_float_dot_product_features.shader_bfloat16_acc =
+                    bool32(mixed_float_dot_product_support.shader_bfloat16_acc);
+                mixed_float_dot_product_features.shader_float8_acc_float32 =
+                    bool32(mixed_float_dot_product_support.shader_float8_acc_float32);
                 extension_names.push(VK_VALVE_SHADER_MIXED_FLOAT_DOT_PRODUCT_NAME.as_ptr());
                 enabled_device_extensions.insert(
                     VK_VALVE_SHADER_MIXED_FLOAT_DOT_PRODUCT_NAME
@@ -362,7 +369,9 @@ impl VulkanComputeDeviceCatalog {
                 shader_bfloat16_features.p_next = device_info.p_next.cast_mut();
                 device_info.p_next = std::ptr::from_ref(&shader_bfloat16_features).cast();
             }
-            if mixed_float_dot_product_support.shader_float8_acc_float32 {
+            if mixed_float_dot_product_support.shader_bfloat16_acc
+                || mixed_float_dot_product_support.shader_float8_acc_float32
+            {
                 mixed_float_dot_product_features.p_next = device_info.p_next.cast_mut();
                 device_info.p_next = std::ptr::from_ref(&mixed_float_dot_product_features).cast();
             }

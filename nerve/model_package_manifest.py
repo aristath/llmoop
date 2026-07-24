@@ -320,13 +320,24 @@ def build_vulkan_resident_package_manifest(
         ) // projection_tile_rows
         projection_local_size_x = 1024
     else:
+        target_devices = compiler_target.get("devices", [])
+        use_bf16_dot2 = bool(target_devices) and all(
+            "shader_mixed_float_dot_product_bfloat16_acc"
+            in device.get("shader_features", [])
+            for device in target_devices
+        )
+        projection_prefix = (
+            "tied_output_projection_dot2"
+            if use_bf16_dot2
+            else "tied_output_projection"
+        )
         projection_shader_file = (
-            f"tied_output_projection_bf16_{vocab_size}x{hidden_size}"
+            f"{projection_prefix}_bf16_{vocab_size}x{hidden_size}"
             f"_scale{shader_float_token(output_scale)}_to_f32.comp"
         )
         projection_batch_lane_tile_width = 4
         projection_batch_shader_file = (
-            f"tied_output_projection_batch{projection_batch_lane_tile_width}_bf16_"
+            f"{projection_prefix}_batch{projection_batch_lane_tile_width}_bf16_"
             f"{vocab_size}x{hidden_size}_scale{shader_float_token(output_scale)}_to_f32.comp"
         )
         # The BF16 projection shader collaboratively computes two vocabulary

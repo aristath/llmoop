@@ -357,6 +357,21 @@ mod tests {
     }
 
     #[test]
+    fn spirv_contract_extracts_native_bfloat16_mixed_dot_product_feature() {
+        let words = spirv_test_module(&[1, 5116, 6914], 1);
+
+        let requirements = vulkan_spirv_requirements(&words).unwrap();
+
+        assert_eq!(
+            requirements.shader_features,
+            BTreeSet::from([
+                VulkanShaderFeature::ShaderBfloat16Type,
+                VulkanShaderFeature::ShaderMixedFloatDotProductBfloat16Acc,
+            ])
+        );
+    }
+
+    #[test]
     fn spirv_contract_extracts_native_integer_dot_product_feature() {
         let words = spirv_test_module(&[1, 39, 6018, 6019], 1);
 

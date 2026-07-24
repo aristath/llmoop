@@ -88,6 +88,7 @@ SPIRV_CAPABILITY_VULKAN_FEATURE_REQUIREMENTS = {
     5116: "shader_bfloat16_type",
     5117: "shader_bfloat16_dot_product",
     5118: "shader_bfloat16_cooperative_matrix",
+    6914: "shader_mixed_float_dot_product_bfloat16_acc",
     6018: "shader_integer_dot_product",
     6019: "shader_integer_dot_product",
     6915: "shader_mixed_float_dot_product_float8_acc_float32",

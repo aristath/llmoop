@@ -67,6 +67,36 @@ def test_compiler_renders_fp8_output_projection_shaders(tmp_path: Path) -> None:
     assert "batch_index * VOCAB_SIZE + row" in batch
 
 
+def test_compiler_renders_native_bf16_dot2_output_projection_shaders(
+    tmp_path: Path,
+) -> None:
+    shader_source_dir = Path(__file__).parents[1] / "runtime-rs" / "shaders"
+    shader_files = {
+        "tied_output_projection_dot2_bf16_248320x5120_scale1_to_f32.comp",
+        "tied_output_projection_dot2_batch4_bf16_248320x5120_scale1_to_f32.comp",
+    }
+
+    copy_shader_templates(shader_source_dir, tmp_path, shader_files)
+
+    decode = (
+        tmp_path
+        / "tied_output_projection_dot2_bf16_248320x5120_scale1_to_f32.comp"
+    ).read_text()
+    batch = (
+        tmp_path
+        / "tied_output_projection_dot2_batch4_bf16_248320x5120_scale1_to_f32.comp"
+    ).read_text()
+    for source in (decode, batch):
+        assert "SPV_VALVE_mixed_float_dot_product" in source
+        assert "capabilities = [6914]" in source
+        assert "bf16_dot2_acc32" in source
+        assert "bf16vec2 values[]" in source
+        assert "const uint INPUT_PAIRS = INPUT_SIZE / 2u;" in source
+        assert "{{" not in source
+    assert "layout(push_constant) uniform BatchControl" not in decode
+    assert "layout(push_constant) uniform BatchControl" in batch
+
+
 def test_compiler_renders_reusable_fp8_activation_kernel_family(
     tmp_path: Path,
 ) -> None:

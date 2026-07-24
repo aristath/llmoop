@@ -1,0 +1,99 @@
+#version 460
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_bfloat16 : require
+#extension GL_EXT_spirv_intrinsics : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+spirv_instruction(
+    extensions = ["SPV_VALVE_mixed_float_dot_product"],
+    capabilities = [6914],
+    id = 6916
+)
+float bf16_dot2_acc32(bf16vec2 a, bf16vec2 b, float accumulator);
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer NormalizedFrame {
+    bf16vec2 values[];
+} normalized_frame;
+layout(set = 0, binding = 1) readonly buffer EmbeddingWeight {
+    bf16vec2 values[];
+} embedding_weight;
+layout(set = 0, binding = 2) buffer Logits {
+    float values[];
+} logits;
+
+const uint INPUT_SIZE = {{INPUT_SIZE}}u;
+const uint VOCAB_SIZE = {{VOCAB_SIZE}}u;
+const uint INPUT_PAIRS = INPUT_SIZE / 2u;
+const uint OUTPUT_PAIRS = (VOCAB_SIZE + 1u) / 2u;
+const float OUTPUT_SCALE = {{OUTPUT_SCALE}};
+
+shared float subgroup_lo[64];
+shared float subgroup_hi[64];
+
+void store_result(uint lo_row, uint hi_row, float lo_sum, float hi_sum) {
+    logits.values[lo_row] = lo_sum * OUTPUT_SCALE;
+    if (hi_row < VOCAB_SIZE) {
+        logits.values[hi_row] = hi_sum * OUTPUT_SCALE;
+    }
+}
+
+void main() {
+    uint output_pair = gl_WorkGroupID.x;
+    uint lane = gl_LocalInvocationID.x;
+    uint lo_row = output_pair * 2u;
+    uint hi_row = lo_row + 1u;
+    uint lo_weight_offset = lo_row * INPUT_PAIRS;
+    uint hi_weight_offset = hi_row * INPUT_PAIRS;
+
+    float lo_sum = 0.0;
+    float hi_sum = 0.0;
+    if (output_pair < OUTPUT_PAIRS) {
+        for (
+            uint column_pair = lane;
+            column_pair < INPUT_PAIRS;
+            column_pair += gl_WorkGroupSize.x
+        ) {
+            bf16vec2 input_pair = normalized_frame.values[column_pair];
+            lo_sum = bf16_dot2_acc32(
+                input_pair,
+                embedding_weight.values[lo_weight_offset + column_pair],
+                lo_sum
+            );
+            if (hi_row < VOCAB_SIZE) {
+                hi_sum = bf16_dot2_acc32(
+                    input_pair,
+                    embedding_weight.values[hi_weight_offset + column_pair],
+                    hi_sum
+                );
+            }
+        }
+    }
+
+    lo_sum = subgroupAdd(lo_sum);
+    hi_sum = subgroupAdd(hi_sum);
+    if (gl_NumSubgroups == 1u) {
+        if (gl_SubgroupInvocationID == 0u && output_pair < OUTPUT_PAIRS) {
+            store_result(lo_row, hi_row, lo_sum, hi_sum);
+        }
+        return;
+    }
+    if (gl_SubgroupInvocationID == 0u) {
+        subgroup_lo[gl_SubgroupID] = lo_sum;
+        subgroup_hi[gl_SubgroupID] = hi_sum;
+    }
+    barrier();
+    if (lane == 0u && output_pair < OUTPUT_PAIRS) {
+        float lo_total = 0.0;
+        float hi_total = 0.0;
+        for (uint subgroup = 0u; subgroup < gl_NumSubgroups; subgroup++) {
+            lo_total += subgroup_lo[subgroup];
+            hi_total += subgroup_hi[subgroup];
+        }
+        store_result(lo_row, hi_row, lo_total, hi_total);
+    }
+}

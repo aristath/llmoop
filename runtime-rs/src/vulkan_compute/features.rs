@@ -55,6 +55,7 @@ pub enum VulkanShaderFeature {
     ShaderBfloat16Type,
     ShaderBfloat16DotProduct,
     ShaderBfloat16CooperativeMatrix,
+    ShaderMixedFloatDotProductBfloat16Acc,
     ShaderMixedFloatDotProductFloat8AccFloat32,
     VulkanMemoryModel,
     VulkanMemoryModelDeviceScope,
@@ -123,6 +124,9 @@ impl VulkanShaderFeature {
             Self::ShaderBfloat16Type => "shader_bfloat16_type",
             Self::ShaderBfloat16DotProduct => "shader_bfloat16_dot_product",
             Self::ShaderBfloat16CooperativeMatrix => "shader_bfloat16_cooperative_matrix",
+            Self::ShaderMixedFloatDotProductBfloat16Acc => {
+                "shader_mixed_float_dot_product_bfloat16_acc"
+            }
             Self::ShaderMixedFloatDotProductFloat8AccFloat32 => {
                 "shader_mixed_float_dot_product_float8_acc_float32"
             }
@@ -164,6 +168,7 @@ struct VulkanShaderBfloat16Support {
 
 #[derive(Clone, Copy, Debug, Default)]
 struct VulkanShaderMixedFloatDotProductSupport {
+    shader_bfloat16_acc: bool,
     shader_float8_acc_float32: bool,
 }
 
