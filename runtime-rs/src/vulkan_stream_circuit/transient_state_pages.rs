@@ -265,6 +265,7 @@ mod transient_state_page_tests {
             block_id: TransientStateBlockId(block),
             block_activation_offset,
             block_activation_capacity: 64,
+            allocated_block: false,
             copy_from_block_id: None,
         }
     }

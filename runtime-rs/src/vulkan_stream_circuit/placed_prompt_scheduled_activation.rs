@@ -148,7 +148,8 @@ impl VulkanResidentInProcessPlacedPromptStream {
                 generated_token_ids.clone(),
                 completed_input_run.is_none(),
             )
-        };
+        }
+        .with_processed_state_activations(1);
         Ok(
             VulkanResidentInProcessPlacedPromptStreamScheduledActivationRun {
                 activation_id: prepared.activation_id,
@@ -350,16 +351,22 @@ impl VulkanResidentInProcessPlacedPromptStream {
             completed_input_run = self.close_scheduled_loop_if_exhausted()?;
         }
 
+        let next_stream_tick = self.next_stream_tick();
+        let processed_state_activation_count = next_stream_tick
+            .checked_sub(pending.start_stream_tick)
+            .and_then(|count| usize::try_from(count).ok())
+            .ok_or(VulkanResidentInProcessPlacedRuntimeError::StreamTickOverflow)?;
         let outcome = RuntimeStreamActivationOutcome::generated_tokens(
             pending.generated_token_ids.clone(),
             completed_input_run.is_none(),
-        );
+        )
+        .with_processed_state_activations(processed_state_activation_count);
         Ok(Some(
             VulkanResidentInProcessPlacedPromptStreamScheduledActivationRun {
                 activation_id: pending.activation_id,
                 input_event_id: pending.input_event_id,
                 start_stream_tick: pending.start_stream_tick,
-                next_stream_tick: self.next_stream_tick(),
+                next_stream_tick,
                 state_bindings: pending.state_bindings,
                 output_events: pending.output_events,
                 generated_token_ids: pending.generated_token_ids,
@@ -424,6 +431,11 @@ impl VulkanResidentInProcessPlacedPromptStream {
                 )?,
         };
 
+        let next_stream_tick = self.next_stream_tick();
+        let processed_state_activation_count = next_stream_tick
+            .checked_sub(start_stream_tick)
+            .and_then(|count| usize::try_from(count).ok())
+            .ok_or(VulkanResidentInProcessPlacedRuntimeError::StreamTickOverflow)?;
         let outcome = if matches!(activation.kind, RuntimeStreamActivationKind::PrefillChunk { .. })
             && generated_token_ids.is_empty()
         {
@@ -433,14 +445,15 @@ impl VulkanResidentInProcessPlacedPromptStream {
                 generated_token_ids.clone(),
                 completed_input_run.is_none(),
             )
-        };
+        }
+        .with_processed_state_activations(processed_state_activation_count);
 
         Ok(
             VulkanResidentInProcessPlacedPromptStreamScheduledActivationRun {
                 activation_id: activation.id,
                 input_event_id: activation.input_event_id.clone(),
                 start_stream_tick,
-                next_stream_tick: self.next_stream_tick(),
+                next_stream_tick,
                 state_bindings,
                 output_events,
                 generated_token_ids,

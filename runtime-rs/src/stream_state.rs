@@ -92,6 +92,7 @@ pub struct TransientStateSlot {
     pub block_id: TransientStateBlockId,
     pub block_activation_offset: usize,
     pub block_activation_capacity: usize,
+    pub allocated_block: bool,
     pub copy_from_block_id: Option<TransientStateBlockId>,
 }
 
@@ -339,15 +340,18 @@ impl TransientStateTable {
             let block_activation_offset =
                 resident_activation_index % entry.shape.activation_capacity;
             let mut copy_from_block_id = None;
+            let mut allocated_block = false;
             if logical_page_index == entry.block_ids.len() {
                 let block_id = arena.allocate_block(entry.shape.clone())?;
                 entry.block_ids.push(block_id);
+                allocated_block = true;
             } else {
                 let block_id = entry.block_ids[logical_page_index];
                 if arena.ref_count(block_id)? > 1 {
                     let replacement = arena.allocate_block(entry.shape.clone())?;
                     arena.release_block(block_id)?;
                     entry.block_ids[logical_page_index] = replacement;
+                    allocated_block = true;
                     copy_from_block_id = Some(block_id);
                 }
             }
@@ -359,11 +363,83 @@ impl TransientStateTable {
                 block_id,
                 block_activation_offset,
                 block_activation_capacity: entry.shape.activation_capacity,
+                allocated_block,
                 copy_from_block_id,
             });
-            entry.logical_activation_count = entry.logical_activation_count.saturating_add(1);
+            entry.logical_activation_count = entry
+                .logical_activation_count
+                .checked_add(1)
+                .ok_or_else(|| {
+                    TransientStateError(
+                        "transient state logical activation count overflow".to_string(),
+                    )
+                })?;
         }
         Ok(slots)
+    }
+
+    pub fn rollback_slots(
+        &mut self,
+        arena: &mut TransientStateArena,
+        key: &TransientStateKey,
+        slots: &[TransientStateSlot],
+    ) -> Result<(), TransientStateError> {
+        if slots.is_empty() {
+            return Ok(());
+        }
+        let entry = self.entry_mut(key)?;
+        if entry.shape.retention == TransientStateRetention::MutableSingleton {
+            return rollback_mutable_singleton(arena, key, entry, slots);
+        }
+        for slot in slots.iter().rev() {
+            let expected_logical_index =
+                entry
+                    .logical_activation_count
+                    .checked_sub(1)
+                    .ok_or_else(|| {
+                        TransientStateError(format!(
+                            "cannot roll back empty transient state {}.{}",
+                            key.node_instance_id, key.state_id
+                        ))
+                    })?;
+            if slot.key != *key || slot.logical_activation_index != expected_logical_index {
+                return Err(TransientStateError(format!(
+                    "transient state rollback for {}.{} is not the latest contiguous reservation",
+                    key.node_instance_id, key.state_id
+                )));
+            }
+            let resident_activation_index = entry
+                .shape
+                .maximum_activation_count
+                .map(|maximum| slot.logical_activation_index % maximum)
+                .unwrap_or(slot.logical_activation_index);
+            let logical_page_index = resident_activation_index / entry.shape.activation_capacity;
+            if entry.block_ids.get(logical_page_index).copied() != Some(slot.block_id) {
+                return Err(TransientStateError(format!(
+                    "transient state rollback for {}.{} no longer owns block {:?}",
+                    key.node_instance_id, key.state_id, slot.block_id
+                )));
+            }
+            if let Some(source_block_id) = slot.copy_from_block_id {
+                arena.retain_block(source_block_id)?;
+                arena.release_block(slot.block_id)?;
+                entry.block_ids[logical_page_index] = source_block_id;
+            }
+            entry.logical_activation_count = expected_logical_index;
+        }
+
+        let retained_activation_count = entry
+            .shape
+            .maximum_activation_count
+            .map(|maximum| entry.logical_activation_count.min(maximum))
+            .unwrap_or(entry.logical_activation_count);
+        let retained_page_count =
+            retained_activation_count.div_ceil(entry.shape.activation_capacity);
+        while entry.block_ids.len() > retained_page_count {
+            let block_id = entry.block_ids.pop().expect("excess state block exists");
+            arena.release_block(block_id)?;
+        }
+        Ok(())
     }
 
     pub fn reset_state(
@@ -527,11 +603,13 @@ fn reserve_mutable_singleton(
     entry: &mut TransientStateEntry,
 ) -> Result<Vec<TransientStateSlot>, TransientStateError> {
     let mut copy_from_block_id = None;
+    let mut allocated_block = false;
     let block_id = match entry.block_ids.first().copied() {
         Some(block_id) if arena.ref_count(block_id)? > 1 => {
             let replacement = arena.allocate_block(entry.shape.clone())?;
             arena.release_block(block_id)?;
             entry.block_ids[0] = replacement;
+            allocated_block = true;
             copy_from_block_id = Some(block_id);
             replacement
         }
@@ -540,6 +618,7 @@ fn reserve_mutable_singleton(
             let block_id = arena.allocate_block(entry.shape.clone())?;
             entry.block_ids.push(block_id);
             entry.logical_activation_count = 1;
+            allocated_block = true;
             block_id
         }
     };
@@ -549,8 +628,40 @@ fn reserve_mutable_singleton(
         block_id,
         block_activation_offset: 0,
         block_activation_capacity: 1,
+        allocated_block,
         copy_from_block_id,
     }])
+}
+
+fn rollback_mutable_singleton(
+    arena: &mut TransientStateArena,
+    key: &TransientStateKey,
+    entry: &mut TransientStateEntry,
+    slots: &[TransientStateSlot],
+) -> Result<(), TransientStateError> {
+    if slots.len() != 1 || slots[0].key != *key {
+        return Err(TransientStateError(format!(
+            "mutable singleton rollback for {}.{} requires its one reservation slot",
+            key.node_instance_id, key.state_id
+        )));
+    }
+    let slot = &slots[0];
+    if entry.block_ids.first().copied() != Some(slot.block_id) {
+        return Err(TransientStateError(format!(
+            "mutable singleton rollback for {}.{} no longer owns block {:?}",
+            key.node_instance_id, key.state_id, slot.block_id
+        )));
+    }
+    if let Some(source_block_id) = slot.copy_from_block_id {
+        arena.retain_block(source_block_id)?;
+        arena.release_block(slot.block_id)?;
+        entry.block_ids[0] = source_block_id;
+    } else if slot.allocated_block {
+        arena.release_block(slot.block_id)?;
+        entry.block_ids.clear();
+        entry.logical_activation_count = 0;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -717,6 +828,63 @@ mod tests {
         assert_eq!(parent.snapshot().entries[0].block_ids, vec![shared_block]);
         assert_eq!(arena.ref_count(shared_block).unwrap(), 1);
         assert_eq!(arena.ref_count(wrapped.block_id).unwrap(), 1);
+    }
+
+    #[test]
+    fn rollback_releases_unused_pages_but_keeps_committed_slots() {
+        let mut arena = TransientStateArena::new();
+        let mut table = TransientStateTable::new("stream").unwrap();
+        table.declare_state(key(), shape()).unwrap();
+        let slots = table.append_activations(&mut arena, &key(), 6).unwrap();
+
+        table
+            .rollback_slots(&mut arena, &key(), &slots[3..])
+            .unwrap();
+
+        let state = table.snapshot();
+        assert_eq!(state.logical_activation_count, 3);
+        assert_eq!(state.block_count, 1);
+        assert_eq!(state.entries[0].block_ids, vec![slots[0].block_id]);
+        assert_eq!(arena.snapshot().unwrap().live_block_count, 1);
+        assert_eq!(arena.snapshot().unwrap().free_block_count, 1);
+    }
+
+    #[test]
+    fn rollback_restores_a_shared_block_replaced_by_copy_on_write() {
+        let mut arena = TransientStateArena::new();
+        let mut parent = TransientStateTable::new("parent").unwrap();
+        parent.declare_state(key(), shape()).unwrap();
+        let shared_block = parent.append_activations(&mut arena, &key(), 3).unwrap()[0].block_id;
+        let mut child = parent.fork(&mut arena, "child").unwrap();
+        let slot = child.append_activations(&mut arena, &key(), 1).unwrap();
+
+        child.rollback_slots(&mut arena, &key(), &slot).unwrap();
+
+        assert_eq!(child.snapshot().logical_activation_count, 3);
+        assert_eq!(child.snapshot().entries[0].block_ids, vec![shared_block]);
+        assert_eq!(arena.ref_count(shared_block).unwrap(), 2);
+        assert_eq!(arena.snapshot().unwrap().live_block_count, 1);
+        assert_eq!(arena.snapshot().unwrap().free_block_count, 1);
+    }
+
+    #[test]
+    fn rollback_releases_a_new_mutable_singleton_reservation() {
+        let mut arena = TransientStateArena::new();
+        let mut table = TransientStateTable::new("stream").unwrap();
+        table
+            .declare_state(
+                key(),
+                TransientStateBlockShape::mutable_singleton(128).unwrap(),
+            )
+            .unwrap();
+        let slot = table.append_activations(&mut arena, &key(), 64).unwrap();
+
+        table.rollback_slots(&mut arena, &key(), &slot).unwrap();
+
+        assert_eq!(table.snapshot().logical_activation_count, 0);
+        assert_eq!(table.snapshot().block_count, 0);
+        assert_eq!(arena.snapshot().unwrap().live_block_count, 0);
+        assert_eq!(arena.snapshot().unwrap().free_block_count, 1);
     }
 
     #[test]

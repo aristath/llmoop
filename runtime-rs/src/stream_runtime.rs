@@ -82,6 +82,7 @@ pub struct RuntimeStreamActivation {
 pub struct RuntimeStreamActivationOutcome {
     pub generated_token_ids: Vec<u32>,
     pub continue_generation: bool,
+    pub processed_state_activation_count: Option<usize>,
 }
 
 impl RuntimeStreamActivationOutcome {
@@ -89,6 +90,7 @@ impl RuntimeStreamActivationOutcome {
         Self {
             generated_token_ids: Vec::new(),
             continue_generation: true,
+            processed_state_activation_count: None,
         }
     }
 
@@ -103,7 +105,13 @@ impl RuntimeStreamActivationOutcome {
         Self {
             generated_token_ids: token_ids.into_iter().collect(),
             continue_generation,
+            processed_state_activation_count: None,
         }
+    }
+
+    pub fn with_processed_state_activations(mut self, processed_count: usize) -> Self {
+        self.processed_state_activation_count = Some(processed_count);
+        self
     }
 }
 
@@ -727,8 +735,15 @@ impl RuntimeStreamScheduler {
             stream.current_event = None;
             stream.in_flight_activation_ids.clone()
         };
-        for activation_id in in_flight_ids {
-            self.in_flight.remove(&activation_id);
+        let in_flight_activations = in_flight_ids
+            .iter()
+            .filter_map(|activation_id| self.in_flight.get(activation_id).cloned())
+            .collect::<Vec<_>>();
+        for activation in &in_flight_activations {
+            self.rollback_unused_activation_state(activation, 0)?;
+        }
+        for activation in in_flight_activations {
+            self.in_flight.remove(&activation.id);
         }
         let snapshot = {
             let stream = self.streams.get_mut(stream_id).ok_or_else(|| {
@@ -999,9 +1014,20 @@ impl RuntimeStreamScheduler {
         activation_id: u64,
         outcome: RuntimeStreamActivationOutcome,
     ) -> Result<RuntimeStreamSnapshot, RuntimeStreamSchedulerError> {
-        let activation = self.in_flight.remove(&activation_id).ok_or_else(|| {
+        let activation = self.in_flight.get(&activation_id).cloned().ok_or_else(|| {
             RuntimeStreamSchedulerError(format!("unknown in-flight activation {activation_id}"))
         })?;
+        let reserved_state_activation_count = activation.kind.work_units();
+        let processed_state_activation_count = outcome
+            .processed_state_activation_count
+            .unwrap_or(reserved_state_activation_count);
+        if processed_state_activation_count > reserved_state_activation_count {
+            return Err(RuntimeStreamSchedulerError(format!(
+                "activation {activation_id} processed {processed_state_activation_count} state activations, exceeding its reservation of {reserved_state_activation_count}"
+            )));
+        }
+        self.rollback_unused_activation_state(&activation, processed_state_activation_count)?;
+        self.in_flight.remove(&activation_id);
         let stream_id = activation.stream_id.clone();
         let stream = self.stream_mut(&stream_id)?;
         stream
@@ -1126,6 +1152,27 @@ impl RuntimeStreamScheduler {
             self.activate_stream(&stream_id);
         }
         Ok(snapshot)
+    }
+
+    fn rollback_unused_activation_state(
+        &mut self,
+        activation: &RuntimeStreamActivation,
+        processed_state_activation_count: usize,
+    ) -> Result<(), RuntimeStreamSchedulerError> {
+        let arena = &mut self.transient_state_arena;
+        let stream = self.streams.get_mut(&activation.stream_id).ok_or_else(|| {
+            RuntimeStreamSchedulerError(format!("unknown stream {:?}", activation.stream_id))
+        })?;
+        for reservation in &activation.state_reservations {
+            let committed_slot_count =
+                processed_state_activation_count.min(reservation.slots.len());
+            stream.transient_state_table.rollback_slots(
+                arena,
+                &reservation.key,
+                &reservation.slots[committed_slot_count..],
+            )?;
+        }
+        Ok(())
     }
 
     pub fn snapshot(&self) -> RuntimeStreamSchedulerSnapshot {

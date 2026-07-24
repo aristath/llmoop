@@ -225,7 +225,7 @@ fn scheduler_reserves_transient_state_slots_for_prefill_and_decode() {
 }
 
 #[test]
-fn scheduler_interrupt_preserves_state_until_an_explicit_reset_reclaims_it() {
+fn scheduler_interrupt_rolls_back_unexecuted_reservations_and_preserves_committed_state() {
     let mut scheduler = RuntimeStreamScheduler::new();
     scheduler.add_stream("stream_a").unwrap();
     scheduler
@@ -237,14 +237,25 @@ fn scheduler_interrupt_preserves_state_until_an_explicit_reset_reclaims_it() {
             RuntimeStreamInputEvent::new("event_0", [1, 2], 8),
         )
         .unwrap();
-    let scheduled = scheduler.schedule_step(budget(1)).unwrap();
+    let prefill = scheduler.schedule_step(budget(1)).unwrap().activations[0].clone();
+    scheduler
+        .complete_activation(
+            prefill.id,
+            RuntimeStreamActivationOutcome::prefill_complete(),
+        )
+        .unwrap();
+    let scheduled = scheduler
+        .schedule_step(
+            RuntimeStreamSchedulerBudget::new(1, 2, 16).with_max_decode_tokens_per_activation(4),
+        )
+        .unwrap();
     assert_eq!(
         scheduled.activations[0].state_reservations[0].slots.len(),
-        2
+        4
     );
     assert_eq!(
         scheduler.snapshot().transient_state_arena.live_block_count,
-        1
+        3
     );
 
     let interrupted = scheduler.interrupt_stream("stream_a", "cancel").unwrap();
@@ -262,7 +273,7 @@ fn scheduler_interrupt_preserves_state_until_an_explicit_reset_reclaims_it() {
     );
     assert_eq!(
         scheduler.snapshot().transient_state_arena.free_block_count,
-        1
+        3
     );
 }
 
@@ -340,10 +351,10 @@ fn scheduler_forks_stream_transient_state_without_copying_blocks() {
     let child_state = scheduler.stream_transient_state_snapshot("child").unwrap();
     assert_eq!(child_state.block_count, 1);
     assert_eq!(child_state.logical_activation_count, 2);
-    let arena_after_source_reset = scheduler.transient_state_arena_snapshot().unwrap();
-    assert_eq!(arena_after_source_reset.live_block_count, 1);
-    assert_eq!(arena_after_source_reset.free_block_count, 0);
-    assert_eq!(arena_after_source_reset.blocks[0].ref_count, 1);
+    let arena_after_source_interrupt = scheduler.transient_state_arena_snapshot().unwrap();
+    assert_eq!(arena_after_source_interrupt.live_block_count, 1);
+    assert_eq!(arena_after_source_interrupt.free_block_count, 0);
+    assert_eq!(arena_after_source_interrupt.blocks[0].ref_count, 2);
 }
 
 #[test]
@@ -501,6 +512,7 @@ fn scheduler_prefix_cache_restores_state_after_source_reset() {
     );
 
     scheduler.interrupt_stream("source", "drop source").unwrap();
+    scheduler.reset_stream_transient_state("source").unwrap();
     scheduler
         .add_stream_with_state_declarations_and_execution_class(
             "target",
@@ -1105,6 +1117,91 @@ fn scheduler_decode_activation_can_cover_a_feedback_window() {
             max_tokens: 1,
         }
     );
+}
+
+#[test]
+fn scheduler_commits_only_the_feedback_ticks_that_actually_executed() {
+    let mut scheduler = RuntimeStreamScheduler::new();
+    scheduler
+        .add_stream_with_state_declarations("stream_a", [(state_key(), state_shape())])
+        .unwrap();
+    scheduler
+        .enqueue_input_event("stream_a", RuntimeStreamInputEvent::new("event_0", [1], 5))
+        .unwrap();
+    let windowed_budget =
+        RuntimeStreamSchedulerBudget::new(1, 2, 16).with_max_decode_tokens_per_activation(4);
+
+    let prefill = scheduler
+        .schedule_step(windowed_budget.clone())
+        .unwrap()
+        .activations[0]
+        .clone();
+    scheduler
+        .complete_activation(
+            prefill.id,
+            RuntimeStreamActivationOutcome::prefill_complete(),
+        )
+        .unwrap();
+    let decode = scheduler
+        .schedule_step(windowed_budget)
+        .unwrap()
+        .activations[0]
+        .clone();
+    assert_eq!(
+        scheduler
+            .stream_transient_state_snapshot("stream_a")
+            .unwrap()
+            .logical_activation_count,
+        5
+    );
+
+    scheduler
+        .complete_activation(
+            decode.id,
+            RuntimeStreamActivationOutcome::generated_tokens([10, 11], false)
+                .with_processed_state_activations(2),
+        )
+        .unwrap();
+
+    let state = scheduler
+        .stream_transient_state_snapshot("stream_a")
+        .unwrap();
+    assert_eq!(state.logical_activation_count, 3);
+    assert_eq!(state.block_count, 2);
+    let arena = scheduler.transient_state_arena_snapshot().unwrap();
+    assert_eq!(arena.live_block_count, 2);
+    assert_eq!(arena.free_block_count, 1);
+}
+
+#[test]
+fn scheduler_rejects_a_processed_tick_count_larger_than_the_reservation() {
+    let mut scheduler = RuntimeStreamScheduler::new();
+    scheduler
+        .add_stream_with_state_declarations("stream_a", [(state_key(), state_shape())])
+        .unwrap();
+    scheduler
+        .enqueue_input_event("stream_a", RuntimeStreamInputEvent::new("event_0", [1], 5))
+        .unwrap();
+    let prefill = scheduler.schedule_step(budget(1)).unwrap().activations[0].clone();
+    let reserved_state = scheduler
+        .stream_transient_state_snapshot("stream_a")
+        .unwrap();
+
+    let error = scheduler
+        .complete_activation(
+            prefill.id,
+            RuntimeStreamActivationOutcome::prefill_complete().with_processed_state_activations(2),
+        )
+        .unwrap_err();
+
+    assert!(error.to_string().contains("exceeding its reservation"));
+    assert_eq!(
+        scheduler
+            .stream_transient_state_snapshot("stream_a")
+            .unwrap(),
+        reserved_state
+    );
+    assert_eq!(scheduler.snapshot().in_flight_activation_count, 1);
 }
 
 #[test]
