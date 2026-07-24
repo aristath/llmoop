@@ -1,4 +1,5 @@
 include!("tests/package_batch.rs");
+include!("tests/feedback_control.rs");
 include!("tests/fixture_model_helpers.rs");
 include!("tests/package_contracts.rs");
 include!("tests/placement_schedule.rs");

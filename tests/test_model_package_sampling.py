@@ -23,6 +23,9 @@ def test_compiler_renders_model_owned_sampling_shader(tmp_path: Path) -> None:
     assert "const float TOP_P = 0.95;" in sampler
     assert "const float MIN_P = 0;" in sampler
     assert "binding = 3) readonly buffer SamplerSeed" in sampler
+    assert "binding = 7) buffer FeedbackControl" in sampler
+    assert "binding = 8) readonly buffer StopTokens" in sampler
+    assert "atomicAdd(feedback_control.words[9], 1u)" in sampler
     assert "partition_cursors" in sampler
     assert "{{" not in candidates
     assert "{{" not in sampler
@@ -56,4 +59,3 @@ def test_compiler_renders_repetition_state_as_sampler_component_artifacts(
     assert "value < 0.0 ? value * REPETITION_PENALTY" in candidates
     assert "binding = 2) readonly buffer SeenTokens" in candidates
     assert all("{{" not in source for source in (tracker, batch_tracker, candidates))
-

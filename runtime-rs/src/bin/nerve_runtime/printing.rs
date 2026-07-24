@@ -111,6 +111,22 @@ fn print_runtime_execution_counters(counters: &VulkanResidentExecutionCounters) 
     println!("  resident_copy_waits={}", counters.resident_copy_waits);
 }
 
+fn print_runtime_feedback_stats(stats: &RuntimeFeedbackExecutionReport) {
+    if stats.window_count == 0 {
+        return;
+    }
+    println!("resident_feedback:");
+    println!("  windows={}", stats.window_count);
+    println!("  planned_ticks={}", stats.planned_tick_count);
+    println!("  submitted_ticks={}", stats.submitted_tick_count);
+    println!("  executed_ticks={}", stats.executed_tick_count);
+    println!("  retained_ticks={}", stats.retained_tick_count);
+    println!("  sampled_ticks={}", stats.sampled_tick_count);
+    println!("  discarded_ticks={}", stats.discarded_tick_count);
+    println!("  template_records={}", stats.template_record_count);
+    println!("  template_replays={}", stats.template_replay_count);
+}
+
 fn print_runtime_speculative_stats(
     cycle_count: usize,
     proposed_draft_token_count: usize,

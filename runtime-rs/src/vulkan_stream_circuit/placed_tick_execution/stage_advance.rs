@@ -155,6 +155,7 @@ fn advance_compact_slice_with_distributed_dependencies<'a, 'batch>(
                             prepare_owner_continuation: dependencies.has_owner_continuation,
                             signal_completion: submission_policy.signal_completion
                                 && submission_batch.is_none(),
+                            use_feedback_indirect: submission_policy.feedback_lane.is_some(),
                         },
                         submission_batch,
                         |device_id| {

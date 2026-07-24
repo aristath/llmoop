@@ -41,8 +41,9 @@ use crate::stream_state::{
 use crate::tensor_storage::TensorStorage;
 use crate::vulkan::{DEFAULT_COMPUTE_LOCAL_SIZE_X, DEFAULT_SPIRV_ENTRY_POINT, read_spirv_words};
 use crate::vulkan_compute::{
-    VulkanComputeDevice, VulkanError, VulkanResidentBuffer, VulkanResidentBufferCopy,
-    VulkanResidentBufferCopyBatch, VulkanResidentBufferRangeCopy, VulkanResidentKernelBufferAccess,
+    VULKAN_RESIDENT_INDIRECT_DISPATCH_BYTE_COUNT, VulkanComputeDevice, VulkanError,
+    VulkanResidentBuffer, VulkanResidentBufferCopy, VulkanResidentBufferCopyBatch,
+    VulkanResidentBufferRangeCopy, VulkanResidentKernelBufferAccess,
     VulkanResidentKernelBufferBinding, VulkanResidentKernelDispatch, VulkanResidentKernelSequence,
     VulkanResidentKernelSequenceInputCopy, VulkanResidentKernelSequenceSnapshotCopy,
     VulkanResidentKernelSequenceStep, VulkanResidentMappedBufferCopy,
@@ -89,6 +90,7 @@ include!("vulkan_stream_circuit/circuit_mount.rs");
 include!("vulkan_stream_circuit/input_transducer.rs");
 include!("vulkan_stream_circuit/output_transducer.rs");
 include!("vulkan_stream_circuit/sampler.rs");
+include!("vulkan_stream_circuit/resident_feedback_control.rs");
 include!("vulkan_stream_circuit/batched_output_projection.rs");
 include!("vulkan_stream_circuit/single_token_tick.rs");
 include!("vulkan_stream_circuit/feedback_loop.rs");

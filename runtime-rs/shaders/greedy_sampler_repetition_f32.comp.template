@@ -18,6 +18,14 @@ layout(set = 0, binding = 3) readonly buffer SeenTokens {
     uint words[];
 } seen_tokens;
 
+layout(set = 0, binding = 7) buffer FeedbackControl {
+    uint words[];
+} feedback_control;
+
+layout(set = 0, binding = 8) readonly buffer StopTokens {
+    uint words[];
+} stop_tokens;
+
 const uint VOCAB_SIZE = {{VOCAB_SIZE}}u;
 const float REPETITION_PENALTY = {{REPETITION_PENALTY}};
 const float PRESENCE_PENALTY = {{PRESENCE_PENALTY}};
@@ -39,6 +47,22 @@ float penalized_logit(uint token_id) {
     }
     value = value < 0.0 ? value * REPETITION_PENALTY : value / REPETITION_PENALTY;
     return value - PRESENCE_PENALTY;
+}
+
+void commit_feedback_control(uint token_id) {
+    uint flags = feedback_control.words[0];
+    if ((flags & 1u) == 0u) {
+        return;
+    }
+    atomicAdd(feedback_control.words[9], 1u);
+    bool cancelled = (flags & 2u) != 0u;
+    bool eos = (stop_tokens.words[token_id >> 5u] & (1u << (token_id & 31u))) != 0u;
+    if (!cancelled && !eos) {
+        return;
+    }
+    if (atomicCompSwap(feedback_control.words[2], 0u, cancelled ? 2u : 1u) == 0u) {
+        feedback_control.words[8] = 2u;
+    }
 }
 
 void main() {
@@ -96,5 +120,6 @@ void main() {
             stream_control.words[2] += 1u;
         }
         stream_control.words[1] = next_tick_low;
+        commit_feedback_control(token_id);
     }
 }

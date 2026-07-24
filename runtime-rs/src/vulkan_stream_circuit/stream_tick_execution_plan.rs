@@ -178,6 +178,40 @@ impl VulkanMountedPlacedResidentStreamTickExecutionPlan {
             .map(|segment| segment.start_stage_index)
     }
 
+    fn configure_feedback_indirect_dispatches(
+        &mut self,
+        control: &mut VulkanResidentFeedbackControlPlane,
+        device_id: &str,
+        prefix_dispatches: &[&VulkanResidentKernelDispatch],
+        suffix_dispatches: &[&VulkanResidentKernelDispatch],
+        generation_tail_dispatch_count: Option<usize>,
+    ) -> Result<(), VulkanError> {
+        let first_stage_index = self.first_dispatch_segment_stage_index();
+        let last_stage_index = self.last_dispatch_segment_stage_index();
+        for segment in &mut self.dispatch_segments {
+            let prefix = if Some(segment.start_stage_index) == first_stage_index {
+                prefix_dispatches
+            } else {
+                &[]
+            };
+            let suffix = if Some(segment.start_stage_index) == last_stage_index {
+                suffix_dispatches
+            } else {
+                &[]
+            };
+            segment.configure_feedback_indirect_dispatches(
+                control,
+                device_id,
+                prefix,
+                suffix,
+                (Some(segment.start_stage_index) == last_stage_index)
+                    .then_some(generation_tail_dispatch_count)
+                    .flatten(),
+            )?;
+        }
+        Ok(())
+    }
+
     pub fn distributed_dispatch_at_stage(
         &self,
         stage_index: usize,

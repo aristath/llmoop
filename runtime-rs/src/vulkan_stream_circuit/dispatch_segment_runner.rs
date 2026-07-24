@@ -9,6 +9,7 @@ pub struct VulkanMountedPlacedResidentDispatchSegmentRunner {
     stream_control_buffer: Arc<VulkanResidentBuffer>,
     sequences: RefCell<BTreeMap<u8, VulkanResidentKernelSequence>>,
     feedback_sequences: RefCell<Vec<VulkanResidentKernelSequence>>,
+    feedback_indirect: Option<VulkanResidentFeedbackIndirectSequence>,
 }
 
 impl VulkanMountedPlacedResidentDispatchSegmentRunner {
@@ -92,7 +93,44 @@ impl VulkanMountedPlacedResidentDispatchSegmentRunner {
                     .map_err(VulkanMountedPlacedResidentKernelDispatchError::Vulkan)?,
             )])),
             feedback_sequences: RefCell::new(Vec::new()),
+            feedback_indirect: None,
         })
+    }
+
+    fn configure_feedback_indirect_dispatches(
+        &mut self,
+        control: &mut VulkanResidentFeedbackControlPlane,
+        device_id: &str,
+        prefix_dispatches: &[&VulkanResidentKernelDispatch],
+        suffix_dispatches: &[&VulkanResidentKernelDispatch],
+        generation_tail_dispatch_count: Option<usize>,
+    ) -> Result<(), VulkanError> {
+        let dispatches = prefix_dispatches
+            .iter()
+            .copied()
+            .chain(
+                self.dispatches
+                    .iter()
+                    .map(|dispatch| &dispatch.resident_dispatch),
+            )
+            .chain(suffix_dispatches.iter().copied());
+        let indirect = control.register_sequence(device_id, dispatches)?;
+        if let Some(generation_tail_dispatch_count) = generation_tail_dispatch_count {
+            if suffix_dispatches.len() != generation_tail_dispatch_count + 1 {
+                return Err(VulkanError(format!(
+                    "resident feedback generation tail has {generation_tail_dispatch_count} dispatches but terminal suffix has {} commands",
+                    suffix_dispatches.len()
+                )));
+            }
+            control.set_generation_tail(
+                indirect.first_dispatch_index
+                    + prefix_dispatches.len()
+                    + self.dispatches.len(),
+                generation_tail_dispatch_count,
+            )?;
+        }
+        self.feedback_indirect = Some(indirect);
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -124,6 +162,7 @@ impl VulkanMountedPlacedResidentDispatchSegmentRunner {
             return self.record_and_submit_sequence(
                 device,
                 sequence,
+                true,
                 control,
                 prefix_dispatches,
                 suffix_dispatches,
@@ -151,6 +190,7 @@ impl VulkanMountedPlacedResidentDispatchSegmentRunner {
         self.record_and_submit_sequence(
             device,
             sequence,
+            false,
             control,
             prefix_dispatches,
             suffix_dispatches,
@@ -167,6 +207,7 @@ impl VulkanMountedPlacedResidentDispatchSegmentRunner {
         &self,
         device: &'a VulkanComputeDevice,
         sequence: &VulkanResidentKernelSequence,
+        use_feedback_indirect: bool,
         control: VulkanMountedPlacedStreamControl,
         prefix_dispatches: &[&VulkanResidentKernelDispatch],
         suffix_dispatches: &[&VulkanResidentKernelDispatch],
@@ -191,24 +232,70 @@ impl VulkanMountedPlacedResidentDispatchSegmentRunner {
             .iter()
             .map(|dispatch| stream_control_push_constant_bytes(&dispatch.push_constants, control))
             .collect::<Result<Vec<_>, _>>()?;
-        let mut steps = Vec::with_capacity(
-            prefix_dispatches.len() + self.dispatches.len() + suffix_dispatches.len(),
-        );
-        steps.extend(
-            prefix_dispatches
-                .iter()
-                .map(|dispatch| VulkanResidentKernelSequenceStep::new(dispatch, &[])),
-        );
-        steps.extend(self.dispatches.iter().zip(&push_constants).map(
-            |(dispatch, push_constants)| {
-                VulkanResidentKernelSequenceStep::new(&dispatch.resident_dispatch, push_constants)
-            },
-        ));
-        steps.extend(
-            suffix_dispatches
-                .iter()
-                .map(|dispatch| VulkanResidentKernelSequenceStep::new(dispatch, &[])),
-        );
+        let indirect = use_feedback_indirect
+            .then(|| {
+                self.feedback_indirect.as_ref().ok_or_else(|| {
+                    VulkanMountedPlacedResidentKernelDispatchError::Vulkan(VulkanError(
+                        "resident feedback segment has no indirect dispatch control".to_string(),
+                    ))
+                })
+            })
+            .transpose()?;
+        let commands = prefix_dispatches
+            .iter()
+            .map(|dispatch| (*dispatch, &[][..]))
+            .chain(
+                self.dispatches
+                    .iter()
+                    .zip(&push_constants)
+                    .map(|(dispatch, push_constants)| {
+                        (&dispatch.resident_dispatch, push_constants.as_slice())
+                    }),
+            )
+            .chain(
+                suffix_dispatches
+                    .iter()
+                    .map(|dispatch| (*dispatch, &[][..])),
+            )
+            .collect::<Vec<_>>();
+        let steps = commands
+            .iter()
+            .enumerate()
+            .map(|(command_index, (dispatch, push_constants))| {
+                if let Some(indirect) = indirect {
+                    let byte_offset =
+                        *indirect.byte_offsets.get(command_index).ok_or_else(|| {
+                            VulkanMountedPlacedResidentKernelDispatchError::Vulkan(VulkanError(
+                                "resident feedback indirect dispatch sequence is shorter than its segment"
+                                    .to_string(),
+                            ))
+                        })?;
+                    VulkanResidentKernelSequenceStep::new_indirect(
+                        dispatch,
+                        push_constants,
+                        &indirect.buffer,
+                        byte_offset,
+                    )
+                    .map_err(VulkanMountedPlacedResidentKernelDispatchError::Vulkan)
+                } else {
+                    Ok(VulkanResidentKernelSequenceStep::new(
+                        dispatch,
+                        push_constants,
+                    ))
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let next_indirect_index = steps.len();
+        if let Some(indirect) = indirect
+            && next_indirect_index != indirect.byte_offsets.len()
+        {
+            return Err(VulkanMountedPlacedResidentKernelDispatchError::Vulkan(
+                VulkanError(format!(
+                    "resident feedback indirect sequence has {} dispatches, segment recorded {next_indirect_index}",
+                    indirect.byte_offsets.len()
+                )),
+            ));
+        }
         if snapshot_copies.is_empty() {
             device.record_resident_kernel_sequence(sequence, &steps)
         } else {

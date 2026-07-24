@@ -43,7 +43,6 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
         devices: &BTreeMap<String, Rc<VulkanComputeDevice>>,
         start_stream_tick: u64,
         tick_count: usize,
-        static_state_snapshots: &[VulkanResidentStateTransactionBank],
         feedback_synchronization: Option<&VulkanResidentPlacedFeedbackTimelineSynchronization>,
         output_synchronization: &VulkanResidentPlacedOutputTimelineSynchronization,
     ) -> Result<
@@ -95,6 +94,9 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
                     dispatch_extensions
                         .suffix_dispatches
                         .extend(self.sampler.resident_dispatches());
+                    dispatch_extensions
+                        .suffix_dispatches
+                        .push(self.sampler.feedback_control_dispatch());
                 }
                 slices.push(
                     VulkanMountedPlacedResidentInProcessStreamTickSlice::new_with_dispatch_extensions(
@@ -131,7 +133,7 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
                         wait_for_completion: false,
                         feedback_lane: Some(tick_index),
                     },
-                    state_transactions: Some(static_state_snapshots),
+                    state_transactions: None,
                     feedback_turn,
                     output_turn: Some(output_turn),
                     submission_batch: Some(&submission_batch),
@@ -219,9 +221,13 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
         devices: &BTreeMap<String, Rc<VulkanComputeDevice>>,
         start_stream_tick: u64,
         tick_count: usize,
+        stop_token_ids: &[u32],
         mut submission_replay: Option<&mut Option<VulkanResidentPlacedFeedbackSubmissionReplay>>,
         mut on_sampled_token: F,
-    ) -> Result<(), VulkanResidentInProcessPlacedRuntimeError>
+    ) -> Result<
+        VulkanResidentFeedbackControlCompletion,
+        VulkanResidentInProcessPlacedRuntimeError,
+    >
     where
         F: FnMut(usize, u32, usize, usize) -> Result<(), VulkanResidentInProcessPlacedRuntimeError>,
     {
@@ -238,8 +244,14 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
                 )),
             ));
         }
+        feedback_loop
+            .control
+            .arm(tick_count, stop_token_ids)
+            .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
+        let mut template_replayed = false;
         let output_timeline_values =
             if let Some(replay) = submission_replay.as_deref_mut().and_then(Option::as_mut) {
+                template_replayed = true;
                 replay
                     .validate_tick_count(tick_count)
                     .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
@@ -258,7 +270,6 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
                         devices,
                         start_stream_tick,
                         tick_count,
-                        &feedback_loop.static_state_snapshots,
                         feedback_loop.feedback_synchronization.as_deref(),
                         &feedback_loop.output_synchronization,
                     )?;
@@ -281,61 +292,67 @@ impl VulkanResidentInProcessPlacedStreamProcessor {
                 device_id: self.model.output_device_id.clone(),
             }
         })?;
-        let output_result: Result<(), VulkanResidentInProcessPlacedRuntimeError> =
-            output_timeline_values
-                .into_iter()
-                .enumerate()
-                .try_for_each(|(tick_index, value)| {
-                    feedback_loop
-                        .output_synchronization
-                        .wait_for_turn(output_device, value)
-                        .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
-                    let stream_tick = start_stream_tick
-                        .checked_add(u64::try_from(tick_index).map_err(|_| {
-                            VulkanResidentInProcessPlacedRuntimeError::StreamTickOverflow
-                        })?)
-                        .ok_or(VulkanResidentInProcessPlacedRuntimeError::StreamTickOverflow)?;
-                    let sampled_token_id = self
-                        .sampler
-                        .completed_run_at(stream_tick)
-                        .map(|run| run.token_id)
-                        .map_err(VulkanResidentInProcessPlacedRuntimeError::Sampler)?;
-                    on_sampled_token(
-                        tick_index,
-                        sampled_token_id,
-                        feedback_loop.scheduler_turn_count_per_tick,
-                        feedback_loop.completed_stage_count_per_tick,
-                    )
-                });
-        self.wait_resident_feedback_terminal_work(devices, tick_count - 1)?;
-        output_result?;
-        Ok(())
-    }
-
-    fn restore_resident_feedback_state_after_tick(
-        &self,
-        tick_index: usize,
-    ) -> Result<(), VulkanResidentInProcessPlacedRuntimeError> {
-        let feedback_loop = self.resident_feedback_loop.as_ref().ok_or_else(|| {
+        let terminal_output_value = output_timeline_values.last().copied().ok_or_else(|| {
             VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(
-                "placed resident feedback loop is not mounted".to_string(),
+                "resident feedback window has no output timeline value".to_string(),
             ))
         })?;
-        if feedback_loop.static_state_snapshots.len() != self.device_slices.len() {
+        feedback_loop
+            .output_synchronization
+            .wait_for_turn(output_device, terminal_output_value)
+            .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
+        self.wait_resident_feedback_terminal_work(devices, tick_count - 1)?;
+        let mut completion = feedback_loop
+            .control
+            .completion()
+            .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
+        completion.template_replayed = template_replayed;
+        if completion.executed_tick_count == 0
+            || completion.executed_tick_count > tick_count
+            || completion.sampled_tick_count == 0
+            || completion.sampled_tick_count > completion.executed_tick_count
+        {
             return Err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop(
-                VulkanError("placed resident feedback snapshot topology changed".to_string()),
+                VulkanError(format!(
+                    "resident feedback control completed {} model ticks and {} sampled ticks for a {tick_count}-tick window",
+                    completion.executed_tick_count, completion.sampled_tick_count
+                )),
             ));
         }
-        for (snapshots, slice) in feedback_loop
-            .static_state_snapshots
-            .iter()
-            .zip(&self.device_slices)
+        if !matches!(
+            completion.stop_reason,
+            VULKAN_FEEDBACK_STOP_REASON_NONE
+                | VULKAN_FEEDBACK_STOP_REASON_EOS
+                | VULKAN_FEEDBACK_STOP_REASON_CANCELLED
+        ) || (completion.executed_tick_count < tick_count
+            && completion.stop_reason == VULKAN_FEEDBACK_STOP_REASON_NONE)
         {
-            snapshots
-                .commit_prefix(&slice.mounted.buffers, tick_index + 1)
-                .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
+            return Err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop(
+                VulkanError(format!(
+                    "resident feedback control reported invalid stop reason {} after {} of {tick_count} ticks",
+                    completion.stop_reason, completion.executed_tick_count
+                )),
+            ));
         }
-        Ok(())
+        for tick_index in 0..completion.sampled_tick_count {
+            let stream_tick = start_stream_tick
+                .checked_add(u64::try_from(tick_index).map_err(|_| {
+                    VulkanResidentInProcessPlacedRuntimeError::StreamTickOverflow
+                })?)
+                .ok_or(VulkanResidentInProcessPlacedRuntimeError::StreamTickOverflow)?;
+            let sampled_token_id = self
+                .sampler
+                .completed_run_at(stream_tick)
+                .map(|run| run.token_id)
+                .map_err(VulkanResidentInProcessPlacedRuntimeError::Sampler)?;
+            on_sampled_token(
+                tick_index,
+                sampled_token_id,
+                feedback_loop.scheduler_turn_count_per_tick,
+                feedback_loop.completed_stage_count_per_tick,
+            )?;
+        }
+        Ok(completion)
     }
 
 }

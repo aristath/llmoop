@@ -509,6 +509,5 @@ fn placed_model_package_runs_runtime_graphed_duplicate_layer() {
         VulkanMountedPlacedResidentInProcessStreamTickRunStatus::Completed
     );
     assert!(run.tick_run.placed_run.completed_stage_delta > 204);
-    assert_eq!(run.sampler_run.descriptor_count, 3);
+    assert_eq!(run.sampler_run.descriptor_count, 5);
 }
-

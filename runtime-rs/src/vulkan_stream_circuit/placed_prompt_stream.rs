@@ -387,6 +387,12 @@ impl VulkanResidentInProcessPlacedPromptStream {
         VulkanResidentInProcessPlacedRuntimeError,
     > {
         let reason = reason.into();
+        if let Some(feedback_loop) = &self.processor.resident_feedback_loop {
+            feedback_loop
+                .control
+                .request_cancel()
+                .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
+        }
         let control_event = if let Some(active_input_event) = &mut self.active_input_event {
             active_input_event.interrupt(reason)
         } else {
@@ -699,32 +705,34 @@ impl VulkanResidentInProcessPlacedPromptStream {
                 .checked_add(feedback_depth_delta)
                 .ok_or(VulkanResidentInProcessPlacedRuntimeError::FeedbackDepthOverflow)?;
             let start_stream_tick = session.next_stream_tick;
-            let mut restore_after_tick = None;
+            let stop_token_ids = active_input_event
+                .as_ref()
+                .expect("resident feedback window requires an active input event")
+                .input_event
+                .stop_token_ids
+                .clone();
             let replay_slot = (tick_count == window_width
                 && processor
                     .resident_feedback_loop
                     .as_ref()
                     .is_some_and(|feedback_loop| feedback_loop.replayable))
             .then_some(&mut *submission_replay);
-            processor.run_resident_feedback_window(
+            let completion = processor.run_resident_feedback_window(
                 devices,
                 start_stream_tick,
                 tick_count,
+                &stop_token_ids,
                 replay_slot,
-                |tick_index, sampled_token_id, scheduler_turn_count, completed_stage_count| {
-                    if restore_after_tick.is_some() {
-                        return Ok(());
-                    }
+                |_tick_index, sampled_token_id, scheduler_turn_count, completed_stage_count| {
                     let stream_tick = session.next_stream_tick;
-                    let (output_event, closes_loop) = {
+                    let output_event = {
                         let active_input_event = active_input_event
                             .as_mut()
                             .expect("resident feedback window requires an active input event");
                         let activation = active_input_event.next_activation().ok_or(
                             VulkanResidentInProcessPlacedRuntimeError::MissingPrivateFeedback,
                         )?;
-                        let closes_loop = activation.input_closes_loop_after_processing;
-                        let output_event = active_input_event.complete_activation(
+                        active_input_event.complete_activation(
                             &activation,
                             stream_tick,
                             scheduler_turn_count,
@@ -733,8 +741,7 @@ impl VulkanResidentInProcessPlacedPromptStream {
                             activation
                                 .should_emit_public_output
                                 .then_some(sampled_token_id),
-                        )?;
-                        (output_event, closes_loop)
+                        )?
                     };
                     session.next_stream_tick = stream_tick
                         .checked_add(1)
@@ -742,19 +749,66 @@ impl VulkanResidentInProcessPlacedPromptStream {
                     if let Some(output_event) = output_event {
                         on_output_event(output_event);
                     }
-                    if closes_loop {
-                        restore_after_tick = Some(tick_index);
-                    }
                     Ok(())
                 },
             )?;
+            active_input_event
+                .as_mut()
+                .expect("resident feedback window requires an active input event")
+                .resident_feedback
+                .record_window(
+                    tick_count,
+                    completion.executed_tick_count,
+                    completion.sampled_tick_count,
+                    completion.template_replayed,
+                );
+            for _ in completion.sampled_tick_count..completion.executed_tick_count {
+                let stream_tick = session.next_stream_tick;
+                let active = active_input_event
+                    .as_mut()
+                    .expect("resident feedback drain requires an active input event");
+                let activation = active.next_activation().ok_or(
+                    VulkanResidentInProcessPlacedRuntimeError::MissingPrivateFeedback,
+                )?;
+                if !activation.input_closes_loop_after_processing
+                    || activation.should_emit_public_output
+                {
+                    return Err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop(
+                        VulkanError(
+                            "resident feedback control executed a drain tick without a closing private feedback input"
+                                .to_string(),
+                        ),
+                    ));
+                }
+                active.complete_activation(
+                    &activation,
+                    stream_tick,
+                    processor
+                        .resident_feedback_loop
+                        .as_ref()
+                        .expect("resident feedback loop is mounted")
+                        .scheduler_turn_count_per_tick,
+                    processor
+                        .resident_feedback_loop
+                        .as_ref()
+                        .expect("resident feedback loop is mounted")
+                        .completed_stage_count_per_tick,
+                    &VulkanPlacedEdgeTransportStats::default(),
+                    None,
+                )?;
+                session.next_stream_tick = stream_tick
+                    .checked_add(1)
+                    .ok_or(VulkanResidentInProcessPlacedRuntimeError::StreamTickOverflow)?;
+            }
             ran_window = true;
-            remaining_feedback_ticks = remaining_feedback_ticks.saturating_sub(tick_count);
+            remaining_feedback_ticks =
+                remaining_feedback_ticks.saturating_sub(completion.executed_tick_count);
             if remaining_feedback_ticks == 0 {
                 break;
             }
-            if let Some(tick_index) = restore_after_tick {
-                processor.restore_resident_feedback_state_after_tick(tick_index)?;
+            if completion.stop_reason != VULKAN_FEEDBACK_STOP_REASON_NONE
+                || completion.executed_tick_count < tick_count
+            {
                 break;
             }
         }

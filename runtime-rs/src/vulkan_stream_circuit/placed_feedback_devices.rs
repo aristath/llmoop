@@ -15,7 +15,7 @@ struct VulkanResidentInProcessPlacedFeedbackLoopEligibility {
     device_slice_count: usize,
     every_slice_has_terminal_segment: bool,
     distributed_dispatches_are_bridged: bool,
-    has_push_constants: bool,
+    has_dynamic_push_constants: bool,
     window_width: usize,
     sampler_history_capacity: usize,
 }
@@ -43,13 +43,20 @@ impl VulkanResidentInProcessPlacedFeedbackLoopEligibility {
 }
 
 struct VulkanResidentInProcessPlacedFeedbackLoop {
-    static_state_snapshots: Vec<VulkanResidentStateTransactionBank>,
     feedback_synchronization: Option<Box<VulkanResidentPlacedFeedbackTimelineSynchronization>>,
     output_synchronization: Box<VulkanResidentPlacedOutputTimelineSynchronization>,
+    control: VulkanResidentFeedbackControlPlane,
     window_width: usize,
     replayable: bool,
     scheduler_turn_count_per_tick: usize,
     completed_stage_count_per_tick: usize,
+}
+
+struct VulkanResidentPlacedFeedbackMount<'a> {
+    input_transducer: &'a VulkanResidentInputEmbeddingTransducerRunner,
+    output_transducer: &'a VulkanResidentOutputTransducerRunner,
+    sampler: &'a VulkanResidentSamplerRunner,
+    control: VulkanResidentFeedbackControlPlane,
 }
 
 struct VulkanResidentPlacedFeedbackTimelineSynchronization {
@@ -334,16 +341,20 @@ impl VulkanResidentInProcessPlacedFeedbackLoop {
         model: &VulkanResidentInProcessPlacedModelPackage,
         device_slices: &[VulkanResidentInProcessPlacedStreamProcessorDevice],
         activation_schedule: &VulkanMountedPlacedResidentInProcessSchedule,
-        input_transducer: &VulkanResidentInputEmbeddingTransducerRunner,
-        output_transducer: &VulkanResidentOutputTransducerRunner,
-        sampler: &VulkanResidentSamplerRunner,
+        mount: VulkanResidentPlacedFeedbackMount<'_>,
         device_for: &F,
     ) -> Result<Option<Self>, VulkanError>
     where
         F: Fn(&str) -> Result<&'a VulkanComputeDevice, E>,
         E: Display,
     {
-        let has_push_constants = input_transducer
+        let VulkanResidentPlacedFeedbackMount {
+            input_transducer,
+            output_transducer,
+            sampler,
+            control,
+        } = mount;
+        let has_dynamic_push_constants = input_transducer
             .resident_dispatch
             .push_constant_byte_count()
             != 0
@@ -363,24 +374,17 @@ impl VulkanResidentInProcessPlacedFeedbackLoop {
                 .iter()
                 .flat_map(|slice| &slice.resident_execution_plan.dispatch_segments)
                 .flat_map(|segment| &segment.dispatches)
-                .any(|dispatch| dispatch.resident_dispatch.push_constant_byte_count() != 0);
-        let mut window_width = VULKAN_BACKEND_LOOP_MAX_WINDOW.min(
-            sampler
-                .history_capacity_activations
-                .max(1),
-        );
-        for slice in device_slices {
-            let device = device_for(&slice.device_id).map_err(|error| {
-                VulkanError(format!("feedback device resolution failed: {error}"))
-            })?;
-            let slice_static_state_bytes = total_static_state_bytes(&slice.mounted.buffers)?;
-            let slice_window_width = backend_loop_window_for_static_state_bytes(
-                slice_static_state_bytes,
-                sampler.history_capacity_activations,
-                backend_loop_transaction_budget_bytes(device),
-            );
-            window_width = window_width.min(slice_window_width);
-        }
+                .any(|dispatch| {
+                    dispatch.resident_dispatch.push_constant_byte_count() != 0
+                        && dispatch.push_constants.as_slice()
+                            != [VulkanKernelScalarBinding {
+                                name: "expert_start".to_string(),
+                                scalar_type: "u32".to_string(),
+                                source: VulkanKernelScalarSource::PushConstant,
+                            }]
+                });
+        let window_width = VULKAN_BACKEND_LOOP_MAX_WINDOW
+            .min(sampler.history_capacity_activations.max(1));
         let eligibility = VulkanResidentInProcessPlacedFeedbackLoopEligibility {
             device_slice_count: device_slices.len(),
             every_slice_has_terminal_segment: device_slices
@@ -395,26 +399,13 @@ impl VulkanResidentInProcessPlacedFeedbackLoop {
                         dependency.has_owner_producer && dependency.has_owner_continuation
                     })
             }),
-            has_push_constants,
+            has_dynamic_push_constants,
             window_width,
             sampler_history_capacity: sampler.history_capacity_activations,
         };
         let Some(window_width) = eligibility.window_width() else {
             return Ok(None);
         };
-        let static_state_snapshots = device_slices
-            .iter()
-            .map(|slice| {
-                let device = device_for(&slice.device_id).map_err(|error| {
-                    VulkanError(format!("feedback device resolution failed: {error}"))
-                })?;
-                VulkanResidentStateTransactionBank::new(
-                    device,
-                    &slice.mounted.buffers,
-                    window_width,
-                )
-            })
-            .collect::<Result<Vec<_>, _>>()?;
         let input_device = device_for(&model.input_device_id).map_err(|error| {
             VulkanError(format!("feedback input device resolution failed: {error}"))
         })?;
@@ -436,11 +427,11 @@ impl VulkanResidentInProcessPlacedFeedbackLoop {
                     })
             })?;
         Ok(Some(Self {
-            static_state_snapshots,
             feedback_synchronization,
             output_synchronization,
+            control,
             window_width,
-            replayable: !has_push_constants,
+            replayable: !has_dynamic_push_constants,
             scheduler_turn_count_per_tick: activation_schedule.turns.len(),
             completed_stage_count_per_tick,
         }))

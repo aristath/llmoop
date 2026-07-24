@@ -16,7 +16,8 @@ use crate::vulkan_stream_circuit::{
     VulkanActivationSlotBufferOverride, VulkanDescriptorResourceAddress,
     VulkanLoadedReusableKernelArtifact, VulkanLoadedReusableKernelArtifactManifest,
     VulkanKernelScalarBinding, VulkanKernelScalarSource, VulkanPreparedDispatch,
-    VulkanPreparedDispatchPlan, VulkanReusableKernelArtifactManifest,
+    VulkanPreparedDispatchPlan, VulkanResidentFeedbackControlPlane,
+    VulkanReusableKernelArtifactManifest,
 };
 
 const DISTRIBUTABLE_PARALLEL_PROJECTION_OP: &str = "parallel_linear_silu_multiply";
@@ -40,6 +41,7 @@ pub struct VulkanDistributedDispatchSubmission {
     pub consume_owner_ready_signal: bool,
     pub prepare_owner_continuation: bool,
     pub signal_completion: bool,
+    pub use_feedback_indirect: bool,
 }
 
 impl VulkanDistributedExecutionPlan {

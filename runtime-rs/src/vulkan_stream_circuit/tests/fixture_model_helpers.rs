@@ -49,7 +49,7 @@ fn placed_feedback_window_accepts_bridged_multi_device_execution_graphs() {
         device_slice_count: 3,
         every_slice_has_terminal_segment: true,
         distributed_dispatches_are_bridged: true,
-        has_push_constants: false,
+        has_dynamic_push_constants: false,
         window_width: 64,
         sampler_history_capacity: 4_096,
     };
@@ -96,7 +96,7 @@ fn placed_feedback_window_accepts_bridged_multi_device_execution_graphs() {
     );
     assert_eq!(
         VulkanResidentInProcessPlacedFeedbackLoopEligibility {
-            has_push_constants: true,
+            has_dynamic_push_constants: true,
             ..eligible
         }
         .window_width(),
@@ -505,7 +505,7 @@ fn compile_temperature_top_k_top_p_sampler_test_kernels(
         let _ = std::fs::remove_file(path);
         words
     };
-    Some(vec![
+    let mut kernels = vec![
         VulkanResidentSamplerKernelArtifact {
             role: "partition_top_k".to_string(),
             spirv_words: compile("candidates", candidates)?,
@@ -518,7 +518,9 @@ fn compile_temperature_top_k_top_p_sampler_test_kernels(
             local_size_x,
             workgroup_count_x: 1,
         },
-    ])
+    ];
+    kernels.push(compile_feedback_control_test_kernel()?);
+    Some(kernels)
 }
 
 fn compile_repetition_temperature_sampler_test_kernels(
@@ -558,7 +560,7 @@ fn compile_repetition_temperature_sampler_test_kernels(
         let _ = std::fs::remove_file(path);
         words
     };
-    Some(vec![
+    let mut kernels = vec![
         VulkanResidentSamplerKernelArtifact {
             role: "record_current_token".to_string(),
             spirv_words: compile("tracker", tracker)?,
@@ -583,7 +585,9 @@ fn compile_repetition_temperature_sampler_test_kernels(
             local_size_x,
             workgroup_count_x: 1,
         },
-    ])
+    ];
+    kernels.push(compile_feedback_control_test_kernel()?);
+    Some(kernels)
 }
 
 fn compile_runtime_temperature_sampler_test_kernels(
@@ -617,7 +621,7 @@ fn compile_runtime_temperature_sampler_test_kernels(
         let _ = std::fs::remove_file(path);
         words
     };
-    Some(vec![
+    let mut kernels = vec![
         VulkanResidentSamplerKernelArtifact {
             role: "runtime_record_current_token".to_string(),
             spirv_words: compile("tracker", tracker)?,
@@ -642,16 +646,34 @@ fn compile_runtime_temperature_sampler_test_kernels(
             local_size_x,
             workgroup_count_x: 1,
         },
-    ])
+    ];
+    kernels.push(compile_feedback_control_test_kernel()?);
+    Some(kernels)
 }
 
-fn greedy_sampler_test_kernels(spirv_words: Vec<u32>) -> Vec<VulkanResidentSamplerKernelArtifact> {
-    vec![VulkanResidentSamplerKernelArtifact {
+fn greedy_sampler_test_kernels(
+    spirv_words: Vec<u32>,
+) -> Option<Vec<VulkanResidentSamplerKernelArtifact>> {
+    Some(vec![
+        VulkanResidentSamplerKernelArtifact {
         role: "sample_logits".to_string(),
         spirv_words,
         local_size_x: 1_024,
         workgroup_count_x: 1,
-    }]
+        },
+        compile_feedback_control_test_kernel()?,
+    ])
+}
+
+fn compile_feedback_control_test_kernel() -> Option<VulkanResidentSamplerKernelArtifact> {
+    let shader =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("shaders/resident_feedback_control.comp");
+    Some(VulkanResidentSamplerKernelArtifact {
+        role: "feedback_control".to_string(),
+        spirv_words: crate::vulkan_compute::compile_shader_words_from_source_path(&shader)?,
+        local_size_x: 1,
+        workgroup_count_x: 1,
+    })
 }
 
 fn sampler_test_hash_u32(mut value: u32) -> u32 {

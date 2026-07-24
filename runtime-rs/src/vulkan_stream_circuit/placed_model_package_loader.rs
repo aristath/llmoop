@@ -584,7 +584,7 @@ impl VulkanResidentInProcessPlacedModelPackage {
                 resident_execution_plan,
             });
         }
-        let distributed_dispatch_runners = VulkanDistributedDispatchRunners::create(
+        let mut distributed_dispatch_runners = VulkanDistributedDispatchRunners::create(
             &self.distributed_execution_plan,
             &self.distributed_parameter_buffers,
             &distributed_activation_buffers,
@@ -667,15 +667,104 @@ impl VulkanResidentInProcessPlacedModelPackage {
                 &self.output_transducer_spec,
             )
             .map_err(VulkanResidentInProcessPlacedRuntimeError::OutputTransducer)?;
-        let sampler = VulkanResidentSamplerRunner::from_output_transducer_with_spec(
+        let local_dispatch_count = devices.iter().try_fold(0usize, |total, slice| {
+            total
+                .checked_add(slice.resident_execution_plan.dispatch_count)
+                .ok_or_else(|| {
+                    VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(
+                        "resident feedback local dispatch count overflowed".to_string(),
+                    ))
+                })
+        })?;
+        let sampler_dispatch_count = VulkanResidentSamplerRunner::feedback_dispatch_count_for_spec(
+            &self.sampler_kernels,
+            &self.sampler_spec,
+        );
+        let feedback_dispatch_capacity = local_dispatch_count
+            .checked_add(distributed_dispatch_runners.shard_count)
+            .and_then(|count| count.checked_add(1))
+            .and_then(|count| count.checked_add(2))
+            .and_then(|count| count.checked_add(sampler_dispatch_count))
+            .ok_or_else(|| {
+                VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(
+                    "resident feedback dispatch capacity overflowed".to_string(),
+                ))
+            })?;
+        let feedback_device_ids = devices
+            .iter()
+            .map(|slice| slice.device_id.clone())
+            .collect::<Vec<_>>();
+        let vocabulary_size = self.sampler_spec.logits_byte_capacity / size_of::<f32>();
+        let mut feedback_control = VulkanResidentFeedbackControlPlane::new(
+            &feedback_device_ids,
+            &self.output_device_id,
+            vocabulary_size,
+            feedback_dispatch_capacity,
+            &device_for,
+        )
+        .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
+        let sampler = VulkanResidentSamplerRunner::from_output_transducer_with_spec_and_feedback_control(
             output_device,
             &output_slice.mounted,
             &output_transducer,
             &self.sampler_kernels,
             &self.sampler_spec,
             random_seed,
+            feedback_control
+                .sampler_bindings()
+                .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?,
         )
         .map_err(VulkanResidentInProcessPlacedRuntimeError::Sampler)?;
+        for slice in &mut devices {
+            let mut prefix_dispatches =
+                SmallVec::<[&VulkanResidentKernelDispatch; 2]>::new();
+            let mut suffix_dispatches =
+                SmallVec::<[&VulkanResidentKernelDispatch; 5]>::new();
+            if slice.device_id == self.input_device_id {
+                prefix_dispatches.push(&input_transducer.resident_dispatch);
+            }
+            if slice.device_id == self.output_device_id {
+                prefix_dispatches.extend(sampler.input_tracking_dispatches());
+                suffix_dispatches.push(&output_transducer.embedding_norm_dispatch);
+                suffix_dispatches.push(&output_transducer.tied_projection_dispatch);
+                suffix_dispatches.extend(sampler.resident_dispatches());
+                suffix_dispatches.push(sampler.feedback_control_dispatch());
+            }
+            let generation_tail_dispatch_count = (slice.device_id == self.output_device_id)
+                .then_some(
+                    2usize
+                        .checked_add(sampler.resident_dispatches().len())
+                        .ok_or_else(|| {
+                            VulkanResidentInProcessPlacedRuntimeError::BackendLoop(VulkanError(
+                                "resident feedback generation tail count overflowed".to_string(),
+                            ))
+                        })?,
+                );
+            slice
+                .resident_execution_plan
+                .configure_feedback_indirect_dispatches(
+                    &mut feedback_control,
+                    &slice.device_id,
+                    &prefix_dispatches,
+                    &suffix_dispatches,
+                    generation_tail_dispatch_count,
+                )
+                .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
+        }
+        distributed_dispatch_runners
+            .configure_feedback_indirect_dispatches(&mut feedback_control, |device_id| {
+                device_for(device_id)
+            })
+            .map_err(|error| {
+                VulkanResidentInProcessPlacedRuntimeError::Package(
+                    VulkanResidentTokenModelPackageError::new(format!(
+                        "failed to configure distributed feedback dispatches: {error}"
+                    )),
+                )
+            })?;
+        feedback_control
+            .finish_registration()
+            .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
         let output_synchronization =
             VulkanResidentPlacedOutputTimelineSynchronization::new(output_device)
                 .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
@@ -683,9 +772,12 @@ impl VulkanResidentInProcessPlacedModelPackage {
             self,
             &devices,
             &activation_schedule,
-            &input_transducer,
-            &output_transducer,
-            &sampler,
+            VulkanResidentPlacedFeedbackMount {
+                input_transducer: &input_transducer,
+                output_transducer: &output_transducer,
+                sampler: &sampler,
+                control: feedback_control,
+            },
             &device_for,
         )
         .map_err(VulkanResidentInProcessPlacedRuntimeError::BackendLoop)?;
@@ -723,4 +815,3 @@ impl VulkanResidentInProcessPlacedModelPackage {
         })
     }
 }
-

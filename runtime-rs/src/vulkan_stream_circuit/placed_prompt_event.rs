@@ -46,6 +46,51 @@ pub struct VulkanResidentInProcessPlacedPromptEventRun {
     pub transport_stats: VulkanPlacedEdgeTransportStats,
     pub output_source_stream_ticks: Vec<u64>,
     pub speculative_decode: VulkanSpeculativeDecodeStats,
+    pub resident_feedback: VulkanResidentFeedbackExecutionStats,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VulkanResidentFeedbackExecutionStats {
+    pub window_count: usize,
+    pub planned_tick_count: usize,
+    pub submitted_tick_count: usize,
+    pub executed_tick_count: usize,
+    pub retained_tick_count: usize,
+    pub sampled_tick_count: usize,
+    pub discarded_tick_count: usize,
+    pub template_record_count: usize,
+    pub template_replay_count: usize,
+}
+
+impl VulkanResidentFeedbackExecutionStats {
+    fn record_window(
+        &mut self,
+        planned_tick_count: usize,
+        executed_tick_count: usize,
+        sampled_tick_count: usize,
+        template_replayed: bool,
+    ) {
+        self.window_count = self.window_count.saturating_add(1);
+        self.planned_tick_count = self.planned_tick_count.saturating_add(planned_tick_count);
+        self.submitted_tick_count = self
+            .submitted_tick_count
+            .saturating_add(planned_tick_count);
+        self.executed_tick_count = self
+            .executed_tick_count
+            .saturating_add(executed_tick_count);
+        self.retained_tick_count = self
+            .retained_tick_count
+            .saturating_add(executed_tick_count);
+        self.sampled_tick_count = self.sampled_tick_count.saturating_add(sampled_tick_count);
+        self.discarded_tick_count = self
+            .discarded_tick_count
+            .saturating_add(planned_tick_count.saturating_sub(executed_tick_count));
+        if template_replayed {
+            self.template_replay_count = self.template_replay_count.saturating_add(1);
+        } else {
+            self.template_record_count = self.template_record_count.saturating_add(1);
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -65,6 +110,7 @@ struct VulkanResidentInProcessPlacedActivePromptEvent {
     output_source_stream_ticks: Vec<u64>,
     output_events: Vec<VulkanResidentTokenOutputEvent>,
     speculative_decode: VulkanSpeculativeDecodeStats,
+    resident_feedback: VulkanResidentFeedbackExecutionStats,
 }
 
 impl VulkanResidentInProcessPlacedActivePromptEvent {
@@ -81,6 +127,7 @@ impl VulkanResidentInProcessPlacedActivePromptEvent {
             generated_token_ids: Vec::with_capacity(remaining_public_outputs),
             output_source_stream_ticks: Vec::with_capacity(remaining_public_outputs),
             output_events: Vec::with_capacity(remaining_public_outputs),
+            resident_feedback: VulkanResidentFeedbackExecutionStats::default(),
             input_event,
             start_stream_tick,
             next_external_input_index: 0,
@@ -305,6 +352,7 @@ impl VulkanResidentInProcessPlacedActivePromptEvent {
             transport_stats: self.transport_stats,
             output_source_stream_ticks: self.output_source_stream_ticks,
             speculative_decode: self.speculative_decode,
+            resident_feedback: self.resident_feedback,
         }
     }
 }
@@ -317,4 +365,3 @@ struct VulkanResidentInProcessPlacedPromptActivation {
     input_is_feedback: bool,
     should_emit_public_output: bool,
 }
-

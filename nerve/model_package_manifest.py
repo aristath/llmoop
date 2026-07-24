@@ -190,6 +190,16 @@ def build_vulkan_resident_package_manifest(
         ]
     )
     sampler_kernels += runtime_sampler_kernels
+    sampler_kernels.append(
+        {
+            "role": "feedback_control",
+            "shader_path": compiled_shader_path(
+                "shaders/resident_feedback_control.comp"
+            ),
+            "local_size_x": 1,
+            "workgroup_count_x": 1,
+        }
+    )
 
     embed_tensor = model_graph["graph"]["input_transducer"]["params"]["weight"][
         "tensor"

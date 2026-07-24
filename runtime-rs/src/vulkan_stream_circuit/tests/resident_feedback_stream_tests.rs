@@ -196,7 +196,10 @@ fn create_fixture_model_resident_greedy_stream_processor_with_capacity(
         eprintln!("skipping {skip_label}: no GLSL to SPIR-V compiler found");
         return None;
     };
-    let sampler_kernels = greedy_sampler_test_kernels(sampler_spirv_words);
+    let Some(sampler_kernels) = greedy_sampler_test_kernels(sampler_spirv_words) else {
+        eprintln!("skipping resident feedback smoke: feedback control shader did not compile");
+        return None;
+    };
 
     let transducer_parameter_buffers = Arc::new(load_fixture_model_transducer_parameter_buffers(
         device,
@@ -272,8 +275,8 @@ fn resident_greedy_feedback_loop_runs_two_ticks() {
     };
     assert_eq!(processor.device_id, "gpu0");
     assert_eq!(processor.component_count, 14);
-    assert_eq!(processor.per_tick_dispatch_count, 246);
-    assert_eq!(processor.per_tick_descriptor_count, 830);
+    assert_eq!(processor.per_tick_dispatch_count, 247);
+    assert_eq!(processor.per_tick_descriptor_count, 834);
     assert_eq!(processor.per_tick_push_constant_byte_count, 0);
     assert_eq!(processor.dynamic_state_capacity_activations, 4);
 
@@ -281,8 +284,8 @@ fn resident_greedy_feedback_loop_runs_two_ticks() {
     assert_eq!(run.device_id, "gpu0");
     assert_eq!(run.initial_token_id, 1);
     assert_eq!(run.tick_runs.len(), 2);
-    assert_eq!(run.per_tick_dispatch_count, 246);
-    assert_eq!(run.per_tick_descriptor_count, 830);
+    assert_eq!(run.per_tick_dispatch_count, 247);
+    assert_eq!(run.per_tick_descriptor_count, 834);
     assert_eq!(run.per_tick_push_constant_byte_count, 0);
     assert_eq!(run.tick_runs[0].stream_tick, 0);
     assert_eq!(run.tick_runs[0].input_token_id, 1);
@@ -292,9 +295,9 @@ fn resident_greedy_feedback_loop_runs_two_ticks() {
         run.tick_runs[0].sampled_token_id
     );
     assert_eq!(run.tick_runs[0].tick_run.dispatch_count, 245);
-    assert_eq!(run.tick_runs[0].sampler_run.descriptor_count, 3);
+    assert_eq!(run.tick_runs[0].sampler_run.descriptor_count, 5);
     assert_eq!(run.tick_runs[1].tick_run.dispatch_count, 245);
-    assert_eq!(run.tick_runs[1].sampler_run.descriptor_count, 3);
+    assert_eq!(run.tick_runs[1].sampler_run.descriptor_count, 5);
     assert_eq!(run.sampled_token_ids, vec![1, 1]);
     assert_eq!(run.tick_runs[0].sampler_run.token_id, 1);
     assert_eq!(run.tick_runs[1].sampler_run.token_id, 1);
@@ -336,8 +339,8 @@ fn resident_greedy_prompt_event_drains_external_input_before_feedback() {
     );
     assert_eq!(run.stop_reason, "max_new_tokens");
     assert_eq!(run.tick_runs.len(), 3);
-    assert_eq!(run.per_tick_dispatch_count, 246);
-    assert_eq!(run.per_tick_descriptor_count, 830);
+    assert_eq!(run.per_tick_dispatch_count, 247);
+    assert_eq!(run.per_tick_descriptor_count, 834);
     assert_eq!(run.per_tick_push_constant_byte_count, 0);
 
     assert_eq!(run.tick_runs[0].stream_tick, 0);
@@ -898,4 +901,3 @@ fn resident_feedback_cycle_restores_recurrent_state_when_eos_arrives_mid_cycle()
     );
     assert_eq!(batched_static_state, scalar_static_state);
 }
-

@@ -426,6 +426,19 @@ pub struct RuntimePromptBenchmarkReport {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeFeedbackExecutionReport {
+    pub window_count: usize,
+    pub planned_tick_count: usize,
+    pub submitted_tick_count: usize,
+    pub executed_tick_count: usize,
+    pub retained_tick_count: usize,
+    pub sampled_tick_count: usize,
+    pub discarded_tick_count: usize,
+    pub template_record_count: usize,
+    pub template_replay_count: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimePlacedPromptRunReport {
     pub ok: bool,
     pub execution_mode: String,
@@ -463,4 +476,5 @@ pub struct RuntimePlacedPromptRunReport {
     pub speculative_draft_time_ns: u64,
     pub speculative_target_verification_time_ns: u64,
     pub speculative_draft_catch_up_time_ns: u64,
+    pub resident_feedback: RuntimeFeedbackExecutionReport,
 }

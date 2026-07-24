@@ -746,6 +746,17 @@
             speculative_draft_time_ns: 0,
             speculative_target_verification_time_ns: 0,
             speculative_draft_catch_up_time_ns: 0,
+            resident_feedback: RuntimeFeedbackExecutionReport {
+                window_count: 1,
+                planned_tick_count: 7,
+                submitted_tick_count: 7,
+                executed_tick_count: 3,
+                retained_tick_count: 3,
+                sampled_tick_count: 2,
+                discarded_tick_count: 4,
+                template_record_count: 1,
+                template_replay_count: 0,
+            },
         };
         let benchmark_transport = RuntimePromptBenchmarkTransportTotalsReport {
             published_packet_count: 0,
@@ -846,6 +857,8 @@
             placed_payload["component_timing_summaries"][0]["total_run_time_ns"],
             90
         );
+        assert_eq!(placed_payload["resident_feedback"]["planned_tick_count"], 7);
+        assert_eq!(placed_payload["resident_feedback"]["discarded_tick_count"], 4);
         assert_eq!(benchmark_payload["profile_runs"], 1);
         assert_eq!(benchmark_payload["run_time_ns"]["average"], 90.0);
         assert_eq!(

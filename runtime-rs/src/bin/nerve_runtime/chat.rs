@@ -266,6 +266,7 @@ struct RuntimeChatTurn {
     speculative_draft_time_ns: u64,
     speculative_target_verification_time_ns: u64,
     speculative_draft_catch_up_time_ns: u64,
+    resident_feedback: RuntimeFeedbackExecutionReport,
 }
 
 fn run_chat_repl<C, T, F>(
@@ -380,6 +381,7 @@ where
                 turn.speculative_target_verification_time_ns,
                 turn.speculative_draft_catch_up_time_ns,
             );
+            print_runtime_feedback_stats(&turn.resident_feedback);
             chat_session.commit_assistant_turn(input_text, &assistant_content);
             Ok(true)
         }

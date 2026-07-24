@@ -166,6 +166,13 @@ fn run_placed_chat(
                     .run
                     .speculative_decode
                     .draft_catch_up_time_ns,
+                resident_feedback: runtime_feedback_execution_report(
+                    submitted_run
+                        .submitted_run
+                        .session_run
+                        .run
+                        .resident_feedback,
+                ),
             })
         },
     )
@@ -323,7 +330,24 @@ fn execute_placed_prompt_run(
         speculative_draft_time_ns: run.speculative_decode.draft_time_ns,
         speculative_target_verification_time_ns: run.speculative_decode.target_verification_time_ns,
         speculative_draft_catch_up_time_ns: run.speculative_decode.draft_catch_up_time_ns,
+        resident_feedback: runtime_feedback_execution_report(run.resident_feedback),
     })
+}
+
+fn runtime_feedback_execution_report(
+    stats: VulkanResidentFeedbackExecutionStats,
+) -> RuntimeFeedbackExecutionReport {
+    RuntimeFeedbackExecutionReport {
+        window_count: stats.window_count,
+        planned_tick_count: stats.planned_tick_count,
+        submitted_tick_count: stats.submitted_tick_count,
+        executed_tick_count: stats.executed_tick_count,
+        retained_tick_count: stats.retained_tick_count,
+        sampled_tick_count: stats.sampled_tick_count,
+        discarded_tick_count: stats.discarded_tick_count,
+        template_record_count: stats.template_record_count,
+        template_replay_count: stats.template_replay_count,
+    }
 }
 
 fn print_placed_prompt_report(
@@ -338,6 +362,7 @@ fn print_placed_prompt_report(
         print_text(&report.output_text);
         print_runtime_timing_stats("stats", &report.timing);
         print_runtime_execution_counters(&vulkan_resident_execution_counters());
+        print_runtime_feedback_stats(&report.resident_feedback);
         print_speculative_profile(report);
         print_placed_component_timing_profile(&report.component_timing_summaries, 5);
     }

@@ -1,0 +1,51 @@
+#version 450
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) buffer FeedbackControl {
+    uint words[];
+} feedback_control;
+
+layout(set = 0, binding = 1) buffer StreamControl {
+    uint words[];
+} stream_control;
+
+void zero_dispatch(uint dispatch_index) {
+    uint word = feedback_control.words[4] + dispatch_index * 3u;
+    feedback_control.words[word] = 0u;
+    feedback_control.words[word + 1u] = 0u;
+    feedback_control.words[word + 2u] = 0u;
+}
+
+void main() {
+    if ((feedback_control.words[0] & 1u) == 0u) {
+        return;
+    }
+
+    atomicAdd(feedback_control.words[1], 1u);
+    if (feedback_control.words[2] == 0u) {
+        return;
+    }
+
+    uint drain = feedback_control.words[8];
+    if (drain == 2u) {
+        uint tail_start = feedback_control.words[6];
+        uint tail_count = feedback_control.words[7];
+        for (uint index = 0u; index < tail_count; index += 1u) {
+            zero_dispatch(tail_start + index);
+        }
+        feedback_control.words[8] = 1u;
+    } else if (drain == 1u) {
+        uint next_tick_low = stream_control.words[1] + 1u;
+        if (next_tick_low == 0u) {
+            stream_control.words[2] += 1u;
+        }
+        stream_control.words[1] = next_tick_low;
+        uint dispatch_count = feedback_control.words[5];
+        for (uint index = 0u; index < dispatch_count; index += 1u) {
+            zero_dispatch(index);
+        }
+        feedback_control.words[8] = 0u;
+    }
+    memoryBarrierBuffer();
+}

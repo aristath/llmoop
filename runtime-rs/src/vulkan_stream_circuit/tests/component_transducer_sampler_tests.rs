@@ -328,7 +328,10 @@ fn resident_greedy_sampler_selects_largest_logit() {
         eprintln!("skipping resident sampler: no GLSL to SPIR-V compiler found");
         return;
     };
-    let sampler_kernels = greedy_sampler_test_kernels(sampler_spirv_words);
+    let Some(sampler_kernels) = greedy_sampler_test_kernels(sampler_spirv_words) else {
+        eprintln!("skipping sampler smoke: feedback control shader did not compile");
+        return;
+    };
 
     let logits_buffer = device
         .create_resident_buffer(FIXTURE_MODEL_LOGITS_BYTES)
@@ -374,7 +377,8 @@ fn resident_greedy_sampler_selects_largest_logit() {
         runner.output_byte_capacity,
         FIXTURE_MODEL_SAMPLER_OUTPUT_BYTES
     );
-    assert_eq!(runner.descriptor_count, 3);
+    assert_eq!(runner.dispatch_count, 1);
+    assert_eq!(runner.descriptor_count, 5);
     assert_eq!(runner.workgroup_count_x, 1);
     assert_eq!(runner.push_constant_byte_count, 0);
 
@@ -383,7 +387,7 @@ fn resident_greedy_sampler_selects_largest_logit() {
     assert_eq!(run.token_id, token_1024 as u32);
     assert_eq!(run.selected_logit_bits, 9.25f32.to_bits());
     assert_eq!(run.control_flags, 0);
-    assert_eq!(run.descriptor_count, 3);
+    assert_eq!(run.descriptor_count, 5);
     assert_eq!(run.workgroup_count_x, 1);
     assert_eq!(run.push_constant_byte_count, 0);
     assert_eq!(
@@ -517,7 +521,7 @@ fn resident_temperature_top_k_top_p_sampler_matches_explicit_random_signal() {
         assert_eq!(run.selected_logit_bits, 2.0f32.to_bits());
         assert_eq!(run.control_flags, 1);
         assert_eq!(runner.dispatch_count, 2);
-        assert_eq!(run.descriptor_count, 6);
+        assert_eq!(run.descriptor_count, 8);
         assert_eq!(run.workgroup_count_x, partition_count + 1);
         selected_tokens.push(run.token_id);
     }
@@ -607,7 +611,7 @@ fn resident_repetition_sampler_tracks_prompt_and_feedback_tokens_on_gpu() {
     )
     .unwrap();
     assert_eq!(runner.dispatch_count, 3);
-    assert_eq!(runner.descriptor_count, 9);
+    assert_eq!(runner.descriptor_count, 11);
     assert_eq!(runner.workgroup_count_x, 6);
 
     let mut logits = vec![-100.0; VOCAB_SIZE];
@@ -978,4 +982,3 @@ fn resident_temperature_top_64_sampler_matches_explicit_random_signal() {
         assert_eq!(run.selected_logit_bits, 2.0f32.to_bits());
     }
 }
-

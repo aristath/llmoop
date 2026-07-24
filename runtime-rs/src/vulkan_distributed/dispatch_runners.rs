@@ -262,6 +262,7 @@ impl VulkanDistributedDispatchRunners {
                     planned: planned_shards,
                     resident_dispatches,
                     sequence,
+                    feedback_sequence: None,
                 });
                 shard_count = shard_count
                     .checked_add(planned_group.dispatches.len())
@@ -421,6 +422,58 @@ impl VulkanDistributedDispatchRunners {
         Ok(())
     }
 
+    pub(crate) fn configure_feedback_indirect_dispatches<'a, F, E>(
+        &mut self,
+        control: &mut VulkanResidentFeedbackControlPlane,
+        mut device_for: F,
+    ) -> Result<(), VulkanDistributedDispatchRunnerError>
+    where
+        F: FnMut(&str) -> Result<&'a VulkanComputeDevice, E>,
+        E: Display,
+    {
+        for dispatch in &mut self.dispatches {
+            for shard in &mut dispatch.shards {
+                let device = device_for(&shard.device_id).map_err(|error| {
+                    VulkanDistributedDispatchRunnerError(format!(
+                        "failed to resolve feedback shard device {:?}: {error}",
+                        shard.device_id
+                    ))
+                })?;
+                let indirect = control
+                    .register_sequence(&shard.device_id, &shard.resident_dispatches)
+                    .map_err(VulkanDistributedDispatchRunnerError::from)?;
+                let push_constants = shard
+                    .planned
+                    .iter()
+                    .map(|planned| planned.base_workgroup_z.to_le_bytes())
+                    .collect::<Vec<_>>();
+                let steps = shard
+                    .resident_dispatches
+                    .iter()
+                    .zip(&push_constants)
+                    .zip(&indirect.byte_offsets)
+                    .map(|((resident_dispatch, push_constants), byte_offset)| {
+                        VulkanResidentKernelSequenceStep::new_indirect(
+                            resident_dispatch,
+                            push_constants,
+                            &indirect.buffer,
+                            *byte_offset,
+                        )
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(VulkanDistributedDispatchRunnerError::from)?;
+                let sequence = device
+                    .create_resident_kernel_sequence()
+                    .map_err(VulkanDistributedDispatchRunnerError::from)?;
+                device
+                    .record_resident_kernel_sequence(&sequence, &steps)
+                    .map_err(VulkanDistributedDispatchRunnerError::from)?;
+                shard.feedback_sequence = Some(sequence);
+            }
+        }
+        Ok(())
+    }
+
     pub fn owner_ready_signal_points(
         &self,
         owner_device_id: &str,
@@ -474,6 +527,7 @@ impl VulkanDistributedDispatchRunners {
             consume_owner_ready_signal,
             prepare_owner_continuation,
             signal_completion,
+            use_feedback_indirect,
         } = submission;
         let dispatch = self.dispatch(owner_device_id, dispatch_index).ok_or_else(|| {
             VulkanDistributedDispatchRunnerError(format!(
@@ -494,9 +548,22 @@ impl VulkanDistributedDispatchRunners {
                     })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let mut submitted: Vec<(&VulkanComputeDevice, &VulkanDistributedDispatchShardRunner)> =
-            Vec::with_capacity(dispatch.shards.len());
+        let mut submitted: Vec<(
+            &VulkanComputeDevice,
+            &VulkanDistributedDispatchShardRunner,
+            &VulkanResidentKernelSequence,
+        )> = Vec::with_capacity(dispatch.shards.len());
         for (shard, device) in resolved_shards {
+            let sequence = if use_feedback_indirect {
+                shard.feedback_sequence.as_ref().ok_or_else(|| {
+                    VulkanDistributedDispatchRunnerError(format!(
+                        "distributed feedback shard on {:?} has no indirect sequence",
+                        shard.device_id
+                    ))
+                })?
+            } else {
+                &shard.sequence
+            };
             let synchronization = dispatch
                 .helper_synchronization
                 .iter()
@@ -522,28 +589,27 @@ impl VulkanDistributedDispatchRunners {
             let submission = if let Some(submission_batch) = submission_batch {
                 submission_batch.enqueue_recorded_sequence(
                     device,
-                    &shard.sequence,
+                    sequence,
                     &wait_points,
                     &signal_points,
                     signal_completion,
                 )
             } else if signal_completion {
                 device.submit_recorded_resident_kernel_sequence_with_timeline_semaphores(
-                    &shard.sequence,
+                    sequence,
                     &wait_points,
                     &signal_points,
                 )
             } else {
                 device.submit_recorded_resident_kernel_sequence_unfenced_with_timeline_semaphores(
-                    &shard.sequence,
+                    sequence,
                     &wait_points,
                     &signal_points,
                 )
             };
             if let Err(error) = submission {
-                for (submitted_device, submitted_shard) in &submitted {
-                    let _ =
-                        submitted_device.wait_resident_kernel_sequence(&submitted_shard.sequence);
+                for (submitted_device, _, submitted_sequence) in &submitted {
+                    let _ = submitted_device.wait_resident_kernel_sequence(submitted_sequence);
                 }
                 return Err(VulkanDistributedDispatchRunnerError(format!(
                     "failed to submit distributed dispatch {}.{} shard on {:?}: {error}",
@@ -552,7 +618,7 @@ impl VulkanDistributedDispatchRunners {
                     shard.device_id
                 )));
             }
-            submitted.push((device, shard));
+            submitted.push((device, shard, sequence));
         }
 
         Ok(VulkanDistributedDispatchRun {
@@ -749,6 +815,7 @@ pub struct VulkanDistributedDispatchShardRunner {
     pub planned: Vec<VulkanDistributedDispatchShard>,
     pub resident_dispatches: Vec<VulkanResidentKernelDispatch>,
     pub sequence: VulkanResidentKernelSequence,
+    feedback_sequence: Option<VulkanResidentKernelSequence>,
 }
 
 struct VulkanDistributedDispatchHelperSynchronization {

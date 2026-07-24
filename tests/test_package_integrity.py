@@ -621,6 +621,7 @@ def test_shader_templates_compile_to_vulkan_1_4_spirv(tmp_path: Path) -> None:
         "greedy_sampler_runtime_f32_32000.comp",
         "temperature_top_k_candidates_runtime_f32_32000_kc256_g128_l256.comp",
         "temperature_top_k_top_p_sampler_runtime_f32_kc256_g128_l256.comp",
+        "resident_feedback_control.comp",
     }
     shader_dir = tmp_path / "shaders"
     copy_shader_templates(shader_source_dir, shader_dir, shader_files)

@@ -633,7 +633,7 @@ fn placed_model_package_runs_split_single_token_tick_and_sampler() {
     );
     assert_eq!(run.tick_run.placed_run.completed_stage_delta, 204);
     assert_eq!(run.tick_run.output_run.as_ref().unwrap().dispatch_count, 2);
-    assert_eq!(run.sampler_run.descriptor_count, 3);
+    assert_eq!(run.sampler_run.descriptor_count, 5);
     assert_eq!(run.sampler_run.token_id, 1);
     assert_eq!(run.sampler_run.selected_logit_bits, 1_100_541_195);
 
@@ -769,4 +769,3 @@ fn placed_model_package_drains_split_prompt_event_before_feedback() {
     assert_eq!(run.transport_stats.direct_receive_count, 6);
     assert_eq!(run.transport_stats.direct_receive_byte_count, 12_288);
 }
-
