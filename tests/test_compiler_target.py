@@ -32,6 +32,8 @@ def device_payload(
         "subgroup_size": 32,
         "max_compute_work_group_invocations": 1024,
         "max_compute_work_group_size_x": 1024,
+        "cooperative_bfloat16_shapes": [[16, 16, 16]],
+        "cooperative_float8_e4m3_shapes": [[16, 16, 32]],
     }
 
 
@@ -69,6 +71,8 @@ def test_compiler_target_preserves_dtype_supported_by_any_gpu() -> None:
         target.to_json()["devices"][0]["max_compute_work_group_invocations"]
         == 1024
     )
+    assert target.devices[0].cooperative_bfloat16_shapes == ((16, 16, 16),)
+    assert target.devices[0].cooperative_float8_e4m3_shapes == ((16, 16, 32),)
 
 
 def test_compiler_target_ignores_cpu_vulkan_devices_and_requires_a_gpu() -> None:

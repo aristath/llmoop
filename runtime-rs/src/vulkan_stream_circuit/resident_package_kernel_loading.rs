@@ -277,6 +277,9 @@ fn batch_device_requirements_are_supported(
             .cooperative_bfloat16_shape
             .is_none_or(|[m, n, k]| device.supports_cooperative_bfloat16_shape(m, n, k))
         && requirements
+            .cooperative_float8_e4m3_shape
+            .is_none_or(|[m, n, k]| device.supports_cooperative_float8_e4m3_shape(m, n, k))
+        && requirements
             .subgroup_size
             .is_none_or(|subgroup_size| device.subgroup_size() == subgroup_size)
 }

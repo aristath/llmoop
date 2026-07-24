@@ -72,6 +72,10 @@ fn validate_component_executions(
                             .is_none_or(|shape| shape.into_iter().all(|dimension| dimension > 0))
                         && implementation
                             .device_requirements
+                            .cooperative_float8_e4m3_shape
+                            .is_none_or(|shape| shape.into_iter().all(|dimension| dimension > 0))
+                        && implementation
+                            .device_requirements
                             .subgroup_size
                             .is_none_or(|subgroup_size| subgroup_size > 0)
                 });

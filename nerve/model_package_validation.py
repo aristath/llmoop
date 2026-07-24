@@ -492,6 +492,11 @@ def valid_batch_implementation(implementation: Any) -> bool:
         requirements.get("subgroup_operations") if requirements else None
     )
     shape = requirements.get("cooperative_bfloat16_shape") if requirements else None
+    float8_shape = (
+        requirements.get("cooperative_float8_e4m3_shape")
+        if requirements
+        else None
+    )
     subgroup_size = requirements.get("subgroup_size") if requirements else None
     stages = implementation.get("stages")
     return (
@@ -527,6 +532,19 @@ def valid_batch_implementation(implementation: Any) -> bool:
                     and not isinstance(dimension, bool)
                     and dimension > 0
                     for dimension in shape
+                )
+            )
+        )
+        and (
+            float8_shape is None
+            or (
+                isinstance(float8_shape, list)
+                and len(float8_shape) == 3
+                and all(
+                    isinstance(dimension, int)
+                    and not isinstance(dimension, bool)
+                    and dimension > 0
+                    for dimension in float8_shape
                 )
             )
         )
@@ -1078,5 +1096,4 @@ def package_artifact_path(package_dir: Path, value: Any, label: str) -> Path:
             f"compiled package {label} path must stay inside the package: {value!r}"
         )
     return package_dir / relative
-
 

@@ -651,6 +651,33 @@ fn physical_device_cooperative_bfloat16_shapes(
     instance: &ash::Instance,
     physical_device: vk::PhysicalDevice,
 ) -> Result<BTreeSet<(u32, u32, u32)>, VulkanError> {
+    physical_device_cooperative_matrix_shapes(
+        entry,
+        instance,
+        physical_device,
+        vk::ComponentTypeKHR::from_raw(VK_COMPONENT_TYPE_BFLOAT16_KHR),
+    )
+}
+
+fn physical_device_cooperative_float8_e4m3_shapes(
+    entry: &Entry,
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+) -> Result<BTreeSet<(u32, u32, u32)>, VulkanError> {
+    physical_device_cooperative_matrix_shapes(
+        entry,
+        instance,
+        physical_device,
+        vk::ComponentTypeKHR::from_raw(VK_COMPONENT_TYPE_FLOAT8_E4M3_EXT),
+    )
+}
+
+fn physical_device_cooperative_matrix_shapes(
+    entry: &Entry,
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+    input_type: vk::ComponentTypeKHR,
+) -> Result<BTreeSet<(u32, u32, u32)>, VulkanError> {
     let cooperative_matrix = ash::khr::cooperative_matrix::Instance::new(entry, instance);
     let properties = unsafe {
         cooperative_matrix
@@ -661,12 +688,11 @@ fn physical_device_cooperative_bfloat16_shapes(
                 ))
             })?
     };
-    let bfloat16 = vk::ComponentTypeKHR::from_raw(VK_COMPONENT_TYPE_BFLOAT16_KHR);
     Ok(properties
         .into_iter()
         .filter(|property| {
-            property.a_type == bfloat16
-                && property.b_type == bfloat16
+            property.a_type == input_type
+                && property.b_type == input_type
                 && property.c_type == vk::ComponentTypeKHR::FLOAT32
                 && property.result_type == vk::ComponentTypeKHR::FLOAT32
                 && property.scope == vk::ScopeKHR::SUBGROUP

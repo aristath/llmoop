@@ -357,6 +357,25 @@ mod tests {
     }
 
     #[test]
+    fn spirv_contract_extracts_every_feature_used_by_cooperative_float8() {
+        let words = spirv_test_module(&[1, 39, 4212, 4213, 4448, 5345, 6022], 3);
+
+        let requirements = vulkan_spirv_requirements(&words).unwrap();
+
+        assert_eq!(
+            requirements.shader_features,
+            BTreeSet::from([
+                VulkanShaderFeature::ShaderInt8,
+                VulkanShaderFeature::StorageBuffer8BitAccess,
+                VulkanShaderFeature::ShaderFloat8,
+                VulkanShaderFeature::ShaderFloat8CooperativeMatrix,
+                VulkanShaderFeature::VulkanMemoryModel,
+                VulkanShaderFeature::CooperativeMatrix,
+            ])
+        );
+    }
+
+    #[test]
     fn spirv_contract_extracts_native_bfloat16_mixed_dot_product_feature() {
         let words = spirv_test_module(&[1, 5116, 6914], 1);
 

@@ -60,6 +60,40 @@ impl VulkanComputeDeviceCatalog {
                     &self.context.instance,
                     physical_device,
                 );
+                let shader_features = physical_device_supported_shader_features(
+                    &self.context.instance,
+                    physical_device,
+                )?;
+                let cooperative_bfloat16_shapes = if BTreeSet::from([
+                    VulkanShaderFeature::CooperativeMatrix,
+                    VulkanShaderFeature::ShaderBfloat16Type,
+                    VulkanShaderFeature::ShaderBfloat16CooperativeMatrix,
+                ])
+                .is_subset(&shader_features)
+                {
+                    physical_device_cooperative_bfloat16_shapes(
+                        &self.context._entry,
+                        &self.context.instance,
+                        physical_device,
+                    )?
+                } else {
+                    BTreeSet::new()
+                };
+                let cooperative_float8_e4m3_shapes = if BTreeSet::from([
+                    VulkanShaderFeature::CooperativeMatrix,
+                    VulkanShaderFeature::ShaderFloat8,
+                    VulkanShaderFeature::ShaderFloat8CooperativeMatrix,
+                ])
+                .is_subset(&shader_features)
+                {
+                    physical_device_cooperative_float8_e4m3_shapes(
+                        &self.context._entry,
+                        &self.context.instance,
+                        physical_device,
+                    )?
+                } else {
+                    BTreeSet::new()
+                };
                 Ok(VulkanComputeTargetCapabilities {
                     physical_device_index: device.physical_device_index,
                     physical_device_id: device.physical_device_id.clone(),
@@ -67,10 +101,7 @@ impl VulkanComputeDeviceCatalog {
                     device_type: device.device_type.clone(),
                     vendor_id: device.vendor_id,
                     device_id: device.device_id,
-                    shader_features: physical_device_supported_shader_features(
-                        &self.context.instance,
-                        physical_device,
-                    )?,
+                    shader_features,
                     subgroup_operations: subgroup_operations(
                         subgroup.supported_operations,
                     ),
@@ -84,6 +115,8 @@ impl VulkanComputeDeviceCatalog {
                     max_compute_work_group_size_x: properties
                         .limits
                         .max_compute_work_group_size[0],
+                    cooperative_bfloat16_shapes,
+                    cooperative_float8_e4m3_shapes,
                 })
             })
             .collect()
@@ -174,6 +207,20 @@ impl VulkanComputeDeviceCatalog {
             } else {
                 BTreeSet::new()
             };
+            let cooperative_float8_e4m3_features_supported =
+                cooperative_matrix_supported
+                    && shader_float8_support.shader_float8
+                    && shader_float8_support.shader_float8_cooperative_matrix;
+            let cooperative_float8_e4m3_shapes =
+                if cooperative_float8_e4m3_features_supported {
+                    physical_device_cooperative_float8_e4m3_shapes(
+                        &self.context._entry,
+                        instance,
+                        physical_device,
+                    )?
+                } else {
+                    BTreeSet::new()
+                };
             let shared_host_memory_alignment =
                 if physical_device_supports_extension(
                     instance,
@@ -408,6 +455,7 @@ impl VulkanComputeDeviceCatalog {
                 shared_host_memory_alignment,
                 opaque_fd_timeline_semaphore_supported,
                 cooperative_bfloat16_shapes,
+                cooperative_float8_e4m3_shapes,
                 subgroup_size,
                 subgroup_supported_stages: subgroup_support.supported_stages,
                 subgroup_supported_operations: subgroup_support.supported_operations,

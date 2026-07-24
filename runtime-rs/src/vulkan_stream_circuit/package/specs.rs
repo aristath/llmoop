@@ -144,6 +144,8 @@ pub struct VulkanResidentVulkanDeviceRequirements {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cooperative_bfloat16_shape: Option<[u32; 3]>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cooperative_float8_e4m3_shape: Option<[u32; 3]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subgroup_size: Option<u32>,
 }
 

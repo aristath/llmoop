@@ -51,6 +51,10 @@ impl VulkanComputeDevice {
         self.cooperative_bfloat16_shapes.contains(&(m, n, k))
     }
 
+    pub fn supports_cooperative_float8_e4m3_shape(&self, m: u32, n: u32, k: u32) -> bool {
+        self.cooperative_float8_e4m3_shapes.contains(&(m, n, k))
+    }
+
     pub fn subgroup_size(&self) -> u32 {
         self.subgroup_size
     }

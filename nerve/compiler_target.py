@@ -25,6 +25,8 @@ class CompilerTargetDevice:
     shader_features: frozenset[str]
     max_compute_work_group_invocations: int
     max_compute_work_group_size_x: int
+    cooperative_bfloat16_shapes: tuple[tuple[int, int, int], ...]
+    cooperative_float8_e4m3_shapes: tuple[tuple[int, int, int], ...]
 
     @classmethod
     def from_json(cls, payload: Json) -> CompilerTargetDevice:
@@ -42,6 +44,12 @@ class CompilerTargetDevice:
                 ),
                 max_compute_work_group_size_x=int(
                     payload["max_compute_work_group_size_x"]
+                ),
+                cooperative_bfloat16_shapes=cooperative_matrix_shapes(
+                    payload, "cooperative_bfloat16_shapes"
+                ),
+                cooperative_float8_e4m3_shapes=cooperative_matrix_shapes(
+                    payload, "cooperative_float8_e4m3_shapes"
                 ),
             )
         except (KeyError, TypeError, ValueError) as error:
@@ -66,6 +74,12 @@ class CompilerTargetDevice:
                 self.max_compute_work_group_invocations
             ),
             "max_compute_work_group_size_x": self.max_compute_work_group_size_x,
+            "cooperative_bfloat16_shapes": [
+                list(shape) for shape in self.cooperative_bfloat16_shapes
+            ],
+            "cooperative_float8_e4m3_shapes": [
+                list(shape) for shape in self.cooperative_float8_e4m3_shapes
+            ],
         }
 
 
@@ -115,6 +129,8 @@ class CompilerTarget:
                 shader_features=frozenset(features),
                 max_compute_work_group_invocations=1024,
                 max_compute_work_group_size_x=1024,
+                cooperative_bfloat16_shapes=(),
+                cooperative_float8_e4m3_shapes=(),
             )
             for index, features in enumerate(feature_sets)
         )
@@ -144,6 +160,38 @@ def native_dtype_shader_features(dtype: str) -> frozenset[str] | None:
             }
         ),
     }.get(dtype)
+
+
+def cooperative_matrix_shapes(
+    payload: Json, field: str
+) -> tuple[tuple[int, int, int], ...]:
+    raw_shapes = payload[field]
+    if not isinstance(raw_shapes, list):
+        raise ModelCompileError(
+            f"runtime compiler target device {field!r} must be a list"
+        )
+    shapes: list[tuple[int, int, int]] = []
+    for raw_shape in raw_shapes:
+        if (
+            not isinstance(raw_shape, list)
+            or len(raw_shape) != 3
+            or any(
+                not isinstance(dimension, int)
+                or isinstance(dimension, bool)
+                or dimension <= 0
+                for dimension in raw_shape
+            )
+        ):
+            raise ModelCompileError(
+                f"runtime compiler target device has invalid {field!r}: "
+                f"{raw_shapes!r}"
+            )
+        shapes.append(tuple(raw_shape))
+    if shapes != sorted(set(shapes)):
+        raise ModelCompileError(
+            f"runtime compiler target device {field!r} must be unique and sorted"
+        )
+    return tuple(shapes)
 
 
 def discover_compiler_target(
