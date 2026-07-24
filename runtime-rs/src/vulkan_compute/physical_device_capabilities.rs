@@ -735,16 +735,31 @@ unsafe fn compute_queue_family_indices(
     instance: &ash::Instance,
     physical_device: vk::PhysicalDevice,
 ) -> Vec<u32> {
-    unsafe { instance.get_physical_device_queue_family_properties(physical_device) }
+    preferred_compute_queue_family_indices(unsafe {
+        instance.get_physical_device_queue_family_properties(physical_device)
+    })
+}
+
+fn preferred_compute_queue_family_indices(
+    queue_families: Vec<vk::QueueFamilyProperties>,
+) -> Vec<u32> {
+    let mut indices = queue_families
         .iter()
         .enumerate()
         .filter_map(|(index, family)| {
-            family
-                .queue_flags
-                .contains(vk::QueueFlags::COMPUTE)
-                .then_some(index as u32)
+            (family.queue_count > 0
+                && family.queue_flags.contains(vk::QueueFlags::COMPUTE))
+            .then_some(index as u32)
         })
-        .collect()
+        .collect::<Vec<_>>();
+    indices.sort_by_key(|index| {
+        let family = &queue_families[*index as usize];
+        (
+            family.queue_flags.contains(vk::QueueFlags::GRAPHICS),
+            *index,
+        )
+    });
+    indices
 }
 
 fn vulkan_device_type_label(device_type: vk::PhysicalDeviceType) -> &'static str {

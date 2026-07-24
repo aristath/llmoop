@@ -156,6 +156,56 @@ mod tests {
 
     use super::*;
 
+    fn queue_family(
+        queue_flags: vk::QueueFlags,
+        queue_count: u32,
+    ) -> vk::QueueFamilyProperties {
+        vk::QueueFamilyProperties {
+            queue_flags,
+            queue_count,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn compute_queue_selection_prefers_a_non_graphics_family() {
+        let queue_families = vec![
+            queue_family(vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE, 1),
+            queue_family(vk::QueueFlags::COMPUTE | vk::QueueFlags::TRANSFER, 1),
+        ];
+
+        assert_eq!(
+            preferred_compute_queue_family_indices(queue_families),
+            vec![1, 0]
+        );
+    }
+
+    #[test]
+    fn compute_queue_selection_falls_back_to_a_universal_family() {
+        let queue_families = vec![
+            queue_family(vk::QueueFlags::TRANSFER, 1),
+            queue_family(vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE, 1),
+        ];
+
+        assert_eq!(
+            preferred_compute_queue_family_indices(queue_families),
+            vec![1]
+        );
+    }
+
+    #[test]
+    fn compute_queue_selection_ignores_families_without_queues() {
+        let queue_families = vec![
+            queue_family(vk::QueueFlags::COMPUTE, 0),
+            queue_family(vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE, 1),
+        ];
+
+        assert_eq!(
+            preferred_compute_queue_family_indices(queue_families),
+            vec![1]
+        );
+    }
+
     fn buffer_access(
         buffer: u64,
         access: VulkanResidentKernelBufferAccess,
