@@ -270,6 +270,24 @@ fn component_batch_execution_rejects_noncontiguous_dispatch_steps() {
     assert!(error.to_string().contains("starts at step 3, expected 2"));
 }
 
+#[test]
+fn component_batch_execution_marks_only_mutating_state_descriptors_as_commits() {
+    assert!(!component_batch_descriptors_commit_state(
+        [
+            VulkanKernelDescriptorUsage::InputSignal,
+            VulkanKernelDescriptorUsage::StateRead,
+            VulkanKernelDescriptorUsage::Parameter,
+        ]
+        .iter()
+    ));
+    assert!(component_batch_descriptors_commit_state(
+        [VulkanKernelDescriptorUsage::StateWrite].iter()
+    ));
+    assert!(component_batch_descriptors_commit_state(
+        [VulkanKernelDescriptorUsage::StateView].iter()
+    ));
+}
+
 const FIXTURE_MODEL_FRAME_BYTES: usize = FIXTURE_MODEL_HIDDEN_SIZE * 2;
 const FIXTURE_MODEL_LOGITS_BYTES: usize = 65_536 * 4;
 const FIXTURE_MODEL_SAMPLER_OUTPUT_BYTES: usize = 16;

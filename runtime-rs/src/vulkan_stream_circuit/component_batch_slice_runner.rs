@@ -275,13 +275,12 @@ impl VulkanResidentComponentBatchSliceRunner {
         let mut dispatch_spans = Vec::with_capacity(slice.mounted_bound.dispatches.len());
         for dispatch in &slice.mounted_bound.dispatches {
             let dispatch_step_start = steps.len();
-            let commits_state = dispatch.descriptors.iter().any(|descriptor| {
-                matches!(
-                    descriptor.usage,
-                    VulkanKernelDescriptorUsage::StateWrite
-                        | VulkanKernelDescriptorUsage::StateView
-                )
-            });
+            let commits_state = component_batch_descriptors_commit_state(
+                dispatch
+                    .descriptors
+                    .iter()
+                    .map(|descriptor| &descriptor.usage),
+            );
             if distributed_execution_plan
                 .dispatches
                 .iter()

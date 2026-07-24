@@ -7,6 +7,17 @@ struct VulkanComponentBatchDispatchStep {
     snapshot_state_buffer_indices: BTreeSet<usize>,
 }
 
+fn component_batch_descriptors_commit_state<'a>(
+    usages: impl IntoIterator<Item = &'a VulkanKernelDescriptorUsage>,
+) -> bool {
+    usages.into_iter().any(|usage| {
+        matches!(
+            usage,
+            VulkanKernelDescriptorUsage::StateWrite | VulkanKernelDescriptorUsage::StateView
+        )
+    })
+}
+
 #[derive(Clone, Copy)]
 enum VulkanComponentBatchStateSemantics<'a> {
     IndependentCandidates(&'a VulkanResidentStateTransactionBank),
