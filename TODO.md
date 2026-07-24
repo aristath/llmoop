@@ -53,7 +53,73 @@ signal path:
 The host should inject input/control events and drain public output/control
 events. It should not be required to schedule every generated token.
 
-### 2. Build genuinely optimized shape- and dtype-specific kernel families
+### 2. Preserve modular layer anatomy through compilation
+
+Make every logical source layer a modular pedal before changing its execution
+further. Compilation must retain three related but distinct representations:
+
+```text
+semantic module tree
+        |
+        v
+lowered semantic execution graph
+        |
+        v
+optimized physical execution graph
+```
+
+The semantic module tree is the model anatomy exposed to the editor. The lowered
+graph makes dataflow, parameters, state reads and writes, and transition ordering
+explicit. The optimized graph may fuse, split, tile, reorder, or replace lowered
+regions for a backend. A semantic module boundary is not automatically a kernel,
+submission, placement, synchronization, or intermediate-buffer boundary.
+
+- Keep the source layer as the top-level graph-editing, repetition, removal,
+  placement, and state-policy pedal.
+- Give each layer a stable, recursively expandable module tree. At minimum,
+  distinguish its token-mixer block, feature-transform block, normalizations,
+  residual paths, projections, gates, position operations, and state
+  attachments.
+- Represent attention KV, recurrent matrices, convolution history, and similar
+  memory as state owned by the relevant mixer module, not as peer top-level
+  pedals.
+- Represent sparse MoE routing, selected expert bank, shared expert, reduction,
+  and residual as submodules of the layer's feature-transform block. Allow the
+  expert bank to expand into individual experts without making every expert a
+  top-level pedal.
+- Define a versioned module-tree schema with stable module IDs, roles, child
+  modules, source-node membership, parameter references, state ownership, and
+  module input/output contracts.
+- Construct exact module membership while lowering each supported layer family;
+  do not recover it later from node-name prefixes.
+- Validate unique module IDs, complete and unambiguous source-node coverage,
+  parent/child containment, valid parameter and state references, and root
+  coverage of the layer.
+- Preserve the semantic tree when producing optimized candidate circuits.
+  Continue using source-node provenance such as `compiled_from` to associate a
+  fused physical node with one or more semantic modules.
+- Carry normalized source-node provenance into packaged kernel metadata so
+  profiling, inspection, and future transformations can attribute physical work
+  to semantic modules even when fusion crosses their boundaries.
+- Add the module tree to the Rust circuit schema and editor model without
+  changing flat-node execution planning or the one-kernel-per-optimized-node
+  package contract.
+- Make the layer pedal expandable in the UI. Show each submodule's responsibility,
+  parameters, owned state, semantic nodes, optimized nodes, kernels, and measured
+  cost where available.
+- Treat layer clusters as composite editor groupings over layer pedals rather
+  than replacing the layer as the compiled component boundary.
+- Recompile packages after the compiler contract changes and add sequential,
+  non-GPU schema, lowering, optimizer-provenance, package, editor, and UI tests
+  for attention, convolution, gated-delta, RG-LRU, dense FFN, and sparse MoE
+  layers.
+
+This representation is the prerequisite for component-by-component
+experimentation. A future transformation can select a semantic module, replace
+its expression or representation, lower it again, verify its boundary behavior,
+and still allow the backend to optimize across semantic boundaries.
+
+### 3. Build genuinely optimized shape- and dtype-specific kernel families
 
 Kernel selection exists, but important paths still use generic or matvec-shaped
 work where the workload calls for a different implementation.
@@ -92,7 +158,7 @@ work where the workload calls for a different implementation.
 - Maintain correctness tests and representative microbenchmarks for every
   optimized family.
 
-### 3. Replace fixed one-component submission quanta with calibrated work quanta
+### 4. Replace fixed one-component submission quanta with calibrated work quanta
 
 The current conservative submission boundary avoids long graphics-ring jobs but
 leaves substantial scheduling and submission overhead.
@@ -107,7 +173,7 @@ leaves substantial scheduling and submission overhead.
 - Expose quantum size, estimated cost, actual duration, and forced-yield metrics
   in normal runtime statistics.
 
-### 4. Execute scheduler batches as real multi-stream Vulkan work
+### 5. Execute scheduler batches as real multi-stream Vulkan work
 
 The scheduler can form compatible batches, but the Vulkan batch executor still
 processes their activations sequentially.
@@ -119,7 +185,7 @@ processes their activations sequentially.
   and fairness while the model remains mounted.
 - Avoid increasing single-stream latency merely to report a wider logical batch.
 
-### 5. Finish physical block-managed transient state
+### 6. Finish physical block-managed transient state
 
 The backend-neutral allocator and logical state tables exist, but resident state
 storage is still fundamentally flat and host offsets remain in the execution
@@ -135,7 +201,7 @@ path.
   component-owned state through the same abstraction.
 - Remove flat resident buffers as the authoritative state model.
 
-### 6. Wire prefix/state reuse into normal stream admission
+### 7. Wire prefix/state reuse into normal stream admission
 
 Prefix-state primitives exist, but normal chat does not automatically use them.
 
@@ -149,7 +215,7 @@ Prefix-state primitives exist, but normal chat does not automatically use them.
 - Report hits, misses, reused tokens, saved prefill work, and eviction behavior.
 - Validate reuse with real multi-turn and branched conversations.
 
-### 7. Define canonical runtime graph identity and reusable execution templates
+### 8. Define canonical runtime graph identity and reusable execution templates
 
 Execution-class compatibility, prefix reuse, and command/template reuse need one
 precise graph identity.
@@ -167,7 +233,7 @@ precise graph identity.
 - Invalidate only templates affected by a graph edit, placement change, or shape
   transition.
 
-### 8. Make cross-device execution efficient without making it mandatory
+### 9. Make cross-device execution efficient without making it mandatory
 
 Everything may run on one device. Multi-device execution should become useful
 when requested by placement or required by model size.
@@ -188,7 +254,7 @@ when requested by placement or required by model size.
 - Compare single-device and necessary multi-device placements; do not force extra
   devices into benchmarks.
 
-### 9. Complete route-native MoE execution
+### 10. Complete route-native MoE execution
 
 Sparse components and selected-route kernels exist, but routing is not yet a
 fully optimized runtime signal path.
@@ -203,7 +269,7 @@ fully optimized runtime signal path.
 - Make the 35B MoE model's performance reflect its active parameter count rather
   than its full declared size.
 
-### 10. Integrate MTP into the steady-state scheduler and device loop
+### 11. Integrate MTP into the steady-state scheduler and device loop
 
 MTP compilation and transactional verification work, but speculative execution
 is not yet part of the optimized steady-state path.
@@ -219,7 +285,7 @@ is not yet part of the optimized steady-state path.
 - Enable MTP by default only where warmed, realistic workloads show a net
   improvement.
 
-### 11. Finish long-context prefill and mixed-workload scheduling
+### 12. Finish long-context prefill and mixed-workload scheduling
 
 - Interleave prefill and decode fairly under memory pressure.
 - Derive prefill chunk size from available memory, device execution limits, and
@@ -231,7 +297,7 @@ is not yet part of the optimized steady-state path.
   limits.
 - Report prefill and decode throughput separately by default.
 
-### 12. Maintain adversarial correctness and performance gates
+### 13. Maintain adversarial correctness and performance gates
 
 Every meaningful compiler, runtime, state, graph, or kernel change must be tested
 against the supported model set rather than optimized around one model.
