@@ -44,6 +44,51 @@ impl VulkanComputeDeviceCatalog {
         &self.available_devices
     }
 
+    pub fn available_target_capabilities(
+        &self,
+    ) -> Result<Vec<VulkanComputeTargetCapabilities>, VulkanError> {
+        self.available_devices
+            .iter()
+            .map(|device| {
+                let physical_device = self.physical_devices[device.physical_device_index];
+                let properties = unsafe {
+                    self.context
+                        .instance
+                        .get_physical_device_properties(physical_device)
+                };
+                let subgroup = physical_device_subgroup_support(
+                    &self.context.instance,
+                    physical_device,
+                );
+                Ok(VulkanComputeTargetCapabilities {
+                    physical_device_index: device.physical_device_index,
+                    physical_device_id: device.physical_device_id.clone(),
+                    device_name: device.device_name.clone(),
+                    device_type: device.device_type.clone(),
+                    vendor_id: device.vendor_id,
+                    device_id: device.device_id,
+                    shader_features: physical_device_supported_shader_features(
+                        &self.context.instance,
+                        physical_device,
+                    )?,
+                    subgroup_operations: subgroup_operations(
+                        subgroup.supported_operations,
+                    ),
+                    subgroup_compute_supported: subgroup
+                        .supported_stages
+                        .contains(vk::ShaderStageFlags::COMPUTE),
+                    subgroup_size: subgroup.subgroup_size,
+                    max_compute_work_group_invocations: properties
+                        .limits
+                        .max_compute_work_group_invocations,
+                    max_compute_work_group_size_x: properties
+                        .limits
+                        .max_compute_work_group_size[0],
+                })
+            })
+            .collect()
+    }
+
     pub fn open_device_uuid(
         &self,
         device_uuid: [u8; vk::UUID_SIZE],
@@ -92,42 +137,28 @@ impl VulkanComputeDeviceCatalog {
                 .map(|heap| heap.size)
                 .max()
                 .unwrap_or(0);
-            let shader_float8_extension_supported = physical_device_supports_extension(
-                instance,
-                physical_device,
-                VK_EXT_SHADER_FLOAT8_NAME,
-            )?;
-            let shader_float8_support = if shader_float8_extension_supported {
-                physical_device_shader_float8_support(instance, physical_device)
-            } else {
-                VulkanShaderFloat8Support::default()
+            let enabled_shader_features =
+                physical_device_supported_shader_features(instance, physical_device)?;
+            let shader_float8_support = VulkanShaderFloat8Support {
+                shader_float8: enabled_shader_features
+                    .contains(&VulkanShaderFeature::ShaderFloat8),
+                shader_float8_cooperative_matrix: enabled_shader_features
+                    .contains(&VulkanShaderFeature::ShaderFloat8CooperativeMatrix),
             };
-            let cooperative_matrix_extension_supported = physical_device_supports_extension(
-                instance,
-                physical_device,
-                ash::khr::cooperative_matrix::NAME,
-            )?;
-            let cooperative_matrix_supported = cooperative_matrix_extension_supported
-                && physical_device_supports_cooperative_matrix(instance, physical_device);
-            let shader_bfloat16_extension_supported = physical_device_supports_extension(
-                instance,
-                physical_device,
-                VK_KHR_SHADER_BFLOAT16_NAME,
-            )?;
-            let shader_bfloat16_support = if shader_bfloat16_extension_supported {
-                physical_device_shader_bfloat16_support(instance, physical_device)
-            } else {
-                VulkanShaderBfloat16Support::default()
+            let cooperative_matrix_supported =
+                enabled_shader_features.contains(&VulkanShaderFeature::CooperativeMatrix);
+            let shader_bfloat16_support = VulkanShaderBfloat16Support {
+                shader_bfloat16_type: enabled_shader_features
+                    .contains(&VulkanShaderFeature::ShaderBfloat16Type),
+                shader_bfloat16_dot_product: enabled_shader_features
+                    .contains(&VulkanShaderFeature::ShaderBfloat16DotProduct),
+                shader_bfloat16_cooperative_matrix: enabled_shader_features
+                    .contains(&VulkanShaderFeature::ShaderBfloat16CooperativeMatrix),
             };
-            let mixed_float_dot_product_extension_supported = physical_device_supports_extension(
-                instance,
-                physical_device,
-                VK_VALVE_SHADER_MIXED_FLOAT_DOT_PRODUCT_NAME,
-            )?;
-            let mixed_float_dot_product_support = if mixed_float_dot_product_extension_supported {
-                physical_device_shader_mixed_float_dot_product_support(instance, physical_device)
-            } else {
-                VulkanShaderMixedFloatDotProductSupport::default()
+            let mixed_float_dot_product_support = VulkanShaderMixedFloatDotProductSupport {
+                shader_float8_acc_float32: enabled_shader_features.contains(
+                    &VulkanShaderFeature::ShaderMixedFloatDotProductFloat8AccFloat32,
+                ),
             };
             let cooperative_bfloat16_features_supported = cooperative_matrix_supported
                 && shader_bfloat16_support.shader_bfloat16_type
@@ -171,35 +202,6 @@ impl VulkanComputeDeviceCatalog {
             // Logical-device features cannot be added later. Enable every supported
             // feature in the runtime's SPIR-V contract so this device can safely
             // host different compiled component packages without being recreated.
-            let mut enabled_shader_features =
-                physical_device_standard_shader_features(instance, physical_device);
-            if shader_float8_support.shader_float8 {
-                enabled_shader_features.insert(VulkanShaderFeature::ShaderFloat8);
-            }
-            if shader_float8_support.shader_float8_cooperative_matrix
-                && cooperative_matrix_supported
-            {
-                enabled_shader_features.insert(VulkanShaderFeature::ShaderFloat8CooperativeMatrix);
-            }
-            if cooperative_matrix_supported {
-                enabled_shader_features.insert(VulkanShaderFeature::CooperativeMatrix);
-            }
-            if shader_bfloat16_support.shader_bfloat16_type {
-                enabled_shader_features.insert(VulkanShaderFeature::ShaderBfloat16Type);
-            }
-            if shader_bfloat16_support.shader_bfloat16_dot_product {
-                enabled_shader_features.insert(VulkanShaderFeature::ShaderBfloat16DotProduct);
-            }
-            if shader_bfloat16_support.shader_bfloat16_cooperative_matrix
-                && cooperative_matrix_supported
-            {
-                enabled_shader_features
-                    .insert(VulkanShaderFeature::ShaderBfloat16CooperativeMatrix);
-            }
-            if mixed_float_dot_product_support.shader_float8_acc_float32 {
-                enabled_shader_features
-                    .insert(VulkanShaderFeature::ShaderMixedFloatDotProductFloat8AccFloat32);
-            }
             let enabled_core_features = vk::PhysicalDeviceFeatures {
                 shader_float64: bool32(
                     enabled_shader_features.contains(&VulkanShaderFeature::ShaderFloat64),

@@ -3,7 +3,7 @@ from model_package_layout_common import *
 def test_compiler_derives_vulkan_features_from_compiled_spirv(tmp_path: Path) -> None:
     shader = tmp_path / "cooperative.spv"
     write_spirv_module(
-        shader, [1, 9, 22, 39, 61, 63, 4433, 5116, 5118, 5345, 6019, 6022, 6915]
+        shader, [1, 9, 22, 39, 61, 63, 4433, 5116, 5118, 5345, 6018, 6019, 6022, 6915]
     )
 
     assert spirv_capabilities(shader) == {
@@ -17,6 +17,7 @@ def test_compiler_derives_vulkan_features_from_compiled_spirv(tmp_path: Path) ->
         5116,
         5118,
         5345,
+        6018,
         6019,
         6022,
         6915,

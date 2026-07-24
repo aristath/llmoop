@@ -32,6 +32,9 @@ fn parse_args_from(raw: impl IntoIterator<Item = String>) -> Result<Args, String
             "--inspect-device-slice" => {
                 parsed.inspect_device_slice = Some(next_value(&mut raw, "--inspect-device-slice")?);
             }
+            "--inspect-devices" => {
+                parsed.inspect_devices = true;
+            }
             "--device" => {
                 let device_id = next_value(&mut raw, &arg)?;
                 if parsed.default_device_id.replace(device_id).is_some() {
@@ -146,10 +149,11 @@ fn parse_args_from(raw: impl IntoIterator<Item = String>) -> Result<Args, String
         + usize::from(parsed.inspect_package)
         + usize::from(parsed.inspect_graph)
         + usize::from(parsed.inspect_placement)
-        + usize::from(parsed.inspect_device_slice.is_some());
+        + usize::from(parsed.inspect_device_slice.is_some())
+        + usize::from(parsed.inspect_devices);
     if inspect_mode_count > 1 {
         return Err(
-            "--inspect-runtime, --inspect-package, --inspect-graph, --inspect-placement, and --inspect-device-slice are mutually exclusive"
+            "--inspect-runtime, --inspect-package, --inspect-graph, --inspect-placement, --inspect-device-slice, and --inspect-devices are mutually exclusive"
                 .to_string(),
         );
     }

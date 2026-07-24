@@ -51,6 +51,20 @@ mod tests {
         assert_eq!(error, "--device may only be supplied once");
     }
 
+    #[test]
+    fn device_capability_inspection_is_a_package_free_mode() {
+        let args = parse_args_from(
+            ["--inspect-devices", "--json"]
+                .into_iter()
+                .map(str::to_string),
+        )
+        .unwrap();
+
+        assert!(args.inspect_devices);
+        assert!(args.json);
+        assert!(args.package_manifest.is_none());
+    }
+
     impl VulkanResidentTokenTextCodec for CharacterCodec {
         fn encode_text(&self, text: &str) -> Result<Vec<u32>, VulkanResidentTokenTextCodecError> {
             Ok(text.chars().map(u32::from).collect())

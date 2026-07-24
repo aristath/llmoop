@@ -15,6 +15,9 @@ fn run() -> Result<(), Box<dyn Error>> {
     }
 
     let args = parse_args().map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    if args.inspect_devices {
+        return inspect_device_capabilities(&args);
+    }
     let package_manifest = args.package_manifest.as_ref().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -96,4 +99,3 @@ fn run() -> Result<(), Box<dyn Error>> {
 
     run_placed_prompt(&context, runtime_model)
 }
-

@@ -201,6 +201,39 @@ fn inspect_available_devices(
     discover_runtime_devices(default_device_id, selected_vulkan_device_index)
 }
 
+fn inspect_device_capabilities(args: &Args) -> Result<(), Box<dyn Error>> {
+    let catalog = VulkanComputeDeviceCatalog::discover()?;
+    let devices = catalog.available_target_capabilities()?;
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&RuntimeDeviceCapabilitiesReport {
+                ok: true,
+                schema: "nerve.device_capabilities.v1",
+                devices,
+            })?
+        );
+        return Ok(());
+    }
+
+    for device in devices {
+        println!(
+            "{} {} ({})",
+            device.physical_device_index, device.device_name, device.physical_device_id
+        );
+        println!(
+            "  shader_features: {}",
+            device
+                .shader_features
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    Ok(())
+}
+
 fn inspect_graph(
     args: &Args,
     package_manifest: &Path,

@@ -19,6 +19,7 @@ use nerve_runtime::{
     RuntimePromptTimingReport, RuntimeRemoteEdgeBufferReport, RuntimeSourceComponent,
     RuntimeTokenizerOptionsReport, RuntimeTopologyReport, VulkanComputeDevice,
     VulkanComputeDeviceCatalog, VulkanComputeDeviceInfo, VulkanResidentExecutionCounters,
+    VulkanComputeTargetCapabilities,
     VulkanResidentHfTokenizerTextCodec, VulkanResidentInProcessPlacedPromptEngine,
     VulkanResidentInProcessPlacedPromptStream, VulkanResidentModelPackageDeviceSlice,
     VulkanResidentModelPackageManifest, VulkanResidentRuntimeModel,
@@ -39,6 +40,7 @@ struct Args {
     inspect_graph: bool,
     inspect_placement: bool,
     inspect_device_slice: Option<String>,
+    inspect_devices: bool,
     default_device_id: Option<String>,
     node_devices: BTreeMap<String, String>,
     device_bindings: BTreeMap<String, String>,
@@ -85,6 +87,7 @@ impl Default for Args {
             inspect_graph: false,
             inspect_placement: false,
             inspect_device_slice: None,
+            inspect_devices: false,
             default_device_id: None,
             node_devices: BTreeMap::new(),
             device_bindings: BTreeMap::new(),
@@ -110,6 +113,13 @@ impl Default for Args {
     }
 }
 
+#[derive(Debug, Serialize)]
+struct RuntimeDeviceCapabilitiesReport {
+    ok: bool,
+    schema: &'static str,
+    devices: Vec<VulkanComputeTargetCapabilities>,
+}
+
 fn sampler_runtime_config(args: &Args) -> VulkanResidentSamplerRuntimeConfig {
     VulkanResidentSamplerRuntimeConfig {
         temperature: args.temperature,
@@ -120,4 +130,3 @@ fn sampler_runtime_config(args: &Args) -> VulkanResidentSamplerRuntimeConfig {
         repetition_penalty: args.repetition_penalty,
     }
 }
-

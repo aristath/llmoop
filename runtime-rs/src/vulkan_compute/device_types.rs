@@ -108,6 +108,22 @@ pub struct VulkanComputeDeviceInfo {
     pub selected_by_default: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct VulkanComputeTargetCapabilities {
+    pub physical_device_index: usize,
+    pub physical_device_id: String,
+    pub device_name: String,
+    pub device_type: String,
+    pub vendor_id: u32,
+    pub device_id: u32,
+    pub shader_features: BTreeSet<VulkanShaderFeature>,
+    pub subgroup_operations: BTreeSet<VulkanSubgroupOperation>,
+    pub subgroup_compute_supported: bool,
+    pub subgroup_size: u32,
+    pub max_compute_work_group_invocations: u32,
+    pub max_compute_work_group_size_x: u32,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VulkanMemoryHeapInfo {
     pub heap_index: u32,

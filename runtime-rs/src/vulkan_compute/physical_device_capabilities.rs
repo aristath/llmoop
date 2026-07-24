@@ -243,6 +243,7 @@ fn vulkan_shader_feature_for_spirv_capability(capability: u32) -> Option<VulkanS
         5116 => VulkanShaderFeature::ShaderBfloat16Type,
         5117 => VulkanShaderFeature::ShaderBfloat16DotProduct,
         5118 => VulkanShaderFeature::ShaderBfloat16CooperativeMatrix,
+        6018 => VulkanShaderFeature::ShaderIntegerDotProduct,
         6019 => VulkanShaderFeature::ShaderIntegerDotProduct,
         6915 => VulkanShaderFeature::ShaderMixedFloatDotProductFloat8AccFloat32,
         5345 => VulkanShaderFeature::VulkanMemoryModel,
@@ -488,6 +489,85 @@ fn physical_device_standard_shader_features(
         );
     }
     supported
+}
+
+fn physical_device_supported_shader_features(
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+) -> Result<BTreeSet<VulkanShaderFeature>, VulkanError> {
+    let mut supported = physical_device_standard_shader_features(instance, physical_device);
+    let cooperative_matrix_supported = physical_device_supports_extension(
+        instance,
+        physical_device,
+        ash::khr::cooperative_matrix::NAME,
+    )? && physical_device_supports_cooperative_matrix(instance, physical_device);
+    if cooperative_matrix_supported {
+        supported.insert(VulkanShaderFeature::CooperativeMatrix);
+    }
+
+    if physical_device_supports_extension(
+        instance,
+        physical_device,
+        VK_EXT_SHADER_FLOAT8_NAME,
+    )? {
+        let float8 = physical_device_shader_float8_support(instance, physical_device);
+        if float8.shader_float8 {
+            supported.insert(VulkanShaderFeature::ShaderFloat8);
+        }
+        if float8.shader_float8_cooperative_matrix && cooperative_matrix_supported {
+            supported.insert(VulkanShaderFeature::ShaderFloat8CooperativeMatrix);
+        }
+    }
+
+    if physical_device_supports_extension(
+        instance,
+        physical_device,
+        VK_KHR_SHADER_BFLOAT16_NAME,
+    )? {
+        let bfloat16 = physical_device_shader_bfloat16_support(instance, physical_device);
+        if bfloat16.shader_bfloat16_type {
+            supported.insert(VulkanShaderFeature::ShaderBfloat16Type);
+        }
+        if bfloat16.shader_bfloat16_dot_product {
+            supported.insert(VulkanShaderFeature::ShaderBfloat16DotProduct);
+        }
+        if bfloat16.shader_bfloat16_cooperative_matrix && cooperative_matrix_supported {
+            supported.insert(VulkanShaderFeature::ShaderBfloat16CooperativeMatrix);
+        }
+    }
+
+    if physical_device_supports_extension(
+        instance,
+        physical_device,
+        VK_VALVE_SHADER_MIXED_FLOAT_DOT_PRODUCT_NAME,
+    )? {
+        let mixed =
+            physical_device_shader_mixed_float_dot_product_support(instance, physical_device);
+        if mixed.shader_float8_acc_float32 {
+            supported.insert(
+                VulkanShaderFeature::ShaderMixedFloatDotProductFloat8AccFloat32,
+            );
+        }
+    }
+    Ok(supported)
+}
+
+fn subgroup_operations(
+    flags: vk::SubgroupFeatureFlags,
+) -> BTreeSet<VulkanSubgroupOperation> {
+    [
+        VulkanSubgroupOperation::Basic,
+        VulkanSubgroupOperation::Vote,
+        VulkanSubgroupOperation::Arithmetic,
+        VulkanSubgroupOperation::Ballot,
+        VulkanSubgroupOperation::Shuffle,
+        VulkanSubgroupOperation::ShuffleRelative,
+        VulkanSubgroupOperation::Clustered,
+        VulkanSubgroupOperation::Quad,
+    ]
+    .into_iter()
+    .filter(|operation| flags.contains(operation.flag()))
+    .collect()
 }
 
 fn physical_device_shader_float8_support(
@@ -917,4 +997,3 @@ unsafe fn read_byte_memory(
     unsafe { device.unmap_memory(memory) };
     Ok(output)
 }
-

@@ -287,7 +287,7 @@ mod tests {
 
     #[test]
     fn spirv_contract_extracts_native_integer_dot_product_feature() {
-        let words = spirv_test_module(&[1, 39, 6019], 1);
+        let words = spirv_test_module(&[1, 39, 6018, 6019], 1);
 
         let requirements = vulkan_spirv_requirements(&words).unwrap();
 

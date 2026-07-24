@@ -204,6 +204,7 @@ Options:
   --inspect-placement        Mount and summarize every logical device slice in the runtime graph.
   --inspect-device-slice <DEVICE_ID>
                              Mount and summarize only the runtime graph nodes assigned to DEVICE_ID.
+  --inspect-devices          Report physical-device compiler capabilities without loading a model.
   --max-new-tokens <N>       Generation stop condition, independent of context size. Default: 65536
   --speculative-draft-tokens <N>
                              MTP draft tokens proposed per verification cycle. Default: 0 (disabled).
