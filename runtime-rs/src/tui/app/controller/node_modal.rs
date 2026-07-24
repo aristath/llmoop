@@ -113,6 +113,8 @@ impl App {
             policy_targets,
             policy_target_index,
             properties,
+            anatomy_expanded: false,
+            anatomy_scroll: 0,
             focus_row: 0,
             error: None,
         }));

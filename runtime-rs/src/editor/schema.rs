@@ -1,4 +1,21 @@
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RuntimeEditorSemanticModule {
+    pub id: String,
+    pub role: String,
+    pub responsibility: String,
+    pub parent_id: Option<String>,
+    pub child_ids: Vec<String>,
+    pub source_node_ids: Vec<String>,
+    pub parameter_ref_ids: Vec<String>,
+    pub owned_state_port_ids: Vec<String>,
+    pub input_signals: Vec<String>,
+    pub output_signals: Vec<String>,
+    pub optimized_node_ids: Vec<String>,
+    pub kernel_node_ids: Vec<String>,
+    pub measured_cost: Option<Value>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RuntimeEditorSourceComponent {
     pub source_id: String,
     pub layer_index: Option<usize>,
@@ -14,6 +31,8 @@ pub struct RuntimeEditorSourceComponent {
     pub parameter_ref_count: usize,
     pub node_count: usize,
     pub kernel_count: usize,
+    pub semantic_modules: Vec<RuntimeEditorSemanticModule>,
+    pub semantic_module_root_id: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

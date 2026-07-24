@@ -183,6 +183,22 @@ mod tests {
                 parameter_ref_count: 4,
                 node_count: 8,
                 kernel_count: 3,
+                semantic_modules: vec![crate::RuntimeEditorSemanticModule {
+                    id: "layer".to_string(),
+                    role: "layer".to_string(),
+                    responsibility: "Editable source layer".to_string(),
+                    parent_id: None,
+                    child_ids: Vec::new(),
+                    source_node_ids: vec!["project".to_string()],
+                    parameter_ref_ids: vec!["weight".to_string()],
+                    owned_state_port_ids: Vec::new(),
+                    input_signals: vec!["input_frame".to_string()],
+                    output_signals: vec!["output_frame".to_string()],
+                    optimized_node_ids: vec!["fused_project".to_string()],
+                    kernel_node_ids: vec!["fused_project".to_string()],
+                    measured_cost: None,
+                }],
+                semantic_module_root_id: Some("layer".to_string()),
             },
             occurrence: 1,
             device_ids: vec!["gpu0".to_string()],
@@ -194,6 +210,8 @@ mod tests {
             policy_targets: Vec::new(),
             policy_target_index: 0,
             properties: vec![property],
+            anatomy_expanded: false,
+            anatomy_scroll: 0,
             focus_row: 5,
             error: None,
         };
@@ -203,5 +221,9 @@ mod tests {
         assert!(rendered.contains("NODE"));
         assert!(rendered.contains("Apply"));
         assert!(rendered.contains("Cancel"));
+        app.dispatch(crate::tui::AppAction::ToggleModuleAnatomy);
+        let rendered = rendered_text(&mut app, 100, 40);
+        assert!(rendered.contains("Editable source layer"));
+        assert!(rendered.contains("fused_project"));
     }
 }

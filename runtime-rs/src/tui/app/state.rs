@@ -68,6 +68,8 @@ pub enum AppAction {
     ModalPrevious,
     ModalNext,
     ModalChange(i32),
+    ToggleModuleAnatomy,
+    ScrollModuleAnatomy(i16),
     ModalClickRow(usize),
     ModelBrowserSelect(usize),
     ModelBrowserOpen(usize),
@@ -294,6 +296,8 @@ pub(crate) struct NodeModalState {
     pub policy_targets: Vec<String>,
     pub policy_target_index: usize,
     pub properties: Vec<NodePropertyDraft>,
+    pub anatomy_expanded: bool,
+    pub anatomy_scroll: u16,
     pub focus_row: usize,
     pub error: Option<String>,
 }
@@ -513,4 +517,3 @@ pub struct App {
     compiler_launch: Result<CompilerLaunch, String>,
     terminal_reset_requested: bool,
 }
-

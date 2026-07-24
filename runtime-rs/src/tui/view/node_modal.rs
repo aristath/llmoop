@@ -1,5 +1,11 @@
 fn render_node_modal(frame: &mut Frame<'_>, app: &mut App, modal: &NodeModalState) {
-    let area = centered_rect(frame.area(), 70, 78, 54, 20);
+    let area = centered_rect(
+        frame.area(),
+        if modal.anatomy_expanded { 88 } else { 70 },
+        if modal.anatomy_expanded { 92 } else { 78 },
+        54,
+        20,
+    );
     frame.render_widget(Clear, area);
     let title = format!(
         " NODE {} · OCCURRENCE {} ",
@@ -21,6 +27,7 @@ fn render_node_modal(frame: &mut Frame<'_>, app: &mut App, modal: &NodeModalStat
             Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Length(1),
+            Constraint::Length(if modal.anatomy_expanded { 16 } else { 2 }),
             Constraint::Min(4),
             Constraint::Length(2),
         ])
@@ -86,15 +93,16 @@ fn render_node_modal(frame: &mut Frame<'_>, app: &mut App, modal: &NodeModalStat
         );
         app.hit_map.insert(area, HitTarget::ModalRow(index));
     }
-    render_node_properties(frame, app, modal, rows[6]);
+    render_module_anatomy(frame, modal, rows[6]);
+    render_node_properties(frame, app, modal, rows[7]);
     if let Some(error) = &modal.error {
         frame.render_widget(
-            Paragraph::new(truncate(error, rows[6].width as usize))
+            Paragraph::new(truncate(error, rows[7].width as usize))
                 .style(Style::default().fg(FAULT)),
             Rect::new(
-                rows[6].x,
-                rows[6].bottom().saturating_sub(1),
-                rows[6].width,
+                rows[7].x,
+                rows[7].bottom().saturating_sub(1),
+                rows[7].width,
                 1,
             ),
         );
@@ -108,17 +116,115 @@ fn render_node_modal(frame: &mut Frame<'_>, app: &mut App, modal: &NodeModalStat
             Span::styled("[ Cancel ]", cancel_style),
         ]))
         .alignment(Alignment::Center),
-        rows[7],
+        rows[8],
     );
-    let middle = rows[7].x + rows[7].width / 2;
+    let middle = rows[8].x + rows[8].width / 2;
     app.hit_map.insert(
-        Rect::new(middle.saturating_sub(10), rows[7].y, 9, 1),
+        Rect::new(middle.saturating_sub(10), rows[8].y, 9, 1),
         HitTarget::ModalApply,
     );
     app.hit_map.insert(
-        Rect::new(middle + 2, rows[7].y, 10, 1),
+        Rect::new(middle + 2, rows[8].y, 10, 1),
         HitTarget::ModalCancel,
     );
+}
+
+fn render_module_anatomy(frame: &mut Frame<'_>, modal: &NodeModalState, area: Rect) {
+    let available = !modal.source.semantic_modules.is_empty();
+    let state = if !available {
+        "unavailable"
+    } else if modal.anatomy_expanded {
+        "expanded"
+    } else {
+        "collapsed"
+    };
+    let block = Block::default()
+        .title(format!(" Module anatomy · {state} · [a] toggle · [PgUp/PgDn] scroll "))
+        .borders(Borders::TOP)
+        .border_style(Style::default().fg(QUIET));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if !available {
+        frame.render_widget(
+            Paragraph::new("This component has no semantic module tree.")
+                .style(Style::default().fg(META)),
+            inner,
+        );
+        return;
+    }
+    if !modal.anatomy_expanded {
+        let root = modal
+            .source
+            .semantic_module_root_id
+            .as_deref()
+            .unwrap_or("layer");
+        frame.render_widget(
+            Paragraph::new(format!(
+                "{root} · {} modules · press a to inspect",
+                modal.source.semantic_modules.len()
+            ))
+            .style(Style::default().fg(META)),
+            inner,
+        );
+        return;
+    }
+
+    let by_id = modal
+        .source
+        .semantic_modules
+        .iter()
+        .map(|module| (module.id.as_str(), module))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let mut lines = Vec::new();
+    if let Some(root_id) = modal.source.semantic_module_root_id.as_deref() {
+        append_module_lines(root_id, 0, &by_id, &mut lines);
+    }
+    frame.render_widget(
+        Paragraph::new(lines)
+            .scroll((modal.anatomy_scroll, 0))
+            .style(Style::default().fg(TEXT)),
+        inner,
+    );
+}
+
+fn append_module_lines(
+    module_id: &str,
+    depth: usize,
+    by_id: &std::collections::BTreeMap<&str, &crate::RuntimeEditorSemanticModule>,
+    lines: &mut Vec<Line<'static>>,
+) {
+    let Some(module) = by_id.get(module_id) else {
+        return;
+    };
+    let indent = "  ".repeat(depth);
+    let short_id = module.id.rsplit('.').next().unwrap_or(module.id.as_str());
+    lines.push(Line::from(vec![
+        Span::styled(format!("{indent}{short_id}"), Style::default().fg(SIGNAL).bold()),
+        Span::styled(format!(" · {}", module.role), Style::default().fg(COOL)),
+    ]));
+    lines.push(Line::styled(
+        format!("{indent}  {}", module.responsibility),
+        Style::default().fg(META),
+    ));
+    let cost = module
+        .measured_cost
+        .as_ref()
+        .map(ToString::to_string)
+        .unwrap_or_else(|| "unmeasured".to_string());
+    lines.push(Line::styled(
+        format!(
+            "{indent}  params [{}] · state [{}] · semantic [{}] · optimized [{}] · kernels [{}] · cost {cost}",
+            module.parameter_ref_ids.join(", "),
+            module.owned_state_port_ids.join(", "),
+            module.source_node_ids.join(", "),
+            module.optimized_node_ids.join(", "),
+            module.kernel_node_ids.join(", "),
+        ),
+        Style::default().fg(QUIET),
+    ));
+    for child_id in &module.child_ids {
+        append_module_lines(child_id, depth + 1, by_id, lines);
+    }
 }
 
 fn render_node_properties(

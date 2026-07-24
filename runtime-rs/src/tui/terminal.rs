@@ -140,6 +140,9 @@ fn action_from_key(app: &App, key: KeyEvent) -> Option<AppAction> {
         },
         Some(Overlay::Node(_)) => match key.code {
             KeyCode::Esc => Some(AppAction::CloseOverlay),
+            KeyCode::Char('a') if !ctrl && !alt => Some(AppAction::ToggleModuleAnatomy),
+            KeyCode::PageUp => Some(AppAction::ScrollModuleAnatomy(-8)),
+            KeyCode::PageDown => Some(AppAction::ScrollModuleAnatomy(8)),
             KeyCode::Up => Some(AppAction::ModalPrevious),
             KeyCode::Down => Some(AppAction::ModalNext),
             KeyCode::Left if app.modal_text_entry_active() && !alt => {

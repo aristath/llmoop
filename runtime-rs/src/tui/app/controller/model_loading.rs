@@ -138,6 +138,18 @@ impl App {
                     .unwrap_or_else(|| modal.row_count() - 1)
             }
             AppAction::ModalChange(delta) => change_node_modal(modal, delta),
+            AppAction::ToggleModuleAnatomy => {
+                modal.anatomy_expanded = !modal.anatomy_expanded;
+                modal.anatomy_scroll = 0;
+            }
+            AppAction::ScrollModuleAnatomy(delta) if modal.anatomy_expanded => {
+                modal.anatomy_scroll = if delta < 0 {
+                    modal.anatomy_scroll.saturating_sub(delta.unsigned_abs())
+                } else {
+                    modal.anatomy_scroll.saturating_add(delta as u16)
+                };
+            }
+            AppAction::ScrollModuleAnatomy(_) => {}
             AppAction::ModalClickRow(row) => {
                 modal.focus_row = row.min(modal.row_count().saturating_sub(1));
                 if row <= 3 {
