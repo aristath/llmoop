@@ -1635,6 +1635,90 @@ def render_shader_source(source_dir: Path, shader_file: str) -> str:
             },
         )
 
+    cooperative_int4_linear = re.fullmatch(
+        r"(linear|linear_bias|linear_residual)_batch64_cooperative_"
+        r"int4_(gptq|ct)_s(f16|bf16)_"
+        r"g(\d+)_(\d+)x(\d+)\.comp",
+        shader_file,
+    )
+    if cooperative_int4_linear is not None:
+        operation, quantization_format, scale_dtype = (
+            cooperative_int4_linear.groups()[:3]
+        )
+        group_size, input_size, output_size = map(
+            int, cooperative_int4_linear.groups()[3:]
+        )
+        validate_native_int4_shader_shape(
+            shader_file, group_size, input_size, output_size
+        )
+        if group_size % COOPERATIVE_BFLOAT16_SHAPE[2]:
+            raise ModelCompileError(
+                f"invalid cooperative INT4 group size in {shader_file!r}"
+            )
+        replacements = int4_shader_replacements(
+            operation=operation,
+            quantization_format=quantization_format,
+            scale_dtype=scale_dtype,
+            batch_tile_width=COOPERATIVE_BATCH_LANE_TILE_WIDTH,
+        )
+        if quantization_format == "gptq":
+            replacements |= {
+                "QZEROS_BUFFER": (
+                    f"layout(set = 0, binding = "
+                    f"{replacements['QZEROS_BINDING']}) "
+                    "readonly buffer QZeros {\n"
+                    "    uint words[];\n"
+                    "} qzeros;"
+                ),
+                "FORMAT_CONSTANTS": (
+                    "const uint ZERO_WORDS = (OUTPUT_SIZE + 7u) / 8u;"
+                ),
+                "READ_SCALE_BODY": (
+                    "    uint index = group * OUTPUT_SIZE + row;\n"
+                    + replacements["READ_SCALE_BODY"]
+                ),
+                "READ_WEIGHT_BODY": (
+                    "    uint packed_column = input_index / 8u;\n"
+                    "    uint packed = qweight.words[\n"
+                    "        packed_column * OUTPUT_SIZE + row\n"
+                    "    ];\n"
+                    "    uint packed_zero = qzeros.words[\n"
+                    "        group * ZERO_WORDS + (row >> 3u)\n"
+                    "    ];\n"
+                    "    int zero = int((packed_zero >> "
+                    "((row & 7u) * 4u)) & 15u) + 1;\n"
+                    "    return int((packed >> "
+                    "((input_index & 7u) * 4u)) & 15u) - zero;"
+                ),
+            }
+        else:
+            replacements |= {
+                "QZEROS_BUFFER": "",
+                "FORMAT_CONSTANTS": "",
+                "READ_SCALE_BODY": (
+                    "    uint index = row * SCALE_COLUMNS + group;\n"
+                    + replacements["READ_SCALE_BODY"]
+                ),
+                "READ_WEIGHT_BODY": (
+                    "    uint packed_column = input_index / 8u;\n"
+                    "    uint packed = qweight.words[\n"
+                    "        row * PACKED_COLUMNS + packed_column\n"
+                    "    ];\n"
+                    "    return int((packed >> "
+                    "((input_index & 7u) * 4u)) & 15u) - 8;"
+                ),
+            }
+        return render_shader_template(
+            source_dir,
+            "linear_batch_cooperative_int4.comp.template",
+            replacements
+            | {
+                "GROUP_SIZE": str(group_size),
+                "INPUT_SIZE": str(input_size),
+                "OUTPUT_SIZE": str(output_size),
+            },
+        )
+
     native_int4_linear = re.fullmatch(
         r"(linear|linear_bias|linear_residual)_int4_(gptq|ct)_s(f16|bf16)_"
         r"g(\d+)_(\d+)x(\d+)\.comp",

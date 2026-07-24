@@ -359,6 +359,18 @@ def test_compiler_selects_cooperative_bfloat16_projection_kernels() -> None:
         )
         == 64
     )
+    assert cooperative_bfloat16_batch_shader_file(
+        "linear_residual_int4_ct_sbf16_g128_5120x17408.comp"
+    ) == (
+        "linear_residual_batch64_cooperative_"
+        "int4_ct_sbf16_g128_5120x17408.comp"
+    )
+    assert (
+        cooperative_bfloat16_workgroup_count_x(
+            "linear_residual_int4_ct_sbf16_g128_5120x17408.comp"
+        )
+        == 272
+    )
     assert (
         cooperative_bfloat16_batch_shader_file(
             "linear_fp8_e4m3_b128x128_1024x4096.comp"
@@ -663,6 +675,40 @@ def test_compiler_renders_cooperative_bfloat16_batch_shaders(tmp_path: Path) -> 
         "VK_KHR_cooperative_matrix",
         "VK_KHR_shader_bfloat16",
     ]
+
+
+def test_compiler_renders_cooperative_int4_prefill_shaders(tmp_path: Path) -> None:
+    shader_source_dir = Path(__file__).parents[1] / "runtime-rs" / "shaders"
+    gptq = (
+        "linear_bias_batch64_cooperative_"
+        "int4_gptq_sf16_g128_5120x17408.comp"
+    )
+    ct = (
+        "linear_residual_batch64_cooperative_"
+        "int4_ct_sbf16_g128_17408x5120.comp"
+    )
+
+    copy_shader_templates(shader_source_dir, tmp_path, {gptq, ct})
+
+    gptq_source = (tmp_path / gptq).read_text()
+    assert "binding = 2) readonly buffer QWeight" in gptq_source
+    assert "binding = 3) readonly buffer QZeros" in gptq_source
+    assert "binding = 4) readonly buffer Scales" in gptq_source
+    assert "binding = 5) readonly buffer Bias" in gptq_source
+    assert "uint index = group * OUTPUT_SIZE + row;" in gptq_source
+    assert "int zero =" in gptq_source
+    assert "coopmat<bfloat16_t" in gptq_source
+    assert "{{" not in gptq_source
+
+    ct_source = (tmp_path / ct).read_text()
+    assert "binding = 1) readonly buffer ResidualFrames" in ct_source
+    assert "binding = 3) readonly buffer QWeight" in ct_source
+    assert "binding = 4) readonly buffer Scales" in ct_source
+    assert "QZeros" not in ct_source
+    assert "uint index = row * SCALE_COLUMNS + group;" in ct_source
+    assert "result_tile[index] = fma(" in ct_source
+    assert "coopmat<bfloat16_t" in ct_source
+    assert "{{" not in ct_source
 
 
 @pytest.mark.parametrize(

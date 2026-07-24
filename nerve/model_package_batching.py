@@ -116,6 +116,24 @@ def cooperative_bfloat16_batch_shader_file(shader_file: str) -> str | None:
             "parallel_linear_silu_multiply_batch64_cooperative_",
             1,
         )
+    int4 = re.fullmatch(
+        r"(linear|linear_bias|linear_residual)_int4_(gptq|ct)_"
+        r"s(f16|bf16)_g(\d+)_(\d+)x(\d+)\.comp",
+        shader_file,
+    )
+    if int4 is not None:
+        operation, quantization_format, scale_dtype, group_size, input_size, output_size = (
+            int4.groups()
+        )
+        if (
+            int(group_size) % COOPERATIVE_BFLOAT16_SHAPE[2]
+            or int(input_size) % int(group_size)
+        ):
+            return None
+        return (
+            f"{operation}_batch64_cooperative_int4_{quantization_format}_"
+            f"s{scale_dtype}_g{group_size}_{input_size}x{output_size}.comp"
+        )
     return None
 
 
@@ -149,6 +167,15 @@ def cooperative_bfloat16_workgroup_count_x(shader_file: str) -> int:
         return (
             int(fused.group(1)) + COOPERATIVE_FUSED_OUTPUT_TILE_WIDTH - 1
         ) // COOPERATIVE_FUSED_OUTPUT_TILE_WIDTH
+    int4 = re.fullmatch(
+        r"(?:linear|linear_bias|linear_residual)_int4_(?:gptq|ct)_"
+        r"s(?:f16|bf16)_g\d+_\d+x(\d+)\.comp",
+        shader_file,
+    )
+    if int4 is not None:
+        return (
+            int(int4.group(1)) + COOPERATIVE_OUTPUT_TILE_WIDTH - 1
+        ) // COOPERATIVE_OUTPUT_TILE_WIDTH
     raise ModelCompileError(
         f"shader {shader_file!r} has no cooperative BF16 batch geometry"
     )
